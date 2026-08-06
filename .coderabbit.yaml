@@ -1,0 +1,49 @@
+# CodeRabbit review settings. https://docs.coderabbit.ai/guides/configure-coderabbit
+# Reviews run on pull requests, so this file does nothing until work lands via PRs
+# rather than commits straight to main.
+language: en-US
+
+reviews:
+  profile: chill # assertive is noisy on a codebase this young
+  request_changes_workflow: false
+  high_level_summary: true
+  review_status: true
+  poem: false
+
+  auto_review:
+    enabled: true
+    drafts: false
+
+  path_filters:
+    # Vendored, generated, or binary — nothing to review, and large.
+    - "!third_party/**"
+    - "!site/**"
+    - "!**/*.onnx"
+    - "!**/*.pt"
+    - "!**/*.hef"
+    - "!**/*.db"
+
+  path_instructions:
+    - path: "cloud/**"
+      instructions: >-
+        FastAPI backend holding real user accounts and device credentials.
+        Flag any endpoint that skips auth, any secret with a hardcoded fallback,
+        any credential or database file that could get committed, and any query
+        built by string interpolation rather than parameter binding.
+
+    - path: "ios/Sources/**"
+      instructions: >-
+        SwiftUI client. Flag URLs assembled with appendingPathComponent when a
+        query string is involved (it percent-escapes "?" and silently 404s),
+        network calls that surface raw URLError text instead of an actionable
+        message, and any credential stored outside Keychain.
+
+    - path: "services/**"
+      instructions: >-
+        Long-running supervised services on a Raspberry Pi under systemd.
+        Flag blocking calls on the capture/inference hot path, threads without
+        shutdown handling, and failures that would kill a service rather than
+        letting the health monitor restart it.
+
+chat:
+  auto_reply: true
