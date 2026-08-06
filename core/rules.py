@@ -35,6 +35,7 @@ from dataclasses import dataclass
 from datetime import datetime
 from typing import Callable, Optional
 
+from core.detections import DetectionFrame
 from core.event_engine import CONFIRMED, EventEngine, RuleSpec
 from core.zones import Zone
 
@@ -241,6 +242,28 @@ class RuleEngine:
                         zone=rule.zone,
                     )
                 )
+        return alerts
+
+    def observe_frame(self, frame: "DetectionFrame", now: Optional[float] = None) -> list[Alert]:
+        """Evaluate every rule against one frame of detections.
+
+        Labels the frame doesn't contain are reported as absent rather than
+        skipped — that is what lets a confirmed event resolve, and what makes
+        absence rules ("alert when the room becomes empty") possible at all.
+        """
+        now = time.monotonic() if now is None else now
+        alerts: list[Alert] = []
+        for detection in {r.detection for r in self._rules.values()}:
+            present = detection in frame.labels()
+            alerts += self.observe(
+                detection,
+                present,
+                confidence=frame.mean_confidence(detection) if present else 0.0,
+                count=frame.count(detection),
+                now=now,
+                boxes=frame.boxes(detection),
+                frame_size=frame.size,
+            )
         return alerts
 
     def active_alerts(self) -> list[str]:

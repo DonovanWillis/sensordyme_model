@@ -39,7 +39,9 @@ from core.health import HealthMonitor
 from core.logger import EventLogger
 from core.logging_setup import get_logger, setup_logging
 from core.network import WifiManager, nmcli_available
+from core.rules import RuleEngine
 from core.telemetry import TelemetryLogger
+from core.zones import load_zones
 from modules import get_module_class
 from services.capture import CaptureService
 from services.provisioning import ProvisioningService
@@ -106,6 +108,10 @@ class DeviceRuntime:
             if bool(alerts_cfg.get("save_evidence", False)) else None
         )
         self._evidence_max = int(alerts_cfg.get("evidence_max_files", 50))
+
+        # AI-configured rules. Zones come from the active module's config, so a
+        # rule naming "pool" resolves against the same polygon the module draws.
+        self.rule_engine = RuleEngine(zones=self._zones_for_module(module_name))
 
         self.bus = FrameBus()
         self.shutdown = threading.Event()
@@ -287,6 +293,34 @@ class DeviceRuntime:
             self.supervisor.add(_InferenceService(self))
         self.supervisor.add(self.provisioning)
 
+    # ------------------------------------------------------------------ AI-configured rules
+    def _zones_for_module(self, module_name: str) -> list:
+        """Zones configured for `module_name`, or none if it has no zone support."""
+        modules_cfg = self.config.get("modules", {})
+        module_cfg = modules_cfg.get(module_name, {}) if isinstance(modules_cfg, dict) else {}
+        return load_zones(module_cfg.get("zones", {}) if isinstance(module_cfg, dict) else {})
+
+    def _emit_rule_alert(self, alert) -> None:
+        """Route a confirmed AI-rule alert through the same path as built-in events.
+
+        Custom rules are not a second-class channel: they log, notify locally, and
+        reach the phone exactly the way a preset's own detections do.
+        """
+        event = Event.now(
+            type=alert.detection,
+            duration=alert.duration_s,
+            confidence=alert.confidence,
+            module_name=self.module_name,
+            contributing_signals=alert.description,
+        )
+        self.logger.log(event)
+        self.alert_manager.notify(event)
+        severity = "loud" if alert.severity == "critical" else "soft"
+        if self.dashboard is not None:
+            self.dashboard.push_event(event, severity)
+        if self.uplink is not None and alert.notify != "silent":
+            self.uplink.push_event(event, severity)
+
     # ------------------------------------------------------------------ health hooks
     def _inference_check(self) -> tuple[bool, str]:
         if self._heartbeat == 0.0:
@@ -350,6 +384,9 @@ class DeviceRuntime:
             old_module = self.module
             self.module, self.module_name, self.active_preset = new_module, new_module_name, name
             self.alert_event_types = self.alert_types_for(new_module_name, preset)
+        # Zones belong to the module's config, so a mode switch re-points custom
+        # rules at the new module's polygons instead of the previous mode's.
+        self.rule_engine.set_zones(self._zones_for_module(new_module_name))
         old_module.close()  # release the old FaceMesh/graph — was leaked before
         if overrides:
             print(f"SensorDyme: variant '{variant_name}' overrides applied: {overrides}")
@@ -381,6 +418,19 @@ class DeviceRuntime:
             if pending and pending != self.active_preset:
                 self._switch_preset(pending)
 
+            # A new AI-configured rule set from the app replaces the live one.
+            # `None` means no news; `[]` means the user deleted their rules and
+            # enforcement must actually stop.
+            if self.uplink is not None:
+                new_rules = self.uplink.pop_pending_rules()
+                if new_rules is not None:
+                    self.rule_engine.replace_rules(new_rules)
+                    pending_zones = self.rule_engine.pending_zones()
+                    print(
+                        f"rules: enforcing {len(self.rule_engine.rules)} AI-configured rule(s)"
+                        + (f"; awaiting zones: {', '.join(pending_zones)}" if pending_zones else "")
+                    )
+
             with self._module_lock:
                 module = self.module
             events = module.process(frame)
@@ -406,6 +456,14 @@ class DeviceRuntime:
             # written to disk", captured only at the moment of a loud alert.
             if evidence_due and self._evidence_dir is not None:
                 self._save_evidence(module, frame, events)
+
+            # AI-configured rules evaluate the module's raw per-frame view, not its
+            # Events: zone and count rules need boxes and counts that an Event does
+            # not carry, and Events are already debounced.
+            detection_frame = module.get_detections()
+            if detection_frame is not None and self.rule_engine.rules:
+                for alert in self.rule_engine.observe_frame(detection_frame):
+                    self._emit_rule_alert(alert)
 
             snapshot = module.get_telemetry_snapshot()
             if snapshot is not None:

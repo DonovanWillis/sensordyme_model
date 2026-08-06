@@ -17,6 +17,7 @@ from typing import Optional
 
 import numpy as np
 
+from core.detections import DetectionFrame
 from core.events import Event
 
 _REGISTRY: dict[str, type["VisionModule"]] = {}
@@ -85,6 +86,19 @@ class VisionModule(ABC):
         have an active/inactive alert state.
         """
         return False
+
+    def get_detections(self) -> Optional["DetectionFrame"]:
+        """What this module saw in the most recent `process()` frame, undebounced.
+
+        Feeds AI-configured rules (core/rules.py), which need boxes and counts
+        that `Event` does not carry — a zone rule ("in the pool area") or a count
+        rule ("more than three people") cannot be evaluated from Events.
+
+        Default returns None (opt-in, like `get_telemetry_snapshot`). Modules that
+        don't override it simply can't back zone or count rules; RuleEngine reads
+        None as "no observation this frame" rather than assuming anything.
+        """
+        return None
 
     def get_telemetry_snapshot(self) -> Optional[dict]:
         """Raw per-frame signal snapshot for telemetry logging (future model-training data).

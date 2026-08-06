@@ -15,6 +15,7 @@ import time
 import cv2
 import numpy as np
 
+from core.detections import Detection, DetectionFrame
 from core.detectors import get_yolo_model
 from core.event_engine import CONFIRMED, RESOLVED, EventEngine, RuleSpec
 from core.events import Event
@@ -40,6 +41,8 @@ class OccupancyModule(VisionModule):
         self._pending_count: int | None = None
         self._pending_streak = 0
         self._last_boxes: list[tuple[int, int, int, int]] = []
+        self._last_confidences: list[float] = []
+        self._last_frame_size: tuple[int, int] = (0, 0)
 
         # Optional security zones (feet-point membership; see core/zones.py).
         self._zones = load_zones(config.get("zones", {}))
@@ -71,6 +74,8 @@ class OccupancyModule(VisionModule):
                 confidences.append(float(box.conf[0]))
 
         self._last_boxes = boxes
+        self._last_confidences = confidences
+        self._last_frame_size = (frame.shape[1], frame.shape[0])
         count = len(boxes)
 
         if count == self._pending_count:
@@ -111,6 +116,20 @@ class OccupancyModule(VisionModule):
     def is_alert_active(self) -> bool:
         """True while any zone violation is confirmed and unresolved."""
         return bool(self._engine.active_detections())
+
+    def get_detections(self) -> DetectionFrame:
+        """This frame's people, with boxes, so zone and count rules can evaluate."""
+        width, height = self._last_frame_size
+        return DetectionFrame(
+            width=width,
+            height=height,
+            detections=tuple(
+                Detection(label="person", confidence=conf, box=tuple(float(v) for v in box))
+                # zip truncates if a detector ever returns mismatched lists, which
+                # is the safe direction: a missing score must not fabricate a box.
+                for box, conf in zip(self._last_boxes, self._last_confidences)
+            ),
+        )
 
     def annotate(self, frame: np.ndarray) -> np.ndarray:
         """Draw zones, a box per detected person, and the current count."""
