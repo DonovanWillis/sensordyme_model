@@ -4,34 +4,79 @@ import Foundation
 
 /// One validated detection rule from Configure-with-AI. Every field was checked
 /// server-side against the device's capability taxonomy before reaching the app.
-struct AIRule: Codable, Equatable {
-    let detection: String     // taxonomy id, e.g. "zone_violation"
-    let description: String
-    let zone: String          // zone the user must draw, or ""
-    let persist_s: Double
-    let min_count: Int
-    let confidence: Double
-    let severity: String      // info | warning | critical
-    let cooldown_s: Double
-    let schedule: String      // "23:00-06:00" or "" (enforcement planned)
-    let notify: String        // push | sms | silent
+/// One monitoring rule: watch `target` for `predicate`, optionally in relation
+/// to `secondary`. Mutable so the review screen can edit before activation —
+/// the user approves a rule, not a black box.
+struct AIRule: Codable, Equatable, Identifiable {
+    var target: String        // "person", "dog", "lying_down"
+    var predicate: String     // present | absent | in_zone | near | holding
+    var secondary: String     // second object for relational rules, or ""
+    var description: String
+    var zone: String          // zone the user must draw, or ""
+    var persist_s: Double
+    var min_count: Int
+    var confidence: Double
+    var severity: String      // info | warning | critical
+    var cooldown_s: Double
+    var schedule: String      // "23:00-06:00" or ""
+    var notify: String        // push | sms | silent
+    /// Present when the rule is an approximation (proximity is evidence of
+    /// "with", not proof of interaction). Carried on the rule so the caveat
+    /// survives to the review screen rather than living only in the reply.
+    var caveat: String?
+
+    var id: String { "\(predicate):\(target):\(secondary)" }
+
+    /// The rule in the user's terms rather than the schema's.
+    var headline: String {
+        let verb: String
+        switch predicate {
+        case "absent": verb = "is gone"
+        case "in_zone": verb = "is in \(zone.isEmpty ? "the area" : zone)"
+        case "near", "holding": verb = "is with \(secondary)"
+        default: verb = min_count > 1 ? "appears (\(min_count)+)" : "appears"
+        }
+        return "\(target.capitalized) \(verb)"
+    }
 }
 
 /// A part of the request the device honestly cannot do, with why and what it'd take.
-struct AIUnsupported: Codable, Equatable {
+struct AIUnsupported: Codable, Equatable, Identifiable {
     let request: String
     let reason: String
     let requires: String
+    /// supported | partial | needs_model | needs_training_data | needs_hardware | unsupported
+    var support: String?
+    var alternatives: [String]?
+
+    var id: String { request + reason }
+
+    /// The takeaway, phrased as a next step rather than a refusal.
+    var route: String {
+        switch support {
+        case "needs_training_data": "Add examples to teach it"
+        case "needs_model": "Needs an extra model"
+        case "needs_hardware": "Needs extra hardware"
+        default: "Not possible from camera alone"
+        }
+    }
 }
 
 struct AIProposal: Codable, Equatable {
-    let preset: String
+    let preset: String        // "" for a custom configuration belonging to no preset
     let variant: String
     let explanation: String
-    let rules: [AIRule]
+    var rules: [AIRule]
     let settings: [String: String]
     let unsupported: [AIUnsupported]
-    let source: String        // "claude" | "fallback" — shown so demos are honest
+    let source: String        // "claude" | "unavailable" | "demo" — shown so demos are honest
+    var mode: String?         // "custom" | "preset"
+
+    /// A custom configuration is the normal outcome, not a failure to match.
+    var isCustom: Bool { preset.isEmpty }
+
+    /// Nothing was understood well enough to act on.
+    var isEmpty: Bool { rules.isEmpty }
 }
 
 protocol BackendAPI {
@@ -246,83 +291,75 @@ final class MockAPI: BackendAPI {
 
     func aiConfigure(deviceID: Int, prompt: String) async throws -> AIProposal {
         try await Task.sleep(for: .seconds(1.2))  // feels like a model thinking
+
         let p = prompt.lowercased()
-
         func has(_ words: String...) -> Bool { words.contains { p.contains($0) } }
-        func rule(_ det: String, _ desc: String, zone: String = "", persist: Double = 2,
-                  severity: String = "warning", cooldown: Double = 60) -> AIRule {
-            AIRule(detection: det, description: desc, zone: zone, persist_s: persist,
-                   min_count: 1, confidence: 0.6, severity: severity, cooldown_s: cooldown,
-                   schedule: "", notify: "push")
+        func rule(_ target: String, _ predicate: String, _ desc: String, secondary: String = "",
+                  zone: String = "", persist: Double = 3, severity: String = "warning",
+                  cooldown: Double = 120, caveat: String? = nil) -> AIRule {
+            AIRule(target: target, predicate: predicate, secondary: secondary, description: desc,
+                   zone: zone, persist_s: persist, min_count: 1, confidence: 0.6,
+                   severity: severity, cooldown_s: cooldown, schedule: "", notify: "push",
+                   caveat: caveat)
         }
 
-        if has("baby", "infant", "crib", "nursery") {
+        // The demo mirrors the real capability layer, refusals included. A
+        // walkthrough that only ever succeeds teaches the wrong expectation and
+        // falls apart the first time someone asks for something unsupported.
+        if has("dog", "cat", "pet", "couch") {
             return AIProposal(
-                preset: "baby_monitoring", variant: "nap_time",
-                explanation: "Switching to Baby Monitoring (Nap Time). You'll be alerted if the baby leaves the safe zone you draw around the crib, or is unusually still for 5 minutes. Crying and face-covered detection aren't supported by the camera alone — listed below with what they'd need.",
-                rules: [
-                    rule("safe_zone_exit", "Alert if the baby leaves the crib zone", zone: "crib", severity: "critical"),
-                    rule("unusual_stillness", "Alert after 5 minutes of unusual stillness", persist: 300),
-                ],
-                settings: [:],
-                unsupported: [
-                    AIUnsupported(request: "Crying alerts", reason: "the device has no microphone",
-                                  requires: "a microphone + audio classifier"),
-                    AIUnsupported(request: "Face-covered detection",
-                                  reason: "adult face models aren't reliable enough on infants for a safety claim",
-                                  requires: "an infant-specific vision model"),
-                ],
-                source: "demo"
-            )
+                preset: "", variant: "",
+                explanation: "Watching for your dog on the couch. Both are objects the camera recognises, so this runs as a custom rule with no mode change.",
+                rules: [rule("dog", "near", "Alert when the dog is on the couch", secondary: "couch",
+                             caveat: "Overlap shows the dog is with the couch, not certainly on it.")],
+                settings: [:], unsupported: [], source: "demo", mode: "custom")
         }
-        if has("fall", "elder", "grandma", "grandpa", "senior") {
+        if has("can", "package", "parcel", "delivery") {
+            return AIProposal(
+                preset: "", variant: "",
+                explanation: "I can't set that up. The detector doesn't recognise that object, and I'd rather say so than quietly watch for something else.",
+                rules: [], settings: [:],
+                unsupported: [AIUnsupported(
+                    request: prompt,
+                    reason: "the current vision model doesn't recognise that object",
+                    requires: "labelled examples to fine-tune a detector for it",
+                    support: "needs_training_data",
+                    alternatives: ["bottle", "cup", "backpack", "suitcase"])],
+                source: "demo", mode: "custom")
+        }
+        if has("floor", "ground", "fall", "elder", "grandma", "grandpa") {
             return AIProposal(
                 preset: "elderly_monitoring", variant: "standard",
-                explanation: "Switching to Elderly Monitoring. A confirmed fall — rapid drop then stillness, so sitting down never triggers it — alerts immediately and stays active until movement resumes.",
-                rules: [
-                    rule("fall", "Loud alert on a confirmed fall", persist: 1.5, severity: "critical", cooldown: 30),
-                    rule("stillness", "Warn after 30 minutes without movement", persist: 1800),
-                ],
-                settings: [:], unsupported: [], source: "demo"
-            )
+                explanation: "Switching to Elderly Monitoring and adding a rule for someone remaining on the floor. Posture comes from body-pose landmarks, and lying in bed does not count: the rule needs them low in the frame too.",
+                rules: [rule("on_floor", "present", "Alert if someone stays on the floor",
+                             persist: 30, severity: "critical", cooldown: 60)],
+                settings: [:], unsupported: [], source: "demo", mode: "preset")
         }
-        if has("security", "intruder", "burglar", "door", "package") {
+        if has("empty", "nobody", "leaves") {
             return AIProposal(
-                preset: "security_monitoring", variant: "away",
-                explanation: "Switching to Security (Away). Person-count changes alert immediately; draw a zone over the entry and lingering there past 30 seconds triggers a loud alert. Package tracking isn't supported yet — noted below.",
-                rules: [
-                    rule("person_detected", "Alert when the number of people changes", persist: 1, cooldown: 30),
-                    rule("person_lingering", "Loud alert if someone lingers in the entry zone", zone: "entry", persist: 30, severity: "critical"),
-                ],
-                settings: [:],
-                unsupported: has("package") ? [
-                    AIUnsupported(request: "Package placed/removed alerts",
-                                  reason: "needs object-permanence tracking against a scene baseline",
-                                  requires: "a custom-trained package model"),
-                ] : [],
-                source: "demo"
-            )
+                preset: "", variant: "",
+                explanation: "Watching for the room becoming empty.",
+                rules: [rule("person", "absent", "Alert when nobody is in view", persist: 10)],
+                settings: [:], unsupported: [], source: "demo", mode: "custom")
         }
         if has("drive", "driving", "car", "phone", "drowsy", "road") {
             return AIProposal(
                 preset: "driver_distraction", variant: "strict",
-                explanation: "Switching to Driver Distraction (Strict). Phone use while looking away triggers the loudest alert within a second; drowsiness fires on sustained eye closure. Quick mirror checks never alarm — that's built into the glance tolerance.",
-                rules: [
-                    rule("phone_use", "Loud alert on phone use while eyes off road", persist: 1, severity: "critical", cooldown: 30),
-                    rule("eyes_closed", "Loud alert on sustained eye closure", persist: 1.5, severity: "critical", cooldown: 30),
-                ],
-                settings: [:], unsupported: [], source: "demo"
-            )
+                explanation: "Switching to Driver Distraction (Strict). Phone use while looking away alerts within a second; quick mirror checks never alarm.",
+                rules: [rule("cell phone", "present", "Alert on phone use while driving",
+                             persist: 1, severity: "critical", cooldown: 30)],
+                settings: [:], unsupported: [], source: "demo", mode: "preset")
         }
         return AIProposal(
-            preset: activePreset, variant: "",
-            explanation: "I kept the current mode. I couldn't map \"\(prompt)\" onto a detection this camera reliably supports — the honest gaps are listed below.",
+            preset: "", variant: "",
+            explanation: "I couldn't turn that into something this camera can watch for. Nothing has been changed.",
             rules: [], settings: [:],
-            unsupported: [AIUnsupported(request: prompt,
-                                        reason: "no matching detection in this mode's capability set",
-                                        requires: "see the capability matrix, or rephrase using presence, zones, stillness, phone use, or falls")],
-            source: "demo"
-        )
+            unsupported: [AIUnsupported(
+                request: prompt,
+                reason: "no detectable object or condition matched the request",
+                requires: "rephrase using an object the camera knows, or add a model for it",
+                support: "unsupported", alternatives: [])],
+            source: "demo", mode: "custom")
     }
 }
 
