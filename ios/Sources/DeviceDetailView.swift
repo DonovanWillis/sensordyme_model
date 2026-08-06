@@ -11,6 +11,7 @@ struct DeviceDetailView: View {
     @State private var errorMessage: String?
     @State private var showAI = false
     @State private var showZones = false
+    @State private var selectedEvent: EventItem?
     @State private var showRename = false
     @State private var newName = ""
     @State private var hasLoaded = false
@@ -87,6 +88,9 @@ struct DeviceDetailView: View {
         }
         .sheet(isPresented: $showZones) {
             ZoneEditorView(device: device)
+        }
+        .sheet(item: $selectedEvent) { event in
+            EventDetailView(device: device, event: event)
         }
         .refreshable { await reload() }
         .task { await reload() }
@@ -325,6 +329,12 @@ struct DeviceDetailView: View {
             VStack(alignment: .leading, spacing: SD.Space.sm) {
                 SDSectionHeader(title: "Recent activity")
 
+                if !events.isEmpty {
+                    EventTimeline(events: events) { selectedEvent = $0 }
+                        .padding(.bottom, SD.Space.xxs)
+                    Divider().overlay(SD.Colors.border)
+                }
+
                 if events.isEmpty {
                     if !hasLoaded {
                         SDLoadingState(message: "Loading activity…")
@@ -337,7 +347,11 @@ struct DeviceDetailView: View {
                     }
                 } else {
                     ForEach(events.prefix(25)) { event in
-                        EventRow(event: event)
+                        Button { selectedEvent = event } label: {
+                            EventRow(event: event)
+                                .contentShape(Rectangle())
+                        }
+                        .buttonStyle(.plain)
                         if event.id != events.prefix(25).last?.id {
                             Divider().overlay(SD.Colors.border)
                         }

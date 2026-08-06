@@ -458,8 +458,10 @@ def device_events(device_id: int, limit: int = 100, uid: int = Depends(current_u
     limit = max(1, min(limit, 1000))
     with db() as conn:
         _owned_device(conn, device_id, uid)
+        # `id` is included so the app can ask why a specific alert fired.
+        # Without it an event is unaddressable and /explain is unreachable.
         rows = conn.execute(
-            "SELECT timestamp, type, confidence, signals, severity FROM events "
+            "SELECT id, timestamp, type, confidence, signals, severity FROM events "
             "WHERE device_id = ? ORDER BY id DESC LIMIT ?",
             (device_id, limit),
         ).fetchall()

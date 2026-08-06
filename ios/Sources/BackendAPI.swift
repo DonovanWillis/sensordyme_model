@@ -92,6 +92,7 @@ protocol BackendAPI {
     func renameDevice(deviceID: Int, name: String) async throws
     func zones(deviceID: Int) async throws -> [MonitorZone]
     func setZones(deviceID: Int, zones: [MonitorZone]) async throws
+    func explain(deviceID: Int, eventID: Int) async throws -> AlertExplanation
     func placeOrder(quantity: Int, address: String) async throws -> Int
     func orders() async throws -> [Order]
 }
@@ -108,6 +109,10 @@ extension APIClient: BackendAPI {
     func zones(deviceID: Int) async throws -> [MonitorZone] {
         let response: ZonesResponse = try await getJSON("v1/devices/\(deviceID)/zones")
         return response.zones
+    }
+
+    func explain(deviceID: Int, eventID: Int) async throws -> AlertExplanation {
+        try await getJSON("v1/devices/\(deviceID)/events/\(eventID)/explain")
     }
 
     func setZones(deviceID: Int, zones: [MonitorZone]) async throws {
@@ -204,8 +209,14 @@ final class MockAPI: BackendAPI {
         history = seeded.reversed()
     }
 
+    private var nextEventID = 1
+
     private func makeEvent(type: String, signals: String, severity: String, at: Date) -> EventItem {
-        EventItem(
+        defer { nextEventID += 1 }
+        return EventItem(
+            // Demo events carry ids too, so tapping one opens an explanation
+            // exactly as it does against a real device.
+            eventID: nextEventID,
             timestamp: ISO8601DateFormatter.flexible.string(from: at),
             type: type,
             confidence: Double.random(in: 0.72...0.97),
@@ -310,6 +321,25 @@ final class MockAPI: BackendAPI {
 
 
     func setZones(deviceID: Int, zones: [MonitorZone]) async throws { demoZones = zones }
+
+    func explain(deviceID: Int, eventID: Int) async throws -> AlertExplanation {
+        try await Task.sleep(for: .milliseconds(400))
+        // Mirrors the real deterministic path, including the rule sentence —
+        // a demo that explains alerts differently from the product teaches the
+        // wrong thing to whoever is watching.
+        return AlertExplanation(
+            headline: "Fall", severity: "critical", when: "2:41 PM",
+            facts: [
+                ExplanationFact(label: "Rapid drop", detail: ""),
+                ExplanationFact(label: "Stillness", detail: ""),
+                ExplanationFact(label: "Detector confidence", detail: "94%"),
+                ExplanationFact(label: "Held for", detail: "8 seconds"),
+                ExplanationFact(label: "Area", detail: "living room"),
+            ],
+            rule: "You were alerted because your rule alerts after 5 seconds.",
+            confidence: 0.94, source: "facts",
+            narrative: "Fall SensorDyme saw: Rapid drop; Stillness; Detector confidence — 94%; Held for — 8 seconds; Area — living room. You were alerted because your rule alerts after 5 seconds.")
+    }
 
     func aiConfigure(deviceID: Int, prompt: String) async throws -> AIProposal {
         try await Task.sleep(for: .seconds(1.2))  // feels like a model thinking

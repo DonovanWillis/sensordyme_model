@@ -146,15 +146,70 @@ struct MonitorZone: Codable, Identifiable, Hashable {
 struct ZonesResponse: Codable { let zones: [MonitorZone] }
 
 struct EventItem: Codable, Identifiable, Hashable {
+    /// Server row id. Optional so an older backend that omits it still decodes —
+    /// the app just can't ask why that event fired.
+    let eventID: Int?
     let timestamp: String
     let type: String
     let confidence: Double?
     let signals: String?
     let severity: String?
 
-    var id: String { timestamp + type + (signals ?? "") }
+    enum CodingKeys: String, CodingKey {
+        case eventID = "id"
+        case timestamp, type, confidence, signals, severity
+    }
+
+    var id: String { "\(eventID.map(String.init) ?? "")\(timestamp)\(type)\(signals ?? "")" }
 
     var date: Date? { ISO8601DateFormatter.flexible.date(from: timestamp) }
+
+    /// Matches jupiter/explain.py's severity mapping, so the app and the
+    /// explanation endpoint never disagree about how alarming something is.
+    var severityStatus: SDStatus {
+        if ["fall", "on_floor", "safe_zone_exit", "zone_violation"].contains(type.split(separator: ":").first.map(String.init) ?? type) {
+            return .alert
+        }
+        switch severity {
+        case "loud": return .alert
+        case "soft": return .warning
+        default: return .online
+        }
+    }
+
+    var isCritical: Bool { severityStatus == .alert }
+
+    /// "phone_use_while_distracted" -> "Phone use while distracted"
+    var title: String {
+        let words = type.replacingOccurrences(of: "_", with: " ")
+            .replacingOccurrences(of: ":", with: " in ")
+        return words.prefix(1).uppercased() + words.dropFirst()
+    }
+}
+
+/// One fact the device recorded, as returned by /explain.
+struct ExplanationFact: Codable, Hashable, Identifiable {
+    let label: String
+    let detail: String
+
+    var id: String { label + detail }
+    var text: String { detail.isEmpty ? label : "\(label) — \(detail)" }
+}
+
+/// Why an alert fired, assembled from stored data on the server.
+struct AlertExplanation: Codable, Hashable {
+    let headline: String
+    let severity: String
+    let when: String
+    let facts: [ExplanationFact]
+    let rule: String
+    let confidence: Double?
+    /// "facts" when assembled deterministically, otherwise the provider name.
+    /// Critical events are always "facts" — a model never rephrases those.
+    let source: String
+    let narrative: String
+
+    var wasRephrased: Bool { source != "facts" }
 }
 
 struct EventsResponse: Codable { let events: [EventItem] }
