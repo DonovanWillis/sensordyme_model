@@ -1,0 +1,9 @@
+# Installed by setup_pi.sh to /etc/sudoers.d/sensordyme-reboot (mode 0440).
+# Two narrowly-scoped privileged actions for the service user:
+#   * the health monitor's last-resort reboot (services/runtime.py, rate-limited
+#     and config-gated);
+#   * BLE advertising via the kernel mgmt API — bluetoothd's own advertising
+#     manager is broken on the Pi 5's controller, so services/ble_gatt.py falls
+#     back to btmgmt (see the comment there).
+pi ALL=(root) NOPASSWD: /usr/bin/systemctl reboot
+pi ALL=(root) NOPASSWD: /usr/bin/btmgmt

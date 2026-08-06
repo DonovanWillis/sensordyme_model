@@ -1,0 +1,111 @@
+"""config.yaml validation: catch bad configs at startup with readable errors.
+
+Deliberately hand-rolled (no pydantic/jsonschema dependency): the known keys are
+type- and range-checked, unknown top-level sections produce warnings (typos like
+`dashbord:` used to fail silently), and modules keep validating their own
+thresholds — this covers the runtime-level shape.
+
+`validate(config)` returns (errors, warnings). Errors abort startup in
+services/runtime (a wrong-typed port must not take the camera down mid-boot);
+warnings are logged and the device runs.
+"""
+
+from __future__ import annotations
+
+_KNOWN_TOP_LEVEL = {
+    "module", "profile", "display", "camera", "dashboard", "cloud", "alerts",
+    "logging", "modules", "mac_max", "accelerator", "network", "health", "hardware",
+}
+
+
+def _check(errors: list[str], condition: bool, message: str) -> None:
+    if not condition:
+        errors.append(message)
+
+
+def _is_num(value) -> bool:
+    return isinstance(value, (int, float)) and not isinstance(value, bool)
+
+
+def validate(config: dict) -> tuple[list[str], list[str]]:
+    """Validate the top-level runtime config. Returns (errors, warnings)."""
+    errors: list[str] = []
+    warnings: list[str] = []
+
+    if not isinstance(config, dict):
+        return ["config.yaml did not parse to a mapping"], []
+
+    for key in config:
+        if key not in _KNOWN_TOP_LEVEL:
+            warnings.append(f"unknown top-level section '{key}:' (typo?)")
+
+    _check(errors, isinstance(config.get("module"), str) and config.get("module"),
+           "`module:` must be a non-empty string")
+    profile = config.get("profile", "pi")
+    _check(errors, profile in ("pi", "mac_max"), f"`profile:` must be 'pi' or 'mac_max', got {profile!r}")
+
+    camera = config.get("camera", {})
+    if isinstance(camera, dict):
+        for key in ("width", "height"):
+            value = camera.get(key, 640)
+            _check(errors, isinstance(value, int) and 16 <= value <= 8192,
+                   f"`camera.{key}:` must be an integer pixel size, got {value!r}")
+        fps = camera.get("fps", 30)
+        _check(errors, _is_num(fps) and 0 < fps <= 240, f"`camera.fps:` must be in (0, 240], got {fps!r}")
+    else:
+        errors.append("`camera:` must be a mapping")
+
+    dashboard = config.get("dashboard", {})
+    if isinstance(dashboard, dict):
+        port = dashboard.get("port", 8899)
+        _check(errors, isinstance(port, int) and 0 <= port <= 65535,
+               f"`dashboard.port:` must be a valid TCP port, got {port!r}")
+        quality = dashboard.get("jpeg_quality", 60)
+        _check(errors, isinstance(quality, int) and 1 <= quality <= 100,
+               f"`dashboard.jpeg_quality:` must be 1-100, got {quality!r}")
+        stream_fps = dashboard.get("stream_fps", 12)
+        _check(errors, _is_num(stream_fps) and 0 < stream_fps <= 60,
+               f"`dashboard.stream_fps:` must be in (0, 60], got {stream_fps!r}")
+        if dashboard.get("token") and str(dashboard.get("host")) not in ("127.0.0.1", "localhost"):
+            warnings.append(
+                "dashboard.token is set with a non-localhost host: make sure the app "
+                "has the same token configured, or the live feed will show 401/spinner"
+            )
+    else:
+        errors.append("`dashboard:` must be a mapping")
+
+    accel_cfg = config.get("accelerator", {})
+    if isinstance(accel_cfg, dict):
+        hef = accel_cfg.get("yolo_hef")
+        _check(errors, hef is None or isinstance(hef, str),
+               f"`accelerator.yolo_hef:` must be a path string or null, got {hef!r}")
+    else:
+        errors.append("`accelerator:` must be a mapping")
+
+    network = config.get("network", {})
+    if isinstance(network, dict):
+        prov = network.get("provisioning", {})
+        if isinstance(prov, dict):
+            method = prov.get("method", "ble")
+            _check(errors, method in ("ble", "hotspot", "off"),
+                   f"`network.provisioning.method:` must be ble|hotspot|off, got {method!r}")
+        else:
+            errors.append("`network.provisioning:` must be a mapping")
+    else:
+        errors.append("`network:` must be a mapping")
+
+    health = config.get("health", {})
+    if isinstance(health, dict):
+        interval = health.get("check_interval_s", 2.0)
+        _check(errors, _is_num(interval) and interval > 0,
+               f"`health.check_interval_s:` must be a positive number, got {interval!r}")
+    else:
+        errors.append("`health:` must be a mapping")
+
+    module_name = config.get("module")
+    modules_cfg = config.get("modules", {})
+    if profile != "mac_max" and isinstance(module_name, str) and isinstance(modules_cfg, dict):
+        _check(errors, module_name in modules_cfg,
+               f"`module: {module_name}` has no `modules.{module_name}:` config section")
+
+    return errors, warnings

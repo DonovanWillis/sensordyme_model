@@ -1,0 +1,68 @@
+# SensorDyme presets: the modes a user can pick from the app / dashboard.
+# Each preset names a registered VisionModule (its thresholds stay in config.yaml's
+# modules: section) plus which event types alert in that mode. Switching presets
+# hot-swaps the module on the live camera loop — no restart.
+#
+# NOTE: presets can only reference standard-path modules (anything under `modules:`);
+# the Mac-only mac_max profile keeps its own launch path (make dev-max).
+# A preset may define `variants`: named tuning profiles selectable from the app as
+# "<preset>:<variant>" (e.g. driver_distraction:teen). A variant's `overrides` are
+# merged over the module's config.yaml block at switch time.
+presets:
+  driver_distraction:
+    title: Driver Distraction
+    description: Drowsiness, gaze, phone use, and risk fusion (the shipping product).
+    module: driver_attention
+    variants:
+      standard: { title: Standard }
+      strict:
+        title: Strict
+        overrides: { drowsy_seconds: 1.5, distraction_seconds: 2.0, phone_use_seconds: 1.0 }
+      teen_driver:
+        title: Teen Driver
+        overrides: { drowsy_seconds: 1.5, distraction_seconds: 1.5, phone_use_seconds: 0.8, glance_min_count: 3 }
+      long_haul:
+        title: Long Haul
+        overrides: { perclos_threshold: 0.12, perclos_window_s: 45.0 }
+
+  driver_distraction_openpilot:
+    title: Driver Distraction (openpilot)
+    description: comma.ai openpilot's DM model and alert policy, plus phone/eyes-closed flags.
+    module: driver_attention_openpilot
+    variants:
+      standard: { title: Standard }
+      strict:
+        title: Strict
+        overrides: { eyes_closed_seconds: 1.5, phone_use_seconds: 0.8 }
+
+  elderly_monitoring:
+    title: Elderly Monitoring
+    description: Fall detection - rapid drop followed by stillness triggers a loud alert.
+    module: fall_detection
+    alert_types: [fall]
+    variants:
+      standard: { title: Standard }
+      post_surgery:
+        title: Post-Surgery
+        overrides: { drop_velocity_threshold: 0.45, stillness_duration_s: 1.0 }
+      active_senior:
+        title: Active Senior
+        overrides: { drop_velocity_threshold: 0.75, stillness_duration_s: 2.0 }
+
+  security_monitoring:
+    title: Security Monitoring
+    description: Person counting - alerts when the number of people in view changes.
+    module: occupancy
+    alert_types: [occupancy_change]
+    variants:
+      home: { title: Home }
+      away:
+        title: Away
+        overrides: { confidence_threshold: 0.4, confirm_frames: 2 }
+      package_watch:
+        title: Package Watch
+        overrides: { confidence_threshold: 0.35, confirm_frames: 2 }
+
+  # Planned presets (modules not yet written; the app shows them as coming soon):
+  #   baby_monitoring:   face-covered / stillness / danger-zone detection
+  #   exam_proctoring:   gaze-off-screen, second person, phone detection

@@ -1,0 +1,30 @@
+name: SensorDyme
+options:
+  bundleIdPrefix: com.sensordyme
+  deploymentTarget:
+    iOS: "17.0"
+targets:
+  SensorDyme:
+    type: application
+    platform: iOS
+    sources:
+      - Sources
+      - Assets.xcassets
+    info:
+      path: Info.plist
+      properties:
+        UILaunchScreen: {}
+        NSAppTransportSecurity:
+          NSAllowsArbitraryLoads: true # dev builds talk to http://localhost / LAN IPs; tighten before App Store
+        # Local-network + Bonjour: auto-discovering the device dashboard (_sensordyme._tcp)
+        NSLocalNetworkUsageDescription: SensorDyme finds your device on your Wi-Fi to show its live camera feed.
+        NSBonjourServices: [_sensordyme._tcp]
+        # Bluetooth: provisioning the device's Wi-Fi when it has no network yet
+        NSBluetoothAlwaysUsageDescription: SensorDyme uses Bluetooth to set up your device's Wi-Fi connection.
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: com.sensordyme.app
+        SWIFT_VERSION: "5.9"
+        CODE_SIGN_STYLE: Automatic
+        DEVELOPMENT_TEAM: D6ZR59ZR7Q # personal team set in Xcode; kept here so regeneration preserves it
+        ASSETCATALOG_COMPILER_APPICON_NAME: AppIcon

@@ -1,0 +1,187 @@
+"""ProvisioningService: the networking workflow the device follows on every boot.
+
+    boot -> NetworkManager auto-joins any saved Wi-Fi
+         -> online within `grace_s`?  --yes-->  NORMAL (BLE off; mDNS + dashboard on Wi-Fi)
+                 |no
+                 v
+         PROVISIONING: advertise over BLE as "SensorDyme-XXXX"
+             app pairs -> writes {ssid, psk} -> nmcli joins & SAVES the profile
+                 -> online -> BLE torn down -> NORMAL
+             connect fails -> error pushed to the status characteristic; window stays open
+
+BLE is for provisioning/config/commands only. The moment Wi-Fi is up the GATT
+server is stopped; video streaming always rides Wi-Fi. If Wi-Fi later drops
+(drove away from home), the device keeps detecting/alerting standalone — and
+this service re-opens the BLE window so the app can hand it a new network
+(e.g. a phone hotspot) without any SD-card surgery.
+
+Method selection (`network.provisioning.method` in config.yaml):
+    ble      -- this in-process GATT flow (default)
+    hotspot  -- legacy scripts/provisioning_hotspot.sh oneshot (kept for
+                installs without BLE); this service stays dormant
+    off      -- no provisioning; Wi-Fi is whatever NetworkManager already knows
+"""
+
+from __future__ import annotations
+
+import socket
+import threading
+from typing import Optional
+
+from core.logging_setup import get_logger
+from core.network import WifiManager, nmcli_available
+
+log = get_logger("provisioning")
+
+
+def _ble_name() -> str:
+    """SensorDyme-XXXX from the wlan0 MAC (mirrors the hotspot script's naming)."""
+    try:
+        with open("/sys/class/net/wlan0/address") as f:
+            suffix = f.read().strip().replace(":", "")[-4:].upper()
+    except OSError:
+        suffix = "0000"
+    return f"SensorDyme-{suffix}"
+
+
+class ProvisioningService:
+    """Wi-Fi watcher + BLE provisioning window. Runs as a supervised service."""
+
+    name = "provisioning"
+
+    def __init__(self, wifi: WifiManager, config: dict, version: str = "dev") -> None:
+        self._wifi = wifi
+        self._method = str(config.get("method", "ble"))
+        self._grace_s = float(config.get("grace_s", 45))
+        self._poll_s = float(config.get("poll_s", 10))
+        self._version = version
+        self._ble = None  # BLEProvisioningServer, created lazily
+        self._ble_unavailable = False
+        self._stop = threading.Event()
+        self._thread: Optional[threading.Thread] = None
+        self.state = "starting"  # starting | online | waiting | provisioning | unavailable
+
+    # ------------------------------------------------------------------ Service lifecycle
+    def start(self, health=None) -> None:  # noqa: ANN001 - supervisor duck-type
+        self._stop.clear()
+        self._thread = threading.Thread(target=self.run, args=(self._stop,), daemon=True, name=self.name)
+        self._thread.start()
+
+    def stop(self, timeout: float = 5.0) -> None:
+        self._stop.set()
+        if self._thread is not None:
+            self._thread.join(timeout=timeout)
+        self._thread = None
+        self._teardown_ble()
+
+    def restart(self) -> None:
+        self.stop()
+        self.start()
+
+    @property
+    def is_running(self) -> bool:
+        return self._thread is not None and self._thread.is_alive()
+
+    # ------------------------------------------------------------------ state machine
+    def run(self, stop: threading.Event) -> None:
+        if self._method != "ble" or not nmcli_available():
+            # Dev Mac, or hotspot/off installs: nothing to orchestrate in-process.
+            self.state = "unavailable" if self._method == "ble" else self._method
+            return
+
+        offline_since: Optional[float] = None
+        import time
+
+        while not stop.is_set():
+            online = self._wifi.is_online()
+            if online:
+                offline_since = None
+                if self._ble is not None:
+                    ssid, ip = self._wifi.current_ssid(), self._wifi.ip_address()
+                    self._push_status({"state": "online", "ssid": ssid, "ip": ip})
+                    log.info("Wi-Fi is up (%s) — closing the BLE provisioning window", ssid)
+                    self._teardown_ble()
+                self.state = "online"
+            else:
+                now = time.monotonic()
+                if offline_since is None:
+                    offline_since = now
+                    self.state = "waiting"
+                if now - offline_since >= self._grace_s and self._ble is None and not self._ble_unavailable:
+                    self._open_ble_window()
+            stop.wait(self._poll_s)
+
+    def status(self) -> tuple[bool, str]:
+        """(healthy, detail) for the health monitor (non-critical component)."""
+        if self.state == "provisioning":
+            return True, "BLE provisioning window open (device unprovisioned or Wi-Fi lost)"
+        if self.state == "unavailable":
+            return False, "BLE provisioning requested but BlueZ bindings are missing"
+        return True, f"state: {self.state}"
+
+    # ------------------------------------------------------------------ BLE window
+    def _open_ble_window(self) -> None:
+        from services.ble_gatt import BLEProvisioningServer, BLEUnavailable
+
+        name = _ble_name()
+        try:
+            self._ble = BLEProvisioningServer(
+                device_name=name,
+                device_info={
+                    "name": name,
+                    "model": "SensorDyme",
+                    "version": self._version,
+                    "hostname": socket.gethostname(),
+                },
+                on_credentials=self._on_credentials,
+                on_command=self._on_command,
+            )
+            self._ble.start()
+            self.state = "provisioning"
+            log.info("no Wi-Fi after %.0fs — BLE provisioning open as '%s'", self._grace_s, name)
+        except BLEUnavailable as exc:
+            self._ble = None
+            self._ble_unavailable = True
+            self.state = "unavailable"
+            log.error("%s", exc)
+
+    def _teardown_ble(self) -> None:
+        if self._ble is not None:
+            self._ble.stop()
+            self._ble = None
+
+    def _push_status(self, status: dict) -> None:
+        if self._ble is not None:
+            self._ble.set_status(status)
+
+    # ------------------------------------------------------------------ app callbacks
+    def _on_credentials(self, ssid: str, psk: str) -> None:
+        """The app wrote Wi-Fi credentials: join + save; report the outcome over BLE."""
+        self._push_status({"state": "connecting", "ssid": ssid})
+        ok, message = self._wifi.connect(ssid, psk)  # nmcli saves the profile on success
+        if ok:
+            self._push_status(
+                {"state": "online", "ssid": ssid, "ip": self._wifi.ip_address(), "message": message}
+            )
+            # The run() loop sees is_online() and closes the BLE window.
+        else:
+            self._push_status({"state": "error", "ssid": ssid, "error": message})
+
+    def _on_command(self, command: dict) -> None:
+        action = command.get("action")
+        if action == "rescan":
+            self._push_status({"state": self.state, "ssids": self._visible_ssids()})
+        elif action == "identify":
+            log.info("BLE identify requested")  # future: blink the status LED via the HAL
+
+    def _visible_ssids(self) -> list[str]:
+        import subprocess
+
+        try:
+            result = subprocess.run(
+                ["nmcli", "-t", "-f", "SSID", "device", "wifi", "list", "--rescan", "yes"],
+                capture_output=True, text=True, timeout=15,
+            )
+            return sorted({s for s in result.stdout.splitlines() if s})[:20]
+        except Exception:  # noqa: BLE001
+            return []

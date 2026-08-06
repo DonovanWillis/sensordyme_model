@@ -1,0 +1,17 @@
+<?xml version="1.0" standalone='no'?><!--*-nxml-*-->
+<!DOCTYPE service-group SYSTEM "avahi-service.dtd">
+<!--
+  mDNS advertisement for the SensorDyme device dashboard.
+  Installed by setup_pi.sh to /etc/avahi/services/sensordyme.service.
+  The iOS app browses _sensordyme._tcp to find the device on the local network
+  and auto-fill the live-feed address - no IP typing.
+-->
+<service-group>
+  <name replace-wildcards="yes">SensorDyme on %h</name>
+  <service>
+    <type>_sensordyme._tcp</type>
+    <port>8899</port>
+    <txt-record>path=/stream</txt-record>
+    <txt-record>version=0.2</txt-record>
+  </service>
+</service-group>

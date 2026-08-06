@@ -1,0 +1,32 @@
+[Unit]
+Description=SensorDyme edge vision service
+# Camera/AI can start before the network is up (the device works standalone);
+# provisioning inside the service handles Wi-Fi/BLE itself. bluetooth.service is
+# wanted (not required) so BLE provisioning works when present but a dead BT
+# stack never blocks the camera product.
+After=multi-user.target bluetooth.service
+Wants=bluetooth.service
+StartLimitIntervalSec=600
+StartLimitBurst=5
+# Absolute last resort, behind in-process recovery AND Restart=always: if the
+# service fails 5 times in 10 minutes, reboot the Pi.
+StartLimitAction=reboot
+
+[Service]
+Type=notify
+NotifyAccess=main
+User=pi
+WorkingDirectory=__SENSORDYME_DIR__
+# Preflight verifies config (fatal), camera, AI HAT, disk — results in
+# data/preflight.json and the journal.
+ExecStartPre=__SENSORDYME_DIR__/.venv/bin/python __SENSORDYME_DIR__/scripts/preflight.py
+ExecStart=__SENSORDYME_DIR__/.venv/bin/python __SENSORDYME_DIR__/main.py --no-display
+# The health monitor sends WATCHDOG=1 only while the capture+inference pipeline
+# is verifiably alive — a wedged loop (not just a dead process) triggers restart.
+WatchdogSec=45
+Restart=always
+RestartSec=3
+TimeoutStartSec=180
+
+[Install]
+WantedBy=multi-user.target

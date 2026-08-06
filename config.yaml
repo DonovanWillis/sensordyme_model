@@ -1,0 +1,367 @@
+# SensorDyme configuration
+# Switch products by changing ONE line: `module`.
+module: driver_attention
+
+# profile: pi (default) | mac_max
+#   pi      -- the shipping product: nano models, config under `modules:` below.
+#              This is what setup_pi.sh deploys and what runs on the Raspberry Pi.
+#   mac_max -- an ADDITIVE, Mac-only high-accuracy profile (config under `mac_max:`
+#              below). It requires Apple Silicon + torch MPS and refuses to start
+#              otherwise. It exists for demos, generating ground-truth comparisons,
+#              and a GPU-backed accuracy ceiling -- it is NOT the shipping product.
+#              Selecting it never reads or affects anything under `modules:`.
+profile: pi
+
+# Show a live debug window (face mesh / boxes / skeleton + red full-screen alert
+# flash). Great for Mac development; set to false for a headless Pi service.
+display: true
+
+camera:
+  width: 640
+  height: 480
+  fps: 30
+  device_index: 0 # cv2.VideoCapture index — only used in Mac/dev mode
+  rotate_180: false # true when the device is mounted upside down (flipped at the sensor on the Pi — no CPU cost)
+
+# Drive Dashboard: the device serves a local web app with the live annotated
+# feed, a big status card, a real-time alert timeline, and session analytics. Works with
+# every module (dev-max, dev-openpilot, dev-dashsentinel, ...). Open the URL printed at
+# startup (default http://localhost:8899).
+# PRIVACY: annotated frames stream in-memory over HTTP to connected browsers only --
+# never written to disk. host 127.0.0.1 = this machine only; set 0.0.0.0 on the Pi to
+# view from your phone on the same network (an explicit opt-in, like the VLM exception).
+dashboard:
+  enabled: true
+  host: 0.0.0.0
+  port: 8899
+  token: null # set a secret string to require X-Device-Token on all /api and /stream requests
+  # (do this whenever host is not 127.0.0.1)
+  # NOTE: the iOS app's live feed does NOT send this header yet -- setting a token here
+  # makes /stream return 401 and the app shows an endless spinner. Leave null until the
+  # app sends X-Device-Token.
+  #
+  # Live-feed cost controls. Annotating + JPEG-encoding competes with the detector for
+  # CPU on the Pi, so frames are only encoded while someone is actually watching /stream.
+  # Lower either value if detection framerate drops while the app's feed is open.
+  jpeg_quality: 60 # 1-100; 80 was the old default, 50-60 is fine on a phone screen
+  stream_fps: 12 # frames/sec pushed to a viewer; detection still runs at full camera fps
+
+# AI accelerator (Raspberry Pi AI HAT+ / Hailo). Detected at startup and verified
+# before inference; falls back to CPU automatically (visible in /api/health) unless
+# `required` is set. `yolo_hef` must point to a model compiled for Hailo with the
+# Dataflow Compiler (see docs/ACCELERATOR.md) — a .pt/.onnx cannot run on the HAT.
+accelerator:
+  enabled: true
+  yolo_hef: null # e.g. /home/pi/sensordyme/models/yolov8s_h8l.hef (NMS-on-chip Model Zoo build)
+  required: false # true = refuse to start without a usable accelerator
+
+# Networking workflow (Pi only; ignored on a dev Mac):
+# on boot NetworkManager auto-joins saved Wi-Fi; if nothing connects within
+# `grace_s`, BLE provisioning opens ("SensorDyme-XXXX") so the app can send
+# credentials — which are then SAVED for every future boot. BLE is for
+# setup/config/commands only; the live feed always streams over Wi-Fi.
+network:
+  provisioning:
+    method: ble # ble | hotspot (legacy scripts/provisioning_hotspot.sh) | off
+    grace_s: 45 # seconds to wait for a saved network before opening the BLE window
+    poll_s: 10 # how often to re-check connectivity
+
+# Health monitoring and automatic recovery: every component (camera, inference,
+# accelerator, dashboard, uplink, wifi, provisioning, hardware) is checked
+# continuously; failures retry -> restart the component -> and only as a last
+# resort (critical component down, restart budget spent) reboot the Pi.
+# Reboots are rate-limited and require the sudoers rule setup_pi.sh installs.
+health:
+  check_interval_s: 2.0
+  allow_reboot: true # only ever acts on the Pi; ignored on a dev Mac
+  reboot_min_interval_s: 1800
+
+# Future peripherals (ESP32-S3, BNO085 IMU, BN-880 GPS, MCP23017, MAX98357A,
+# LEDs, buttons) — see hardware/hal.py. Absent hardware is never an error.
+hardware: {}
+
+# Cloud uplink: connects the device to the cloud backend in cloud/ (accounts, mobile app,
+# push alerts, remote mode switching). Events and status only -- frames NEVER leave the
+# device through this channel. The device works fully standalone when this is off/unreachable.
+cloud:
+  enabled: false
+  base_url: http://localhost:8787 # your deployed cloud/ backend URL
+  device_key: "" # issued by `python cloud/manage.py create-device <name>` -- see cloud/README.md
+  poll_interval_s: 5
+
+logging:
+  level: info # debug | info | warning | error — service log verbosity (journalctl -u sensordyme)
+  csv_path: data/events.csv
+  telemetry_csv_path: data/telemetry.csv # raw per-frame signals (throttled) -- future model-training data
+  telemetry_interval_s: 0.5 # minimum seconds between two telemetry rows
+
+alerts:
+  sinks: [console, sound, gpio_buzzer] # gpio_buzzer drives the piezo on the Pi device; skipped with a notice on Mac
+  cooldown_s: 15 # minimum seconds between two alerts of the same type (patient: don't re-alert too soon)
+  escalation_window_s: 60 # repeat within this window -> continuous tone (event types not in loud/soft_types below)
+  loud_types: [drowsiness, phone_use, eyes_down, attention_lost, high_risk, # always the loud/continuous tone
+               driverDistracted, driverUnresponsive, # openpilot terminal (red) alerts -- continuous alarm, as in the car
+               phoneUseDetected, eyesClosedDetected, # openpilot module's additive distracted-driving flags
+               skinnemoen_distracted, skinnemoen_phone_use, # skinnemoen module: every alert audible (additive)
+               dashsentinel_drowsy] # DashSentinel's DROWSY status -- loud alarm
+  soft_types: [fatigue_warning, frequent_glancing, elevated_risk, # always the soft chime
+               promptDriverDistracted, promptDriverUnresponsive, # openpilot prompt (orange) alerts -- chime, as in the car
+               distractionDetected, # openpilot module's additive instant chime (fires ~0.3s after detection)
+               skinnemoen_calibration_complete, # skinnemoen calibration-done chime (the original beeped here)
+               dashsentinel_warning, dashsentinel_no_face, dashsentinel_vision_degraded] # DashSentinel soft tiers
+  gpio_buzzer_pin: 17 # BCM pin, Pi only
+
+modules:
+  driver_attention:
+    # --- drowsiness (eye closure) ---
+    ear_threshold_ratio: 0.75 # personal threshold = this * the calibrated open-eye baseline EAR
+    ear_threshold_fallback: 0.20 # used only before calibration completes, or if calibration.json is unreadable
+    calibration_duration_s: 10.0 # seconds of startup sampling (look at the road) used to compute EAR + head-pose baselines
+    calibration_path: data/calibration.json # persisted baseline; delete or pass --recalibrate to redo it
+    drowsy_seconds: 2.0 # continuous eye closure (EAR < threshold) required to fire "drowsiness" -- blinks are far shorter
+    perclos_window_s: 60.0 # rolling window (seconds) for PERCLOS = % of time eyes were closed
+    perclos_threshold: 0.15 # PERCLOS above this fires "fatigue_warning" even with no single long closure
+
+    # --- distraction (head pose, corrected for camera mounting angle -- see calibration above) ---
+    yaw_threshold_deg: 35 # |calibrated yaw| beyond this = looking away from the road (sideways)
+    distraction_seconds: 3.0 # sustained duration required to fire "distraction" -- patient: mirror/blindspot checks are shorter
+    glance_window_s: 45.0 # rolling window (seconds) for the repeated short-glance counter
+    glance_min_count: 5 # this many off-center glances within glance_window_s fires "frequent_glancing"
+    pitch_threshold_deg: -20 # calibrated pitch below this = looking down (phone in lap); more sensitive than yaw
+    eyes_down_seconds: 2.5 # sustained duration required to fire "eyes_down"
+    face_lost_seconds: 2.5 # camera can't find a face at all for this long -> "attention_lost" (turned away/slumped/obstructed)
+
+    # --- object detection: scans the ENTIRE frame (not just near the face) for anything
+    # the driver could be holding, via YOLO11-nano run every Nth frame ---
+    yolo_weights: yolo11n.pt # shared with occupancy.py via core/detectors.py (loaded once, cached)
+    yolo_every_n_frames: 3 # run YOLO (+ hands) on 1 out of every N frames; Face Mesh still runs every frame
+    yolo_confidence_threshold: 0.35 # minimum YOLO detection confidence to count -- phones are small/thin, keep this forgiving
+    yolo_classes: # COCO class name -> event type this module emits when that class appears
+      cell phone: phone_detected
+      cup: eating_drinking
+      bottle: eating_drinking
+      wine glass: eating_drinking
+      bowl: eating_drinking
+      banana: eating_drinking
+      apple: eating_drinking
+      orange: eating_drinking
+      broccoli: eating_drinking
+      carrot: eating_drinking
+      hot dog: eating_drinking
+      pizza: eating_drinking
+      donut: eating_drinking
+      cake: eating_drinking
+      sandwich: eating_drinking
+      fork: eating_drinking
+      knife: eating_drinking
+      spoon: eating_drinking
+    phone_use_seconds: 2.0 # phone visible AND (eyes_down OR yaw off-center), sustained this long -> "phone_use"
+    enable_hands: true # MediaPipe Hands: a hand overlapping the phone box raises phone_use confidence
+    hand_phone_iou_threshold: 0.2 # hand/phone box IoU above this counts as "holding it"
+
+    # --- risk fusion: reasons across signals together (see modules/driver_attention.py::RiskFusion) ---
+    risk_ema_alpha: 0.3 # smoothing for the composite score; higher = reacts faster but noisier
+    risk_elevated_threshold: 0.4 # composite score above this fires the soft "elevated_risk" event
+    risk_high_threshold: 0.75 # composite score above this, sustained, fires the loud "high_risk" event
+    risk_confirm_seconds: 1.0 # composite score must stay above risk_high_threshold this long to fire "high_risk"
+
+  driver_attention_openpilot:
+    # comma.ai openpilot's driver monitoring, verbatim (model + policy from openpilot
+    # v0.9.7). Run with: make dev-openpilot. See modules/driver_attention_openpilot.py.
+    model_path: dmonitoring_model.onnx # auto-downloaded from the openpilot repo on first run (~16MB)
+    sim_speed_ms: 25.0 # simulated vEgo (m/s); >13 so openpilot's pose auto-calibration runs, as on the highway
+    sim_engaged: true # start with openpilot "engaged" (active monitoring, 11s countdown); toggle live with [e]
+    always_on: false # openpilot's Always-On Driver Monitoring toggle
+    sim_brake_disengage_prob: 0.0 # modelV2 brake-disengage prob: 0 = steady cruising (their lenient thresholds)
+    instant_distraction_sound: true # ADDITIVE (not stock openpilot): chime the moment openpilot's own
+    # "certainly distracted" signal fires (~0.3s after detection), instead of staying silent until the
+    # ~5s orange prompt. Set false for the untouched in-car experience. Re-beep spacing = alerts.cooldown_s.
+    # --- ADDITIVE distracted-driving flags (openpilot's published model can't see phones) ---
+    phone_detection: true # YOLO phone detector; "using it" = phone box + hand overlap, sustained
+    phone_weights: yolo11n.pt # nano is plenty at webcam resolution; swap to yolo11x.pt for max accuracy
+    phone_device: mps # runs on the M3 GPU alongside the openpilot model on CPU
+    phone_every_n_frames: 3 # detection stride; the openpilot model still runs every frame
+    phone_confidence_threshold: 0.35
+    hand_phone_iou_threshold: 0.2 # hand/phone box IoU above this counts as "holding it"
+    enable_hands: true # MediaPipe Hands; false = phone visible alone counts as use
+    phone_use_seconds: 1.0 # sustained phone-in-hand duration -> "phoneUseDetected" (loud)
+    eyes_closed_seconds: 2.0 # sustained eye closure -> "eyesClosedDetected" (loud)
+    eyes_closed_blink_threshold: 0.865 # openpilot's own _BLINK_THRESHOLD, applied to its blink signal
+
+  driver_attention_skinnemoen:
+    # erlendskinnemoen's MediaPipe FaceMesh DMS (github course project), vendored verbatim
+    # for head-to-head accuracy comparison. Run with: make dev-skinnemoen. The original
+    # algorithm has no tunable parameters -- its thresholds are hardcoded and kept as-is
+    # (EAR threshold at 80% toward closed, 30deg angle limit, PERCLOS>0.8 over ~10s).
+    # --- ADDITIVE phone detection (the original has none): phone in frame + driver
+    # looking at it (its own DISTRACTED angle condition) -> skinnemoen_phone_use (loud) ---
+    phone_detection: true
+    phone_weights: yolo11n.pt
+    phone_device: mps
+    phone_every_n_frames: 3
+    phone_confidence_threshold: 0.35
+
+  driver_attention_dashsentinel:
+    # DashSentinel (github.com/alec-kr/DashSentinel), vendored under third_party/ --
+    # its real feature-extraction + adaptive-scoring pipeline with its own CLI defaults.
+    # Run with: make dev-dashsentinel. ~25s calibration; the per-driver profile PERSISTS
+    # and adapts across sessions (delete the file below to start fresh).
+    profile_path: data/dashsentinel_profile.json
+    rebuild_baseline_on_start: false # true = wipe the learned profile at launch
+    warning_threshold: 0.42 # their smoothed drowsy-score tiers
+    drowsy_threshold: 0.58
+    calibration_seconds: 25
+    ear_threshold: 0.23
+    yawn_mar_threshold: 0.45
+    yawn_frames_threshold: 12
+    refine_landmarks: false # their default; true adds iris landmarks (slower)
+
+  occupancy:
+    confidence_threshold: 0.5 # YOLO person-detection confidence threshold
+    confirm_frames: 3 # frames a new count must persist before it's emitted
+    model_weights: yolo11n.pt # auto-downloaded by ultralytics on first run
+
+  fall_detection:
+    drop_velocity_threshold: 0.6 # fraction of frame-height/sec that counts as a "rapid drop"
+    stillness_duration_s: 1.5 # seconds of stillness after a drop before a fall event fires
+    stillness_velocity_threshold: 0.02 # fraction of frame-height/sec considered "still"
+
+# ============================================================================
+# mac_max profile -- additive, Mac-only, GPU-backed high-accuracy mode.
+# Read ONLY when `profile: mac_max` above. Never read by, and never affects,
+# the pi profile or anything under `modules:`. See modules/driver_attention_max.py.
+# Every threshold below cites its real-world basis.
+# ============================================================================
+mac_max:
+  device: mps # torch device for detection; startup refuses to run if MPS is unavailable
+
+  driver_attention:
+    # --- calibration: one combined "look at the screen center" prompt, captures
+    # both the personal EAR baseline and the neutral forward-gaze baseline ---
+    calibration_seconds: 3.0 # spec: prompt-based calibration, short enough to not annoy the user
+    calibration_path: data/gaze_calibration.json # separate file from the pi profile's data/calibration.json
+    ear_threshold_ratio: 0.75 # same calibrated-ratio approach as the pi profile (modules/driver_attention.py)
+    ear_threshold_fallback: 0.20
+
+    # --- blink vs. drowsiness (human-factors literature) ---
+    blink_ignore_max_s: 0.5 # normal voluntary/reflex blinks last ~100-400ms (Schiffman, "Sensation and Perception");
+    # closures shorter than this are completely ignored, not just debounced
+    microsleep_seconds: 0.5 # 0.5-1.5s sustained closure = microsleep territory -> "microsleep_warning" (soft)
+    drowsiness_seconds: 1.5 # >1.5s sustained closure -> "drowsiness" (loud)
+    perclos_window_s: 60.0 # PERCLOS: standard rolling window used in drowsiness research (Wierwille et al., FHWA)
+    perclos_fatigue_threshold: 0.15 # PERCLOS > 0.15 -> "fatigue" state/event (commonly cited moderate-drowsiness cutoff)
+    perclos_escalate_threshold: 0.25 # PERCLOS > 0.25 -> "fatigue_critical" (loud) -- severe-drowsiness cutoff
+    blink_rate_window_s: 120.0 # rolling 2-minute window for blinks/min
+    blink_rate_baseline_seconds: 300.0 # first 5 minutes of the session establish the user's own baseline rate
+    blink_rate_low_per_min: 8.0 # normal awake blink rate is roughly 15-20/min; sustained rate below this is atypical
+    blink_rate_high_per_min: 30.0 # sustained rate above this (rapid blinking) is also an atypical fatigue signal
+    fatigue_pattern_confirm_s: 30.0 # blink rate must stay out of [low, high] this long before "fatigue_pattern" fires
+    # (log-only -- feeds the FATIGUED state, does not alert on its own)
+
+    # --- glance / eyes-off-road (NHTSA-based, using the fused gaze vector, not just head yaw) ---
+    gaze_off_road_seconds: 2.0 # NHTSA visual-manual distraction guideline: single glance > 2s -> "eyes_off_road"
+    excessive_glance_window_s: 12.0 # rolling window for cumulative (not single-glance) off-road time
+    excessive_glance_budget_s: 4.5 # cumulative off-road gaze > 4.5s within 12s -> "excessive_glancing"
+    # (the texting pattern: many short glances, none individually over the 2s single-glance limit)
+    gaze_yaw_threshold_deg: 20 # gaze-vector (head + eye-in-head) yaw beyond this = off-road; tighter than raw
+    # head yaw alone since eye deviation is added on top
+    gaze_pitch_down_threshold_deg: -15 # gaze pitch below this = looking down (phone in lap)
+    eyes_down_seconds: 1.5 # tighter than the sideways gaze limit -- looking down is more dangerous, less legitimate
+
+    # --- detection: full-frame, full frame rate (Mac can afford it) ---
+    detector_weights: yolo11x.pt # highest-accuracy model in the YOLO11 family; swap to rtdetr-l.pt for A/B testing
+    # (same ultralytics YOLO(...) loader dispatches on either checkpoint's own architecture)
+    detector_confidence_threshold: 0.4 # a larger, more accurate model affords a stricter threshold than the nano one
+    detector_classes: # COCO class name -> event type (deliberately narrower than the pi profile's list --
+      cell phone: phone_detected # this profile is about proving out the fusion logic precisely, not class coverage)
+      cup: eating_drinking
+      bottle: eating_drinking
+      sandwich: eating_drinking
+      banana: eating_drinking
+      donut: eating_drinking
+      person: person_detected # log-only bookkeeping; not used by any alert logic
+    enable_hands: true # MediaPipe Hands runs every frame in this profile (no stride -- Mac can afford it)
+
+    # --- phone / object fusion: confidence stacking, not single triggers ---
+    hand_phone_iou_threshold: 0.2 # hand/phone box IoU above this counts as "holding it" (matches the pi profile)
+    phone_alone_confidence: 0.3 # phone visible, eyes forward, no hand overlap -> log-only (mounted GPS is legitimate)
+    phone_in_hand_confidence: 0.7 # phone + hand overlap -> "phone_in_hand" (soft)
+    phone_use_distracted_confidence: 0.95 # phone + hand overlap + (eyes_down OR off-road), sustained -> loudest tier
+    phone_use_distracted_seconds: 1.5 # sustain duration required for the loudest phone_use_while_distracted tier
+    hand_face_proximity_window_s: 30.0 # rolling window for repeated hand-to-face motion (eating pattern)
+    hand_face_proximity_min_count: 2 # >= this many hand-approaches-face episodes in the window -> eating_drinking
+    hand_face_distance_ratio: 0.6 # heuristic (no specific literature value): hand-to-face-box distance, as a
+    # fraction of the face box's own size, counted as "near"
+
+    # --- temporal smoothing ---
+    median_filter_frames: 5 # ~5-frame rolling median on every raw signal before it reaches the state machine,
+    # so a single flickered detection never causes a state change
+
+    # --- frontier VLM judge: a Claude vision model as the slow, precise tier ---
+    # The local pipeline keeps the fast reflexes; every interval_s an in-memory JPEG of the
+    # current frame is sent to the Anthropic API and classified with human-level scene
+    # understanding (mounted GPS vs held phone, asleep vs looking down, wallet vs phone).
+    # A dangerous verdict must repeat on confirm_judgments consecutive calls at or above
+    # min_confidence before a vlm_confirmed_* alert fires -- one flaky classification never
+    # alerts. PRIVACY: enabling this transmits frames (in memory, never via disk) to the
+    # Anthropic API; the pi profile is entirely unaffected. Requires credentials
+    # (ANTHROPIC_API_KEY or `ant auth login`); without them it prints one line and disables
+    # itself -- local detection continues unaffected.
+    vlm:
+      enabled: true
+      # provider selects the judge backend -- swap one line to A/B different VLMs on the
+      # same harness. Accuracy ceiling: anthropic > NVIDIA NIM (cloud) > local Qwen 7B.
+      #   anthropic          -- Claude via the Anthropic API (default; most accurate; frames transmitted)
+      #   ollama             -- local model via Ollama, e.g. Qwen2.5-VL; frames NEVER leave this Mac; free
+      #   openai_compatible  -- any OpenAI-compatible endpoint: NVIDIA NIM, LM Studio, vLLM, ...
+      provider: openai_compatible # Google Gemini via its OpenAI-compatible endpoint (free-tier key)
+      model: gemini-3.1-flash-lite # verified working end-to-end with this key (3-frame burst, ~1s/verdict).
+      # gemini-3.5-flash is stronger but was returning free-tier 503s at setup time -- worth retrying later;
+      # gemini-2.5-flash is retired for new users.
+      base_url: https://generativelanguage.googleapis.com/v1beta/openai
+      api_key_env: GEMINI_API_KEY # export it (set in ~/.zshrc); the key itself is NEVER stored in this file
+      max_tokens: 1024 # Gemini 3.5 Flash spends hidden thinking tokens against this budget before the
+      # visible JSON verdict -- 300 (the default) can come back empty; 1024 leaves comfortable room
+      #
+      # --- Claude via the Anthropic API (the accuracy ceiling; needs ANTHROPIC_API_KEY) ---
+      # provider: anthropic
+      # model: claude-opus-4-8
+      # base_url: null
+      # api_key_env: null
+      # interval_s: 4.0
+      #
+      # --- Qwen2.5-VL locally (fully on-device, free) ---
+      # provider: ollama
+      # model: qwen2.5vl:7b        # first: install Ollama from ollama.com, then `ollama pull qwen2.5vl:7b`
+      # interval_s: 12.0           # a 7B VLM takes several seconds per frame on an M3 -- pace accordingly
+      #
+      # --- NVIDIA NIM (cloud; pick a vision model + copy its exact ID from build.nvidia.com) ---
+      # provider: openai_compatible
+      # model: <model id from build.nvidia.com, e.g. an NVIDIA vision/VL model>
+      # base_url: https://integrate.api.nvidia.com/v1
+      # api_key_env: NVIDIA_API_KEY
+      #
+      # --- Google Gemini (cloud; via Google's OpenAI-compatible endpoint -- key from aistudio.google.com) ---
+      # provider: openai_compatible
+      # model: gemini-2.5-flash      # fast/cheap and strong at vision; check ai.google.dev for the latest IDs
+      # base_url: https://generativelanguage.googleapis.com/v1beta/openai
+      # api_key_env: GEMINI_API_KEY
+      #
+      interval_s: 8.0 # seconds between judgments (async worker; never blocks the camera loop).
+      # 8s keeps the free Gemini tier under its requests-per-minute cap; drop to 4.0 on a paid key.
+      burst_frames: 3 # frames per judgment, captured burst_spacing_s apart. A single frame can't
+      # distinguish a blink from a microsleep or a mirror check from a stare; a short burst can.
+      # Costs ~burst_frames x the image tokens per judgment. Set to 1 for the original single-frame mode.
+      burst_spacing_s: 0.7 # seconds between the frames of one burst (temporal context window ~1.4s at 3 frames)
+      min_confidence: 0.7 # verdicts below this confidence can never confirm an alert
+      confirm_judgments: 2 # consecutive dangerous verdicts required -> worst-case ~2*interval_s to a confirmed alert
+      jpeg_quality: 80 # in-memory JPEG encode quality for the judged frame
+      max_consecutive_failures: 5 # API errors in a row before the judge disables itself for this run
+
+  alerts:
+    sinks: [console, sound] # no gpio_buzzer -- this profile only ever runs on a Mac
+    cooldown_s: 10 # spec: 10s cooldown per alert type for this profile (pi profile uses 15s -- unaffected)
+    loud_types: [drowsiness, eyes_down, phone_use_while_distracted, fatigue_critical,
+                 vlm_confirmed_drowsiness, vlm_confirmed_distraction, vlm_confirmed_phone_use]
+    soft_types: [microsleep_warning, phone_in_hand, eating_drinking, eyes_off_road, excessive_glancing, fatigue,
+                 vlm_confirmed_eating]

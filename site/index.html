@@ -1,0 +1,1162 @@
+<title>SensorDyme — Driver-Attention Instrument</title>
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="color-scheme" content="dark">
+
+<style>
+  /* ============================================================
+     SENSORDYME — holographic instrument. Committed single theme.
+     ============================================================ */
+  :root{
+    --bg:#05080c;
+    --panel:#0a1118;
+    --panel2:#0d151d;
+    --ink:#e6f2ee;
+    --mut:#8fa8a2;
+    --tl:#45e6c8;          /* hologram ink */
+    --amb:#ffb454;         /* warning */
+    --dgr:#ff5063;         /* alert */
+    --line:rgba(96,232,206,.14);
+    --mono:ui-monospace,"SF Mono",SFMono-Regular,Menlo,Consolas,"Liberation Mono",monospace;
+    --disp:-apple-system,BlinkMacSystemFont,"Segoe UI",system-ui,Helvetica,Arial,sans-serif;
+  }
+  *{box-sizing:border-box;margin:0;padding:0}
+  html{scroll-behavior:smooth}
+  html,body{overflow-x:clip;background:var(--bg)}
+  html.locked{overflow:hidden}
+  body{
+    font-family:var(--disp);color:var(--ink);
+    font-size:16px;line-height:1.6;
+    -webkit-font-smoothing:antialiased;
+  }
+  ::selection{background:rgba(69,230,200,.25)}
+  a{color:var(--tl);text-decoration:none}
+  a:focus-visible,button:focus-visible{outline:2px solid var(--tl);outline-offset:3px;border-radius:2px}
+  section{scroll-margin-top:64px}
+
+  .mono{font-family:var(--mono)}
+  .eyebrow{
+    font-family:var(--mono);font-size:11px;letter-spacing:.28em;
+    text-transform:uppercase;color:var(--tl);opacity:.85;
+  }
+  h1,h2{font-weight:800;letter-spacing:-.03em;text-wrap:balance;text-transform:uppercase}
+  h2{font-size:clamp(30px,4.6vw,58px);line-height:1.02}
+  .sub{color:var(--mut);max-width:56ch;font-size:clamp(15px,1.35vw,18px)}
+
+  /* ---------------- nav ---------------- */
+  .nav{
+    position:fixed;inset:0 0 auto 0;z-index:60;height:56px;
+    display:flex;align-items:center;justify-content:space-between;
+    padding:0 clamp(16px,3vw,40px);
+    background:rgba(5,8,12,.72);backdrop-filter:blur(10px);
+    border-bottom:1px solid var(--line);
+  }
+  .brand{display:flex;align-items:center;gap:10px;font-family:var(--mono);
+    font-size:13px;letter-spacing:.22em;color:var(--ink)}
+  .brand .dot{width:7px;height:7px;border-radius:50%;background:var(--tl);
+    box-shadow:0 0 10px var(--tl);animation:pulse 2.2s infinite}
+  @keyframes pulse{0%,100%{opacity:1}50%{opacity:.35}}
+  .nav-links{display:flex;gap:clamp(12px,2vw,26px)}
+  .nav-links a{font-family:var(--mono);font-size:10px;letter-spacing:.22em;
+    color:var(--mut);text-transform:uppercase;padding:4px 2px;border-bottom:1px solid transparent}
+  .nav-links a[aria-current="true"]{color:var(--tl);border-bottom-color:var(--tl)}
+  @media(max-width:700px){.nav-links{display:none}}
+
+  /* ---------------- intro ---------------- */
+  #intro{
+    position:fixed;inset:0;z-index:100;background:var(--bg);
+    display:grid;place-items:center;transition:opacity .6s ease;
+  }
+  #intro.done{opacity:0;pointer-events:none}
+  .intro-inner{
+    display:grid;grid-template-columns:minmax(280px,460px) 240px;
+    gap:48px;align-items:center;padding:24px;
+  }
+  @media(max-width:720px){.intro-inner{grid-template-columns:1fr;justify-items:center}}
+  #introLog{
+    font-family:var(--mono);font-size:12.5px;line-height:1.9;color:var(--tl);
+    white-space:pre;min-height:14.5em;opacity:.9;
+  }
+  #introLog .warn{color:var(--amb)}
+  .intro-scene{display:grid;gap:10px;justify-items:center}
+  #introCanvas{width:240px;height:240px;border:1px solid var(--line)}
+  #introCap{font-family:var(--mono);font-size:10px;letter-spacing:.3em;color:var(--mut);text-transform:uppercase}
+  #introBar{position:absolute;left:0;bottom:0;height:2px;background:var(--tl);width:0%;
+    box-shadow:0 0 12px var(--tl)}
+  #introWord{
+    position:absolute;inset:0;display:grid;place-items:center;
+    font-weight:800;font-size:clamp(40px,9vw,110px);letter-spacing:-.02em;
+    opacity:0;transform:scale(.96);transition:opacity .5s ease,transform .5s ease;
+    text-transform:uppercase;background:var(--bg);
+  }
+  #introWord.show{opacity:1;transform:scale(1)}
+  #introWord em{font-style:normal;color:var(--tl)}
+  #introSkip{
+    position:absolute;right:20px;bottom:16px;background:none;border:1px solid var(--line);
+    color:var(--mut);font-family:var(--mono);font-size:10px;letter-spacing:.2em;
+    padding:6px 12px;cursor:pointer;text-transform:uppercase;
+  }
+
+  /* ---------------- hero ---------------- */
+  .hero{position:relative;min-height:100vh;display:flex;align-items:flex-end;overflow:hidden}
+  #heroCanvas{position:absolute;inset:0;width:100%;height:100%}
+  .hero-copy{
+    position:relative;z-index:2;padding:0 clamp(16px,4vw,56px) clamp(60px,10vh,110px);
+    display:grid;gap:18px;max-width:1200px;
+  }
+  .hero h1{font-size:clamp(44px,9vw,124px);line-height:.94}
+  .hero h1 em{font-style:normal;color:var(--tl)}
+  .stats{display:flex;flex-wrap:wrap;gap:clamp(16px,3vw,44px);margin-top:8px}
+  .stat{font-family:var(--mono)}
+  .stat b{display:block;font-size:clamp(20px,2.4vw,30px);color:var(--tl);
+    font-variant-numeric:tabular-nums;font-weight:600}
+  .stat span{font-size:10px;letter-spacing:.2em;color:var(--mut);text-transform:uppercase}
+  .readout{
+    position:absolute;z-index:2;top:76px;right:clamp(14px,3vw,40px);
+    font-family:var(--mono);font-size:11px;line-height:2;color:var(--mut);
+    border:1px solid var(--line);padding:10px 14px;background:rgba(5,8,12,.55);
+    font-variant-numeric:tabular-nums;
+  }
+  .readout b{color:var(--tl);font-weight:500}
+  @media(max-width:700px){.readout{display:none}}
+  .cue{
+    position:absolute;z-index:2;left:50%;bottom:18px;transform:translateX(-50%);
+    font-family:var(--mono);font-size:10px;letter-spacing:.3em;color:var(--mut);
+    animation:cue 2s infinite;text-transform:uppercase;
+  }
+  @keyframes cue{0%,100%{transform:translate(-50%,0)}50%{transform:translate(-50%,6px)}}
+
+  /* ---------------- chapters (pinned) ---------------- */
+  .chapter{position:relative}
+  .chapter .stage{position:sticky;top:0;height:100vh;overflow:hidden}
+  .ch-head{position:absolute;z-index:3;top:calc(56px + 4vh);left:clamp(16px,4vw,56px);display:grid;gap:10px;max-width:640px}
+  #device{height:340vh}
+  #pipeline{height:340vh}
+  #edge{height:300vh}
+
+  /* device */
+  #deviceCanvas{position:absolute;inset:0;width:100%;height:100%}
+  .lbls{position:absolute;z-index:3;right:clamp(14px,4vw,56px);top:20vh;width:min(300px,34vw);display:grid;gap:5.5vh}
+  .lbl{opacity:0;transform:translateX(14px);transition:opacity .5s ease,transform .5s ease;
+    border-left:2px solid var(--tl);padding-left:14px}
+  .lbl.on{opacity:1;transform:none}
+  .lbl .nm{font-family:var(--mono);font-size:12px;letter-spacing:.14em;color:var(--ink);text-transform:uppercase}
+  .lbl .pr{font-family:var(--mono);font-size:12px;color:var(--tl);font-variant-numeric:tabular-nums}
+  .lbl .nt{font-size:12.5px;color:var(--mut);line-height:1.45;margin-top:2px}
+  .bom{
+    position:absolute;z-index:3;left:clamp(16px,4vw,56px);bottom:8vh;
+    font-family:var(--mono);opacity:0;transition:opacity .5s ease;
+  }
+  .bom.on{opacity:1}
+  .bom b{font-size:clamp(30px,4vw,48px);color:var(--tl);font-variant-numeric:tabular-nums;font-weight:600}
+  .bom span{display:block;font-size:10px;letter-spacing:.24em;color:var(--mut);text-transform:uppercase}
+  @media(max-width:760px){
+    .lbls{position:static;width:auto;padding:56vh clamp(16px,5vw,40px) 0;gap:14px}
+    .lbl{opacity:1;transform:none}
+    .bom{bottom:4vh}
+  }
+
+  /* pipeline */
+  .pipe-wrap{position:absolute;inset:0;display:grid;place-items:center;padding:0 clamp(14px,4vw,56px)}
+  .pipe{position:relative;width:min(1100px,100%)}
+  #pipeCanvas{position:absolute;inset:-40px 0;width:100%;height:calc(100% + 80px);pointer-events:none}
+  .nodes{position:relative;display:grid;grid-template-columns:repeat(6,1fr);gap:12px}
+  @media(max-width:860px){.nodes{grid-template-columns:repeat(2,1fr);gap:14px}}
+  .node{
+    border:1px solid var(--line);background:var(--panel);padding:16px 12px;
+    display:grid;gap:6px;justify-items:center;text-align:center;
+    transition:border-color .4s ease,box-shadow .4s ease,opacity .4s ease;opacity:.45;
+  }
+  .node .g{font-size:22px;color:var(--mut);transition:color .4s ease}
+  .node .n{font-family:var(--mono);font-size:10.5px;letter-spacing:.16em;text-transform:uppercase}
+  .node .s{font-size:11px;color:var(--mut);line-height:1.35}
+  .node.lit{opacity:1;border-color:rgba(69,230,200,.55);box-shadow:0 0 24px rgba(69,230,200,.10)}
+  .node.lit .g{color:var(--tl)}
+  .node.alarm{border-color:var(--dgr);box-shadow:0 0 30px rgba(255,80,99,.22);animation:alarm 1s infinite}
+  .node.alarm .g{color:var(--dgr)}
+  @keyframes alarm{0%,100%{box-shadow:0 0 30px rgba(255,80,99,.22)}50%{box-shadow:0 0 44px rgba(255,80,99,.4)}}
+  .sigline{
+    margin-top:26px;font-family:var(--mono);font-size:12.5px;color:var(--mut);
+    min-height:1.6em;text-align:center;font-variant-numeric:tabular-nums;
+  }
+  .sigline b{color:var(--amb);font-weight:500}
+  .sigline .cur{display:inline-block;width:7px;height:14px;background:var(--tl);
+    vertical-align:-2px;animation:pulse 1s infinite}
+
+  /* ---------------- flow sections ---------------- */
+  .sec{padding:clamp(80px,14vh,160px) clamp(16px,4vw,56px);max-width:1240px;margin:0 auto;display:grid;gap:28px}
+  .sec-head{display:grid;gap:12px;max-width:760px}
+
+  /* instruments */
+  .grid2{display:grid;grid-template-columns:repeat(2,1fr);gap:18px}
+  @media(max-width:820px){.grid2{grid-template-columns:1fr}}
+  .card{border:1px solid var(--line);background:var(--panel);padding:18px 18px 14px;display:grid;gap:10px}
+  .card-top{display:flex;justify-content:space-between;align-items:baseline;gap:12px}
+  .card-top .t{font-family:var(--mono);font-size:11px;letter-spacing:.2em;color:var(--ink);text-transform:uppercase}
+  .card-top .v{font-family:var(--mono);font-size:14px;color:var(--tl);font-variant-numeric:tabular-nums}
+  .card-top .v.warn{color:var(--amb)}
+  .card-top .v.bad{color:var(--dgr)}
+  .card canvas{width:100%;height:150px;display:block}
+  .card .fn{font-size:12px;color:var(--mut);line-height:1.45}
+  .card .fn b{color:var(--ink);font-weight:600}
+
+  /* edge / globe */
+  #globeCanvas{position:absolute;inset:0;width:100%;height:100%}
+  .beats{position:absolute;z-index:3;left:clamp(16px,4vw,56px);top:0;height:100%;
+    width:min(480px,86vw);display:grid;align-items:center}
+  .beat{grid-area:1/1;opacity:0;transform:translateY(16px);
+    transition:opacity .5s ease,transform .5s ease;display:grid;gap:14px}
+  .beat.on{opacity:1;transform:none}
+  .beat h3{font-size:clamp(26px,3.6vw,46px);font-weight:800;letter-spacing:-.02em;
+    line-height:1.05;text-transform:uppercase;text-wrap:balance}
+  .beat h3 em{font-style:normal;color:var(--tl)}
+  .beat p{color:var(--mut);max-width:44ch}
+  .zero{font-family:var(--mono);font-variant-numeric:tabular-nums}
+  .zero b{font-size:clamp(56px,9vw,120px);color:var(--tl);font-weight:600;line-height:1}
+  .zero span{display:block;font-size:11px;letter-spacing:.26em;color:var(--mut);text-transform:uppercase;margin-top:6px}
+  .grepline{
+    font-family:var(--mono);font-size:12.5px;color:var(--tl);
+    border:1px solid var(--line);background:rgba(10,17,24,.8);
+    padding:12px 14px;overflow-x:auto;white-space:nowrap;
+  }
+  .grepline i{font-style:normal;color:var(--mut)}
+
+  /* profiles */
+  .profiles{display:grid;grid-template-columns:1fr 1fr;gap:18px}
+  @media(max-width:820px){.profiles{grid-template-columns:1fr}}
+  .prof{border:1px solid var(--line);background:var(--panel);padding:24px;display:grid;gap:14px;align-content:start}
+  .prof.max{border-color:rgba(69,230,200,.4)}
+  .tag{font-family:var(--mono);font-size:10px;letter-spacing:.24em;text-transform:uppercase;
+    color:var(--bg);background:var(--tl);display:inline-block;padding:4px 10px;width:max-content}
+  .tag.ghost{background:none;color:var(--mut);border:1px solid var(--line)}
+  .prof h3{font-size:22px;font-weight:800;letter-spacing:-.01em;text-transform:uppercase}
+  .spec{display:grid;gap:0;font-family:var(--mono);font-size:12.5px}
+  .spec div{display:flex;justify-content:space-between;gap:16px;padding:8px 0;
+    border-bottom:1px dashed rgba(143,168,162,.18)}
+  .spec div:last-child{border-bottom:none}
+  .spec i{font-style:normal;color:var(--mut)}
+  .spec b{color:var(--ink);font-weight:500;text-align:right}
+
+  /* build / footer */
+  .bomtable{border:1px solid var(--line);font-family:var(--mono);font-size:12.5px;overflow-x:auto}
+  .bomtable div{display:grid;grid-template-columns:1fr auto;gap:20px;padding:9px 16px;
+    border-bottom:1px solid rgba(96,232,206,.08);font-variant-numeric:tabular-nums}
+  .bomtable div:last-child{border-bottom:none;color:var(--tl)}
+  .bomtable span:last-child{text-align:right}
+  .term{
+    border:1px solid var(--line);background:#04070a;font-family:var(--mono);
+    font-size:13px;line-height:1.9;padding:18px 20px;overflow-x:auto;white-space:pre;color:var(--mut);
+  }
+  .term b{color:var(--tl);font-weight:500}
+  .term i{font-style:normal;color:var(--ink)}
+  footer{border-top:1px solid var(--line);padding:36px clamp(16px,4vw,56px);
+    display:flex;flex-wrap:wrap;gap:16px;justify-content:space-between;
+    font-family:var(--mono);font-size:11px;letter-spacing:.12em;color:var(--mut)}
+  footer b{color:var(--tl);font-weight:500}
+
+  @media (prefers-reduced-motion: reduce){
+    html{scroll-behavior:auto}
+    *,*::before,*::after{animation-duration:.01ms !important;animation-iteration-count:1 !important;transition-duration:.01ms !important}
+  }
+</style>
+
+<header class="nav">
+  <div class="brand"><span class="dot"></span>SENSORDYME</div>
+  <nav class="nav-links">
+    <a href="#device">Device</a>
+    <a href="#pipeline">Pipeline</a>
+    <a href="#signals">Signals</a>
+    <a href="#edge">Edge</a>
+    <a href="#profiles">Profiles</a>
+    <a href="#build">Build</a>
+  </nav>
+</header>
+
+<div id="intro" aria-hidden="true">
+  <div class="intro-inner">
+    <pre id="introLog"></pre>
+    <div class="intro-scene">
+      <canvas id="introCanvas" width="240" height="240"></canvas>
+      <div id="introCap">THE DEVICE</div>
+    </div>
+  </div>
+  <div id="introWord">SENSOR<em>DYME</em></div>
+  <div id="introBar"></div>
+  <button id="introSkip" type="button">Skip ▸</button>
+</div>
+
+<main>
+
+  <!-- =============== HERO =============== -->
+  <section class="hero" id="top">
+    <canvas id="heroCanvas"></canvas>
+    <div class="readout" aria-hidden="true">
+      EAR <b id="roEar">0.31</b><br>
+      YAW <b id="roYaw">+0.0°</b><br>
+      PERCLOS <b id="roPer">3.2%</b><br>
+      STATE <b id="roState">ATTENTIVE</b>
+    </div>
+    <div class="hero-copy">
+      <span class="eyebrow">Edge computer vision · Raspberry Pi 5 · on-device only</span>
+      <h1>The driver-<br>attention <em>instrument</em>.</h1>
+      <p class="sub">SensorDyme watches for drowsiness, distraction, and phone use in
+        real time — fusing eye closure, gaze, and object detection into one risk signal.
+        It runs entirely on a $180 device on your dash, and it never records you.</p>
+      <div class="stats">
+        <div class="stat"><b>87/87</b><span>tests passing</span></div>
+        <div class="stat"><b>~$180</b><span>full hardware BOM</span></div>
+        <div class="stat"><b>2.0 s</b><span>NHTSA glance threshold</span></div>
+        <div class="stat"><b>0</b><span>frames ever written to disk</span></div>
+      </div>
+    </div>
+    <div class="cue">Scroll ▾</div>
+  </section>
+
+  <!-- =============== DEVICE =============== -->
+  <section class="chapter" id="device">
+    <div class="stage">
+      <canvas id="deviceCanvas"></canvas>
+      <div class="ch-head">
+        <span class="eyebrow">CH.01 — Hardware</span>
+        <h2>Seven parts.<br>Ten minutes.</h2>
+        <p class="sub">No soldering, no display, no part that isn't earning its place.
+          Every dollar goes where it improves detection or reliability.</p>
+      </div>
+      <div class="lbls">
+        <div class="lbl" data-at="0.16">
+          <div class="nm">Camera Module 3 NoIR · Wide</div>
+          <div class="pr">$47 w/ IR + cable</div>
+          <div class="nt">Infrared illumination — drowsiness detection matters most at night.</div>
+        </div>
+        <div class="lbl" data-at="0.36">
+          <div class="nm">Raspberry Pi 5 · 4GB</div>
+          <div class="pr">$60</div>
+          <div class="nt">CPU-bound workload. 4GB on purpose — more RAM buys nothing here.</div>
+        </div>
+        <div class="lbl" data-at="0.56">
+          <div class="nm">Active Cooler</div>
+          <div class="pr">$5</div>
+          <div class="nt">Sustained CV inference throttles without it, especially in a hot car.</div>
+        </div>
+        <div class="lbl" data-at="0.74">
+          <div class="nm">Buzzer · SD · power · mount</div>
+          <div class="pr">$68</div>
+          <div class="nt">GPIO piezo alert, high-endurance storage, 5V/5A car power, dash mount.</div>
+        </div>
+      </div>
+      <div class="bom" id="bomBox">
+        <b id="bomTotal">$0</b>
+        <span>total bill of materials</span>
+      </div>
+    </div>
+  </section>
+
+  <!-- =============== PIPELINE =============== -->
+  <section class="chapter" id="pipeline">
+    <div class="stage">
+      <div class="ch-head">
+        <span class="eyebrow">CH.02 — The model</span>
+        <h2>Six stages,<br>one verdict.</h2>
+      </div>
+      <div class="pipe-wrap">
+        <div class="pipe">
+          <canvas id="pipeCanvas"></canvas>
+          <div class="nodes" id="nodes">
+            <div class="node"><span class="g">◉</span><span class="n">Camera</span><span class="s">640×480 · IR</span></div>
+            <div class="node"><span class="g">▦</span><span class="n">Face mesh</span><span class="s">478 landmarks</span></div>
+            <div class="node"><span class="g">◎</span><span class="n">Gaze</span><span class="s">iris + head pose</span></div>
+            <div class="node"><span class="g">▣</span><span class="n">Objects</span><span class="s">YOLO11 · phone / food</span></div>
+            <div class="node"><span class="g">⬢</span><span class="n">Risk fusion</span><span class="s">EMA + corroboration</span></div>
+            <div class="node"><span class="g">▲</span><span class="n">Alert</span><span class="s">soft / loud tiers</span></div>
+          </div>
+          <div class="sigline" id="sigline"></div>
+        </div>
+      </div>
+    </div>
+  </section>
+
+  <!-- =============== SIGNALS =============== -->
+  <section class="sec" id="signals">
+    <div class="sec-head">
+      <span class="eyebrow">CH.03 — Live signals</span>
+      <h2>Blink-proof by design.</h2>
+      <p class="sub">Every threshold is grounded in human-factors research — normal blinks,
+        mirror checks, and mounted GPS units never alert. The instrument only speaks
+        when the pattern is real.</p>
+    </div>
+    <div class="grid2">
+      <div class="card">
+        <div class="card-top"><span class="t">Eye aspect ratio · 9s</span><span class="v" id="vEar">0.31</span></div>
+        <canvas id="cEar"></canvas>
+        <p class="fn">Closures under <b>500 ms</b> are blinks — ignored entirely.
+          0.5–1.5 s → <b>microsleep warning</b>. Over 1.5 s → <b>drowsiness</b>, loud tier.</p>
+      </div>
+      <div class="card">
+        <div class="card-top"><span class="t">PERCLOS · rolling 60s</span><span class="v" id="vPer">8.0%</span></div>
+        <canvas id="cPer"></canvas>
+        <p class="fn">Percent of time eyes closed. Over <b>15%</b> → fatigue.
+          Over <b>25%</b> → critical — catches the drowsy-but-blinking driver.</p>
+      </div>
+      <div class="card">
+        <div class="card-top"><span class="t">Glance budget · 12s window</span><span class="v" id="vGla">0.0s</span></div>
+        <canvas id="cGla"></canvas>
+        <p class="fn">Cumulative eyes-off-road beyond <b>4.5 s in any 12 s</b> fires
+          even when no single glance crossed 2.0 s — the texting pattern.</p>
+      </div>
+      <div class="card">
+        <div class="card-top"><span class="t">Risk fusion · EMA</span><span class="v" id="vRsk">12%</span></div>
+        <canvas id="cRsk"></canvas>
+        <p class="fn">Eye, gaze, and object risk are weighted and <b>corroborated</b> —
+          mildly drowsy <em>and</em> glancing away scores worse than either alone.</p>
+      </div>
+    </div>
+  </section>
+
+  <!-- =============== EDGE / GLOBE =============== -->
+  <section class="chapter" id="edge">
+    <div class="stage">
+      <canvas id="globeCanvas"></canvas>
+      <div class="ch-head" style="max-width:none">
+        <span class="eyebrow">CH.04 — The edge</span>
+      </div>
+      <div class="beats">
+        <div class="beat" data-b="0">
+          <h3>Everything happens <em>here</em>.</h3>
+          <p>Capture, inference, fusion, alerting — the whole pipeline runs on the
+            device on your dash. No cloud. No account. No round trip.</p>
+        </div>
+        <div class="beat" data-b="1">
+          <div class="zero"><b>0 B</b><span>transmitted · ever</span></div>
+          <p>Frames exist only in memory, for one loop iteration, then they're gone.
+            Only derived events — a timestamp, a type, a confidence — touch the disk.</p>
+        </div>
+        <div class="beat" data-b="2">
+          <h3>Enforced in code, <em>not policy</em>.</h3>
+          <div class="grepline">$ grep -rn <i>"PRIVACY: frames are never persisted"</i> .<br>core/camera.py:83 <i>· the single point frames exist</i></div>
+        </div>
+      </div>
+    </div>
+  </section>
+
+  <!-- =============== PROFILES =============== -->
+  <section class="sec" id="profiles">
+    <div class="sec-head">
+      <span class="eyebrow">CH.05 — Two profiles</span>
+      <h2>One codebase.<br>Two ceilings.</h2>
+      <p class="sub">The Pi profile ships. The mac_max profile exists to measure it —
+        a GPU-backed accuracy ceiling for demos and ground truth.</p>
+    </div>
+    <div class="profiles">
+      <div class="prof">
+        <span class="tag">Shipping product</span>
+        <h3>profile: pi</h3>
+        <div class="spec">
+          <div><i>Compute</i><b>Raspberry Pi 5 · CPU</b></div>
+          <div><i>Detector</i><b>YOLO11-nano · strided</b></div>
+          <div><i>Attention signal</i><b>Head pose (calibrated)</b></div>
+          <div><i>Drowsiness</i><b>EAR + PERCLOS</b></div>
+          <div><i>Runs as</i><b>systemd · headless · always-on</b></div>
+          <div><i>Power draw</i><b>Fits a 27W car socket</b></div>
+        </div>
+      </div>
+      <div class="prof max">
+        <span class="tag ghost">Accuracy ceiling · Mac only</span>
+        <h3>profile: mac_max</h3>
+        <div class="spec">
+          <div><i>Compute</i><b>Apple Silicon · MPS</b></div>
+          <div><i>Detector</i><b>YOLO11-x / RT-DETR-l · every frame</b></div>
+          <div><i>Attention signal</i><b>True gaze — iris + head pose</b></div>
+          <div><i>Drowsiness</i><b>3 tiers + blink-rate baseline</b></div>
+          <div><i>Phone logic</i><b>Confidence stacking · 0.3 → 0.7 → 0.95</b></div>
+          <div><i>Purpose</i><b>Demos · ground truth · benchmarks</b></div>
+        </div>
+      </div>
+    </div>
+  </section>
+
+  <!-- =============== BUILD =============== -->
+  <section class="sec" id="build">
+    <div class="sec-head">
+      <span class="eyebrow">CH.06 — Build one</span>
+      <h2>From cart to<br>dashboard.</h2>
+    </div>
+    <div class="grid2">
+      <div class="bomtable" aria-label="Bill of materials">
+        <div><span>Raspberry Pi 5 · 4GB</span><span>$60</span></div>
+        <div><span>Camera Module 3 NoIR Wide + IR + cable</span><span>$47</span></div>
+        <div><span>Official Active Cooler</span><span>$5</span></div>
+        <div><span>High-endurance microSD · 64GB</span><span>$13</span></div>
+        <div><span>USB-C PD car charger · 5V/5A + cable</span><span>$26</span></div>
+        <div><span>GPIO piezo buzzer + jumpers</span><span>$3</span></div>
+        <div><span>Dashcam case + suction mount</span><span>$29</span></div>
+        <div><span>TOTAL — under the $200 cap</span><span>~$183</span></div>
+      </div>
+      <div class="term"><b>$</b> <i>./setup_pi.sh</i>          <b># apt + venv + systemd, one shot</b>
+<b>$</b> <i>sudo systemctl status sensordyme</i>
+  ● sensordyme.service — <b>active (running)</b>
+<b>$</b> <i>python main.py --recalibrate</i>
+  <b>calibrating…</b> look at the road normally (10s)
+  baseline yaw <b>+14.2°</b> · EAR <b>0.31</b> · saved
+
+<b>$</b> <i>make dev</i>            <b># Mac webcam, live overlay</b>
+<b>$</b> <i>make dev-max</i>        <b># mac_max profile, full HUD</b></div>
+    </div>
+  </section>
+
+  <footer>
+    <span><b>SENSORDYME</b> · edge vision platform</span>
+    <span>87/87 tests · pi + mac_max profiles</span>
+    <span><b>#</b> PRIVACY: frames are never persisted</span>
+  </footer>
+</main>
+
+<script>
+(function(){
+"use strict";
+const TL="#45e6c8", AMB="#ffb454", DGR="#ff5063";
+const RM = matchMedia("(prefers-reduced-motion: reduce)").matches;
+const clamp=(v,a,b)=>Math.min(b,Math.max(a,v));
+const ease=u=>u<.5?2*u*u:1-Math.pow(-2*u+2,2)/2;
+
+/* ---------- scene registry ---------- */
+const scenes=[];
+function addScene(id,draw){
+  const c=document.getElementById(id);
+  if(!c) return null;
+  const s={c,ctx:c.getContext("2d"),draw,w:0,h:0,live:false,progress:0};
+  scenes.push(s);
+  return s;
+}
+function fit(s){
+  const r=s.c.getBoundingClientRect();
+  const d=Math.min(2,window.devicePixelRatio||1);
+  s.c.width=Math.max(2,r.width*d); s.c.height=Math.max(2,r.height*d);
+  s.ctx.setTransform(d,0,0,d,0,0); s.w=r.width; s.h=r.height;
+}
+function fitAll(){ scenes.forEach(fit); measurePipe(); }
+
+/* ---------- HEAD hologram ---------- */
+const HEAD=(()=>{
+  const N=400, pts=[];
+  const d3=(a,b)=>Math.hypot(a.x-b.x,a.y-b.y,a.z-b.z);
+  for(let i=0;i<N;i++){
+    const y=1-2*(i+.5)/N, r=Math.sqrt(Math.max(0,1-y*y)), th=i*2.399963229728653;
+    const p={x:Math.cos(th)*r,y:y*1.15,z:Math.sin(th)*r,k:0};
+    if(p.z>0)p.z*=.96;
+    if(p.y<-.4){const f=1-.3*(-p.y-.4);p.x*=f;p.z*=f;}
+    pts.push(p);
+  }
+  const eL={x:-.32,y:.22,z:.86}, eR={x:.32,y:.22,z:.86};
+  for(const p of pts){
+    if(d3(p,eL)<.22||d3(p,eR)<.22)p.k=1;
+    else if(d3(p,{x:0,y:-.08,z:1.02})<.17){p.z+=.05;}
+    else if(Math.abs(p.y+.52)<.06&&p.z>.68&&Math.abs(p.x)<.3)p.k=3;
+  }
+  const edges=[];
+  for(let i=0;i<N;i++)for(let j=i+1;j<N;j++){
+    if(d3(pts[i],pts[j])<.21)edges.push([i,j]);
+  }
+  return{pts,edges,eyeY:.22};
+})();
+
+let heroEar=.31, heroYaw=0;
+function drawHead(ctx,W,H,t,opts){
+  opts=opts||{};
+  const cx=opts.cx!==undefined?opts.cx:W*.62;
+  const cy=opts.cy!==undefined?opts.cy:H*.44;
+  const S=(opts.scale||.32)*Math.min(W,H);
+  const rot=Math.sin(t*.35)*.55+(opts.spin||0);
+  const tilt=-.1;
+  // blink cycle
+  const cyc=t%3.4; let es=1;
+  if(cyc<.3){const u=cyc/.3; es=u<.5?1-u*2:(u-.5)*2; es=Math.max(.08,es);}
+  heroEar=.09+.22*es; heroYaw=rot*30;
+  const cR=Math.cos(rot),sR=Math.sin(rot),cT=Math.cos(tilt),sT=Math.sin(tilt);
+  const P=HEAD.pts, proj=new Array(P.length);
+  for(let i=0;i<P.length;i++){
+    const p=P[i];
+    let py=p.y;
+    if(p.k===1) py=HEAD.eyeY+(p.y-HEAD.eyeY)*es;
+    const x1=p.x*cR - p.z*sR, z1=p.x*sR + p.z*cR;
+    const y2=py*cT - z1*sT,   z2=py*sT + z1*cT;
+    const sc=3/(3+z2);
+    proj[i]={x:cx+x1*sc*S, y:cy-y2*sc*S, z:z2, k:p.k, my:py};
+  }
+  // glow
+  const g=ctx.createRadialGradient(cx,cy,S*.1,cx,cy,S*1.5);
+  g.addColorStop(0,"rgba(69,230,200,.07)");g.addColorStop(1,"rgba(69,230,200,0)");
+  ctx.fillStyle=g; ctx.fillRect(cx-S*1.6,cy-S*1.6,S*3.2,S*3.2);
+  // edges
+  ctx.lineWidth=1;
+  for(const [a,b] of HEAD.edges){
+    const A=proj[a],B=proj[b];
+    const near=clamp((1.1-(A.z+B.z)/2)/2.2,0,1);
+    ctx.strokeStyle="rgba(69,230,200,"+(0.03+0.15*near).toFixed(3)+")";
+    ctx.beginPath();ctx.moveTo(A.x,A.y);ctx.lineTo(B.x,B.y);ctx.stroke();
+  }
+  // scanline sweep
+  const yScan=1.15-((t*.35)%2.5);
+  for(const q of proj){
+    const near=clamp((1.1-q.z)/2.2,0,1);
+    let col,sz,al;
+    if(q.k===1){col=TL;sz=2.2;al=.95;}
+    else if(q.k===3){col=TL;sz=1.7;al=.6;}
+    else{col=TL;sz=1.3;al=.18+.4*near;}
+    if(Math.abs(q.my-yScan)<.07){al=Math.min(1,al+.5);sz+=.7;}
+    ctx.globalAlpha=al;ctx.fillStyle=col;
+    ctx.beginPath();ctx.arc(q.x,q.y,sz,0,7);ctx.fill();
+  }
+  ctx.globalAlpha=1;
+}
+
+/* ---------- GLOBE ---------- */
+const GLOBE=(()=>{
+  const N=560, pts=[];
+  for(let i=0;i<N;i++){
+    const y=1-2*(i+.5)/N, r=Math.sqrt(Math.max(0,1-y*y)), th=i*2.399963229728653;
+    pts.push({x:Math.cos(th)*r,y,z:Math.sin(th)*r});
+  }
+  return pts;
+})();
+function drawGlobe(ctx,W,H,t,opts){
+  opts=opts||{};
+  const small=W<820;
+  const cx=opts.cx!==undefined?opts.cx:(small?W*.5:W*.66);
+  const cy=opts.cy!==undefined?opts.cy:(small?H*.68:H*.52);
+  const R=(opts.scale||.34)*Math.min(W,H);
+  const rot=t*.14, tilt=-.38;
+  const cR=Math.cos(rot),sR=Math.sin(rot),cT=Math.cos(tilt),sT=Math.sin(tilt);
+  const tp=(x,y,z)=>{
+    const x1=x*cR-z*sR, z1=x*sR+z*cR;
+    const y2=y*cT-z1*sT, z2=y*sT+z1*cT;
+    return{x:cx+x1*R,y:cy-y2*R,z:z2};
+  };
+  // graticule
+  ctx.lineWidth=1;
+  const ring=(fn)=>{
+    let prev=null;
+    for(let k=0;k<=64;k++){
+      const q=fn(k/64*Math.PI*2), s=tp(q[0],q[1],q[2]);
+      if(prev&&s.z<0&&prev.z<0){
+        ctx.strokeStyle="rgba(69,230,200,.16)";
+        ctx.beginPath();ctx.moveTo(prev.x,prev.y);ctx.lineTo(s.x,s.y);ctx.stroke();
+      }
+      prev=s;
+    }
+  };
+  for(const lat of[-60,-30,0,30,60]){
+    const rr=Math.cos(lat*Math.PI/180), yy=Math.sin(lat*Math.PI/180);
+    ring(a=>[Math.cos(a)*rr,yy,Math.sin(a)*rr]);
+  }
+  for(let m=0;m<6;m++){
+    const lon=m/6*Math.PI;
+    ring(a=>[Math.cos(a)*Math.cos(lon),Math.sin(a),Math.cos(a)*Math.sin(lon)]);
+  }
+  // points
+  for(const p of GLOBE){
+    const s=tp(p.x,p.y,p.z);
+    const front=s.z<0;
+    ctx.globalAlpha=front?.55:.07;
+    ctx.fillStyle=TL;
+    ctx.beginPath();ctx.arc(s.x,s.y,front?1.4:1,0,7);ctx.fill();
+  }
+  ctx.globalAlpha=1;
+  // device marker + contained pulse (nothing ever leaves)
+  const mk=tp(Math.cos(1.1)*Math.cos(.6),Math.sin(.6),Math.sin(1.1)*Math.cos(.6));
+  if(mk.z<0){
+    ctx.fillStyle=AMB;
+    ctx.beginPath();ctx.arc(mk.x,mk.y,3.4,0,7);ctx.fill();
+    const u=(t%2.4)/2.4;
+    ctx.strokeStyle="rgba(255,180,84,"+(0.5*(1-u)).toFixed(3)+")";
+    ctx.lineWidth=1.5;
+    ctx.beginPath();ctx.arc(mk.x,mk.y,4+u*26,0,7);ctx.stroke();
+  }
+}
+
+/* ---------- DEVICE exploded iso ---------- */
+function drawDevice(ctx,W,H,t,pr){
+  const small=W<760;
+  const cx=small?W*.5:W*.40, cy=small?H*.34:H*.56;
+  const u=Math.min(W,H)/(small?300:250);
+  const iso=(px,py,pz)=>[cx+(px-py)*.72*u, cy+(px+py)*.40*u-pz*u];
+  const bob=RM?0:Math.sin(t*.9)*2.2;
+  const e=ease(clamp(pr*1.5,0,1));
+  const zBoard=16+36*e, zCam=(16+36*e)*2;
+
+  function plate(w,h,z,opts){
+    opts=opts||{};
+    const cs=[[-w/2,-h/2],[w/2,-h/2],[w/2,h/2],[-w/2,h/2]].map(p=>iso(p[0],p[1],z+bob));
+    // side walls
+    const th=5;
+    const cs2=[[-w/2,-h/2],[w/2,-h/2],[w/2,h/2],[-w/2,h/2]].map(p=>iso(p[0],p[1],z+bob-th));
+    ctx.fillStyle="rgba(6,11,15,.9)";
+    for(const [a,b] of [[1,2],[2,3]]){
+      ctx.beginPath();
+      ctx.moveTo(cs[a][0],cs[a][1]);ctx.lineTo(cs[b][0],cs[b][1]);
+      ctx.lineTo(cs2[b][0],cs2[b][1]);ctx.lineTo(cs2[a][0],cs2[a][1]);
+      ctx.closePath();ctx.fill();
+      ctx.strokeStyle="rgba(69,230,200,.18)";ctx.stroke();
+    }
+    // top
+    ctx.beginPath();
+    ctx.moveTo(cs[0][0],cs[0][1]);
+    for(let i=1;i<4;i++)ctx.lineTo(cs[i][0],cs[i][1]);
+    ctx.closePath();
+    ctx.fillStyle=opts.fill||"rgba(10,17,24,.92)";ctx.fill();
+    ctx.strokeStyle="rgba(69,230,200,"+(opts.edge||.45)+")";ctx.lineWidth=1.2;ctx.stroke();
+    return {center:iso(0,0,z+bob)};
+  }
+  // dashed spine
+  const top=iso(0,0,zCam+bob), bot=iso(0,0,bob);
+  ctx.setLineDash([3,6]);ctx.strokeStyle="rgba(69,230,200,.3)";ctx.lineWidth=1;
+  ctx.beginPath();ctx.moveTo(top[0],top[1]-14);ctx.lineTo(bot[0],bot[1]+10);ctx.stroke();
+  ctx.setLineDash([]);
+
+  // cooler (fins)
+  const cool=plate(120,84,0,{edge:.35});
+  for(let i=0;i<8;i++){
+    const yy=-42+i*12;
+    const a=iso(-52,yy,bob+2), b=iso(52,yy,bob+2);
+    ctx.strokeStyle="rgba(69,230,200,.22)";
+    ctx.beginPath();ctx.moveTo(a[0],a[1]);ctx.lineTo(b[0],b[1]);ctx.stroke();
+  }
+  // board
+  const board=plate(120,84,zBoard,{edge:.55});
+  plate(26,26,zBoard+.5,{fill:"rgba(13,21,29,.95)",edge:.5}); // SoC
+  // ports along +x edge
+  for(const yy of[-26,-4,18]){
+    const a=iso(60,yy,zBoard+bob), b=iso(74,yy,zBoard+bob), c2=iso(74,yy+12,zBoard+bob), d=iso(60,yy+12,zBoard+bob);
+    ctx.beginPath();ctx.moveTo(a[0],a[1]);ctx.lineTo(b[0],b[1]);ctx.lineTo(c2[0],c2[1]);ctx.lineTo(d[0],d[1]);ctx.closePath();
+    ctx.fillStyle="rgba(6,11,15,.9)";ctx.fill();
+    ctx.strokeStyle="rgba(69,230,200,.3)";ctx.stroke();
+  }
+  // buzzer next to board on ground
+  const bz=iso(96,44,bob+3);
+  ctx.strokeStyle="rgba(255,180,84,.6)";ctx.lineWidth=1.2;
+  ctx.beginPath();ctx.ellipse(bz[0],bz[1],9,4.6,0,0,7);ctx.stroke();
+  // camera plate
+  const cam=plate(56,56,zCam,{edge:.65});
+  const lc=iso(0,0,zCam+bob+1);
+  ctx.strokeStyle="rgba(69,230,200,.85)";ctx.lineWidth=1.6;
+  ctx.beginPath();ctx.ellipse(lc[0],lc[1],13,6.8,0,0,7);ctx.stroke();
+  ctx.beginPath();ctx.ellipse(lc[0],lc[1],5.5,2.9,0,0,7);ctx.stroke();
+  // IR emitters pulsing
+  const pu=RM?.6:.4+.4*Math.sin(t*3);
+  for(const [ex,ey] of [[-20,-20],[20,-20],[-20,20],[20,20]]){
+    const q=iso(ex,ey,zCam+bob+1);
+    ctx.fillStyle="rgba(255,180,84,"+(0.25+0.55*pu).toFixed(3)+")";
+    ctx.beginPath();ctx.ellipse(q[0],q[1],3,1.7,0,0,7);ctx.fill();
+  }
+  // leader lines to labels (desktop)
+  if(!small){
+    const anchors=[cam.center,board.center,cool.center,[bz[0],bz[1]]];
+    const ats=[0.16,0.36,0.56,0.74];
+    const lx=W*.63;
+    const lys=[H*.24,H*.42,H*.60,H*.77];
+    ctx.lineWidth=1;
+    for(let i=0;i<4;i++){
+      if(pr>ats[i]){
+        ctx.strokeStyle="rgba(69,230,200,.28)";
+        ctx.beginPath();ctx.moveTo(anchors[i][0]+16,anchors[i][1]);
+        ctx.lineTo(lx,lys[i]);ctx.stroke();
+        ctx.fillStyle=TL;
+        ctx.beginPath();ctx.arc(anchors[i][0]+16,anchors[i][1],2,0,7);ctx.fill();
+      }
+    }
+  }
+}
+
+/* ---------- PIPELINE ---------- */
+const nodesEl=[...document.querySelectorAll("#nodes .node")];
+const sigEl=document.getElementById("sigline");
+const SIG="contributing_signals: gaze_off + phone + hand_overlap";
+let pipePts=[];
+function measurePipe(){
+  const c=document.getElementById("pipeCanvas");
+  if(!c)return;
+  const cr=c.getBoundingClientRect();
+  pipePts=nodesEl.map(n=>{
+    const r=n.getBoundingClientRect();
+    return{x:r.left-cr.left+r.width/2,y:r.top-cr.top+r.height/2};
+  });
+}
+function drawPipe(ctx,W,H,t,pr){
+  if(pipePts.length<2)measurePipe();
+  const lf=clamp((pr-.05)/.62,0,1);
+  // base path
+  ctx.lineWidth=1;
+  ctx.strokeStyle="rgba(69,230,200,.12)";
+  ctx.beginPath();
+  pipePts.forEach((p,i)=>i?ctx.lineTo(p.x,p.y):ctx.moveTo(p.x,p.y));
+  ctx.stroke();
+  // lit portion
+  const segs=pipePts.length-1, litLen=lf*segs;
+  ctx.strokeStyle=TL;ctx.lineWidth=1.6;
+  ctx.shadowColor=TL;ctx.shadowBlur=8;
+  ctx.beginPath();
+  for(let i=0;i<segs;i++){
+    const a=pipePts[i],b=pipePts[i+1];
+    const f=clamp(litLen-i,0,1);
+    if(f<=0)break;
+    if(i===0)ctx.moveTo(a.x,a.y);
+    ctx.lineTo(a.x+(b.x-a.x)*f, a.y+(b.y-a.y)*f);
+  }
+  ctx.stroke();ctx.shadowBlur=0;
+  // pulses
+  if(!RM&&lf>0){
+    for(let k=0;k<3;k++){
+      const u=((t*.22+k/3)%1)*litLen;
+      const i=Math.min(segs-1,Math.floor(u)), f=u-i;
+      const a=pipePts[i],b=pipePts[i+1];
+      const x=a.x+(b.x-a.x)*f, y=a.y+(b.y-a.y)*f;
+      ctx.fillStyle=TL;ctx.globalAlpha=.9;
+      ctx.beginPath();ctx.arc(x,y,2.6,0,7);ctx.fill();
+      ctx.globalAlpha=1;
+    }
+  }
+  // node states
+  nodesEl.forEach((n,i)=>{
+    n.classList.toggle("lit", lf>=i/(nodesEl.length-1)-.001);
+  });
+  const alarm=pr>.82;
+  nodesEl[nodesEl.length-1].classList.toggle("alarm",alarm);
+  if(alarm&&pipePts.length){
+    const p=pipePts[pipePts.length-1];
+    const u=(t%1.3)/1.3;
+    ctx.strokeStyle="rgba(255,80,99,"+(0.55*(1-u)).toFixed(3)+")";
+    ctx.lineWidth=1.6;
+    ctx.beginPath();ctx.arc(p.x,p.y,8+u*40,0,7);ctx.stroke();
+  }
+  // typed signal string
+  const n=Math.floor(clamp((pr-.6)/.28,0,1)*SIG.length);
+  if(n>0){
+    const s=SIG.slice(0,n);
+    const i2=s.indexOf(":");
+    sigEl.innerHTML=(i2>=0?s.slice(0,i2+1)+"<b>"+s.slice(i2+1)+"</b>":s)+
+      (n<SIG.length?'<span class="cur"></span>':"");
+  }else sigEl.textContent="";
+}
+
+/* ---------- INSTRUMENTS ---------- */
+function earSig(u){
+  let e=.31+.008*Math.sin(u*1.7);
+  const k=Math.floor(u/2.3), tb=k*2.3+.6;
+  const long=(k%5===4), dur=long?1.9:.22;
+  const dt=u-tb;
+  if(dt>0&&dt<dur){
+    const f=Math.sin(Math.PI*dt/dur);
+    e=e-(e-.07)*f;
+  }
+  return e;
+}
+function drawEar(ctx,W,H,t){
+  const win=9, pad=8;
+  const y0=H-18, y1=10;
+  const Y=v=>y0-(v/.4)*(y0-y1);
+  // threshold
+  ctx.setLineDash([4,5]);ctx.strokeStyle="rgba(255,180,84,.5)";ctx.lineWidth=1;
+  ctx.beginPath();ctx.moveTo(0,Y(.22));ctx.lineTo(W,Y(.22));ctx.stroke();
+  ctx.setLineDash([]);
+  ctx.fillStyle="rgba(255,180,84,.7)";ctx.font="9px "+getComputedStyle(document.body).getPropertyValue("--mono");
+  ctx.fillText("threshold 0.22",6,Y(.22)-4);
+  // long-closure zones shaded
+  for(let x=0;x<W;x++){
+    const u=t-win+win*x/W;
+    const k=Math.floor(u/2.3);
+    if(k%5===4){const tb=k*2.3+.6;const dt=u-tb;
+      if(dt>0&&dt<1.9){ctx.fillStyle="rgba(255,80,99,.06)";ctx.fillRect(x,y1,1,y0-y1);}
+    }
+  }
+  // waveform
+  ctx.strokeStyle=TL;ctx.lineWidth=1.6;ctx.beginPath();
+  for(let x=0;x<=W;x++){
+    const v=earSig(t-win+win*x/W);
+    x?ctx.lineTo(x,Y(v)):ctx.moveTo(x,Y(v));
+  }
+  ctx.stroke();
+  const cur=earSig(t);
+  setV("vEar",cur.toFixed(2),cur<.22?"bad":"");
+}
+function drawPer(ctx,W,H,t){
+  const v=clamp(.10+.09*Math.sin(t*.13)+.05*Math.sin(t*.041),.02,.34);
+  const cx=W/2, cy=H*.86, R=Math.min(W*.36,H*.78);
+  const a0=Math.PI*1.02, a1=Math.PI*1.98;
+  const A=f=>a0+(a1-a0)*clamp(f/.35,0,1);
+  ctx.lineWidth=9;ctx.lineCap="round";
+  ctx.strokeStyle="rgba(143,168,162,.15)";
+  ctx.beginPath();ctx.arc(cx,cy,R,a0,a1);ctx.stroke();
+  ctx.strokeStyle=v>.25?DGR:v>.15?AMB:TL;
+  ctx.beginPath();ctx.arc(cx,cy,R,a0,A(v));ctx.stroke();
+  ctx.lineCap="butt";
+  // zone ticks
+  for(const [z,c] of [[.15,AMB],[.25,DGR]]){
+    const a=A(z);
+    ctx.strokeStyle=c;ctx.lineWidth=2;
+    ctx.beginPath();
+    ctx.moveTo(cx+Math.cos(a)*(R-12),cy+Math.sin(a)*(R-12));
+    ctx.lineTo(cx+Math.cos(a)*(R+12),cy+Math.sin(a)*(R+12));
+    ctx.stroke();
+  }
+  ctx.fillStyle=getComputedStyle(document.body).getPropertyValue("--ink");
+  ctx.font="600 22px "+getComputedStyle(document.body).getPropertyValue("--mono");
+  ctx.textAlign="center";
+  ctx.fillText((v*100).toFixed(1)+"%",cx,cy-R*.28);
+  ctx.font="9px "+getComputedStyle(document.body).getPropertyValue("--mono");
+  ctx.fillStyle="rgba(143,168,162,.9)";
+  ctx.fillText(v>.25?"CRITICAL":v>.15?"FATIGUE":"NOMINAL",cx,cy-R*.28+16);
+  ctx.textAlign="left";
+  setV("vPer",(v*100).toFixed(1)+"%",v>.25?"bad":v>.15?"warn":"");
+}
+function offRoad(u){const m=((u%9)+9)%9;return (m<1.4)||(m>2.5&&m<3.9)||(m>5&&m<6.4);}
+function drawGla(ctx,W,H,t){
+  let cum=0;const step=.1;
+  for(let u=t-12;u<t;u+=step)if(offRoad(u))cum+=step;
+  const y=H*.44, bh=26;
+  const w12=W-16, x0=8;
+  ctx.strokeStyle="rgba(143,168,162,.25)";ctx.lineWidth=1;
+  ctx.strokeRect(x0,y,w12,bh);
+  for(let i=1;i<12;i++){
+    const x=x0+w12*i/12;
+    ctx.beginPath();ctx.moveTo(x,y+bh);ctx.lineTo(x,y+bh+5);ctx.stroke();
+  }
+  const over=cum>4.5;
+  ctx.fillStyle=over?"rgba(255,80,99,.7)":"rgba(69,230,200,.65)";
+  ctx.fillRect(x0,y,w12*clamp(cum/12,0,1),bh);
+  // budget marker
+  const bx=x0+w12*4.5/12;
+  ctx.setLineDash([4,4]);ctx.strokeStyle=AMB;ctx.lineWidth=1.5;
+  ctx.beginPath();ctx.moveTo(bx,y-12);ctx.lineTo(bx,y+bh+12);ctx.stroke();
+  ctx.setLineDash([]);
+  ctx.fillStyle=AMB;ctx.font="9px "+getComputedStyle(document.body).getPropertyValue("--mono");
+  ctx.fillText("4.5s budget",bx+5,y-4);
+  ctx.fillStyle="rgba(143,168,162,.9)";
+  ctx.fillText("0s",x0,y+bh+16);
+  ctx.fillText("12s window",x0+w12-52,y+bh+16);
+  setV("vGla",cum.toFixed(1)+"s",over?"bad":"");
+}
+let rEma=.12;
+function drawRsk(ctx,W,H,t,dt){
+  const eye=.5+.5*Math.sin(t*.31);
+  const gaz=.5+.5*Math.sin(t*.23+2.1);
+  const pho=(Math.sin(t*.11)>.35)?.85:.08;
+  let raw=.42*eye+.30*gaz+.22*pho;
+  if(eye>.5&&gaz>.5)raw+=.25;
+  raw=clamp(raw,0,1);
+  rEma+=(raw-rEma)*clamp(dt*2,0,.2);
+  const mono=getComputedStyle(document.body).getPropertyValue("--mono");
+  // inputs
+  const ins=[["EYE",eye],["GAZE",gaz],["PHONE",pho]];
+  const bw=Math.min(120,W*.3);
+  ins.forEach(([n,v],i)=>{
+    const y=18+i*40;
+    ctx.fillStyle="rgba(143,168,162,.9)";ctx.font="9px "+mono;
+    ctx.fillText(n,8,y-4);
+    ctx.fillStyle="rgba(143,168,162,.15)";ctx.fillRect(8,y,bw,8);
+    ctx.fillStyle=TL;ctx.fillRect(8,y,bw*v,8);
+  });
+  // arrow
+  ctx.strokeStyle="rgba(69,230,200,.4)";ctx.lineWidth=1;
+  ctx.beginPath();ctx.moveTo(bw+22,H*.42);ctx.lineTo(bw+50,H*.42);ctx.stroke();
+  ctx.beginPath();ctx.moveTo(bw+50,H*.42);ctx.lineTo(bw+43,H*.42-4);ctx.moveTo(bw+50,H*.42);ctx.lineTo(bw+43,H*.42+4);ctx.stroke();
+  // fused bar
+  const fx=bw+62, fw=W-fx-12, fy=H*.30, fh=30;
+  ctx.strokeStyle="rgba(143,168,162,.25)";ctx.strokeRect(fx,fy,fw,fh);
+  const col=rEma>.75?DGR:rEma>.4?AMB:TL;
+  ctx.fillStyle=col;ctx.globalAlpha=.75;
+  ctx.fillRect(fx,fy,fw*rEma,fh);ctx.globalAlpha=1;
+  for(const [z,c] of [[.4,AMB],[.75,DGR]]){
+    ctx.setLineDash([3,4]);ctx.strokeStyle=c;
+    ctx.beginPath();ctx.moveTo(fx+fw*z,fy-8);ctx.lineTo(fx+fw*z,fy+fh+8);ctx.stroke();
+    ctx.setLineDash([]);
+  }
+  ctx.fillStyle="rgba(143,168,162,.9)";ctx.font="9px "+mono;
+  ctx.fillText("elevated",fx+fw*.4+4,fy-10);
+  ctx.fillText("high",fx+fw*.75+4,fy-10);
+  ctx.fillStyle=col;ctx.font="600 18px "+mono;
+  ctx.fillText(Math.round(rEma*100)+"%",fx,fy+fh+24);
+  setV("vRsk",Math.round(rEma*100)+"%",rEma>.75?"bad":rEma>.4?"warn":"");
+}
+const vCache={};
+function setV(id,txt,cls){
+  let el=vCache[id]||(vCache[id]=document.getElementById(id));
+  if(!el)return;
+  if(el.textContent!==txt)el.textContent=txt;
+  el.className="v"+(cls?" "+cls:"");
+}
+
+/* ---------- register scenes ---------- */
+const sHero=addScene("heroCanvas",(ctx,W,H,t)=>{
+  ctx.clearRect(0,0,W,H);
+  // faint grid
+  ctx.strokeStyle="rgba(69,230,200,.045)";ctx.lineWidth=1;
+  for(let x=0;x<W;x+=84){ctx.beginPath();ctx.moveTo(x,0);ctx.lineTo(x,H);ctx.stroke();}
+  for(let y=0;y<H;y+=84){ctx.beginPath();ctx.moveTo(0,y);ctx.lineTo(W,y);ctx.stroke();}
+  const small=W<760;
+  drawHead(ctx,W,H,t,{cx:small?W*.5:W*.66,cy:small?H*.32:H*.42,scale:small?.26:.34});
+  // readout tick
+  if(!RM){
+    setText("roEar",heroEar.toFixed(2));
+    setText("roYaw",(heroYaw>=0?"+":"")+heroYaw.toFixed(1)+"°");
+    setText("roPer",(2.4+1.6*Math.abs(Math.sin(t*.1))).toFixed(1)+"%");
+    setText("roState",heroEar<.15?"BLINK":"ATTENTIVE");
+  }
+});
+function setText(id,v){const el=vCache[id]||(vCache[id]=document.getElementById(id));if(el&&el.textContent!==v)el.textContent=v;}
+
+const sDevice=addScene("deviceCanvas",(ctx,W,H,t,pr)=>{
+  ctx.clearRect(0,0,W,H);
+  drawDevice(ctx,W,H,t,pr);
+  // labels + BOM
+  document.querySelectorAll(".lbl").forEach(l=>{
+    l.classList.toggle("on",W<760||pr>parseFloat(l.dataset.at));
+  });
+  const bb=document.getElementById("bomBox");
+  const show=pr>.8;
+  bb.classList.toggle("on",show);
+  if(show){
+    const n=Math.round(183*clamp((pr-.8)/.14,0,1));
+    setText("bomTotal","$"+n);
+  }
+});
+
+const sPipe=addScene("pipeCanvas",(ctx,W,H,t,pr)=>{
+  ctx.clearRect(0,0,W,H);
+  drawPipe(ctx,W,H,t,pr);
+});
+
+const sGlobe=addScene("globeCanvas",(ctx,W,H,t,pr)=>{
+  ctx.clearRect(0,0,W,H);
+  drawGlobe(ctx,W,H,t);
+  const idx=pr<.36?0:pr<.7?1:2;
+  document.querySelectorAll(".beat").forEach(b=>{
+    b.classList.toggle("on",+b.dataset.b===idx);
+  });
+});
+
+let lastT=0;
+const sEar=addScene("cEar",(ctx,W,H,t)=>{ctx.clearRect(0,0,W,H);drawEar(ctx,W,H,t);});
+const sPer=addScene("cPer",(ctx,W,H,t)=>{ctx.clearRect(0,0,W,H);drawPer(ctx,W,H,t);});
+const sGla=addScene("cGla",(ctx,W,H,t)=>{ctx.clearRect(0,0,W,H);drawGla(ctx,W,H,t);});
+const sRsk=addScene("cRsk",(ctx,W,H,t)=>{ctx.clearRect(0,0,W,H);drawRsk(ctx,W,H,t,t-lastT);});
+
+/* ---------- visibility ---------- */
+const io=new IntersectionObserver(es=>{
+  for(const e of es){
+    const s=scenes.find(x=>x.c===e.target);
+    if(s)s.live=e.isIntersecting;
+  }
+},{rootMargin:"120px"});
+scenes.forEach(s=>io.observe(s.c));
+
+/* ---------- scroll progress ---------- */
+const chapters=[["device",sDevice],["pipeline",sPipe],["edge",sGlobe]];
+function onScroll(){
+  const vh=innerHeight;
+  for(const [id,s] of chapters){
+    const el=document.getElementById(id);
+    const r=el.getBoundingClientRect();
+    s.progress=clamp(-r.top/(r.height-vh),0,1);
+  }
+}
+addEventListener("scroll",onScroll,{passive:true});
+addEventListener("resize",()=>{fitAll();onScroll();});
+
+/* ---------- nav active ---------- */
+const navIO=new IntersectionObserver(es=>{
+  for(const e of es){
+    if(e.isIntersecting){
+      document.querySelectorAll(".nav-links a").forEach(a=>{
+        a.toggleAttribute("aria-current",a.getAttribute("href")==="#"+e.target.id);
+        if(a.getAttribute("href")==="#"+e.target.id)a.setAttribute("aria-current","true");
+      });
+    }
+  }
+},{rootMargin:"-45% 0px -45% 0px"});
+["device","pipeline","signals","edge","profiles","build"].forEach(id=>{
+  const el=document.getElementById(id);if(el)navIO.observe(el);
+});
+
+/* ---------- main loop ---------- */
+const t0=performance.now();
+function frame(now){
+  const t=(now-t0)/1000;
+  for(const s of scenes)if(s.live)s.draw(s.ctx,s.w,s.h,t,s.progress);
+  lastT=t;
+  requestAnimationFrame(frame);
+}
+
+/* ---------- intro ---------- */
+const intro=document.getElementById("intro");
+const logEl=document.getElementById("introLog");
+const iCap=document.getElementById("introCap");
+const iBar=document.getElementById("introBar");
+const iWord=document.getElementById("introWord");
+const iC=document.getElementById("introCanvas");
+const iCtx=iC.getContext("2d");
+const LOGS=[
+ "SENSORDYME BOOT v2.4",
+ "camera ....... picamera2 / IR 640x480   OK",
+ "face mesh .... 478 landmarks            OK",
+ "gaze ......... iris + head pose         OK",
+ "detector ..... yolo11 / 18 classes      OK",
+ "risk fusion .. armed                    OK",
+ "# PRIVACY: frames are never persisted",
+];
+const FULLLOG=LOGS.join("\n");
+let introDone=false;
+function finishIntro(){
+  if(introDone)return;
+  introDone=true;
+  intro.classList.add("done");
+  document.documentElement.classList.remove("locked");
+  setTimeout(()=>{intro.style.display="none";},700);
+}
+function runIntro(){
+  document.documentElement.classList.add("locked");
+  const T=3.6, start=performance.now();
+  const caps=["THE DEVICE","THE MODEL","THE EDGE"];
+  function step(now){
+    if(introDone)return;
+    const u=(now-start)/1000;
+    // typed log
+    const n=Math.floor(clamp(u/2.6,0,1)*FULLLOG.length);
+    const s=FULLLOG.slice(0,n);
+    const li=s.lastIndexOf("\n# ");
+    logEl.innerHTML=li>=0
+      ? escapeHtml(s.slice(0,li))+'\n<span class="warn">'+escapeHtml(s.slice(li+1))+"</span>"
+      : escapeHtml(s);
+    // mini scene
+    const ph=Math.min(2,Math.floor(u/1.0));
+    iCap.textContent=caps[ph];
+    iCtx.setTransform(1,0,0,1,0,0);
+    iCtx.clearRect(0,0,240,240);
+    if(ph===0)drawDevice(iCtx,240,240,u,ease(clamp(u/.9,0,1)));
+    else if(ph===1)drawHead(iCtx,240,240,u,{cx:120,cy:110,scale:.42});
+    else drawGlobe(iCtx,240,240,u,{cx:120,cy:120,scale:.42});
+    iBar.style.width=clamp(u/T,0,1)*100+"%";
+    if(u>2.95)iWord.classList.add("show");
+    if(u>=T)finishIntro();
+    else requestAnimationFrame(step);
+  }
+  requestAnimationFrame(step);
+  ["click","keydown","wheel","touchstart"].forEach(ev=>
+    intro.addEventListener(ev,finishIntro,{passive:true}));
+  document.getElementById("introSkip").addEventListener("click",finishIntro);
+}
+function escapeHtml(s){return s.replace(/&/g,"&amp;").replace(/</g,"&lt;");}
+
+/* ---------- boot ---------- */
+fitAll();onScroll();
+if(RM){
+  intro.style.display="none";
+  // static single-pass render
+  sDevice.progress=.9;sPipe.progress=.85;sGlobe.progress=.5;
+  scenes.forEach(s=>{s.live=true;s.draw(s.ctx,s.w,s.h,2,s.progress);s.live=false;});
+  document.querySelectorAll(".lbl").forEach(l=>l.classList.add("on"));
+  document.getElementById("bomBox").classList.add("on");
+  setText("bomTotal","$183");
+}else{
+  runIntro();
+  requestAnimationFrame(frame);
+}
+})();
+</script>

@@ -1,0 +1,35 @@
+# --- Python environments & caches -------------------------------------------
+.venv/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+*.egg-info/
+
+# --- Runtime output & downloaded data ---------------------------------------
+# data/ holds event logs, telemetry, per-device calibration, generated reports,
+# and downloaded training datasets (state_farm is ~6GB). All of it is either
+# machine-specific or re-downloadable — never versioned.
+data/
+
+# Model weights fetched on first use by ultralytics / the openpilot module.
+*.pt
+*.hef
+models/
+
+# --- Generated iOS project ---------------------------------------------------
+# SensorDyme.xcodeproj and Info.plist are generated from ios/project.yml by
+# xcodegen (`cd ios && xcodegen generate`). project.yml is the source of truth
+# and pins the signing team, so the generated project is disposable.
+ios/SensorDyme.xcodeproj/
+ios/Info.plist
+
+# --- OS / editor -------------------------------------------------------------
+.DS_Store
+*.swp
+.idea/
+.vscode/
+
+# --- Local operational artifacts --------------------------------------------
+setup.log
+setup*.log
+*.local.yaml

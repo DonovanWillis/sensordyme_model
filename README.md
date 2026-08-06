@@ -1,0 +1,353 @@
+# SensorDyme
+
+A modular edge computer-vision platform. One codebase, two targets:
+
+- **Raspberry Pi 5 + Camera Module 3** — the production target, running headless as a systemd service.
+- **Mac (M3 / any macOS)** — the dev target, using your built-in webcam, with a live debug window.
+
+The platform auto-detects which one it's on at startup (by trying to import `picamera2`) — no flags, no branching config.
+
+## Quickstart: Mac (30 seconds)
+
+```bash
+./setup_mac.sh
+source .venv/bin/activate
+python main.py
+```
+
+A window pops up showing your webcam with a live face mesh overlay, EAR and yaw readouts. The first 10 seconds calibrate your personal EAR baseline *and* your neutral head pose — keep your eyes open and look at the camera (or wherever you'll actually be looking, if the camera isn't centered) during that window. After that, close your eyes for 2+ seconds or turn your head away for 3+ seconds and **the whole screen flashes red with an ALERT banner**. Hold a phone up (real or a hand mimicking one) while looking away and you'll see an orange box appear around it, turning red once `phone_use` fires. Press `q` or Ctrl+C to quit; events land in `data/events.csv`.
+
+Want to see every signal while tuning thresholds? Run `make dev-debug` (or `python main.py --debug`) for a window with EAR, yaw, pitch, PERCLOS%, YOLO/hand boxes, and the current state label all overlaid.
+
+## Quickstart: Raspberry Pi 5
+
+```bash
+# from your Mac, after cloning this repo onto the Pi (or via `make deploy` below)
+./setup_pi.sh
+```
+
+This installs apt packages (`python3-picamera2`, etc.), creates a venv, installs Python deps, and installs + starts `sensordyme.service` (systemd, `Restart=always`, headless — no display on the Pi by default).
+
+```bash
+sudo systemctl status sensordyme   # check it's running
+journalctl -u sensordyme -f        # tail logs
+```
+
+## Hardware: building the physical device
+
+Optimized for two things at once: the fewest parts and least assembly time, **and** a hard budget of under $200 — every dollar spent where it actually improves detection accuracy or reliability, nowhere else. Seven shopping-list items (a couple are small two-part bundles), no soldering, no display, roughly 10 minutes to assemble, **~$180 total**, leaving headroom under $200 for tax/shipping/price drift.
+
+Prices below are realistic street prices at the time of writing, not live quotes — they'll drift with the market and your region/retailer. Treat the total as a target to shop toward, not a guarantee.
+
+| # | Part | Est. price | Why this one, specifically |
+|---|------|-----------|------|
+| 1 | **Raspberry Pi 5 (4GB)** | $60 | The compute. 4GB, not 8/16GB — this workload is CPU-bound, not RAM-bound, so the extra $20–$40 for more RAM buys literally nothing here. This is where NOT spending more matters most. |
+| 2 | **Camera Module 3 NoIR (Wide) + IR illuminator board + Pi 5 camera cable (22-pin → 15-pin)** | $47 | The single highest-leverage spend in the whole build: without IR, the device is blind at night, which is exactly when drowsiness detection matters most. Wide FoV matters too, since the camera won't be dead-center on the dash (see the calibration note below). **The cable is not optional**: the Pi 5 uses a 22-pin mini camera connector, and Camera Module 3 ships with a 15-pin cable that won't fit — order the ~$3 adapter cable with the camera. IR wavelength: 850nm gives a brighter image (sensors are 2–4× more responsive) but emits a faint visible red glow; 940nm is fully invisible but dimmer — either works, pick per your glow tolerance. Prefer a USB/5V-powered illuminator so you don't need a second 12V feed in the car. |
+| 3 | **Raspberry Pi 5 Active Cooler (official)** | $5 | Cheapest official accessory that exists, and not optional — sustained CV inference throttles the Pi 5 without it, especially in a hot car. Best dollar-for-dollar spend in the list. |
+| 4 | **High-endurance microSD card (64GB)** | $13 | The single biggest field-failure mode for always-on Pi devices is SD corruption from abrupt power loss when the car shuts off. A dashcam/security-camera-rated "high endurance" card (SanDisk High Endurance, WD Purple SC, etc.) is built for exactly this continuous-write pattern, for about the same price as a standard card — pure upside, no reason to skip it. 64GB, not more: frames are never written to disk (see the privacy statement below), so capacity is never the bottleneck. |
+| 5 | **USB-C PD car charger (30W, 5V/5A) + an e-marked USB-C cable** | $26 | Must explicitly support 5V/5A — the Pi 5 negotiates full power over USB-C PD, and cheap car chargers/cables that top out at 5V/2.4A under-power it, causing throttling or random brownouts in the field. This is the one place a "cheaper" option actively breaks the device, so it's worth the extra few dollars over the bargain-bin charger. **Reusing a charger you already own?** Check its label for a `5V⎓5A` output line (most phone chargers only do 5V/3A — the Pi boots but throttles under sustained CV load), then verify in the field with `vcgencmd get_throttled` (`0x0` = healthy; anything else means under-voltage occurred mid-drive). |
+| 6 | **5V GPIO piezo buzzer (2-wire, active) + 2× female-female jumper wires** | $3 | The audible alert — two jumper wires to a GPIO pin and GND, already wired up in software via `core/alerts.py`'s `GPIOBuzzerSink`. The Pi 5 has no 3.5mm audio jack, so this is also the *cheapest* way to get sound, not a compromise. Don't forget the jumper wires — buzzer modules ship with bare pins. |
+| 7 | **Dashcam-style case (camera cutout + cooling clearance) + heavy-duty suction dash mount (1/4-20 thread)** | $29 | A cheap suction mount will vibrate loose on rough roads within weeks; the extra few dollars for a heavy-duty one is the difference between a device that stays aimed at your face and one that doesn't. **DIY/3D-printed alternative ($0–5 in filament):** print in **PETG/ABS/ASA, never PLA** (dashboards exceed 70°C in the sun; PLA sags at ~60°C), leave real airflow openings for the Active Cooler (a sealed box is a heater), use open holes — not printed "windows" — in front of the camera and IR LEDs (plastic attenuates IR), and make the mount rigid: a mount that flexes invalidates the calibrated head-pose baseline, so re-run `--recalibrate` any time it shifts. |
+| | **Total** | **~$180** | **~$20 under the $200 cap**, intentionally — real prices vary by retailer/region/tariffs, and this leaves room to absorb that without blowing the budget. |
+
+If you end up with slack in the budget, the highest-value places to spend it, in order: (1) a slightly better dash mount if yours will see rough roads, (2) a name-brand car charger over a generic one (power reliability, not raw wattage, is the actual risk), (3) a second high-endurance microSD as a spare. Going from 4GB to 8GB RAM on the Pi 5 is deliberately *not* on that list — it's the classic way to overspend on this build for zero real-world benefit.
+
+**Assembly** (no tools beyond a small screwdriver for the case, no soldering):
+1. Clip the Active Cooler onto the Pi 5.
+2. Connect the camera ribbon cable to the Pi's camera port.
+3. Connect the buzzer's two wires to a GPIO pin and a GND pin (matching `gpio_buzzer_pin` in `config.yaml`, default BCM 17).
+4. Flash the microSD card, insert it, close the case.
+5. Mount the case on the windshield/dash mount, angled toward the driver's face.
+6. Plug the USB-C car charger into the Pi and the car's 12V socket.
+7. Power on and run `./setup_pi.sh` (one time) — it installs everything and starts the service on every boot from then on.
+
+**Deliberately left out of the core list** (add only if you need it):
+- *A UPS/supercapacitor HAT* for guaranteed clean shutdown — the high-endurance SD card in slot 4 covers most of this risk far more cheaply; add a UPS HAT only if you're seeing corruption in practice.
+- *An NVMe/SSD HAT* for storage — adds a HAT + drive (2 more parts, more assembly) for a workload that doesn't need the extra speed or endurance beyond what the high-endurance SD card already provides.
+- *A cellular modem or Wi-Fi dongle for remote monitoring* — deliberately absent: it would let frames or events leave the device, in tension with the privacy design below. Only add this if you specifically want fleet-style remote reporting, and audit what it transmits.
+
+Since the camera won't be perfectly centered on the dash with this mount, run `python main.py --recalibrate` once installed, in the final mounted position, looking at the road normally — see [Driver attention module](#driver-attention-module) below for why that matters.
+
+## mac_max profile: what it's for (and what it isn't)
+
+**The pi profile above is the shipping product.** `mac_max` is an additive, Mac-only profile for three things: live demos, generating ground-truth comparisons, and establishing a GPU-backed accuracy ceiling to measure the nano/edge models against. It requires Apple Silicon + torch MPS, refuses to start otherwise, and never reads or affects anything under `modules:` — selecting it is entirely opt-in and every default stays on `profile: pi`.
+
+```bash
+make dev-max
+# or: python main.py --profile mac_max --debug
+```
+
+On first run it prompts **"LOOK AT THE SCREEN CENTER"** for 3 seconds — this calibrates your personal EAR baseline and a neutral forward-gaze baseline together (persisted to `data/gaze_calibration.json`, separate from the pi profile's `data/calibration.json`). After that you get a full tuning overlay: a gaze-vector arrow drawn from your eyes, on/off-road status, EAR + blink count + blink rate + PERCLOS%, YOLO boxes with confidence, hand-phone IoU, the fused state, and a rolling 12-second glance-budget bar.
+
+What's different from the pi profile, in order of how much it changes the *signal quality* (not just the compute budget):
+
+1. **Gaze, not head pose.** MediaPipe Face Mesh's refined iris landmarks (indices 468/473) let `_compute_gaze_components` measure where the eyes are pointing *within* the eye socket, which is added to head yaw/pitch to produce an actual gaze vector — a driver can turn their head only slightly and still look far off-axis with their eyes, which head-angle-only logic (the pi profile) can't see.
+2. **Tiered drowsiness with a real blink-rate signal.** Instead of one sustained-closure threshold, three tiers: ignore closures <500ms entirely (a normal blink), 0.5–1.5s sustained → `microsleep_warning` (soft), >1.5s → `drowsiness` (loud) — plus `BlinkRateTracker`, which compares your current blinks/min against your own first-5-minute session baseline and flags a sustained anomalous rate as `fatigue_pattern` (log-only, feeds the FATIGUED state).
+3. **Confidence-stacked phone/object fusion**, not one binary check: phone alone (0.3, log-only — a mounted GPS is legitimate) → phone + hand overlap (0.7, `phone_in_hand`, soft) → phone + hand overlap + eyes off-road, sustained (0.95, `phone_use_while_distracted`, loudest tier). Eating/drinking additionally requires *repeated* hand-to-face motion (≥2 approaches in 30s), not just a food class + a nearby hand.
+4. **Detection runs on the full frame, every frame, on MPS** — YOLO11-x by default (`detector_weights` swaps to `rtdetr-l.pt` for A/B testing, same `ultralytics.YOLO(...)` loader either way), classes: `cell phone`, `cup`, `bottle`, `sandwich`, `banana`, `donut`, plus `person`. MediaPipe Hands also runs every frame (no stride) — Mac can afford both.
+5. **Temporal smoothing.** Every raw signal (EAR, gaze yaw/pitch, and the phone/hand-overlap booleans) passes through a ~5-frame rolling median (`RollingMedianFilter`) before it reaches any threshold, so a single flickered detector reading can't flip a state on its own.
+
+All of it still funnels through the exact same `core/alerts.py` `AlertManager` and `core/logger.py` `EventLogger` as the pi profile — nothing about alert escalation/cooldown or CSV logging was forked. Every event also carries a `contributing_signals` string (e.g. `"phone + hand_overlap + gaze_off"`) in a new, purely-additive CSV column, so `data/events.csv` stays analyzable for either profile.
+
+Every threshold's real-world basis is cited directly in `config.yaml` under `mac_max:` (NHTSA visual-manual glance guidelines, PERCLOS drowsiness-research cutoffs, normal blink duration/rate ranges, etc.) — read it there rather than here, since the comments are next to the numbers they justify.
+
+### The frontier VLM judge (mac_max only)
+
+On top of the local pipeline, mac_max runs a **Claude vision model (`claude-opus-4-8`) as a slow, precise second tier** — the same verifier-not-hot-path split commercial driver-monitoring stacks use. Every `vlm.interval_s` (default 4s), an in-memory JPEG of the current frame goes to the Anthropic API and comes back as a strict-JSON verdict: `attentive / distracted / drowsy / phone_use / eating_drinking`, with a confidence and a one-sentence evidence string. This is what buys enterprise-grade *judgment*: the VLM understands the whole scene — mounted GPS vs. a phone in hand, asleep vs. glancing down, a wallet vs. a phone — in ways geometric signals can't.
+
+The judge sees **motion, not a snapshot**: each judgment sends a burst of `vlm.burst_frames` frames (default 3) captured `vlm.burst_spacing_s` apart (default 0.7s), in chronological order. A single frame cannot distinguish a blink from a microsleep or a mirror check from a stare; a ~1.4s burst can, and the prompt explicitly tells the judge to use the motion across frames. This costs ~3× the image tokens per judgment — set `burst_frames: 1` to restore the original single-frame mode.
+
+The timing discipline is the point:
+- The judge runs in a **daemon thread with a one-slot mailbox** — the camera loop is never blocked, ever.
+- Every verdict is logged to `data/events.csv` as a `vlm_judgment` (log-only, with the evidence in `contributing_signals`).
+- An alert (`vlm_confirmed_phone_use`, `vlm_confirmed_drowsiness`, `vlm_confirmed_distraction` — loud; `vlm_confirmed_eating` — soft) fires only after **`confirm_judgments` consecutive same-state verdicts** (default 2) at or above `min_confidence` (default 0.7). One flaky classification never makes a sound; a real phone-in-hand session confirms in ~2×`interval_s`.
+- **Graceful without credentials**: no `ANTHROPIC_API_KEY` (and no `ant auth login` profile) → the judge prints one line telling you exactly what to set, disables itself, and the local pipeline continues untouched. Same on repeated API errors (`max_consecutive_failures`).
+- The debug HUD (`make dev-max`) shows a live `VLM: PHONE_USE 0.92 (3s ago)` line, and the fused state shows `VLM:<STATE>` when a confirmed verdict is driving the alert.
+
+**Privacy tradeoff, stated plainly:** with `vlm.enabled: true`, frames are transmitted (in memory — still never written to disk) to the Anthropic API for classification. This is a deliberate exception to the "nothing leaves the device" property, exists only in this Mac-only profile, is announced in the terminal at startup, and turns off with one config line (`vlm.enabled: false`). The pi profile never constructs the judge and is entirely unaffected.
+
+To use it: `export ANTHROPIC_API_KEY=sk-ant-...` (or `ant auth login`) before `make dev-max`. Each judgment is one small vision request; at the default 4s interval that's ~900 requests per driving hour — set `interval_s` higher if you want to spend less.
+
+#### Swapping the judge model (Qwen, NVIDIA, anything OpenAI-compatible)
+
+The judge is backend-pluggable via `vlm.provider` — swap one config line to A/B different VLMs on the identical harness (same prompt, same confirmation debounce, same event log, so `data/events.csv` verdicts are directly comparable across providers):
+
+| `provider` | What it runs | Frames leave the Mac? | Accuracy / cost |
+|---|---|---|---|
+| `anthropic` (default) | Claude (`claude-opus-4-8`) | Yes (API) | The accuracy ceiling; per-request cost |
+| `ollama` | A local model via Ollama — e.g. **Qwen2.5-VL** | **No — fully on-device** | Free; noticeably below frontier at 7B; seconds per judgment on an M3 |
+| `openai_compatible` | Any OpenAI-compatible endpoint: **NVIDIA NIM** (build.nvidia.com), LM Studio, vLLM | Depends on `base_url` | Varies by model |
+
+**Qwen2.5-VL locally (fully private, free):**
+```bash
+# one-time: install Ollama from ollama.com, then
+ollama pull qwen2.5vl:7b
+```
+```yaml
+vlm:
+  provider: ollama
+  model: qwen2.5vl:7b
+  interval_s: 12.0   # a 7B VLM takes several seconds per frame on an M3 — pace accordingly
+```
+With a local provider the startup notice flips to "frames stay ON-DEVICE" — the full privacy invariant holds again.
+
+**NVIDIA NIM (cloud):** create an API key at build.nvidia.com, pick a vision model there and copy its exact model ID, then:
+```yaml
+vlm:
+  provider: openai_compatible
+  model: <exact model id from build.nvidia.com>
+  base_url: https://integrate.api.nvidia.com/v1
+  api_key_env: NVIDIA_API_KEY
+```
+```bash
+export NVIDIA_API_KEY=nvapi-...
+make dev-max
+```
+
+**Google Gemini (cloud):** frontier-class vision with a fast/cheap Flash tier that suits a periodic judge well. Google exposes an OpenAI-compatible endpoint, so this needs no code — grab a key from [aistudio.google.com](https://aistudio.google.com), then:
+```yaml
+vlm:
+  provider: openai_compatible
+  model: gemini-2.5-flash            # check ai.google.dev for the latest model IDs
+  base_url: https://generativelanguage.googleapis.com/v1beta/openai
+  api_key_env: GEMINI_API_KEY
+```
+```bash
+export GEMINI_API_KEY=...
+make dev-max
+```
+
+Implementation notes: the Anthropic backend uses server-enforced structured outputs (the verdict is guaranteed-valid JSON); Ollama uses its schema-constrained `format` parameter; generic OpenAI-compatible endpoints get the JSON contract in the prompt with fence/prose-tolerant parsing. All three degrade the same way — a clear one-line instruction (missing key, Ollama not running, model not pulled) and self-disable, with the local pipeline unaffected.
+
+### A/B testing the detector
+
+```yaml
+mac_max:
+  driver_attention:
+    detector_weights: yolo11x.pt   # or: rtdetr-l.pt
+```
+
+Both load through the same `core/detectors.py::get_yolo_model(weights, device)` — swapping the weights string is the entire A/B test; no code changes.
+
+### Measuring accuracy (scripted protocol)
+
+`benchmarks/accuracy_protocol.py` turns "how accurate is it?" into a number. With `make dev-max` running and calibrated in one terminal, run `make accuracy` in another: it walks you through a timed scenario script (attentive baseline, sustained eye closure, look-away, eyes-down, phone-in-hand, a mounted-phone false-positive control, drinking) and records each phase's UTC window to `benchmarks/results/protocol_<ts>.json`. Then:
+
+```bash
+python benchmarks/accuracy_protocol.py grade --protocol benchmarks/results/protocol_<ts>.json
+```
+
+grades `data/events.csv` against the script: per-phase PASS/MISS (did any expected event type fire inside the phase window + grace period?), false positives (alertable events firing where nothing was expected — including during the mounted-phone control phase), and an overall recall figure. A `_report.json` lands next to the protocol for tracking across config changes.
+
+### Benchmarking pi vs. mac_max
+
+```bash
+python benchmarks/run_benchmarks.py --profile pi      --video clip.mp4 --minutes 2
+python benchmarks/run_benchmarks.py --profile mac_max --video clip.mp4 --minutes 2
+```
+
+Same video, two profiles — this is the "what does 10x compute buy" comparison row: diff the FPS/latency in `benchmarks/results/{profile}_driver_attention_*.json` (pi's own filenames are unchanged — no `pi_` prefix — since `pi` remains the default `--profile`).
+
+## Architecture
+
+```
+sensordyme/
+├── main.py                  # entrypoint: loads config.yaml, starts camera, runs selected module
+├── config.yaml              # module: driver_attention  <- one line switches the product
+├── requirements.txt         # pinned versions; Pi-only extras noted at the bottom
+├── setup_pi.sh              # one-shot Pi setup: apt packages, pip installs, systemd service
+├── setup_mac.sh             # one-shot Mac dev setup (venv, pip)
+├── sensordyme.service       # systemd unit: runs main.py on boot, Restart=always
+├── core/
+│   ├── camera.py            # Picamera2 on Pi / cv2.VideoCapture(0) on Mac, auto-detected
+│   ├── events.py            # Event dataclass: timestamp, type, duration, confidence, module_name
+│   ├── alerts.py            # console / sound / GPIO buzzer sinks + escalation + cooldown
+│   ├── detectors.py         # shared YOLO model cache + IoU helper (occupancy + driver_attention)
+│   ├── logger.py            # appends events to data/events.csv (never writes frames)
+│   ├── telemetry.py         # throttled raw-signal log to data/telemetry.csv (future model training)
+│   └── reports.py           # weekly summary PDF (matplotlib charts + reportlab layout)
+├── modules/
+│   ├── base.py              # VisionModule ABC + registry + SustainedConditionTracker
+│   ├── driver_attention.py  # calibrated EAR + PERCLOS (drowsiness), yaw/pitch (distraction),
+│   │                        #   YOLO11-nano + MediaPipe Hands (phone/food) -- see below
+│   ├── driver_attention_max.py # mac_max profile ONLY: gaze fusion, tiered drowsiness,
+│   │                        #   confidence-stacked phone fusion -- see "mac_max profile" below
+│   ├── occupancy.py         # YOLO11-nano person counting -> occupancy_change events
+│   └── fall_detection.py    # MediaPipe Pose: drop-then-stillness -> fall events
+├── benchmarks/
+│   ├── run_benchmarks.py    # per-module latency/FPS/thermal -> JSON + summary CSV
+│   ├── plot_results.py      # FPS bar chart, latency box plot, thermal line chart (300dpi PNGs)
+│   └── sample_data/         # drop test videos here
+├── tests/                   # pytest suite (no camera required)
+├── data/                    # gitignored: events.csv, reports/
+└── Makefile                 # make dev | bench | report | deploy
+```
+
+### Data flow
+
+```
+        ┌─────────────┐     frame      ┌──────────────────┐   Event(s)   ┌─────────────┐
+Camera  │ Picamera2 / │ ─────────────▶ │  VisionModule    │ ───────────▶ │ EventLogger  │──▶ data/events.csv
+(auto-  │ cv2 webcam  │                │ (config-selected) │              └─────────────┘
+detect) └─────────────┘                └────────┬─────────┘
+                                                  │ alert-worthy events
+                                                  ▼
+                                          ┌───────────────┐
+                                          │ AlertManager  │──▶ console / sound / GPIO buzzer
+                                          │ (escalation + │
+                                          │  cooldown)    │
+                                          └───────────────┘
+```
+
+## How the platform is auto-detected
+
+`core/camera.py` tries `import picamera2` at startup. If it succeeds, you're on a Pi and frames come from Picamera2 at the Camera Module 3's native pipeline. If it fails (e.g. on a Mac, where picamera2 isn't installable), frames come from `cv2.VideoCapture(0)` — your built-in webcam. `main.py` prints which mode it picked on every run.
+
+## Adding a new module (3 steps)
+
+1. Create `modules/your_module.py`, subclassing `VisionModule` and decorating the class with `@register_module("your_module")`.
+2. Add a `modules.your_module: {...thresholds...}` block to `config.yaml`.
+3. Set `module: your_module` in `config.yaml`.
+
+That's it — `main.py` never needs editing. `modules/__init__.py` auto-discovers every file in `modules/` via `pkgutil`, so the `@register_module` decorator always runs and your module shows up in the registry.
+
+## Driver attention module
+
+Real testing surfaced three failure modes with a naive "raw threshold" approach: ordinary blinks tripped drowsiness, brief mirror/blindspot glances tripped distraction, and the module was blind to anything that wasn't a face (phone in hand, food, etc). Each is addressed with a dedicated mechanism rather than a bigger threshold:
+
+- **Drowsiness (blink-proof).** `SustainedConditionTracker` only fires once EAR has stayed below the personal threshold for a *continuous* `drowsy_seconds` (default **2.0s**) measured in monotonic time — a blink (a few hundred ms) resets it to zero, no partial credit. A second, slower signal, **PERCLOS** (% of the last `perclos_window_s` spent with eyes closed), catches the driver who blinks heavily but never has one single long closure — it fires the softer `fatigue_warning`.
+- **Per-user EAR calibration + neutral head pose.** `AttentionCalibrator` runs once at startup: for `calibration_duration_s` (default 10s), look at the road as you normally would. It learns two things from that window, not just one:
+  - your resting EAR (different faces have different resting EAR — a single fixed threshold misfires across users), setting the operative threshold to `ear_threshold_ratio * baseline`;
+  - a **neutral yaw/pitch baseline** — "looking at the road" is *not* yaw=0/pitch=0 unless the camera is mounted dead-center on the dashboard. A camera mounted off to the side (phone/Pi next to the wheel rather than centered) sees your ordinary forward gaze at some nonzero angle; every subsequent yaw/pitch reading is corrected against this baseline (`raw − baseline`) before any threshold is applied, so the mounting position no longer matters.
+
+  Both are persisted together to `data/calibration.json`; delete that file or pass `--recalibrate` to redo it (e.g. after a different person, or a different mounting position, starts using the same install).
+- **Distraction (glance-tolerant).** The same sustained-condition mechanism, applied to the *calibrated* yaw, means a normal 1–2s mirror or blindspot check resets cleanly and never fires `distraction` (default sustain: `distraction_seconds` = **3.0s**, `yaw_threshold_deg` = 35°). A separate `GlanceCounter` watches for the pattern single-glance logic misses: `glance_min_count` (default 5) short off-center glances within `glance_window_s` (default 45s) fires `frequent_glancing` — texting while still looking up periodically.
+- **Eyes down (separate from sideways).** Looking down at a lap is more dangerous and less often legitimate than a sideways glance, so calibrated pitch gets its own, more sensitive check: `pitch_threshold_deg` (default -20°) sustained for `eyes_down_seconds` (default 2.5s) fires `eyes_down`, independent of the yaw-based `distraction` event.
+- **Full-frame object scanning, with a visible bounding box.** YOLO11-nano (shared via `core/detectors.py` so `occupancy.py` doesn't load a second copy) scans the *entire* frame — not just near the face — on every `yolo_every_n_frames`-th frame (default 3) so Face Mesh keeps full frame rate. It covers everything a driver's hands might realistically hold: `cell phone`, plus 17 food/drink classes (`cup`, `bottle`, `wine glass`, `bowl`, `banana`, `apple`, `orange`, `broccoli`, `carrot`, `hot dog`, `pizza`, `donut`, `cake`, `sandwich`, `fork`, `knife`, `spoon`) via the `yolo_classes` config block. Boxes are drawn live in the **default** window (not just `--debug`) — orange while just visible, red once it's driving a `phone_use` alert. A phone alone is not an alert — a dashboard-mounted phone/GPS is legitimate and only logs `phone_detected`. It becomes the loud `phone_use` alert only when the phone is visible **and** the eyes are off the road (`distraction` or `eyes_down` condition) for `phone_use_seconds` (default 2.0s). If MediaPipe Hands (`enable_hands`, default on) finds a hand overlapping the phone box (IoU > `hand_phone_iou_threshold`), confidence is raised — someone visibly holding it is more certain than a phone merely in frame. Hands are drawn in the default view too. Any failure loading YOLO/Hands is caught, printed once to the terminal, and disables that subsystem gracefully instead of crashing the video loop or failing silently — check the terminal for `driver_attention: object detection ready (...)` to confirm it's active.
+- **Face lost.** If the camera can't find a face at all (turned fully away, slumped over, obstructed) for `face_lost_seconds` (default 2.5s), that's treated as a risk signal in its own right — `attention_lost` fires (loud) — rather than silently reported as "nothing going on," which is what naive per-signal logic does by default.
+- **Risk fusion — reasoning across signals, not just within each one.** `RiskFusion` combines every signal above into one continuous, smoothed 0–100% score, shown as a live bar in both the default and debug windows. This is the part that actually reasons about the driver holistically: independent thresholds each catch their own failure mode but miss *compound* danger — a driver who's a little drowsy AND glancing away is more dangerous than either fact alone (a microsleep is worse if attention is already split), so eye-risk and gaze-risk being simultaneously elevated adds a corroboration bonus on top of their weighted sum. The composite score fires its own `elevated_risk` (soft) / `high_risk` (loud) events for combinations that never cross any single signal's own bar. See `RiskFusion`'s docstring in `modules/driver_attention.py` for the full weighting rationale (`risk_ema_alpha`, `risk_elevated_threshold`, `risk_high_threshold`, `risk_confirm_seconds` in config).
+- **Patient alerting.** The alert cooldown (`alerts.cooldown_s`, default 15s) keeps any single event type from re-alerting too soon, on top of each signal's own sustained-duration/rolling-window debounce above.
+- **Debug overlay.** `make dev-debug` (or `python main.py --debug`) shows every raw signal — EAR, calibrated yaw/pitch (plus the raw values and learned baseline, so you can sanity-check calibration itself), PERCLOS%, glance count, the risk bar, and the current state label — essential for on-device tuning.
+- **Telemetry for a future learned model.** Hand-tuned thresholds are a starting point, not the destination — the real accuracy lever is training a model on labeled real-world driving data. Every frame's raw signals (EAR, yaw, pitch, PERCLOS, risk score, phone/hand/eating context) are available via `get_telemetry_snapshot()`, and `main.py` logs a throttled stream of them to `data/telemetry.csv` (`logging.telemetry_interval_s`, default one row per 0.5s) regardless of whether anything fired. Run real sessions, label the false positives/negatives, and that CSV becomes the training set for a small temporal classifier that could eventually replace this hand-tuned fusion layer entirely.
+
+### Tuning guide
+
+| Symptom | Change this |
+|---|---|
+| Too many drowsiness alerts on normal blinking | Increase `drowsy_seconds`, or lower `ear_threshold_ratio` (a smaller ratio = a stricter, lower threshold, so only deeper closures count) |
+| Drowsiness never fires even when eyes are clearly closed | Increase `ear_threshold_ratio` toward 1.0, or run `--recalibrate` if the baseline was captured with sunglasses/bad lighting/eyes not fully open |
+| Missed "drowsy but blinking a lot" drivers | Lower `perclos_threshold`, or shorten `perclos_window_s` so it reacts faster |
+| Mirror/blindspot checks still trigger distraction | Increase `distraction_seconds` |
+| Distraction never fires on real sustained turns | Lower `yaw_threshold_deg` or `distraction_seconds` |
+| Texting-while-glancing-up isn't caught | Lower `glance_min_count` or increase `glance_window_s` |
+| `eyes_down` fires on normal driving posture | Make `pitch_threshold_deg` more negative (e.g. -30), or increase `eyes_down_seconds` |
+| Missed phone use | Lower `phone_use_seconds`, lower `yolo_confidence_threshold`, or decrease `yolo_every_n_frames` for more frequent YOLO sampling (costs FPS — check with `make bench`) |
+| Mounted phone/GPS triggers loud alerts | This shouldn't happen (mounted phone + eyes-on-road only logs `phone_detected`) — if it does, `yaw_threshold_deg`/`pitch_threshold_deg` are probably too loose |
+| Too much CPU/latency from object detection | Increase `yolo_every_n_frames`, or set `enable_hands: false` |
+| Wrong alert loudness for an event type | Edit `alerts.loud_types` / `alerts.soft_types` in `config.yaml` |
+| Alerts feel too eager overall | Increase `alerts.cooldown_s` |
+| Camera mounted to the side of the dashboard (not facing the driver head-on) fires `distraction`/`eyes_down` while looking straight at the road | Run `--recalibrate` with the camera in its final mounted position and look at the road normally for the first 10s — this learns the neutral yaw/pitch for *that* mount. Check `make dev-debug`'s "Raw yaw/pitch ... (baseline ...)" line: if the baseline is still near 0 despite an off-center mount, recalibration didn't run (delete `data/calibration.json` and restart, or pass `--recalibrate`) |
+| `high_risk`/`elevated_risk` fire too easily on combinations that feel benign | Raise `risk_elevated_threshold`/`risk_high_threshold`, or lower `RiskFusion.CORROBORATION_BONUS` in `modules/driver_attention.py` if the eye+gaze combination specifically feels oversensitive |
+| `high_risk`/`elevated_risk` never fire even when things feel clearly compounding | Lower the thresholds, or increase `risk_ema_alpha` so the score reacts faster to fresh signal |
+| `attention_lost` fires during normal driving (e.g. looking far to check a mirror/blindspot) | Increase `face_lost_seconds` — Face Mesh naturally loses tracking briefly on extreme turns |
+| Want to know if object detection is actually running | Check the terminal for `driver_attention: object detection ready (...)` on startup and `driver_attention: phone detected in frame` when one appears; the video window also shows "object detection: OFF (see terminal)" if it failed to load |
+| Missed a food/drink item entirely | Confirm it's a COCO class SensorDyme lists (`yolo_classes` in config.yaml) — YOLO11-nano only knows COCO's 80 classes, so novel objects (a specific snack brand, a thermos) won't be recognized by name, only as the closest COCO class if at all |
+
+## Occupancy module: first-run note
+
+`occupancy` uses YOLO11-nano (`ultralytics`), loaded through the same shared cache in `core/detectors.py` that `driver_attention` uses. The first time either module runs, `yolo11n.pt` isn't cached yet — ultralytics will auto-download it (one-time, needs internet). A one-line notice prints when this happens; subsequent runs use the cached weights with no network access.
+
+## Benchmarking
+
+```bash
+make bench                                  # all modules, 1 min each, live camera
+python benchmarks/run_benchmarks.py --modules driver_attention --minutes 5
+python benchmarks/plot_results.py           # renders charts from the latest results
+```
+
+Results land in `benchmarks/results/{module}_{timestamp}.json`, a `summary_{timestamp}.csv`, and three 300dpi PNGs (FPS bar chart with a real-time threshold line, latency box plots, and — on a Pi — a CPU-temperature-over-time line chart via `vcgencmd`).
+
+Each module is benchmarked under its exact `config.yaml` settings (each result JSON embeds that config under `module_config`), so `driver_attention`'s numbers include its real YOLO11-nano + MediaPipe Hands stride — not a Face-Mesh-only fast path. If you want the isolated Face Mesh cost, temporarily set `yolo_every_n_frames` very high (e.g. `1000000`) before benchmarking.
+
+## Weekly reports
+
+```bash
+make report
+```
+
+Reads `data/events.csv` and writes a PDF to `data/reports/` with events-per-day, events-per-type, and events-per-hour-of-day charts.
+
+## Privacy design statement
+
+**SensorDyme never writes a camera frame or video clip to disk, ever.** Only *derived* signals are persisted: an `Event` (timestamp, type, duration, confidence, module name) to `data/events.csv`, and a throttled numeric snapshot (EAR, yaw, pitch, PERCLOS, risk score, object-presence booleans/counts — never pixels) to `data/telemetry.csv` for future model training. Frames exist solely as in-memory numpy arrays for the duration of one processing loop iteration and are discarded immediately after. The single point in the codebase where a frame is produced is marked with a grep-able comment:
+
+**One deliberate, opt-out exception:** the Mac-only mac_max profile's VLM judge (`vlm.enabled: true`) transmits in-memory JPEG frames to the Anthropic API for classification — announced in the terminal at startup, disabled with one config line, and never part of the pi profile. The no-disk-writes invariant holds everywhere regardless.
+
+```bash
+grep -rn "PRIVACY: frames are never persisted" .
+```
+
+This is enforced by design (there is no code path in `core/`, `modules/`, or `main.py` that writes a frame to a file, socket, or external service), not by a runtime check — read `core/camera.py` to verify it yourself.
+
+## Testing
+
+```bash
+make test
+# or: .venv/bin/python -m pytest -q
+```
+
+The suite covers EAR math and the blink-proof drowsiness state machine (synthetic EAR time series), the glance-tolerant distraction state machine and repeated-glance counter (synthetic yaw time series), EAR + head-pose calibration persistence, the RiskFusion cross-signal engine (corroboration bonus, smoothing, hysteresis), telemetry throttling/persistence, IoU box math, alert escalation/cooldown (including the fixed loud/soft type overrides), config loading, and the module registry — all mocking the frame source (plain numpy arrays) or driving the underlying trackers directly with synthetic timestamps, so it runs on a Mac with no camera at all.
+
+`tests/test_driver_attention_max.py` covers the mac_max profile the same way — via synthetic signal timelines against the underlying trackers (`GazeCalibrator`, `BlinkRateTracker`, `CumulativeConditionTracker`, `RollingMedianFilter`), not the full `DriverAttentionMaxModule` (which eagerly loads MediaPipe and, since mac_max runs detection every frame with no stride, lazily downloads a ~109MB YOLO11-x checkpoint on its very first `process()` call) — so this suite stays fast and needs no GPU, camera, or network either. It proves: 20 normal blinks → zero events, a 1.2s mirror check → zero `eyes_off_road` events, three short glances totaling 5s in a 12s window → `excessive_glancing` fires even though no single glance crossed the 2s threshold, and a phone visible with eyes forward never reaches the AlertManager (only `phone_in_hand`/`phone_use_while_distracted` do).
+
+## Makefile targets
+
+| Target          | What it does                                                       |
+|-----------------|---------------------------------------------------------------------|
+| `make dev`      | Runs `main.py` — on a Mac, opens the webcam with the live overlay    |
+| `make dev-debug`| Runs `main.py --debug` — full tuning overlay (EAR/yaw/pitch/PERCLOS/boxes/state) |
+| `make dev-max`  | Runs `main.py --profile mac_max --debug` — the Mac-only high-accuracy profile |
+| `make bench`    | Runs `benchmarks/run_benchmarks.py` for all registered modules       |
+| `make report`   | Generates the weekly summary PDF from `data/events.csv`              |
+| `make deploy`   | rsyncs the repo to `pi@sensordyme.local` and restarts the service    |
+| `make test`     | Runs the pytest suite                                                |

@@ -1,0 +1,11 @@
+Info: X scale constrained.
+Info: Y scale constrained.
+Plotted to '/home/alec-kr/Downloads/DashSentinel/nodemcu_carrier_pcb/nodemcu_carrier_pcb-F_Cu.gbr'.
+Plotted to '/home/alec-kr/Downloads/DashSentinel/nodemcu_carrier_pcb/nodemcu_carrier_pcb-B_Cu.gbr'.
+Plotted to '/home/alec-kr/Downloads/DashSentinel/nodemcu_carrier_pcb/nodemcu_carrier_pcb-F_Silkscreen.gbr'.
+Plotted to '/home/alec-kr/Downloads/DashSentinel/nodemcu_carrier_pcb/nodemcu_carrier_pcb-B_Silkscreen.gbr'.
+Plotted to '/home/alec-kr/Downloads/DashSentinel/nodemcu_carrier_pcb/nodemcu_carrier_pcb-F_Mask.gbr'.
+Plotted to '/home/alec-kr/Downloads/DashSentinel/nodemcu_carrier_pcb/nodemcu_carrier_pcb-B_Mask.gbr'.
+Plotted to '/home/alec-kr/Downloads/DashSentinel/nodemcu_carrier_pcb/nodemcu_carrier_pcb-Edge_Cuts.gbr'.
+Created Gerber job file '/home/alec-kr/Downloads/DashSentinel/nodemcu_carrier_pcb/nodemcu_carrier_pcb-job.gbrjob'.
+Info: Done.

@@ -1,0 +1,496 @@
+"""DeviceRuntime: builds, wires, supervises, and cleanly shuts down every service.
+
+This is what `python main.py` actually runs after resolving the profile/module.
+Thread architecture (each box restartable on its own):
+
+    CaptureService ──publish──> FrameBus ──wait_for_fresh──> inference loop
+        (camera thread)                        (main thread with --display,
+                                                InferenceService thread headless)
+    DashboardServer  -- its own HTTP threads; /stream pulls JPEGs at stream_fps
+    CloudUplink      -- its own sync thread (events up / commands down)
+    ProvisioningService -- Wi-Fi watcher + BLE window (Pi only)
+    HealthMonitor    -- checks everything above; restarts, escalates, feeds the
+                        systemd watchdog, and serves /api/health via the dashboard
+
+Startup order: accelerator probe -> camera (with retries) -> capture -> dashboard
+-> uplink -> provisioning -> health -> sd_notify READY. Shutdown is the reverse,
+runs on SIGTERM (systemd stop) and SIGINT alike, and always releases the camera.
+"""
+
+from __future__ import annotations
+
+import os
+import signal
+import subprocess
+import threading
+import time
+from datetime import datetime, timezone
+from pathlib import Path
+from typing import Optional
+
+import cv2
+
+from core import accel, sdnotify
+from core.alerts import AlertManager
+from core.camera import Camera, CameraError
+from core.events import Event
+from core.frame_bus import FrameBus
+from core.health import HealthMonitor
+from core.logger import EventLogger
+from core.logging_setup import get_logger, setup_logging
+from core.network import WifiManager, nmcli_available
+from core.telemetry import TelemetryLogger
+from modules import get_module_class
+from services.capture import CaptureService
+from services.provisioning import ProvisioningService
+from services.supervisor import Service, Supervisor
+
+log = get_logger("runtime")
+
+_CAMERA_OPEN_RETRIES = 5
+_CAMERA_OPEN_BACKOFF_S = 2.0
+_VERSION = "0.2"
+
+
+class _InferenceService(Service):
+    """Runs the inference loop in a supervised thread (headless mode)."""
+
+    name = "inference"
+
+    def __init__(self, runtime: "DeviceRuntime") -> None:
+        super().__init__()
+        self._runtime = runtime
+
+    def run(self, stop: threading.Event) -> None:
+        self._runtime._inference_loop(stop)
+
+
+class DeviceRuntime:
+    """Owns every long-running piece of the device for one process lifetime."""
+
+    def __init__(
+        self,
+        *,
+        config: dict,
+        profile: str,
+        module,
+        module_name: str,
+        alert_manager: AlertManager,
+        alert_cfg: dict,
+        alert_event_types: set,
+        alert_types_for,
+        presets: dict,
+        active_preset: Optional[str],
+        display: bool,
+        debug: bool,
+        window_name: str = "SensorDyme",
+    ) -> None:
+        self.config = config
+        self.profile = profile
+        self.module = module
+        self.module_name = module_name
+        self.alert_manager = alert_manager
+        self.alert_event_types = alert_event_types
+        self.alert_types_for = alert_types_for
+        self.loud_types = set(alert_cfg.get("loud_types", []))
+        self.soft_types = set(alert_cfg.get("soft_types", []))
+        self.presets = presets
+        self.active_preset = active_preset
+        self.display = display
+        self.debug = debug
+        self.window_name = window_name
+
+        self.bus = FrameBus()
+        self.shutdown = threading.Event()
+        self._module_lock = threading.Lock()  # guards module swaps vs. the inference loop
+        self._heartbeat = 0.0  # monotonic time of the last completed inference iteration
+        self._last_stream_push = 0.0
+
+        self.camera: Optional[Camera] = None
+        self.capture: Optional[CaptureService] = None
+        self.dashboard = None
+        self.uplink = None
+        self.provisioning: Optional[ProvisioningService] = None
+        self.health: Optional[HealthMonitor] = None
+        self.supervisor: Optional[Supervisor] = None
+        self.logger: Optional[EventLogger] = None
+        self.telemetry: Optional[TelemetryLogger] = None
+        self.hardware = None
+
+    # ------------------------------------------------------------------ build
+    def _open_camera(self) -> Camera:
+        """Open the camera with retries — transient 'device busy' at boot must not
+        burn a whole systemd restart cycle (and model reload) per attempt."""
+        last_exc: Optional[Exception] = None
+        for attempt in range(1, _CAMERA_OPEN_RETRIES + 1):
+            try:
+                camera = Camera(self.config.get("camera", {}))
+                # Prove it produces frames before declaring victory (the "verify
+                # the camera" boot step): one real read, not just a successful open.
+                camera.read()
+                if attempt > 1:
+                    log.info("camera opened on attempt %d", attempt)
+                return camera
+            except (CameraError, RuntimeError) as exc:
+                last_exc = exc
+                log.warning(
+                    "camera open attempt %d/%d failed: %s", attempt, _CAMERA_OPEN_RETRIES, exc
+                )
+                time.sleep(_CAMERA_OPEN_BACKOFF_S)
+        raise CameraError(f"camera unavailable after {_CAMERA_OPEN_RETRIES} attempts: {last_exc}")
+
+    def _build(self) -> None:
+        setup_logging(str(self.config.get("logging", {}).get("level", "INFO")))
+
+        # Accelerator: probe once, install the config, verify before inference starts.
+        accel_cfg = self.config.get("accelerator", {})
+        info = accel.configure(accel_cfg)
+        if accel_cfg.get("required", False) and not info.usable:
+            raise RuntimeError(f"accelerator.required is set but: {info.detail}")
+
+        logging_config = self.config.get("logging", {})
+        self.logger = EventLogger(logging_config.get("csv_path", "data/events.csv"))
+        self.telemetry = TelemetryLogger(
+            logging_config.get("telemetry_csv_path", "data/telemetry.csv"),
+            interval_s=float(logging_config.get("telemetry_interval_s", 0.5)),
+        )
+
+        self.camera = self._open_camera()
+        self.capture = CaptureService(self.camera, self.bus)
+
+        # Warm-up inference on a dummy frame BEFORE services start: model loads
+        # (mediapipe graph, YOLO weights — a download on first ever run) happen
+        # here, not inside the live loop where they'd starve capture and stall
+        # the first seconds of detection. READY then genuinely means "one full
+        # inference has completed". Warm-up events are discarded, never logged.
+        import numpy as np
+
+        cam_cfg = self.config.get("camera", {})
+        dummy = np.zeros((int(cam_cfg.get("height", 480)), int(cam_cfg.get("width", 640)), 3), dtype=np.uint8)
+        try:
+            self.module.process(dummy)
+        except Exception as exc:  # noqa: BLE001 - a no-face frame must never kill boot
+            log.warning("model warm-up raised (continuing): %s", exc)
+
+        # Health monitor + last-resort policy (created before dashboard so the
+        # dashboard can serve /api/health from day one).
+        health_cfg = self.config.get("health", {})
+        self.health = HealthMonitor(
+            check_interval_s=float(health_cfg.get("check_interval_s", 2.0)),
+            on_last_resort=self._last_resort,
+            watchdog_ping=sdnotify.notify_watchdog if sdnotify.enabled() else None,
+        )
+
+        dash_cfg = self.config.get("dashboard", {})
+        if bool(dash_cfg.get("enabled", False)):
+            from core.dashboard import DashboardServer
+
+            self.dashboard = DashboardServer(
+                host=str(dash_cfg.get("host", "127.0.0.1")),
+                port=int(dash_cfg.get("port", 8899)),
+                module_name=self.module_name,
+                presets=self.presets,
+                active_preset=self.active_preset,
+                token=dash_cfg.get("token") or None,
+                events_csv_path=logging_config.get("csv_path", "data/events.csv"),
+                jpeg_quality=int(dash_cfg.get("jpeg_quality", 60)),
+                stream_fps=float(dash_cfg.get("stream_fps", 12)),
+                health_provider=lambda: self.health.snapshot(),
+            )
+            print(
+                f"SensorDyme: dashboard live at {self.dashboard.start()} — annotated frames stream "
+                "in-memory to connected browsers only (localhost by default); never written to disk"
+            )
+
+        cloud_cfg = self.config.get("cloud", {})
+        if bool(cloud_cfg.get("enabled", False)) and cloud_cfg.get("device_key"):
+            from core.uplink import CloudUplink
+
+            self.uplink = CloudUplink(cloud_cfg)
+            self.uplink.set_active_preset(self.active_preset)
+            self.uplink.start()
+            print(
+                f"SensorDyme: cloud uplink -> {cloud_cfg.get('base_url')} "
+                "(events + mode commands; never frames)"
+            )
+
+        wifi = WifiManager()
+        network_cfg = self.config.get("network", {})
+        self.provisioning = ProvisioningService(
+            wifi, network_cfg.get("provisioning", {}), version=_VERSION
+        )
+
+        # Hardware HAL: null implementations today; health-visible either way.
+        from hardware.hal import build_hardware
+
+        self.hardware = build_hardware(self.config.get("hardware", {}))
+
+        # ---- health registrations -------------------------------------------------
+        camera_fps = max(self.camera.fps, 1.0)
+        stale_after = max(2.0, 5.0 / camera_fps)  # 5 frame intervals, 2s floor
+        boot_time = time.monotonic()
+
+        def camera_check() -> tuple[bool, str]:
+            age = self.bus.age_s()
+            if age == float("inf"):  # no frame yet: grace during service startup
+                starting = time.monotonic() - boot_time < 10.0
+                return starting, "waiting for first frame"
+            return age < stale_after, f"last frame {age:.1f}s ago"
+
+        self.health.register(
+            "camera",
+            critical=True,
+            check=camera_check,
+            restart=lambda: self.capture.restart(),
+            check_interval_s=2.0,
+        )
+        self.health.register(
+            "inference",
+            critical=True,
+            check=self._inference_check,
+            restart=self._restart_inference,
+            check_interval_s=2.0,
+        )
+        self.health.register("accelerator", check=accel.status, check_interval_s=60.0)
+        if self.dashboard is not None:
+            self.health.register(
+                "dashboard",
+                check=lambda: (self.dashboard.is_alive(), self.dashboard.url),
+                restart=lambda: self.dashboard.restart(),
+                check_interval_s=10.0,
+            )
+        if self.uplink is not None:
+            self.health.register(
+                "cloud_uplink",
+                check=lambda: (
+                    self.uplink.connected,
+                    "connected" if self.uplink.connected else "offline — events queued on device",
+                ),
+                check_interval_s=15.0,
+            )
+        self.health.register("wifi", check=wifi.status, check_interval_s=15.0)
+        self.health.register("provisioning", check=lambda: self.provisioning.status(), check_interval_s=15.0)
+        for name, component in self.hardware.health_checks().items():
+            self.health.register(name, check=component, check_interval_s=60.0)
+
+        # ---- supervisor -----------------------------------------------------------
+        self.supervisor = Supervisor(self.health)
+        self.supervisor.add(self.capture)
+        if not self.display:
+            self.supervisor.add(_InferenceService(self))
+        self.supervisor.add(self.provisioning)
+
+    # ------------------------------------------------------------------ health hooks
+    def _inference_check(self) -> tuple[bool, str]:
+        if self._heartbeat == 0.0:
+            return True, "starting"
+        age = time.monotonic() - self._heartbeat
+        return age < 10.0, f"last iteration {age:.1f}s ago"
+
+    def _restart_inference(self) -> None:
+        if self.display:
+            return  # display mode runs inference on the main thread; nothing to bounce
+        self.supervisor.restart("inference")
+
+    def _last_resort(self, component: str) -> None:
+        """A critical component is down and restarts are spent: reboot the Pi —
+        config-gated, rate-limited, and never on a dev machine."""
+        health_cfg = self.config.get("health", {})
+        if not bool(health_cfg.get("allow_reboot", False)) or not nmcli_available():
+            log.critical(
+                "%s is down and unrecoverable; reboot disabled (health.allow_reboot) — "
+                "leaving recovery to systemd's Restart/StartLimitAction",
+                component,
+            )
+            return
+        marker = Path("data/.last_reboot_request")
+        min_interval = float(health_cfg.get("reboot_min_interval_s", 1800))
+        now = time.time()
+        try:
+            if marker.exists() and now - marker.stat().st_mtime < min_interval:
+                log.critical("reboot suppressed: last one was <%.0fs ago", min_interval)
+                return
+            marker.parent.mkdir(parents=True, exist_ok=True)
+            marker.touch()
+        except OSError:
+            pass
+        log.critical("LAST RESORT: rebooting because '%s' is unrecoverable", component)
+        subprocess.run(["sudo", "-n", "systemctl", "reboot"], check=False)
+
+    # ------------------------------------------------------------------ preset switching
+    def _switch_preset(self, name: str) -> None:
+        """Hot-swap the running module to a preset (optionally "preset:variant")."""
+        base_name, _, variant_name = name.partition(":")
+        preset = self.presets.get(base_name)
+        if preset is None or self.profile == "mac_max":
+            return
+        overrides = {}
+        if variant_name:
+            variant = (preset.get("variants") or {}).get(variant_name)
+            if variant is None:
+                print(f"SensorDyme: preset '{base_name}' has no variant '{variant_name}'")
+                return
+            overrides = variant.get("overrides") or {}
+        new_module_name = preset["module"]
+        try:
+            new_module = get_module_class(new_module_name)(
+                {**self.config["modules"][new_module_name], **overrides, "recalibrate": False}
+            )
+        except Exception as exc:  # noqa: BLE001 - a bad preset must not kill the device
+            print(f"SensorDyme: preset switch to '{name}' failed: {exc}")
+            return
+        with self._module_lock:
+            old_module = self.module
+            self.module, self.module_name, self.active_preset = new_module, new_module_name, name
+            self.alert_event_types = self.alert_types_for(new_module_name, preset)
+        old_module.close()  # release the old FaceMesh/graph — was leaked before
+        if overrides:
+            print(f"SensorDyme: variant '{variant_name}' overrides applied: {overrides}")
+        if self.dashboard is not None:
+            self.dashboard.set_active_preset(name, new_module_name)
+        if self.uplink is not None:
+            self.uplink.set_active_preset(name)
+        switch_event = Event.now("preset_changed", 0.0, 1.0, "system", f"mode -> {name}")
+        self.logger.log(switch_event)
+        if self.dashboard is not None:
+            self.dashboard.push_event(switch_event, "log")
+        print(f"SensorDyme: switched to preset '{name}' (module '{new_module_name}')")
+
+    # ------------------------------------------------------------------ the inference loop
+    def _inference_loop(self, stop: threading.Event) -> None:
+        last_seq = 0
+        stream_interval = (
+            self.dashboard.stream_interval if self.dashboard is not None else 0.0
+        )
+        while not (stop.is_set() or self.shutdown.is_set()):
+            frame, seq = self.bus.wait_for_fresh(last_seq, timeout=0.5)
+            if seq == last_seq or frame is None:
+                continue  # timeout: no fresh frame — health watches bus.age_s()
+            last_seq = seq
+
+            pending = (self.dashboard.pop_pending_preset() if self.dashboard else None) or (
+                self.uplink.pop_pending_preset() if self.uplink else None
+            )
+            if pending and pending != self.active_preset:
+                self._switch_preset(pending)
+
+            with self._module_lock:
+                module = self.module
+            events = module.process(frame)
+            for event in events:
+                self.logger.log(event)
+                if event.type in self.alert_event_types:
+                    self.alert_manager.notify(event)
+                severity = (
+                    "loud" if event.type in self.loud_types
+                    else "soft" if event.type in self.soft_types or event.type in self.alert_event_types
+                    else "log"
+                )
+                if self.dashboard is not None:
+                    self.dashboard.push_event(event, severity)
+                if self.uplink is not None and event.type in self.alert_event_types:
+                    self.uplink.push_event(event, severity)
+
+            snapshot = module.get_telemetry_snapshot()
+            if snapshot is not None:
+                self.telemetry.log_if_due(
+                    time.monotonic(), datetime.now(timezone.utc).isoformat(), self.module_name, snapshot
+                )
+            if self.dashboard is not None:
+                self.dashboard.push_status(module.is_alert_active(), snapshot)
+
+            # Annotate + encode only when someone is watching, and never faster than
+            # stream_fps — inference cadence and stream cadence are decoupled, so a
+            # phone at 12fps costs nothing at 30fps detection.
+            now = time.monotonic()
+            want_stream = (
+                self.dashboard is not None
+                and self.dashboard.has_viewers()
+                and now - self._last_stream_push >= stream_interval
+            )
+            view = None
+            if self.display or want_stream:
+                view = module.annotate_debug(frame.copy()) if self.debug else module.annotate(frame.copy())
+                if module.is_alert_active():
+                    view = _apply_alert_overlay(view)
+                if want_stream:
+                    self.dashboard.push_frame(view)
+                    self._last_stream_push = now
+            if self.display and view is not None:
+                cv2.imshow(self.window_name, view)
+                key = cv2.waitKey(1) & 0xFF
+                if key == ord("q"):
+                    self.shutdown.set()
+                    break
+                if key != 255 and hasattr(module, "handle_key"):
+                    module.handle_key(key)  # module-specific controls (e.g. openpilot wheel touch)
+
+            self._heartbeat = time.monotonic()
+
+    # ------------------------------------------------------------------ run
+    def run(self) -> None:
+        self._build()
+
+        # systemd sends SIGTERM on stop; a clean release of the camera + flushed
+        # logs must happen on that path too, not just Ctrl+C. (Handlers can only
+        # be installed from the main thread — tests drive run() from a worker.)
+        def _request_shutdown(signum, _frame):
+            log.info("received %s — shutting down", signal.Signals(signum).name)
+            self.shutdown.set()
+
+        if threading.current_thread() is threading.main_thread():
+            signal.signal(signal.SIGTERM, _request_shutdown)
+            signal.signal(signal.SIGINT, _request_shutdown)
+
+        self.supervisor.start_all()
+        self.health.start()
+        sdnotify.notify_ready()
+        log.info(
+            "runtime up: profile=%s module=%s display=%s accelerator=%s",
+            self.profile, self.module_name, self.display, accel.status()[1],
+        )
+
+        try:
+            if self.display:
+                # cv2.imshow must run on the main thread on macOS.
+                self._inference_loop(self.shutdown)
+            else:
+                while not self.shutdown.wait(0.5):
+                    pass
+        except KeyboardInterrupt:
+            print("\nSensorDyme: shutting down (Ctrl+C)")
+        finally:
+            sdnotify.notify_stopping()
+            self.shutdown.set()
+            self.health.stop()
+            self.supervisor.stop_all()
+            if self.uplink is not None:
+                self.uplink.close()
+            if self.dashboard is not None:
+                self.dashboard.close()
+            self.logger.close()
+            self.telemetry.close()
+            with self._module_lock:
+                self.module.close()
+            if self.camera is not None:
+                self.camera.release()
+            if self.display:
+                cv2.destroyAllWindows()
+            log.info("shutdown complete")
+
+
+def _apply_alert_overlay(view):
+    """Flash the frame red and stamp an ALERT banner on it (moved from main.py)."""
+    overlay = view.copy()
+    overlay[:] = (0, 0, 255)
+    view = cv2.addWeighted(overlay, 0.45, view, 0.55, 0)
+    cv2.putText(
+        view,
+        "ALERT",
+        (max(0, view.shape[1] // 2 - 90), 60),
+        cv2.FONT_HERSHEY_SIMPLEX,
+        1.6,
+        (255, 255, 255),
+        3,
+    )
+    return view

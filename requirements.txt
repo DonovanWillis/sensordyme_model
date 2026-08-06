@@ -1,0 +1,28 @@
+# SensorDyme core dependencies — installed on BOTH Mac (dev) and Raspberry Pi.
+# Python 3.11+ required (mediapipe does not yet support 3.13+).
+mediapipe==0.10.14
+ultralytics==8.3.28
+opencv-python==4.10.0.84
+numpy==1.26.4
+pyyaml==6.0.2
+matplotlib==3.9.2
+reportlab==4.2.5
+simpleaudio==1.0.4
+pytest==8.3.3
+anthropic==0.116.0 # mac_max VLM judge (provider: anthropic); harmless (unused) on the Pi
+requests==2.34.2 # mac_max VLM judge (providers: ollama / openai_compatible); already a transitive dep of ultralytics
+
+# --- Raspberry Pi only extras ---
+# These are installed separately by setup_pi.sh. picamera2 ships as an apt
+# package on Pi OS (python3-picamera2) and is NOT pip-installable on Mac;
+# gpiozero is likewise Pi-only. Do not add them above this line.
+#
+#   picamera2   (apt: python3-picamera2)
+#   gpiozero==2.0.1
+#   lgpio==0.2.2.0
+
+# openpilot driver-monitoring module (modules/driver_attention_openpilot.py).
+# Installs on both Mac (dev) and Pi (aarch64 wheels) — on the Pi with the NoIR camera at
+# dash height, the openpilot DM model runs close to its native training conditions
+# (IR driver-facing dash cam), unlike a laptop webcam.
+onnxruntime==1.27.0
