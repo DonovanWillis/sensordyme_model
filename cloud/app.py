@@ -138,6 +138,7 @@ def init_db() -> None:
             "ALTER TABLE users ADD COLUMN sms_on_loud INTEGER DEFAULT 1",
             "ALTER TABLE devices ADD COLUMN ai_rules TEXT",  # validated AI-configure proposal (JSON)
             "ALTER TABLE devices ADD COLUMN health TEXT",  # last device-reported health (JSON)
+            "ALTER TABLE devices ADD COLUMN zones TEXT",  # user-drawn areas (JSON)
         ):
             try:
                 conn.execute(statement)
@@ -194,6 +195,13 @@ def _rules_version(ai_rules_json: Optional[str]) -> str:
     if not ai_rules_json:
         return ""
     return hashlib.sha256(ai_rules_json.encode()).hexdigest()[:16]
+
+
+def _zones_version(zones_json: Optional[str]) -> str:
+    """Fingerprint of a device's zone set (empty when it has none)."""
+    if not zones_json or zones_json == "[]":
+        return ""
+    return hashlib.sha256(zones_json.encode()).hexdigest()[:16]
 
 
 def _rules_payload(ai_rules_json: Optional[str]) -> list[dict]:
@@ -295,6 +303,10 @@ class RenameBody(BaseModel):
     name: str
 
 
+class ZonesBody(BaseModel):
+    zones: list[dict] = []
+
+
 class IngestBody(BaseModel):
     events: list[dict] = []
     active_preset: Optional[str] = None
@@ -303,6 +315,7 @@ class IngestBody(BaseModel):
     # Fingerprint of the rule set the device is currently enforcing. Lets ingest
     # re-deliver rules only when they actually changed, instead of every poll.
     rules_version: Optional[str] = None
+    zones_version: Optional[str] = None
 
 
 class AIConfigureBody(BaseModel):
@@ -459,6 +472,69 @@ def set_preset(device_id: int, body: PresetBody, uid: int = Depends(current_user
         _owned_device(conn, device_id, uid)
         conn.execute("UPDATE devices SET desired_preset = ? WHERE id = ?", (body.preset, device_id))
     return {"ok": True, "desired_preset": body.preset}
+
+
+# ------------------------------------------------------------------------- zones
+# A zone is a named area the user draws over their own camera view. Rules about
+# places ("the kitchen", "the pool area", "this room") are meaningless without
+# them: a camera cannot know what a kitchen is, only that a person's feet are
+# inside a shape someone drew and named.
+#
+# Stored in normalised 0..1 coordinates so one drawing survives any change of
+# capture resolution, and delivered to the device over the same fingerprinted
+# command channel as rules.
+
+def _clean_zones(raw: list) -> list[dict]:
+    """Validate a zone list. Bad entries are dropped, not repaired.
+
+    A zone that arrives malformed would otherwise become an area of the wrong
+    shape silently watching the wrong part of a room, which is worse than the
+    rule plainly not working.
+    """
+    cleaned: list[dict] = []
+    for entry in raw or []:
+        if not isinstance(entry, dict):
+            continue
+        name = str(entry.get("name") or "").strip()
+        kind = str(entry.get("kind") or "restricted")
+        points = entry.get("polygon") or []
+        if not name or kind not in ("restricted", "safe", "boundary"):
+            continue
+        try:
+            polygon = [(float(p[0]), float(p[1])) for p in points]
+        except (TypeError, ValueError, IndexError):
+            continue
+        # Three points is the minimum that encloses an area; anything outside
+        # 0..1 is not a normalised coordinate and cannot be trusted.
+        if len(polygon) < 3 or not all(0.0 <= x <= 1.0 and 0.0 <= y <= 1.0 for x, y in polygon):
+            continue
+        cleaned.append({
+            "name": name,
+            "kind": kind,
+            "polygon": [[round(x, 4), round(y, 4)] for x, y in polygon],
+        })
+    return cleaned
+
+
+@app.get("/v1/devices/{device_id}/zones")
+def get_zones(device_id: int, uid: int = Depends(current_user)):
+    with db() as conn:
+        device = _owned_device(conn, device_id, uid)
+    try:
+        zones = json.loads(device["zones"] or "[]")
+    except (ValueError, TypeError):
+        zones = []
+    return {"zones": zones if isinstance(zones, list) else []}
+
+
+@app.post("/v1/devices/{device_id}/zones")
+def set_zones(device_id: int, body: ZonesBody, uid: int = Depends(current_user)):
+    zones = _clean_zones(body.zones)
+    rejected = len(body.zones or []) - len(zones)
+    with db() as conn:
+        _owned_device(conn, device_id, uid)
+        conn.execute("UPDATE devices SET zones = ? WHERE id = ?", (json.dumps(zones), device_id))
+    return {"ok": True, "zones": zones, "rejected": rejected}
 
 
 # ------------------------------------------------------------------------- AI configuration
@@ -862,9 +938,9 @@ def ingest(body: IngestBody, device: sqlite3.Row = Depends(current_device)):
                 ),
             )
         row = conn.execute(
-            "SELECT desired_preset, ai_rules FROM devices WHERE id = ?", (device["id"],)
+            "SELECT desired_preset, ai_rules, zones FROM devices WHERE id = ?", (device["id"],)
         ).fetchone()
-        desired, ai_rules_json = row["desired_preset"], row["ai_rules"]
+        desired, ai_rules_json, zones_json = row["desired_preset"], row["ai_rules"], row["zones"]
         # Convergence: once the device reports the desired preset as active, the
         # command is fulfilled — clear it. Without this, a stale desired_preset
         # keeps re-delivering forever and FIGHTS local mode switches made on the
@@ -892,5 +968,18 @@ def ingest(body: IngestBody, device: sqlite3.Row = Depends(current_device)):
         command = dict(command or {})
         command["set_rules"] = _rules_payload(ai_rules_json)
         command["rules_version"] = version
+
+    # Zones travel the same way rules do. A zone rule without its polygon is
+    # inert, so the two have to arrive by the same mechanism or a rule can be
+    # live on the device while the area it names is not.
+    zone_version = _zones_version(zones_json)
+    if zone_version and zone_version != (body.zones_version or ""):
+        command = dict(command or {})
+        try:
+            command["set_zones"] = json.loads(zones_json)
+        except (ValueError, TypeError):
+            command.pop("set_zones", None)
+        else:
+            command["zones_version"] = zone_version
 
     return {"ok": True, "stored": len(body.events), "command": command}

@@ -501,6 +501,18 @@ class DeviceRuntime:
             # `None` means no news; `[]` means the user deleted their rules and
             # enforcement must actually stop.
             if self.uplink is not None:
+                # Zones first: a rule that names an area is inert until the area
+                # exists, so applying rules before zones would leave a freshly
+                # activated rule silently doing nothing for one cycle.
+                new_zones = self.uplink.pop_pending_zones()
+                if new_zones is not None:
+                    zones = load_zones({
+                        z["name"]: {"polygon": z.get("polygon"), "kind": z.get("kind", "restricted")}
+                        for z in new_zones if isinstance(z, dict) and z.get("name")
+                    })
+                    self.rule_engine.set_zones(zones)
+                    print(f"zones: {len(zones)} area(s) active ({', '.join(z.name for z in zones) or 'none'})")
+
                 new_rules = self.uplink.pop_pending_rules()
                 if new_rules is not None:
                     self.rule_engine.replace_rules(new_rules)

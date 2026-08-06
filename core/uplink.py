@@ -34,6 +34,8 @@ class CloudUplink:
         self._rules_version: str = ""
         self._pending_rules: Optional[list[dict]] = None
         self._health: Optional[dict] = None
+        self._zones_version: str = ""
+        self._pending_zones: Optional[list[dict]] = None
         self._stop = threading.Event()
         self._connected = False
         import requests  # already a dependency (VLM judge backends)
@@ -80,6 +82,16 @@ class CloudUplink:
             pending, self._pending_preset = self._pending_preset, None
             return pending
 
+    def pop_pending_zones(self) -> Optional[list[dict]]:
+        """Zones drawn in the app, awaiting the main loop.
+
+        None means nothing new; `[]` means the user deleted their zones and
+        every area rule must stop matching rather than keep the old shapes.
+        """
+        with self._lock:
+            pending, self._pending_zones = self._pending_zones, None
+            return pending
+
     def pop_pending_rules(self) -> Optional[list[dict]]:
         """AI-configured rules awaiting the main loop, if a new set arrived.
 
@@ -104,6 +116,7 @@ class CloudUplink:
                     self._queue.clear()
                     active = self._active_preset
                     rules_version = self._rules_version
+                    zones_version = self._zones_version
                     health = self._health
                 # 1) push events (an empty batch doubles as the online heartbeat)
                 resp = self._requests.post(
@@ -112,6 +125,7 @@ class CloudUplink:
                         "events": batch,
                         "active_preset": active,
                         "rules_version": rules_version,
+                        "zones_version": zones_version,
                         "health": health,
                     },
                     headers=headers,
@@ -131,6 +145,11 @@ class CloudUplink:
                         # its next tick, and re-sending every poll until then
                         # would restart in-flight rule tracking each time.
                         self._rules_version = str(command.get("rules_version") or "")
+                if "set_zones" in command:
+                    zones = command.get("set_zones")
+                    with self._lock:
+                        self._pending_zones = zones if isinstance(zones, list) else []
+                        self._zones_version = str(command.get("zones_version") or "")
                 if not self._connected:
                     self._connected = True
                     print(f"cloud_uplink: connected to {self._base_url}")
