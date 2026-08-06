@@ -90,6 +90,8 @@ protocol BackendAPI {
     func aiConfigure(deviceID: Int, prompt: String) async throws -> AIProposal
     func setPhone(_ phone: String, smsOnLoud: Bool) async throws
     func renameDevice(deviceID: Int, name: String) async throws
+    func zones(deviceID: Int) async throws -> [MonitorZone]
+    func setZones(deviceID: Int, zones: [MonitorZone]) async throws
     func placeOrder(quantity: Int, address: String) async throws -> Int
     func orders() async throws -> [Order]
 }
@@ -101,6 +103,17 @@ private struct OrderPlacedResponse: Codable {
 extension APIClient: BackendAPI {
     func aiConfigure(deviceID: Int, prompt: String) async throws -> AIProposal {
         try await postJSON("v1/ai/configure", body: ["device_id": deviceID, "prompt": prompt])
+    }
+
+    func zones(deviceID: Int) async throws -> [MonitorZone] {
+        let response: ZonesResponse = try await getJSON("v1/devices/\(deviceID)/zones")
+        return response.zones
+    }
+
+    func setZones(deviceID: Int, zones: [MonitorZone]) async throws {
+        struct OK: Codable { let ok: Bool }
+        let payload = zones.map { ["name": $0.name, "kind": $0.kind, "polygon": $0.polygon] }
+        let _: OK = try await postJSON("v1/devices/\(deviceID)/zones", body: ["zones": payload])
     }
 
     func setPhone(_ phone: String, smsOnLoud: Bool) async throws {
@@ -138,6 +151,10 @@ extension APIClient: BackendAPI {
 /// delay), keeps history for reports, and answers AI configuration prompts.
 @MainActor
 final class MockAPI: BackendAPI {
+    /// Zones drawn during the walkthrough. In-memory only: the demo device
+    /// has no camera, so persisting them would outlive their meaning.
+    private var demoZones: [MonitorZone] = []
+
     static let shared = MockAPI()
 
     private var activePreset = "driver_distraction"
@@ -289,6 +306,11 @@ final class MockAPI: BackendAPI {
 
     func setNtfyTopic(_ topic: String) async throws {}
 
+    func zones(deviceID: Int) async throws -> [MonitorZone] { demoZones }
+
+
+    func setZones(deviceID: Int, zones: [MonitorZone]) async throws { demoZones = zones }
+
     func aiConfigure(deviceID: Int, prompt: String) async throws -> AIProposal {
         try await Task.sleep(for: .seconds(1.2))  // feels like a model thinking
 
@@ -366,6 +388,26 @@ final class MockAPI: BackendAPI {
 // MARK: - APIClient generic POST helper used by aiConfigure
 
 extension APIClient {
+    func getJSON<T: Decodable>(_ path: String) async throws -> T {
+        guard let baseURL else {
+            throw APIError(message: "No cloud backend configured. Open Settings → Cloud backend and enter your server's address.")
+        }
+        var req = URLRequest(url: baseURL.appendingPathComponent(path))
+        req.httpMethod = "GET"
+        req.timeoutInterval = 30
+        if let token { req.setValue("Bearer \(token)", forHTTPHeaderField: "Authorization") }
+        let (data, response) = try await URLSession.shared.data(for: req)
+        let status = (response as? HTTPURLResponse)?.statusCode ?? 0
+        guard status != 401 else {
+            throw APIError(message: "Your session has expired. Please sign in again.", isAuthFailure: true)
+        }
+        guard (200..<300).contains(status) else {
+            let detail = (try? JSONSerialization.jsonObject(with: data) as? [String: Any])?["detail"]
+            throw APIError(message: (detail as? String) ?? "request failed (\(status))")
+        }
+        return try JSONDecoder().decode(T.self, from: data)
+    }
+
     func postJSON<T: Decodable>(_ path: String, body: [String: Any]) async throws -> T {
         guard let baseURL else {
             throw APIError(message: "No cloud backend configured. Open Settings → Cloud backend and enter your server's address.")

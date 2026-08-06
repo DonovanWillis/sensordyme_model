@@ -10,6 +10,7 @@ struct DeviceDetailView: View {
     @State private var switchingTo: String?
     @State private var errorMessage: String?
     @State private var showAI = false
+    @State private var showZones = false
     @State private var showRename = false
     @State private var newName = ""
     @State private var hasLoaded = false
@@ -56,6 +57,11 @@ struct DeviceDetailView: View {
                     } label: {
                         Label("Rename device", systemImage: "pencil")
                     }
+                    Button {
+                        showZones = true
+                    } label: {
+                        Label("Areas", systemImage: "square.dashed")
+                    }
                     NavigationLink {
                         ReportsView(device: device)
                     } label: {
@@ -78,6 +84,9 @@ struct DeviceDetailView: View {
         }
         .sheet(isPresented: $showAI) {
             AIConfigureView(device: device) { await reload() }
+        }
+        .sheet(isPresented: $showZones) {
+            ZoneEditorView(device: device)
         }
         .refreshable { await reload() }
         .task { await reload() }

@@ -108,6 +108,43 @@ struct DeviceHealthReport: Codable, Hashable {
 
 struct DevicesResponse: Codable { let devices: [Device] }
 
+/// A named area drawn over the camera view, in normalised 0..1 coordinates so
+/// one drawing survives any change of capture resolution or phone screen size.
+struct MonitorZone: Codable, Identifiable, Hashable {
+    var name: String
+    var kind: String          // restricted | safe | boundary
+    var polygon: [[Double]]   // [[x, y], …]
+
+    var id: String { name }
+
+    /// What the device does with it, in the user's terms rather than the schema's.
+    var meaning: String {
+        switch kind {
+        case "safe": "Alert when someone leaves this area"
+        case "boundary": "Alert when someone crosses this line"
+        default: "Alert when someone enters this area"
+        }
+    }
+
+    var points: [CGPoint] {
+        polygon.compactMap { pair in
+            pair.count >= 2 ? CGPoint(x: pair[0], y: pair[1]) : nil
+        }
+    }
+
+    /// Three points is the minimum that encloses an area.
+    var isUsable: Bool { points.count >= 3 }
+
+    static func from(points: [CGPoint], name: String, kind: String) -> MonitorZone {
+        MonitorZone(
+            name: name, kind: kind,
+            polygon: points.map { [Double($0.x), Double($0.y)] }
+        )
+    }
+}
+
+struct ZonesResponse: Codable { let zones: [MonitorZone] }
+
 struct EventItem: Codable, Identifiable, Hashable {
     let timestamp: String
     let type: String
