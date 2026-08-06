@@ -101,3 +101,31 @@ def test_annotate_draws_without_camera(tmp_path):
     out = module.annotate(frame)
     assert out.shape == frame.shape
     assert out.sum() > 0  # zones + box + status text actually drawn
+
+
+# --------------------------------------------------------------- per-frame detection view
+def test_get_detections_exposes_people_with_boxes(monkeypatch):
+    """Zone and count rules need boxes and counts, which Events don't carry."""
+    module = _module()
+    monkeypatch.setattr(module, "_detect_people", lambda frame: [IN_CRIB])
+    module.process(np.zeros((H, W, 3), dtype=np.uint8))
+
+    frame = module.get_detections()
+    assert frame.size == (W, H)
+    assert frame.count("person") == 1
+    assert len(frame.boxes("person")) == 1
+
+
+def test_get_detections_defaults_confidence_for_stubbed_boxes(monkeypatch):
+    """Boxes from an override that reports no confidence count as certain, not dropped."""
+    module = _module()
+    monkeypatch.setattr(module, "_detect_people", lambda frame: [IN_CRIB])
+    module.process(np.zeros((H, W, 3), dtype=np.uint8))
+    assert module.get_detections().mean_confidence("person") == 1.0
+
+
+def test_get_detections_is_empty_before_any_frame():
+    module = _module()
+    frame = module.get_detections()
+    assert frame.count("person") == 0
+    assert frame.size == (0, 0)

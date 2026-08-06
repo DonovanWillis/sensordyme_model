@@ -52,6 +52,7 @@ import cv2
 import mediapipe as mp
 import numpy as np
 
+from core.detections import Detection, DetectionFrame
 from core.detectors import Box, get_yolo_model, iou
 from core.events import Event
 from modules.base import SustainedConditionTracker, VisionModule, register_module
@@ -508,6 +509,10 @@ class DriverAttentionModule(VisionModule):
         self._last_eating_boxes: list[Box] = []
         self._last_hand_boxes: list[Box] = []
         self._last_overlay_boxes: list[tuple[Box, str]] = []
+        # Parallel to _last_overlay_boxes. Kept separate rather than widening that
+        # tuple, which the annotate path unpacks as a pair.
+        self._last_overlay_confidences: list[float] = []
+        self._last_frame_size: tuple[int, int] = (0, 0)
         self._phone_visible_prev = False
         self._eating_visible_prev = False
         self._pending_phone_detected_edge = False
@@ -592,6 +597,7 @@ class DriverAttentionModule(VisionModule):
         phone_boxes: list[Box] = []
         eating_boxes: list[Box] = []
         overlay_boxes: list[tuple[Box, str]] = []
+        overlay_confidences: list[float] = []
         for result in results:
             for box in result.boxes:
                 class_id = int(box.cls[0])
@@ -600,6 +606,7 @@ class DriverAttentionModule(VisionModule):
                     continue
                 xyxy = tuple(int(v) for v in box.xyxy[0].tolist())
                 overlay_boxes.append((xyxy, self._yolo_model.names[class_id]))
+                overlay_confidences.append(float(box.conf[0]))
                 if event_type == "phone_detected":
                     phone_boxes.append(xyxy)
                 else:
@@ -619,6 +626,8 @@ class DriverAttentionModule(VisionModule):
         self._last_eating_boxes = eating_boxes
         self._last_hand_boxes = hand_boxes
         self._last_overlay_boxes = overlay_boxes
+        self._last_overlay_confidences = overlay_confidences
+        self._last_frame_size = (w, h)
         self._hand_overlaps_phone = any(
             iou(hand_box, phone_box) > self._hand_phone_iou_threshold
             for hand_box in hand_boxes
@@ -808,6 +817,34 @@ class DriverAttentionModule(VisionModule):
             events.append(Event.now(risk_event, 0.0, score, self.name))
 
         return events
+
+    def get_detections(self) -> DetectionFrame:
+        """Objects seen this stride tick, labelled with their YOLO class name.
+
+        Labels are the detector's own names ("cell phone", "bottle", ...) rather
+        than this module's event names, because a custom rule targets the *thing*
+        the user described, not the conclusion this module happens to draw from it.
+
+        Hands are excluded: they come from MediaPipe landmarks rather than a
+        detector with a comparable confidence, and a hand box means something
+        quite different from an object box.
+        """
+        width, height = self._last_frame_size
+        return DetectionFrame(
+            width=width,
+            height=height,
+            detections=tuple(
+                Detection(
+                    label=label,
+                    confidence=(
+                        self._last_overlay_confidences[i]
+                        if i < len(self._last_overlay_confidences) else 1.0
+                    ),
+                    box=tuple(float(v) for v in box),
+                )
+                for i, (box, label) in enumerate(self._last_overlay_boxes)
+            ),
+        )
 
     def get_telemetry_snapshot(self) -> Optional[dict]:
         """Raw per-frame signal snapshot for telemetry logging (future model-training data)."""
