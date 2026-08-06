@@ -29,6 +29,10 @@ class CloudUplink:
         self._lock = threading.Lock()
         self._active_preset: Optional[str] = None
         self._pending_preset: Optional[str] = None
+        # Rule set currently enforced, reported upstream so the backend only
+        # re-sends on a real change instead of on every poll.
+        self._rules_version: str = ""
+        self._pending_rules: Optional[list[dict]] = None
         self._stop = threading.Event()
         self._connected = False
         import requests  # already a dependency (VLM judge backends)
@@ -65,6 +69,16 @@ class CloudUplink:
             pending, self._pending_preset = self._pending_preset, None
             return pending
 
+    def pop_pending_rules(self) -> Optional[list[dict]]:
+        """AI-configured rules awaiting the main loop, if a new set arrived.
+
+        None means "nothing new" — distinct from `[]`, which means the user
+        deliberately cleared their rules and the device must stop enforcing them.
+        """
+        with self._lock:
+            pending, self._pending_rules = self._pending_rules, None
+            return pending
+
     @property
     def connected(self) -> bool:
         return self._connected
@@ -78,10 +92,15 @@ class CloudUplink:
                     batch = list(self._queue)
                     self._queue.clear()
                     active = self._active_preset
+                    rules_version = self._rules_version
                 # 1) push events (an empty batch doubles as the online heartbeat)
                 resp = self._requests.post(
                     f"{self._base_url}/v1/ingest",
-                    json={"events": batch, "active_preset": active},
+                    json={
+                        "events": batch,
+                        "active_preset": active,
+                        "rules_version": rules_version,
+                    },
                     headers=headers,
                     timeout=10,
                 )
@@ -91,6 +110,14 @@ class CloudUplink:
                 if command.get("set_preset"):
                     with self._lock:
                         self._pending_preset = command["set_preset"]
+                if "set_rules" in command:
+                    rules = command.get("set_rules")
+                    with self._lock:
+                        self._pending_rules = rules if isinstance(rules, list) else []
+                        # Acknowledge immediately: the main loop applies these on
+                        # its next tick, and re-sending every poll until then
+                        # would restart in-flight rule tracking each time.
+                        self._rules_version = str(command.get("rules_version") or "")
                 if not self._connected:
                     self._connected = True
                     print(f"cloud_uplink: connected to {self._base_url}")

@@ -20,6 +20,7 @@ Create device: .venv/bin/python cloud/manage.py create-device "Car unit"
 from __future__ import annotations
 
 import hashlib
+import json
 import os
 import secrets
 import sqlite3
@@ -166,6 +167,22 @@ def current_user(authorization: str = Header(default="")) -> int:
     return int(payload["uid"])
 
 
+def _rules_version(ai_rules_json: Optional[str]) -> str:
+    """Stable fingerprint of a device's stored rule set (empty when it has none)."""
+    if not ai_rules_json:
+        return ""
+    return hashlib.sha256(ai_rules_json.encode()).hexdigest()[:16]
+
+
+def _rules_payload(ai_rules_json: Optional[str]) -> list[dict]:
+    """The `rules` list out of a stored proposal, tolerant of anything malformed."""
+    try:
+        rules = json.loads(ai_rules_json or "{}").get("rules")
+    except (ValueError, TypeError, AttributeError):
+        return []
+    return [r for r in rules if isinstance(r, dict)] if isinstance(rules, list) else []
+
+
 def current_device(x_device_key: str = Header(default="")) -> sqlite3.Row:
     """FastAPI dependency: resolve X-Device-Key to a device row."""
     with db() as conn:
@@ -259,6 +276,9 @@ class RenameBody(BaseModel):
 class IngestBody(BaseModel):
     events: list[dict] = []
     active_preset: Optional[str] = None
+    # Fingerprint of the rule set the device is currently enforcing. Lets ingest
+    # re-deliver rules only when they actually changed, instead of every poll.
+    rules_version: Optional[str] = None
 
 
 class AIConfigureBody(BaseModel):
@@ -676,9 +696,10 @@ def ingest(body: IngestBody, device: sqlite3.Row = Depends(current_device)):
                     now,
                 ),
             )
-        desired = conn.execute("SELECT desired_preset FROM devices WHERE id = ?", (device["id"],)).fetchone()[
-            "desired_preset"
-        ]
+        row = conn.execute(
+            "SELECT desired_preset, ai_rules FROM devices WHERE id = ?", (device["id"],)
+        ).fetchone()
+        desired, ai_rules_json = row["desired_preset"], row["ai_rules"]
         # Convergence: once the device reports the desired preset as active, the
         # command is fulfilled — clear it. Without this, a stale desired_preset
         # keeps re-delivering forever and FIGHTS local mode switches made on the
@@ -697,4 +718,14 @@ def ingest(body: IngestBody, device: sqlite3.Row = Depends(current_device)):
     command = None
     if desired and desired != (body.active_preset or device["active_preset"]):
         command = {"set_preset": desired}
+
+    # Custom rules are configured in the app but enforced on the device, so they
+    # have to travel down this channel — without it a saved proposal changed the
+    # text in the app and nothing about what the camera actually watched for.
+    version = _rules_version(ai_rules_json)
+    if version and version != (body.rules_version or ""):
+        command = dict(command or {})
+        command["set_rules"] = _rules_payload(ai_rules_json)
+        command["rules_version"] = version
+
     return {"ok": True, "stored": len(body.events), "command": command}

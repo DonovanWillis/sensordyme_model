@@ -131,9 +131,22 @@ def test_full_customer_journey(backend):
     orders = client.get("/v1/orders", headers=auth).json()["orders"]
     assert len(orders) == 1 and orders[0]["quantity"] == 2
 
-    # 6f) preset with a variant flows through the command channel untouched
+    # 6f) preset with a variant flows through the command channel untouched.
+    # The fall rule configured in 6b also rides down on this poll: the device has
+    # not acknowledged a rules_version yet, and rules the user configured are
+    # useless until the device that enforces them actually receives them.
     client.post(f"/v1/devices/{device_id}/preset", json={"preset": "driver_distraction:teen_driver"}, headers=auth)
     r = client.post("/v1/ingest", json={"events": [], "active_preset": "elderly_monitoring"}, headers=device_headers)
+    command = r.json()["command"]
+    assert command["set_preset"] == "driver_distraction:teen_driver"
+    assert [rule["detection"] for rule in command["set_rules"]] == ["fall"]
+
+    # Once acknowledged, only the preset command remains outstanding.
+    r = client.post(
+        "/v1/ingest",
+        json={"events": [], "active_preset": "elderly_monitoring", "rules_version": command["rules_version"]},
+        headers=device_headers,
+    )
     assert r.json()["command"] == {"set_preset": "driver_distraction:teen_driver"}
 
     # 7) another user cannot see or control this device
