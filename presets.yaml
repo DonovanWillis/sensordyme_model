@@ -51,9 +51,9 @@ presets:
 
   security_monitoring:
     title: Security Monitoring
-    description: Person counting - alerts when the number of people in view changes.
+    description: Person counting, restricted zones, and lingering detection.
     module: occupancy
-    alert_types: [occupancy_change]
+    alert_types: [occupancy_change, zone_violation, person_lingering]
     variants:
       home: { title: Home }
       away:
@@ -63,6 +63,19 @@ presets:
         title: Package Watch
         overrides: { confidence_threshold: 0.35, confirm_frames: 2 }
 
+  baby_monitoring:
+    title: Baby Monitoring
+    description: Presence, safe/danger zones, and unusual-stillness alerts with staged confirmation.
+    module: baby_monitoring
+    alert_types: [zone_violation, safe_zone_exit, unusual_stillness, person_absent]
+    variants:
+      standard: { title: Standard }
+      nap_time:
+        title: Nap Time
+        overrides: { expect_presence: true, still_warning_s: 300 }
+      play_area:
+        title: Play Area
+        overrides: { still_warning_s: 60, zone_confirm_s: 1.5 }
+
   # Planned presets (modules not yet written; the app shows them as coming soon):
-  #   baby_monitoring:   face-covered / stillness / danger-zone detection
   #   exam_proctoring:   gaze-off-screen, second person, phone detection

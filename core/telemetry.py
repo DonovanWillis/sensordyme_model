@@ -65,18 +65,22 @@ class TelemetryLogger:
         if self._last_write_time is not None and (now - self._last_write_time) < self._interval_s:
             return False
         self._last_write_time = now
+        # Tolerant of per-module snapshot shapes: the schema is driver-centric
+        # (this file predates other modes), so absent keys log as zeros rather
+        # than crashing the inference loop when e.g. baby_monitoring supplies
+        # {person_count, motion_energy, ...} instead.
         self._writer.writerow(
             [
                 timestamp_iso,
                 module_name,
-                f"{snapshot['ear']:.4f}",
-                f"{snapshot['yaw_deg']:.2f}",
-                f"{snapshot['pitch_deg']:.2f}",
-                f"{snapshot['perclos']:.4f}",
-                f"{snapshot['risk_score']:.4f}",
-                int(snapshot["phone_visible"]),
-                snapshot["hand_count"],
-                int(snapshot["eating_visible"]),
+                f"{float(snapshot.get('ear', 0.0)):.4f}",
+                f"{float(snapshot.get('yaw_deg', 0.0)):.2f}",
+                f"{float(snapshot.get('pitch_deg', 0.0)):.2f}",
+                f"{float(snapshot.get('perclos', 0.0)):.4f}",
+                f"{float(snapshot.get('risk_score', 0.0)):.4f}",
+                int(snapshot.get("phone_visible", 0)),
+                snapshot.get("hand_count", 0),
+                int(snapshot.get("eating_visible", 0)),
             ]
         )
         self._file.flush()

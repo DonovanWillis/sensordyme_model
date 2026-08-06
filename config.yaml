@@ -97,6 +97,12 @@ logging:
 
 alerts:
   sinks: [console, sound, gpio_buzzer] # gpio_buzzer drives the piezo on the Pi device; skipped with a notice on Mac
+  # Evidence snapshots (PRIVACY: opt-in, and the ONLY exception to "frames are
+  # never written to disk"): when true, one annotated JPEG is saved locally per
+  # loud alert, bounded to evidence_max_files, never uploaded anywhere.
+  save_evidence: false
+  evidence_dir: data/evidence
+  evidence_max_files: 50
   cooldown_s: 15 # minimum seconds between two alerts of the same type (patient: don't re-alert too soon)
   escalation_window_s: 60 # repeat within this window -> continuous tone (event types not in loud/soft_types below)
   loud_types: [drowsiness, phone_use, eyes_down, attention_lost, high_risk, # always the loud/continuous tone
@@ -220,6 +226,30 @@ modules:
     confidence_threshold: 0.5 # YOLO person-detection confidence threshold
     confirm_frames: 3 # frames a new count must persist before it's emitted
     model_weights: yolo11n.pt # auto-downloaded by ultralytics on first run
+    # Optional security zones (normalized 0..1 coords; see core/zones.py).
+    # A person's feet inside a `restricted` zone -> zone_violation (sustained);
+    # staying past linger_s -> person_lingering. Example:
+    #   zones:
+    #     front_door: { polygon: [[0.6,0.2],[0.95,0.2],[0.95,0.9],[0.6,0.9]], kind: restricted }
+    zones: {}
+    zone_confirm_s: 2.0 # seconds inside a zone before zone_violation confirms
+    linger_s: 30.0 # seconds inside a zone before person_lingering confirms
+
+  baby_monitoring:
+    confidence_threshold: 0.4 # YOLO person-detection confidence (children are smaller/lower-conf)
+    detect_every_n_frames: 2 # run detection every Nth frame (motion runs every frame)
+    model_weights: yolo11n.pt
+    still_warning_s: 120 # unusually-still warning after this many seconds of low motion
+    still_max_motion: 0.015 # motion-energy floor below which the subject counts as "still"
+    absence_warning_s: 30 # person_absent confirms after this long (only if expect_presence)
+    expect_presence: false # true = alert when nobody is visible (e.g. nap monitoring)
+    zone_confirm_s: 2.0
+    # Safe zone = where the child should stay (crib/play area): leaving it alerts.
+    # Restricted zones = user-drawn danger areas (stairs/pool/stove): entering alerts.
+    #   zones:
+    #     crib:   { polygon: [[0.2,0.2],[0.8,0.2],[0.8,0.9],[0.2,0.9]], kind: safe }
+    #     stairs: { polygon: [[0.0,0.5],[0.15,0.5],[0.15,1.0],[0.0,1.0]], kind: restricted }
+    zones: {}
 
   fall_detection:
     drop_velocity_threshold: 0.6 # fraction of frame-height/sec that counts as a "rapid drop"

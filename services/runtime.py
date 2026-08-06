@@ -100,6 +100,13 @@ class DeviceRuntime:
         self.debug = debug
         self.window_name = window_name
 
+        alerts_cfg = config.get("alerts", {}) if isinstance(config.get("alerts"), dict) else {}
+        self._evidence_dir: Optional[Path] = (
+            Path(str(alerts_cfg.get("evidence_dir", "data/evidence")))
+            if bool(alerts_cfg.get("save_evidence", False)) else None
+        )
+        self._evidence_max = int(alerts_cfg.get("evidence_max_files", 50))
+
         self.bus = FrameBus()
         self.shutdown = threading.Event()
         self._module_lock = threading.Lock()  # guards module swaps vs. the inference loop
@@ -377,6 +384,7 @@ class DeviceRuntime:
             with self._module_lock:
                 module = self.module
             events = module.process(frame)
+            evidence_due = False
             for event in events:
                 self.logger.log(event)
                 if event.type in self.alert_event_types:
@@ -386,10 +394,18 @@ class DeviceRuntime:
                     else "soft" if event.type in self.soft_types or event.type in self.alert_event_types
                     else "log"
                 )
+                if severity == "loud":
+                    evidence_due = True
                 if self.dashboard is not None:
                     self.dashboard.push_event(event, severity)
                 if self.uplink is not None and event.type in self.alert_event_types:
                     self.uplink.push_event(event, severity)
+
+            # Evidence snapshots: OPT-IN (alerts.save_evidence), local-disk only,
+            # bounded count — the single, deliberate exception to "frames are never
+            # written to disk", captured only at the moment of a loud alert.
+            if evidence_due and self._evidence_dir is not None:
+                self._save_evidence(module, frame, events)
 
             snapshot = module.get_telemetry_snapshot()
             if snapshot is not None:
@@ -426,6 +442,22 @@ class DeviceRuntime:
                     module.handle_key(key)  # module-specific controls (e.g. openpilot wheel touch)
 
             self._heartbeat = time.monotonic()
+
+    # ------------------------------------------------------------------ evidence
+    def _save_evidence(self, module, frame, events) -> None:
+        """Write one annotated snapshot for a loud alert (opt-in, bounded, local-only)."""
+        try:
+            self._evidence_dir.mkdir(parents=True, exist_ok=True)
+            view = module.annotate(frame.copy())
+            stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S")
+            types = "+".join(sorted({e.type for e in events}))[:60] or "alert"
+            cv2.imwrite(str(self._evidence_dir / f"{stamp}_{types}.jpg"), view)
+            # Bounded retention: newest N only.
+            files = sorted(self._evidence_dir.glob("*.jpg"))
+            for old in files[:-self._evidence_max]:
+                old.unlink(missing_ok=True)
+        except Exception as exc:  # noqa: BLE001 - evidence must never break detection
+            log.warning("evidence snapshot failed: %s", exc)
 
     # ------------------------------------------------------------------ run
     def run(self) -> None:

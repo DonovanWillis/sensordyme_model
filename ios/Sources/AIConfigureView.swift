@@ -115,26 +115,47 @@ struct AIConfigureView: View {
                 .font(.subheadline)
 
             if !proposal.rules.isEmpty {
-                VStack(alignment: .leading, spacing: 6) {
-                    ForEach(proposal.rules, id: \.self) { rule in
-                        Label(rule, systemImage: "bolt.fill")
-                            .font(.caption)
-                            .foregroundStyle(.secondary)
+                VStack(alignment: .leading, spacing: 8) {
+                    ForEach(proposal.rules, id: \.detection) { rule in
+                        HStack(alignment: .top, spacing: 8) {
+                            Image(systemName: rule.severity == "critical" ? "bolt.fill" : "bell.fill")
+                                .font(.caption)
+                                .foregroundStyle(rule.severity == "critical" ? .red : .orange)
+                                .padding(.top, 2)
+                            VStack(alignment: .leading, spacing: 2) {
+                                Text(rule.description).font(.caption)
+                                Text(ruleDetail(rule))
+                                    .font(.caption2.monospaced())
+                                    .foregroundStyle(.secondary)
+                            }
+                        }
                     }
                 }
             }
 
-            if !proposal.settings.isEmpty {
-                ScrollView(.horizontal, showsIndicators: false) {
-                    HStack(spacing: 6) {
-                        ForEach(proposal.settings.sorted(by: { $0.key < $1.key }), id: \.key) { key, value in
-                            Text("\(key): \(value)")
-                                .font(.caption2.monospaced())
-                                .padding(.horizontal, 10).padding(.vertical, 6)
-                                .background(Capsule().fill(.thinMaterial))
+            // The honest part: what the device can't do, and what it would take.
+            if !proposal.unsupported.isEmpty {
+                VStack(alignment: .leading, spacing: 8) {
+                    Label("Not possible with this camera", systemImage: "exclamationmark.triangle")
+                        .font(.caption.bold())
+                        .foregroundStyle(.orange)
+                    ForEach(proposal.unsupported, id: \.request) { item in
+                        VStack(alignment: .leading, spacing: 2) {
+                            Text(item.request).font(.caption)
+                            Text("\(item.reason) — needs \(item.requires)")
+                                .font(.caption2)
+                                .foregroundStyle(.secondary)
                         }
                     }
                 }
+                .padding(10)
+                .background(RoundedRectangle(cornerRadius: 12).fill(.orange.opacity(0.08)))
+            }
+
+            if proposal.source == "fallback" {
+                Label("Configured offline (AI service unavailable) — using safe defaults", systemImage: "wifi.slash")
+                    .font(.caption2)
+                    .foregroundStyle(.secondary)
             }
 
             if !applied {
@@ -150,6 +171,15 @@ struct AIConfigureView: View {
         .background(RoundedRectangle(cornerRadius: 20).fill(.background.secondary))
         .overlay(RoundedRectangle(cornerRadius: 20).strokeBorder(Brand.gradient, lineWidth: 1.5))
         .transition(.move(edge: .bottom).combined(with: .opacity))
+    }
+
+    private func ruleDetail(_ rule: AIRule) -> String {
+        var parts: [String] = ["\(rule.detection)"]
+        if !rule.zone.isEmpty { parts.append("zone: \(rule.zone) (draw it in device settings)") }
+        if rule.persist_s > 0 { parts.append("after \(Int(rule.persist_s))s") }
+        if !rule.schedule.isEmpty { parts.append("hours \(rule.schedule) (scheduling coming soon)") }
+        parts.append("cooldown \(Int(rule.cooldown_s))s")
+        return parts.joined(separator: " · ")
     }
 
     private func configure() {

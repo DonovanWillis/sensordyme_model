@@ -92,6 +92,7 @@ def init_db() -> None:
         for statement in (
             "ALTER TABLE users ADD COLUMN phone TEXT",
             "ALTER TABLE users ADD COLUMN sms_on_loud INTEGER DEFAULT 1",
+            "ALTER TABLE devices ADD COLUMN ai_rules TEXT",  # validated AI-configure proposal (JSON)
         ):
             try:
                 conn.execute(statement)
@@ -370,87 +371,237 @@ def set_preset(device_id: int, body: PresetBody, uid: int = Depends(current_user
 
 
 # ------------------------------------------------------------------------- AI configuration
-_AI_SYSTEM_PROMPT = (
-    "You configure a SensorDyme monitoring device from a user's plain-language request. "
-    "Available presets: driver_distraction, driver_distraction_openpilot, baby_monitoring, "
-    "elderly_monitoring, security_monitoring. Answer ONLY a JSON object: "
-    '{"preset": "<one of the presets>", "explanation": "<2-3 friendly sentences on what you set up>", '
-    '"settings": {"<setting>": "<value>", ...}, "rules": ["<alert rule>", ...]}'
+# Natural language -> a validated detection configuration. The pipeline is:
+#   1. Claude (structured outputs) proposes {preset, rules[], settings, unsupported[]}
+#      grounded in the device's real capability taxonomy (core/taxonomy.py);
+#   2. _validate_proposal re-checks every rule against the taxonomy server-side —
+#      the model cannot claim a detection the device doesn't support;
+#   3. anything unsupported comes back with WHY and what it would need, instead
+#      of being silently accepted.
+# Without an ANTHROPIC_API_KEY the deterministic keyword fallback still returns
+# valid (if less nuanced) configurations, so the demo never dies with the network.
+
+_MODES = (
+    "driver_distraction", "driver_distraction_openpilot", "baby_monitoring",
+    "elderly_monitoring", "security_monitoring",
 )
 
+_RULE_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "detection": {"type": "string", "description": "A detection id from the capability sheet"},
+        "description": {"type": "string", "description": "Human-readable restatement of the user's rule"},
+        "zone": {"type": "string", "description": "Zone name the user must draw for area rules; empty if none"},
+        "persist_s": {"type": "number", "description": "Seconds the condition must hold before alerting"},
+        "min_count": {"type": "integer", "description": "Occurrences required within the window (usually 1)"},
+        "confidence": {"type": "number", "description": "Minimum detection confidence 0-1"},
+        "severity": {"type": "string", "enum": ["info", "warning", "critical"]},
+        "cooldown_s": {"type": "number", "description": "Seconds between repeat notifications"},
+        "schedule": {"type": "string", "description": "Active hours like '23:00-06:00', or empty for always"},
+        "notify": {"type": "string", "enum": ["push", "sms", "silent"]},
+    },
+    "required": ["detection", "description", "zone", "persist_s", "min_count", "confidence",
+                 "severity", "cooldown_s", "schedule", "notify"],
+    "additionalProperties": False,
+}
+
+_PROPOSAL_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "preset": {"type": "string", "enum": list(_MODES)},
+        "variant": {"type": "string", "description": "Preset variant name, or empty for standard"},
+        "explanation": {"type": "string", "description": "2-3 friendly sentences on what was set up"},
+        "rules": {"type": "array", "items": _RULE_SCHEMA},
+        "settings": {
+            "type": "object",
+            "description": "Module threshold overrides as string key/value pairs",
+            "additionalProperties": False,
+            "properties": {},
+        },
+        "unsupported": {
+            "type": "array",
+            "description": "Parts of the request the device cannot reliably do",
+            "items": {
+                "type": "object",
+                "properties": {
+                    "request": {"type": "string"},
+                    "reason": {"type": "string"},
+                    "requires": {"type": "string", "description": "What hardware/model/setup would enable it"},
+                },
+                "required": ["request", "reason", "requires"],
+                "additionalProperties": False,
+            },
+        },
+    },
+    "required": ["preset", "variant", "explanation", "rules", "settings", "unsupported"],
+    "additionalProperties": False,
+}
+
+
+def _taxonomy():
+    """core.taxonomy, imported lazily so the cloud backend can also run standalone."""
+    try:
+        from core import taxonomy
+        return taxonomy
+    except ImportError:
+        return None
+
+
+def _ai_system_prompt() -> str:
+    tax = _taxonomy()
+    capability_sheet = tax.summary_for_llm() if tax else ""
+    return (
+        "You translate a user's plain-language monitoring request into a configuration for "
+        "SensorDyme, a privacy-first camera device (all video stays on the device; only events "
+        "leave it). Pick the best preset, then express the user's specific wishes as structured "
+        "rules using ONLY detection ids from the capability sheet below.\n\n"
+        "HONESTY RULES (these are the product's core promise):\n"
+        "- Only use detections marked SUPPORTED or PARTIAL. If part of the request needs an "
+        "UNSUPPORTED/PLANNED detection, put it in `unsupported` with the reason and what it "
+        "would require — never pretend the device can do it.\n"
+        "- Area rules ('near the pool', 'in the storage room') use a zone the user must draw in "
+        "the app: name the zone in the rule and mention drawing it in the explanation.\n"
+        "- Time rules ('after 11pm') go in `schedule`; note in the explanation that scheduled "
+        "enforcement is coming and the rule alerts at all hours until then.\n"
+        "- Never claim identity, intent, intoxication, or medical conditions from appearance.\n"
+        "- Prefer conservative persistence (>=2s) and sensible cooldowns (>=30s) so users are "
+        "not flooded; single ambiguous frames must never alert.\n\n"
+        "CAPABILITY SHEET:\n" + capability_sheet
+    )
+
+
+def _ai_configure_llm(prompt: str) -> Optional[dict]:
+    """Ask Claude for a structured configuration proposal (None -> keyword fallback)."""
+    if not os.environ.get("ANTHROPIC_API_KEY"):
+        return None
+    try:
+        import anthropic
+
+        client = anthropic.Anthropic()
+        response = client.messages.create(
+            model=os.environ.get("SENSORDYME_AI_MODEL", "claude-opus-5"),
+            max_tokens=2048,
+            output_config={
+                "format": {"type": "json_schema", "schema": _PROPOSAL_SCHEMA},
+                "effort": "low",  # interactive endpoint; schema does the heavy lifting
+            },
+            system=_ai_system_prompt(),
+            messages=[{"role": "user", "content": prompt}],
+        )
+        if response.stop_reason == "refusal":
+            return None
+        import json as _json
+
+        text = next(b.text for b in response.content if b.type == "text")
+        data = _json.loads(text)
+        data["source"] = "claude"
+        return data
+    except Exception:  # noqa: BLE001 - the keyword fallback must keep the feature alive
+        return None
+
+
 _AI_FALLBACKS = [
-    (("baby", "infant", "crib", "nursery"), "baby_monitoring",
-     "Baby Monitoring: face-covered detection at maximum sensitivity, crying alerts on."),
+    (("baby", "infant", "crib", "nursery", "toddler"), "baby_monitoring",
+     "Baby Monitoring: presence, safe/danger zones, and unusual-stillness alerts. Draw a safe "
+     "zone around the crib (and any danger zones) in the app to enable area alerts.",
+     [("unusual_stillness", "Alert if unusually still for a long period", 120.0, "warning")]),
     (("fall", "elder", "senior", "grandma", "grandpa"), "elderly_monitoring",
-     "Elderly Monitoring: immediate fall alerts plus a daytime inactivity check."),
-    (("security", "intruder", "door", "package", "burglar"), "security_monitoring",
-     "Security: alerts whenever the number of people in view changes."),
+     "Elderly Monitoring: immediate fall alerts (rapid drop then stillness — sitting down "
+     "won't trigger it), staying active until movement resumes.",
+     [("fall", "Alert immediately on a confirmed fall", 1.5, "critical")]),
+    (("security", "intruder", "door", "burglar", "lurk", "linger", "trespass"), "security_monitoring",
+     "Security: person-count changes, plus restricted-zone and lingering alerts once you draw "
+     "zones in the app.",
+     [("zone_violation", "Alert when someone enters a restricted zone", 2.0, "critical")]),
     (("drive", "driving", "car", "phone", "drowsy", "road"), "driver_distraction",
-     "Driver Distraction: loud alerts for phone use while looking away and sustained eye closure."),
+     "Driver Distraction: loud alerts for phone use while looking away and sustained eye closure.",
+     [("phone_use", "Alert on sustained phone use while driving", 2.0, "critical")]),
 ]
 
 
 def _ai_fallback(prompt: str) -> dict:
-    """Deterministic keyword configuration when no LLM key is configured."""
+    """Deterministic keyword configuration when Claude is unavailable. Returns the
+    same structured shape, honestly labeled with source=fallback."""
     lowered = prompt.lower()
-    for keywords, preset, explanation in _AI_FALLBACKS:
+    for keywords, preset, explanation, rules in _AI_FALLBACKS:
         if any(k in lowered for k in keywords):
-            return {"preset": preset, "explanation": explanation, "settings": {}, "rules": [f"From: {prompt}"]}
+            return {
+                "preset": preset, "variant": "", "explanation": explanation,
+                "rules": [
+                    {"detection": det, "description": desc, "zone": "", "persist_s": persist,
+                     "min_count": 1, "confidence": 0.6, "severity": sev, "cooldown_s": 60.0,
+                     "schedule": "", "notify": "push"}
+                    for det, desc, persist, sev in rules
+                ],
+                "settings": {}, "unsupported": [], "source": "fallback",
+            }
     return {
-        "preset": "driver_distraction",
-        "explanation": f"Kept the default mode and added your rule: {prompt}",
-        "settings": {},
-        "rules": [f"Notify when: {prompt}"],
+        "preset": "security_monitoring", "variant": "", "rules": [], "settings": {},
+        "explanation": (
+            "I couldn't confidently match that to the device's capabilities without the AI "
+            "service. I've selected Security Monitoring as a safe default — try rephrasing, "
+            "or pick a mode manually."
+        ),
+        "unsupported": [{
+            "request": prompt,
+            "reason": "no keyword match and the AI service is not configured",
+            "requires": "an ANTHROPIC_API_KEY on the backend, or a manual mode selection",
+        }],
+        "source": "fallback",
     }
 
 
-def _ai_configure_llm(prompt: str) -> Optional[dict]:
-    """Ask an LLM (Gemini via its OpenAI-compatible endpoint) for a configuration."""
-    import json as _json
-
-    api_key = os.environ.get("GEMINI_API_KEY")
-    if not api_key:
-        return None
-    try:
-        import requests
-
-        resp = requests.post(
-            "https://generativelanguage.googleapis.com/v1beta/openai/chat/completions",
-            json={
-                "model": os.environ.get("SENSORDYME_AI_MODEL", "gemini-3.1-flash-lite"),
-                "max_tokens": 1024,
-                "messages": [
-                    {"role": "system", "content": _AI_SYSTEM_PROMPT},
-                    {"role": "user", "content": prompt},
-                ],
-            },
-            headers={"Authorization": f"Bearer {api_key}"},
-            timeout=45,
-        )
-        resp.raise_for_status()
-        text = resp.json()["choices"][0]["message"]["content"].strip()
-        if text.startswith("```"):
-            text = text.strip("`").removeprefix("json").strip()
-        data = _json.loads(text)
-        if data.get("preset") not in {p for _, p, _ in [(k, p, e) for k, p, e in _AI_FALLBACKS]} | {
-            "driver_distraction_openpilot", "driver_distraction",
-        }:
-            return None
-        return {
-            "preset": data["preset"],
-            "explanation": str(data.get("explanation", "")),
-            "settings": {str(k): str(v) for k, v in (data.get("settings") or {}).items()},
-            "rules": [str(r) for r in (data.get("rules") or [])],
-        }
-    except Exception:  # noqa: BLE001 - fall back to keywords on any LLM failure
-        return None
+def _validate_proposal(data: dict) -> dict:
+    """Server-side enforcement of the taxonomy: the LLM's claims are re-checked here.
+    Rules naming unsupported/unknown detections are MOVED to `unsupported` with the
+    real reason — the device never receives a rule it can't execute."""
+    tax = _taxonomy()
+    preset = data.get("preset") if data.get("preset") in _MODES else "security_monitoring"
+    valid_rules, unsupported = [], list(data.get("unsupported") or [])
+    for rule in data.get("rules") or []:
+        det_id = str(rule.get("detection", ""))
+        det = tax.find(preset, det_id) if tax else None
+        if tax and det is None:
+            unsupported.append({
+                "request": str(rule.get("description", det_id)),
+                "reason": f"'{det_id}' is not a detection {preset} provides",
+                "requires": "see the capability matrix (docs/DETECTIONS.md)",
+            })
+            continue
+        if det is not None and det.support not in ("supported", "partial"):
+            unsupported.append({
+                "request": str(rule.get("description", det_id)),
+                "reason": f"'{det_id}' is {det.support} on this device",
+                "requires": det.requires or "future model/hardware support",
+            })
+            continue
+        rule["persist_s"] = max(0.5, min(3600.0, float(rule.get("persist_s", 2.0) or 2.0)))
+        rule["confidence"] = max(0.2, min(0.95, float(rule.get("confidence", 0.6) or 0.6)))
+        rule["cooldown_s"] = max(10.0, min(86400.0, float(rule.get("cooldown_s", 60.0) or 60.0)))
+        rule["min_count"] = max(1, min(100, int(rule.get("min_count", 1) or 1)))
+        if rule.get("severity") not in ("info", "warning", "critical"):
+            rule["severity"] = "warning"
+        if det is not None and det.caveat:
+            rule["description"] = f"{rule.get('description', '')} (note: {det.caveat})"
+        valid_rules.append(rule)
+    data["preset"] = preset
+    data["rules"] = valid_rules
+    data["unsupported"] = unsupported
+    return data
 
 
 @app.post("/v1/ai/configure")
 def ai_configure(body: AIConfigureBody, uid: int = Depends(current_user)):
     with db() as conn:
         _owned_device(conn, body.device_id, uid)
-    result = _ai_configure_llm(body.prompt) or _ai_fallback(body.prompt)
+    result = _validate_proposal(_ai_configure_llm(body.prompt) or _ai_fallback(body.prompt))
+    # Persist the validated proposal on the device so the app's Apply (set_preset)
+    # and future device-side rule sync both have it.
+    import json as _json
+
+    with db() as conn:
+        conn.execute("UPDATE devices SET ai_rules = ? WHERE id = ?",
+                     (_json.dumps(result), body.device_id))
     return result
 
 
@@ -485,6 +636,13 @@ def ingest(body: IngestBody, device: sqlite3.Row = Depends(current_device)):
         desired = conn.execute("SELECT desired_preset FROM devices WHERE id = ?", (device["id"],)).fetchone()[
             "desired_preset"
         ]
+        # Convergence: once the device reports the desired preset as active, the
+        # command is fulfilled — clear it. Without this, a stale desired_preset
+        # keeps re-delivering forever and FIGHTS local mode switches made on the
+        # device/dashboard (the device flips back within one poll interval).
+        if desired and desired == (body.active_preset or device["active_preset"]):
+            conn.execute("UPDATE devices SET desired_preset = NULL WHERE id = ?", (device["id"],))
+            desired = None
 
     for e in body.events:
         if e.get("severity") == "loud" and owner is not None:

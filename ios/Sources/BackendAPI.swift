@@ -2,11 +2,36 @@ import Foundation
 
 // MARK: - Shared API surface, so the app runs identically against the real cloud or the demo device.
 
+/// One validated detection rule from Configure-with-AI. Every field was checked
+/// server-side against the device's capability taxonomy before reaching the app.
+struct AIRule: Codable, Equatable {
+    let detection: String     // taxonomy id, e.g. "zone_violation"
+    let description: String
+    let zone: String          // zone the user must draw, or ""
+    let persist_s: Double
+    let min_count: Int
+    let confidence: Double
+    let severity: String      // info | warning | critical
+    let cooldown_s: Double
+    let schedule: String      // "23:00-06:00" or "" (enforcement planned)
+    let notify: String        // push | sms | silent
+}
+
+/// A part of the request the device honestly cannot do, with why and what it'd take.
+struct AIUnsupported: Codable, Equatable {
+    let request: String
+    let reason: String
+    let requires: String
+}
+
 struct AIProposal: Codable, Equatable {
     let preset: String
+    let variant: String
     let explanation: String
+    let rules: [AIRule]
     let settings: [String: String]
-    let rules: [String]
+    let unsupported: [AIUnsupported]
+    let source: String        // "claude" | "fallback" — shown so demos are honest
 }
 
 protocol BackendAPI {
@@ -211,44 +236,79 @@ final class MockAPI: BackendAPI {
         let p = prompt.lowercased()
 
         func has(_ words: String...) -> Bool { words.contains { p.contains($0) } }
+        func rule(_ det: String, _ desc: String, zone: String = "", persist: Double = 2,
+                  severity: String = "warning", cooldown: Double = 60) -> AIRule {
+            AIRule(detection: det, description: desc, zone: zone, persist_s: persist,
+                   min_count: 1, confidence: 0.6, severity: severity, cooldown_s: cooldown,
+                   schedule: "", notify: "push")
+        }
 
         if has("baby", "infant", "crib", "nursery") {
             return AIProposal(
-                preset: "baby_monitoring",
-                explanation: "Switching to Baby Monitoring. Face-covered detection is set to maximum sensitivity, crying alerts are on, and I added a quiet-hours rule so soft alerts don't buzz your phone overnight — face-covered alerts always come through.",
-                settings: ["face_covered_sensitivity": "high", "cry_alerts": "on", "movement_log": "on"],
-                rules: ["Loud alert if face stays covered > 3s", "Soft alert on sustained crying", "Quiet hours 10pm–7am for soft alerts"]
+                preset: "baby_monitoring", variant: "nap_time",
+                explanation: "Switching to Baby Monitoring (Nap Time). You'll be alerted if the baby leaves the safe zone you draw around the crib, or is unusually still for 5 minutes. Crying and face-covered detection aren't supported by the camera alone — listed below with what they'd need.",
+                rules: [
+                    rule("safe_zone_exit", "Alert if the baby leaves the crib zone", zone: "crib", severity: "critical"),
+                    rule("unusual_stillness", "Alert after 5 minutes of unusual stillness", persist: 300),
+                ],
+                settings: [:],
+                unsupported: [
+                    AIUnsupported(request: "Crying alerts", reason: "the device has no microphone",
+                                  requires: "a microphone + audio classifier"),
+                    AIUnsupported(request: "Face-covered detection",
+                                  reason: "adult face models aren't reliable enough on infants for a safety claim",
+                                  requires: "an infant-specific vision model"),
+                ],
+                source: "demo"
             )
         }
         if has("fall", "elder", "grandma", "grandpa", "senior") {
             return AIProposal(
-                preset: "elderly_monitoring",
-                explanation: "Switching to Elderly Monitoring. Fall detection alerts immediately, and I added an inactivity check — if no movement is seen for 30 minutes during the day, you get a soft alert.",
-                settings: ["fall_alerts": "immediate", "inactivity_window": "30 min", "night_mode": "reduced"],
-                rules: ["Loud alert on fall (drop + stillness)", "Soft alert after 30 min daytime inactivity"]
+                preset: "elderly_monitoring", variant: "standard",
+                explanation: "Switching to Elderly Monitoring. A confirmed fall — rapid drop then stillness, so sitting down never triggers it — alerts immediately and stays active until movement resumes.",
+                rules: [
+                    rule("fall", "Loud alert on a confirmed fall", persist: 1.5, severity: "critical", cooldown: 30),
+                    rule("stillness", "Warn after 30 minutes without movement", persist: 1800),
+                ],
+                settings: [:], unsupported: [], source: "demo"
             )
         }
         if has("security", "intruder", "burglar", "door", "package") {
             return AIProposal(
-                preset: "security_monitoring",
-                explanation: "Switching to Security. You'll get an alert whenever the number of people in view changes, with a loud alert if someone lingers in the entry zone.",
-                settings: ["person_alerts": "on_change", "linger_threshold": "30s"],
-                rules: ["Soft alert on occupancy change", "Loud alert if a person lingers > 30s"]
+                preset: "security_monitoring", variant: "away",
+                explanation: "Switching to Security (Away). Person-count changes alert immediately; draw a zone over the entry and lingering there past 30 seconds triggers a loud alert. Package tracking isn't supported yet — noted below.",
+                rules: [
+                    rule("person_detected", "Alert when the number of people changes", persist: 1, cooldown: 30),
+                    rule("person_lingering", "Loud alert if someone lingers in the entry zone", zone: "entry", persist: 30, severity: "critical"),
+                ],
+                settings: [:],
+                unsupported: has("package") ? [
+                    AIUnsupported(request: "Package placed/removed alerts",
+                                  reason: "needs object-permanence tracking against a scene baseline",
+                                  requires: "a custom-trained package model"),
+                ] : [],
+                source: "demo"
             )
         }
         if has("drive", "driving", "car", "phone", "drowsy", "road") {
             return AIProposal(
-                preset: "driver_distraction",
-                explanation: "Switching to Driver Distraction. Phone use while looking away triggers the loudest alert within about a second; drowsiness fires on 1.5s of sustained eye closure. I kept mirror-check tolerance on so quick glances never alarm.",
-                settings: ["phone_alerts": "loud", "drowsy_seconds": "1.5", "glance_tolerance": "on"],
-                rules: ["Loud alert on phone-in-hand while eyes off road", "Loud alert on sustained eye closure", "No alert for brief mirror checks"]
+                preset: "driver_distraction", variant: "strict",
+                explanation: "Switching to Driver Distraction (Strict). Phone use while looking away triggers the loudest alert within a second; drowsiness fires on sustained eye closure. Quick mirror checks never alarm — that's built into the glance tolerance.",
+                rules: [
+                    rule("phone_use", "Loud alert on phone use while eyes off road", persist: 1, severity: "critical", cooldown: 30),
+                    rule("eyes_closed", "Loud alert on sustained eye closure", persist: 1.5, severity: "critical", cooldown: 30),
+                ],
+                settings: [:], unsupported: [], source: "demo"
             )
         }
         return AIProposal(
-            preset: activePreset,
-            explanation: "I kept the current mode and tuned it to your request: \"\(prompt)\". Alerts matching that description are set to notify you immediately; everything else stays log-only.",
-            settings: ["custom_rule": "enabled"],
-            rules: ["Notify immediately when: \(prompt)"]
+            preset: activePreset, variant: "",
+            explanation: "I kept the current mode. I couldn't map \"\(prompt)\" onto a detection this camera reliably supports — the honest gaps are listed below.",
+            rules: [], settings: [:],
+            unsupported: [AIUnsupported(request: prompt,
+                                        reason: "no matching detection in this mode's capability set",
+                                        requires: "see the capability matrix, or rephrase using presence, zones, stillness, phone use, or falls")],
+            source: "demo"
         )
     }
 }

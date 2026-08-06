@@ -7,17 +7,25 @@ struct FeedCard: View {
     let device: Device
     let alertActive: Bool
 
+    private var isLiveFeed: Bool {
+        !state.isDemo && !state.deviceLocalURL.isEmpty && URL(string: state.deviceLocalURL) != nil
+    }
+
     var body: some View {
         ZStack {
             if state.isDemo {
                 SimulatedFeedView(preset: device.activePreset ?? "driver_distraction", alert: alertActive)
-            } else if let url = URL(string: state.deviceLocalURL), !state.deviceLocalURL.isEmpty {
+            } else if isLiveFeed, let url = URL(string: state.deviceLocalURL) {
                 MJPEGView(url: url)  // MJPEGView appends /stream (and the device token) itself
             } else {
                 feedPlaceholder
             }
         }
-        .frame(height: 230)
+        // The live feed sizes itself to the camera's real aspect ratio (never
+        // cropped — see MJPEGView); the simulated feed and placeholder keep a
+        // fixed card height.
+        .frame(height: isLiveFeed ? nil : 230)
+        .frame(maxWidth: .infinity)
         .clipShape(RoundedRectangle(cornerRadius: 22))
         .overlay(
             RoundedRectangle(cornerRadius: 22)
@@ -120,11 +128,19 @@ struct MJPEGView: View {
         ZStack {
             Brand.ink
             if let image = reader.image {
+                // FULL frame, always: fit (letterbox) at the camera's real aspect
+                // ratio, never fill+crop — cropping a safety camera hides exactly
+                // the edges where events happen. The container adopts the stream's
+                // aspect ratio so letterboxing only appears if the width forces it.
                 Image(uiImage: image)
                     .resizable()
-                    .aspectRatio(contentMode: .fill)
+                    .aspectRatio(contentMode: .fit)
+                    .frame(maxWidth: .infinity)
+                    .aspectRatio(image.size.height > 0 ? image.size.width / image.size.height : 4 / 3,
+                                 contentMode: .fit)
             } else {
                 ProgressView().tint(.white)
+                    .frame(height: 230)
             }
             if reader.isReconnecting {
                 VStack {

@@ -77,7 +77,15 @@ class SoundSink:
         if level == AlertLevel.SUPPRESSED:
             return
         duration_s = 0.15 if level == AlertLevel.SOFT else 0.6
-        threading.Thread(target=self._play_tone, args=(duration_s,), daemon=True).start()
+        threading.Thread(target=self._play_tone_safe, args=(duration_s,), daemon=True).start()
+
+    def _play_tone_safe(self, duration_s: float) -> None:
+        """Tone playback that can never crash-spam: a Pi with no PCM audio device
+        raises from simpleaudio on every alert — degrade to the terminal bell."""
+        try:
+            self._play_tone(duration_s)
+        except Exception:  # noqa: BLE001 - audio is best-effort by design
+            print("\a", end="", flush=True)
 
     def _play_tone(self, duration_s: float) -> None:
         """Play (or emulate) a tone of the given length using the best available backend."""
