@@ -15,12 +15,15 @@ import time
 import cv2
 import numpy as np
 
+from core.accel import COCO_NAMES
 from core.detections import Detection, DetectionFrame
 from core.detectors import get_yolo_model
 from core.event_engine import CONFIRMED, RESOLVED, EventEngine, RuleSpec
 from core.events import Event
 from core.zones import load_zones
 from modules.base import VisionModule, register_module
+
+_PERSON_CLASS = 0  # COCO
 
 
 @register_module("occupancy")
@@ -43,6 +46,12 @@ class OccupancyModule(VisionModule):
         self._last_boxes: list[tuple[int, int, int, int]] = []
         self._last_confidences: list[float] = []
         self._last_frame_size: tuple[int, int] = (0, 0)
+        # Person (COCO 0) is this module's own business; AI-configured rules can
+        # add classes on top via set_requested_labels().
+        self._last_labels: list[str] = []
+        self._last_person_boxes: list[tuple[int, int, int, int]] = []
+        self._requested_class_ids: list[int] = [_PERSON_CLASS]
+        self._extra_labels: set[str] = set()
 
         # Optional security zones (feet-point membership; see core/zones.py).
         self._zones = load_zones(config.get("zones", {}))
@@ -63,20 +72,35 @@ class OccupancyModule(VisionModule):
     def process(self, frame: np.ndarray) -> list[Event]:
         """Detect people in `frame`; emit occupancy_change once a new count is confirmed."""
         events: list[Event] = []
-        results = self._model.predict(frame, verbose=False, classes=[0], conf=self._confidence_threshold)
+        results = self._model.predict(
+            frame, verbose=False, classes=self._requested_class_ids, conf=self._confidence_threshold
+        )
 
         boxes: list[tuple[int, int, int, int]] = []
         confidences: list[float] = []
+        labels: list[str] = []
         for result in results:
             for box in result.boxes:
                 xyxy = box.xyxy[0].tolist()
                 boxes.append(tuple(int(v) for v in xyxy))
                 confidences.append(float(box.conf[0]))
+                # Class ids are only meaningful once extra classes are requested;
+                # a detector shim without .cls still yields people.
+                class_id = int(box.cls[0]) if getattr(box, "cls", None) is not None else _PERSON_CLASS
+                labels.append(COCO_NAMES.get(class_id, str(class_id)))
 
         self._last_boxes = boxes
         self._last_confidences = confidences
+        self._last_labels = labels
         self._last_frame_size = (frame.shape[1], frame.shape[0])
-        count = len(boxes)
+
+        # Occupancy means PEOPLE. Once custom rules widen the detector to dogs or
+        # couches, counting every box would report a dog as an extra occupant and
+        # fire occupancy_change at it.
+        person_indices = [i for i, label in enumerate(labels) if label == "person"]
+        self._last_person_boxes = [boxes[i] for i in person_indices]
+        count = len(person_indices)
+        confidences_for_count = [confidences[i] for i in person_indices]
 
         if count == self._pending_count:
             self._pending_streak += 1
@@ -85,7 +109,10 @@ class OccupancyModule(VisionModule):
             self._pending_streak = 1
 
         if self._pending_streak >= self._confirm_frames and count != self._last_emitted_count:
-            confidence = sum(confidences) / len(confidences) if confidences else 1.0
+            confidence = (
+                sum(confidences_for_count) / len(confidences_for_count)
+                if confidences_for_count else 1.0
+            )
             events.append(Event.now("occupancy_change", 0.0, confidence, self.name))
             self._last_emitted_count = count
 
@@ -97,7 +124,9 @@ class OccupancyModule(VisionModule):
             for zone in self._zones:
                 if zone.kind not in ("restricted", "boundary"):
                     continue
-                inside = any(zone.contains_box(b, w, h) for b in boxes)
+                # People only: zone_violation is a person event, and a dog in the
+                # zone must not raise one.
+                inside = any(zone.contains_box(b, w, h) for b in self._last_person_boxes)
                 transitions += self._engine.update(f"zone_violation:{zone.name}", inside, 0.85, now)
                 transitions += self._engine.update(f"person_lingering:{zone.name}", inside, 0.85, now)
             for tr in transitions:
@@ -117,17 +146,29 @@ class OccupancyModule(VisionModule):
         """True while any zone violation is confirmed and unresolved."""
         return bool(self._engine.active_detections())
 
+    def set_requested_labels(self, labels: set[str]) -> None:
+        """Ask the detector for these classes too, on top of people.
+
+        Unknown labels are dropped rather than raising: the capability layer has
+        already refused anything the detector cannot name, and a stray label
+        must not take the camera down.
+        """
+        name_to_id = {name: class_id for class_id, name in COCO_NAMES.items()}
+        extra = {name_to_id[label] for label in labels if label in name_to_id}
+        self._extra_labels = {label for label in labels if label in name_to_id}
+        self._requested_class_ids = sorted({_PERSON_CLASS, *extra})
+
     def get_detections(self) -> DetectionFrame:
-        """This frame's people, with boxes, so zone and count rules can evaluate."""
+        """This frame's detections, with boxes, so zone/count/relation rules can evaluate."""
         width, height = self._last_frame_size
         return DetectionFrame(
             width=width,
             height=height,
             detections=tuple(
-                Detection(label="person", confidence=conf, box=tuple(float(v) for v in box))
+                Detection(label=label, confidence=conf, box=tuple(float(v) for v in box))
                 # zip truncates if a detector ever returns mismatched lists, which
                 # is the safe direction: a missing score must not fabricate a box.
-                for box, conf in zip(self._last_boxes, self._last_confidences)
+                for box, conf, label in zip(self._last_boxes, self._last_confidences, self._last_labels)
             ),
         )
 

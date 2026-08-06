@@ -123,3 +123,35 @@ def test_base_module_opts_out_by_default():
 
     assert Bare({}).get_detections() is None
     assert np.asarray([1]).size == 1  # numpy import is real, not decorative
+
+
+# --------------------------------------------------------- relational + general predicates
+def test_dog_on_couch_fires_only_when_the_boxes_overlap():
+    """The brief's flagship case: both are real COCO classes, so this must work."""
+    engine = RuleEngine([rule(
+        detection="dog", predicate="near", secondary="couch",
+        description="dog on the couch", persist_s=2.0,
+    )])
+    couch = Detection("couch", 0.9, (0.0, 500.0, 1000.0, 1000.0))
+
+    apart = frame(Detection("dog", 0.9, (100.0, 50.0, 200.0, 150.0)), couch)
+    assert drive_frames(engine, apart) == []
+
+    on_it = frame(Detection("dog", 0.9, (300.0, 600.0, 500.0, 800.0)), couch)
+    assert len(drive_frames(engine, on_it, start=9000.0)) == 1
+
+
+def test_relational_rule_needs_both_objects_present():
+    engine = RuleEngine([rule(detection="dog", predicate="near", secondary="couch")])
+    assert drive_frames(engine, frame(Detection("dog", 0.9, (300.0, 600.0, 500.0, 800.0)))) == []
+
+
+def test_absence_rule_fires_when_the_room_empties():
+    """'Tell me when the room is empty' — a confident observation of nothing."""
+    engine = RuleEngine([rule(detection="person", predicate="absent", description="room empty")])
+    assert len(drive_frames(engine, frame())) == 1
+
+
+def test_absence_rule_does_not_fire_while_someone_is_there():
+    engine = RuleEngine([rule(detection="person", predicate="absent")])
+    assert drive_frames(engine, frame(person())) == []

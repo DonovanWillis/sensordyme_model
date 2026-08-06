@@ -480,26 +480,47 @@ _MODES = (
 _RULE_SCHEMA = {
     "type": "object",
     "properties": {
-        "detection": {"type": "string", "description": "A detection id from the capability sheet"},
-        "description": {"type": "string", "description": "Human-readable restatement of the user's rule"},
+        # A rule is (target, predicate) rather than an opaque detection id tied to
+        # one preset. That is what lets a request exist without belonging to any
+        # of the five modes — the old shape could only name detections some
+        # preset already provided, which is why everything collapsed into one.
+        "target": {
+            "type": "string",
+            "description": "The object to watch, using an EXACT label from the capability sheet "
+                           "(e.g. 'person', 'dog', 'bottle'). Empty for whole-scene conditions.",
+        },
+        "predicate": {
+            "type": "string",
+            "description": "What to check about the target, from the capability sheet "
+                           "(e.g. 'present', 'in_zone', 'near', 'absent').",
+        },
+        "secondary": {
+            "type": "string",
+            "description": "Second object for relational predicates like 'near'/'holding' "
+                           "(e.g. target='dog', predicate='near', secondary='couch'). Empty otherwise.",
+        },
+        "description": {"type": "string", "description": "Plain-language restatement of the user's rule"},
         "zone": {"type": "string", "description": "Zone name the user must draw for area rules; empty if none"},
         "persist_s": {"type": "number", "description": "Seconds the condition must hold before alerting"},
-        "min_count": {"type": "integer", "description": "Occurrences required within the window (usually 1)"},
+        "min_count": {"type": "integer", "description": "How many must be present (usually 1)"},
         "confidence": {"type": "number", "description": "Minimum detection confidence 0-1"},
         "severity": {"type": "string", "enum": ["info", "warning", "critical"]},
         "cooldown_s": {"type": "number", "description": "Seconds between repeat notifications"},
         "schedule": {"type": "string", "description": "Active hours like '23:00-06:00', or empty for always"},
         "notify": {"type": "string", "enum": ["push", "sms", "silent"]},
     },
-    "required": ["detection", "description", "zone", "persist_s", "min_count", "confidence",
-                 "severity", "cooldown_s", "schedule", "notify"],
+    "required": ["target", "predicate", "secondary", "description", "zone", "persist_s",
+                 "min_count", "confidence", "severity", "cooldown_s", "schedule", "notify"],
     "additionalProperties": False,
 }
 
 _PROPOSAL_SCHEMA = {
     "type": "object",
     "properties": {
-        "preset": {"type": "string", "enum": list(_MODES)},
+        # "" means a custom configuration that belongs to no preset. Requests
+        # must be allowed to not be one of the five modes; forcing a preset is
+        # what turned "monitor for a can" into "watch for intruders".
+        "preset": {"type": "string", "enum": ["", *list(_MODES)]},
         "variant": {"type": "string", "description": "Preset variant name, or empty for standard"},
         "explanation": {"type": "string", "description": "2-3 friendly sentences on what was set up"},
         "rules": {"type": "array", "items": _RULE_SCHEMA},
@@ -538,7 +559,54 @@ def _taxonomy():
         return None
 
 
+def _capabilities():
+    """core.capabilities, imported lazily so the backend can run standalone."""
+    try:
+        from core import capabilities
+
+        return capabilities
+    except ImportError:
+        return None
+
+
 def _ai_system_prompt() -> str:
+    caps = _capabilities()
+    if caps is None:
+        return _legacy_system_prompt()
+    return (
+        "You turn a person's plain-language monitoring request into a configuration for "
+        "SensorDyme, a privacy-first camera device (video never leaves the device; only "
+        "events do).\n\n"
+        "SensorDyme is a GENERAL monitoring platform, not five fixed modes. Most requests "
+        "are custom configurations. Only set `preset` when the request genuinely matches one "
+        "of these whole-scenario modes: " + ", ".join(_MODES) + ". Otherwise leave `preset` "
+        "empty — a custom rule set is the normal, expected outcome, not a failure.\n\n"
+        "Express the request as rules of the form (target, predicate, secondary). Use ONLY "
+        "the exact labels and predicates from the capability sheet below.\n\n"
+        "Examples of the shape:\n"
+        "  'alert if my dog gets on the couch'  -> target=dog, predicate=near, secondary=couch\n"
+        "  'alert if someone enters the pool area' -> target=person, predicate=in_zone, zone=pool\n"
+        "  'tell me when the room is empty'     -> target=person, predicate=absent\n"
+        "  'alert if more than 3 people arrive' -> target=person, predicate=present, min_count=4\n\n"
+        "HONESTY RULES — these are the product's core promise:\n"
+        "- If a label is NOT in the sheet, do NOT substitute a preset or a loosely similar "
+        "object. Put the request in `unsupported`, say plainly that the vision model does not "
+        "recognise it, and state what would enable it (a model that includes that class, or "
+        "labelled examples to train one). Naming a close alternative from the sheet is helpful; "
+        "silently swapping to it is not.\n"
+        "- Predicates marked UNAVAILABLE cannot be used. Put those requests in `unsupported` "
+        "with the stated requirement.\n"
+        "- Never claim identity, intent, intoxication, emotion or medical conditions from "
+        "appearance. Report observable events only.\n"
+        "- Area rules need a zone the user draws in the app: name it and say so.\n"
+        "- Prefer conservative persistence (>=2s) and cooldowns (>=30s); a single ambiguous "
+        "frame must never alert.\n"
+        "- A request you cannot serve is fine to decline. An invented capability is not.\n\n"
+        "CAPABILITY SHEET:\n" + caps.registry().describe_for_llm()
+    )
+
+
+def _legacy_system_prompt() -> str:
     tax = _taxonomy()
     capability_sheet = tax.summary_for_llm() if tax else ""
     return (
@@ -626,39 +694,110 @@ def _ai_fallback(prompt: str) -> dict:
                 ],
                 "settings": {}, "unsupported": [], "source": "fallback",
             }
+    # No keyword matched. Historically this returned security_monitoring as a
+    # "safe default", which was neither safe nor a default: it silently pointed
+    # the camera at something the user never asked for, and reported success.
+    # Changing nothing is the honest outcome — say what is wrong and what fixes it.
     return {
-        "preset": "security_monitoring", "variant": "", "rules": [], "settings": {},
+        "preset": "", "variant": "", "rules": [], "settings": {},
         "explanation": (
-            "I couldn't confidently match that to the device's capabilities without the AI "
-            "service. I've selected Security Monitoring as a safe default — try rephrasing, "
-            "or pick a mode manually."
+            "I can't interpret custom requests right now — the language service that turns "
+            "your words into a monitoring rule isn't configured on your backend, so I'd only "
+            "be guessing. Nothing has been changed. You can still pick a monitoring mode "
+            "manually in the meantime."
         ),
         "unsupported": [{
             "request": prompt,
-            "reason": "no keyword match and the AI service is not configured",
-            "requires": "an ANTHROPIC_API_KEY on the backend, or a manual mode selection",
+            "reason": "the language service that interprets custom requests is not configured",
+            "requires": "set ANTHROPIC_API_KEY on the backend and restart it",
+            "support": "unsupported",
+            "alternatives": [],
         }],
-        "source": "fallback",
+        "source": "unavailable",
     }
 
 
 def _validate_proposal(data: dict) -> dict:
-    """Server-side enforcement of the taxonomy: the LLM's claims are re-checked here.
-    Rules naming unsupported/unknown detections are MOVED to `unsupported` with the
-    real reason — the device never receives a rule it can't execute."""
-    tax = _taxonomy()
-    preset = data.get("preset") if data.get("preset") in _MODES else "security_monitoring"
+    """Re-check the model's claims against what the device can actually run.
+
+    The model is capable and well-briefed, but it is still the thing being
+    checked: a rule that reaches the device must be executable there. Rules the
+    capability layer cannot serve are MOVED to `unsupported` carrying the
+    specific gap, so the user learns what to add rather than watching a rule
+    that silently never fires.
+
+    Validation is against the capability registry, not against a preset's
+    detection list. That is the substantive change: a rule no longer has to
+    belong to one of the five modes in order to exist.
+    """
+    caps = _capabilities()
+    if caps is None:
+        return _legacy_validate_proposal(data)
+
+    reg = caps.registry()
+    preset = data.get("preset") if data.get("preset") in _MODES else ""
     valid_rules, unsupported = [], list(data.get("unsupported") or [])
+
     for rule in data.get("rules") or []:
-        det_id = str(rule.get("detection", ""))
-        det = tax.find(preset, det_id) if tax else None
-        if tax and det is None:
+        target = str(rule.get("target", "")).strip().lower()
+        predicate = str(rule.get("predicate", "")).strip().lower() or "present"
+        secondary = str(rule.get("secondary", "")).strip().lower()
+        described = str(rule.get("description") or f"{predicate} {target}".strip())
+
+        verdict = reg.assess(target, predicate)
+        if not verdict.ok:
             unsupported.append({
-                "request": str(rule.get("description", det_id)),
-                "reason": f"'{det_id}' is not a detection {preset} provides",
-                "requires": "see the capability matrix (docs/DETECTIONS.md)",
+                "request": described,
+                "reason": verdict.reason,
+                "requires": verdict.requires or "additional model or training data",
+                "support": verdict.support.value,
+                "alternatives": list(verdict.alternatives),
             })
             continue
+
+        # A relational rule is only as good as its second object.
+        if secondary:
+            secondary_verdict = reg.assess(secondary, "present")
+            if not secondary_verdict.ok:
+                unsupported.append({
+                    "request": described,
+                    "reason": secondary_verdict.reason,
+                    "requires": secondary_verdict.requires or "additional model or training data",
+                    "support": secondary_verdict.support.value,
+                    "alternatives": list(secondary_verdict.alternatives),
+                })
+                continue
+
+        rule["target"] = target
+        rule["predicate"] = predicate
+        rule["secondary"] = secondary
+        rule["persist_s"] = max(0.5, min(3600.0, float(rule.get("persist_s", 2.0) or 2.0)))
+        rule["confidence"] = max(0.2, min(0.95, float(rule.get("confidence", 0.6) or 0.6)))
+        rule["cooldown_s"] = max(10.0, min(86400.0, float(rule.get("cooldown_s", 60.0) or 60.0)))
+        rule["min_count"] = max(1, min(100, int(rule.get("min_count", 1) or 1)))
+        if rule.get("severity") not in ("info", "warning", "critical"):
+            rule["severity"] = "warning"
+        if verdict.support is caps.Support.PARTIAL:
+            # The user is told the rule is an approximation, on the rule itself,
+            # so the caveat survives into the review screen and the rule list.
+            rule["caveat"] = verdict.reason
+        valid_rules.append(rule)
+
+    data["preset"] = preset
+    data["mode"] = "preset" if preset else "custom"
+    data["rules"] = valid_rules
+    data["unsupported"] = unsupported
+    return data
+
+
+def _legacy_validate_proposal(data: dict) -> dict:
+    """Taxonomy-based validation, for a backend running without core/ available."""
+    tax = _taxonomy()
+    preset = data.get("preset") if data.get("preset") in _MODES else ""
+    valid_rules, unsupported = [], list(data.get("unsupported") or [])
+    for rule in data.get("rules") or []:
+        det_id = str(rule.get("detection", "") or rule.get("target", ""))
+        det = tax.find(preset, det_id) if (tax and preset) else None
         if det is not None and det.support not in ("supported", "partial"):
             unsupported.append({
                 "request": str(rule.get("description", det_id)),
@@ -666,14 +805,6 @@ def _validate_proposal(data: dict) -> dict:
                 "requires": det.requires or "future model/hardware support",
             })
             continue
-        rule["persist_s"] = max(0.5, min(3600.0, float(rule.get("persist_s", 2.0) or 2.0)))
-        rule["confidence"] = max(0.2, min(0.95, float(rule.get("confidence", 0.6) or 0.6)))
-        rule["cooldown_s"] = max(10.0, min(86400.0, float(rule.get("cooldown_s", 60.0) or 60.0)))
-        rule["min_count"] = max(1, min(100, int(rule.get("min_count", 1) or 1)))
-        if rule.get("severity") not in ("info", "warning", "critical"):
-            rule["severity"] = "warning"
-        if det is not None and det.caveat:
-            rule["description"] = f"{rule.get('description', '')} (note: {det.caveat})"
         valid_rules.append(rule)
     data["preset"] = preset
     data["rules"] = valid_rules

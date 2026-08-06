@@ -87,6 +87,21 @@ class VisionModule(ABC):
         """
         return False
 
+    def set_requested_labels(self, labels: set[str]) -> None:
+        """Widen what this module asks the detector for, for AI-configured rules.
+
+        Modules narrow their detector call to the classes their own logic needs
+        (occupancy asks for people and nothing else). That is right for cost, and
+        wrong the moment a user writes "alert me if my dog gets on the couch":
+        the rule is valid, `dog` and `couch` are real classes, and the detector
+        would never have been asked for them — so the rule could be accepted,
+        stored, shipped, and silently never fire.
+
+        The runtime calls this whenever the rule set changes. Default is a no-op:
+        a module that cannot widen simply keeps its own classes, and the rule is
+        reported as unenforceable rather than quietly ignored.
+        """
+
     def get_detections(self) -> Optional["DetectionFrame"]:
         """What this module saw in the most recent `process()` frame, undebounced.
 

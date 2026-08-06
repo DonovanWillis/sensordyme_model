@@ -58,33 +58,36 @@ def test_unmatched_prompt_is_honest_not_fake(backend):
 def test_validation_moves_unsupported_detections_out_of_rules(backend):
     app_module, client, headers = backend
 
+    def rule(**overrides):
+        base = {"target": "person", "predicate": "present", "secondary": "", "description": "d",
+                "zone": "", "persist_s": 2, "min_count": 1, "confidence": 0.6,
+                "severity": "warning", "cooldown_s": 60, "schedule": "", "notify": "push"}
+        base.update(overrides)
+        return base
+
     def fake_llm(prompt):
         return {
-            "preset": "baby_monitoring", "variant": "", "explanation": "test",
+            "preset": "", "variant": "", "explanation": "test",
             "settings": {}, "unsupported": [], "source": "claude",
             "rules": [
-                {"detection": "unusual_stillness", "description": "still too long", "zone": "",
-                 "persist_s": 120, "min_count": 1, "confidence": 0.6, "severity": "warning",
-                 "cooldown_s": 60, "schedule": "", "notify": "push"},
-                # The model hallucinating an unsupported capability:
-                {"detection": "crying", "description": "alert on crying", "zone": "",
-                 "persist_s": 2, "min_count": 1, "confidence": 0.6, "severity": "critical",
-                 "cooldown_s": 60, "schedule": "", "notify": "push"},
-                # And a detection id that doesn't exist at all:
-                {"detection": "quantum_entanglement", "description": "??", "zone": "",
-                 "persist_s": 2, "min_count": 1, "confidence": 0.6, "severity": "info",
-                 "cooldown_s": 60, "schedule": "", "notify": "push"},
+                rule(target="person", predicate="present", description="someone is here"),
+                # A behaviour no installed model can recognise:
+                rule(target="person", predicate="eating", description="alert on eating"),
+                # An object the detector has never heard of:
+                rule(target="quantum_entanglement", predicate="present", description="??"),
             ],
         }
 
     app_module._ai_configure_llm = fake_llm
     resp = client.post("/v1/ai/configure",
-                       json={"device_id": 1, "prompt": "watch the baby"}, headers=headers)
+                       json={"device_id": 1, "prompt": "watch the room"}, headers=headers)
     data = resp.json()
-    kept = [r["detection"] for r in data["rules"]]
-    assert kept == ["unusual_stillness"]                 # only the real capability survived
-    reasons = " ".join(u["reason"] for u in data["unsupported"])
-    assert "crying" in reasons and "quantum_entanglement" in reasons
+    kept = [r["target"] for r in data["rules"]]
+    assert kept == ["person"]                            # only the executable rule survived
+    blocked = " ".join(u["request"] + u["reason"] for u in data["unsupported"])
+    assert "eating" in blocked and "quantum_entanglement" in blocked
+    # Each rejection carries the specific gap, not a generic apology.
+    assert all(u.get("requires") for u in data["unsupported"])
 
 
 def test_validation_clamps_out_of_range_values(backend):

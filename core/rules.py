@@ -58,6 +58,15 @@ class Alert:
     zone: str = ""
 
 
+def _boxes_overlap(a: tuple, b: tuple) -> bool:
+    """Whether two pixel-space (x1, y1, x2, y2) boxes intersect at all."""
+    return not (a[2] <= b[0] or b[2] <= a[0] or a[3] <= b[1] or b[3] <= a[1])
+
+
+def _any_overlap(boxes_a: list, boxes_b: list) -> bool:
+    return any(_boxes_overlap(a, b) for a in boxes_a for b in boxes_b)
+
+
 def _parse_schedule(text: str) -> Optional[tuple[int, int]]:
     """'23:00-06:00' -> (1380, 360) in minutes-since-midnight. None means always on.
 
@@ -95,8 +104,10 @@ class ConfiguredRule:
     """One validated AI-configure rule, ready to evaluate."""
 
     rule_id: str
-    detection: str
+    detection: str          # the object label to watch ("person", "dog")
     description: str
+    predicate: str = "present"  # present | absent | in_zone | near | holding
+    secondary: str = ""     # second object, for relational predicates
     zone: str = ""
     severity: str = "warning"
     notify: str = "push"
@@ -111,9 +122,12 @@ class ConfiguredRule:
         detection id cannot be evaluated at all, but a rule with a nonsense
         severity is still the rule the user asked for, so it is clamped.
         """
-        detection = str(raw.get("detection") or "").strip()
+        # `target` is the current shape; `detection` is accepted so proposals
+        # stored by an older backend keep working after an upgrade.
+        detection = str(raw.get("target") or raw.get("detection") or "").strip().lower()
         if not detection:
             return None
+        predicate = str(raw.get("predicate") or "present").strip().lower()
         severity = str(raw.get("severity") or "warning")
         notify = str(raw.get("notify") or "push")
         try:
@@ -121,8 +135,10 @@ class ConfiguredRule:
         except (TypeError, ValueError):
             min_count = 1
         return cls(
-            rule_id=f"rule{index}:{detection}",
+            rule_id=f"rule{index}:{predicate}:{detection}",
             detection=detection,
+            predicate=predicate,
+            secondary=str(raw.get("secondary") or "").strip().lower(),
             description=str(raw.get("description") or detection),
             zone=str(raw.get("zone") or "").strip(),
             severity=severity if severity in _SEVERITIES else "warning",
@@ -253,18 +269,53 @@ class RuleEngine:
         """
         now = time.monotonic() if now is None else now
         alerts: list[Alert] = []
-        for detection in {r.detection for r in self._rules.values()}:
-            present = detection in frame.labels()
-            alerts += self.observe(
-                detection,
-                present,
-                confidence=frame.mean_confidence(detection) if present else 0.0,
-                count=frame.count(detection),
-                now=now,
-                boxes=frame.boxes(detection),
-                frame_size=frame.size,
-            )
+        minute_of_day = self._minute_of_day()
+
+        for rule in self._rules.values():
+            seen = rule.detection in frame.labels()
+            boxes = frame.boxes(rule.detection)
+            active = self._evaluate(rule, frame, seen, boxes)
+
+            if active and not _in_window(rule.schedule, minute_of_day):
+                active = False  # outside its hours the rule observes nothing at all
+            if active and rule.zone:
+                active = self._in_zone(rule.zone, boxes, frame.size)
+
+            confidence = frame.mean_confidence(rule.detection) if seen else 0.0
+            # An absence rule is a confident observation of nothing, so it cannot
+            # borrow the (zero) confidence of the thing that is missing.
+            if rule.predicate == "absent":
+                confidence = 1.0
+
+            for transition in self._engine.update(rule.rule_id, active, confidence, now=now):
+                if transition.state != CONFIRMED or rule.notify == "silent":
+                    continue
+                alerts.append(Alert(
+                    rule_id=rule.rule_id,
+                    detection=rule.detection,
+                    description=rule.description,
+                    severity=rule.severity,
+                    notify=rule.notify,
+                    confidence=transition.confidence,
+                    duration_s=transition.duration_s,
+                    zone=rule.zone,
+                ))
         return alerts
+
+    def _evaluate(self, rule: ConfiguredRule, frame: "DetectionFrame",
+                  seen: bool, boxes: list) -> bool:
+        """Whether this rule's condition holds in this frame."""
+        if rule.predicate == "absent":
+            return not seen
+        if rule.predicate in ("near", "holding"):
+            # Proximity stands in for interaction: overlapping boxes are strong
+            # evidence of "with", and no evidence at all of intent. The rule
+            # carries a caveat saying so.
+            if not seen or not rule.secondary:
+                return False
+            return _any_overlap(boxes, frame.boxes(rule.secondary))
+        # present / in_zone / count all start from "is it there, enough of it".
+        return seen and frame.count(rule.detection) >= rule.min_count
 
     def active_alerts(self) -> list[str]:
         """rule_ids currently confirmed and unresolved."""

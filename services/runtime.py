@@ -300,6 +300,28 @@ class DeviceRuntime:
             self.supervisor.add(_InferenceService(self))
         self.supervisor.add(self.provisioning)
 
+    def _apply_requested_labels(self) -> None:
+        """Tell the running module which objects the active rules need.
+
+        Without this the chain breaks at its last link: a rule naming `dog` and
+        `couch` is valid, stored and delivered, but the module asks the detector
+        only for people, so the rule can never fire. The user would see a rule
+        listed as active that does nothing.
+        """
+        labels = {rule.detection for rule in self.rule_engine.rules if rule.detection}
+        labels |= {rule.secondary for rule in self.rule_engine.rules if rule.secondary}
+        with self._module_lock:
+            module = self.module
+        module.set_requested_labels(labels)
+        if labels and module.get_detections() is None:
+            # The module cannot report per-frame detections at all, so these
+            # rules will never be evaluated. Say so rather than fail silently.
+            log.warning(
+                "module '%s' does not expose per-frame detections; %d AI-configured rule(s) "
+                "cannot be enforced in this mode",
+                self.module_name, len(self.rule_engine.rules),
+            )
+
     # ------------------------------------------------------------------ health reporting
     def _collect_health(self) -> dict:
         """This device's real state, for the app's status indicators."""
@@ -445,6 +467,7 @@ class DeviceRuntime:
                 new_rules = self.uplink.pop_pending_rules()
                 if new_rules is not None:
                     self.rule_engine.replace_rules(new_rules)
+                    self._apply_requested_labels()
                     pending_zones = self.rule_engine.pending_zones()
                     print(
                         f"rules: enforcing {len(self.rule_engine.rules)} AI-configured rule(s)"
