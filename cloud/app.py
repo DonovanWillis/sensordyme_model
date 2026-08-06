@@ -931,6 +931,46 @@ def ai_configure(body: AIConfigureBody, uid: int = Depends(current_user)):
     return result
 
 
+@app.get("/v1/devices/{device_id}/events/{event_id}/explain")
+def explain_event(device_id: int, event_id: int, uid: int = Depends(current_user)):
+    """Why this alert fired, grounded in what the device actually recorded.
+
+    The explanation is assembled from the stored event and the rule it came
+    from. Jupiter only rephrases that fact list — it is never asked what
+    happened, so it cannot invent a cause. With no model reachable the
+    deterministic text is returned unchanged, which is why this endpoint has no
+    failure mode beyond the event not existing.
+    """
+    with db() as conn:
+        device = _owned_device(conn, device_id, uid)
+        row = conn.execute(
+            "SELECT * FROM events WHERE id = ? AND device_id = ?", (event_id, device_id)
+        ).fetchone()
+    if row is None:
+        raise HTTPException(404, "no such event on this device")
+
+    try:
+        from jupiter.explain import explain, parse_rule_for_event
+    except ImportError:
+        raise HTTPException(503, "explanations are unavailable on this backend")
+
+    event = dict(row)
+    rule = parse_rule_for_event(device["ai_rules"], event.get("type", ""))
+
+    provider = None
+    if JUPITER_PROVIDER not in ("", "off"):
+        try:
+            from jupiter.providers import get_provider
+
+            candidate = get_provider(JUPITER_PROVIDER, _jupiter_config())
+            ok, _ = candidate.available()
+            provider = candidate if ok else None
+        except Exception:  # noqa: BLE001 - the facts path never needs a model
+            provider = None
+
+    return explain(event, rule, provider=provider).as_dict()
+
+
 # ------------------------------------------------------------------------- device API
 @app.post("/v1/ingest")
 def ingest(body: IngestBody, device: sqlite3.Row = Depends(current_device)):
