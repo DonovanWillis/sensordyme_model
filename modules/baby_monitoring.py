@@ -26,6 +26,7 @@ from typing import Optional
 import cv2
 import numpy as np
 
+from core.detections import Detection, DetectionFrame
 from core.detectors import get_yolo_model
 from core.event_engine import CONFIRMED, RESOLVED, EventEngine, RuleSpec
 from core.events import Event
@@ -85,6 +86,8 @@ class BabyMonitoringModule(VisionModule):
         # --- per-frame state ---------------------------------------------------
         self._frame_index = 0
         self._last_boxes: list[tuple[int, int, int, int]] = []
+        self._last_confidences: list[float] = []
+        self._last_frame_size: tuple[int, int] = (0, 0)
         self._last_count = -1
         self._prev_gray: Optional[np.ndarray] = None
         self._last_motion = 0.0
@@ -98,10 +101,14 @@ class BabyMonitoringModule(VisionModule):
         results = self._model.predict(
             frame, verbose=False, classes=[_PERSON_CLASS], conf=self._confidence_threshold
         )
-        boxes = []
+        boxes, confidences = [], []
         for result in results:
             for box in result.boxes:
                 boxes.append(tuple(int(v) for v in box.xyxy[0].tolist()))
+                confidences.append(float(box.conf[0]))
+        # Recorded alongside rather than returned, so subclasses and tests that
+        # override this method for its boxes keep working unchanged.
+        self._last_confidences = confidences
         return boxes
 
     def _motion_energy(self, frame: np.ndarray) -> float:
@@ -124,6 +131,7 @@ class BabyMonitoringModule(VisionModule):
         boxes = self._last_boxes
         self._last_motion = self._motion_energy(frame)
         h, w = frame.shape[:2]
+        self._last_frame_size = (w, h)
         return self._reason(boxes, self._last_motion, w, h, now)
 
     def _reason(self, boxes: list, motion: float, w: int, h: int, now: float) -> list[Event]:
@@ -201,6 +209,31 @@ class BabyMonitoringModule(VisionModule):
 
     def is_alert_active(self) -> bool:
         return bool(self._engine.active_detections())
+
+    def get_detections(self) -> DetectionFrame:
+        """People seen in the most recent *detection* frame, for custom rules.
+
+        This module only runs YOLO every `detect_every_n_frames`, reusing the last
+        boxes in between, so on a skipped frame these are the boxes the module is
+        itself reasoning about — deliberately the same view, not a fresher one.
+
+        Confidence falls back to 1.0 for boxes set without it (tests and
+        subclasses that stub `_detect_people`), matching how the module treats
+        its own detections: as certain enough to act on.
+        """
+        width, height = self._last_frame_size
+        return DetectionFrame(
+            width=width,
+            height=height,
+            detections=tuple(
+                Detection(
+                    label="person",
+                    confidence=self._last_confidences[i] if i < len(self._last_confidences) else 1.0,
+                    box=tuple(float(v) for v in box),
+                )
+                for i, box in enumerate(self._last_boxes)
+            ),
+        )
 
     def get_telemetry_snapshot(self) -> Optional[dict]:
         return {
