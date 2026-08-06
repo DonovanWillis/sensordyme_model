@@ -33,6 +33,7 @@ class CloudUplink:
         # re-sends on a real change instead of on every poll.
         self._rules_version: str = ""
         self._pending_rules: Optional[list[dict]] = None
+        self._health: Optional[dict] = None
         self._stop = threading.Event()
         self._connected = False
         import requests  # already a dependency (VLM judge backends)
@@ -62,6 +63,16 @@ class CloudUplink:
     def set_active_preset(self, name: Optional[str]) -> None:
         with self._lock:
             self._active_preset = name
+
+    def set_health(self, report: Optional[dict]) -> None:
+        """Latest device health, sent with the next sync.
+
+        Held as a snapshot rather than collected inside the worker so the health
+        read happens on the runtime's own thread, where the frame bus, capture
+        service and Wi-Fi manager actually live.
+        """
+        with self._lock:
+            self._health = report
 
     def pop_pending_preset(self) -> Optional[str]:
         """Remote set_preset command awaiting the main loop, if any."""
@@ -93,6 +104,7 @@ class CloudUplink:
                     self._queue.clear()
                     active = self._active_preset
                     rules_version = self._rules_version
+                    health = self._health
                 # 1) push events (an empty batch doubles as the online heartbeat)
                 resp = self._requests.post(
                     f"{self._base_url}/v1/ingest",
@@ -100,6 +112,7 @@ class CloudUplink:
                         "events": batch,
                         "active_preset": active,
                         "rules_version": rules_version,
+                        "health": health,
                     },
                     headers=headers,
                     timeout=10,

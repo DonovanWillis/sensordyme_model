@@ -191,9 +191,22 @@ final class MockAPI: BackendAPI {
         return [
             Device(id: 1, name: deviceName, activePreset: activePreset,
                    desiredPreset: desiredPreset, online: true,
-                   lastSeen: Date().timeIntervalSince1970)
+                   lastSeen: Date().timeIntervalSince1970,
+                   health: Self.demoHealth)
         ]
     }
+
+    /// Health for the walkthrough device. Every line says "simulated" — a demo
+    /// that claims a Hailo-8 is running when no hardware is attached is the
+    /// exact thing that destroys credibility when someone asks to see the Pi.
+    private static let demoHealth = DeviceHealthReport(
+        camera: HealthComponent(state: "ok", detail: "simulated feed", metrics: ["fps": .number(12)]),
+        inference: HealthComponent(state: "ok", detail: "simulated analysis", metrics: nil),
+        accelerator: HealthComponent(state: "unknown", detail: "no hardware attached (demo)", metrics: nil),
+        network: HealthComponent(state: "ok", detail: "simulated connection", metrics: nil),
+        system: HealthComponent(state: "ok", detail: "simulated", metrics: nil),
+        cloudConnected: true
+    )
 
     func claim(code: String) async throws {
         try await Task.sleep(for: .seconds(1.0))  // pairing handshake feel

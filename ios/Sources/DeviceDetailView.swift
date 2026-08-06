@@ -36,6 +36,7 @@ struct DeviceDetailView: View {
                 FeedCard(device: device, alertActive: alertActive)
 
                 statusRow
+                healthCard
                 configureCard
                 modeCard
                 activityCard
@@ -100,6 +101,83 @@ struct DeviceDetailView: View {
                 .font(SD.Typography.caption.weight(.semibold))
                 .foregroundStyle(SD.Colors.textSecondary)
                 .lineLimit(1)
+        }
+    }
+
+    // MARK: Health
+    //
+    // Every row here is something the Pi observed and sent up this cycle. When
+    // the device stops reporting the backend withholds the whole report, so
+    // these disappear rather than freezing on their last happy values.
+
+    @ViewBuilder private var healthCard: some View {
+        if let health = device.health {
+            SDCard {
+                VStack(alignment: .leading, spacing: SD.Space.sm) {
+                    SDSectionHeader(title: "Device health")
+                    healthRow("Camera", systemImage: "camera.fill", health.camera, metric: "fps", suffix: " fps")
+                    healthRow("AI", systemImage: "cpu", health.accelerator)
+                    healthRow("Monitoring", systemImage: "eye.fill", health.inference)
+                    healthRow("Network", systemImage: "wifi", health.network)
+                }
+            }
+        } else if device.online {
+            // Online but silent about itself: an older device build that predates
+            // health reporting. Say so plainly instead of showing nothing.
+            SDCard {
+                Label(
+                    "This device isn't reporting its status yet. Update it to see camera and AI health here.",
+                    systemImage: "info.circle"
+                )
+                .font(SD.Typography.caption)
+                .foregroundStyle(SD.Colors.textSecondary)
+            }
+        }
+    }
+
+    @ViewBuilder
+    private func healthRow(
+        _ title: String,
+        systemImage: String,
+        _ component: HealthComponent?,
+        metric: String? = nil,
+        suffix: String = ""
+    ) -> some View {
+        if let component {
+            HStack(spacing: SD.Space.sm) {
+                Image(systemName: systemImage)
+                    .font(.system(size: 14))
+                    .frame(width: 22)
+                    .foregroundStyle(SD.Colors.textTertiary)
+                VStack(alignment: .leading, spacing: 1) {
+                    Text(title)
+                        .font(SD.Typography.body)
+                        .foregroundStyle(SD.Colors.textPrimary)
+                    // The device's own sentence — "running on the Hailo-8
+                    // accelerator", "no new frame for 12.3s" — rather than a
+                    // word the app invented on its behalf.
+                    Text(component.detail)
+                        .font(SD.Typography.caption)
+                        .foregroundStyle(SD.Colors.textSecondary)
+                        .lineLimit(2)
+                }
+                Spacer(minLength: SD.Space.xxs)
+                if let metric, let value = component.metric(metric) {
+                    Text(value + suffix)
+                        .font(SD.Typography.caption.monospacedDigit())
+                        .foregroundStyle(SD.Colors.textSecondary)
+                }
+                if component.isKnown {
+                    Circle().fill(component.status.tint).frame(width: 8, height: 8)
+                } else {
+                    Image(systemName: "questionmark.circle")
+                        .font(.caption)
+                        .foregroundStyle(SD.Colors.textTertiary)
+                }
+            }
+            .padding(.vertical, 2)
+            .accessibilityElement(children: .combine)
+            .accessibilityLabel("\(title): \(component.detail)")
         }
     }
 

@@ -137,6 +137,7 @@ def init_db() -> None:
             "ALTER TABLE users ADD COLUMN phone TEXT",
             "ALTER TABLE users ADD COLUMN sms_on_loud INTEGER DEFAULT 1",
             "ALTER TABLE devices ADD COLUMN ai_rules TEXT",  # validated AI-configure proposal (JSON)
+            "ALTER TABLE devices ADD COLUMN health TEXT",  # last device-reported health (JSON)
         ):
             try:
                 conn.execute(statement)
@@ -165,6 +166,27 @@ def current_user(authorization: str = Header(default="")) -> int:
     except jwt.PyJWTError as exc:
         raise HTTPException(401, f"invalid token: {exc}") from exc
     return int(payload["uid"])
+
+
+_HEALTH_STALE_S = 30  # matches the `online` window
+
+
+def _health_payload(row: sqlite3.Row, now: float) -> Optional[dict]:
+    """A device's last health report, or None if it can no longer be trusted.
+
+    Health is only meaningful while the device is talking to us. Once it stops,
+    the last report is a photograph of a moment that has passed — and rendering
+    "Camera: capturing" next to a device that has been unplugged for an hour is
+    exactly the failure this whole pipeline exists to prevent.
+    """
+    last_seen = row["last_seen"]
+    if not last_seen or now - last_seen >= _HEALTH_STALE_S:
+        return None
+    try:
+        report = json.loads(row["health"] or "null")
+    except (ValueError, TypeError):
+        return None
+    return report if isinstance(report, dict) else None
 
 
 def _rules_version(ai_rules_json: Optional[str]) -> str:
@@ -276,6 +298,8 @@ class RenameBody(BaseModel):
 class IngestBody(BaseModel):
     events: list[dict] = []
     active_preset: Optional[str] = None
+    # The device's own view of its camera, inference, accelerator and network.
+    health: Optional[dict] = None
     # Fingerprint of the rule set the device is currently enforcing. Lets ingest
     # re-deliver rules only when they actually changed, instead of every poll.
     rules_version: Optional[str] = None
@@ -406,6 +430,10 @@ def list_devices(uid: int = Depends(current_user)):
                 "desired_preset": r["desired_preset"],
                 "online": bool(r["last_seen"] and now - r["last_seen"] < 30),
                 "last_seen": r["last_seen"],
+                # Whatever the device last said about itself. Withheld once the
+                # device goes quiet: a stale report showing a healthy camera is
+                # worse than no report, because the app would render it as live.
+                "health": _health_payload(r, now),
             }
             for r in rows
         ]
@@ -674,8 +702,14 @@ def ingest(body: IngestBody, device: sqlite3.Row = Depends(current_device)):
     now = time.time()
     with db() as conn:
         conn.execute(
-            "UPDATE devices SET last_seen = ?, active_preset = COALESCE(?, active_preset) WHERE id = ?",
-            (now, body.active_preset, device["id"]),
+            "UPDATE devices SET last_seen = ?, active_preset = COALESCE(?, active_preset),"
+            " health = COALESCE(?, health) WHERE id = ?",
+            (
+                now,
+                body.active_preset,
+                json.dumps(body.health) if body.health is not None else None,
+                device["id"],
+            ),
         )
         owner = (
             conn.execute("SELECT * FROM users WHERE id = ?", (device["owner_id"],)).fetchone()

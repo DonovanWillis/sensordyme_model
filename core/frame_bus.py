@@ -49,6 +49,13 @@ class FrameBus:
         with self._cond:
             return self._frame, self._seq
 
+    @property
+    def sequence(self) -> int:
+        """Total frames published. Lets health measure real throughput between
+        samples without holding a frame reference just to read the counter."""
+        with self._cond:
+            return self._seq
+
     def wait_for_fresh(self, last_seq: int, timeout: float = 1.0) -> tuple[Optional[np.ndarray], int]:
         """Block until a frame newer than `last_seq` arrives (or timeout).
 

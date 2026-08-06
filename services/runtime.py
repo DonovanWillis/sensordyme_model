@@ -38,6 +38,7 @@ from core.frame_bus import FrameBus
 from core.health import HealthMonitor
 from core.logger import EventLogger
 from core.logging_setup import get_logger, setup_logging
+from core import device_health
 from core.network import WifiManager, nmcli_available
 from core.rules import RuleEngine
 from core.telemetry import TelemetryLogger
@@ -49,6 +50,9 @@ from services.supervisor import Service, Supervisor
 
 log = get_logger("runtime")
 
+# Matches the uplink's default poll interval: sampling faster just discards
+# readings, and /proc + vcgencmd reads are not free.
+_HEALTH_SAMPLE_S = 5.0
 _CAMERA_OPEN_RETRIES = 5
 _CAMERA_OPEN_BACKOFF_S = 2.0
 _VERSION = "0.2"
@@ -121,6 +125,8 @@ class DeviceRuntime:
 
         self.camera: Optional[Camera] = None
         self.capture: Optional[CaptureService] = None
+        self.wifi: Optional[WifiManager] = None
+        self._last_health_sample = 0.0
         self.dashboard = None
         self.uplink = None
         self.provisioning: Optional[ProvisioningService] = None
@@ -228,6 +234,7 @@ class DeviceRuntime:
             )
 
         wifi = WifiManager()
+        self.wifi = wifi  # also read by the health report the app displays
         network_cfg = self.config.get("network", {})
         self.provisioning = ProvisioningService(
             wifi, network_cfg.get("provisioning", {}), version=_VERSION
@@ -292,6 +299,19 @@ class DeviceRuntime:
         if not self.display:
             self.supervisor.add(_InferenceService(self))
         self.supervisor.add(self.provisioning)
+
+    # ------------------------------------------------------------------ health reporting
+    def _collect_health(self) -> dict:
+        """This device's real state, for the app's status indicators."""
+        heartbeat_age = None if self._heartbeat == 0.0 else time.monotonic() - self._heartbeat
+        return device_health.collect(
+            bus=self.bus,
+            capture=self.capture,
+            wifi=self.wifi,
+            heartbeat_age_s=heartbeat_age,
+            module_name=self.module_name,
+            uplink_connected=self.uplink.connected if self.uplink is not None else None,
+        )
 
     # ------------------------------------------------------------------ AI-configured rules
     def _zones_for_module(self, module_name: str) -> list:
@@ -464,6 +484,15 @@ class DeviceRuntime:
             if detection_frame is not None and self.rule_engine.rules:
                 for alert in self.rule_engine.observe_frame(detection_frame):
                     self._emit_rule_alert(alert)
+
+            # Health is sampled here, on the thread that owns the frame bus and
+            # capture service, and handed to the uplink as a snapshot. Sampled at
+            # the uplink's own cadence rather than every frame: reading /proc and
+            # vcgencmd 30 times a second would cost more than it reports.
+            sampled_at = time.monotonic()
+            if self.uplink is not None and sampled_at - self._last_health_sample >= _HEALTH_SAMPLE_S:
+                self._last_health_sample = sampled_at
+                self.uplink.set_health(self._collect_health())
 
             snapshot = module.get_telemetry_snapshot()
             if snapshot is not None:

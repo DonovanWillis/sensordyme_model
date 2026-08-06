@@ -30,6 +30,7 @@ from __future__ import annotations
 
 import os
 import shutil
+import time
 from dataclasses import dataclass
 from typing import Optional
 
@@ -114,6 +115,32 @@ def detect() -> AcceleratorInfo:
 _accel_cfg: dict = {}
 _accel_info: Optional[AcceleratorInfo] = None
 _hailo_failed_reason: Optional[str] = None
+
+# Proof of work, not proof of configuration. A seated HAT with a runtime and a
+# .hef path means the accelerator *should* be in use; only a completed inference
+# means it *is*. The app tells a customer (and an investor) "AI running on the
+# Hailo-8", so that claim has to rest on something that actually executed.
+_inference_count = 0
+_last_inference_monotonic: Optional[float] = None
+
+
+def record_inference() -> None:
+    """Called by HailoYOLO after each successful on-device inference."""
+    global _inference_count, _last_inference_monotonic
+    _inference_count += 1
+    _last_inference_monotonic = time.monotonic()
+
+
+def inference_stats() -> dict:
+    """What the accelerator has actually done, for health reporting."""
+    age = None if _last_inference_monotonic is None else time.monotonic() - _last_inference_monotonic
+    return {
+        "count": _inference_count,
+        "age_s": None if age is None else round(age, 2),
+        # Inference is only "live" if one landed recently. A count from five
+        # minutes ago means the pipeline has since stopped or fallen back.
+        "live": age is not None and age < 10.0,
+    }
 
 
 def configure(accel_cfg: dict, info: Optional[AcceleratorInfo] = None) -> AcceleratorInfo:
@@ -253,6 +280,9 @@ class HailoYOLO:
         with self._infer_pipeline as pipeline:
             with self._network_group.activate(self._network_group_params):
                 raw = pipeline.infer({self._input_name: batch})
+        # Recorded only after the device returned a result, so the health report
+        # reflects work the Hailo actually completed.
+        record_inference()
         # One output tensor (NMS postprocess): per image, a list per class of Nx5 rows.
         per_class = raw[next(iter(raw))][0]
 

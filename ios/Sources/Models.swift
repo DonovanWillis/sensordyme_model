@@ -14,12 +14,95 @@ struct Device: Codable, Identifiable, Hashable {
     let desiredPreset: String?
     let online: Bool
     let lastSeen: Double?
+    /// What the device last said about itself. `nil` when it has gone quiet —
+    /// the backend withholds stale reports rather than let the app render a
+    /// healthy camera for a Pi that was unplugged an hour ago.
+    let health: DeviceHealthReport?
 
     enum CodingKeys: String, CodingKey {
-        case id, name, online
+        case id, name, online, health
         case activePreset = "active_preset"
         case desiredPreset = "desired_preset"
         case lastSeen = "last_seen"
+    }
+}
+
+/// One subsystem as the device reported it.
+struct HealthComponent: Codable, Hashable {
+    let state: String        // ok | warning | failed | unknown
+    let detail: String
+    let metrics: [String: MetricValue]?
+
+    var status: SDStatus {
+        switch state {
+        case "ok": .online
+        case "warning": .warning
+        case "failed": .alert
+        default: .offline
+        }
+    }
+
+    /// "unknown" is a real answer, not a failure — the device is saying it
+    /// cannot tell, which the UI must not dress up as either good or bad.
+    var isKnown: Bool { state != "unknown" }
+
+    func metric(_ key: String) -> String? { metrics?[key]?.description }
+}
+
+/// Health metrics are heterogeneous (fps 12.0, ssid "Home", present true), so
+/// they decode into a small union rather than forcing one Swift type.
+enum MetricValue: Codable, Hashable, CustomStringConvertible {
+    case number(Double)
+    case text(String)
+    case flag(Bool)
+
+    init(from decoder: Decoder) throws {
+        let container = try decoder.singleValueContainer()
+        // Bool before Double: JSONDecoder will happily read `true` as 1.
+        if let value = try? container.decode(Bool.self) { self = .flag(value) }
+        else if let value = try? container.decode(Double.self) { self = .number(value) }
+        else if let value = try? container.decode(String.self) { self = .text(value) }
+        else { self = .text("—") }
+    }
+
+    func encode(to encoder: Encoder) throws {
+        var container = encoder.singleValueContainer()
+        switch self {
+        case .number(let value): try container.encode(value)
+        case .text(let value): try container.encode(value)
+        case .flag(let value): try container.encode(value)
+        }
+    }
+
+    var description: String {
+        switch self {
+        case .number(let value):
+            value == value.rounded() ? String(Int(value)) : String(format: "%.1f", value)
+        case .text(let value): value
+        case .flag(let value): value ? "yes" : "no"
+        }
+    }
+}
+
+struct DeviceHealthReport: Codable, Hashable {
+    let camera: HealthComponent?
+    let inference: HealthComponent?
+    let accelerator: HealthComponent?
+    let network: HealthComponent?
+    let system: HealthComponent?
+    let cloudConnected: Bool?
+
+    enum CodingKeys: String, CodingKey {
+        case camera, inference, accelerator, network, system
+        case cloudConnected = "cloud_connected"
+    }
+
+    /// The worst thing the device is currently reporting, for a one-glance summary.
+    var worstStatus: SDStatus {
+        let components = [camera, inference, accelerator, network, system].compactMap { $0 }
+        if components.contains(where: { $0.state == "failed" }) { return .alert }
+        if components.contains(where: { $0.state == "warning" }) { return .warning }
+        return components.isEmpty ? .offline : .online
     }
 }
 
