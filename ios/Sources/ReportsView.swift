@@ -91,7 +91,7 @@ struct ReportsView: View {
                 Circle().stroke(.quaternary, lineWidth: 10)
                 Circle()
                     .trim(from: 0, to: Double(report.safetyScore) / 100)
-                    .stroke(Brand.gradient, style: StrokeStyle(lineWidth: 10, lineCap: .round))
+                    .stroke(SD.Colors.accent, style: StrokeStyle(lineWidth: 10, lineCap: .round))
                     .rotationEffect(.degrees(-90))
                 Text("\(report.safetyScore)")
                     .font(.system(size: 34, weight: .heavy, design: .rounded))
@@ -102,7 +102,7 @@ struct ReportsView: View {
                 Text("Safety score").font(.headline)
                 Text("\(report.totalAlerts) alerts in this session window — \(report.loudAlerts) serious.")
                     .font(.subheadline)
-                    .foregroundStyle(.secondary)
+                    .foregroundStyle(SD.Colors.textSecondary)
             }
             Spacer()
         }
@@ -113,14 +113,14 @@ struct ReportsView: View {
         VStack(alignment: .leading, spacing: 12) {
             Text("Alerts by hour").font(.headline)
             if report.hourly.isEmpty {
-                Text("No alerts yet").foregroundStyle(.secondary)
+                Text("No alerts yet").foregroundStyle(SD.Colors.textSecondary)
             } else {
                 Chart(report.hourly, id: \.hour) { item in
                     BarMark(
                         x: .value("Hour", item.hour, unit: .hour),
                         y: .value("Alerts", item.count)
                     )
-                    .foregroundStyle(Brand.gradient)
+                    .foregroundStyle(SD.Colors.accent)
                     .cornerRadius(4)
                 }
                 .frame(height: 160)

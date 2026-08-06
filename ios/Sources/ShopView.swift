@@ -34,7 +34,7 @@ struct ShopView: View {
     private var productCard: some View {
         VStack(spacing: 14) {
             ZStack {
-                RoundedRectangle(cornerRadius: 24).fill(Brand.gradient)
+                RoundedRectangle(cornerRadius: 24).fill(SD.Colors.accent)
                 VStack(spacing: 10) {
                     LogoMark(size: 66)
                         .colorScheme(.dark)
@@ -50,7 +50,7 @@ struct ShopView: View {
             HStack {
                 VStack(alignment: .leading, spacing: 2) {
                     Text("$\(unitPrice)").font(.title2.weight(.heavy))
-                    Text("free shipping · 30-day returns").font(.caption).foregroundStyle(.secondary)
+                    Text("free shipping · 30-day returns").font(.caption).foregroundStyle(SD.Colors.textSecondary)
                 }
                 Spacer()
                 Stepper(value: $quantity, in: 1...25) {
@@ -87,10 +87,10 @@ struct ShopView: View {
                 Label("Order #\(placedOrderID) placed — \(quantity) unit\(quantity > 1 ? "s" : "") on the way",
                       systemImage: "shippingbox.fill")
                     .font(.subheadline.bold())
-                    .foregroundStyle(.green)
+                    .foregroundStyle(SD.Colors.success)
             }
             if let errorMessage {
-                Text(errorMessage).font(.callout).foregroundStyle(.red)
+                Text(errorMessage).font(.callout).foregroundStyle(SD.Colors.danger)
             }
         }
         .brandCard()
@@ -101,11 +101,11 @@ struct ShopView: View {
             Text("Your orders").font(.headline)
             ForEach(orderHistory) { order in
                 HStack {
-                    Image(systemName: "shippingbox.fill").foregroundStyle(Brand.gradient)
+                    Image(systemName: "shippingbox.fill").foregroundStyle(SD.Colors.accent)
                     VStack(alignment: .leading, spacing: 2) {
                         Text("Order #\(order.id) — \(order.quantity) unit\(order.quantity > 1 ? "s" : "")")
                             .font(.subheadline.bold())
-                        Text(order.address).font(.caption).foregroundStyle(.secondary).lineLimit(1)
+                        Text(order.address).font(.caption).foregroundStyle(SD.Colors.textSecondary).lineLimit(1)
                     }
                     Spacer()
                     Text(order.status.capitalized)

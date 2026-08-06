@@ -48,7 +48,7 @@ struct SettingsView: View {
                         .autocorrectionDisabled()
                     Text("Where cloud/app.py runs — your server's public URL, or your Mac's LAN address while developing. (Not \"localhost\": on a phone that means the phone itself.)")
                         .font(.footnote)
-                        .foregroundStyle(.secondary)
+                        .foregroundStyle(SD.Colors.textSecondary)
                 }
 
                 Section("Troubleshooting") {
@@ -59,7 +59,7 @@ struct SettingsView: View {
                     }
                     Text("Tests every stage — account, cloud, device, live feed — and points at the first one that fails.")
                         .font(.footnote)
-                        .foregroundStyle(.secondary)
+                        .foregroundStyle(SD.Colors.textSecondary)
                 }
 
                 Section("Live feed (local network)") {
@@ -90,7 +90,7 @@ struct SettingsView: View {
                         .autocorrectionDisabled()
                     Text("The device's dashboard address on your Wi-Fi. Frames stream directly device-to-phone — they never pass through the cloud. “Find my device” discovers it automatically (mDNS).")
                         .font(.footnote)
-                        .foregroundStyle(.secondary)
+                        .foregroundStyle(SD.Colors.textSecondary)
                 }
 
                 Section("Device Wi-Fi setup") {
@@ -101,7 +101,7 @@ struct SettingsView: View {
                     }
                     Text("For a brand-new device, or one taken somewhere without its saved network.")
                         .font(.footnote)
-                        .foregroundStyle(.secondary)
+                        .foregroundStyle(SD.Colors.textSecondary)
                 }
 
                 Section("Device health") {
@@ -122,7 +122,7 @@ struct SettingsView: View {
                             }
                         }
                     } else if let healthError {
-                        Text(healthError).font(.footnote).foregroundStyle(.secondary)
+                        Text(healthError).font(.footnote).foregroundStyle(SD.Colors.textSecondary)
                     }
                     Button("Check device health") {
                         Task {
@@ -161,11 +161,11 @@ struct SettingsView: View {
                     .disabled(alertPhone.isEmpty)
                     if phoneSaved {
                         Label("Saved — serious alerts will text this number", systemImage: "checkmark.circle.fill")
-                            .font(.footnote).foregroundStyle(.green)
+                            .font(.footnote).foregroundStyle(SD.Colors.success)
                     }
                     Text("When the sensor detects distracted driving (or a fall, a covered face, an intruder), a text goes to this number within seconds.")
                         .font(.footnote)
-                        .foregroundStyle(.secondary)
+                        .foregroundStyle(SD.Colors.textSecondary)
                 }
 
                 Section("Push notifications") {
@@ -186,12 +186,12 @@ struct SettingsView: View {
                     .disabled(ntfyTopic.isEmpty)
                     Text("Loud alerts push via ntfy.sh today (install the free ntfy app and subscribe to your topic). Native APNs push replaces this for the App Store build.")
                         .font(.footnote)
-                        .foregroundStyle(.secondary)
+                        .foregroundStyle(SD.Colors.textSecondary)
                     if let savedMessage {
-                        Text(savedMessage).font(.footnote).foregroundStyle(.green)
+                        Text(savedMessage).font(.footnote).foregroundStyle(SD.Colors.success)
                     }
                     if let errorMessage {
-                        Text(errorMessage).font(.footnote).foregroundStyle(.red)
+                        Text(errorMessage).font(.footnote).foregroundStyle(SD.Colors.danger)
                     }
                 }
 

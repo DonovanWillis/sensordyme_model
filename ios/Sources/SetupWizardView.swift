@@ -51,7 +51,7 @@ struct SetupWizardView: View {
                 }
 
                 if let errorMessage {
-                    Text(errorMessage).font(.callout).foregroundStyle(.red)
+                    Text(errorMessage).font(.callout).foregroundStyle(SD.Colors.danger)
                 }
             }
             .padding(24)
@@ -78,7 +78,7 @@ struct SetupWizardView: View {
         HStack(spacing: 6) {
             ForEach(0..<4, id: \.self) { index in
                 Capsule()
-                    .fill(index <= min(step.rawValue, 3) ? AnyShapeStyle(Brand.gradient) : AnyShapeStyle(.quaternary))
+                    .fill(index <= min(step.rawValue, 3) ? AnyShapeStyle(SD.Colors.accent) : AnyShapeStyle(.quaternary))
                     .frame(height: 5)
             }
         }
@@ -87,16 +87,16 @@ struct SetupWizardView: View {
     private func stepBody(icon: String, title: String, text: String) -> some View {
         VStack(spacing: 16) {
             ZStack {
-                Circle().fill(Brand.gradient.opacity(0.15)).frame(width: 130, height: 130)
+                Circle().fill(SD.Colors.accent.opacity(0.15)).frame(width: 130, height: 130)
                 Image(systemName: icon)
                     .font(.system(size: 52))
-                    .foregroundStyle(Brand.gradient)
+                    .foregroundStyle(SD.Colors.accent)
                     .symbolEffect(.pulse)
             }
             Text(title).font(.title2.bold())
             Text(text)
                 .font(.subheadline)
-                .foregroundStyle(.secondary)
+                .foregroundStyle(SD.Colors.textSecondary)
                 .multilineTextAlignment(.center)
         }
     }
@@ -160,7 +160,7 @@ struct SetupWizardView: View {
     private var doneStep: some View {
         VStack(spacing: 16) {
             ZStack {
-                Circle().fill(Brand.okGradient).frame(width: 130, height: 130)
+                Circle().fill(SD.Colors.success).frame(width: 130, height: 130)
                 Image(systemName: "checkmark")
                     .font(.system(size: 56, weight: .heavy))
                     .foregroundStyle(.white)
@@ -169,7 +169,7 @@ struct SetupWizardView: View {
             Text("You're live").font(.title.bold())
             Text("Your SensorDyme is online, watching, and fully controllable from this app — modes, alerts, reports, everything.")
                 .font(.subheadline)
-                .foregroundStyle(.secondary)
+                .foregroundStyle(SD.Colors.textSecondary)
                 .multilineTextAlignment(.center)
         }
     }

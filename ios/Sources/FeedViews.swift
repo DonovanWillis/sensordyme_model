@@ -29,7 +29,7 @@ struct FeedCard: View {
         .clipShape(RoundedRectangle(cornerRadius: 22))
         .overlay(
             RoundedRectangle(cornerRadius: 22)
-                .strokeBorder(alertActive ? AnyShapeStyle(Brand.alertGradient) : AnyShapeStyle(.quaternary),
+                .strokeBorder(alertActive ? AnyShapeStyle(SD.Colors.danger) : AnyShapeStyle(.quaternary),
                               lineWidth: alertActive ? 3 : 1)
         )
         .animation(.easeInOut(duration: 0.4), value: alertActive)
@@ -37,13 +37,13 @@ struct FeedCard: View {
 
     private var feedPlaceholder: some View {
         ZStack {
-            Brand.ink
+            SD.Colors.canvas
             VStack(spacing: 10) {
-                Image(systemName: "video.slash.fill").font(.title).foregroundStyle(.secondary)
+                Image(systemName: "video.slash.fill").font(.title).foregroundStyle(SD.Colors.textSecondary)
                 Text("Live feed streams on your home/car network.\nSet the device address in Settings.")
                     .font(.caption)
                     .multilineTextAlignment(.center)
-                    .foregroundStyle(.secondary)
+                    .foregroundStyle(SD.Colors.textSecondary)
             }
         }
     }
@@ -68,7 +68,7 @@ struct SimulatedFeedView: View {
         TimelineView(.animation(minimumInterval: 1 / 30)) { context in
             let t = context.date.timeIntervalSinceReferenceDate
             ZStack {
-                LinearGradient(colors: [Brand.ink, Color(hex: 0x1A2036)], startPoint: .top, endPoint: .bottom)
+                SD.Colors.canvas
 
                 // subject silhouette with gentle "breathing" motion
                 Image(systemName: sceneIcon)
@@ -79,12 +79,12 @@ struct SimulatedFeedView: View {
 
                 // tracking box drifting like a live detector
                 RoundedRectangle(cornerRadius: 10)
-                    .strokeBorder(alert ? AnyShapeStyle(Brand.alertGradient) : AnyShapeStyle(Brand.gradient), lineWidth: 2)
+                    .strokeBorder(alert ? AnyShapeStyle(SD.Colors.danger) : AnyShapeStyle(SD.Colors.accent), lineWidth: 2)
                     .frame(width: 130, height: 150)
                     .offset(x: 12 * sin(t * 0.35), y: 4 + 4 * sin(t * 0.9))
 
                 // sweeping scan line
-                LinearGradient(colors: [.clear, Brand.electric.opacity(0.35), .clear],
+                LinearGradient(colors: [.clear, SD.Colors.accent.opacity(0.35), .clear],
                                startPoint: .top, endPoint: .bottom)
                     .frame(height: 46)
                     .offset(y: CGFloat(((t * 40).truncatingRemainder(dividingBy: 300)) - 150))
@@ -126,7 +126,7 @@ struct MJPEGView: View {
 
     var body: some View {
         ZStack {
-            Brand.ink
+            SD.Colors.canvas
             if let image = reader.image {
                 // FULL frame, always: fit (letterbox) at the camera's real aspect
                 // ratio, never fill+crop — cropping a safety camera hides exactly

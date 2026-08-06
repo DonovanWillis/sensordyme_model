@@ -12,7 +12,7 @@ struct ProvisioningView: View {
             Section {
                 Text("If your device has no Wi-Fi yet (new, or you moved it), it broadcasts over Bluetooth as SensorDyme-XXXX. Connect and send it your network.")
                     .font(.footnote)
-                    .foregroundStyle(.secondary)
+                    .foregroundStyle(SD.Colors.textSecondary)
             }
 
             Section("1. Find your device") {
@@ -23,9 +23,9 @@ struct ProvisioningView: View {
                     }
                 case .bluetoothOff:
                     Label("Turn on Bluetooth in Settings to continue", systemImage: "exclamationmark.triangle")
-                        .foregroundStyle(.orange)
+                        .foregroundStyle(SD.Colors.warning)
                 case .scanning:
-                    HStack { ProgressView(); Text("Scanning…").foregroundStyle(.secondary) }
+                    HStack { ProgressView(); Text("Scanning…").foregroundStyle(SD.Colors.textSecondary) }
                 default:
                     EmptyView()
                 }
@@ -82,20 +82,20 @@ struct ProvisioningView: View {
         case .connecting(let name):
             Section { HStack { ProgressView(); Text("Connecting to \(name)…") } }
         case .ready(let name):
-            Section { Label("Connected to \(name)", systemImage: "checkmark.circle").foregroundStyle(.green) }
+            Section { Label("Connected to \(name)", systemImage: "checkmark.circle").foregroundStyle(SD.Colors.success) }
         case .deviceConnecting:
             Section { HStack { ProgressView(); Text("Device is joining your Wi-Fi…") } }
         case .success(let ip):
             Section {
                 Label("Device is online\(ip.map { " at \($0)" } ?? "")", systemImage: "checkmark.circle.fill")
-                    .foregroundStyle(.green)
+                    .foregroundStyle(SD.Colors.success)
                 Text("Bluetooth setup is done — the live feed streams over Wi-Fi. Use “Find my device” in Settings to fill in the feed address.")
                     .font(.footnote)
-                    .foregroundStyle(.secondary)
+                    .foregroundStyle(SD.Colors.textSecondary)
             }
         case .failed(let message):
             Section {
-                Label(message, systemImage: "xmark.circle").foregroundStyle(.red)
+                Label(message, systemImage: "xmark.circle").foregroundStyle(SD.Colors.danger)
                 Button("Try again") { ble.startScan() }
             }
         default:

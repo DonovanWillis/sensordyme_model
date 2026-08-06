@@ -40,7 +40,7 @@ struct DiagnosticsView: View {
                                 .foregroundStyle(color(for: result.passed))
                             VStack(alignment: .leading, spacing: 2) {
                                 Text(result.name).font(.subheadline.weight(.semibold))
-                                Text(result.detail).font(.caption).foregroundStyle(.secondary)
+                                Text(result.detail).font(.caption).foregroundStyle(SD.Colors.textSecondary)
                             }
                         }
                     }
