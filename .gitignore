@@ -43,3 +43,6 @@ setup*.log
 # codes, orders, event history. Was committed through e57b1bb and purged from
 # history on 2026-08-06 — never track it again.
 cloud/*.db
+
+# JWT signing key, generated and persisted by cloud/app.py on first run.
+cloud/.jwt_secret

@@ -43,13 +43,26 @@ cloud:
 
 ## Deploy
 
-Anything that runs Python works (Fly.io, Railway, a small VPS). Set real secrets:
+Anything that runs Python works (Fly.io, Railway, a small VPS).
 
 ```bash
-export SENSORDYME_JWT_SECRET=$(openssl rand -hex 32)
 export SENSORDYME_DB=/data/sensordyme.db
 uvicorn cloud.app:app --host 0.0.0.0 --port 8787
 ```
+
+**Do not** generate the JWT secret inline on the command line
+(`export SENSORDYME_JWT_SECRET=$(openssl rand -hex 32)`, as this file used to
+advise). That mints a new signing key on every restart, which invalidates every
+session issued before it — the app reports `invalid token: Signature
+verification failed` on a token that was valid when issued. `app.py` now
+generates a key once and persists it to `cloud/.jwt_secret` (gitignored), so
+sessions survive restarts on their own.
+
+Set `SENSORDYME_JWT_SECRET` explicitly only when several server processes must
+share one key — generate it *once*, store it in your host's secret manager, and
+inject the same value every boot. `SENSORDYME_JWT_SECRET_FILE` overrides where
+the persisted key lives (useful when the DB is on a read-only or ephemeral
+volume).
 
 SQLite is fine to start; the storage layer is one file (`app.py`) to swap for
 Postgres when real traffic arrives. Push notifications use ntfy.sh today (no

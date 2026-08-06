@@ -33,9 +33,52 @@ from fastapi import Depends, FastAPI, Header, HTTPException
 from pydantic import BaseModel
 
 DB_PATH = os.environ.get("SENSORDYME_DB", str(Path(__file__).parent / "sensordyme.db"))
-JWT_SECRET = os.environ.get("SENSORDYME_JWT_SECRET", "dev-secret-change-in-production")
 JWT_TTL_S = 30 * 24 * 3600
 NTFY_BASE = os.environ.get("SENSORDYME_NTFY_BASE", "https://ntfy.sh")
+
+
+def _load_jwt_secret() -> str:
+    """A signing key that survives restarts, however the server was launched.
+
+    Every token is signed with this key and verified with it 30 days later, so it
+    must be *stable*. Two earlier behaviours made it unstable, and both produced
+    `401 invalid token: Signature verification failed` on a token that was
+    perfectly valid when issued:
+
+      * an unset env var silently fell back to a committed default, so a server
+        started from a plain shell and one started from a configured shell
+        disagreed about every token; and
+      * the documented deploy command was `export SENSORDYME_JWT_SECRET=$(openssl
+        rand -hex 32)`, which mints a *new* key on every invocation — so each
+        restart invalidated every session that existed before it.
+
+    An explicit env var still wins (that is how you share one key across several
+    server processes). Otherwise the key is generated once and persisted next to
+    the database, which keeps sessions alive across restarts without ever
+    shipping a shared default that anyone could forge tokens with.
+    """
+    env = os.environ.get("SENSORDYME_JWT_SECRET", "").strip()
+    if env:
+        return env
+
+    path = Path(os.environ.get("SENSORDYME_JWT_SECRET_FILE", Path(DB_PATH).parent / ".jwt_secret"))
+    try:
+        existing = path.read_text().strip()
+        if existing:
+            return existing
+    except FileNotFoundError:
+        pass
+
+    generated = secrets.token_hex(32)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    # 0600 before the write, so the key is never briefly world-readable.
+    fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    with os.fdopen(fd, "w") as handle:
+        handle.write(generated)
+    return generated
+
+
+JWT_SECRET = _load_jwt_secret()
 
 app = FastAPI(title="SensorDyme Cloud", version="0.1")
 
