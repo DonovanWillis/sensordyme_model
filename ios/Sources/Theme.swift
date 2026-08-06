@@ -139,6 +139,56 @@ extension View {
     func brandCard() -> some View { modifier(BrandCard()) }
 }
 
+/// Surfaces a connection problem *without* hiding whatever is already on screen.
+/// The device views poll on a timer and keep their last-known data when a refresh
+/// fails, so without this a dead backend looks exactly like a healthy one — the
+/// screen just quietly stops changing.
+struct ConnectionBanner: View {
+    let message: String
+    var title = "Can't reach the backend"
+    var retry: (() async -> Void)?
+
+    @State private var retrying = false
+
+    var body: some View {
+        HStack(alignment: .top, spacing: 12) {
+            Image(systemName: "exclamationmark.triangle.fill")
+                .font(.headline)
+                .foregroundStyle(.orange)
+            VStack(alignment: .leading, spacing: 6) {
+                Text(title)
+                    .font(.subheadline.weight(.semibold))
+                Text(message)
+                    .font(.footnote)
+                    .foregroundStyle(.secondary)
+                    .fixedSize(horizontal: false, vertical: true)
+                if let retry {
+                    Button {
+                        retrying = true
+                        Task {
+                            await retry()
+                            retrying = false
+                        }
+                    } label: {
+                        if retrying {
+                            ProgressView().controlSize(.small)
+                        } else {
+                            Text("Try again").font(.footnote.weight(.semibold))
+                        }
+                    }
+                    .disabled(retrying)
+                    .padding(.top, 2)
+                }
+            }
+            Spacer(minLength: 0)
+        }
+        .padding(14)
+        .background(RoundedRectangle(cornerRadius: 16).fill(Color.orange.opacity(0.12)))
+        .overlay(RoundedRectangle(cornerRadius: 16).strokeBorder(Color.orange.opacity(0.35), lineWidth: 1))
+        .accessibilityElement(children: .combine)
+    }
+}
+
 /// Slow-moving animated gradient used behind hero surfaces ("vibrant transitions").
 struct AnimatedBrandBackground: View {
     @State private var animate = false

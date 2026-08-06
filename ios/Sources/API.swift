@@ -3,6 +3,9 @@ import SwiftUI
 
 struct APIError: LocalizedError {
     let message: String
+    /// A 401. The stored token is dead, so retrying is pointless — the caller
+    /// should send the user back to sign-in rather than keep polling.
+    var isAuthFailure = false
     var errorDescription: String? { message }
 }
 
@@ -42,6 +45,9 @@ struct APIClient {
             throw APIError(message: Self.explain(error, host: baseURL.host ?? "the server"))
         }
         let status = (response as? HTTPURLResponse)?.statusCode ?? 0
+        guard status != 401 else {
+            throw APIError(message: "Your session has expired. Please sign in again.", isAuthFailure: true)
+        }
         guard (200..<300).contains(status) else {
             // FastAPI errors arrive as {"detail": "..."}
             let detail = (try? JSONSerialization.jsonObject(with: data) as? [String: Any])?["detail"]
@@ -128,6 +134,9 @@ final class AppState: ObservableObject {
 
     @Published var isSignedIn: Bool = false
     @Published var isDemo: Bool = false
+    /// Explains an involuntary sign-out on the auth screen, so a rotated server
+    /// secret or an expired token doesn't just silently dump the user to login.
+    @Published var signOutNotice: String?
 
     /// Auth token, kept in the Keychain (not UserDefaults). Migrates any token
     /// stored by earlier builds on first launch.
@@ -163,6 +172,7 @@ final class AppState: ObservableObject {
         storedToken = auth.token
         accountEmail = auth.email
         isSignedIn = true
+        signOutNotice = nil
     }
 
     func enterDemo() {
@@ -170,6 +180,7 @@ final class AppState: ObservableObject {
         isDemo = true
         accountEmail = "demo@sensordyme.app"
         isSignedIn = true
+        signOutNotice = nil
     }
 
     func signOut() {
@@ -178,5 +189,14 @@ final class AppState: ObservableObject {
         storedDemo = false
         isDemo = false
         isSignedIn = false
+        signOutNotice = nil
+    }
+
+    /// The token was rejected. Without this the polling views retry a dead token
+    /// every few seconds forever, showing nothing to explain why data went stale.
+    func expireSession(_ reason: String) {
+        guard isSignedIn, !isDemo else { return }
+        signOut()
+        signOutNotice = reason
     }
 }

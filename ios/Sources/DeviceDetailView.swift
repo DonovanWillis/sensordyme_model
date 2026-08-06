@@ -23,6 +23,12 @@ struct DeviceDetailView: View {
     var body: some View {
         ScrollView {
             VStack(spacing: 16) {
+                // Above the feed, not below the fold: this view polls every 4s and
+                // keeps showing the last frame and event list when a refresh fails.
+                if let errorMessage {
+                    ConnectionBanner(message: errorMessage) { await reload() }
+                }
+
                 FeedCard(device: device, alertActive: alertActive)
 
                 statusRow
@@ -32,10 +38,6 @@ struct DeviceDetailView: View {
                 modeCard
 
                 historyCard
-
-                if let errorMessage {
-                    Text(errorMessage).font(.callout).foregroundStyle(.red)
-                }
             }
             .padding()
         }
@@ -240,6 +242,8 @@ struct DeviceDetailView: View {
             }
             events = try await state.backend.events(deviceID: device.id, limit: 200)
             errorMessage = nil
+        } catch let error as APIError where error.isAuthFailure {
+            state.expireSession(error.message)
         } catch {
             errorMessage = error.localizedDescription
         }

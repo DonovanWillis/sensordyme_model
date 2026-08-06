@@ -12,11 +12,16 @@ struct DevicesView: View {
         NavigationStack {
             ScrollView {
                 VStack(spacing: 14) {
-                    if devices.isEmpty {
+                    // Shown whether or not devices are loaded: a failed refresh
+                    // leaves stale cards on screen that look perfectly current.
+                    if let errorMessage {
+                        ConnectionBanner(message: errorMessage) { await reload() }
+                    }
+                    if devices.isEmpty && errorMessage == nil {
                         ContentUnavailableView(
                             "No devices yet",
                             systemImage: "video.slash",
-                            description: Text(errorMessage ?? "Pair your SensorDyme device with its claim code.")
+                            description: Text("Pair your SensorDyme device with its claim code.")
                         )
                         .padding(.top, 60)
                     }
@@ -58,6 +63,8 @@ struct DevicesView: View {
         do {
             devices = try await state.backend.devices()
             errorMessage = nil
+        } catch let error as APIError where error.isAuthFailure {
+            state.expireSession(error.message)
         } catch {
             errorMessage = error.localizedDescription
         }

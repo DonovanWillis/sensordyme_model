@@ -21,6 +21,11 @@ struct AuthView: View {
                         .font(.subheadline)
                         .foregroundStyle(.secondary)
 
+                    // Why the user is suddenly looking at a login screen.
+                    if let notice = state.signOutNotice {
+                        ConnectionBanner(message: notice, title: "Signed out")
+                    }
+
                     VStack(spacing: 12) {
                         TextField("Email", text: $email)
                             .textContentType(.emailAddress)

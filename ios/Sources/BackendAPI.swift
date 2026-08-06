@@ -328,6 +328,9 @@ extension APIClient {
         req.httpBody = try JSONSerialization.data(withJSONObject: body)
         let (data, response) = try await URLSession.shared.data(for: req)
         let status = (response as? HTTPURLResponse)?.statusCode ?? 0
+        guard status != 401 else {
+            throw APIError(message: "Your session has expired. Please sign in again.", isAuthFailure: true)
+        }
         guard (200..<300).contains(status) else {
             let detail = (try? JSONSerialization.jsonObject(with: data) as? [String: Any])?["detail"]
             throw APIError(message: (detail as? String) ?? "request failed (\(status))")
