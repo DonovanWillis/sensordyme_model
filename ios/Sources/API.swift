@@ -131,6 +131,16 @@ final class AppState: ObservableObject {
     @AppStorage("deviceToken") var deviceToken: String = ""  // dashboard.token; sent as X-Device-Token
     @AppStorage("accountEmail") var accountEmail: String = ""
     @AppStorage("demoMode") private var storedDemo: Bool = false
+    /// Stored raw so the enum can gain cases without invalidating saved values.
+    @AppStorage("appearance") private var storedAppearance: String = SD.Appearance.system.rawValue
+
+    var appearance: SD.Appearance {
+        get { SD.Appearance(rawValue: storedAppearance) ?? .system }
+        set {
+            objectWillChange.send()  // @AppStorage on a plain property won't publish
+            storedAppearance = newValue.rawValue
+        }
+    }
 
     @Published var isSignedIn: Bool = false
     @Published var isDemo: Bool = false

@@ -8,6 +8,9 @@ struct SensorDymeApp: App {
         WindowGroup {
             RootView()
                 .environmentObject(state)
+                // Applied at the root so every screen, sheet and alert inherits
+                // it — a theme applied per-screen leaves modals in the old one.
+                .preferredColorScheme(state.appearance.colorScheme)
         }
     }
 }

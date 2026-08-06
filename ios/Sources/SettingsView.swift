@@ -26,6 +26,21 @@ struct SettingsView: View {
                     }
                 }
 
+                Section("Appearance") {
+                    Picker("Theme", selection: Binding(
+                        get: { state.appearance },
+                        set: { state.appearance = $0 }
+                    )) {
+                        ForEach(SD.Appearance.allCases) { option in
+                            Label(option.title, systemImage: option.icon).tag(option)
+                        }
+                    }
+                    .pickerStyle(.segmented)
+                    Text("System follows your phone's setting. Light and Dark override it for SensorDyme only.")
+                        .font(SD.Typography.caption)
+                        .foregroundStyle(SD.Colors.textSecondary)
+                }
+
                 Section("Cloud backend") {
                     TextField("http://192.168.1.x:8787", text: state.$baseURLString)
                         .keyboardType(.URL)

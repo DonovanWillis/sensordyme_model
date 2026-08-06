@@ -22,38 +22,45 @@ enum SD {
     /// Semantic colours, all adaptive. A phone in a bright car interior is a
     /// real use case, so nothing here assumes a dark UI.
     enum Colors {
-        // Foundation
-        static let background = adaptive(light: 0xF6F7F9, dark: 0x0A0D13)
-        static let surface = adaptive(light: 0xFFFFFF, dark: 0x131822)
-        static let surfaceRaised = adaptive(light: 0xFFFFFF, dark: 0x1B2130)
+        // Foundation. True white and true black, as specified.
+        //
+        // A white page with white cards needs *something* to separate them, and
+        // the honest choices are a tint or a line. Lines win here: tinted cards
+        // on white drift grey as they stack, while a hairline stays crisp and
+        // keeps the page feeling like paper rather than a stack of panels.
+        // Dark mode mirrors it — black page, barely-lifted cards, hairline.
+        static let background = adaptive(light: 0xFFFFFF, dark: 0x000000)
+        static let surface = adaptive(light: 0xFFFFFF, dark: 0x0C0C0D)
+        static let surfaceRaised = adaptive(light: 0xF7F7F8, dark: 0x161618)
 
         /// Behind video, in both modes. Footage reads best on a neutral dark
         /// field, and a white box around a night-vision frame looks broken.
-        static let canvas = Color(hex: 0x0A0D13)
+        static let canvas = Color(hex: 0x000000)
 
         // Text
-        static let textPrimary = adaptive(light: 0x0C111D, dark: 0xF3F6FA)
-        static let textSecondary = adaptive(light: 0x4A5567, dark: 0x99A4B7)
-        static let textTertiary = adaptive(light: 0x8B95A7, dark: 0x69748A)
+        static let textPrimary = adaptive(light: 0x000000, dark: 0xFFFFFF)
+        static let textSecondary = adaptive(light: 0x5A5A5E, dark: 0xA8A8AD)
+        static let textTertiary = adaptive(light: 0x8E8E93, dark: 0x707075)
         static let textOnAccent = Color.white
 
-        // Lines
-        static let border = adaptive(light: 0xE3E7EE, dark: 0x252C3A)
-        static let borderStrong = adaptive(light: 0xCED5E0, dark: 0x353E50)
+        // Lines. The only thing separating a white card from a white page, so
+        // they carry real weight here rather than being decorative.
+        static let border = adaptive(light: 0xE5E5E7, dark: 0x2A2A2E)
+        static let borderStrong = adaptive(light: 0xC9C9CE, dark: 0x3C3C42)
 
         /// The one interactive colour. If it is blue, you can tap it.
-        static let accent = adaptive(light: 0x2C64F0, dark: 0x5B8CFF)
-        static let accentMuted = adaptive(light: 0xEDF2FE, dark: 0x18233D)
+        static let accent = adaptive(light: 0x0A62F0, dark: 0x4C8DFF)
+        static let accentMuted = adaptive(light: 0xEDF3FE, dark: 0x101B2E)
 
         // Status. Deliberately distinct from the accent so "interactive" and
         // "something is happening" can never be confused.
-        static let success = adaptive(light: 0x0E8A4F, dark: 0x2ECC80)
-        static let successMuted = adaptive(light: 0xE7F6EE, dark: 0x0E2A1E)
-        static let warning = adaptive(light: 0xB45309, dark: 0xF5A524)
-        static let warningMuted = adaptive(light: 0xFDF3E7, dark: 0x2C2010)
-        static let danger = adaptive(light: 0xC62828, dark: 0xFF5A52)
-        static let dangerMuted = adaptive(light: 0xFDECEC, dark: 0x2E1414)
-        static let offline = adaptive(light: 0x9AA3B2, dark: 0x5C6678)
+        static let success = adaptive(light: 0x0B7A45, dark: 0x30D07A)
+        static let successMuted = adaptive(light: 0xEBF7F0, dark: 0x0A1F15)
+        static let warning = adaptive(light: 0x9A5B00, dark: 0xF5A524)
+        static let warningMuted = adaptive(light: 0xFCF3E8, dark: 0x241A0B)
+        static let danger = adaptive(light: 0xC00F0C, dark: 0xFF5F57)
+        static let dangerMuted = adaptive(light: 0xFDEDEC, dark: 0x260F0E)
+        static let offline = adaptive(light: 0x8E8E93, dark: 0x636368)
 
         private static func adaptive(light: UInt32, dark: UInt32) -> Color {
             Color(uiColor: UIColor { traits in
@@ -114,6 +121,43 @@ enum SD {
                 color: .black.opacity(scheme == .dark ? 0 : 0.06 * strength),
                 radius: 12 * strength, x: 0, y: 4 * strength
             )
+        }
+    }
+
+    // MARK: Appearance
+
+    /// The user's theme choice. `system` is the default because most people
+    /// want the app to match the phone, but an explicit choice has to be
+    /// honoured — someone who runs their phone dark and wants SensorDyme white
+    /// in a bright car is making a real request, not a mistake.
+    enum Appearance: String, CaseIterable, Identifiable {
+        case system, light, dark
+
+        var id: String { rawValue }
+
+        var title: String {
+            switch self {
+            case .system: "System"
+            case .light: "Light"
+            case .dark: "Dark"
+            }
+        }
+
+        var icon: String {
+            switch self {
+            case .system: "iphone"
+            case .light: "sun.max"
+            case .dark: "moon"
+            }
+        }
+
+        /// nil means "don't override", which is what lets `system` work.
+        var colorScheme: ColorScheme? {
+            switch self {
+            case .system: nil
+            case .light: .light
+            case .dark: .dark
+            }
         }
     }
 
