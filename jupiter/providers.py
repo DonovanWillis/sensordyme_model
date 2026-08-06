@@ -112,10 +112,6 @@ class JupiterLocalProvider(Provider):
         return True, f"{self.model} on {self.base_url}"
 
     def complete(self, system: str, user: str, *, schema=None, grammar=None) -> ProviderResult:
-        options = {"temperature": self.temperature, "num_predict": self.max_tokens}
-        if grammar:
-            options["grammar"] = grammar
-
         body = {
             "model": self.model,
             "messages": [
@@ -123,11 +119,27 @@ class JupiterLocalProvider(Provider):
                 {"role": "user", "content": user},
             ],
             "stream": False,
-            "options": options,
+            "options": {"temperature": self.temperature, "num_predict": self.max_tokens},
         }
-        # Ollama's own JSON mode, as a second belt when no grammar is supplied.
-        if schema is not None and not grammar:
-            body["format"] = "json"
+
+        # Structured output goes through `format`, NOT `options.grammar`.
+        #
+        # Ollama accepts `options.grammar` and silently ignores it — a grammar
+        # forcing the literal "BANANA" still returned ordinary prose. Measured,
+        # not assumed. Because it was ignored, the model was free to invent
+        # predicates ("exists", "removes") that the registry then rejected, and
+        # the whole request looked like a refusal. Passing the JSON Schema as
+        # `format` enforces the enums, so an invalid predicate is untypeable.
+        #
+        # `grammar` is still accepted by this signature for runtimes that do
+        # honour GBNF (llama.cpp's own server does), and reported honestly in
+        # `meta` so telemetry cannot claim a constraint that was not applied.
+        constrained = False
+        if schema is not None:
+            body["format"] = schema
+            constrained = True
+        elif grammar:
+            body["options"]["grammar"] = grammar
 
         started = time.monotonic()
         try:
@@ -148,7 +160,7 @@ class JupiterLocalProvider(Provider):
             text=text, provider=self.name, model=self.model,
             latency_s=round(time.monotonic() - started, 3),
             prompt_chars=len(system) + len(user), completion_chars=len(text),
-            meta={"grammar": bool(grammar)},
+            meta={"constrained": constrained},
         )
 
 

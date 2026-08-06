@@ -24,8 +24,9 @@ from core.capabilities import registry
 _RULES = """\
 RULES:
 1. Use ONLY exact labels and predicates from the capability sheet. Never invent one.
-2. If the request needs something not in the sheet, put it in `unsupported` and
-   explain plainly. Never substitute a loosely similar object.
+2. If the request needs something NOT in the sheet, set target to "none" and put
+   the request in `unsupported`. Never substitute a different object — watching
+   for a person when someone asked about a can is worse than saying you cannot.
 3. Never claim identity, intent, emotion, or medical condition from appearance.
 4. Prefer persist_s >= 2 and cooldown_s >= 30. A single ambiguous frame must never alert.
 5. Area requests need a zone the user draws: name it in `zone` and say so.
@@ -49,7 +50,12 @@ _EXAMPLES = [
         "monitor for a can",
         {
             "understood": "I can't watch for that — the detector doesn't recognise cans.",
-            "rules": [],
+            "rules": [{
+                "target": "none", "predicate": "present", "secondary": "",
+                "description": "monitor for a can", "zone": "", "persist_s": 3.0,
+                "min_count": 1, "confidence": 0.6, "severity": "info",
+                "cooldown_s": 60.0, "schedule": "", "notify": "silent",
+            }],
             "unsupported": [{
                 "request": "monitor for a can",
                 "reason": "'can' is not an object the vision model recognises",

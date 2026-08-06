@@ -31,6 +31,9 @@ CONFIDENCE_MIN, CONFIDENCE_MAX = 0.2, 0.95
 COOLDOWN_MIN, COOLDOWN_MAX = 10.0, 86400.0
 COUNT_MIN, COUNT_MAX = 1, 100
 
+#: What the model emits when nothing in the vocabulary fits the request.
+NO_TARGET = "none"
+
 SEVERITIES = ("info", "warning", "critical")
 NOTIFY_KINDS = ("push", "sms", "silent")
 
@@ -184,7 +187,15 @@ def schema_for_registry(reg=None) -> dict:
     generated, never written down: it is exactly what the registry reports today.
     """
     reg = reg or registry()
-    labels = sorted(reg.labels())
+    # NO_TARGET is an escape hatch, and it is load-bearing. Enum-constraining
+    # `target` to detectable labels removes the model's ability to say "that is
+    # not on the list": asked to watch for a can it must emit SOME valid label,
+    # and it picks an unrelated one. Measured on qwen2.5-1.5b: "alert me if a
+    # can appears" produced target=person with the description "Cans appear in
+    # the area of interest". Constrained decoding had turned an honest refusal
+    # into a confident wrong answer — worse than the unconstrained failure,
+    # which validation caught. A legal token for "cannot" fixes the cause.
+    labels = sorted(reg.labels()) + [NO_TARGET]
     predicates = sorted(reg.predicates())
 
     rule = {
@@ -293,6 +304,15 @@ def parse_response(payload: Any, reg=None) -> Interpretation:
         if not isinstance(entry, dict):
             continue
         draft = RuleDraft.from_dict(entry)
+        if draft.target == NO_TARGET:
+            result.unsupported.append({
+                "request": draft.description or "(request)",
+                "reason": "no object SensorDyme can detect matches this request",
+                "requires": "a model trained on the thing you described",
+                "support": "needs_training_data",
+                "alternatives": [],
+            })
+            continue
         ok, reason, extra = draft.validate(reg)
         if ok:
             result.rules.append(draft)

@@ -285,7 +285,9 @@ def test_local_provider_reports_a_missing_server_usefully():
     assert "ollama" in detail.lower()
 
 
-def test_local_provider_passes_the_grammar_through():
+def test_local_provider_uses_schema_constrained_output():
+    """Ollama silently IGNORES options.grammar — measured, not assumed — so the
+    schema must go through `format` or the enums are not enforced at all."""
     captured = {}
 
     class Response:
@@ -298,10 +300,12 @@ def test_local_provider_passes_the_grammar_through():
         return Response()
 
     provider = JupiterLocalProvider(post=post)
-    result = provider.complete("sys", "user", schema={}, grammar="root ::= \"x\"")
-    assert captured["options"]["grammar"] == 'root ::= "x"'
+    result = provider.complete("sys", "user", schema={"type": "object"},
+                               grammar='root ::= "x"')
+    assert captured["format"] == {"type": "object"}
+    assert "grammar" not in captured.get("options", {})
+    assert result.meta["constrained"] is True
     assert isinstance(result, ProviderResult)
-    assert result.latency_s >= 0
 
 
 # --------------------------------------------------------------------- eval harness
@@ -361,3 +365,33 @@ def test_harness_catches_a_provider_that_returns_prose(reg):
     examples = generate(limit=20, reg=reg)
     summary = run(examples, ScriptedProvider(config={"default": "Sure!"}), reg=reg).summary()
     assert summary["parse_rate"] == 0.0
+
+
+def test_a_misconfigured_provider_name_does_not_500(reg):
+    """A typo in SENSORDYME_AI_PROVIDER once raised out of interpret() and
+    produced a 500 on every Configure-with-AI request."""
+    outcome = interpret("watch a person", provider_name="typo-provider", reg=reg)
+    assert not outcome.ok
+    assert "typo-provider" in outcome.error
+    assert outcome.interpretation.rules == []
+
+
+def test_no_target_is_treated_as_a_refusal(reg):
+    """Enum-constraining `target` removes the model's ability to say "not on the
+    list", so it substitutes an unrelated object. NO_TARGET is that escape."""
+    from jupiter.schema import NO_TARGET
+
+    result = parse_response({
+        "understood": "cannot", "unsupported": [],
+        "rules": [{"target": NO_TARGET, "predicate": "present",
+                   "description": "monitor for a can"}],
+    }, reg)
+    assert result.rules == []
+    assert "can" in result.unsupported[0]["request"]
+
+
+def test_no_target_is_in_the_constrained_enum(reg):
+    from jupiter.schema import NO_TARGET
+
+    enum = schema_for_registry(reg)["properties"]["rules"]["items"]["properties"]["target"]["enum"]
+    assert NO_TARGET in enum

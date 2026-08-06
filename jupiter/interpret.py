@@ -103,7 +103,27 @@ def interpret(
     # refusing outright would reject legitimate phrasings that happen to match.
     injection = security.looks_like_injection(cleaned)
 
-    backend = provider or get_provider(provider_name, config)
+    # Provider construction is inside the guarded path on purpose. A typo in
+    # SENSORDYME_AI_PROVIDER, or an openai_compatible runtime with no base_url,
+    # raises here — and outside a try that meant a 500 on every Configure-with-AI
+    # request rather than a message saying the AI is misconfigured.
+    try:
+        backend = provider or get_provider(provider_name, config)
+    except JupiterUnavailable as exc:
+        return InterpretOutcome(
+            interpretation=Interpretation(understood="", rules=[], unsupported=[{
+                "request": cleaned,
+                "reason": exc.message,
+                "requires": "a valid AI provider — see docs/JUPITER.md",
+                "support": "unsupported",
+                "alternatives": [],
+            }]),
+            provider=str(provider_name or "jupiter"),
+            ok=False,
+            error=exc.message,
+            injection_suspected=injection,
+        )
+
     system = prompt_module.system_prompt(reg)
     user = prompt_module.user_prompt(cleaned)
     schema = schema_for_registry(reg)
@@ -157,7 +177,7 @@ def interpret(
         meta={
             "prompt_chars": result.prompt_chars,
             "completion_chars": result.completion_chars,
-            "grammar": result.meta.get("grammar", False),
+            "constrained": result.meta.get("constrained", False),
             "rules": len(interpretation.rules),
             "rejected": len(interpretation.unsupported),
         },

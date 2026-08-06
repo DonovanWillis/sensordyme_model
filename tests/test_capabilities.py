@@ -175,6 +175,11 @@ def backend(tmp_path, monkeypatch):
     pytest.importorskip("fastapi")
     from fastapi.testclient import TestClient
 
+    # Pin the AI provider: without this the suite passes or fails depending
+    # on whether a local model server is running, which is not a property
+    # a test should have. "unavailable" is not a registered provider, so
+    # _ai_configure_llm falls through to the deterministic path.
+    monkeypatch.setenv("SENSORDYME_AI_PROVIDER", "unavailable")
     monkeypatch.setenv("SENSORDYME_DB", str(tmp_path / "test.db"))
     monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)
     for mod in ("cloud.app", "cloud"):
