@@ -40,6 +40,7 @@ from core.logger import EventLogger
 from core.logging_setup import get_logger, setup_logging
 from core import device_health
 from core.network import WifiManager, nmcli_available
+from core.dataset import CaptureStore
 from core.rules import RuleEngine
 from core.telemetry import TelemetryLogger
 from core.zones import load_zones
@@ -116,6 +117,16 @@ class DeviceRuntime:
         # AI-configured rules. Zones come from the active module's config, so a
         # rule naming "pool" resolves against the same polygon the module draws.
         self.rule_engine = RuleEngine(zones=self._zones_for_module(module_name))
+
+        # Opt-in training capture. Disabled unless config says otherwise, and
+        # local-only either way — nothing here can upload.
+        training_cfg = config.get("training", {}) if isinstance(config.get("training"), dict) else {}
+        self.capture_store = CaptureStore(training_cfg.get("capture", {}))
+        if self.capture_store.enabled:
+            log.info(
+                "training capture ON: writing to %s (max %d samples, never uploaded)",
+                self.capture_store.directory, self.capture_store.max_samples,
+            )
 
         self.bus = FrameBus()
         self.shutdown = threading.Event()
@@ -322,6 +333,32 @@ class DeviceRuntime:
                 self.module_name, len(self.rule_engine.rules),
             )
 
+    def _model_version(self) -> str:
+        """Which model produced a sample — useless data without it, since you
+        cannot tell an old model's mistakes from a new one's."""
+        weights = (self.config.get("modules", {}).get(self.module_name, {}) or {}).get(
+            "model_weights", "yolo11n.pt"
+        )
+        return str(weights)
+
+    def _capture_training_sample(self, frame, alert, detection_frame) -> None:
+        """Keep the frame that triggered a rule, if capture is switched on."""
+        if not self.capture_store.should_capture():
+            return
+        self.capture_store.capture(
+            frame,
+            event_type=alert.detection,
+            rule_id=alert.rule_id,
+            confidence=alert.confidence,
+            module=self.module_name,
+            model_version=self._model_version(),
+            # The model's guess, so a labeller starts from it rather than a blank frame.
+            detections=[
+                {"label": d.label, "confidence": d.confidence, "box": list(d.box) if d.box else None}
+                for d in detection_frame.detections
+            ],
+        )
+
     # ------------------------------------------------------------------ health reporting
     def _collect_health(self) -> dict:
         """This device's real state, for the app's status indicators."""
@@ -507,6 +544,16 @@ class DeviceRuntime:
             if detection_frame is not None and self.rule_engine.rules:
                 for alert in self.rule_engine.observe_frame(detection_frame):
                     self._emit_rule_alert(alert)
+                    self._capture_training_sample(frame, alert, detection_frame)
+
+            # A periodic frame with nothing happening. Negatives are what stop a
+            # detector learning to answer yes to everything, and they are gated
+            # behind their own opt-in because they are footage of ordinary life.
+            if self.capture_store.should_capture(negative=True):
+                self.capture_store.capture(
+                    frame, module=self.module_name,
+                    model_version=self._model_version(),
+                )
 
             # Health is sampled here, on the thread that owns the frame bus and
             # capture service, and handed to the uplink as a snapshot. Sampled at

@@ -103,6 +103,7 @@ alerts:
   save_evidence: false
   evidence_dir: data/evidence
   evidence_max_files: 50
+
   cooldown_s: 15 # minimum seconds between two alerts of the same type (patient: don't re-alert too soon)
   escalation_window_s: 60 # repeat within this window -> continuous tone (event types not in loud/soft_types below)
   loud_types: [drowsiness, phone_use, eyes_down, attention_lost, high_risk, # always the loud/continuous tone
@@ -116,6 +117,26 @@ alerts:
                skinnemoen_calibration_complete, # skinnemoen calibration-done chime (the original beeped here)
                dashsentinel_warning, dashsentinel_no_face, dashsentinel_vision_degraded] # DashSentinel soft tiers
   gpio_buzzer_pin: 17 # BCM pin, Pi only
+
+# --- Training capture (OPT-IN, LOCAL ONLY) -----------------------------------
+# Off by default, and deliberately so: a camera that accumulates footage of your
+# home without being asked is the thing customers are right to fear. When on,
+# frames are written to `dir` on this device and NEVER uploaded — there is no
+# network path out. Getting data off the device is a separate command a person
+# runs: `python scripts/export_dataset.py --source data/training --out <path>`.
+#
+# capture_negatives records ordinary frames with nothing happening. A detector
+# trained only on frames containing the target learns to say yes, so negatives
+# matter — but they are footage of normal life, which is why they are a second,
+# separate opt-in.
+training:
+  capture:
+    enabled: false
+    dir: data/training
+    max_samples: 500 # capture stops here; it never fills the card
+    min_interval_s: 5.0 # rate limit, so one sustained event can't flood the set
+    capture_negatives: false
+    negative_interval_s: 300.0
 
 modules:
   driver_attention:
