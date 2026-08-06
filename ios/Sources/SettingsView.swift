@@ -18,7 +18,7 @@ struct SettingsView: View {
                 if state.isDemo {
                     Section {
                         HStack(spacing: 12) {
-                            LogoMark(size: 30, gradient: true)
+                            LogoMark(size: 30, accented: true)
                             Text("Demo mode — everything you see is a simulated device.")
                                 .font(.subheadline)
                         }

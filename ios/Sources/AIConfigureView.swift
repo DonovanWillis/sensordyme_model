@@ -89,7 +89,7 @@ struct AIConfigureView: View {
 
     private var header: some View {
         HStack(spacing: 14) {
-            LogoMark(size: 40, gradient: true)
+            LogoMark(size: 40, accented: true)
             VStack(alignment: .leading, spacing: 2) {
                 Text("Tell it what to watch").font(.headline)
                 Text("Plain language in, a full device configuration out.")

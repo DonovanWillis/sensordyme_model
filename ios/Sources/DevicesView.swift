@@ -1,61 +1,86 @@
 import SwiftUI
 
+/// The home screen: every device, its state at a glance, and one tap to the
+/// things people actually came to do.
+///
+/// Deliberately shows only what the backend can substantiate — online state,
+/// active mode, last contact. Camera / AI-accelerator / Wi-Fi tiles are absent
+/// rather than optimistic: the device does not report that health upstream yet,
+/// and a green "AI running" light that is really just "the row exists in the
+/// database" is the kind of thing that falls apart in a live demo.
 struct DevicesView: View {
     @EnvironmentObject private var state: AppState
     @State private var devices: [Device] = []
     @State private var errorMessage: String?
     @State private var showClaim = false
+    @State private var hasLoaded = false
 
     private let refreshTimer = Timer.publish(every: 10, on: .main, in: .common).autoconnect()
 
     var body: some View {
         NavigationStack {
             ScrollView {
-                VStack(spacing: 14) {
+                LazyVStack(spacing: SD.Space.sm) {
                     // Shown whether or not devices are loaded: a failed refresh
                     // leaves stale cards on screen that look perfectly current.
                     if let errorMessage {
                         ConnectionBanner(message: errorMessage) { await reload() }
+                            .padding(.bottom, SD.Space.xxs)
                     }
-                    if devices.isEmpty && errorMessage == nil {
-                        ContentUnavailableView(
-                            "No devices yet",
-                            systemImage: "video.slash",
-                            description: Text("Pair your SensorDyme device with its claim code.")
-                        )
-                        .padding(.top, 60)
+
+                    if !devices.isEmpty {
+                        SDSectionHeader(title: devices.count == 1 ? "Your device" : "Your devices")
+                            .padding(.top, SD.Space.xxs)
                     }
+
                     ForEach(devices) { device in
                         NavigationLink(value: device) {
                             DeviceCard(device: device)
                         }
                         .buttonStyle(.plain)
                     }
-                }
-                .padding()
-            }
-            .navigationDestination(for: Device.self) { device in
-                DeviceDetailView(device: device)
-            }
-            .navigationTitle("Devices")
-            .toolbar {
-                ToolbarItem(placement: .principal) {
-                    LogoMark(size: 22, gradient: true)
-                }
-                ToolbarItem(placement: .topBarTrailing) {
-                    Button {
-                        showClaim = true
-                    } label: {
-                        Label("Set up device", systemImage: "plus")
+
+                    if devices.isEmpty {
+                        emptyOrLoading
                     }
                 }
+                .padding(.horizontal, SD.Space.md)
+                .padding(.bottom, SD.Space.lg)
             }
-            .sheet(isPresented: $showClaim) {
-                SetupWizardView { await reload() }
+            .background(SD.Colors.background)
+            .navigationDestination(for: Device.self) { DeviceDetailView(device: $0) }
+            .navigationTitle("SensorDyme")
+            .navigationBarTitleDisplayMode(.large)
+            .toolbar {
+                ToolbarItem(placement: .topBarTrailing) {
+                    Button { showClaim = true } label: {
+                        Label("Add device", systemImage: "plus")
+                    }
+                    .tint(SD.Colors.accent)
+                }
             }
+            .sheet(isPresented: $showClaim) { SetupWizardView { await reload() } }
             .refreshable { await reload() }
             .task { await reload() }
             .onReceive(refreshTimer) { _ in Task { await reload() } }
+        }
+        .tint(SD.Colors.accent)
+    }
+
+    /// Distinguishes "still loading" from "genuinely nothing here" — showing an
+    /// empty state during the first fetch reads as "you have no devices", which
+    /// is alarming when you do.
+    @ViewBuilder private var emptyOrLoading: some View {
+        if !hasLoaded && errorMessage == nil {
+            SDLoadingState(message: "Looking for your devices…")
+        } else if errorMessage == nil {
+            SDEmptyState(
+                icon: "sensor.tag.radiowaves.forward",
+                title: "No devices yet",
+                message: "Add your SensorDyme with the claim code printed on the card in the box.",
+                actionTitle: "Add device",
+                action: { showClaim = true }
+            )
         }
     }
 
@@ -68,40 +93,70 @@ struct DevicesView: View {
         } catch {
             errorMessage = error.localizedDescription
         }
+        hasLoaded = true
     }
 }
+
+// MARK: - Device card
 
 struct DeviceCard: View {
     let device: Device
 
+    private var status: SDStatus { device.online ? .online : .offline }
+
+    /// "Offline" alone leaves people wondering whether it just happened or has
+    /// been down all week, which is the first thing anyone wants to know.
+    private var subtitle: String {
+        if device.online { return Preset.title(for: device.activePreset) }
+        guard let lastSeen = device.lastSeen else { return "Not seen yet" }
+        let elapsed = Date().timeIntervalSince(Date(timeIntervalSince1970: lastSeen))
+        return "Last seen \(Self.elapsed.localizedString(fromTimeInterval: -elapsed))"
+    }
+
+    private static let elapsed: RelativeDateTimeFormatter = {
+        let formatter = RelativeDateTimeFormatter()
+        formatter.unitsStyle = .full
+        return formatter
+    }()
+
     var body: some View {
-        HStack(spacing: 14) {
-            ZStack {
-                RoundedRectangle(cornerRadius: 14)
-                    .fill(device.online ? AnyShapeStyle(Brand.gradient) : AnyShapeStyle(.quaternary))
-                    .frame(width: 52, height: 52)
-                Image(systemName: "video.fill")
-                    .foregroundStyle(.white)
-            }
-            VStack(alignment: .leading, spacing: 3) {
-                Text(device.name).font(.headline)
-                HStack(spacing: 6) {
-                    Circle()
-                        .fill(device.online ? .green : .gray.opacity(0.4))
-                        .frame(width: 8, height: 8)
-                    Text(device.online ? Preset.title(for: device.activePreset) : "Offline")
-                        .font(.subheadline)
-                        .foregroundStyle(.secondary)
+        SDCard {
+            HStack(spacing: SD.Space.sm) {
+                ZStack {
+                    RoundedRectangle(cornerRadius: SD.Radius.md, style: .continuous)
+                        .fill(device.online ? SD.Colors.accentMuted : SD.Colors.surfaceRaised)
+                        .frame(width: 46, height: 46)
+                    Image(systemName: "video.fill")
+                        .font(.system(size: 18))
+                        .foregroundStyle(device.online ? SD.Colors.accent : SD.Colors.textTertiary)
                 }
+
+                VStack(alignment: .leading, spacing: SD.Space.xxs) {
+                    Text(device.name)
+                        .font(SD.Typography.headline)
+                        .foregroundStyle(SD.Colors.textPrimary)
+                        .lineLimit(1)
+                    Text(subtitle)
+                        .font(SD.Typography.caption)
+                        .foregroundStyle(SD.Colors.textSecondary)
+                        .lineLimit(1)
+                }
+
+                Spacer(minLength: SD.Space.xs)
+
+                SDStatusPill(status: status, pulses: device.online)
+
+                Image(systemName: "chevron.right")
+                    .font(.caption.weight(.semibold))
+                    .foregroundStyle(SD.Colors.textTertiary)
             }
-            Spacer()
-            Image(systemName: "chevron.right")
-                .font(.footnote.bold())
-                .foregroundStyle(.tertiary)
         }
-        .brandCard()
+        .accessibilityElement(children: .combine)
+        .accessibilityLabel("\(device.name), \(status.label), \(subtitle)")
     }
 }
+
+// MARK: - Pairing
 
 struct ClaimDeviceView: View {
     @EnvironmentObject private var state: AppState
@@ -115,38 +170,48 @@ struct ClaimDeviceView: View {
         NavigationStack {
             Form {
                 Section("Claim code") {
-                    TextField("e.g. 1A2B-3C4D-5E6F", text: $code)
-                        .autocapitalization(.allCharacters)
+                    TextField("1A2B-3C4D-5E6F", text: $code)
+                        .textInputAutocapitalization(.characters)
                         .autocorrectionDisabled()
-                    Text("Printed on the card in the box (or by cloud/manage.py create-device).")
-                        .font(.footnote)
-                        .foregroundStyle(.secondary)
+                        .font(SD.Typography.body.monospacedDigit())
+                    Text("Printed on the card that came in the box.")
+                        .font(SD.Typography.caption)
+                        .foregroundStyle(SD.Colors.textSecondary)
                 }
                 if let errorMessage {
-                    Text(errorMessage).foregroundStyle(.red)
+                    Section {
+                        Label(errorMessage, systemImage: "exclamationmark.triangle.fill")
+                            .font(SD.Typography.callout)
+                            .foregroundStyle(SD.Colors.danger)
+                    }
                 }
             }
-            .navigationTitle("Pair Device")
+            .navigationTitle("Add device")
+            .navigationBarTitleDisplayMode(.inline)
             .toolbar {
                 ToolbarItem(placement: .confirmationAction) {
-                    Button(busy ? "Pairing…" : "Pair") {
-                        busy = true
-                        Task {
-                            defer { busy = false }
-                            do {
-                                try await state.backend.claim(code: code.trimmingCharacters(in: .whitespaces))
-                                await onClaimed()
-                                dismiss()
-                            } catch {
-                                errorMessage = error.localizedDescription
-                            }
-                        }
-                    }
-                    .disabled(code.isEmpty || busy)
+                    Button(busy ? "Pairing…" : "Pair", action: pair)
+                        .disabled(code.isEmpty || busy)
                 }
                 ToolbarItem(placement: .cancellationAction) {
                     Button("Cancel") { dismiss() }
                 }
+            }
+        }
+        .tint(SD.Colors.accent)
+    }
+
+    private func pair() {
+        busy = true
+        errorMessage = nil
+        Task {
+            defer { busy = false }
+            do {
+                try await state.backend.claim(code: code.trimmingCharacters(in: .whitespaces))
+                await onClaimed()
+                dismiss()
+            } catch {
+                errorMessage = error.localizedDescription
             }
         }
     }

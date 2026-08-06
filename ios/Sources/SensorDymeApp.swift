@@ -25,7 +25,7 @@ struct RootView: View {
                 SettingsView()
                     .tabItem { Label("Settings", systemImage: "gearshape.fill") }
             }
-            .tint(Brand.electric)
+            .tint(SD.Colors.accent)
         } else {
             AuthView()
         }
