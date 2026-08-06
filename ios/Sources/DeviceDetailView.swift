@@ -1,5 +1,8 @@
 import SwiftUI
 
+/// The screen a SensorDyme owner actually lives in: the camera, what it's
+/// watching for, and what it has seen. Technical detail belongs in Device
+/// Health, not here — nobody buying a baby monitor should meet the word "YOLO".
 struct DeviceDetailView: View {
     @EnvironmentObject private var state: AppState
     @State var device: Device
@@ -9,6 +12,7 @@ struct DeviceDetailView: View {
     @State private var showAI = false
     @State private var showRename = false
     @State private var newName = ""
+    @State private var hasLoaded = false
 
     private let refreshTimer = Timer.publish(every: 4, on: .main, in: .common).autoconnect()
 
@@ -22,7 +26,7 @@ struct DeviceDetailView: View {
 
     var body: some View {
         ScrollView {
-            VStack(spacing: 16) {
+            VStack(spacing: SD.Space.md) {
                 // Above the feed, not below the fold: this view polls every 4s and
                 // keeps showing the last frame and event list when a refresh fails.
                 if let errorMessage {
@@ -32,32 +36,33 @@ struct DeviceDetailView: View {
                 FeedCard(device: device, alertActive: alertActive)
 
                 statusRow
-
-                aiButton
-
+                configureCard
                 modeCard
-
-                historyCard
+                activityCard
             }
-            .padding()
+            .padding(.horizontal, SD.Space.md)
+            .padding(.bottom, SD.Space.lg)
         }
+        .background(SD.Colors.background)
         .navigationTitle(device.name)
         .navigationBarTitleDisplayMode(.inline)
         .toolbar {
-            NavigationLink {
-                ReportsView(device: device)
-            } label: {
-                Label("Report", systemImage: "chart.bar.fill")
-            }
-            Menu {
-                Button {
-                    newName = device.name
-                    showRename = true
+            ToolbarItem(placement: .topBarTrailing) {
+                Menu {
+                    Button {
+                        newName = device.name
+                        showRename = true
+                    } label: {
+                        Label("Rename device", systemImage: "pencil")
+                    }
+                    NavigationLink {
+                        ReportsView(device: device)
+                    } label: {
+                        Label("Full report", systemImage: "chart.bar")
+                    }
                 } label: {
-                    Label("Rename device", systemImage: "pencil")
+                    Image(systemName: "ellipsis.circle")
                 }
-            } label: {
-                Image(systemName: "ellipsis.circle")
             }
         }
         .alert("Rename device", isPresented: $showRename) {
@@ -78,145 +83,181 @@ struct DeviceDetailView: View {
         .onReceive(refreshTimer) { _ in Task { await reload() } }
     }
 
+    // MARK: Status
+
     private var statusRow: some View {
-        HStack(spacing: 12) {
-            statusChip(
-                icon: device.online ? "wifi" : "wifi.slash",
-                label: device.online ? "Online" : "Offline",
-                style: device.online ? AnyShapeStyle(Brand.okGradient) : AnyShapeStyle(.quaternary)
+        HStack(spacing: SD.Space.xs) {
+            SDStatusPill(
+                status: device.online ? .online : .offline,
+                pulses: device.online
             )
-            statusChip(
-                icon: alertActive ? "exclamationmark.triangle.fill" : "checkmark.shield.fill",
-                label: alertActive ? "Alert" : "All clear",
-                style: alertActive ? AnyShapeStyle(Brand.alertGradient) : AnyShapeStyle(.quaternary)
+            SDStatusPill(
+                status: alertActive ? .alert : .online,
+                text: alertActive ? "Alert" : "All clear"
             )
-            statusChip(
-                icon: "square.grid.2x2.fill",
-                label: Preset.title(for: device.activePreset),
-                style: AnyShapeStyle(Brand.gradient)
-            )
+            Spacer()
+            Text(Preset.title(for: device.activePreset))
+                .font(SD.Typography.caption.weight(.semibold))
+                .foregroundStyle(SD.Colors.textSecondary)
+                .lineLimit(1)
         }
     }
 
-    private func statusChip(icon: String, label: String, style: AnyShapeStyle) -> some View {
-        HStack(spacing: 6) {
-            Image(systemName: icon).font(.caption)
-            Text(label).font(.caption.bold()).lineLimit(1)
-        }
-        .foregroundStyle(.white)
-        .padding(.horizontal, 12).padding(.vertical, 8)
-        .background(Capsule().fill(style))
-        .frame(maxWidth: .infinity)
-    }
+    // MARK: Configure with AI
 
-    private var aiButton: some View {
-        Button {
-            showAI = true
-        } label: {
-            HStack {
-                Image(systemName: "sparkles")
-                VStack(alignment: .leading, spacing: 1) {
-                    Text("Configure with AI").font(.headline)
-                    Text("Describe what to watch — the model sets everything up")
-                        .font(.caption)
-                        .opacity(0.85)
+    private var configureCard: some View {
+        Button { showAI = true } label: {
+            SDCard {
+                HStack(spacing: SD.Space.sm) {
+                    ZStack {
+                        RoundedRectangle(cornerRadius: SD.Radius.sm, style: .continuous)
+                            .fill(SD.Colors.accentMuted)
+                            .frame(width: 38, height: 38)
+                        Image(systemName: "wand.and.stars")
+                            .foregroundStyle(SD.Colors.accent)
+                    }
+                    VStack(alignment: .leading, spacing: 2) {
+                        Text("Configure with AI")
+                            .font(SD.Typography.headline)
+                            .foregroundStyle(SD.Colors.textPrimary)
+                        Text("Describe what to watch for in your own words")
+                            .font(SD.Typography.caption)
+                            .foregroundStyle(SD.Colors.textSecondary)
+                            .lineLimit(2)
+                    }
+                    Spacer(minLength: SD.Space.xxs)
+                    Image(systemName: "chevron.right")
+                        .font(.caption.weight(.semibold))
+                        .foregroundStyle(SD.Colors.textTertiary)
                 }
-                Spacer()
-                Image(systemName: "chevron.right").font(.footnote.bold())
             }
-            .foregroundStyle(.white)
-            .padding(16)
-            .background(RoundedRectangle(cornerRadius: 20).fill(Brand.gradient))
         }
         .buttonStyle(.plain)
     }
+
+    // MARK: Mode
 
     private var activeBase: String { Preset.split(device.activePreset).base }
     private var activeVariant: String? { Preset.split(device.activePreset).variant }
 
     private var modeCard: some View {
-        VStack(alignment: .leading, spacing: 10) {
-            Text("Mode").font(.headline)
-            ForEach(Preset.catalog) { preset in
-                let isActive = activeBase == preset.name
-                Button {
-                    setMode(preset.name)
-                } label: {
-                    HStack {
-                        Image(systemName: preset.icon)
-                            .frame(width: 30)
-                            .foregroundStyle(isActive ? AnyShapeStyle(Brand.gradient) : AnyShapeStyle(.secondary))
-                        VStack(alignment: .leading, spacing: 2) {
-                            Text(preset.title).foregroundStyle(.primary)
-                            Text(preset.subtitle).font(.caption).foregroundStyle(.secondary)
-                        }
-                        Spacer()
-                        if isActive {
-                            Image(systemName: "checkmark.circle.fill").foregroundStyle(.green)
-                        } else if Preset.split(switchingTo).base == preset.name {
-                            ProgressView()
-                        }
-                    }
-                    .padding(.vertical, 6)
-                }
-                .buttonStyle(.plain)
+        SDCard {
+            VStack(alignment: .leading, spacing: SD.Space.sm) {
+                SDSectionHeader(title: "Monitoring mode")
 
-                // tuning variants for the active mode (Teen Driver, Away, Newborn, ...)
-                if isActive && !preset.variants.isEmpty {
-                    ScrollView(.horizontal, showsIndicators: false) {
-                        HStack(spacing: 8) {
-                            ForEach(preset.variants) { variant in
-                                let selected = (activeVariant ?? preset.variants.first?.name) == variant.name
-                                Button {
-                                    setMode("\(preset.name):\(variant.name)")
-                                } label: {
-                                    Text(variant.title)
-                                        .font(.caption.bold())
-                                        .padding(.horizontal, 12).padding(.vertical, 7)
-                                        .background(
-                                            Capsule().fill(selected ? AnyShapeStyle(Brand.gradient) : AnyShapeStyle(.thinMaterial))
-                                        )
-                                        .foregroundStyle(selected ? .white : .primary)
-                                }
-                                .buttonStyle(.plain)
-                            }
-                        }
-                        .padding(.vertical, 2)
+                ForEach(Preset.catalog) { preset in
+                    modeRow(preset)
+                    if preset.id != Preset.catalog.last?.id {
+                        Divider().overlay(SD.Colors.border)
                     }
                 }
 
-                if preset.id != Preset.catalog.last?.id {
-                    Divider()
+                if let switchingTo {
+                    Label(
+                        "Switching to \(Preset.title(for: switchingTo)) — applies on the device's next sync.",
+                        systemImage: "arrow.triangle.2.circlepath"
+                    )
+                    .font(SD.Typography.caption)
+                    .foregroundStyle(SD.Colors.textSecondary)
                 }
-            }
-            if let switchingTo {
-                Text("Switching to \(Preset.title(for: switchingTo))… the device applies it on its next sync.")
-                    .font(.footnote)
-                    .foregroundStyle(.secondary)
             }
         }
-        .brandCard()
     }
 
-    private var historyCard: some View {
-        VStack(alignment: .leading, spacing: 10) {
-            HStack {
-                Text("Activity").font(.headline)
-                Spacer()
-                NavigationLink("Full report") { ReportsView(device: device) }
-                    .font(.subheadline)
+    @ViewBuilder
+    private func modeRow(_ preset: Preset) -> some View {
+        let isActive = activeBase == preset.name
+        let isSwitching = Preset.split(switchingTo).base == preset.name
+
+        VStack(alignment: .leading, spacing: SD.Space.xs) {
+            Button { setMode(preset.name) } label: {
+                HStack(spacing: SD.Space.sm) {
+                    Image(systemName: preset.icon)
+                        .frame(width: 26)
+                        .foregroundStyle(isActive ? SD.Colors.accent : SD.Colors.textTertiary)
+                    VStack(alignment: .leading, spacing: 1) {
+                        Text(preset.title)
+                            .font(SD.Typography.body)
+                            .foregroundStyle(SD.Colors.textPrimary)
+                        Text(preset.subtitle)
+                            .font(SD.Typography.caption)
+                            .foregroundStyle(SD.Colors.textSecondary)
+                    }
+                    Spacer(minLength: SD.Space.xxs)
+                    if isActive {
+                        Image(systemName: "checkmark.circle.fill")
+                            .foregroundStyle(SD.Colors.success)
+                    } else if isSwitching {
+                        ProgressView().controlSize(.small)
+                    }
+                }
+                .contentShape(Rectangle())
             }
-            if events.isEmpty {
-                Text("No events yet").foregroundStyle(.secondary)
-            }
-            ForEach(events.prefix(25)) { event in
-                EventRow(event: event)
-                if event.id != events.prefix(25).last?.id {
-                    Divider()
+            .buttonStyle(.plain)
+
+            // Tuning variants, shown only for the mode currently running.
+            if isActive && !preset.variants.isEmpty {
+                ScrollView(.horizontal, showsIndicators: false) {
+                    HStack(spacing: SD.Space.xs) {
+                        ForEach(preset.variants) { variant in
+                            let selected = (activeVariant ?? preset.variants.first?.name) == variant.name
+                            Button {
+                                setMode("\(preset.name):\(variant.name)")
+                            } label: {
+                                Text(variant.title)
+                                    .font(SD.Typography.caption.weight(.semibold))
+                                    .padding(.horizontal, SD.Space.sm)
+                                    .padding(.vertical, SD.Space.xxs + 3)
+                                    .background(
+                                        Capsule().fill(selected ? SD.Colors.accent : SD.Colors.surfaceRaised)
+                                    )
+                                    .overlay(
+                                        Capsule().strokeBorder(
+                                            selected ? .clear : SD.Colors.border, lineWidth: 1
+                                        )
+                                    )
+                                    .foregroundStyle(
+                                        selected ? SD.Colors.textOnAccent : SD.Colors.textSecondary
+                                    )
+                            }
+                            .buttonStyle(.plain)
+                        }
+                    }
+                    .padding(.leading, 26 + SD.Space.sm)
+                    .padding(.vertical, 2)
                 }
             }
         }
-        .brandCard()
+        .padding(.vertical, SD.Space.xxs)
+    }
+
+    // MARK: Activity
+
+    private var activityCard: some View {
+        SDCard {
+            VStack(alignment: .leading, spacing: SD.Space.sm) {
+                SDSectionHeader(title: "Recent activity")
+
+                if events.isEmpty {
+                    if !hasLoaded {
+                        SDLoadingState(message: "Loading activity…")
+                    } else {
+                        SDEmptyState(
+                            icon: "checkmark.circle",
+                            title: "Nothing to report",
+                            message: "Events appear here as soon as \(device.name) sees something worth telling you about."
+                        )
+                    }
+                } else {
+                    ForEach(events.prefix(25)) { event in
+                        EventRow(event: event)
+                        if event.id != events.prefix(25).last?.id {
+                            Divider().overlay(SD.Colors.border)
+                        }
+                    }
+                }
+            }
+        }
     }
 
     private func setMode(_ name: String) {
@@ -247,36 +288,57 @@ struct DeviceDetailView: View {
         } catch {
             errorMessage = error.localizedDescription
         }
+        hasLoaded = true
     }
 }
+
+// MARK: - Event row
 
 struct EventRow: View {
     let event: EventItem
 
-    private var color: Color {
+    private var tint: Color {
         switch event.severity {
-        case "loud": .red
-        case "soft": .orange
-        default: .secondary.opacity(0.5)
+        case "loud": SD.Colors.danger
+        case "soft": SD.Colors.warning
+        default: SD.Colors.textTertiary
         }
     }
 
+    /// Event types arrive as backend identifiers ("phone_use_while_distracted").
+    /// Showing those raw is the fastest way to make a consumer product feel like
+    /// a debug console.
+    private var title: String {
+        event.type
+            .replacingOccurrences(of: "_", with: " ")
+            .capitalized
+    }
+
     var body: some View {
-        HStack(alignment: .firstTextBaseline, spacing: 10) {
-            Circle().fill(color).frame(width: 9, height: 9)
+        HStack(alignment: .top, spacing: SD.Space.sm) {
+            Circle()
+                .fill(tint)
+                .frame(width: 8, height: 8)
+                .padding(.top, 6)
             VStack(alignment: .leading, spacing: 2) {
-                Text(event.type).font(.subheadline.weight(.semibold))
+                Text(title)
+                    .font(SD.Typography.body)
+                    .foregroundStyle(SD.Colors.textPrimary)
                 if let signals = event.signals, !signals.isEmpty {
-                    Text(signals).font(.caption).foregroundStyle(.secondary).lineLimit(2)
+                    Text(signals)
+                        .font(SD.Typography.caption)
+                        .foregroundStyle(SD.Colors.textSecondary)
+                        .lineLimit(2)
                 }
             }
-            Spacer()
+            Spacer(minLength: SD.Space.xxs)
             if let date = event.date {
                 Text(date, style: .relative)
-                    .font(.caption2)
-                    .foregroundStyle(.secondary)
+                    .font(SD.Typography.caption)
+                    .foregroundStyle(SD.Colors.textTertiary)
             }
         }
-        .padding(.vertical, 2)
+        .padding(.vertical, SD.Space.xxs)
+        .accessibilityElement(children: .combine)
     }
 }
