@@ -130,7 +130,8 @@ def _camera(bus, capture) -> Component:
     fps = _measure_fps(bus)
     if fps is not None:
         metrics["fps"] = fps
-    if capture is not None and not capture.is_running():
+    # CaptureService.is_running is a property, not a method.
+    if capture is not None and not capture.is_running:
         return Component(FAILED, "capture service stopped", metrics)
     if age > _STALE_S:
         return Component(FAILED, f"no new frame for {age:.1f}s", metrics)

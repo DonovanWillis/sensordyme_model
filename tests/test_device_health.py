@@ -25,9 +25,18 @@ class FakeBus:
 
 
 class FakeCapture:
+    """Mirrors services.CaptureService: `is_running` is a PROPERTY, not a method.
+
+    An earlier version of this double defined it as a method. The tests passed
+    and the real device crashed with "'bool' object is not callable" on its
+    first health sample — a fake that is easier to write than the real thing is
+    a fake that hides the bug it exists to catch.
+    """
+
     def __init__(self, running=True):
         self._running = running
 
+    @property
     def is_running(self):
         return self._running
 
