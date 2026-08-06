@@ -259,25 +259,59 @@ class CapabilityRegistry:
     def describe_for_llm(self) -> str:
         """The capability sheet handed to the language model.
 
-        The model is told what exists rather than asked to guess, which is what
-        keeps it from proposing rules the device cannot run.
+        Layout is not cosmetic here — it was measured. The first version put all
+        84 labels on one comma-separated line and listed UNAVAILABLE conditions
+        before available ones. A 1.5B model reading that declined objects it
+        could actually detect ("banana", "baseball glove") because it could not
+        find them, while the most prominent conditions on the page were the ones
+        that do not work.
+
+        So: labels are grouped and wrapped so each line is scannable, and
+        anything unavailable is moved to its own section at the end, after the
+        model has already read what it *can* do.
         """
-        lines = ["DETECTABLE OBJECTS (exact labels — use these verbatim):"]
-        lines.append("  " + ", ".join(sorted(self.labels())))
+        available = self.labels()
+        lines = ["DETECTABLE OBJECTS — use these labels EXACTLY, and only these:"]
+
+        # Grouped by the category map that already exists, so this introduces no
+        # second vocabulary to keep in sync.
+        grouped: set[str] = set()
+        for word, members in sorted(_CATEGORY_EXPANSIONS.items()):
+            usable = [m for m in members if m in available]
+            if usable:
+                lines.append(f"  {word}: {', '.join(sorted(usable))}")
+                grouped.update(usable)
+
+        remaining = sorted(available - grouped)
+        if remaining:
+            lines.append("  other:")
+            for chunk in _chunk(remaining, 8):
+                lines.append(f"    {', '.join(chunk)}")
+
         lines.append("")
-        lines.append("CONDITIONS you may ask about them:")
+        lines.append("CONDITIONS — use these EXACTLY:")
+        unavailable: list[str] = []
         for capability in sorted(self._capabilities.values(), key=lambda c: c.id):
             if not capability.predicates:
                 continue
-            status = "" if capability.available else f"  [UNAVAILABLE — needs {capability.requires}]"
-            lines.append(f"  {', '.join(sorted(capability.predicates))} — {capability.summary}{status}")
-        lines.append("")
-        lines.append("CATEGORY WORDS that expand to concrete labels:")
-        for word, expansions in sorted(_CATEGORY_EXPANSIONS.items()):
-            usable = [e for e in expansions if e in self.labels()]
-            if usable:
-                lines.append(f"  {word} -> {', '.join(usable)}")
+            listing = f"  {', '.join(sorted(capability.predicates))} — {capability.summary}"
+            if capability.available:
+                lines.append(listing)
+            else:
+                unavailable.append(
+                    f"  {', '.join(sorted(capability.predicates))} — needs {capability.requires}"
+                )
+
+        if unavailable:
+            lines.append("")
+            lines.append("NOT AVAILABLE — never use these; put such requests in `unsupported`:")
+            lines.extend(unavailable)
         return "\n".join(lines)
+
+
+def _chunk(items: list[str], size: int):
+    for start in range(0, len(items), size):
+        yield items[start:start + size]
 
 
 _SUPPORT_ORDER = {

@@ -166,7 +166,25 @@ def test_removing_a_capability_withdraws_its_claims():
 def test_capability_sheet_lists_real_labels_for_the_model(reg):
     sheet = reg.describe_for_llm()
     assert "person" in sheet and "couch" in sheet
-    assert "UNAVAILABLE" in sheet  # unavailable capabilities are declared, not hidden
+    # Unavailable capabilities are declared, not hidden — but AFTER the usable
+    # ones. Printing them first measurably cost accuracy: they were the most
+    # prominent entries on the page and none of them work.
+    assert "NOT AVAILABLE" in sheet
+    assert sheet.index("CONDITIONS") < sheet.index("NOT AVAILABLE")
+
+
+def test_object_labels_are_scannable_not_one_long_line(reg):
+    """84 labels on a single comma-separated line measurably broke a 1.5B
+    model's ability to find objects it can actually detect.
+
+    Only the LABEL lines are constrained. Prose in the not-available section is
+    allowed to run long — the model reads it once, rather than searching it for
+    a word.
+    """
+    sheet = reg.describe_for_llm()
+    objects_section = sheet.split("CONDITIONS")[0]
+    longest = max(len(line) for line in objects_section.splitlines())
+    assert longest < 140, f"a {longest}-char label line is back; the model cannot scan it"
 
 
 # --------------------------------------------------------------- the endpoint
