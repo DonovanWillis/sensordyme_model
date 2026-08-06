@@ -24,9 +24,8 @@ def reg():
 
 
 # --------------------------------------------------------------- what really exists
-def test_the_detector_vocabulary_is_the_coco_class_list(reg):
+def test_the_object_vocabulary_is_the_coco_class_list(reg):
     labels = reg.labels()
-    assert len(labels) == 80
     for present in ("person", "dog", "couch", "bottle", "cup", "cell phone", "car"):
         assert present in labels
     # The absences matter more than the presences: these are the words users
@@ -82,10 +81,19 @@ def test_behaviours_need_an_action_model(reg):
         assert "action-recognition" in verdict.requires
 
 
-def test_posture_needs_a_pose_model(reg):
-    verdict = reg.assess("person", "lying_down")
-    assert verdict.support is Support.NEEDS_MODEL
-    assert "pose model" in verdict.requires
+def test_posture_is_available_as_labels_now_that_pose_is_wired(reg):
+    """Postures are labels, asked for the same way objects are."""
+    if "lying_down" not in reg.labels():
+        pytest.skip("mediapipe not installed in this environment")
+    for pose_label in ("standing", "sitting", "lying_down", "on_floor"):
+        assert reg.assess(pose_label, "present").support is Support.SUPPORTED
+
+
+def test_climbing_still_needs_an_action_model(reg):
+    """Posture is not action: standing on a chair and climbing look identical."""
+    verdict = reg.assess("person", "climbing")
+    assert not verdict.ok
+    assert "action-recognition" in verdict.requires
 
 
 def test_entry_and_exit_need_tracking(reg):

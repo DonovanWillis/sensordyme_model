@@ -304,6 +304,21 @@ def _coco_labels() -> frozenset[str]:
         return frozenset()
 
 
+def _pose_available() -> bool:
+    """Whether body-pose estimation can run on this device at all.
+
+    Availability here means the model is installed. Whether the *active* mode
+    runs it is a separate question the runtime answers, by warning when a rule
+    needs detections the running module does not produce.
+    """
+    try:
+        import mediapipe  # noqa: F401
+
+        return True
+    except Exception:  # noqa: BLE001 - absence is an answer, not an error
+        return False
+
+
 def default_registry() -> CapabilityRegistry:
     """The capability set of a stock SensorDyme device."""
     return CapabilityRegistry([
@@ -347,13 +362,27 @@ def default_registry() -> CapabilityRegistry:
         Capability(
             id="pose.body",
             kind="pose",
-            summary="whole-body posture from skeletal landmarks",
-            predicates=frozenset({"standing", "sitting", "lying_down", "on_floor", "climbing"}),
-            available=False,
-            requires="a body-pose model wired into the shared pipeline "
-                     "(MediaPipe Pose exists in the fall-detection module but is not "
-                     "exposed as a general capability)",
+            summary="body posture from skeletal landmarks, in modes that run pose "
+                    "estimation (elderly monitoring / fall detection)",
+            # Postures are LABELS, not predicates: a rule asks whether
+            # "lying_down" is present exactly as it asks whether "dog" is, so the
+            # rule engine needs no special case and a better posture model can
+            # replace this one without the rule layer noticing.
+            labels=frozenset({"standing", "sitting", "lying_down", "on_floor"}),
+            predicates=frozenset(),
+            available=_pose_available(),
+            requires="mediapipe, and a monitoring mode that runs pose estimation",
             requirement_kind=Support.NEEDS_MODEL,
+        ),
+        Capability(
+            id="pose.climbing",
+            kind="pose",
+            summary="climbing, reaching and other whole-body actions",
+            predicates=frozenset({"climbing", "reaching"}),
+            available=False,
+            requires="an action-recognition model — posture alone cannot "
+                     "distinguish climbing from standing on something",
+            requirement_kind=Support.NEEDS_TRAINING_DATA,
         ),
         Capability(
             id="action.recognition",

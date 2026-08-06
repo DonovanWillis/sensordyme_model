@@ -9,6 +9,8 @@ import cv2
 import mediapipe as mp
 import numpy as np
 
+from core import posture
+from core.detections import Detection, DetectionFrame
 from core.events import Event
 from modules.base import VisionModule, register_module
 
@@ -38,6 +40,9 @@ class FallDetectionModule(VisionModule):
         self._fired_for_current_fall = False
         self._last_pose_proto = None
         self._alert_active = False
+        self._last_posture: Optional[posture.Posture] = None
+        self._last_frame_size: tuple[int, int] = (0, 0)
+        self._last_hip_y: Optional[float] = None
 
     def process(self, frame: np.ndarray) -> list[Event]:
         """Run pose estimation on `frame`, updating drop/stillness state and returning events."""
@@ -50,12 +55,21 @@ class FallDetectionModule(VisionModule):
 
         if not results.pose_landmarks:
             self._last_pose_proto = None
+            self._last_posture = None
+            self._last_hip_y = None
             self._prev_y = None
             self._prev_t = None
             return events
 
         self._last_pose_proto = results.pose_landmarks
         landmarks = results.pose_landmarks.landmark
+
+        # Posture from the landmarks this module was already computing, so
+        # custom rules ("someone on the floor") cost no extra inference.
+        frame_h, frame_w = frame.shape[:2]
+        self._last_frame_size = (frame_w, frame_h)
+        self._last_posture = posture.classify(landmarks, aspect=frame_w / max(frame_h, 1))
+        self._last_hip_y = posture.hip_height(landmarks)
         indices = HIP_LANDMARKS + SHOULDER_LANDMARKS
         avg_y = sum(landmarks[i].y for i in indices) / len(indices) * h
 
@@ -86,6 +100,30 @@ class FallDetectionModule(VisionModule):
         self._prev_y = avg_y
         self._prev_t = now
         return events
+
+    def get_detections(self) -> DetectionFrame:
+        """The tracked person plus their posture, as labels custom rules can use.
+
+        Posture is emitted as its own label ("lying_down", "on_floor") alongside
+        "person", so a rule can ask for a posture the same way it asks for an
+        object — the rule engine needs no special case, and a future posture
+        model can replace this one without the rule layer noticing.
+
+        No bounding box: MediaPipe Pose gives landmarks, not a detection box, and
+        inventing one from landmark extents would let zone rules silently key off
+        a rectangle that means something different from every other box here.
+        """
+        width, height = self._last_frame_size
+        detections: list[Detection] = []
+        if self._last_posture is not None:
+            detections.append(Detection(label="person", confidence=0.9))
+            if self._last_posture.label != posture.UNKNOWN:
+                detections.append(
+                    Detection(label=self._last_posture.label, confidence=self._last_posture.confidence)
+                )
+            if posture.is_on_floor(self._last_posture, self._last_hip_y):
+                detections.append(Detection(label="on_floor", confidence=self._last_posture.confidence))
+        return DetectionFrame(width=width, height=height, detections=tuple(detections))
 
     def annotate(self, frame: np.ndarray) -> np.ndarray:
         """Draw the pose skeleton on `frame`."""
