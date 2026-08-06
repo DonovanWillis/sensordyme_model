@@ -11,6 +11,19 @@ Events only — frames never leave the device.
 .venv/bin/uvicorn cloud.app:app --port 8787
 ```
 
+That binds loopback only, which is right for the simulator. A real phone needs the
+Mac's LAN address, so bind all interfaces — and once the port is reachable from the
+network, sign tokens with a real secret instead of the dev default in `app.py`:
+
+```bash
+mkdir -p .secrets && openssl rand -hex 32 > .secrets/jwt_secret   # once; gitignored
+SENSORDYME_JWT_SECRET="$(cat .secrets/jwt_secret)" \
+  .venv/bin/uvicorn cloud.app:app --host 0.0.0.0 --port 8787
+```
+
+Then point the app at `http://<your-mac-ip>:8787` in Settings → Cloud backend.
+Changing the secret invalidates existing tokens — the app will ask you to sign in again.
+
 ## Provision a device
 
 ```bash

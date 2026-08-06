@@ -33,3 +33,13 @@ ios/Info.plist
 setup.log
 setup*.log
 *.local.yaml
+
+# --- Secrets ------------------------------------------------------------------
+# Real JWT signing key etc. app.py falls back to a committed dev default, which
+# is fine on loopback and not fine on a LAN-exposed port.
+.secrets/
+
+# Backend database: real accounts (email + pw_hash + salt), device_key, claim
+# codes, orders, event history. Was committed through e57b1bb and purged from
+# history on 2026-08-06 — never track it again.
+cloud/*.db

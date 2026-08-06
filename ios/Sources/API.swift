@@ -11,11 +11,20 @@ struct APIClient {
     let baseURL: URL?
     let token: String?
 
-    private func request(_ method: String, _ path: String, body: [String: Any]? = nil) async throws -> Data {
+    private func request(_ method: String, _ path: String, query: [String: String]? = nil, body: [String: Any]? = nil) async throws -> Data {
         guard let baseURL else {
             throw APIError(message: "No cloud backend configured. Open Settings → Cloud backend and enter your server's address.")
         }
-        var req = URLRequest(url: baseURL.appendingPathComponent(path))
+        // appendingPathComponent percent-escapes "?", so a query string baked into
+        // `path` lands in the path and 404s. Queries go through URLComponents.
+        var comps = URLComponents(url: baseURL.appendingPathComponent(path), resolvingAgainstBaseURL: false)
+        if let query {
+            comps?.queryItems = query.map { URLQueryItem(name: $0.key, value: $0.value) }
+        }
+        guard let url = comps?.url else {
+            throw APIError(message: "Couldn't build a request URL for \(path).")
+        }
+        var req = URLRequest(url: url)
         req.httpMethod = method
         req.timeoutInterval = 15
         if let token {
@@ -87,7 +96,7 @@ struct APIClient {
     }
 
     func events(deviceID: Int, limit: Int = 100) async throws -> [EventItem] {
-        try decode(EventsResponse.self, from: try await request("GET", "v1/devices/\(deviceID)/events?limit=\(limit)")).events
+        try decode(EventsResponse.self, from: try await request("GET", "v1/devices/\(deviceID)/events", query: ["limit": String(limit)])).events
     }
 
     func setPreset(deviceID: Int, preset: String) async throws {
