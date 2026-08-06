@@ -705,34 +705,62 @@ def _legacy_system_prompt() -> str:
     )
 
 
+# Which model interprets custom requests. Jupiter (a local model) is the
+# default, so a fresh install needs no third-party API key to configure a camera
+# its owner already paid for. Anthropic remains selectable as a benchmark.
+JUPITER_PROVIDER = os.environ.get("SENSORDYME_AI_PROVIDER", "jupiter").strip().lower()
+JUPITER_MODEL = os.environ.get("JUPITER_MODEL", "").strip()
+JUPITER_BASE_URL = os.environ.get("JUPITER_BASE_URL", "").strip()
+# Off by default. An external provider must never be reached because it happens
+# to be installed — sending a user's words off the box is an explicit decision.
+JUPITER_ALLOW_EXTERNAL_FALLBACK = os.environ.get(
+    "SENSORDYME_ALLOW_EXTERNAL_AI", ""
+).strip().lower() in ("1", "true", "yes")
+
+
+def _jupiter_config() -> dict:
+    config = {}
+    if JUPITER_MODEL:
+        config["model"] = JUPITER_MODEL
+    if JUPITER_BASE_URL:
+        config["base_url"] = JUPITER_BASE_URL
+    return config
+
+
 def _ai_configure_llm(prompt: str) -> Optional[dict]:
-    """Ask Claude for a structured configuration proposal (None -> keyword fallback)."""
-    if not os.environ.get("ANTHROPIC_API_KEY"):
-        return None
+    """Interpret a request into a structured proposal, or None to fall through.
+
+    Jupiter and Anthropic are interchangeable here on purpose: both return a
+    proposal that `_validate_proposal` then re-checks against the capability
+    registry. Neither is trusted, so swapping the provider changes accuracy and
+    cost, never what the device is willing to run.
+    """
     try:
-        import anthropic
-
-        client = anthropic.Anthropic()
-        response = client.messages.create(
-            model=os.environ.get("SENSORDYME_AI_MODEL", "claude-opus-5"),
-            max_tokens=2048,
-            output_config={
-                "format": {"type": "json_schema", "schema": _PROPOSAL_SCHEMA},
-                "effort": "low",  # interactive endpoint; schema does the heavy lifting
-            },
-            system=_ai_system_prompt(),
-            messages=[{"role": "user", "content": prompt}],
-        )
-        if response.stop_reason == "refusal":
-            return None
-        import json as _json
-
-        text = next(b.text for b in response.content if b.type == "text")
-        data = _json.loads(text)
-        data["source"] = "claude"
-        return data
-    except Exception:  # noqa: BLE001 - the keyword fallback must keep the feature alive
+        from jupiter.interpret import interpret
+    except ImportError:
+        # Backend deployed without core/ + jupiter/ on the path. Say nothing
+        # here; the caller's fallback explains it to the user.
         return None
+
+    outcome = interpret(prompt, provider_name=JUPITER_PROVIDER, config=_jupiter_config())
+
+    if not outcome.ok and JUPITER_ALLOW_EXTERNAL_FALLBACK and JUPITER_PROVIDER != "anthropic":
+        # Explicitly enabled, and only after the local path failed.
+        outcome = interpret(prompt, provider_name="anthropic")
+
+    if not outcome.ok and not outcome.interpretation.rules:
+        return None  # let the caller report why, rather than inventing a preset
+
+    proposal = outcome.interpretation.as_proposal()
+    proposal["source"] = outcome.provider or JUPITER_PROVIDER
+    proposal["jupiter"] = {
+        "provider": outcome.provider,
+        "model": outcome.model,
+        "latency_s": outcome.latency_s,
+        "injection_suspected": outcome.injection_suspected,
+        **outcome.meta,
+    }
+    return proposal
 
 
 _AI_FALLBACKS = [

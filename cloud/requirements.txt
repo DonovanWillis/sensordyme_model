@@ -4,3 +4,13 @@ fastapi==0.115.*
 uvicorn[standard]==0.32.*
 pyjwt==2.*
 requests==2.*
+
+# Jupiter (local model) needs no extra package here — it speaks HTTP to a model
+# server, which keeps the API process light and restartable.
+#
+# anthropic is OPTIONAL: only needed to run the benchmark provider. It was
+# previously imported by app.py without being declared here, so a clean deploy
+# hit ImportError, the bare `except` swallowed it, and every Configure-with-AI
+# request silently fell through to a 4-keyword table. Install it only if you
+# intend to compare against Claude:
+#   pip install anthropic==0.116.0
