@@ -31,7 +31,15 @@ final class BLEProvisioner: NSObject, ObservableObject {
     }
 
     @Published var state: State = .idle
+    /// Discovered devices, strongest signal first.
+    ///
+    /// Signal strength is kept because a name alone can be ambiguous: a device
+    /// that has been reflashed or test-configured may advertise under a stale
+    /// alias, so two entries can appear for what is really one unit — or one
+    /// real device alongside a leftover advertisement. The nearer, stronger
+    /// signal is almost always the one in the room with you.
     @Published var discovered: [String] = []
+    @Published private(set) var signalByName: [String: Int] = [:]
 
     private var central: CBCentralManager?
     private var peripheral: CBPeripheral?
@@ -42,6 +50,7 @@ final class BLEProvisioner: NSObject, ObservableObject {
     func startScan() {
         state = .scanning
         discovered = []
+        signalByName = [:]
         peripheralsByName = [:]
         central = CBCentralManager(delegate: self, queue: .main)
         // Scanning begins in centralManagerDidUpdateState once Bluetooth is powered on.
@@ -101,7 +110,11 @@ extension BLEProvisioner: CBCentralManagerDelegate, CBPeripheralDelegate {
             ?? peripheral.name ?? "SensorDyme device"
         Task { @MainActor in
             self.peripheralsByName[name] = peripheral
+            self.signalByName[name] = RSSI.intValue
             if !self.discovered.contains(name) { self.discovered.append(name) }
+            // Strongest first, so the device you are standing next to is the one
+            // offered first rather than whichever happened to answer soonest.
+            self.discovered.sort { (self.signalByName[$0] ?? -200) > (self.signalByName[$1] ?? -200) }
         }
     }
 

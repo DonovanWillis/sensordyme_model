@@ -54,7 +54,18 @@ struct ProvisioningView: View {
                     Button {
                         ble.connect(name: name)
                     } label: {
-                        Label(name, systemImage: "sensor.tag.radiowaves.forward")
+                        HStack {
+                            Label(name, systemImage: "sensor.tag.radiowaves.forward")
+                            Spacer()
+                            if let rssi = ble.signalByName[name] {
+                                // -50 is very close, -90 is far. Shown because a
+                                // stale advertisement and a live device can look
+                                // identical by name alone.
+                                Text(rssi > -60 ? "Nearby" : rssi > -80 ? "In range" : "Weak")
+                                    .font(SD.Typography.caption)
+                                    .foregroundStyle(rssi > -60 ? SD.Colors.success : SD.Colors.textTertiary)
+                            }
+                        }
                     }
                 }
             }
