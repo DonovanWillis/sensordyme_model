@@ -61,6 +61,7 @@ class ProvisioningService:
         self._ble_unavailable = False
         self._stop = threading.Event()
         self._thread: Optional[threading.Thread] = None
+        self._connect_thread: Optional[threading.Thread] = None
         self.state = "starting"  # starting | online | waiting | provisioning | unavailable
 
     # ------------------------------------------------------------------ Service lifecycle
@@ -169,9 +170,42 @@ class ProvisioningService:
 
     # ------------------------------------------------------------------ app callbacks
     def _on_credentials(self, ssid: str, psk: str) -> None:
-        """The app wrote Wi-Fi credentials: join + save; report the outcome over BLE."""
+        """The app wrote Wi-Fi credentials: join + save; report the outcome over BLE.
+
+        Returns immediately and joins on a worker thread. This is not an
+        optimisation — it is the difference between the app showing progress and
+        the app appearing to hang.
+
+        This callback runs inside the BLE write handler, on the GLib main loop
+        thread. Joining a network takes up to 45 seconds, and while that call
+        blocked the loop, nothing could be delivered to the phone: the
+        "connecting" status was queued before the join and could not leave until
+        after it finished. The user saw "Sending…" and total silence for the
+        entire attempt, which reads as a broken device rather than a working one
+        doing something slow.
+        """
+        if self._connect_thread is not None and self._connect_thread.is_alive():
+            # A second write while the first is still going would race two nmcli
+            # invocations against the same radio.
+            log.info("BLE: ignoring credentials for '%s' — a join is already running", ssid)
+            return
+
         self._push_status({"state": "connecting", "ssid": ssid})
-        ok, message = self._wifi.connect(ssid, psk)  # nmcli saves the profile on success
+        self._connect_thread = threading.Thread(
+            target=self._join_network, args=(ssid, psk),
+            daemon=True, name="wifi-join",
+        )
+        self._connect_thread.start()
+
+    def _join_network(self, ssid: str, psk: str) -> None:
+        """Join `ssid` off the event loop, reporting the outcome over BLE."""
+        try:
+            ok, message = self._wifi.connect(ssid, psk)  # nmcli saves the profile on success
+        except Exception as exc:  # noqa: BLE001 - the window must survive a failed join
+            log.error("wifi join failed: %s", exc)
+            self._push_status({"state": "error", "ssid": ssid, "error": str(exc)})
+            return
+
         if ok:
             self._push_status(
                 {"state": "online", "ssid": ssid, "ip": self._wifi.ip_address(), "message": message}

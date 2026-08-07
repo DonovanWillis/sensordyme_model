@@ -125,3 +125,75 @@ def test_method_off_is_dormant(monkeypatch):
     service = ProvisioningService(FakeWifi(), {"method": "off"})
     service.run(threading.Event())
     assert service.state == "off"
+
+
+def test_joining_wifi_does_not_block_the_ble_event_loop(monkeypatch):
+    """The credential write runs on the GLib main loop thread. Joining a network
+    takes up to 45 seconds, and while that blocked the loop no status could
+    reach the phone — the app showed "Sending…" and silence for the whole
+    attempt, which reads as a broken device rather than a slow one."""
+    import threading
+    import time as _time
+
+    from core.network import WifiManager
+    from services.provisioning import ProvisioningService
+
+    started = threading.Event()
+    release = threading.Event()
+
+    class SlowWifi(WifiManager):
+        def is_online(self):
+            return False
+
+        def connect(self, ssid, password):
+            started.set()
+            release.wait(timeout=5)
+            return True, "joined"
+
+    service = ProvisioningService(SlowWifi(), {"method": "ble"})
+    service._ble = FakeBLEServer("x", {}, lambda *a: None)
+
+    began = _time.monotonic()
+    service._on_credentials("HomeNet", "secret")
+    elapsed = _time.monotonic() - began
+
+    # The handler must return immediately rather than waiting for the join.
+    assert elapsed < 0.5, f"credential handler blocked for {elapsed:.1f}s"
+    assert started.wait(timeout=2), "the join never started"
+
+    # And "connecting" must already be visible to the phone.
+    assert service._ble.statuses[-1].get("state") == "connecting"
+
+    release.set()
+
+
+def test_a_second_credential_write_while_joining_is_ignored(monkeypatch):
+    """Two nmcli invocations racing for the same radio is worse than a dropped
+    duplicate write."""
+    import threading
+
+    from core.network import WifiManager
+    from services.provisioning import ProvisioningService
+
+    calls = []
+    release = threading.Event()
+
+    class SlowWifi(WifiManager):
+        def is_online(self):
+            return False
+
+        def connect(self, ssid, password):
+            calls.append(ssid)
+            release.wait(timeout=5)
+            return True, "joined"
+
+    service = ProvisioningService(SlowWifi(), {"method": "ble"})
+    service._ble = FakeBLEServer("x", {}, lambda *a: None)
+
+    service._on_credentials("First", "a")
+    service._on_credentials("Second", "b")
+    release.set()
+    if service._connect_thread:
+        service._connect_thread.join(timeout=5)
+
+    assert calls == ["First"]
