@@ -174,8 +174,22 @@ class CloudUplink:
                     # not: the address was correct on the network where it was
                     # configured, and means nothing on any other one.
                     self._explained_failure = True
-                    print(f"cloud_uplink: cannot reach {self._base_url} ({exc})")
-                    if self._looks_like_bare_ip():
+                    # An HTTP error is not a reachability problem. The backend
+                    # answered — it refused. Reporting "cannot reach" for a
+                    # rejected device key sends someone to debug a network that
+                    # is working perfectly.
+                    status = getattr(getattr(exc, "response", None), "status_code", None)
+                    if status in (401, 403):
+                        print(
+                            f"cloud_uplink: {self._base_url} rejected this device's key "
+                            f"(HTTP {status}). The backend is reachable; the key is wrong or "
+                            f"unknown to it — re-issue with `python cloud/manage.py`."
+                        )
+                    elif status is not None:
+                        print(f"cloud_uplink: {self._base_url} returned HTTP {status}")
+                    else:
+                        print(f"cloud_uplink: cannot reach {self._base_url} ({exc})")
+                    if status is None and self._looks_like_bare_ip():
                         print(
                             "cloud_uplink: base_url is a fixed IP address. If this device or "
                             "the backend has moved to a different network, that address now "
@@ -185,7 +199,26 @@ class CloudUplink:
                         )
                 self._connected = False
                 with self._lock:
-                    # put the batch back (bounded deque drops oldest under pressure)
-                    for item in reversed(batch):
-                        self._queue.appendleft(item)
+                    # Put the batch back in front of anything recorded since,
+                    # but never at the cost of those newer events.
+                    #
+                    # `appendleft` on a full deque evicts from the RIGHT — the
+                    # newest end. So re-queuing a failed batch used to discard
+                    # the most recent alerts in favour of the ones that had just
+                    # failed to send, which is backwards for a safety product:
+                    # during a long outage the device threw away what was
+                    # happening now to preserve what happened an hour ago. The
+                    # comment here claimed it dropped the oldest.
+                    capacity = self._queue.maxlen
+                    space = len(batch) if capacity is None else capacity - len(self._queue)
+                    if space > 0:
+                        # Keep the newest of the failed batch when it cannot all fit.
+                        for item in reversed(batch[-space:]):
+                            self._queue.appendleft(item)
+                    dropped = len(batch) - max(space, 0)
+                    if dropped > 0:
+                        print(
+                            f"cloud_uplink: backlog full — {dropped} older event(s) dropped; "
+                            f"newer ones kept"
+                        )
             self._stop.wait(self._poll_interval_s)
