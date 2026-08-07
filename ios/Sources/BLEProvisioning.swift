@@ -65,6 +65,7 @@ final class BLEProvisioner: NSObject, ObservableObject {
     @Published private(set) var networks: [VisibleNetwork] = []
     private var networksCharacteristic: CBCharacteristic?
     private var sendTimeout: Task<Void, Never>?
+    private var statusPoll: Task<Void, Never>?
 
     private var central: CBCentralManager?
     private var peripheral: CBPeripheral?
@@ -117,6 +118,35 @@ final class BLEProvisioner: NSObject, ObservableObject {
         state = .sending
         peripheral.writeValue(payload, for: credsCharacteristic, type: .withResponse)
         startSendTimeout()
+        startStatusPolling()
+    }
+
+    /// Read the status characteristic on a timer while a join is in flight.
+    ///
+    /// Notifications are the primary channel, but they fail silently: if the
+    /// subscription did not take, or the device could not flush it because its
+    /// event loop was blocked, the app waits forever for a message that will
+    /// never arrive. A read cannot be missed the same way — it asks, and the
+    /// device answers with whatever it has right now.
+    ///
+    /// Belt and braces on purpose. This is the exact path where silence is
+    /// indistinguishable from failure, and where the user is standing there
+    /// watching.
+    private func startStatusPolling() {
+        statusPoll?.cancel()
+        statusPoll = Task { [weak self] in
+            for _ in 0..<30 {   // ~60s, matching the send deadline
+                try? await Task.sleep(for: .seconds(2))
+                guard !Task.isCancelled, let self else { return }
+                guard case .sending = self.state else {
+                    // Something already resolved it; stop asking.
+                    return
+                }
+                if let peripheral = self.peripheral, let characteristic = self.statusCharacteristic {
+                    peripheral.readValue(for: characteristic)
+                }
+            }
+        }
     }
 
     /// Give up waiting, with a reason.
@@ -258,6 +288,9 @@ extension BLEProvisioner: CBCentralManagerDelegate, CBPeripheralDelegate {
             if let state = status["state"] as? String,
                ["connecting", "online", "error"].contains(state) {
                 self.sendTimeout?.cancel()
+                // "connecting" means the write landed; keep polling for the
+                // outcome. Anything terminal ends the polling too.
+                if state != "connecting" { self.statusPoll?.cancel() }
             }
             switch status["state"] as? String {
             case "connecting":
