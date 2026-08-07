@@ -169,6 +169,11 @@ final class DeviceLink: ObservableObject {
 
     var currentURL: String? { cachedURL.isEmpty ? nil : cachedURL }
 
+    /// A knowable reason discovery cannot work — a denied Local Network
+    /// permission, most usefully. Nil when the only honest answer is
+    /// "nothing answered".
+    var discoveryProblem: String? { discovery.problem }
+
     // MARK: Reachability
 
     /// A short probe against the device's own health endpoint. Deliberately

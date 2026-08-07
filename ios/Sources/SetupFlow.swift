@@ -196,10 +196,14 @@ final class SetupFlow: ObservableObject {
             // far is that the phone is still on the old network — mDNS does not
             // cross networks, so the device can be perfectly online and
             // invisible from here.
+            // A knowable reason beats a guess. Telling someone to check their
+            // Wi-Fi when the real cause is a denied Local Network permission
+            // sends them round a loop that can never succeed.
             phase = .failed(
-                "Your SensorDyme was given the details for \(targetSSID) and said it joined, "
-                + "but this phone can't see it yet. Check your phone is on \(targetSSID) too, "
-                + "then search again."
+                link.discoveryProblem
+                ?? "Your SensorDyme was given the details for \(targetSSID) and said it joined, "
+                    + "but this phone can't see it yet. Check your phone is on \(targetSSID) too, "
+                    + "then search again."
             )
             rediscoverTask = nil
         }

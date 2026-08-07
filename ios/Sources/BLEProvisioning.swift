@@ -160,6 +160,37 @@ final class BLEProvisioner: NSObject, ObservableObject {
         }
     }
 
+    /// Clear everything that points at a link which no longer exists.
+    ///
+    /// This is what makes the guards elsewhere mean what they say: while these
+    /// stayed set, `refreshNetworks()` and `send()` both passed their checks and
+    /// then quietly did nothing.
+    private func handleDisconnect() {
+        peripheral = nil
+        credsCharacteristic = nil
+        statusCharacteristic = nil
+        networksCharacteristic = nil
+        sendTimeout?.cancel(); sendTimeout = nil
+        statusPoll?.cancel(); statusPoll = nil
+        networks = []
+        scanningNetworks = false
+
+        switch state {
+        case .idle, .success, .failed:
+            // We asked for this. SetupFlow drops the link deliberately after a
+            // successful join, and stop() sets .idle before this fires — without
+            // this case a completed setup would flip to failed.
+            break
+        case .sending, .deviceConnecting:
+            // Do not blame the password. The device may well have joined; we
+            // just lost the channel it would have told us on.
+            fail("Bluetooth to your SensorDyme dropped while it was joining. It may have "
+                 + "joined anyway — search again to check before re-entering the password.")
+        default:
+            fail("Bluetooth to your SensorDyme dropped. Move closer to it and search again.")
+        }
+    }
+
     /// Move to `.failed`, remembering what was in progress.
     private func fail(_ reason: String) {
         if case .failed = state {} else { stateBeforeFailure = state }
@@ -230,11 +261,11 @@ final class BLEProvisioner: NSObject, ObservableObject {
     private func startStatusPolling() {
         statusPoll?.cancel()
         statusPoll = Task { [weak self] in
-            for _ in 0..<30 {   // ~60s, matching the send deadline
+            for _ in 0..<45 {   // ~90s: the write window plus a join of up to 45s
                 try? await Task.sleep(for: .seconds(2))
                 guard !Task.isCancelled, let self else { return }
-                guard case .sending = self.state else {
-                    // Something already resolved it; stop asking.
+                guard self.awaitingOutcome else {
+                    // Resolved, or we are no longer waiting on anything.
                     return
                 }
                 if let peripheral = self.peripheral, let characteristic = self.statusCharacteristic {
@@ -257,9 +288,16 @@ final class BLEProvisioner: NSObject, ObservableObject {
     private func startSendTimeout() {
         sendTimeout?.cancel()
         sendTimeout = Task { [weak self] in
-            try? await Task.sleep(for: .seconds(60))
+            try? await Task.sleep(for: .seconds(90))
             guard !Task.isCancelled, let self else { return }
-            if case .sending = self.state {
+            // Covers the join too, not just the write.
+            //
+            // The deadline used to test only `.sending`, and the device moves to
+            // "connecting" within a fraction of a second — so by the time the
+            // timer fired there was nothing left to time out. The one state that
+            // can genuinely hang, the join itself, was the one state with no
+            // deadline at all.
+            if self.awaitingOutcome {
                 self.fail(
                     "The device didn't confirm within a minute. It's usually the Wi-Fi password — "
                     + "check it and try again. Other causes: the network needs a browser sign-in "
@@ -337,6 +375,23 @@ extension BLEProvisioner: CBCentralManagerDelegate, CBPeripheralDelegate {
         Task { @MainActor in
             self.fail(error?.localizedDescription ?? "could not connect")
         }
+    }
+
+    /// An established link dropped.
+    ///
+    /// This delegate was simply absent. `didFailToConnect` only fires for a
+    /// connection that never came up, so a link that dies afterwards — the
+    /// device rebooting after it joins Wi-Fi, someone walking out of range,
+    /// BlueZ dropping it — called a method that did not exist, and nothing ran.
+    /// Every stored reference stayed non-nil pointing at a dead connection, so
+    /// every later `guard let` passed, reads and writes were discarded silently
+    /// by CoreBluetooth, and a minute later the app told the user their Wi-Fi
+    /// password was probably wrong. It was blaming the password for a Bluetooth
+    /// problem.
+    nonisolated func centralManager(
+        _ central: CBCentralManager, didDisconnectPeripheral peripheral: CBPeripheral, error: Error?
+    ) {
+        Task { @MainActor in self.handleDisconnect() }
     }
 
     nonisolated func peripheral(_ peripheral: CBPeripheral, didDiscoverServices error: Error?) {
@@ -423,8 +478,14 @@ extension BLEProvisioner: CBCentralManagerDelegate, CBPeripheralDelegate {
             // "SensorDyme is ready" without ever showing a network or asking
             // for a password.
             let outcome = ProvisioningStatus.interpret(status, awaitingOutcome: self.awaitingOutcome)
-            if outcome != .none { self.sendTimeout?.cancel() }
-            if ProvisioningStatus.isTerminal(outcome) { self.statusPoll?.cancel() }
+            // Only a settled answer stops the clock. Cancelling on "connecting"
+            // disarmed the deadline at the exact moment the device began the
+            // part that can hang, leaving notifications as the only channel —
+            // and a missed notification then meant waiting for ever.
+            if ProvisioningStatus.isTerminal(outcome) {
+                self.sendTimeout?.cancel()
+                self.statusPoll?.cancel()
+            }
 
             switch outcome {
             case .none:

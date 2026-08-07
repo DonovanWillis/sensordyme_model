@@ -20,6 +20,12 @@ final class DeviceDiscovery: ObservableObject {
 
     @Published var found: [Found] = []
     @Published var isSearching = false
+    /// Why discovery cannot work, when the reason is knowable.
+    ///
+    /// Distinct from "found nothing": a denied permission and an absent device
+    /// look identical in the results, and only one of them can be fixed by
+    /// looking harder.
+    @Published private(set) var problem: String?
 
     private var browser: NWBrowser?
     private var resolvers: [NWConnection] = []
@@ -47,6 +53,30 @@ final class DeviceDiscovery: ObservableObject {
                 }
             }
         }
+        // NWBrowser reports its own failures only through this handler, and
+        // nowhere else. Without it a denied Local Network permission — which
+        // iOS prompts for, and which people do decline — makes the browser fail
+        // while `browseResultsChangedHandler` simply never fires. The app then
+        // says it cannot find the device on this network and suggests checking
+        // the Wi-Fi, which can never fix it. The user re-joins networks for ever.
+        browser.stateUpdateHandler = { [weak self] state in
+            Task { @MainActor in
+                guard let self else { return }
+                switch state {
+                case .failed(let error):
+                    self.problem = Self.explain(error)
+                    self.isSearching = false
+                case .waiting(let error):
+                    self.problem = Self.explain(error)
+                case .ready:
+                    self.problem = nil
+                case .cancelled:
+                    self.isSearching = false
+                default:
+                    break
+                }
+            }
+        }
         browser.start(queue: .main)
         // Auto-stop after a while; discovery is a burst, not a background drain.
         Task { [weak self] in
@@ -61,6 +91,23 @@ final class DeviceDiscovery: ObservableObject {
         resolvers.forEach { $0.cancel() }
         resolvers.removeAll()
         isSearching = false
+    }
+
+    /// Turn a Network framework error into something actionable.
+    ///
+    /// Only the cases we can genuinely identify. A confident wrong explanation
+    /// is worse than the raw error, because it sends someone to fix the wrong
+    /// thing — and the permission case is the one that is otherwise invisible.
+    private static func explain(_ error: NWError) -> String {
+        if case let .dns(code) = error {
+            // The code iOS returns when Local Network access is denied.
+            if code == -65570 || code == kDNSServiceErr_PolicyDenied {
+                return "SensorDyme needs Local Network permission to find your device. "
+                     + "Settings → SensorDyme → Local Network."
+            }
+            return "Couldn't search this network (DNS error \(code))."
+        }
+        return "Couldn't search this network: \(error.localizedDescription)"
     }
 
     /// The device's own ID from its mDNS TXT record.
