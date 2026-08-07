@@ -63,7 +63,11 @@ accelerator:
 network:
   provisioning:
     method: ble # ble | hotspot (legacy scripts/provisioning_hotspot.sh) | off
-    grace_s: 45 # seconds to wait for a saved network before opening the BLE window
+    # 0 = open the Bluetooth setup window the moment the device is offline.
+    # It closes again the instant Wi-Fi comes up, so a normal boot on a known
+    # network advertises for a second or two and nobody sees it. A longer wait
+    # only ever punishes the person standing there trying to set the device up.
+    grace_s: 0 # seconds offline before the BLE setup window opens
     poll_s: 10 # how often to re-check connectivity
 
 # Health monitoring and automatic recovery: every component (camera, inference,

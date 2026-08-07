@@ -1,7 +1,7 @@
 """ProvisioningService: the networking workflow the device follows on every boot.
 
     boot -> NetworkManager auto-joins any saved Wi-Fi
-         -> online within `grace_s`?  --yes-->  NORMAL (BLE off; mDNS + dashboard on Wi-Fi)
+         -> online?  --yes-->  NORMAL (BLE off; mDNS + dashboard on Wi-Fi)
                  |no
                  v
          PROVISIONING: advertise over BLE as "SensorDyme-XXXX"
@@ -16,7 +16,9 @@ this service re-opens the BLE window so the app can hand it a new network
 (e.g. a phone hotspot) without any SD-card surgery.
 
 Method selection (`network.provisioning.method` in config.yaml):
-    ble      -- this in-process GATT flow (default)
+    ble      -- this in-process GATT flow (default). The window opens the
+                moment the device is offline and closes the moment Wi-Fi is up,
+                so it is there when someone needs it and invisible otherwise.
     hotspot  -- legacy scripts/provisioning_hotspot.sh oneshot (kept for
                 installs without BLE); this service stays dormant
     off      -- no provisioning; Wi-Fi is whatever NetworkManager already knows
@@ -52,7 +54,7 @@ class ProvisioningService:
     def __init__(self, wifi: WifiManager, config: dict, version: str = "dev") -> None:
         self._wifi = wifi
         self._method = str(config.get("method", "ble"))
-        self._grace_s = float(config.get("grace_s", 45))
+        self._grace_s = float(config.get("grace_s", 0))
         self._poll_s = float(config.get("poll_s", 10))
         self._version = version
         self._ble = None  # BLEProvisioningServer, created lazily
@@ -107,6 +109,16 @@ class ProvisioningService:
                 if offline_since is None:
                     offline_since = now
                     self.state = "waiting"
+                # Open the window as soon as the device is offline. `grace_s`
+                # used to default to 45, which meant someone standing next to a
+                # freshly-moved device with the app open waited three quarters
+                # of a minute for anything to appear on Bluetooth — long enough
+                # to conclude it was broken and go looking for a bug.
+                #
+                # Advertising a few seconds longer on a normal boot costs almost
+                # nothing: the window closes the instant Wi-Fi comes up, which
+                # on a known network is well before anyone could connect to it.
+                # Waiting costs the entire setup experience.
                 if now - offline_since >= self._grace_s and self._ble is None and not self._ble_unavailable:
                     self._open_ble_window()
             stop.wait(self._poll_s)
@@ -138,7 +150,7 @@ class ProvisioningService:
             )
             self._ble.start()
             self.state = "provisioning"
-            log.info("no Wi-Fi after %.0fs — BLE provisioning open as '%s'", self._grace_s, name)
+            log.info("no Wi-Fi — Bluetooth setup open as '%s'; pair from the SensorDyme app", name)
         except BLEUnavailable as exc:
             self._ble = None
             self._ble_unavailable = True
