@@ -167,6 +167,9 @@ enum SD {
         /// One spring for everything that moves, so the app feels like one product.
         static let standard = Animation.spring(response: 0.32, dampingFraction: 0.85)
         static let gentle = Animation.easeInOut(duration: 0.25)
+        /// For acknowledging a touch. Anything slower reads as lag on the one
+        /// interaction where lag is least forgivable.
+        static let quick = Animation.easeOut(duration: 0.12)
     }
 }
 

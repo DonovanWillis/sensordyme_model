@@ -49,6 +49,16 @@ struct VisibleNetwork: Identifiable, Hashable {
         default: "Weak"
         }
     }
+
+    /// Coarse strength, for ordering. Deliberately coarse: the point is that
+    /// ordinary signal jitter must not be able to move a row.
+    var strengthRank: Int {
+        switch signal {
+        case 70...: 2
+        case 40..<70: 1
+        default: 0
+        }
+    }
 }
 
 @MainActor
@@ -154,6 +164,24 @@ final class BLEProvisioner: NSObject, ObservableObject {
     private func fail(_ reason: String) {
         if case .failed = state {} else { stateBeforeFailure = state }
         state = .failed(reason)
+    }
+
+    /// Order networks so the list does not rearrange itself under a finger.
+    ///
+    /// The device sorts by signal, and signal moves by a few points between
+    /// scans — so sorting on the raw number reshuffles rows on every refresh.
+    /// A refresh landing between touch-down and touch-up then sends the tap to
+    /// a different network, or to nothing. That is invisible from the outside
+    /// and reads as "the row didn't respond".
+    ///
+    /// Bucketing first means only a real change in strength can move a row,
+    /// and ties break on name, which never changes.
+    static func stableOrder(_ networks: [VisibleNetwork]) -> [VisibleNetwork] {
+        networks.sorted {
+            $0.strengthRank != $1.strengthRank
+                ? $0.strengthRank > $1.strengthRank
+                : $0.ssid.localizedCaseInsensitiveCompare($1.ssid) == .orderedAscending
+        }
     }
 
     /// Ask the device for its Wi-Fi list.
@@ -374,7 +402,7 @@ extension BLEProvisioner: CBCentralManagerDelegate, CBPeripheralDelegate {
                     secured: entry["secured"] as? Bool ?? true
                 )
             }
-            Task { @MainActor in self.networks = scanned }
+            Task { @MainActor in self.networks = Self.stableOrder(scanned) }
             return
         }
 

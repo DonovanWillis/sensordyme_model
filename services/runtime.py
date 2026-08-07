@@ -299,6 +299,12 @@ class DeviceRuntime:
                 ),
                 check_interval_s=15.0,
             )
+        # Non-critical: a hot device is still a working device, and the Pi's
+        # firmware protects the hardware on its own. This is here so a person
+        # can see the temperature and whether the fan is actually turning,
+        # rather than having to SSH in to find out.
+        from core import thermal
+        self.health.register("thermal", check=thermal.status, check_interval_s=20.0)
         self.health.register("wifi", check=wifi.status, check_interval_s=15.0)
         self.health.register("provisioning", check=lambda: self.provisioning.status(), check_interval_s=15.0)
         for name, component in self.hardware.health_checks().items():

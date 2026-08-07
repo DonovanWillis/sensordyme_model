@@ -234,7 +234,7 @@ class ProvisioningService:
     def status(self) -> tuple[bool, str]:
         """(healthy, detail) for the health monitor (non-critical component)."""
         if self.state == "provisioning":
-            return True, "BLE provisioning window open (device unprovisioned or Wi-Fi lost)"
+            return True, "offline — Bluetooth setup open so the app can hand it a network"
         if self.state == "reconfigurable":
             return True, "online; Bluetooth still open so the device can be moved to another network"
         if self.state == "unavailable":

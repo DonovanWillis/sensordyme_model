@@ -12,7 +12,7 @@ struct SetupFlowView: View {
     @StateObject private var flow = SetupFlow()
 
     @State private var selectedSSID = ""
-    @State private var password = ""
+    @State private var selectedSecured = true
     @State private var showPasswordEntry = false
 
     var body: some View {
@@ -170,24 +170,7 @@ struct SetupFlowView: View {
                         .buttonStyle(SDButtonStyle(kind: .primary))
                 } else {
                     ForEach(flow.ble.discovered) { device in
-                        Button { flow.connect(to: device) } label: {
-                            HStack(spacing: SD.Space.sm) {
-                                Image(systemName: "sensor.tag.radiowaves.forward")
-                                    .foregroundStyle(SD.Colors.accent)
-                                VStack(alignment: .leading, spacing: 1) {
-                                    Text(device.name)
-                                        .font(SD.Typography.body)
-                                        .foregroundStyle(SD.Colors.textPrimary)
-                                    Text(device.proximity)
-                                        .font(SD.Typography.caption)
-                                        .foregroundStyle(SD.Colors.textTertiary)
-                                }
-                                Spacer()
-                                Image(systemName: "chevron.right")
-                                    .foregroundStyle(SD.Colors.textTertiary)
-                            }
-                        }
-                        .buttonStyle(.plain)
+                        DeviceRow(device: device) { flow.connect(to: device) }
                         if device.id != flow.ble.discovered.last?.id {
                             Divider().overlay(SD.Colors.border)
                         }
@@ -202,10 +185,13 @@ struct SetupFlowView: View {
             SDCard {
                 VStack(alignment: .leading, spacing: SD.Space.sm) {
                     if flow.ble.networks.isEmpty, flow.ble.scanningNetworks {
-                        HStack {
+                        HStack(spacing: SD.Space.sm) {
                             ProgressView().controlSize(.small)
-                            Text("Scanning…").foregroundStyle(SD.Colors.textSecondary)
+                            Text("Scanning for Wi-Fi…")
+                                .font(SD.Typography.callout)
+                                .foregroundStyle(SD.Colors.textSecondary)
                         }
+                        .frame(minHeight: 56)
                     } else if let problem = flow.ble.networkProblem {
                         // Not the same as "the device saw nothing". The app
                         // never managed to ask — which looks identical on
@@ -230,24 +216,14 @@ struct SetupFlowView: View {
                             .buttonStyle(SDButtonStyle(kind: .secondary, fullWidth: false))
                     } else {
                         ForEach(flow.ble.networks) { network in
-                            Button {
+                            NetworkRow(network: network, isSelected: selectedSSID == network.ssid) {
+                                // Selection is shown at once. The sheet takes a
+                                // moment to present, and without an immediate
+                                // mark the tap looks like it did nothing.
                                 selectedSSID = network.ssid
+                                selectedSecured = network.secured
                                 showPasswordEntry = true
-                            } label: {
-                                HStack(spacing: SD.Space.sm) {
-                                    Image(systemName: network.secured ? "lock.fill" : "lock.open")
-                                        .font(.caption)
-                                        .foregroundStyle(SD.Colors.textTertiary)
-                                    Text(network.ssid)
-                                        .font(SD.Typography.body)
-                                        .foregroundStyle(SD.Colors.textPrimary)
-                                    Spacer()
-                                    Text(network.strength)
-                                        .font(SD.Typography.caption)
-                                        .foregroundStyle(SD.Colors.textTertiary)
-                                }
                             }
-                            .buttonStyle(.plain)
                             if network.id != flow.ble.networks.last?.id {
                                 Divider().overlay(SD.Colors.border)
                             }
@@ -256,31 +232,52 @@ struct SetupFlowView: View {
                 }
             }
 
-            HStack {
+            HStack(spacing: SD.Space.sm) {
+                if !flow.ble.networks.isEmpty {
+                    Text(flow.ble.networks.count == 1
+                         ? "1 network" : "\(flow.ble.networks.count) networks")
+                        .font(SD.Typography.caption)
+                        .foregroundStyle(SD.Colors.textTertiary)
+                }
+                Spacer()
                 Button("Other network…") {
+                    // Hidden networks never appear in a scan, so typing a name
+                    // has to stay possible.
                     selectedSSID = ""
+                    selectedSecured = true
                     showPasswordEntry = true
                 }
                 .buttonStyle(SDButtonStyle(kind: .tertiary, fullWidth: false))
-                Spacer()
                 if flow.ble.scanningNetworks {
                     HStack(spacing: SD.Space.xxs) {
                         ProgressView().controlSize(.small)
                         Text("Refreshing").font(SD.Typography.caption)
                             .foregroundStyle(SD.Colors.textTertiary)
                     }
+                    .frame(minHeight: 44)
                 } else {
-                    Button("Refresh") { flow.ble.refreshNetworks() }
-                        .font(SD.Typography.caption)
-                        .foregroundStyle(SD.Colors.accent)
+                    Button {
+                        flow.ble.refreshNetworks()
+                    } label: {
+                        Label("Refresh", systemImage: "arrow.clockwise")
+                            .font(SD.Typography.caption)
+                    }
+                    .buttonStyle(SDRowButtonStyle(minHeight: 44))
+                    .fixedSize()
+                    .foregroundStyle(SD.Colors.accent)
                 }
             }
         }
         .sheet(isPresented: $showPasswordEntry) {
-            PasswordSheet(ssid: $selectedSSID, password: $password) {
+            // The sheet keeps its own copy of what is typed.
+            //
+            // This screen re-renders constantly — every scan tick, every status
+            // push from the device. Binding the field to parent state means
+            // that churn reaches the text field and the keyboard, which is what
+            // made typing feel unreliable.
+            PasswordSheet(initialSSID: selectedSSID, secured: selectedSecured) { ssid, password in
                 showPasswordEntry = false
-                flow.send(ssid: selectedSSID, password: password)
-                password = ""   // not kept a moment longer than the write needs it
+                flow.send(ssid: ssid, password: password)
             }
         }
     }
@@ -359,43 +356,120 @@ struct SetupFlowView: View {
 /// Separate from the network list so the keyboard cannot cover the list behind
 /// it, and so the password lives in exactly one place that is easy to audit.
 private struct PasswordSheet: View {
-    @Binding var ssid: String
-    @Binding var password: String
-    let onSubmit: () -> Void
+    let initialSSID: String
+    let secured: Bool
+    let onSubmit: (String, String) -> Void
 
     @Environment(\.dismiss) private var dismiss
-    @FocusState private var focused: Bool
+    @State private var ssid: String
+    @State private var password = ""
+    @State private var reveal = false
+    @FocusState private var focus: Field?
+
+    private enum Field { case ssid, password }
+
+    init(initialSSID: String, secured: Bool, onSubmit: @escaping (String, String) -> Void) {
+        self.initialSSID = initialSSID
+        self.secured = secured
+        self.onSubmit = onSubmit
+        _ssid = State(initialValue: initialSSID)
+    }
 
     var body: some View {
         NavigationStack {
             Form {
-                Section("Network") {
-                    TextField("Network name", text: $ssid)
-                        .textInputAutocapitalization(.never)
-                        .autocorrectionDisabled()
+                if initialSSID.isEmpty {
+                    Section("Network name") {
+                        TextField("Exactly as it appears", text: $ssid)
+                            .textInputAutocapitalization(.never)
+                            .autocorrectionDisabled()
+                            .focused($focus, equals: .ssid)
+                            .submitLabel(.next)
+                            .onSubmit { focus = .password }
+                    }
                 }
-                Section("Password") {
-                    SecureField("Wi-Fi password", text: $password)
-                        .textInputAutocapitalization(.never)
-                        .autocorrectionDisabled()
-                        .focused($focused)
-                    Text("Sent straight to your SensorDyme over Bluetooth. It isn't stored on this phone or sent anywhere else.")
-                        .font(SD.Typography.caption)
-                        .foregroundStyle(SD.Colors.textTertiary)
+
+                if secured {
+                    Section("Password") {
+                        HStack {
+                            Group {
+                                if reveal {
+                                    TextField("Wi-Fi password", text: $password)
+                                } else {
+                                    SecureField("Wi-Fi password", text: $password)
+                                }
+                            }
+                            .textInputAutocapitalization(.never)
+                            .autocorrectionDisabled()
+                            .textContentType(.password)
+                            .focused($focus, equals: .password)
+                            .submitLabel(.go)
+                            .onSubmit(submit)
+
+                            // Wi-Fi passwords are long, random and typed on a
+                            // phone keyboard. Not being able to check what you
+                            // typed turns one slip into a failed setup and a
+                            // retry, with no way to tell which it was.
+                            Button {
+                                reveal.toggle()
+                            } label: {
+                                Image(systemName: reveal ? "eye.slash" : "eye")
+                                    .foregroundStyle(SD.Colors.textSecondary)
+                            }
+                            .buttonStyle(.plain)
+                            .accessibilityLabel(reveal ? "Hide password" : "Show password")
+                        }
+
+                        Text("Sent straight to your SensorDyme over Bluetooth. It isn't stored on this phone or sent anywhere else.")
+                            .font(SD.Typography.caption)
+                            .foregroundStyle(SD.Colors.textTertiary)
+                    }
+                } else {
+                    Section {
+                        Label("This network is open — no password needed.",
+                              systemImage: "lock.open")
+                            .font(SD.Typography.callout)
+                            .foregroundStyle(SD.Colors.textSecondary)
+                    }
+                }
+
+                Section {
+                    Button(action: submit) {
+                        Text("Connect SensorDyme")
+                            .frame(maxWidth: .infinity)
+                    }
+                    .buttonStyle(SDButtonStyle(kind: .primary))
+                    .disabled(!canSubmit)
+                    .listRowInsets(EdgeInsets())
+                    .listRowBackground(Color.clear)
                 }
             }
-            .navigationTitle(ssid.isEmpty ? "Other network" : ssid)
+            .navigationTitle(initialSSID.isEmpty ? "Other network" : initialSSID)
             .navigationBarTitleDisplayMode(.inline)
             .toolbar {
                 ToolbarItem(placement: .cancellationAction) {
                     Button("Cancel") { password = ""; dismiss() }
                 }
-                ToolbarItem(placement: .confirmationAction) {
-                    Button("Connect", action: onSubmit)
-                        .disabled(ssid.trimmingCharacters(in: .whitespaces).isEmpty)
-                }
             }
-            .task { focused = true }
+            .task {
+                // Straight to the field that needs typing.
+                focus = initialSSID.isEmpty ? .ssid : (secured ? .password : nil)
+            }
         }
+        .tint(SD.Colors.accent)
+    }
+
+    /// WPA keys are at least 8 characters. Refusing a shorter one here is
+    /// kinder than sending it, waiting for the device to try it, and reporting
+    /// a rejection thirty seconds later.
+    private var canSubmit: Bool {
+        guard !ssid.trimmingCharacters(in: .whitespaces).isEmpty else { return false }
+        return secured ? password.count >= 8 : true
+    }
+
+    private func submit() {
+        guard canSubmit else { return }
+        onSubmit(ssid.trimmingCharacters(in: .whitespaces), password)
+        password = ""
     }
 }

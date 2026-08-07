@@ -78,6 +78,7 @@ struct DeviceReadinessCard: View {
             "dashboard": "Live feed",
             "provisioning": "Bluetooth",
             "cloud_uplink": "Cloud link",
+            "thermal": "Temperature",
         ]
         return health.components
             .sorted { $0.key < $1.key }
