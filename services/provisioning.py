@@ -146,6 +146,7 @@ class ProvisioningService:
                     "hostname": socket.gethostname(),
                 },
                 on_credentials=self._on_credentials,
+                scan_networks=lambda: self._wifi.scan(),
                 on_command=self._on_command,
             )
             self._ble.start()

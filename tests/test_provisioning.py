@@ -30,8 +30,13 @@ class FakeWifi:
 class FakeBLEServer:
     instances = []
 
-    def __init__(self, device_name, device_info, on_credentials, on_command=None):
+    def __init__(self, device_name, device_info, on_credentials, on_command=None,
+                 scan_networks=None):
+        # Mirrors the real BLEProvisioningServer signature. A double that
+        # drifts from it fails at construction and every assertion after it
+        # reports something unrelated.
         self.device_name = device_name
+        self.scan_networks = scan_networks
         self.on_credentials = on_credentials
         self.statuses = []
         self.running = False

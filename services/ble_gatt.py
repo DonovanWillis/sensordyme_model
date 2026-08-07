@@ -36,6 +36,7 @@ CHAR_DEVICE_INFO_UUID = "5d1e0002-5344-4d45-b000-536e447a6d65"
 CHAR_WIFI_CREDS_UUID = "5d1e0003-5344-4d45-b000-536e447a6d65"
 CHAR_STATUS_UUID = "5d1e0004-5344-4d45-b000-536e447a6d65"
 CHAR_COMMAND_UUID = "5d1e0005-5344-4d45-b000-536e447a6d65"
+CHAR_NETWORKS_UUID = "5d1e0006-5344-4d45-b000-536e447a6d65"
 
 BLUEZ_SERVICE = "org.bluez"
 GATT_MANAGER_IFACE = "org.bluez.GattManager1"
@@ -70,6 +71,10 @@ class BLEProvisioningServer:
     ) -> None:
         self._device_name = device_name
         self._device_info = device_info
+        # Scanned lazily, on read: a scan takes seconds and the radio is
+        # busy at boot, so doing it eagerly would delay the advertisement
+        # that lets anyone talk to the device at all.
+        self._scan_networks = scan_networks
         self._on_credentials = on_credentials
         self._on_command = on_command
         self._status: dict = {"state": "provisioning"}
@@ -283,6 +288,30 @@ class BLEProvisioningServer:
                 log.info("BLE: received Wi-Fi credentials for '%s'", ssid)
                 server._on_credentials(ssid, psk)
 
+        class NetworksChrc(Characteristic):
+            """Wi-Fi networks the DEVICE can see, so the app can offer a list.
+
+            Read on demand rather than pushed: the app asks when it opens the
+            setup screen, which is the only moment the answer matters, and a
+            scan costs seconds of radio time that would otherwise delay setup.
+            """
+
+            def read_value(self):
+                if server._scan_networks is None:
+                    return b"[]"
+                try:
+                    networks = server._scan_networks()
+                except Exception as exc:  # noqa: BLE001 - a failed scan is an empty list
+                    log.warning("BLE: wifi scan failed: %s", exc)
+                    return b"[]"
+                payload = json.dumps(networks).encode()
+                # BLE reads are MTU-bounded and this stack does not implement
+                # long reads. Twelve networks is more than anyone picks from and
+                # stays comfortably inside a default MTU.
+                if len(payload) > 480:
+                    payload = json.dumps(networks[:12]).encode()
+                return payload
+
         class StatusChrc(Characteristic):
             def read_value(self):
                 return json.dumps(server._status).encode()
@@ -327,6 +356,7 @@ class BLEProvisioningServer:
             (1, WifiCredsChrc, CHAR_WIFI_CREDS_UUID, ["write"]),
             (2, StatusChrc, CHAR_STATUS_UUID, ["read", "notify"]),
             (3, CommandChrc, CHAR_COMMAND_UUID, ["write"]),
+            (4, NetworksChrc, CHAR_NETWORKS_UUID, ["read"]),
         ):
             chrc = cls(bus, index, uuid, flags, service.PATH)
             app.add(chrc)

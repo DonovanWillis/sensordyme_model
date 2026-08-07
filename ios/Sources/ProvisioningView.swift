@@ -85,10 +85,50 @@ struct ProvisioningView: View {
     }
 
     private var wifiSection: some View {
-        Section("2. Send your Wi-Fi") {
-            TextField("Network name (SSID)", text: $ssid)
-                .autocapitalization(.none)
+        Section("2. Choose a network") {
+            // The list comes from the DEVICE's own scan, not the phone's. iOS
+            // cannot enumerate Wi-Fi networks at all, and the device's list is
+            // the one that matters anyway: it is the machine that has to
+            // associate, and it may sit behind a wall from the router.
+            if ble.networks.isEmpty {
+                HStack {
+                    ProgressView().controlSize(.small)
+                    Text("Looking for networks…")
+                        .font(SD.Typography.callout)
+                        .foregroundStyle(SD.Colors.textSecondary)
+                }
+            } else {
+                ForEach(ble.networks) { network in
+                    Button { ssid = network.ssid } label: {
+                        HStack(spacing: SD.Space.sm) {
+                            Image(systemName: network.secured ? "wifi.square.fill" : "wifi.square")
+                                .foregroundStyle(ssid == network.ssid
+                                                 ? SD.Colors.accent : SD.Colors.textTertiary)
+                            Text(network.ssid)
+                                .foregroundStyle(SD.Colors.textPrimary)
+                            Spacer()
+                            Text(network.strength)
+                                .font(SD.Typography.caption)
+                                .foregroundStyle(SD.Colors.textTertiary)
+                            if ssid == network.ssid {
+                                Image(systemName: "checkmark")
+                                    .foregroundStyle(SD.Colors.accent)
+                            }
+                        }
+                    }
+                    .buttonStyle(.plain)
+                }
+            }
+
+            Button("Scan again") { ble.refreshNetworks() }
+                .font(SD.Typography.caption)
+                .foregroundStyle(SD.Colors.accent)
+
+            // Hidden networks never appear in a scan, so typing stays possible.
+            TextField("Or type a network name", text: $ssid)
+                .textInputAutocapitalization(.never)
                 .autocorrectionDisabled()
+
             SecureField("Password", text: $password)
             Button {
                 ble.send(ssid: ssid, password: password)

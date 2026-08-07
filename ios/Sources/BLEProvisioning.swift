@@ -14,6 +14,24 @@ private let bleServiceUUID = CBUUID(string: "5d1e0001-5344-4d45-b000-536e447a6d6
 private let bleDeviceInfoUUID = CBUUID(string: "5d1e0002-5344-4d45-b000-536e447a6d65")
 private let bleWifiCredsUUID = CBUUID(string: "5d1e0003-5344-4d45-b000-536e447a6d65")
 private let bleStatusUUID = CBUUID(string: "5d1e0004-5344-4d45-b000-536e447a6d65")
+private let bleNetworksUUID = CBUUID(string: "5d1e0006-5344-4d45-b000-536e447a6d65")
+
+/// One Wi-Fi network the device can see.
+struct VisibleNetwork: Identifiable, Hashable {
+    let ssid: String
+    let signal: Int      // 0-100, as NetworkManager reports it
+    let secured: Bool
+
+    var id: String { ssid }
+
+    var strength: String {
+        switch signal {
+        case 70...: "Strong"
+        case 40..<70: "Good"
+        default: "Weak"
+        }
+    }
+}
 
 @MainActor
 final class BLEProvisioner: NSObject, ObservableObject {
@@ -41,6 +59,12 @@ final class BLEProvisioner: NSObject, ObservableObject {
     @Published var discovered: [String] = []
     @Published private(set) var signalByName: [String: Int] = [:]
 
+    /// Networks the DEVICE can see. Scanned on the Pi, not the phone: iOS
+    /// cannot enumerate Wi-Fi at all, and the Pi's list is the one that
+    /// matters — it is the machine that has to associate.
+    @Published private(set) var networks: [VisibleNetwork] = []
+    private var networksCharacteristic: CBCharacteristic?
+
     private var central: CBCentralManager?
     private var peripheral: CBPeripheral?
     private var credsCharacteristic: CBCharacteristic?
@@ -51,6 +75,7 @@ final class BLEProvisioner: NSObject, ObservableObject {
         state = .scanning
         discovered = []
         signalByName = [:]
+        networks = []
         peripheralsByName = [:]
         central = CBCentralManager(delegate: self, queue: .main)
         // Scanning begins in centralManagerDidUpdateState once Bluetooth is powered on.
@@ -74,6 +99,13 @@ final class BLEProvisioner: NSObject, ObservableObject {
     }
 
     /// Send Wi-Fi credentials to the connected device.
+    /// Re-scan on the device. The list is a moment in time, and the network
+    /// someone is looking for may only appear on the second sweep.
+    func refreshNetworks() {
+        guard let peripheral, let characteristic = networksCharacteristic else { return }
+        peripheral.readValue(for: characteristic)
+    }
+
     func send(ssid: String, password: String) {
         guard let peripheral, let credsCharacteristic,
               let payload = try? JSONSerialization.data(withJSONObject: ["ssid": ssid, "psk": password])
@@ -156,6 +188,11 @@ extension BLEProvisioner: CBCentralManagerDelegate, CBPeripheralDelegate {
                 case bleStatusUUID:
                     self.statusCharacteristic = characteristic
                     peripheral.setNotifyValue(true, for: characteristic)
+                case bleNetworksUUID:
+                    self.networksCharacteristic = characteristic
+                    // Ask immediately: the device scans on read, and the answer
+                    // is wanted the moment the setup form appears.
+                    peripheral.readValue(for: characteristic)
                 default:
                     break
                 }
@@ -169,7 +206,23 @@ extension BLEProvisioner: CBCentralManagerDelegate, CBPeripheralDelegate {
     nonisolated func peripheral(
         _ peripheral: CBPeripheral, didUpdateValueFor characteristic: CBCharacteristic, error: Error?
     ) {
-        guard characteristic.uuid == bleStatusUUID, let data = characteristic.value,
+        guard let data = characteristic.value else { return }
+
+        if characteristic.uuid == bleNetworksUUID {
+            let parsed = (try? JSONSerialization.jsonObject(with: data)) as? [[String: Any]] ?? []
+            let scanned = parsed.compactMap { entry -> VisibleNetwork? in
+                guard let ssid = entry["ssid"] as? String, !ssid.isEmpty else { return nil }
+                return VisibleNetwork(
+                    ssid: ssid,
+                    signal: entry["signal"] as? Int ?? 0,
+                    secured: entry["secured"] as? Bool ?? true
+                )
+            }
+            Task { @MainActor in self.networks = scanned }
+            return
+        }
+
+        guard characteristic.uuid == bleStatusUUID,
               let status = try? JSONSerialization.jsonObject(with: data) as? [String: Any]
         else { return }
         Task { @MainActor in

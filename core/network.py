@@ -11,6 +11,7 @@ opens BLE provisioning if nothing connects within the grace period.
 
 from __future__ import annotations
 
+import re
 import shutil
 import subprocess
 from typing import Optional
@@ -94,6 +95,57 @@ class WifiManager:
         except Exception as exc:  # noqa: BLE001
             log.warning("nmcli connection list failed: %s", exc)
             return []
+
+    def scan(self, limit: int = 20) -> list[dict]:
+        """Wi-Fi networks this device can see, strongest first.
+
+        Scanned on the DEVICE, not the phone, and that distinction is the whole
+        point: iOS cannot enumerate networks at all without an entitlement Apple
+        effectively does not grant, and even if it could, the phone's list is
+        the wrong one. The Pi is the machine that has to associate — it may sit
+        behind a wall from the router, or reach a network the phone does not.
+        Offering a network the phone can see and the Pi cannot produces a setup
+        that fails with no explanation.
+
+        Hidden networks are omitted: they have no SSID to show, and a blank row
+        is worse than none. They remain reachable by typing the name.
+        """
+        if not nmcli_available():
+            return []
+        try:
+            # --rescan yes forces a fresh sweep; the cached list goes stale
+            # exactly when it matters, which is right after the device moves.
+            result = _run(
+                ["-t", "-f", "SSID,SIGNAL,SECURITY", "device", "wifi", "list", "--rescan", "yes"],
+                timeout=20,
+            )
+        except Exception as exc:  # noqa: BLE001 - a failed scan must not break provisioning
+            log.warning("nmcli wifi scan failed: %s", exc)
+            return []
+
+        seen: dict[str, dict] = {}
+        for line in result.stdout.splitlines():
+            # nmcli escapes colons inside fields as "\:", so split on unescaped ones.
+            parts = re.split(r"(?<!\\):", line)
+            if len(parts) < 3:
+                continue
+            ssid = parts[0].replace("\\:", ":").strip()
+            if not ssid:
+                continue  # hidden network
+            try:
+                signal = int(parts[1])
+            except ValueError:
+                signal = 0
+            security = parts[2].strip()
+            # The same SSID appears once per access point on a mesh; keep the
+            # strongest, or the list is three copies of the same network.
+            if ssid not in seen or signal > seen[ssid]["signal"]:
+                seen[ssid] = {
+                    "ssid": ssid,
+                    "signal": signal,
+                    "secured": bool(security and security != "--"),
+                }
+        return sorted(seen.values(), key=lambda n: n["signal"], reverse=True)[:limit]
 
     def connect(self, ssid: str, password: str) -> tuple[bool, str]:
         """Join `ssid`, saving the profile so NetworkManager auto-reconnects on
