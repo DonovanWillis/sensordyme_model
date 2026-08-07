@@ -29,9 +29,17 @@ accuracy: # run the timed scenario script (make dev-max must already be running 
 report:
 	$(VENV)/python -c "from core.reports import generate_weekly_report; print(generate_weekly_report('data/events.csv', 'data/reports'))"
 
+# config.yaml is DEVICE STATE, not code: it holds this unit's device_key, its
+# cloud address, its camera orientation and its .hef path. Copying the repo's
+# copy over it silently unpairs the device from the backend and un-rotates the
+# camera, and the failure shows up much later as "the app stopped seeing it".
+# Config changes ship as explicit migrations (scripts/migrate_config.py), never
+# as a side effect of deploying code.
 deploy:
 	rsync -av --exclude='.venv' --exclude='data' --exclude='.git' --exclude='__pycache__' \
+		--exclude='config.yaml' --exclude='*.log' --exclude='.secrets' \
 		./ pi@sensordyme.local:~/sensordyme/
+	ssh pi@sensordyme.local 'cd ~/sensordyme && python3 scripts/migrate_config.py config.yaml'
 	ssh pi@sensordyme.local 'cd ~/sensordyme && sudo systemctl restart sensordyme.service'
 
 test:

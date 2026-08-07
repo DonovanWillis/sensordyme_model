@@ -182,18 +182,38 @@ class BLEProvisioningServer:
                 log.error("btmgmt fallback failed (%s): %s", subcommand, exc)
                 return
             if subcommand == "add-adv":
-                if "Instance added" in result.stdout:
+                # Judge it by the exit code, not by what it printed.
+                #
+                # btmgmt only writes "Instance added: 1" when stdout is a
+                # terminal; under systemd it is a pipe and says nothing at all.
+                # Matching on that text meant a *successful* advertisement was
+                # reported as a failure on every boot — and because the failure
+                # path left _btmgmt_active False, teardown then skipped rm-adv
+                # and leaked the instance into the next run.
+                if result.returncode == 0:
                     self._btmgmt_active = True
                     log.info("BLE advertising via kernel mgmt as '%s'", self._device_name)
                 else:
+                    # This is the last fallback: when it genuinely fails the
+                    # device is invisible and cannot be set up at all, so report
+                    # everything rather than a bare "failed:".
                     log.error(
-                        "btmgmt add-adv failed: %s",
-                        (result.stderr or result.stdout).strip()[:200],
+                        "btmgmt add-adv failed (rc=%s) stdout=%r stderr=%r — "
+                        "the device will NOT be visible over Bluetooth",
+                        result.returncode,
+                        result.stdout.strip()[:200],
+                        result.stderr.strip()[:200],
                     )
 
     def _stop_btmgmt_advertising(self) -> None:
-        if not getattr(self, "_btmgmt_active", False):
-            return
+        """Remove our advertising instance. Attempted unconditionally.
+
+        Not gated on `_btmgmt_active`: the flag records what this process
+        believes it did, and a leaked instance is precisely the case where that
+        belief was wrong. Removing an instance that is not there costs one
+        harmless non-zero exit; leaving one behind blocks the next boot's
+        advertisement and makes the device unsettable.
+        """
         import subprocess
 
         try:
@@ -204,6 +224,34 @@ class BLEProvisioningServer:
         except Exception:  # noqa: BLE001 - teardown must never raise
             pass
         self._btmgmt_active = False
+
+    def is_advertising(self) -> bool:
+        """Whether the controller is actually advertising, asked of the kernel.
+
+        Observed rather than remembered. Every other signal here is what some
+        earlier call *returned*; this is the device looking at itself, which is
+        the only answer worth reporting to a person asking why their phone
+        cannot see it.
+
+        Asks `advinfo` for the registered instance count, NOT the `advertising`
+        flag in `btmgmt info`. On the Pi 5's CYW43455 that flag stays clear
+        while instance-based advertising is running, so reading it reports a
+        visible device as invisible — the mirror image of the bug above.
+        """
+        import subprocess
+
+        try:
+            result = subprocess.run(
+                ["sudo", "-n", "btmgmt", "advinfo"],
+                capture_output=True, text=True, timeout=10,
+            )
+        except Exception:  # noqa: BLE001
+            return False
+        for line in result.stdout.splitlines():
+            if "Instances list with" in line:
+                digits = "".join(c for c in line if c.isdigit())
+                return bool(digits) and int(digits) > 0
+        return False
 
     def set_status(self, status: dict) -> None:
         """Update the status characteristic (and notify a subscribed app)."""

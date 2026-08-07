@@ -161,28 +161,47 @@ struct ProvisioningView: View {
 
     @ViewBuilder
     private var statusSection: some View {
+        // One checklist for the whole flow rather than a different message per
+        // state. Setup spans two radios and several slow steps, and a lone
+        // spinner cannot say which one is slow — so someone watching it decides
+        // the app has hung and force-quits, losing a setup that was working.
+        if showProgress {
+            Section("Progress") {
+                SetupProgressView(steps: SetupStep.checklist(
+                    for: ble.state,
+                    networksFound: ble.networks.count,
+                    scanning: ble.scanningNetworks,
+                    stateBeforeFailure: ble.stateBeforeFailure
+                ))
+                .padding(.vertical, SD.Space.xxs)
+            }
+        }
+
         switch ble.state {
-        case .connecting(let name):
-            Section { HStack { ProgressView(); Text("Connecting to \(name)…") } }
-        case .ready(let name):
-            Section { Label("Connected to \(name)", systemImage: "checkmark.circle").foregroundStyle(SD.Colors.success) }
-        case .deviceConnecting:
-            Section { HStack { ProgressView(); Text("Device is joining your Wi-Fi…") } }
-        case .success(let ip):
+        case .success:
             Section {
-                Label("Device is online\(ip.map { " at \($0)" } ?? "")", systemImage: "checkmark.circle.fill")
-                    .foregroundStyle(SD.Colors.success)
                 Text("Bluetooth setup is done — the live feed streams over Wi-Fi. Use “Find my device” in Settings to fill in the feed address.")
                     .font(.footnote)
                     .foregroundStyle(SD.Colors.textSecondary)
             }
-        case .failed(let message):
+        case .failed:
             Section {
-                Label(message, systemImage: "xmark.circle").foregroundStyle(SD.Colors.danger)
+                // The reason is already shown against the step it belongs to,
+                // so this only offers the way out.
                 Button("Try again") { ble.startScan() }
+                    .buttonStyle(SDButtonStyle(kind: .primary))
             }
         default:
             EmptyView()
+        }
+    }
+
+    /// Show the checklist once there is something real to report about a device.
+    /// Before that it would be six grey circles describing nothing.
+    private var showProgress: Bool {
+        switch ble.state {
+        case .idle, .bluetoothOff, .scanning: false
+        default: true
         }
     }
 }

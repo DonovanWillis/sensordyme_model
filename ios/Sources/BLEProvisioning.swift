@@ -86,6 +86,13 @@ final class BLEProvisioner: NSObject, ObservableObject {
     /// are none" — and the screen has to guess. It used to guess "still
     /// looking", so a device that found nothing showed a spinner forever.
     @Published private(set) var scanningNetworks = false
+    /// The state the flow was in when it failed.
+    ///
+    /// "Setup failed" is nearly useless on its own: failing to find the device
+    /// and failing to join the network are different problems with different
+    /// fixes. Keeping the last good state means the checklist can mark the one
+    /// step that broke and leave the completed ones standing.
+    @Published private(set) var stateBeforeFailure: State?
     private var networksCharacteristic: CBCharacteristic?
     private var sendTimeout: Task<Void, Never>?
     private var statusPoll: Task<Void, Never>?
@@ -126,6 +133,12 @@ final class BLEProvisioner: NSObject, ObservableObject {
     /// Send Wi-Fi credentials to the connected device.
     /// Re-scan on the device. The list is a moment in time, and the network
     /// someone is looking for may only appear on the second sweep.
+    /// Move to `.failed`, remembering what was in progress.
+    private func fail(_ reason: String) {
+        if case .failed = state {} else { stateBeforeFailure = state }
+        state = .failed(reason)
+    }
+
     func refreshNetworks() {
         guard let peripheral, let characteristic = networksCharacteristic else { return }
         peripheral.readValue(for: characteristic)
@@ -135,7 +148,7 @@ final class BLEProvisioner: NSObject, ObservableObject {
         guard let peripheral, let credsCharacteristic,
               let payload = try? JSONSerialization.data(withJSONObject: ["ssid": ssid, "psk": password])
         else {
-            state = .failed("not connected to a device")
+            fail("not connected to a device")
             return
         }
         state = .sending
@@ -188,7 +201,7 @@ final class BLEProvisioner: NSObject, ObservableObject {
             try? await Task.sleep(for: .seconds(60))
             guard !Task.isCancelled, let self else { return }
             if case .sending = self.state {
-                self.state = .failed(
+                self.fail(
                     "The device didn't confirm within a minute. It's usually the Wi-Fi password — "
                     + "check it and try again. Other causes: the network needs a browser sign-in "
                     + "(hotel or campus Wi-Fi), or it's 5GHz-only. A phone hotspot is the most "
@@ -263,14 +276,14 @@ extension BLEProvisioner: CBCentralManagerDelegate, CBPeripheralDelegate {
         _ central: CBCentralManager, didFailToConnect peripheral: CBPeripheral, error: Error?
     ) {
         Task { @MainActor in
-            self.state = .failed(error?.localizedDescription ?? "could not connect")
+            self.fail(error?.localizedDescription ?? "could not connect")
         }
     }
 
     nonisolated func peripheral(_ peripheral: CBPeripheral, didDiscoverServices error: Error?) {
         Task { @MainActor in
             guard let service = peripheral.services?.first(where: { $0.uuid == bleServiceUUID }) else {
-                self.state = .failed("device is missing the provisioning service")
+                self.fail("device is missing the provisioning service")
                 return
             }
             peripheral.discoverCharacteristics(
@@ -345,7 +358,7 @@ extension BLEProvisioner: CBCentralManagerDelegate, CBPeripheralDelegate {
             case "online":
                 self.state = .success(ip: status["ip"] as? String)
             case "error":
-                self.state = .failed((status["error"] as? String) ?? "device could not join that network")
+                self.fail((status["error"] as? String) ?? "device could not join that network")
             default:
                 break
             }
@@ -356,7 +369,7 @@ extension BLEProvisioner: CBCentralManagerDelegate, CBPeripheralDelegate {
         _ peripheral: CBPeripheral, didWriteValueFor characteristic: CBCharacteristic, error: Error?
     ) {
         if let error {
-            Task { @MainActor in self.state = .failed(error.localizedDescription) }
+            Task { @MainActor in self.fail(error.localizedDescription) }
         }
     }
 }

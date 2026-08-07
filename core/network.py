@@ -20,7 +20,37 @@ from core.logging_setup import get_logger
 
 log = get_logger("wifi")
 
+# Outer bound on a single join attempt: associate + 4-way handshake + DHCP.
+# A wrong passphrase normally fails in a few seconds because the access point
+# rejects the handshake outright — this is the cap for a network that accepts
+# the key and then stalls (slow DHCP, a captive portal), not the expected wait.
+# Kept deliberately: without it a stalled join hangs setup with no way out.
 _CONNECT_TIMEOUT_S = 45
+
+
+def explain_connect_failure(raw: str, ssid: str) -> str:
+    """Turn an nmcli error into something a person can act on.
+
+    nmcli says "Connection activation failed: (7) Secrets were required, but
+    not provided." A consumer reads that and learns nothing about what to do
+    next. The mapping is deliberately narrow: anything unrecognised is passed
+    through verbatim rather than guessed at, because a confidently wrong
+    explanation ("wrong password" when the router was simply off) sends someone
+    to fix a thing that was never broken.
+    """
+    lowered = raw.lower()
+    if "secrets were required" in lowered or "no secrets" in lowered:
+        return f"That password was not accepted by '{ssid}'. Check it and try again."
+    if "property is invalid" in lowered or "invalid" in lowered and "key" in lowered:
+        return "That password is not a valid Wi-Fi key — most are at least 8 characters."
+    if "no network with ssid" in lowered or "not found" in lowered:
+        return (
+            f"The device cannot see '{ssid}' from where it is. Move it closer to "
+            f"the router, or check the network is on."
+        )
+    if "timeout" in lowered or "timed out" in lowered:
+        return f"'{ssid}' did not finish connecting in time. It may be out of range."
+    return raw
 
 
 def nmcli_available() -> bool:
@@ -158,15 +188,131 @@ class WifiManager:
             args = ["device", "wifi", "connect", ssid]
             if password:
                 args += ["password", password]
+            existing = set(self.saved_networks())
             result = _run(args, timeout=_CONNECT_TIMEOUT_S)
             if result.returncode == 0:
                 log.info("joined wifi '%s'", ssid)
+                self._prefer(ssid)
                 return True, f"joined '{ssid}' — the device will appear online in the app shortly"
-            message = result.stderr.strip() or "could not join network"
-            log.warning("wifi connect to '%s' failed: %s", ssid, message)
-            return False, message
+            raw = result.stderr.strip() or "could not join network"
+            # Never log `password`; the SSID and nmcli's reason are enough to
+            # diagnose this, and the passphrase is the one thing that must not
+            # end up in a log file someone later pastes into a bug report.
+            log.warning("wifi connect to '%s' failed: %s", ssid, raw)
+            if ssid not in existing:
+                # A failed `device wifi connect` still leaves the profile it
+                # created behind. Left there, NetworkManager retries it on every
+                # future boot — so one typo turns into a device that keeps
+                # trying a network it can never join.
+                self.forget_network(ssid)
+            return False, explain_connect_failure(raw, ssid)
+        except subprocess.TimeoutExpired:
+            self.forget_network(ssid)
+            return False, (
+                f"'{ssid}' did not respond in time. It may be out of range of the "
+                f"device, or the network may be asking for a sign-in page."
+            )
         except Exception as exc:  # noqa: BLE001
             return False, str(exc)
+
+    def watch(self, on_change, stop: "threading.Event") -> "threading.Thread | None":
+        """Call `on_change()` whenever NetworkManager's state moves. Non-blocking.
+
+        Polling cannot be both cheap and quick: checking every ten seconds means
+        up to ten seconds of a device that has lost its network doing nothing
+        visible, and checking every second spawns a subprocess sixty times a
+        minute on a Pi that is already busy running inference.
+
+        `nmcli monitor` is the thing that already knows. It emits a line the
+        moment anything changes, so the device reacts to a network appearing or
+        vanishing rather than discovering it on the next tick.
+        """
+        import threading
+
+        if not nmcli_available():
+            return None
+
+        def pump() -> None:
+            while not stop.is_set():
+                try:
+                    process = subprocess.Popen(
+                        ["nmcli", "monitor"],
+                        stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True,
+                    )
+                except Exception as exc:  # noqa: BLE001
+                    log.warning("nmcli monitor unavailable (%s) — falling back to polling", exc)
+                    return
+                try:
+                    for _ in process.stdout:  # type: ignore[union-attr]
+                        if stop.is_set():
+                            break
+                        on_change()
+                except Exception:  # noqa: BLE001
+                    pass
+                finally:
+                    process.terminate()
+                # nmcli monitor exits if NetworkManager restarts. Come back,
+                # rather than silently degrading to no notifications at all.
+                if not stop.is_set():
+                    stop.wait(2)
+
+        thread = threading.Thread(target=pump, daemon=True, name="nm-monitor")
+        thread.start()
+        return thread
+
+    def _prefer(self, ssid: str) -> None:
+        """Make `ssid` the network this device reaches for first on future boots.
+
+        Most-recently-set-up wins. When someone moves a device to a new place
+        and both the old and new networks are somehow in range, the one they
+        just deliberately configured is the one they meant — and without an
+        explicit order NetworkManager picks by its own criteria, which shows up
+        as a device that mysteriously rejoins the wrong network after a reboot.
+
+        Best effort: a device that joined a network but could not be told to
+        prefer it is still a device that joined the network.
+        """
+        if not nmcli_available():
+            return
+        try:
+            highest = 0
+            for name in self.saved_networks():
+                if name == ssid:
+                    continue
+                result = _run(["-t", "-f", "connection.autoconnect-priority",
+                               "connection", "show", name])
+                value = result.stdout.strip().rsplit(":", 1)[-1]
+                if value.lstrip("-").isdigit():
+                    highest = max(highest, int(value))
+            _run(["connection", "modify", ssid,
+                  "connection.autoconnect", "yes",
+                  "connection.autoconnect-priority", str(highest + 1)])
+        except Exception as exc:  # noqa: BLE001
+            log.warning("could not set autoconnect priority for '%s': %s", ssid, exc)
+
+    def saved_networks(self) -> list[str]:
+        """SSIDs NetworkManager already has profiles for, strongest priority first."""
+        if not nmcli_available():
+            return []
+        try:
+            result = _run(["-t", "-f", "NAME,TYPE", "connection", "show"])
+        except Exception:  # noqa: BLE001
+            return []
+        return [
+            line.rsplit(":", 1)[0]
+            for line in result.stdout.splitlines()
+            if line.endswith(":802-11-wireless") and line.rsplit(":", 1)[0]
+        ]
+
+    def forget_network(self, ssid: str) -> bool:
+        """Delete a saved profile. Used to clean up after a failed join."""
+        if not nmcli_available() or not ssid:
+            return False
+        try:
+            result = _run(["connection", "delete", ssid])
+            return result.returncode == 0
+        except Exception:  # noqa: BLE001
+            return False
 
     def status(self) -> tuple[bool, str]:
         """(healthy, detail) for the health monitor's `wifi` component (non-critical:

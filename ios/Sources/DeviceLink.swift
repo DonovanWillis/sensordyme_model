@@ -47,7 +47,13 @@ final class DeviceLink: ObservableObject {
     @Published private(set) var state: State = .idle
     @Published private(set) var lastResolvedAt: Date?
 
-    /// The device's stable Bonjour identity. This is what survives a move.
+    /// The device's own stable ID (`SD-XXXXXXXX`), published in its mDNS TXT
+    /// record. This is what survives a move; the address never does.
+    ///
+    /// The storage key still says "service name" because that is what earlier
+    /// versions kept here, and changing the key would strand every device
+    /// already linked. The value's meaning changed; the migration in
+    /// `resolve(force:)` handles the old contents.
     @AppStorage("deviceServiceName") private var serviceName: String = ""
     /// Last known address. A cache, never the source of truth.
     @AppStorage("deviceLocalURL") private var cachedURL: String = ""
@@ -117,7 +123,20 @@ final class DeviceLink: ObservableObject {
         // Prefer the device we were previously linked to. On a network with
         // several SensorDymes, silently adopting a different one would be worse
         // than failing — the user would be watching someone else's camera.
-        let match = found.first { $0.id == serviceName } ?? (serviceName.isEmpty ? found.first : nil)
+        var match = found.first { $0.id == serviceName }
+
+        if match == nil, serviceName.isEmpty {
+            match = found.first
+        }
+
+        // Devices linked before identity moved to the device's own ID stored a
+        // Bonjour service name instead. That no longer matches anything, so the
+        // app would report a perfectly healthy device as missing and make the
+        // user re-pair it. Adopt it — but only when exactly one device answers,
+        // so this can never silently rebind someone to a neighbour's camera.
+        if match == nil, !serviceName.hasPrefix("SD-"), found.count == 1 {
+            match = found.first
+        }
 
         guard let match else {
             // Silence from Bonjour has several causes and the app cannot tell

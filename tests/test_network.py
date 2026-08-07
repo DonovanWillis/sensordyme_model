@@ -52,10 +52,17 @@ def test_parsing_with_fake_nmcli(monkeypatch):
     assert WifiManager().saved_wifi_names() == ["HomeNet"]
 
 
-def test_connect_failure_surfaces_stderr(monkeypatch):
+def test_connect_failure_reaches_the_caller_in_words_a_person_can_act_on(monkeypatch):
+    """The reason must not be swallowed — but nmcli's wording is not the point.
+
+    "no network with SSID" tells a consumer nothing about what to do; naming the
+    network and saying it cannot be seen from here does.
+    """
     monkeypatch.setattr(network_module, "nmcli_available", lambda: True)
     monkeypatch.setattr(
         network_module, "_run", _fake_run(returncode=4, stderr="Error: no network with SSID")
     )
     ok, message = WifiManager().connect("Nope", "pw")
-    assert not ok and "SSID" in message
+    assert not ok
+    assert "Nope" in message
+    assert message.strip() and message != "could not join network"

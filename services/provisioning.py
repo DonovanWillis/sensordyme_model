@@ -52,17 +52,37 @@ class ProvisioningService:
 
     name = "provisioning"
 
+    # Ceiling on how long to wait between checks while the device is offline or
+    # the setup window is open. Bounds "network vanished" -> "visible on
+    # Bluetooth" to about a second rather than a full poll interval of apparent
+    # nothing. A ceiling, not a fixed value: a caller that asked to be polled
+    # faster than this meant it, and must not be slowed down by a floor.
+    _UNSETTLED_POLL_CEILING_S = 1.0
+
     def __init__(self, wifi: WifiManager, config: dict, version: str = "dev") -> None:
         self._wifi = wifi
         self._method = str(config.get("method", "ble"))
         self._grace_s = float(config.get("grace_s", 0))
         self._poll_s = float(config.get("poll_s", 10))
+        # How long after boot Bluetooth stays open even when Wi-Fi is working.
+        #
+        # Without this, moving a device to a new network requires first making it
+        # fail: the setup window only existed while offline, so a working device
+        # could not be reconfigured at all. The consumer answer is that a device
+        # you just switched on is always reachable for a few minutes — long
+        # enough to re-point it, short enough that it is not permanently open.
+        self._reconfigure_window_s = float(config.get("reconfigure_window_s", 300))
         self._version = version
         self._ble = None  # BLEProvisioningServer, created lazily
         self._ble_unavailable = False
         self._stop = threading.Event()
         self._thread: Optional[threading.Thread] = None
         self._connect_thread: Optional[threading.Thread] = None
+        # Somebody has successfully set this device up over Bluetooth since it
+        # booted. The reconfigure window exists for a device nobody has touched
+        # yet; once it has been pointed at a network on purpose, leaving the
+        # window open is exposure with no remaining purpose.
+        self._provisioned_this_session = False
         self.state = "starting"  # starting | online | waiting | provisioning | unavailable
 
     # ------------------------------------------------------------------ Service lifecycle
@@ -73,6 +93,10 @@ class ProvisioningService:
 
     def stop(self, timeout: float = 5.0) -> None:
         self._stop.set()
+        # Wake the run loop rather than letting it sit out its interval.
+        wake = getattr(self, "_wake", None)
+        if wake is not None:
+            wake.set()
         if self._thread is not None:
             self._thread.join(timeout=timeout)
         self._thread = None
@@ -93,21 +117,50 @@ class ProvisioningService:
             self.state = "unavailable" if self._method == "ble" else self._method
             return
 
-        offline_since: Optional[float] = None
         import time
 
+        offline_since: Optional[float] = None
+        started_at = time.monotonic()
+
+        # Wake the moment NetworkManager reports a change, instead of finding
+        # out on the next tick. Measured on hardware, polling put 8.1 seconds
+        # between "Wi-Fi vanished" and "visible on Bluetooth" — almost all of it
+        # spent asleep in the settled interval, doing nothing.
+        changed = threading.Event()
+        self._wifi.watch(changed.set, stop)
+        self._wake = changed
+
         while not stop.is_set():
+            now = time.monotonic()
             online = self._wifi.is_online()
+
             if online:
                 offline_since = None
-                if self._ble is not None:
-                    ssid, ip = self._wifi.current_ssid(), self._wifi.ip_address()
-                    self._push_status({"state": "online", "ssid": ssid, "ip": ip})
-                    log.info("Wi-Fi is up (%s) — closing the BLE provisioning window", ssid)
-                    self._teardown_ble()
-                self.state = "online"
+                # A device that has just been switched on stays reachable over
+                # Bluetooth for a few minutes even though its Wi-Fi is fine.
+                # This is what makes "I moved it to a new house" possible: the
+                # window used to exist only while offline, so reconfiguring a
+                # working device meant first breaking it.
+                reconfigurable = (
+                    (now - started_at) < self._reconfigure_window_s
+                    and not self._provisioned_this_session
+                )
+                if reconfigurable:
+                    self.state = "reconfigurable"
+                    if self._ble is None and not self._ble_unavailable:
+                        self._open_ble_window()
+                    self._push_status(self._describe())
+                else:
+                    if self._ble is not None:
+                        ssid = self._wifi.current_ssid()
+                        self._push_status(self._describe())
+                        log.info(
+                            "Wi-Fi is up (%s) and the setup window has elapsed — closing Bluetooth",
+                            ssid,
+                        )
+                        self._teardown_ble()
+                    self.state = "online"
             else:
-                now = time.monotonic()
                 if offline_since is None:
                     offline_since = now
                     self.state = "waiting"
@@ -123,12 +176,45 @@ class ProvisioningService:
                 # Waiting costs the entire setup experience.
                 if now - offline_since >= self._grace_s and self._ble is None and not self._ble_unavailable:
                     self._open_ble_window()
-            stop.wait(self._poll_s)
+                if self._ble is not None:
+                    self.state = "provisioning"
+            # Poll quickly whenever something is expected to change, slowly when
+            # nothing is. A settled device on known Wi-Fi has no reason to be
+            # asked every second; a device that just lost its network is one
+            # somebody is probably standing over, and up to ten seconds of
+            # apparent nothing is exactly the pause that reads as broken.
+            settled = online and self._ble is None
+            interval = (
+                self._poll_s if settled
+                else min(self._poll_s, self._UNSETTLED_POLL_CEILING_S)
+            )
+            # The interval is now a backstop, not the mechanism: a state change
+            # wakes this immediately, and the timeout only covers what nmcli
+            # monitor might not report.
+            changed.clear()
+            changed.wait(timeout=interval)
+
+    def _describe(self) -> dict:
+        """The device's own account of where it is in setup.
+
+        Sent over Bluetooth so the app can show real steps rather than a
+        spinner. Every field here is observed, never assumed.
+        """
+        online = self._wifi.is_online()
+        return {
+            "state": "online" if online else self.state,
+            "ssid": self._wifi.current_ssid() if online else None,
+            "ip": self._wifi.ip_address() if online else None,
+            "device_id": device_id(),
+            "reconfigurable": self.state == "reconfigurable",
+        }
 
     def status(self) -> tuple[bool, str]:
         """(healthy, detail) for the health monitor (non-critical component)."""
         if self.state == "provisioning":
             return True, "BLE provisioning window open (device unprovisioned or Wi-Fi lost)"
+        if self.state == "reconfigurable":
+            return True, "online; Bluetooth still open so the device can be moved to another network"
         if self.state == "unavailable":
             return False, "BLE provisioning requested but BlueZ bindings are missing"
         return True, f"state: {self.state}"
@@ -211,6 +297,7 @@ class ProvisioningService:
             return
 
         if ok:
+            self._provisioned_this_session = True
             self._push_status(
                 {"state": "online", "ssid": ssid, "ip": self._wifi.ip_address(), "message": message}
             )
