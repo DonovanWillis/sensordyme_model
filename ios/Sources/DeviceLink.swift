@@ -120,10 +120,18 @@ final class DeviceLink: ObservableObject {
         let match = found.first { $0.id == serviceName } ?? (serviceName.isEmpty ? found.first : nil)
 
         guard let match else {
-            // Nothing answered. Either the device is on another network, or
-            // this network blocks multicast, or it needs provisioning. The app
-            // cannot tell those apart from here, so it says the actionable one.
-            state = found.isEmpty ? .needsProvisioning : .notFound
+            // Silence from Bonjour has several causes and the app cannot tell
+            // them apart: the device may be powered off, on another network, out
+            // of range, or on a network that blocks multicast.
+            //
+            // An earlier version reported "needs Wi-Fi setup" here, which named
+            // the one cause the user can act on — and was wrong most of the
+            // time. Worse, it pointed at Bluetooth provisioning, which only
+            // works within a few metres of the device, so someone whose camera
+            // was simply in another building went looking for it on Bluetooth
+            // and found nothing. Listing the real possibilities is less tidy and
+            // far more useful.
+            state = .notFound
             return
         }
 

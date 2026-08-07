@@ -20,12 +20,16 @@ struct DeviceLinkBanner: View {
         case .notFound:
             row(icon: "wifi.exclamationmark", tint: SD.Colors.warning,
                 title: "Can't find your device",
-                detail: "It may be on a different Wi-Fi network than your phone.",
+                detail: "It may be switched off, on a different Wi-Fi network, or somewhere else. SensorDyme finds it automatically once you're both on the same network.",
                 action: "Search again")
         case .needsProvisioning:
+            // Only shown when the device has been SEEN and reports no network —
+            // never as a guess. Bluetooth setup needs you within a few metres of
+            // it, so suggesting it for a device that is simply elsewhere sends
+            // someone hunting for a signal that cannot exist.
             row(icon: "wifi.slash", tint: SD.Colors.warning,
                 title: "Your device needs Wi-Fi setup",
-                detail: "Set it up over Bluetooth — it only takes a moment.",
+                detail: "Stand near your SensorDyme and set it up over Bluetooth.",
                 action: "Search again")
         }
     }
