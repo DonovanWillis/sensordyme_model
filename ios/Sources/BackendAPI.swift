@@ -93,8 +93,54 @@ protocol BackendAPI {
     func zones(deviceID: Int) async throws -> [MonitorZone]
     func setZones(deviceID: Int, zones: [MonitorZone]) async throws
     func explain(deviceID: Int, eventID: Int) async throws -> AlertExplanation
+    func triggerDemoEvent(_ scenario: DemoScenario) async throws -> EventItem
     func placeOrder(quantity: Int, address: String) async throws -> Int
     func orders() async throws -> [Order]
+}
+
+/// A rehearsable demo event. Waiting ~20s for a synthesised alert is not a
+/// demo; pressing a button and having the whole pipeline run is.
+///
+/// Every scenario maps to an event type the detection code already emits, so a
+/// demo exercises the real path — rule severity, notification, explanation —
+/// rather than a parallel one built to look good.
+struct DemoScenario: Identifiable, Hashable, CaseIterable {
+    let id: String
+    let title: String
+    let detail: String
+    let icon: String
+    let type: String
+    let signals: String
+    let severity: String
+
+    static let distractedDriving = DemoScenario(
+        id: "distraction", title: "Distracted driving",
+        detail: "Phone in hand with eyes off the road", icon: "car.fill",
+        type: "phone_use", signals: "phone + hand_overlap + gaze_off", severity: "loud")
+
+    static let drowsyDriving = DemoScenario(
+        id: "drowsy", title: "Drowsy driver",
+        detail: "Sustained eye closure at speed", icon: "eye.slash.fill",
+        type: "drowsiness", signals: "sustained_closure + head_nod", severity: "loud")
+
+    static let poolSafety = DemoScenario(
+        id: "pool", title: "Child near pool",
+        detail: "Person in the pool zone", icon: "figure.pool.swim",
+        type: "zone_violation:pool", signals: "person + zone_entry", severity: "loud")
+
+    static let fall = DemoScenario(
+        id: "fall", title: "Fall detected",
+        detail: "Rapid drop then stillness on the floor", icon: "figure.fall",
+        type: "fall", signals: "rapid_drop + stillness", severity: "loud")
+
+    static let lingering = DemoScenario(
+        id: "lingering", title: "Someone lingering",
+        detail: "A person stayed at the entry", icon: "person.fill.questionmark",
+        type: "person_lingering", signals: "person + dwell", severity: "soft")
+
+    static let allCases: [DemoScenario] = [
+        .distractedDriving, .drowsyDriving, .poolSafety, .fall, .lingering,
+    ]
 }
 
 private struct OrderPlacedResponse: Codable {
@@ -113,6 +159,13 @@ extension APIClient: BackendAPI {
 
     func explain(deviceID: Int, eventID: Int) async throws -> AlertExplanation {
         try await getJSON("v1/devices/\(deviceID)/events/\(eventID)/explain")
+    }
+
+    func triggerDemoEvent(_ scenario: DemoScenario) async throws -> EventItem {
+        // Deliberately unavailable against a real device: injecting a fake event
+        // into a live safety system's history is exactly the kind of thing that
+        // should be impossible, not merely discouraged.
+        throw APIError(message: "Simulated events are only available on the demo device. Switch to the demo device to rehearse alerts.")
     }
 
     func setZones(deviceID: Int, zones: [MonitorZone]) async throws {
@@ -321,6 +374,14 @@ final class MockAPI: BackendAPI {
 
 
     func setZones(deviceID: Int, zones: [MonitorZone]) async throws { demoZones = zones }
+
+    func triggerDemoEvent(_ scenario: DemoScenario) async throws -> EventItem {
+        try await Task.sleep(for: .milliseconds(500))  // the device thinking
+        let event = makeEvent(type: scenario.type, signals: scenario.signals,
+                              severity: scenario.severity, at: Date())
+        history.insert(event, at: 0)
+        return event
+    }
 
     func explain(deviceID: Int, eventID: Int) async throws -> AlertExplanation {
         try await Task.sleep(for: .milliseconds(400))

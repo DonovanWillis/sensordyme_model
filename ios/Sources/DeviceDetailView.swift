@@ -12,6 +12,8 @@ struct DeviceDetailView: View {
     @State private var showAI = false
     @State private var showZones = false
     @State private var selectedEvent: EventItem?
+    @State private var showDemoTrigger = false
+    @StateObject private var notifier = AlertNotifier.shared
     @State private var showRename = false
     @State private var newName = ""
     @State private var hasLoaded = false
@@ -63,6 +65,13 @@ struct DeviceDetailView: View {
                     } label: {
                         Label("Areas", systemImage: "square.dashed")
                     }
+                    if state.isDemo {
+                        Button {
+                            showDemoTrigger = true
+                        } label: {
+                            Label("Run a demo alert", systemImage: "play.circle")
+                        }
+                    }
                     NavigationLink {
                         ReportsView(device: device)
                     } label: {
@@ -91,6 +100,22 @@ struct DeviceDetailView: View {
         }
         .sheet(item: $selectedEvent) { event in
             EventDetailView(device: device, event: event)
+        }
+        .sheet(isPresented: $showDemoTrigger) {
+            DemoTriggerView(device: device) { await reload() }
+        }
+        // A tapped notification opens its alert, which is the last beat of the
+        // demo: buzz, tap, "here is why".
+        .onChange(of: notifier.pendingEventID) { _, id in
+            guard let id else { return }
+            if let match = events.first(where: { $0.eventID == id }) {
+                selectedEvent = match
+            }
+            notifier.pendingEventID = nil
+        }
+        .task {
+            await notifier.refreshAuthorization()
+            if !notifier.authorized { await notifier.requestPermission() }
         }
         .refreshable { await reload() }
         .task { await reload() }
@@ -383,6 +408,9 @@ struct DeviceDetailView: View {
                 }
             }
             events = try await state.backend.events(deviceID: device.id, limit: 200)
+            // The notifier dedupes by event id, so calling this on every poll
+            // announces each alert exactly once.
+            await notifier.announce(events, device: device, simulated: state.isDemo)
             errorMessage = nil
         } catch let error as APIError where error.isAuthFailure {
             state.expireSession(error.message)
