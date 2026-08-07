@@ -15,6 +15,7 @@ struct DevicesView: View {
     @State private var showClaim = false
     @State private var hasLoaded = false
     @StateObject private var link = DeviceLink()
+    @StateObject private var refreshing = ProgressTracker()
 
     private let refreshTimer = Timer.publish(every: 10, on: .main, in: .common).autoconnect()
 
@@ -55,10 +56,15 @@ struct DevicesView: View {
             .navigationBarTitleDisplayMode(.large)
             .toolbar {
                 ToolbarItem(placement: .topBarTrailing) {
-                    Button { showClaim = true } label: {
-                        Label("Add device", systemImage: "plus")
+                    HStack(spacing: SD.Space.xs) {
+                        // Sits beside the add button so a background refresh is
+                        // visible without occupying a row of its own.
+                        SDProgress(phase: refreshing.phase)
+                        Button { showClaim = true } label: {
+                            Label("Add device", systemImage: "plus")
+                        }
+                        .tint(SD.Colors.accent)
                     }
-                    .tint(SD.Colors.accent)
                 }
             }
             .sheet(isPresented: $showClaim) { SetupWizardView { await reload() } }
@@ -93,12 +99,16 @@ struct DevicesView: View {
     }
 
     private func reload() async {
+        refreshing.begin()
         do {
             devices = try await state.backend.devices()
             errorMessage = nil
+            refreshing.succeed()
         } catch let error as APIError where error.isAuthFailure {
+            refreshing.fail()
             state.expireSession(error.message)
         } catch {
+            refreshing.fail()
             errorMessage = error.localizedDescription
         }
         hasLoaded = true

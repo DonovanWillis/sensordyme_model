@@ -22,6 +22,7 @@ struct ZoneEditorView: View {
     @State private var loading = true
     @State private var errorMessage: String?
     @State private var saving = false
+    @StateObject private var saveProgress = ProgressTracker()
 
     var body: some View {
         NavigationStack {
@@ -144,8 +145,15 @@ struct ZoneEditorView: View {
                     Spacer()
                 }
 
-                Button("Save area") { saveDraft() }
-                    .buttonStyle(SDButtonStyle(kind: .primary))
+                Button {
+                    saveDraft()
+                } label: {
+                    HStack(spacing: SD.Space.xs) {
+                        Text("Save area")
+                        SDProgress(phase: saveProgress.phase)
+                    }
+                }
+                .buttonStyle(SDButtonStyle(kind: .primary))
                     .disabled(draft.count < 3 || draftName.trimmingCharacters(in: .whitespaces).isEmpty || saving)
             }
         }
@@ -249,7 +257,9 @@ struct ZoneEditorView: View {
         Task {
             defer { saving = false }
             do {
-                try await state.backend.setZones(deviceID: device.id, zones: updated)
+                try await saveProgress.track {
+                    try await state.backend.setZones(deviceID: device.id, zones: updated)
+                }
                 zones = updated
                 draft = []
                 onSuccess()

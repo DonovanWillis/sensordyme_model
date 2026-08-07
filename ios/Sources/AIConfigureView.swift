@@ -20,6 +20,7 @@ struct AIConfigureView: View {
     @State private var applied = false
     @State private var errorMessage: String?
     @FocusState private var promptFocused: Bool
+    @StateObject private var thinkingProgress = ProgressTracker()
 
     /// Deliberately spans what works and what doesn't, so the honest answers are
     /// discovered during setup rather than in front of an investor.
@@ -110,7 +111,10 @@ struct AIConfigureView: View {
                         Text("Working it out…")
                     }
                 } else {
-                    Text(proposal == nil ? "Continue" : "Try again")
+                    HStack(spacing: SD.Space.xs) {
+                        Text(proposal == nil ? "Continue" : "Try again")
+                        SDProgress(phase: thinkingProgress.phase)
+                    }
                 }
             }
             .buttonStyle(SDButtonStyle(kind: .primary))
@@ -341,7 +345,9 @@ struct AIConfigureView: View {
         Task {
             defer { thinking = false }
             do {
-                let result = try await state.backend.aiConfigure(deviceID: device.id, prompt: prompt)
+                let result = try await thinkingProgress.track {
+                    try await state.backend.aiConfigure(deviceID: device.id, prompt: prompt)
+                }
                 withAnimation(SD.Motion.standard) { proposal = result }
             } catch {
                 errorMessage = error.localizedDescription
