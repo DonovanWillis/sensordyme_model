@@ -64,6 +64,7 @@ final class BLEProvisioner: NSObject, ObservableObject {
     /// matters — it is the machine that has to associate.
     @Published private(set) var networks: [VisibleNetwork] = []
     private var networksCharacteristic: CBCharacteristic?
+    private var sendTimeout: Task<Void, Never>?
 
     private var central: CBCentralManager?
     private var peripheral: CBPeripheral?
@@ -115,6 +116,33 @@ final class BLEProvisioner: NSObject, ObservableObject {
         }
         state = .sending
         peripheral.writeValue(payload, for: credsCharacteristic, type: .withResponse)
+        startSendTimeout()
+    }
+
+    /// Give up waiting, with a reason.
+    ///
+    /// The device has up to 45 seconds to join a network, and older firmware
+    /// blocks its own event loop for that whole time — so a slow join and a
+    /// dead one look identical from here. Without a deadline the screen sits on
+    /// "Sending…" indefinitely, which teaches the user nothing and looks like a
+    /// hung app.
+    ///
+    /// Generous on purpose: firing before the device has finished trying would
+    /// report a failure that did not happen.
+    private func startSendTimeout() {
+        sendTimeout?.cancel()
+        sendTimeout = Task { [weak self] in
+            try? await Task.sleep(for: .seconds(60))
+            guard !Task.isCancelled, let self else { return }
+            if case .sending = self.state {
+                self.state = .failed(
+                    "The device didn't confirm within a minute. It's usually the Wi-Fi password — "
+                    + "check it and try again. Other causes: the network needs a browser sign-in "
+                    + "(hotel or campus Wi-Fi), or it's 5GHz-only. A phone hotspot is the most "
+                    + "reliable way to get the device online."
+                )
+            }
+        }
     }
 }
 
@@ -226,6 +254,11 @@ extension BLEProvisioner: CBCentralManagerDelegate, CBPeripheralDelegate {
               let status = try? JSONSerialization.jsonObject(with: data) as? [String: Any]
         else { return }
         Task { @MainActor in
+            // The device answered, so the deadline has done its job.
+            if let state = status["state"] as? String,
+               ["connecting", "online", "error"].contains(state) {
+                self.sendTimeout?.cancel()
+            }
             switch status["state"] as? String {
             case "connecting":
                 self.state = .deviceConnecting
