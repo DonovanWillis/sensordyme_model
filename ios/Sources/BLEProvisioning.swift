@@ -16,6 +16,24 @@ private let bleWifiCredsUUID = CBUUID(string: "5d1e0003-5344-4d45-b000-536e447a6
 private let bleStatusUUID = CBUUID(string: "5d1e0004-5344-4d45-b000-536e447a6d65")
 private let bleNetworksUUID = CBUUID(string: "5d1e0006-5344-4d45-b000-536e447a6d65")
 
+/// One physical device seen over Bluetooth.
+///
+/// Identified by CoreBluetooth's peripheral UUID, which is stable for a given
+/// device on a given phone. Names are display only — a device can present more
+/// than one, and treating a name as identity is what produced duplicates.
+struct DiscoveredDevice: Identifiable, Hashable {
+    let id: UUID
+    let name: String
+    let rssi: Int
+
+    /// How close it is. The device in the room reads "Nearby".
+    var proximity: String {
+        if rssi >= -60 { return "Nearby" }
+        if rssi >= -80 { return "In range" }
+        return "Weak"
+    }
+}
+
 /// One Wi-Fi network the device can see.
 struct VisibleNetwork: Identifiable, Hashable {
     let ssid: String
@@ -56,13 +74,18 @@ final class BLEProvisioner: NSObject, ObservableObject {
     /// alias, so two entries can appear for what is really one unit — or one
     /// real device alongside a leftover advertisement. The nearer, stronger
     /// signal is almost always the one in the room with you.
-    @Published var discovered: [String] = []
-    @Published private(set) var signalByName: [String: Int] = [:]
+    @Published var discovered: [DiscoveredDevice] = []
 
     /// Networks the DEVICE can see. Scanned on the Pi, not the phone: iOS
     /// cannot enumerate Wi-Fi at all, and the Pi's list is the one that
     /// matters — it is the machine that has to associate.
     @Published private(set) var networks: [VisibleNetwork] = []
+    /// Whether the DEVICE is scanning right now, reported by the device itself.
+    ///
+    /// Without this an empty list has two meanings — "still looking" and "there
+    /// are none" — and the screen has to guess. It used to guess "still
+    /// looking", so a device that found nothing showed a spinner forever.
+    @Published private(set) var scanningNetworks = false
     private var networksCharacteristic: CBCharacteristic?
     private var sendTimeout: Task<Void, Never>?
     private var statusPoll: Task<Void, Never>?
@@ -71,14 +94,13 @@ final class BLEProvisioner: NSObject, ObservableObject {
     private var peripheral: CBPeripheral?
     private var credsCharacteristic: CBCharacteristic?
     private var statusCharacteristic: CBCharacteristic?
-    private var peripheralsByName: [String: CBPeripheral] = [:]
+    private var peripheralsByID: [UUID: CBPeripheral] = [:]
 
     func startScan() {
         state = .scanning
         discovered = []
-        signalByName = [:]
         networks = []
-        peripheralsByName = [:]
+        peripheralsByID = [:]
         central = CBCentralManager(delegate: self, queue: .main)
         // Scanning begins in centralManagerDidUpdateState once Bluetooth is powered on.
     }
@@ -92,8 +114,9 @@ final class BLEProvisioner: NSObject, ObservableObject {
         state = .idle
     }
 
-    func connect(name: String) {
-        guard let target = peripheralsByName[name] else { return }
+    func connect(id: UUID) {
+        guard let target = peripheralsByID[id] else { return }
+        let name = discovered.first { $0.id == id }?.name ?? "SensorDyme device"
         state = .connecting(name: name)
         central?.stopScan()
         peripheral = target
@@ -196,15 +219,36 @@ extension BLEProvisioner: CBCentralManagerDelegate, CBPeripheralDelegate {
         advertisementData: [String: Any],
         rssi RSSI: NSNumber
     ) {
-        let name = (advertisementData[CBAdvertisementDataLocalNameKey] as? String)
-            ?? peripheral.name ?? "SensorDyme device"
+        // Identity is the peripheral's UUID, never its name.
+        //
+        // CoreBluetooth calls this repeatedly for one device, and the name can
+        // differ between calls: CBAdvertisementDataLocalNameKey comes from the
+        // advertisement packet while peripheral.name is the cached GAP name
+        // (the adapter alias). A Pi advertising "SensorDyme" that iOS has
+        // cached as "SensorDyme-TEST" produced TWO entries for ONE device —
+        // which is exactly the duplicate that has been showing up. Keying on
+        // identifier makes that impossible rather than filtered.
+        let advertised = advertisementData[CBAdvertisementDataLocalNameKey] as? String
+        let name = advertised ?? peripheral.name ?? "SensorDyme device"
+        let id = peripheral.identifier
         Task { @MainActor in
-            self.peripheralsByName[name] = peripheral
-            self.signalByName[name] = RSSI.intValue
-            if !self.discovered.contains(name) { self.discovered.append(name) }
-            // Strongest first, so the device you are standing next to is the one
-            // offered first rather than whichever happened to answer soonest.
-            self.discovered.sort { (self.signalByName[$0] ?? -200) > (self.signalByName[$1] ?? -200) }
+            self.peripheralsByID[id] = peripheral
+            let device = DiscoveredDevice(id: id, name: name, rssi: RSSI.intValue)
+            if let index = self.discovered.firstIndex(where: { $0.id == id }) {
+                // Same device, fresher reading. Prefer the advertised name: it
+                // is what the device is saying right now, rather than what iOS
+                // remembers it being called.
+                self.discovered[index] = DiscoveredDevice(
+                    id: id,
+                    name: advertised ?? self.discovered[index].name,
+                    rssi: RSSI.intValue
+                )
+            } else {
+                self.discovered.append(device)
+            }
+            // Strongest first, so the device you are standing next to is offered
+            // first rather than whichever answered soonest.
+            self.discovered.sort { $0.rssi > $1.rssi }
         }
     }
 
@@ -284,6 +328,9 @@ extension BLEProvisioner: CBCentralManagerDelegate, CBPeripheralDelegate {
               let status = try? JSONSerialization.jsonObject(with: data) as? [String: Any]
         else { return }
         Task { @MainActor in
+            self.scanningNetworks = (status["scanning"] as? Bool) ?? false
+            // A scan that just finished has a list waiting to be read.
+            if !self.scanningNetworks { self.refreshNetworks() }
             // The device answered, so the deadline has done its job.
             if let state = status["state"] as? String,
                ["connecting", "online", "error"].contains(state) {

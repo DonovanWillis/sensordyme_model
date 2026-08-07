@@ -81,7 +81,7 @@ struct SettingsView: View {
                             state.deviceLocalURL = device.url
                             discovery.stop()
                         } label: {
-                            Label("\(device.id) — \(device.url)", systemImage: "sensor.tag.radiowaves.forward")
+                            Label("\(device.name) — \(device.url)", systemImage: "sensor.tag.radiowaves.forward")
                                 .lineLimit(1)
                         }
                     }

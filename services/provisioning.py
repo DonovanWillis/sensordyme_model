@@ -31,19 +31,20 @@ import threading
 from typing import Optional
 
 from core.logging_setup import get_logger
+from core.identity import device_id, display_name
 from core.network import WifiManager, nmcli_available
 
 log = get_logger("provisioning")
 
 
 def _ble_name() -> str:
-    """SensorDyme-XXXX from the wlan0 MAC (mirrors the hotspot script's naming)."""
-    try:
-        with open("/sys/class/net/wlan0/address") as f:
-            suffix = f.read().strip().replace(":", "")[-4:].upper()
-    except OSError:
-        suffix = "0000"
-    return f"SensorDyme-{suffix}"
+    """The name shown in the app's Bluetooth list, derived from the device ID.
+
+    Display only. The app identifies devices by CoreBluetooth's peripheral UUID
+    and by the `id` field below — never by this string, which is why a stale
+    adapter alias can no longer split one Pi into two list entries.
+    """
+    return display_name()
 
 
 class ProvisioningService:
@@ -141,6 +142,9 @@ class ProvisioningService:
             self._ble = BLEProvisioningServer(
                 device_name=name,
                 device_info={
+                    # The stable identity, so the app can recognise this device
+                    # as the same one it already knows however it was found.
+                    "id": device_id(),
                     "name": name,
                     "model": "SensorDyme",
                     "version": self._version,
@@ -215,20 +219,16 @@ class ProvisioningService:
             self._push_status({"state": "error", "ssid": ssid, "error": message})
 
     def _on_command(self, command: dict) -> None:
+        """Handle an app command. Runs on the BLE event loop — never block here.
+
+        This previously shelled out to `nmcli --rescan yes` inline, which stalls
+        every BLE operation for as long as the radio takes. Rescanning is now
+        the BLE server's own non-blocking refresh; the app learns the outcome
+        from the status push and re-reads the list.
+        """
         action = command.get("action")
         if action == "rescan":
-            self._push_status({"state": self.state, "ssids": self._visible_ssids()})
+            if self._ble is not None:
+                self._ble.refresh_networks()
         elif action == "identify":
             log.info("BLE identify requested")  # future: blink the status LED via the HAL
-
-    def _visible_ssids(self) -> list[str]:
-        import subprocess
-
-        try:
-            result = subprocess.run(
-                ["nmcli", "-t", "-f", "SSID", "device", "wifi", "list", "--rescan", "yes"],
-                capture_output=True, text=True, timeout=15,
-            )
-            return sorted({s for s in result.stdout.splitlines() if s})[:20]
-        except Exception:  # noqa: BLE001
-            return []

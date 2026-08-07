@@ -6,9 +6,16 @@ import Network
 /// so nobody ever types an IP address into Settings.
 @MainActor
 final class DeviceDiscovery: ObservableObject {
+    /// One device on the network.
+    ///
+    /// `id` is the device's own stable ID (`SD-XXXXXXXX`) from its mDNS TXT
+    /// record, not its service name and not its address. Both of those change —
+    /// the name if the hostname is edited, the address every time the device
+    /// moves network — and keying on either turns one device into two entries.
     struct Found: Identifiable, Equatable {
-        let id: String   // service name, e.g. "SensorDyme on sensordyme"
-        let url: String  // resolved http://ip:port
+        let id: String       // SD-XXXXXXXX, or the service name on an older device
+        let name: String     // what to show, e.g. "SensorDyme on sensordyme"
+        let url: String      // resolved http://ip:port — a cache, never identity
     }
 
     @Published var found: [Found] = []
@@ -31,7 +38,11 @@ final class DeviceDiscovery: ObservableObject {
                 guard let self else { return }
                 for result in results {
                     if case let .service(name, _, _, _) = result.endpoint {
-                        self.resolve(endpoint: result.endpoint, name: name)
+                        self.resolve(
+                            endpoint: result.endpoint,
+                            name: name,
+                            deviceID: Self.deviceID(from: result, fallback: name)
+                        )
                     }
                 }
             }
@@ -52,9 +63,23 @@ final class DeviceDiscovery: ObservableObject {
         isSearching = false
     }
 
+    /// The device's own ID from its mDNS TXT record.
+    ///
+    /// Falls back to the service name for a device running firmware that predates
+    /// the `id` record. That is weaker — a renamed host looks like a new device —
+    /// but it is the only handle such a device offers, and refusing to list it
+    /// would be worse than listing it imperfectly.
+    private static func deviceID(from result: NWBrowser.Result, fallback: String) -> String {
+        guard case let .bonjour(record) = result.metadata,
+              let identifier = record["id"],
+              identifier.hasPrefix("SD-")
+        else { return fallback }
+        return identifier
+    }
+
     /// Bonjour gives a service endpoint; opening a throwaway connection to it is
     /// the supported way to learn the concrete ip:port for building a URL.
-    private func resolve(endpoint: NWEndpoint, name: String) {
+    private func resolve(endpoint: NWEndpoint, name: String, deviceID: String) {
         let connection = NWConnection(to: endpoint, using: .tcp)
         resolvers.append(connection)
         connection.stateUpdateHandler = { [weak self, weak connection] state in
@@ -73,9 +98,14 @@ final class DeviceDiscovery: ObservableObject {
             let url = "http://\(cleaned):\(port.rawValue)"
             Task { @MainActor in
                 guard let self else { return }
-                let item = Found(id: name, url: url)
-                if !self.found.contains(item) {
-                    self.found.removeAll { $0.id == name }
+                let item = Found(id: deviceID, name: name, url: url)
+                // Replace in place. Appending would move a device down the list
+                // every time it re-resolved, and re-resolution is routine —
+                // Bonjour reports the same service repeatedly, and a device with
+                // both IPv4 and IPv6 resolves twice in a row.
+                if let index = self.found.firstIndex(where: { $0.id == deviceID }) {
+                    self.found[index] = item
+                } else {
                     self.found.append(item)
                 }
                 connection?.cancel()

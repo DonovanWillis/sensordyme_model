@@ -67,14 +67,26 @@ class BLEProvisioningServer:
         device_name: str,
         device_info: dict,
         on_credentials: Callable[[str, str], None],
+        scan_networks: Optional[Callable[[], list]] = None,
         on_command: Optional[Callable[[dict], None]] = None,
     ) -> None:
         self._device_name = device_name
         self._device_info = device_info
-        # Scanned lazily, on read: a scan takes seconds and the radio is
-        # busy at boot, so doing it eagerly would delay the advertisement
-        # that lets anyone talk to the device at all.
+        # Scanning happens on a worker thread and reads answer from this cache.
+        #
+        # It used to run inside read_value(), which executes on the GLib main
+        # loop — the single thread that serves every BLE operation. One `nmcli
+        # --rescan yes` takes up to 20 seconds, and for that whole time the
+        # device could not answer a read, accept a write, or push a status
+        # notification. Opening "Choose a Network" therefore froze the entire
+        # connection, which is what made that screen slow.
+        #
+        # The radio is genuinely slow; that part cannot be fixed. What can be
+        # fixed is making everything else wait for it.
         self._scan_networks = scan_networks
+        self._networks: list = []
+        self._scanning = False
+        self._scan_lock = threading.Lock()
         self._on_credentials = on_credentials
         self._on_command = on_command
         self._status: dict = {"state": "provisioning"}
@@ -99,6 +111,41 @@ class BLEProvisioningServer:
         self._thread = threading.Thread(target=self._run, daemon=True, name="ble-gatt")
         self._running = True
         self._thread.start()
+        # Start scanning immediately rather than when the app asks. Setup takes
+        # a person several seconds of tapping to reach the network screen; using
+        # those seconds means the list is usually already there on arrival.
+        self.refresh_networks()
+
+    def refresh_networks(self) -> None:
+        """Kick off a scan on a worker thread. Returns immediately.
+
+        Concurrent calls collapse into the running scan: the app re-reading, a
+        rescan command, and the periodic refresh must not stack up several
+        nmcli invocations against one radio.
+        """
+        if self._scan_networks is None:
+            return
+        with self._scan_lock:
+            if self._scanning:
+                return
+            self._scanning = True
+        self.set_status(dict(self._status))  # surface scanning=True
+        threading.Thread(target=self._scan_worker, daemon=True, name="wifi-scan").start()
+
+    def _scan_worker(self) -> None:
+        try:
+            networks = self._scan_networks() or []
+        except Exception as exc:  # noqa: BLE001 - a failed scan is an empty list
+            log.warning("BLE: wifi scan failed: %s", exc)
+            networks = []
+        with self._scan_lock:
+            # Keep the previous list on a failed rescan. An empty screen where
+            # networks were a moment ago reads as "gone", not as "ask again".
+            if networks or not self._networks:
+                self._networks = networks
+            self._scanning = False
+        log.info("BLE: wifi scan found %d network(s)", len(networks))
+        self.set_status(dict(self._status))  # surface scanning=False
 
     def stop(self) -> None:
         self._running = False
@@ -164,7 +211,12 @@ class BLEProvisioningServer:
         chrc = self._status_chrc
         if chrc is not None:
             try:
-                chrc.push_value(json.dumps(self._status).encode())
+                # Scanning rides along with every status push so the app can say
+                # "looking for networks" instead of showing an empty list that
+                # is indistinguishable from "there are none".
+                payload = dict(self._status)
+                payload["scanning"] = self._scanning
+                chrc.push_value(json.dumps(payload).encode())
             except Exception as exc:  # noqa: BLE001
                 log.warning("BLE status notify failed: %s", exc)
 
@@ -291,19 +343,19 @@ class BLEProvisioningServer:
         class NetworksChrc(Characteristic):
             """Wi-Fi networks the DEVICE can see, so the app can offer a list.
 
-            Read on demand rather than pushed: the app asks when it opens the
-            setup screen, which is the only moment the answer matters, and a
-            scan costs seconds of radio time that would otherwise delay setup.
+            Served from a cache refreshed on a worker thread. The read itself
+            must return instantly — it runs on the BLE event loop, so any wait
+            here is a wait for every other BLE operation too.
             """
 
             def read_value(self):
-                if server._scan_networks is None:
-                    return b"[]"
-                try:
-                    networks = server._scan_networks()
-                except Exception as exc:  # noqa: BLE001 - a failed scan is an empty list
-                    log.warning("BLE: wifi scan failed: %s", exc)
-                    return b"[]"
+                # Answers from cache, always. Never scan here: this runs on the
+                # GLib main loop and blocking it stalls the whole connection.
+                with server._scan_lock:
+                    networks = list(server._networks)
+                # A read is the app saying it is on the network screen now, so
+                # this is exactly when a fresh list is worth starting.
+                server.refresh_networks()
                 payload = json.dumps(networks).encode()
                 # BLE reads are MTU-bounded and this stack does not implement
                 # long reads. Twelve networks is more than anyone picks from and
@@ -314,7 +366,9 @@ class BLEProvisioningServer:
 
         class StatusChrc(Characteristic):
             def read_value(self):
-                return json.dumps(server._status).encode()
+                payload = dict(server._status)
+                payload["scanning"] = server._scanning
+                return json.dumps(payload).encode()
 
         class CommandChrc(Characteristic):
             def write_value(self, data):

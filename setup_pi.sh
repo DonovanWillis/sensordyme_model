@@ -59,7 +59,9 @@ else
 fi
 
 echo "==> Advertising the device over mDNS (app auto-discovery: _sensordyme._tcp)"
-sudo cp deploy/avahi/sensordyme.service /etc/avahi/services/sensordyme.service
+# Generated, not copied: the record carries this board's stable device ID, which
+# is how the app knows a device found at a new IP is one it already has.
+sudo python3 scripts/publish_mdns.py /etc/avahi/services/sensordyme.service
 sudo systemctl restart avahi-daemon
 
 echo "==> Allowing the health monitor's last-resort reboot (single sudoers rule)"

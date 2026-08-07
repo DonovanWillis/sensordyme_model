@@ -50,21 +50,17 @@ struct ProvisioningView: View {
                 default:
                     EmptyView()
                 }
-                ForEach(ble.discovered, id: \.self) { name in
+                ForEach(ble.discovered) { device in
                     Button {
-                        ble.connect(name: name)
+                        ble.connect(id: device.id)
                     } label: {
                         HStack {
-                            Label(name, systemImage: "sensor.tag.radiowaves.forward")
+                            Label(device.name, systemImage: "sensor.tag.radiowaves.forward")
                             Spacer()
-                            if let rssi = ble.signalByName[name] {
-                                // -50 is very close, -90 is far. Shown because a
-                                // stale advertisement and a live device can look
-                                // identical by name alone.
-                                Text(rssi > -60 ? "Nearby" : rssi > -80 ? "In range" : "Weak")
-                                    .font(SD.Typography.caption)
-                                    .foregroundStyle(rssi > -60 ? SD.Colors.success : SD.Colors.textTertiary)
-                            }
+                            Text(device.proximity)
+                                .font(SD.Typography.caption)
+                                .foregroundStyle(device.rssi > -60
+                                                 ? SD.Colors.success : SD.Colors.textTertiary)
                         }
                     }
                 }
@@ -90,12 +86,27 @@ struct ProvisioningView: View {
             // cannot enumerate Wi-Fi networks at all, and the device's list is
             // the one that matters anyway: it is the machine that has to
             // associate, and it may sit behind a wall from the router.
-            if ble.networks.isEmpty {
+            if ble.networks.isEmpty, ble.scanningNetworks {
                 HStack {
                     ProgressView().controlSize(.small)
                     Text("Looking for networks…")
                         .font(SD.Typography.callout)
                         .foregroundStyle(SD.Colors.textSecondary)
+                }
+            } else if ble.networks.isEmpty {
+                // The device finished and found nothing. Saying "looking"
+                // forever would be a lie, and it hides the real next step:
+                // the device may be out of range of the router.
+                VStack(alignment: .leading, spacing: SD.Space.xs) {
+                    Text("No networks found")
+                        .font(SD.Typography.callout)
+                        .foregroundStyle(SD.Colors.textPrimary)
+                    Text("The device could not see any Wi-Fi from where it is. Move it closer to the router, or type the name below.")
+                        .font(SD.Typography.caption)
+                        .foregroundStyle(SD.Colors.textSecondary)
+                        .fixedSize(horizontal: false, vertical: true)
+                    Button("Search again") { ble.refreshNetworks() }
+                        .buttonStyle(SDButtonStyle(kind: .secondary, fullWidth: false))
                 }
             } else {
                 ForEach(ble.networks) { network in
