@@ -48,6 +48,31 @@ DBUS_OM_IFACE = "org.freedesktop.DBus.ObjectManager"
 DBUS_PROP_IFACE = "org.freedesktop.DBus.Properties"
 
 
+# Backstop for centrals that do not issue Read Blob requests. Long reads are the
+# real mechanism (see ReadValue), but a value that cannot survive a single-MTU
+# read at all leaves such a client with nothing, and iOS negotiates a smaller
+# MTU than macOS. Sorted strongest-first, so what fits is what matters.
+_MAX_NETWORK_PAYLOAD = 4096
+
+
+def _fit_networks(networks: list) -> bytes:
+    """Serialise as many networks as fit the payload budget, strongest first.
+
+    Trimmed by BYTES, not by count. The previous cap took the first twelve and
+    assumed that was small enough; twelve real SSIDs are about 700 bytes, so the
+    cap never engaged and the value was truncated mid-JSON by the transport —
+    which the app cannot parse at all, turning a full list into an empty one.
+    """
+    compact = []
+    for network in networks:
+        candidate = compact + [network]
+        encoded = json.dumps(candidate, separators=(",", ":")).encode()
+        if len(encoded) > _MAX_NETWORK_PAYLOAD:
+            break
+        compact = candidate
+    return json.dumps(compact, separators=(",", ":")).encode()
+
+
 class BLEUnavailable(RuntimeError):
     """BlueZ / dbus python bindings are not present on this platform."""
 
@@ -325,7 +350,16 @@ class BLEProvisioningServer:
 
             @dbus.service.method(GATT_CHRC_IFACE, in_signature="a{sv}", out_signature="ay")
             def ReadValue(self, options):
-                return dbus.Array(self.read_value(), signature="y")
+                # Honour the offset. This is how ATT transfers a value larger
+                # than one MTU: the central issues Read Blob requests for
+                # successive chunks. Ignoring it — which this did — silently
+                # truncated every oversized value at the MTU boundary, so the
+                # network list arrived as invalid JSON and the app showed no
+                # networks at all in exactly the case that matters, a flat with
+                # a dozen of them. It was worse on iOS, which negotiates a
+                # smaller MTU than macOS.
+                offset = int(options.get("offset", 0))
+                return dbus.Array(self.read_value(offset)[offset:], signature="y")
 
             @dbus.service.method(GATT_CHRC_IFACE, in_signature="aya{sv}")
             def WriteValue(self, value, options):
@@ -373,7 +407,7 @@ class BLEProvisioningServer:
                 return self.properties().get(interface, {})
 
         class DeviceInfoChrc(Characteristic):
-            def read_value(self):
+            def read_value(self, offset=0):
                 return json.dumps(server._device_info).encode()
 
         class WifiCredsChrc(Characteristic):
@@ -396,24 +430,20 @@ class BLEProvisioningServer:
             here is a wait for every other BLE operation too.
             """
 
-            def read_value(self):
+            def read_value(self, offset=0):
                 # Answers from cache, always. Never scan here: this runs on the
                 # GLib main loop and blocking it stalls the whole connection.
                 with server._scan_lock:
                     networks = list(server._networks)
-                # A read is the app saying it is on the network screen now, so
-                # this is exactly when a fresh list is worth starting.
-                server.refresh_networks()
-                payload = json.dumps(networks).encode()
-                # BLE reads are MTU-bounded and this stack does not implement
-                # long reads. Twelve networks is more than anyone picks from and
-                # stays comfortably inside a default MTU.
-                if len(payload) > 480:
-                    payload = json.dumps(networks[:12]).encode()
-                return payload
+                if offset == 0:
+                    # A read from the start is the app arriving on the network
+                    # screen, which is exactly when a fresh list is worth
+                    # starting. Later chunks of the same read must not restart it.
+                    server.refresh_networks()
+                return _fit_networks(networks)
 
         class StatusChrc(Characteristic):
-            def read_value(self):
+            def read_value(self, offset=0):
                 payload = dict(server._status)
                 payload["scanning"] = server._scanning
                 return json.dumps(payload).encode()

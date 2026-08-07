@@ -32,6 +32,11 @@ class FakeWifi:
         self.online = True  # credentials "work"
         return True, f"joined '{ssid}'"
 
+    def provision(self, ssid, psk):
+        # Mirrors WifiManager.provision: the safe path the service now uses,
+        # which saves and validates the new network before releasing the old.
+        return self.connect(ssid, psk)
+
 
 class FakeBLEServer:
     instances = []
@@ -61,7 +66,8 @@ class FakeBLEServer:
         self.refreshed = getattr(self, "refreshed", 0) + 1
 
 
-def _make_service(monkeypatch, wifi, grace_s=0.05, poll_s=0.02, reconfigure_window_s=0.0):
+def _make_service(monkeypatch, wifi, grace_s=0.05, poll_s=0.02, reconfigure_window_s=0.0,
+                  always_available=False):
     # Pretend we're on a Pi and swap the real GATT server for the fake.
     monkeypatch.setattr(provisioning_module, "nmcli_available", lambda: True)
     import services.ble_gatt as ble_gatt
@@ -73,6 +79,9 @@ def _make_service(monkeypatch, wifi, grace_s=0.05, poll_s=0.02, reconfigure_wind
         "grace_s": grace_s,
         "poll_s": poll_s,
         "reconfigure_window_s": reconfigure_window_s,
+        # Off by default here so the window tests below still exercise the
+        # window. Production defaults to always-on; that is covered explicitly.
+        "always_available": always_available,
     })
 
 
@@ -168,8 +177,15 @@ def test_credentials_connect_save_and_close_the_window(monkeypatch):
         ble = FakeBLEServer.instances[0]
 
         ble.on_credentials("HomeNet", "secret")  # the app writes credentials
+        # The write returns immediately and joins on a worker, so waiting for
+        # that worker is the difference between testing the behaviour and
+        # testing how fast this machine happens to be.
+        service._connect_thread.join(timeout=3)
         assert wifi.connect_calls == [("HomeNet", "secret")]
-        assert any(s.get("state") == "online" for s in ble.statuses)  # success notified
+        # The outcome of the write, not the connectivity field — those are
+        # deliberately separate now, because the periodic connectivity push used
+        # to overwrite the result and turn a failure into an apparent success.
+        assert any((s.get("provision") or {}).get("state") == "ok" for s in ble.statuses)
 
         deadline = time.monotonic() + 2  # watcher loop notices online and closes BLE
         while time.monotonic() < deadline and ble.running:
@@ -212,7 +228,7 @@ def test_joining_wifi_does_not_block_the_ble_event_loop(monkeypatch):
         def is_online(self):
             return False
 
-        def connect(self, ssid, password):
+        def provision(self, ssid, password):
             started.set()
             release.wait(timeout=5)
             return True, "joined"
@@ -229,7 +245,7 @@ def test_joining_wifi_does_not_block_the_ble_event_loop(monkeypatch):
     assert started.wait(timeout=2), "the join never started"
 
     # And "connecting" must already be visible to the phone.
-    assert service._ble.statuses[-1].get("state") == "connecting"
+    assert (service._ble.statuses[-1].get("provision") or {}).get("state") == "connecting"
 
     release.set()
 
@@ -249,7 +265,7 @@ def test_a_second_credential_write_while_joining_is_ignored(monkeypatch):
         def is_online(self):
             return False
 
-        def connect(self, ssid, password):
+        def provision(self, ssid, password):
             calls.append(ssid)
             release.wait(timeout=5)
             return True, "joined"
@@ -284,3 +300,68 @@ def test_stopping_wakes_the_loop_rather_than_waiting_out_the_interval(monkeypatc
     began = time.monotonic()
     service.stop(timeout=5)
     assert time.monotonic() - began < 3, "stop() waited out the poll interval"
+
+
+def test_bluetooth_stays_reachable_on_a_device_that_has_been_running_for_days(monkeypatch):
+    """The production default, and the thing the boot window made impossible.
+
+    A device sitting on a shelf working for a week is exactly the one someone
+    wants to move to a new house — and a window that closed six days ago leaves
+    breaking its Wi-Fi as the only way in. What makes staying open safe is
+    authentication (core/pairing.py), not brevity.
+    """
+    wifi = FakeWifi(online=True)
+    service = _make_service(monkeypatch, wifi, reconfigure_window_s=0.01,
+                            always_available=True)
+    _run_briefly(service, 0.3)  # far past the window
+    assert len(FakeBLEServer.instances) == 1
+    assert FakeBLEServer.instances[0].running, "Bluetooth closed on a healthy device"
+    assert service.state == "reconfigurable"
+
+
+def test_a_successful_setup_does_not_close_an_always_available_window(monkeypatch):
+    """Provisioning once must not lock out the next move."""
+    wifi = FakeWifi(online=False)
+    service = _make_service(monkeypatch, wifi, always_available=True)
+    stop = threading.Event()
+    thread = threading.Thread(target=service.run, args=(stop,))
+    thread.start()
+    try:
+        deadline = time.monotonic() + 2
+        while time.monotonic() < deadline and not FakeBLEServer.instances:
+            time.sleep(0.01)
+        ble = FakeBLEServer.instances[0]
+        ble.on_credentials("HomeNet", "secret")
+        time.sleep(0.2)
+        assert ble.running, "window closed after setup; the device can never be moved again"
+    finally:
+        stop.set()
+        thread.join(timeout=2)
+
+
+def test_a_failed_setup_is_not_overwritten_by_the_next_connectivity_push(monkeypatch):
+    """The bug this separation exists for.
+
+    The device stays on its old network when a new one is refused — so the very
+    next connectivity push says "online". When that shared one field, it landed
+    on top of the failure a second later and the app read it as the new network
+    having worked. A refused password showed as a successful setup.
+    """
+    class RefusingWifi(FakeWifi):
+        def provision(self, ssid, psk):
+            return False, "That password was not accepted by 'HomeWiFi'."
+
+    wifi = RefusingWifi(online=True)  # still on the old network throughout
+    service = _make_service(monkeypatch, wifi, always_available=True)
+    service._ble = FakeBLEServer("x", {}, lambda *a: None)
+
+    service._on_credentials("HomeWiFi", "wrong")
+    service._connect_thread.join(timeout=3)
+
+    # Let the run loop push connectivity on top.
+    _run_briefly(service, 0.15)
+
+    provisions = [s.get("provision") for s in service._ble.statuses if s.get("provision")]
+    assert provisions, "no provisioning outcome was ever reported"
+    assert provisions[-1]["state"] == "error", provisions[-1]
+    assert "password" in provisions[-1]["error"].lower()

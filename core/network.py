@@ -38,12 +38,18 @@ def explain_connect_failure(raw: str, ssid: str) -> str:
     explanation ("wrong password" when the router was simply off) sends someone
     to fix a thing that was never broken.
     """
+    # nmcli appends a "Hint: use 'journalctl -xe NM_CONNECTION=<uuid>…'" line.
+    # Useful to an engineer with a terminal; noise to someone holding a phone,
+    # and it drowns the one sentence that matters.
+    raw = raw.split("Hint:", 1)[0].strip()
+
     lowered = raw.lower()
     if "secrets were required" in lowered or "no secrets" in lowered:
         return f"That password was not accepted by '{ssid}'. Check it and try again."
     if "property is invalid" in lowered or "invalid" in lowered and "key" in lowered:
         return "That password is not a valid Wi-Fi key — most are at least 8 characters."
-    if "no network with ssid" in lowered or "not found" in lowered:
+    if ("no network with ssid" in lowered or "not found" in lowered
+            or "could not be found" in lowered or "network not found" in lowered):
         return (
             f"The device cannot see '{ssid}' from where it is. Move it closer to "
             f"the router, or check the network is on."
@@ -259,6 +265,108 @@ class WifiManager:
         thread = threading.Thread(target=pump, daemon=True, name="nm-monitor")
         thread.start()
         return thread
+
+    def active_profile(self) -> Optional[str]:
+        """The NetworkManager profile currently carrying the Wi-Fi connection."""
+        if not nmcli_available():
+            return None
+        try:
+            result = _run(["-t", "-f", "NAME,TYPE,DEVICE", "connection", "show", "--active"])
+        except Exception:  # noqa: BLE001
+            return None
+        for line in result.stdout.splitlines():
+            parts = line.split(":")
+            if len(parts) >= 2 and parts[1] == "802-11-wireless":
+                return parts[0]
+        return None
+
+    def provision(self, ssid: str, password: str) -> tuple[bool, str]:
+        """Move the device to `ssid`, keeping the current network until it works.
+
+        `connect()` uses `nmcli device wifi connect`, which associates
+        immediately — it gives up the working network before knowing whether the
+        new one will accept it. That is the wrong order for a device someone has
+        just carried into a new building: a mistyped password leaves it on
+        nothing, out of Bluetooth range, with no way back.
+
+        Here the profile is created and validated first, and the working
+        connection is only released to activate it. If activation fails the new
+        profile is deleted and the previous one brought back, so a failed attempt
+        costs a few seconds of downtime rather than the device.
+        """
+        if not ssid:
+            return False, "network name required"
+        if not nmcli_available():
+            return True, f"dry-run (no nmcli on this platform): would join '{ssid}'"
+
+        previous = self.active_profile()
+        existed = ssid in self.saved_networks()
+
+        try:
+            if not existed:
+                args = [
+                    "connection", "add", "type", "wifi", "con-name", ssid,
+                    "ifname", "wlan0", "ssid", ssid,
+                    "connection.autoconnect", "yes",
+                ]
+                if password:
+                    args += ["wifi-sec.key-mgmt", "wpa-psk", "wifi-sec.psk", password]
+                result = _run(args)
+                if result.returncode != 0:
+                    reason = result.stderr.strip() or "could not save that network"
+                    log.warning("could not create profile for '%s': %s", ssid, reason)
+                    return False, explain_connect_failure(reason, ssid)
+            elif password:
+                # Known network, new password: update in place rather than
+                # creating a duplicate profile for the same SSID.
+                _run(["connection", "modify", ssid,
+                      "wifi-sec.key-mgmt", "wpa-psk", "wifi-sec.psk", password])
+
+            # Only now is the working connection at risk.
+            result = _run(["connection", "up", ssid], timeout=_CONNECT_TIMEOUT_S)
+            if result.returncode == 0 and self._settled_on(ssid):
+                log.info("switched to wifi '%s'", ssid)
+                self._prefer(ssid)
+                return True, f"joined '{ssid}'"
+
+            reason = result.stderr.strip() or "the network did not accept the connection"
+            log.warning("switch to '%s' failed: %s", ssid, reason)
+        except subprocess.TimeoutExpired:
+            reason = "timed out"
+        except Exception as exc:  # noqa: BLE001
+            reason = str(exc)
+
+        self._roll_back(ssid, created=not existed, previous=previous)
+        return False, explain_connect_failure(reason, ssid)
+
+    def _settled_on(self, ssid: str) -> bool:
+        """Whether the device is really on `ssid` with an address.
+
+        `nmcli connection up` returning 0 means activation began, not that the
+        network works. Reporting success on that alone is how a device ends up
+        "connected" to something that never gave it an address.
+        """
+        import time
+
+        deadline = time.monotonic() + 20
+        while time.monotonic() < deadline:
+            if self.current_ssid() == ssid and self.ip_address() and self.is_online():
+                return True
+            time.sleep(0.5)
+        return False
+
+    def _roll_back(self, ssid: str, created: bool, previous: Optional[str]) -> None:
+        """Undo a failed switch and get the device back on something."""
+        try:
+            if created:
+                # Leaving it saved means NetworkManager retries a network that
+                # rejected us on every future boot.
+                _run(["connection", "delete", ssid])
+            if previous and previous != ssid:
+                log.info("switch failed — returning to '%s'", previous)
+                _run(["connection", "up", previous], timeout=_CONNECT_TIMEOUT_S)
+        except Exception as exc:  # noqa: BLE001 - recovery must never raise
+            log.error("could not restore the previous network: %s", exc)
 
     def _prefer(self, ssid: str) -> None:
         """Make `ssid` the network this device reaches for first on future boots.

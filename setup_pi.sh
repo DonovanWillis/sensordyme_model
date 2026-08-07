@@ -64,6 +64,15 @@ echo "==> Advertising the device over mDNS (app auto-discovery: _sensordyme._tcp
 sudo python3 scripts/publish_mdns.py /etc/avahi/services/sensordyme.service
 sudo systemctl restart avahi-daemon
 
+echo "==> Allowing the device to manage its own Wi-Fi (polkit)"
+# Without this the service runs as `pi` under systemd with no login session, so
+# polkit refuses settings.modify.system and saving a Wi-Fi profile fails with
+# "Insufficient privileges" — the device accepts credentials over Bluetooth and
+# then cannot act on them.
+sudo install -m 0644 deploy/polkit/10-sensordyme-network.rules \
+  /etc/polkit-1/rules.d/10-sensordyme-network.rules
+sudo systemctl restart polkit
+
 echo "==> Allowing the health monitor's last-resort reboot (single sudoers rule)"
 sudo install -m 0440 deploy/sudoers/sensordyme-reboot /etc/sudoers.d/sensordyme-reboot
 

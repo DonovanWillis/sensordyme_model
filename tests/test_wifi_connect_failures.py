@@ -139,3 +139,24 @@ def test_failing_to_set_priority_does_not_fail_the_join(monkeypatch):
     monkeypatch.setattr(network, "_run", run)
     ok, _ = WifiManager().connect("NewNet", "pw")
     assert ok is True
+
+
+def test_the_journalctl_hint_is_stripped():
+    """nmcli appends "Hint: use 'journalctl -xe NM_CONNECTION=<uuid>...'". Useful
+    to an engineer at a terminal; noise to someone holding a phone, and it
+    drowns the one sentence that matters."""
+    raw = ("Error: Connection activation failed: The Wi-Fi network could not be found\\n"
+           "Hint: use 'journalctl -xe NM_CONNECTION=b8f5c1c1 + NM_DEVICE=wlan0' to get more details.")
+    message = explain_connect_failure(raw, "Upstairs")
+    assert "journalctl" not in message
+    assert "NM_CONNECTION" not in message
+
+
+def test_nm_activation_wording_for_a_missing_network_is_recognised():
+    """Observed verbatim on a Pi 5. The earlier patterns matched "not found" but
+    not "could not be found", so this fell through to the raw text."""
+    message = explain_connect_failure(
+        "Error: Connection activation failed: The Wi-Fi network could not be found", "Upstairs")
+    assert "Upstairs" in message
+    assert "closer" in message.lower() or "cannot see" in message.lower()
+    assert "activation failed" not in message.lower()

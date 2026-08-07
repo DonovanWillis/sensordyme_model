@@ -1,0 +1,27 @@
+// Let SensorDyme manage its own Wi-Fi.
+//
+// The service runs as `pi` under systemd, which means no login session, which
+// means polkit treats it as an inactive subject and refuses
+// org.freedesktop.NetworkManager.settings.modify.system. Saving a Wi-Fi profile
+// then fails with "Insufficient privileges" — so a device could be handed
+// credentials over Bluetooth and simply not be allowed to act on them.
+//
+// This is deliberately narrower than the alternatives. Granting `pi` blanket
+// sudo for nmcli would hand the service the power to run any nmcli subcommand
+// as root; enumerating the actions this product genuinely performs keeps the
+// grant to what it is for: joining, saving and listing networks.
+//
+// Installed by setup_pi.sh to /etc/polkit-1/rules.d/.
+polkit.addRule(function (action, subject) {
+    var allowed = [
+        "org.freedesktop.NetworkManager.settings.modify.system",
+        "org.freedesktop.NetworkManager.settings.modify.own",
+        "org.freedesktop.NetworkManager.network-control",
+        "org.freedesktop.NetworkManager.wifi.scan",
+        "org.freedesktop.NetworkManager.enable-disable-wifi",
+        "org.freedesktop.NetworkManager.enable-disable-network"
+    ];
+    if (allowed.indexOf(action.id) !== -1 && subject.isInGroup("netdev")) {
+        return polkit.Result.YES;
+    }
+});

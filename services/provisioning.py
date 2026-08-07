@@ -64,13 +64,19 @@ class ProvisioningService:
         self._method = str(config.get("method", "ble"))
         self._grace_s = float(config.get("grace_s", 0))
         self._poll_s = float(config.get("poll_s", 10))
-        # How long after boot Bluetooth stays open even when Wi-Fi is working.
+        # Whether Bluetooth setup is reachable whenever the device is running.
         #
-        # Without this, moving a device to a new network requires first making it
-        # fail: the setup window only existed while offline, so a working device
-        # could not be reconfigured at all. The consumer answer is that a device
-        # you just switched on is always reachable for a few minutes — long
-        # enough to re-point it, short enough that it is not permanently open.
+        # It first shipped as a few-minute window after boot, on the theory that
+        # a shorter exposure is safer. In practice that made the product's
+        # central promise impossible: a device that has been sitting on a shelf
+        # working for a week is exactly the one you want to move to a new house,
+        # and its window closed six days ago. The only way to reconfigure it was
+        # to break its Wi-Fi first — which is the problem, not the solution.
+        #
+        # So it stays open, and what makes that safe is authentication rather
+        # than brevity: see core/pairing.py. A window that is merely short is
+        # not security, it is a smaller target.
+        self._always_available = bool(config.get("always_available", True))
         self._reconfigure_window_s = float(config.get("reconfigure_window_s", 300))
         self._version = version
         self._ble = None  # BLEProvisioningServer, created lazily
@@ -83,6 +89,15 @@ class ProvisioningService:
         # yet; once it has been pointed at a network on purpose, leaving the
         # window open is exposure with no remaining purpose.
         self._provisioned_this_session = False
+        # The outcome of the most recent credential write, reported separately
+        # from connectivity.
+        #
+        # These were one field, and the periodic connectivity push overwrote the
+        # provisioning result about a second after it was set — so a device that
+        # had just REFUSED a network reported "online" (on the old one), and the
+        # app read that as the new network succeeding. A failed setup showed as
+        # a successful one, which is the worst way for this to be wrong.
+        self._provision: Optional[dict] = None
         self.state = "starting"  # starting | online | waiting | provisioning | unavailable
 
     # ------------------------------------------------------------------ Service lifecycle
@@ -141,10 +156,13 @@ class ProvisioningService:
                 # This is what makes "I moved it to a new house" possible: the
                 # window used to exist only while offline, so reconfiguring a
                 # working device meant first breaking it.
-                reconfigurable = (
-                    (now - started_at) < self._reconfigure_window_s
-                    and not self._provisioned_this_session
-                )
+                if self._always_available:
+                    reconfigurable = True
+                else:
+                    reconfigurable = (
+                        (now - started_at) < self._reconfigure_window_s
+                        and not self._provisioned_this_session
+                    )
                 if reconfigurable:
                     self.state = "reconfigurable"
                     if self._ble is None and not self._ble_unavailable:
@@ -207,6 +225,10 @@ class ProvisioningService:
             "ip": self._wifi.ip_address() if online else None,
             "device_id": device_id(),
             "reconfigurable": self.state == "reconfigurable",
+            # Never merged into `state`: "which network am I on" and "did the
+            # thing you just asked for work" are different questions, and the
+            # answer to the first must not be mistaken for the second.
+            "provision": self._provision,
         }
 
     def status(self) -> tuple[bool, str]:
@@ -280,7 +302,8 @@ class ProvisioningService:
             log.info("BLE: ignoring credentials for '%s' — a join is already running", ssid)
             return
 
-        self._push_status({"state": "connecting", "ssid": ssid})
+        self._provision = {"state": "connecting", "ssid": ssid}
+        self._push_status(self._describe())
         self._connect_thread = threading.Thread(
             target=self._join_network, args=(ssid, psk),
             daemon=True, name="wifi-join",
@@ -290,20 +313,25 @@ class ProvisioningService:
     def _join_network(self, ssid: str, psk: str) -> None:
         """Join `ssid` off the event loop, reporting the outcome over BLE."""
         try:
-            ok, message = self._wifi.connect(ssid, psk)  # nmcli saves the profile on success
+            # provision(), not connect(): the device may already be on a working
+            # network that someone is standing a long way from. The new profile
+            # is saved and validated before that connection is given up, and
+            # restored if the new network refuses us.
+            ok, message = self._wifi.provision(ssid, psk)
         except Exception as exc:  # noqa: BLE001 - the window must survive a failed join
             log.error("wifi join failed: %s", exc)
-            self._push_status({"state": "error", "ssid": ssid, "error": str(exc)})
+            self._provision = {"state": "error", "ssid": ssid, "error": str(exc)}
+            self._push_status(self._describe())
             return
 
         if ok:
             self._provisioned_this_session = True
-            self._push_status(
-                {"state": "online", "ssid": ssid, "ip": self._wifi.ip_address(), "message": message}
-            )
-            # The run() loop sees is_online() and closes the BLE window.
+            self._provision = {
+                "state": "ok", "ssid": ssid, "ip": self._wifi.ip_address(), "message": message,
+            }
         else:
-            self._push_status({"state": "error", "ssid": ssid, "error": message})
+            self._provision = {"state": "error", "ssid": ssid, "error": message}
+        self._push_status(self._describe())
 
     def _on_command(self, command: dict) -> None:
         """Handle an app command. Runs on the BLE event loop — never block here.
