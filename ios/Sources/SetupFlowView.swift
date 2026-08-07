@@ -206,6 +206,16 @@ struct SetupFlowView: View {
                             ProgressView().controlSize(.small)
                             Text("Scanning…").foregroundStyle(SD.Colors.textSecondary)
                         }
+                    } else if let problem = flow.ble.networkProblem {
+                        // Not the same as "the device saw nothing". The app
+                        // never managed to ask — which looks identical on
+                        // screen and has a completely different fix.
+                        Label(problem, systemImage: "exclamationmark.triangle.fill")
+                            .font(SD.Typography.callout)
+                            .foregroundStyle(SD.Colors.warning)
+                            .fixedSize(horizontal: false, vertical: true)
+                        Button("Try again") { flow.ble.refreshNetworks() }
+                            .buttonStyle(SDButtonStyle(kind: .secondary, fullWidth: false))
                     } else if flow.ble.networks.isEmpty {
                         // The device looked and found nothing. Saying "scanning"
                         // forever would be a lie and hides the real next step.

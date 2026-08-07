@@ -10,7 +10,7 @@ networks in range.
 
 import json
 
-from services.ble_gatt import _fit_networks
+from services.ble_gatt import _GATT_MAX_ATTRIBUTE_BYTES, _fit_networks
 
 
 def networks(count, prefix="Brightspeed_ABCDEF"):
@@ -38,7 +38,40 @@ def test_trimming_is_by_bytes_not_by_count():
                   for i in range(40)]
     payload = _fit_networks(long_names)
     json.loads(payload)
-    assert len(payload) <= 4096
+    assert len(payload) <= _GATT_MAX_ATTRIBUTE_BYTES
+
+
+def test_the_payload_never_exceeds_what_gatt_can_carry():
+    """512 octets is the ceiling in the GATT specification, not a tuning knob.
+    BlueZ truncates there with no error, so anything larger reaches the app as
+    JSON cut mid-string — which it cannot parse, so it shows NO networks. That
+    reads as "this device can't see any Wi-Fi" while the device sees twelve.
+
+    Observed on hardware: a read returned exactly 512 bytes ending mid-SSID.
+    """
+    for count in (1, 5, 12, 40, 200):
+        payload = _fit_networks(networks(count))
+        assert len(payload) <= _GATT_MAX_ATTRIBUTE_BYTES, f"{count} networks -> {len(payload)} bytes"
+        json.loads(payload)  # raises if truncated
+
+
+def test_a_realistic_neighbourhood_still_yields_a_usable_list():
+    """The real scan from the test flat: twelve networks, ordinary SSID lengths.
+    Trimming to fit must not leave so few that the list is useless."""
+    real = [
+        {"ssid": "MyAltice 54be1b", "signal": 94, "secured": True},
+        {"ssid": "ATTBcBKJJA", "signal": 79, "secured": True},
+        {"ssid": "Brightspeed_0112F425", "signal": 57, "secured": True},
+        {"ssid": "LEWIS", "signal": 57, "secured": True},
+        {"ssid": "Brightspeed_01879288", "signal": 55, "secured": True},
+        {"ssid": "Samsung Fridge_E50AJTRE004E", "signal": 54, "secured": True},
+        {"ssid": "Brightspeed_010CBF10", "signal": 49, "secured": True},
+        {"ssid": "MyOptimum d9127f", "signal": 39, "secured": True},
+        {"ssid": "MyAltice 35a84d", "signal": 22, "secured": True},
+    ]
+    parsed = json.loads(_fit_networks(real))
+    assert len(parsed) >= 5, f"only {len(parsed)} networks survived the cap"
+    assert parsed[0]["ssid"] == "MyAltice 54be1b", "the strongest network must survive"
 
 
 def test_a_short_list_is_untouched():

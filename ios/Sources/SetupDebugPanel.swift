@@ -46,6 +46,8 @@ struct SetupDebugPanel: View {
                     row("Setup phase", phaseLabel)
                     row("Wi-Fi scan", ble.scanningNetworks ? "running on device" : "idle")
                     row("Networks received", "\(ble.networks.count)")
+                    row("Networks characteristic",
+                        ble.networkProblem == nil ? "available" : "MISSING")
                     if let failure = lastError {
                         row("Last error", failure)
                     }

@@ -48,11 +48,19 @@ DBUS_OM_IFACE = "org.freedesktop.DBus.ObjectManager"
 DBUS_PROP_IFACE = "org.freedesktop.DBus.Properties"
 
 
-# Backstop for centrals that do not issue Read Blob requests. Long reads are the
-# real mechanism (see ReadValue), but a value that cannot survive a single-MTU
-# read at all leaves such a client with nothing, and iOS negotiates a smaller
-# MTU than macOS. Sorted strongest-first, so what fits is what matters.
-_MAX_NETWORK_PAYLOAD = 4096
+# A GATT attribute value is at most 512 octets. Not a tuning knob — it is the
+# ceiling in the specification, and BlueZ truncates at exactly 512 with no error.
+#
+# The previous value was 4096, chosen as "generously large", which meant the cap
+# never engaged: the payload sailed past 512, the transport cut it mid-string,
+# and the app received unparseable JSON and showed no networks. It read as "this
+# device cannot see any Wi-Fi" — the opposite of the truth, since the device
+# could see twelve.
+#
+# Long reads (see ReadValue's offset handling) are what get us up to 512 rather
+# than one MTU. They cannot get us past it.
+_GATT_MAX_ATTRIBUTE_BYTES = 512
+_MAX_NETWORK_PAYLOAD = 480  # headroom under the ceiling
 
 
 def _fit_networks(networks: list) -> bytes:

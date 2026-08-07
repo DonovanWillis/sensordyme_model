@@ -86,6 +86,12 @@ final class BLEProvisioner: NSObject, ObservableObject {
     /// are none" — and the screen has to guess. It used to guess "still
     /// looking", so a device that found nothing showed a spinner forever.
     @Published private(set) var scanningNetworks = false
+    /// Why the network list is unavailable, when it is.
+    ///
+    /// Distinguishes "the device looked and saw nothing" from "the app never
+    /// managed to ask" — which look identical on screen and have completely
+    /// different fixes.
+    @Published private(set) var networkProblem: String?
     /// The state the flow was in when it failed.
     ///
     /// "Setup failed" is nearly useless on its own: failing to find the device
@@ -150,8 +156,22 @@ final class BLEProvisioner: NSObject, ObservableObject {
         state = .failed(reason)
     }
 
+    /// Ask the device for its Wi-Fi list.
+    ///
+    /// Reports when it cannot rather than returning quietly. The quiet version
+    /// of this guard is how a missing characteristic turned into a permanently
+    /// empty network list and a button that did nothing: every layer behaved
+    /// exactly as written, and none of them said so.
     func refreshNetworks() {
-        guard let peripheral, let characteristic = networksCharacteristic else { return }
+        guard let peripheral else {
+            networkProblem = "Not connected to your SensorDyme."
+            return
+        }
+        guard let characteristic = networksCharacteristic else {
+            networkProblem = "This SensorDyme didn't offer a Wi-Fi list. It may need a software update."
+            return
+        }
+        networkProblem = nil
         peripheral.readValue(for: characteristic)
     }
 
@@ -297,9 +317,19 @@ extension BLEProvisioner: CBCentralManagerDelegate, CBPeripheralDelegate {
                 self.fail("device is missing the provisioning service")
                 return
             }
-            peripheral.discoverCharacteristics(
-                [bleWifiCredsUUID, bleStatusUUID, bleDeviceInfoUUID], for: service
-            )
+            // Discover everything the service offers, rather than a list kept
+            // by hand.
+            //
+            // That list omitted the networks characteristic. CoreBluetooth only
+            // delivers what you ask for, so it was never discovered, the
+            // property stayed nil, and refreshNetworks() hit its guard and did
+            // nothing — for ever, without a word. The device saw twelve
+            // networks and the app showed none and a dead "Search again".
+            //
+            // A filter here has to be kept in step with services/ble_gatt.py by
+            // memory, and the penalty for forgetting is invisible. Passing nil
+            // costs one extra round trip and removes the whole failure mode.
+            peripheral.discoverCharacteristics(nil, for: service)
         }
     }
 
