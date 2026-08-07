@@ -16,6 +16,7 @@ import SwiftUI
 @MainActor
 final class SetupFlow: ObservableObject {
     enum Phase: Equatable {
+        case bluetoothUnavailable
         case findingDevice
         case connecting(name: String)
         case choosingNetwork
@@ -36,6 +37,7 @@ final class SetupFlow: ObservableObject {
 
     private var observers: [AnyCancellable] = []
     private var rediscoverTask: Task<Void, Never>?
+    private var searchClock: Task<Void, Never>?
 
     /// How long to keep looking for the device on its new network.
     ///
@@ -54,11 +56,14 @@ final class SetupFlow: ObservableObject {
         link.start()
         ble.startScan()
         observeBLE()
+        startSearchClock()
     }
 
     func stop() {
         rediscoverTask?.cancel()
         rediscoverTask = nil
+        searchClock?.cancel()
+        searchClock = nil
         ble.stop()
     }
 
@@ -76,8 +81,10 @@ final class SetupFlow: ObservableObject {
     /// Start over from discovery, keeping nothing.
     func retry() {
         rediscoverTask?.cancel()
+        rediscoverTask = nil
         ble.startScan()
         phase = .findingDevice
+        startSearchClock()
     }
 
     // MARK: Bridging the two radios
@@ -87,13 +94,36 @@ final class SetupFlow: ObservableObject {
         // duplicating it. The one thing added here is what happens *after*
         // success, which Bluetooth has no opinion about.
         observers.append(ble.objectWillChange.sink { [weak self] in
-            Task { @MainActor in self?.absorbBLEState() }
+            guard let self else { return }
+            // Forward the change on. SwiftUI does NOT propagate through nested
+            // ObservableObjects: the view observes this flow, so a change to
+            // `ble.discovered` reaches nobody unless it is republished here.
+            //
+            // Without this line the app found the device every time and simply
+            // never redrew — it sat on "Searching for SensorDyme" forever with
+            // the device sitting in `ble.discovered` the whole time. The status
+            // quo was invisible rather than broken, which is why it survived a
+            // clean build and a passing test suite.
+            self.objectWillChange.send()
+            Task { @MainActor in self.absorbBLEState() }
+        })
+        observers.append(link.objectWillChange.sink { [weak self] in
+            self?.objectWillChange.send()
         })
     }
 
     private func absorbBLEState() {
         switch ble.state {
-        case .idle, .scanning, .bluetoothOff:
+        case .bluetoothOff:
+            // Its own phase, not "searching".
+            //
+            // Denied permission and a switched-off radio both produce exactly
+            // the symptom of a device that is not there, and the app used to
+            // show the same endless "Looking for your SensorDyme" for all
+            // three. Two of those are fixed in Settings in five seconds, but
+            // only if the app says so.
+            if isBeforeSending { phase = .bluetoothUnavailable }
+        case .idle, .scanning:
             if case .findingDevice = phase {} else if isBeforeSending { phase = .findingDevice }
         case .connecting(let name):
             phase = .connecting(name: name)
@@ -116,8 +146,26 @@ final class SetupFlow: ObservableObject {
 
     private var isBeforeSending: Bool {
         switch phase {
-        case .findingDevice, .connecting, .choosingNetwork: true
+        case .bluetoothUnavailable, .findingDevice, .connecting, .choosingNetwork: true
         default: false
+        }
+    }
+
+    /// How long discovery has been running, so the UI can offer help rather
+    /// than spin indefinitely. A spinner that never changes tells someone
+    /// nothing about whether to keep waiting or go and check something.
+    @Published private(set) var searchingSeconds = 0
+
+    private func startSearchClock() {
+        searchClock?.cancel()
+        searchingSeconds = 0
+        searchClock = Task { [weak self] in
+            while !Task.isCancelled {
+                try? await Task.sleep(for: .seconds(1))
+                guard let self else { return }
+                guard case .findingDevice = phase else { continue }
+                searchingSeconds += 1
+            }
         }
     }
 

@@ -21,6 +21,7 @@ struct SetupFlowView: View {
                 VStack(alignment: .leading, spacing: SD.Space.md) {
                     header
                     content
+                    SetupDebugPanel(flow: flow, ble: flow.ble)
                 }
                 .padding(.horizontal, SD.Space.md)
                 .padding(.vertical, SD.Space.md)
@@ -43,6 +44,11 @@ struct SetupFlowView: View {
 
     @ViewBuilder private var header: some View {
         switch flow.phase {
+        case .bluetoothUnavailable:
+            headline("Bluetooth is off",
+                     "SensorDyme sets up your device's Wi-Fi over Bluetooth. Turn it on in Settings, and allow SensorDyme to use it.")
+        case .findingDevice where !flow.ble.discovered.isEmpty:
+            headline("SensorDyme found", "Tap Connect to set up its Wi-Fi.")
         case .findingDevice:
             headline("Looking for your SensorDyme",
                      "Stand within a few metres of it. Bluetooth doesn't reach much further.")
@@ -81,6 +87,25 @@ struct SetupFlowView: View {
 
     @ViewBuilder private var content: some View {
         switch flow.phase {
+        case .bluetoothUnavailable:
+            SDCard {
+                VStack(alignment: .leading, spacing: SD.Space.sm) {
+                    Label("Control Centre → Bluetooth, or Settings → Bluetooth",
+                          systemImage: "1.circle")
+                        .font(SD.Typography.callout)
+                        .foregroundStyle(SD.Colors.textPrimary)
+                    Label("Settings → SensorDyme → allow Bluetooth",
+                          systemImage: "2.circle")
+                        .font(SD.Typography.callout)
+                        .foregroundStyle(SD.Colors.textPrimary)
+                    Button("Open Settings") {
+                        if let url = URL(string: UIApplication.openSettingsURLString) {
+                            UIApplication.shared.open(url)
+                        }
+                    }
+                    .buttonStyle(SDButtonStyle(kind: .primary))
+                }
+            }
         case .findingDevice:
             deviceList
         case .connecting:
@@ -112,6 +137,37 @@ struct SetupFlowView: View {
                         .font(SD.Typography.caption)
                         .foregroundStyle(SD.Colors.textTertiary)
                         .fixedSize(horizontal: false, vertical: true)
+                    if flow.searchingSeconds > 20 {
+                        Divider().overlay(SD.Colors.border)
+                        Text("Still nothing after \(flow.searchingSeconds)s")
+                            .font(SD.Typography.label)
+                            .foregroundStyle(SD.Colors.warning)
+                        Text("Check the device is powered on and you are within a few metres of it. If it is already on your Wi-Fi and working, it stays reachable over Bluetooth too — so this should still find it.")
+                            .font(SD.Typography.caption)
+                            .foregroundStyle(SD.Colors.textSecondary)
+                            .fixedSize(horizontal: false, vertical: true)
+                        Button("Search again") { flow.retry() }
+                            .buttonStyle(SDButtonStyle(kind: .secondary, fullWidth: false))
+                    }
+                } else if flow.ble.discovered.count == 1, let device = flow.ble.discovered.first {
+                    // The overwhelmingly common case. A single row that happens
+                    // to be tappable asks someone to work out that it is a
+                    // button; a labelled button does not.
+                    HStack(spacing: SD.Space.sm) {
+                        Image(systemName: "checkmark.circle.fill")
+                            .foregroundStyle(SD.Colors.success)
+                        VStack(alignment: .leading, spacing: 1) {
+                            Text(device.name)
+                                .font(SD.Typography.body)
+                                .foregroundStyle(SD.Colors.textPrimary)
+                            Text(device.proximity)
+                                .font(SD.Typography.caption)
+                                .foregroundStyle(SD.Colors.textTertiary)
+                        }
+                        Spacer()
+                    }
+                    Button("Connect") { flow.connect(to: device) }
+                        .buttonStyle(SDButtonStyle(kind: .primary))
                 } else {
                     ForEach(flow.ble.discovered) { device in
                         Button { flow.connect(to: device) } label: {
