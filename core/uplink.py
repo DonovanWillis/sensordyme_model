@@ -38,6 +38,7 @@ class CloudUplink:
         self._pending_zones: Optional[list[dict]] = None
         self._stop = threading.Event()
         self._connected = False
+        self._explained_failure = False
         import requests  # already a dependency (VLM judge backends)
 
         self._requests = requests
@@ -106,6 +107,16 @@ class CloudUplink:
     def connected(self) -> bool:
         return self._connected
 
+    def _looks_like_bare_ip(self) -> bool:
+        """Whether base_url points at a numeric address rather than a name.
+
+        A name resolves wherever the host goes; an IP is only true on the
+        network it was written down on.
+        """
+        import re as _re
+
+        return bool(_re.search(r"//(\d{1,3}\.){3}\d{1,3}(:|/|$)", self._base_url))
+
     # ------------------------------------------------------------------ worker
     def _run(self) -> None:
         headers = {"X-Device-Key": self._device_key}
@@ -152,10 +163,26 @@ class CloudUplink:
                         self._zones_version = str(command.get("zones_version") or "")
                 if not self._connected:
                     self._connected = True
+                    self._explained_failure = False
                     print(f"cloud_uplink: connected to {self._base_url}")
             except Exception as exc:  # noqa: BLE001 - the device must keep working offline
                 if self._connected:
                     print(f"cloud_uplink: connection lost ({exc}); device continues standalone")
+                elif not self._explained_failure:
+                    # Said once, not every five seconds. A bare IP in base_url is
+                    # the commonest cause of a device that looks broken and is
+                    # not: the address was correct on the network where it was
+                    # configured, and means nothing on any other one.
+                    self._explained_failure = True
+                    print(f"cloud_uplink: cannot reach {self._base_url} ({exc})")
+                    if self._looks_like_bare_ip():
+                        print(
+                            "cloud_uplink: base_url is a fixed IP address. If this device or "
+                            "the backend has moved to a different network, that address now "
+                            "points at nothing. Use the backend host's mDNS name instead — "
+                            "e.g. http://your-macbook.local:8787 — which follows it between "
+                            "networks. See docs/NETWORKING.md."
+                        )
                 self._connected = False
                 with self._lock:
                     # put the batch back (bounded deque drops oldest under pressure)

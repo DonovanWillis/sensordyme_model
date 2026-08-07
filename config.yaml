@@ -85,6 +85,12 @@ hardware: {}
 # device through this channel. The device works fully standalone when this is off/unreachable.
 cloud:
   enabled: false
+  # Use a NAME, not an IP. A fixed address is only true on the network it was
+  # written down on: move either machine and the device keeps running perfectly
+  # while appearing offline in the app. Both macOS and Pi OS resolve `.local`
+  # out of the box. See docs/NETWORKING.md.
+  #   good: http://your-macbook.local:8787
+  #   bad:  http://192.168.1.251:8787
   base_url: http://localhost:8787 # your deployed cloud/ backend URL
   device_key: "" # issued by `python cloud/manage.py create-device <name>` -- see cloud/README.md
   poll_interval_s: 5
