@@ -14,6 +14,7 @@ struct DevicesView: View {
     @State private var errorMessage: String?
     @State private var showClaim = false
     @State private var hasLoaded = false
+    @StateObject private var link = DeviceLink()
 
     private let refreshTimer = Timer.publish(every: 10, on: .main, in: .common).autoconnect()
 
@@ -32,6 +33,7 @@ struct DevicesView: View {
                         SDSectionHeader(title: devices.count == 1 ? "Your device" : "Your devices")
                             .padding(.top, SD.Space.xxs)
                     }
+                    DeviceLinkBanner(link: link)
 
                     ForEach(devices) { device in
                         NavigationLink(value: device) {
@@ -61,7 +63,13 @@ struct DevicesView: View {
             }
             .sheet(isPresented: $showClaim) { SetupWizardView { await reload() } }
             .refreshable { await reload() }
-            .task { await reload() }
+            .task {
+                await reload()
+                // Re-resolve the device's address on launch and whenever the
+                // network changes, so a move never requires typing an IP.
+                link.start()
+                await link.ensureConnection()
+            }
             .onReceive(refreshTimer) { _ in Task { await reload() } }
         }
         .tint(SD.Colors.accent)
