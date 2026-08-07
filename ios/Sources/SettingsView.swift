@@ -1,6 +1,7 @@
 import SwiftUI
 
 struct SettingsView: View {
+    @State private var showSetup = false
     @EnvironmentObject private var state: AppState
     @StateObject private var discovery = DeviceDiscovery()
     @State private var ntfyTopic = ""
@@ -94,12 +95,13 @@ struct SettingsView: View {
                 }
 
                 Section("Device Wi-Fi setup") {
-                    NavigationLink {
-                        ProvisioningView()
-                    } label: {
+                    // Same flow as the home screen's Bluetooth button, not a
+                    // second one. Two provisioning screens means two state
+                    // machines to keep honest, and they drift.
+                    Button { showSetup = true } label: {
                         Label("Set up device Wi-Fi over Bluetooth", systemImage: "wave.3.right")
                     }
-                    Text("For a brand-new device, or one taken somewhere without its saved network.")
+                    Text("For a brand-new device, or one moved somewhere new. Works whether or not the device currently has Wi-Fi.")
                         .font(.footnote)
                         .foregroundStyle(SD.Colors.textSecondary)
                 }
@@ -205,6 +207,7 @@ struct SettingsView: View {
                 }
             }
             .navigationTitle("Settings")
+            .sheet(isPresented: $showSetup) { SetupFlowView() }
         }
     }
 

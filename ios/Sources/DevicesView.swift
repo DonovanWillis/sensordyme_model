@@ -13,6 +13,7 @@ struct DevicesView: View {
     @State private var devices: [Device] = []
     @State private var errorMessage: String?
     @State private var showClaim = false
+    @State private var showSetup = false
     @State private var hasLoaded = false
     @StateObject private var link = DeviceLink()
     @StateObject private var refreshing = ProgressTracker()
@@ -60,6 +61,10 @@ struct DevicesView: View {
                         // Sits beside the add button so a background refresh is
                         // visible without occupying a row of its own.
                         SDProgress(phase: refreshing.phase)
+                        Button { showSetup = true } label: {
+                            Label("Connect over Bluetooth", systemImage: "sensor.tag.radiowaves.forward")
+                        }
+                        .tint(SD.Colors.accent)
                         Button { showClaim = true } label: {
                             Label("Add device", systemImage: "plus")
                         }
@@ -68,6 +73,10 @@ struct DevicesView: View {
                 }
             }
             .sheet(isPresented: $showClaim) { SetupWizardView { await reload() } }
+            .sheet(isPresented: $showSetup) {
+                SetupFlowView()
+                    .onDisappear { Task { await link.ensureConnection() } }
+            }
             .refreshable { await reload() }
             .task {
                 await reload()
@@ -91,7 +100,7 @@ struct DevicesView: View {
             SDEmptyState(
                 icon: "sensor.tag.radiowaves.forward",
                 title: "No devices yet",
-                message: "Add your SensorDyme with the claim code printed on the card in the box.",
+                message: "Add your SensorDyme with the claim code printed on the card in the box — or connect one over Bluetooth to put it on your Wi-Fi.",
                 actionTitle: "Add device",
                 action: { showClaim = true }
             )

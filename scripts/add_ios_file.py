@@ -59,10 +59,28 @@ def add(text: str, name: str) -> tuple[str, bool]:
     return text, True
 
 
+def prune(text: str, name: str) -> tuple[str, bool]:
+    """Remove every entry for a file that no longer exists on disk.
+
+    Deleting a Swift file without this leaves four dangling references and the
+    build fails with "Build input file cannot be found" — which points at the
+    file you deliberately removed and reads like the deletion was a mistake.
+    """
+    kept, dropped = [], False
+    for line in text.splitlines(keepends=True):
+        if f"/* {name} " in line or f"/* {name} */" in line:
+            dropped = True
+            continue
+        kept.append(line)
+    return "".join(kept), dropped
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__,
                                      formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("files", nargs="*", help="Swift filenames under ios/Sources")
+    parser.add_argument("--prune", action="store_true",
+                        help="also remove entries for files no longer on disk")
     parser.add_argument("--sync", action="store_true",
                         help="add every file in ios/Sources not already listed")
     args = parser.parse_args()
@@ -81,6 +99,18 @@ def main() -> int:
     backup = PBXPROJ.with_suffix(".pbxproj.bak")
     backup.write_text(text)
 
+    removed = []
+    if args.prune or args.sync:
+        # Anything the project references that is no longer on disk. Without
+        # this a deleted file breaks the build with an error that names the
+        # file you meant to delete.
+        on_disk = {p.name for p in SOURCES.glob("*.swift")}
+        referenced = set(re.findall(r"/\* (\w+\.swift) ", text))
+        for stale in sorted(referenced - on_disk):
+            text, did = prune(text, stale)
+            if did:
+                removed.append(stale)
+
     added = []
     for name in names:
         if not (SOURCES / name).exists():
@@ -90,14 +120,16 @@ def main() -> int:
         if did:
             added.append(name)
 
-    if not added:
-        print("nothing to add; every file is already in the project")
+    if not added and not removed:
+        print("nothing to change; the project matches ios/Sources")
         return 0
 
     PBXPROJ.write_text(text)
     for name in added:
         print(f"  + {name}")
-    print(f"\nadded {len(added)} file(s); backup at {backup.name}")
+    for name in removed:
+        print(f"  - {name} (no longer on disk)")
+    print(f"\n{len(added)} added, {len(removed)} removed; backup at {backup.name}")
     return 0
 
 

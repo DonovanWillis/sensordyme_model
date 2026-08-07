@@ -102,7 +102,8 @@ extension SetupStep {
         for state: BLEProvisioner.State,
         networksFound: Int,
         scanning: Bool,
-        stateBeforeFailure: BLEProvisioner.State? = nil
+        stateBeforeFailure: BLEProvisioner.State? = nil,
+        handover: Status = .pending
     ) -> [SetupStep] {
         // Which step a failure belongs to: the one that was in flight. Marking
         // the whole list failed would hide how far setup actually got, which is
@@ -145,7 +146,14 @@ extension SetupStep {
             SetupStep(id: "join", title: "Device joins the network",
                       detail: currentStage >= 4 ? "this can take up to a minute" : nil,
                       status: status(4)),
-            SetupStep(id: "ready", title: "SensorDyme ready", status: status(5)),
+            // The step Bluetooth cannot report on. Once the device has been
+            // given credentials it leaves the network this conversation was
+            // happening over, so its own progress is unobservable from here —
+            // the app has to go and find it again. Showing this as a step is
+            // what stops the gap reading as a crash.
+            SetupStep(id: "rejoin", title: "Find it on the new network",
+                      detail: handover == .active ? "this can take a minute" : nil,
+                      status: handover == .pending ? status(5) : handover),
         ]
 
         if case let .failed(reason) = state, let failedStage,
@@ -153,8 +161,13 @@ extension SetupStep {
             steps[failedStage].detail = reason
         }
         if case let .success(ip) = state {
-            steps[5].status = .done
-            steps[5].detail = ip.map { "on your network at \($0)" }
+            // Bluetooth reporting success means the device accepted and joined —
+            // not that this phone can reach it. That is the next step's job.
+            steps[4].status = .done
+            steps[4].detail = ip.map { "device reports it is on \($0)" }
+        }
+        if handover == .done {
+            steps = steps.map { var s = $0; if s.status != .failed { s.status = .done }; return s }
         }
         return steps
     }
