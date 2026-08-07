@@ -10,9 +10,25 @@ struct ProvisioningView: View {
     var body: some View {
         Form {
             Section {
-                Text("If your device has no Wi-Fi yet (new, or you moved it), it broadcasts over Bluetooth as SensorDyme-XXXX. Connect and send it your network.")
-                    .font(.footnote)
+                VStack(alignment: .leading, spacing: SD.Space.xs) {
+                    Text("If your device has no Wi-Fi yet — new, or you moved it — it waits here for a network. Scan below, then send it yours.")
+                        .font(SD.Typography.callout)
+                        .foregroundStyle(SD.Colors.textPrimary)
+
+                    // The single most confusing thing about this flow. The device
+                    // advertises a custom service, which iOS Settings does not
+                    // list — it only shows standard profiles like headphones. So
+                    // someone checking there sees nothing, concludes the device
+                    // is dead, and never gets to this screen, which is the only
+                    // place it can appear.
+                    Label(
+                        "Your SensorDyme won't appear in the iPhone's Bluetooth settings — only here. That's normal.",
+                        systemImage: "info.circle"
+                    )
+                    .font(SD.Typography.caption)
                     .foregroundStyle(SD.Colors.textSecondary)
+                    .fixedSize(horizontal: false, vertical: true)
+                }
             }
 
             Section("1. Find your device") {
@@ -25,7 +41,12 @@ struct ProvisioningView: View {
                     Label("Turn on Bluetooth in Settings to continue", systemImage: "exclamationmark.triangle")
                         .foregroundStyle(SD.Colors.warning)
                 case .scanning:
-                    HStack { ProgressView(); Text("Scanning…").foregroundStyle(SD.Colors.textSecondary) }
+                    VStack(alignment: .leading, spacing: SD.Space.xxs) {
+                        HStack { ProgressView(); Text("Scanning…").foregroundStyle(SD.Colors.textSecondary) }
+                        Text("Stand within a few metres of your SensorDyme. Bluetooth doesn't reach further.")
+                            .font(SD.Typography.caption)
+                            .foregroundStyle(SD.Colors.textTertiary)
+                    }
                 default:
                     EmptyView()
                 }
