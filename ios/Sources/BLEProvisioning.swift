@@ -133,6 +133,17 @@ final class BLEProvisioner: NSObject, ObservableObject {
     /// Send Wi-Fi credentials to the connected device.
     /// Re-scan on the device. The list is a moment in time, and the network
     /// someone is looking for may only appear on the second sweep.
+    /// Whether a credential write is outstanding.
+    ///
+    /// Before this is true the device's status is just a description of itself,
+    /// not an answer to anything the app asked.
+    private var awaitingOutcome: Bool {
+        switch state {
+        case .sending, .deviceConnecting: true
+        default: false
+        }
+    }
+
     /// Move to `.failed`, remembering what was in progress.
     private func fail(_ reason: String) {
         if case .failed = state {} else { stateBeforeFailure = state }
@@ -344,23 +355,28 @@ extension BLEProvisioner: CBCentralManagerDelegate, CBPeripheralDelegate {
             self.scanningNetworks = (status["scanning"] as? Bool) ?? false
             // A scan that just finished has a list waiting to be read.
             if !self.scanningNetworks { self.refreshNetworks() }
-            // The device answered, so the deadline has done its job.
-            if let state = status["state"] as? String,
-               ["connecting", "online", "error"].contains(state) {
-                self.sendTimeout?.cancel()
-                // "connecting" means the write landed; keep polling for the
-                // outcome. Anything terminal ends the polling too.
-                if state != "connecting" { self.statusPoll?.cancel() }
-            }
-            switch status["state"] as? String {
-            case "connecting":
-                self.state = .deviceConnecting
-            case "online":
-                self.state = .success(ip: status["ip"] as? String)
-            case "error":
-                self.fail((status["error"] as? String) ?? "device could not join that network")
-            default:
+
+            // Only read this as an outcome once one has been asked for.
+            //
+            // A device that is already on Wi-Fi reports "online" continuously
+            // and truthfully. Treating that as the result of a credential write
+            // meant the app declared setup finished the moment it connected
+            // over Bluetooth — jumping from "Connect SensorDyme" straight to
+            // "SensorDyme is ready" without ever showing a network or asking
+            // for a password.
+            let outcome = ProvisioningStatus.interpret(status, awaitingOutcome: self.awaitingOutcome)
+            if outcome != .none { self.sendTimeout?.cancel() }
+            if ProvisioningStatus.isTerminal(outcome) { self.statusPoll?.cancel() }
+
+            switch outcome {
+            case .none:
                 break
+            case .joining:
+                self.state = .deviceConnecting
+            case .joined(let ip):
+                self.state = .success(ip: ip)
+            case .failed(let reason):
+                self.fail(reason)
             }
         }
     }
