@@ -409,6 +409,19 @@ def default_registry() -> CapabilityRegistry:
             requirement_kind=Support.NEEDS_MODEL,
         ),
         Capability(
+            id="activity.gait",
+            kind="pose",
+            summary="movement recognised from pose over about a second, in modes "
+                    "that run pose estimation",
+            # Activities are LABELS like any object, so "alert me if someone runs
+            # in the hallway" needs no special case in the rule engine.
+            labels=frozenset({"walking", "running", "jumping"}),
+            predicates=frozenset(),
+            available=_pose_available(),
+            requires="mediapipe, and a monitoring mode that runs pose estimation",
+            requirement_kind=Support.NEEDS_MODEL,
+        ),
+        Capability(
             id="pose.climbing",
             kind="pose",
             summary="climbing, reaching and other whole-body actions",
@@ -416,6 +429,24 @@ def default_registry() -> CapabilityRegistry:
             available=False,
             requires="an action-recognition model — posture alone cannot "
                      "distinguish climbing from standing on something",
+            requirement_kind=Support.NEEDS_TRAINING_DATA,
+        ),
+        Capability(
+            id="appearance.eyewear",
+            kind="face",
+            summary="whether a person is wearing glasses or sunglasses",
+            labels=frozenset({"glasses", "sunglasses"}),
+            predicates=frozenset(),
+            available=False,
+            # Deliberately declared and unavailable rather than approximated.
+            # A heuristic ("the eye region is dark, so: sunglasses") would be
+            # untested, would fail in shadow, backlight and on dark skin, and
+            # would be indistinguishable to a user from a real detector. In a
+            # product whose differentiator is refusing to overclaim, guessing
+            # here would cost more than the feature is worth.
+            requires="an eyewear classifier trained on cropped eye regions — "
+                     "roughly a few hundred labelled examples per class, in "
+                     "varied lighting, to fine-tune a small CNN",
             requirement_kind=Support.NEEDS_TRAINING_DATA,
         ),
         Capability(

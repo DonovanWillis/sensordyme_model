@@ -10,7 +10,9 @@ import mediapipe as mp
 import numpy as np
 
 from core import posture
+from core.activity import ActivityRecognizer
 from core.detections import Detection, DetectionFrame
+from core.event_engine import CONFIRMED, RESOLVED, EventEngine, RuleSpec
 from core.events import Event
 from modules.base import VisionModule, register_module
 
@@ -41,6 +43,23 @@ class FallDetectionModule(VisionModule):
         self._last_pose_proto = None
         self._alert_active = False
         self._last_posture: Optional[posture.Posture] = None
+        self._activity = ActivityRecognizer()
+        self._last_activity = None
+
+        # Activity events go through the shared lifecycle, which is what turns
+        # "running" into ONE alert with a start and an end rather than one per
+        # frame for as long as someone keeps running.
+        self._activity_engine = EventEngine({})
+        self._activity_engine.add_rule(RuleSpec(
+            detection="running", severity="warning",
+            persist_s=float(config.get("running_confirm_s", 1.0)),
+            min_frames=5, resolve_after_s=2.0, cooldown_s=15.0,
+        ))
+        self._activity_engine.add_rule(RuleSpec(
+            detection="jumping", severity="info",
+            persist_s=float(config.get("jump_confirm_s", 0.2)),
+            min_frames=2, resolve_after_s=1.5, cooldown_s=5.0,
+        ))
         self._last_frame_size: tuple[int, int] = (0, 0)
         self._last_hip_y: Optional[float] = None
 
@@ -56,6 +75,10 @@ class FallDetectionModule(VisionModule):
         if not results.pose_landmarks:
             self._last_pose_proto = None
             self._last_posture = None
+            # The subject left: motion history describes someone who is no
+            # longer there and would misclassify whoever arrives next.
+            self._activity.reset()
+            self._last_activity = None
             self._last_hip_y = None
             self._prev_y = None
             self._prev_t = None
@@ -68,8 +91,13 @@ class FallDetectionModule(VisionModule):
         # custom rules ("someone on the floor") cost no extra inference.
         frame_h, frame_w = frame.shape[:2]
         self._last_frame_size = (frame_w, frame_h)
-        self._last_posture = posture.classify(landmarks, aspect=frame_w / max(frame_h, 1))
+        aspect = frame_w / max(frame_h, 1)
+        self._last_posture = posture.classify(landmarks, aspect=aspect)
         self._last_hip_y = posture.hip_height(landmarks)
+
+        # Activity from the same landmarks — no extra inference.
+        self._last_activity = self._activity.update(landmarks, now=now, aspect=aspect)
+        events += self._activity_events(now)
         indices = HIP_LANDMARKS + SHOULDER_LANDMARKS
         avg_y = sum(landmarks[i].y for i in indices) / len(indices) * h
 
@@ -101,6 +129,46 @@ class FallDetectionModule(VisionModule):
         self._prev_t = now
         return events
 
+    def _activity_events(self, now: float) -> list[Event]:
+        """Turn the activity state into lifecycle-managed events.
+
+        Every frame feeds the engine, but only CONFIRMED and RESOLVED
+        transitions become events — which is what makes thirty seconds of
+        running one alert with a start and an end, not thirty alerts.
+        """
+        state = self._last_activity
+        if state is None or not state.ready:
+            return []
+
+        events: list[Event] = []
+        evidence = ", ".join(f"{k}={v}" for k, v in state.signals.items() if k != "reason")
+
+        for attribute in (state.running, state.jumping):
+            transitions = self._activity_engine.update(
+                attribute.name, attribute.present, attribute.confidence or 0.0, now
+            )
+            for transition in transitions:
+                if transition.state == CONFIRMED:
+                    events.append(Event.now(
+                        transition.detection, transition.duration_s,
+                        transition.confidence, self.name, evidence,
+                    ))
+                elif transition.state == RESOLVED:
+                    events.append(Event.now(
+                        f"{transition.detection}_ended", transition.duration_s,
+                        transition.confidence, self.name, evidence,
+                    ))
+        return events
+
+    def get_activity(self) -> Optional[dict]:
+        """Every attribute believed about the subject right now, independently.
+
+        Multi-attribute by design: a person can be running and upright and not
+        jumping all at once, and collapsing that to one label throws away the
+        combinations that matter.
+        """
+        return self._last_activity.as_dict() if self._last_activity else None
+
     def get_detections(self) -> DetectionFrame:
         """The tracked person plus their posture, as labels custom rules can use.
 
@@ -123,6 +191,13 @@ class FallDetectionModule(VisionModule):
                 )
             if posture.is_on_floor(self._last_posture, self._last_hip_y):
                 detections.append(Detection(label="on_floor", confidence=self._last_posture.confidence))
+
+        # Activities are labels too, so "alert me if someone runs in the hallway"
+        # is expressible with the rule engine exactly as any object rule is.
+        if self._last_activity is not None and self._last_activity.ready:
+            for attribute in self._last_activity.active():
+                if attribute.name not in {d.label for d in detections}:
+                    detections.append(Detection(label=attribute.name, confidence=attribute.confidence))
         return DetectionFrame(width=width, height=height, detections=tuple(detections))
 
     def annotate(self, frame: np.ndarray) -> np.ndarray:
