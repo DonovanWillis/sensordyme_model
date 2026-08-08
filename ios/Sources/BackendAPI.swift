@@ -274,7 +274,11 @@ final class MockAPI: BackendAPI {
             type: type,
             confidence: Double.random(in: 0.72...0.97),
             signals: signals,
-            severity: severity
+            severity: severity,
+            // Demo events come from a preset, not a configured rule. Marking
+            // them as configured would make them all notify, which is exactly
+            // the spam this distinction exists to prevent.
+            source: "module"
         )
     }
 

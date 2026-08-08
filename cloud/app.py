@@ -145,6 +145,10 @@ def init_db() -> None:
             # this the app showed the base mode as selected while a custom
             # configuration was the thing actually running.
             "ALTER TABLE devices ADD COLUMN monitoring TEXT",
+            # Whether an event came from something the user configured. Without
+            # it the app cannot tell a preset's own warning from the one thing
+            # someone explicitly asked to be told about.
+            "ALTER TABLE events ADD COLUMN source TEXT",
         ):
             try:
                 conn.execute(statement)
@@ -471,7 +475,7 @@ def device_events(device_id: int, limit: int = 100, uid: int = Depends(current_u
         # `id` is included so the app can ask why a specific alert fired.
         # Without it an event is unaddressable and /explain is unreachable.
         rows = conn.execute(
-            "SELECT id, timestamp, type, confidence, signals, severity FROM events "
+            "SELECT id, timestamp, type, confidence, signals, severity, source FROM events "
             "WHERE device_id = ? ORDER BY id DESC LIMIT ?",
             (device_id, limit),
         ).fetchall()
@@ -1010,8 +1014,8 @@ def ingest(body: IngestBody, device: sqlite3.Row = Depends(current_device)):
         )
         for e in body.events[:200]:
             conn.execute(
-                "INSERT INTO events (device_id, timestamp, type, confidence, signals, severity, received_at)"
-                " VALUES (?, ?, ?, ?, ?, ?, ?)",
+                "INSERT INTO events (device_id, timestamp, type, confidence, signals, severity,"
+                " source, received_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
                 (
                     device["id"],
                     str(e.get("timestamp", "")),
@@ -1019,6 +1023,7 @@ def ingest(body: IngestBody, device: sqlite3.Row = Depends(current_device)):
                     float(e.get("confidence", 0.0) or 0.0),
                     str(e.get("signals", "")),
                     str(e.get("severity", "log")),
+                    str(e.get("source") or "module"),
                     now,
                 ),
             )
@@ -1049,7 +1054,9 @@ def ingest(body: IngestBody, device: sqlite3.Row = Depends(current_device)):
     # decides interruptions only.
     for e in body.events:
         owner_id = owner["id"] if owner is not None else None
-        send, held = gate.evaluate(owner_id, str(e.get("severity", "")))
+        send, held = gate.evaluate(
+            owner_id, str(e.get("severity", "")), source=str(e.get("source") or "module")
+        )
         if not send:
             continue
         title = f"SensorDyme: {e.get('type', 'alert')}"

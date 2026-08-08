@@ -469,7 +469,9 @@ struct DeviceDetailView: View {
             events = try await state.backend.events(deviceID: device.id, limit: 200)
             // The notifier dedupes by event id, so calling this on every poll
             // announces each alert exactly once.
-            await notifier.announce(events, device: device, simulated: state.isDemo)
+            // AlertWatcher owns notifications now, from the app root, so it
+            // works on every screen. Announcing here as well duplicated the
+            // work on the one screen that was already the busiest.
             errorMessage = nil
         } catch let error as APIError where error.isAuthFailure {
             state.expireSession(error.message)

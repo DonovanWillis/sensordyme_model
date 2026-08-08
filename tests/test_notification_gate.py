@@ -104,3 +104,31 @@ def test_a_quiet_period_reports_nothing_held():
     gate.evaluate(1, "loud", now=0.0)
     send, held = gate.evaluate(1, "loud", now=100.0)
     assert send is True and held == 0
+
+
+def test_something_the_user_configured_always_qualifies():
+    """The regression that made this feature look broken.
+
+    A custom rule defaults to severity "warning" -> "soft", which the gate
+    dropped. So the one event someone had explicitly asked to be told about was
+    the only one that never arrived, while the preset's own alerts kept coming
+    through — the exact opposite of what configuring it meant.
+    """
+    gate = NotificationGate()
+    assert gate.should_notify(1, "soft", now=0.0) is False           # a preset warning
+    gate.reset()
+    send, _ = gate.evaluate(1, "soft", now=0.0, source="custom_rule")
+    assert send is True, "a configured rule did not notify"
+
+
+def test_a_configured_event_still_respects_the_cooldown():
+    """Honouring the intent must not reintroduce spam."""
+    gate = NotificationGate()
+    assert gate.evaluate(1, "soft", now=0.0, source="custom_rule")[0] is True
+    assert gate.evaluate(1, "soft", now=5.0, source="custom_rule")[0] is False
+    assert gate.evaluate(1, "soft", now=20.0, source="custom_rule")[0] is True
+
+
+def test_a_presets_own_warning_is_still_not_worth_interrupting_for():
+    gate = NotificationGate()
+    assert gate.evaluate(1, "soft", now=0.0, source="module")[0] is False

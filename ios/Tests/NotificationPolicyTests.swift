@@ -10,10 +10,11 @@ func check(_ condition: Bool, _ what: String) {
 let t0 = Date(timeIntervalSince1970: 1_000_000)
 let cooldown: TimeInterval = 20
 
-func decide(critical: Bool = true, seen: Bool = false, at offset: TimeInterval = 0,
+func decide(critical: Bool = true, configured: Bool = false,
+            seen: Bool = false, at offset: TimeInterval = 0,
             lastAt: TimeInterval? = nil) -> NotificationPolicy.Decision {
     NotificationPolicy.decide(
-        isCritical: critical, alreadySeen: seen,
+        isCritical: critical, isConfigured: configured, alreadySeen: seen,
         now: t0.addingTimeInterval(offset),
         lastNotifiedAt: lastAt.map { t0.addingTimeInterval($0) },
         cooldown: cooldown)
@@ -62,6 +63,17 @@ if case .suppress(.withinCooldown) = decide(critical: true, at: 3, lastAt: 0) {
 }
 check(decide(critical: true, lastAt: nil) == .notify,
       "first ever alert, with no previous notification, notifies")
+
+print("\nsomething the user configured always qualifies:")
+check(decide(critical: false, configured: true) == .notify,
+      "a configured rule notifies even at warning severity")
+check(decide(critical: false, configured: false) == .suppress(.notCritical),
+      "a preset's own warning still does not")
+if case .suppress(.withinCooldown) = decide(critical: false, configured: true, at: 5, lastAt: 0) {
+    print("  ok   a configured rule still respects the cooldown")
+} else {
+    print("  FAIL configured rules must not bypass the cooldown"); failures += 1
+}
 
 print("\n\(failures == 0 ? "PASSED" : "\(failures) FAILED")")
 exit(failures == 0 ? 0 : 1)

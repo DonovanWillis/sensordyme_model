@@ -422,7 +422,10 @@ class DeviceRuntime:
         if self.dashboard is not None:
             self.dashboard.push_event(event, severity)
         if self.uplink is not None and alert.notify != "silent":
-            self.uplink.push_event(event, severity)
+            # Marked as configured. `notify: "push"` on a rule IS someone asking
+            # to be told; the severity field is about how prominent it looks,
+            # not about whether it is worth interrupting for.
+            self.uplink.push_event(event, severity, source="custom_rule")
 
     # ------------------------------------------------------------------ health hooks
     def _inference_check(self) -> tuple[bool, str]:

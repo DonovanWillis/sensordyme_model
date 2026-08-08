@@ -51,7 +51,7 @@ class NotificationGate:
         self._lock = threading.Lock()
 
     def evaluate(self, user_id: Optional[int], severity: str,
-                 now: Optional[float] = None) -> tuple[bool, int]:
+                 now: Optional[float] = None, source: str = "module") -> tuple[bool, int]:
         """(may interrupt now, how many were held back since the last one).
 
         Returns both together because the count is consumed by the act of
@@ -63,7 +63,18 @@ class NotificationGate:
         already stored, and the timeline shows it. It means only that the phone
         will not buzz for it.
         """
-        if user_id is None or severity != CRITICAL_SEVERITY:
+        if user_id is None:
+            return False, 0
+
+        # Something the user explicitly configured always qualifies.
+        #
+        # Severity alone cannot answer "should this interrupt someone". A custom
+        # rule defaults to `warning`, which maps to `soft`, which this dropped —
+        # so the one event a person asked to be told about was the only one that
+        # never arrived, while the preset's own alerts kept coming through. That
+        # is the exact opposite of what configuring it meant.
+        configured = source == "custom_rule"
+        if not configured and severity != CRITICAL_SEVERITY:
             return False, 0
 
         now = time.time() if now is None else now

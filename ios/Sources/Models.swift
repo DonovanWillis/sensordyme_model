@@ -185,11 +185,21 @@ struct EventItem: Codable, Identifiable, Hashable {
     let confidence: Double?
     let signals: String?
     let severity: String?
+    /// "custom_rule" when this is something the user explicitly configured.
+    /// Optional so an older backend still decodes.
+    let source: String?
 
     enum CodingKeys: String, CodingKey {
         case eventID = "id"
-        case timestamp, type, confidence, signals, severity
+        case timestamp, type, confidence, signals, severity, source
     }
+
+    /// Whether the user asked to be told about this specifically.
+    ///
+    /// Severity alone cannot answer that: a configured rule defaults to
+    /// "warning" -> "soft", which the notifier dropped — so the one event
+    /// someone had asked for was the only one that never arrived.
+    var isConfigured: Bool { source == "custom_rule" }
 
     var id: String { "\(eventID.map(String.init) ?? "")\(timestamp)\(type)\(signals ?? "")" }
 

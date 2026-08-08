@@ -19,9 +19,18 @@ final class AlertWatcher: ObservableObject {
     private let notifier = AlertNotifier.shared
     private var task: Task<Void, Never>?
 
-    /// Fast enough that an alert feels immediate while demonstrating, slow
-    /// enough not to hammer the backend from every screen.
-    private let interval: Duration = .seconds(5)
+    /// How often to check for alerts.
+    ///
+    /// Deliberately slower than it first shipped. At 5s this ran alongside
+    /// DeviceDetailView's own 4s refresh, so with the device screen open the
+    /// app made two round trips every couple of seconds for the same data —
+    /// which is felt as lag on every other interaction, because they share a
+    /// connection and the main actor.
+    ///
+    /// A notification arriving within fifteen seconds is indistinguishable from
+    /// one arriving within five, for an event that persisted long enough to be
+    /// confirmed in the first place.
+    private let interval: Duration = .seconds(15)
 
     func start(state: AppState) {
         guard task == nil else { return }

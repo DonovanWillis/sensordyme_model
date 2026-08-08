@@ -102,6 +102,7 @@ final class AlertNotifier: NSObject, ObservableObject {
             // from a driver-monitor doing exactly its job.
             let decision = NotificationPolicy.decide(
                 isCritical: event.isCritical,
+                isConfigured: event.isConfigured,
                 alreadySeen: seen.contains(id),
                 now: Date(),
                 lastNotifiedAt: lastNotifiedAt,

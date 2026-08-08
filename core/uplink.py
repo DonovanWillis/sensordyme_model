@@ -52,8 +52,16 @@ class CloudUplink:
         self._stop.set()
 
     # ------------------------------------------------------------------ main-loop side
-    def push_event(self, event, severity: str) -> None:
-        """Queue one alert event for the next sync cycle."""
+    def push_event(self, event, severity: str, source: str = "module") -> None:
+        """Queue one alert event for the next sync cycle.
+
+        `source` distinguishes a preset's own detection from something the user
+        explicitly configured. It exists because severity alone cannot answer
+        "should this interrupt someone": a custom rule defaults to `warning`,
+        which maps to `soft`, which the notification gate drops — so the one
+        event a person asked to be told about was the one that never arrived,
+        while the preset's own alerts kept coming through.
+        """
         with self._lock:
             self._queue.append(
                 {
@@ -62,6 +70,7 @@ class CloudUplink:
                     "confidence": round(event.confidence, 3),
                     "signals": event.contributing_signals,
                     "severity": severity,
+                    "source": source,
                 }
             )
 

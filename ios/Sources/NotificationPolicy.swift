@@ -28,13 +28,16 @@ enum NotificationPolicy {
 
     static func decide(
         isCritical: Bool,
+        isConfigured: Bool = false,
         alreadySeen: Bool,
         now: Date,
         lastNotifiedAt: Date?,
         cooldown: TimeInterval
     ) -> Decision {
         if alreadySeen { return .suppress(.alreadySeen) }
-        if !isCritical { return .suppress(.notCritical) }
+        // Something the user explicitly configured always qualifies, whatever
+        // severity it carries — asking to be told about it IS the instruction.
+        if !isCritical && !isConfigured { return .suppress(.notCritical) }
         if let last = lastNotifiedAt {
             let elapsed = now.timeIntervalSince(last)
             if elapsed < cooldown {
