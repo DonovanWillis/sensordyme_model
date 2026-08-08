@@ -30,6 +30,7 @@ from pathlib import Path
 from typing import Optional
 
 import jwt
+from core.presets import resolve_preset, same_preset
 from fastapi import Depends, FastAPI, Header, HTTPException
 from pydantic import BaseModel
 
@@ -472,8 +473,12 @@ def device_events(device_id: int, limit: int = 100, uid: int = Depends(current_u
 def set_preset(device_id: int, body: PresetBody, uid: int = Depends(current_user)):
     with db() as conn:
         _owned_device(conn, device_id, uid)
-        conn.execute("UPDATE devices SET desired_preset = ? WHERE id = ?", (body.preset, device_id))
-    return {"ok": True, "desired_preset": body.preset}
+        # Store the current name for a mode, never a superseded one. The device
+        # will apply and report the current name, so a stored alias could never
+        # match on convergence and would re-send on every poll for ever.
+        normalized = resolve_preset(body.preset)
+        conn.execute("UPDATE devices SET desired_preset = ? WHERE id = ?", (normalized, device_id))
+    return {"ok": True, "desired_preset": normalized}
 
 
 # ------------------------------------------------------------------------- zones
@@ -1015,7 +1020,12 @@ def ingest(body: IngestBody, device: sqlite3.Row = Depends(current_device)):
         # command is fulfilled — clear it. Without this, a stale desired_preset
         # keeps re-delivering forever and FIGHTS local mode switches made on the
         # device/dashboard (the device flips back within one poll interval).
-        if desired and desired == (body.active_preset or device["active_preset"]):
+        # Compare by mode, not by string. A device handed a superseded name
+        # applies — and correctly reports — the current one, so raw equality
+        # never matches: the backend concludes the command was ignored and
+        # re-sends it every poll, fighting whatever mode the user picks locally.
+        # This also converges rows written before names were normalised.
+        if desired and same_preset(desired, body.active_preset or device["active_preset"]):
             conn.execute("UPDATE devices SET desired_preset = NULL WHERE id = ?", (device["id"],))
             desired = None
 

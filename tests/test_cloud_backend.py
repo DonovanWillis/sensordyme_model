@@ -136,14 +136,17 @@ def test_full_customer_journey(backend):
     orders = client.get("/v1/orders", headers=auth).json()["orders"]
     assert len(orders) == 1 and orders[0]["quantity"] == 2
 
-    # 6f) preset with a variant flows through the command channel untouched.
+    # 6f) preset with a variant flows through the command channel, normalised.
+    # A superseded name is stored as the mode it now refers to: the device will
+    # apply and report the CURRENT name, so keeping the old one would mean the
+    # convergence check never matches and the command re-sends on every poll.
     # The fall rule configured in 6b also rides down on this poll: the device has
     # not acknowledged a rules_version yet, and rules the user configured are
     # useless until the device that enforces them actually receives them.
     client.post(f"/v1/devices/{device_id}/preset", json={"preset": "driver_distraction:teen_driver"}, headers=auth)
     r = client.post("/v1/ingest", json={"events": [], "active_preset": "elderly_monitoring"}, headers=device_headers)
     command = r.json()["command"]
-    assert command["set_preset"] == "driver_distraction:teen_driver"
+    assert command["set_preset"] == "driver_safety:teen_driver"
     assert [rule["detection"] for rule in command["set_rules"]] == ["fall"]
 
     # Once acknowledged, only the preset command remains outstanding.
@@ -152,7 +155,21 @@ def test_full_customer_journey(backend):
         json={"events": [], "active_preset": "elderly_monitoring", "rules_version": command["rules_version"]},
         headers=device_headers,
     )
-    assert r.json()["command"] == {"set_preset": "driver_distraction:teen_driver"}
+    assert r.json()["command"] == {"set_preset": "driver_safety:teen_driver"}
+
+    # 6g) and it CONVERGES: once the device reports the mode as active, the
+    # command is cleared rather than re-sent for ever. Verified against the
+    # superseded name too, because rows written before the rename still hold it
+    # and a device reporting "driver_safety" must satisfy them.
+    r = client.post(
+        "/v1/ingest",
+        json={"events": [], "active_preset": "driver_safety:teen_driver",
+              "rules_version": command["rules_version"]},
+        headers=device_headers,
+    )
+    # An empty/absent command is the success case: nothing left outstanding.
+    assert "set_preset" not in (r.json().get("command") or {}), \
+        "the preset command re-sent after the device already reported that mode"
 
     # 7) another user cannot see or control this device
     r2 = client.post("/v1/signup", json={"email": "stranger@example.com", "password": "supersecret2"})
