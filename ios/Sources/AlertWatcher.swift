@@ -1,0 +1,58 @@
+import SwiftUI
+
+/// Watches every device for new alerts, from anywhere in the app.
+///
+/// Notifications used to be posted only by DeviceDetailView's refresh loop,
+/// which runs only while that one screen is open. So an alert reached you
+/// exactly when you were already looking at the device and least needed
+/// telling, and never when you were on the Devices list, in Settings, or
+/// looking at something else — which is every moment a notification is for.
+///
+/// **The honest limit**, unchanged and worth stating plainly: these are local
+/// notifications, so the app posts them. It must be running or very recently
+/// backgrounded — iOS suspends timers in a backgrounded app and decides for
+/// itself when to let one run again. Force-quit the app and nothing arrives.
+/// That is the difference between this and APNs, and it is why this is a demo
+/// path rather than the shipping one.
+@MainActor
+final class AlertWatcher: ObservableObject {
+    private let notifier = AlertNotifier.shared
+    private var task: Task<Void, Never>?
+
+    /// Fast enough that an alert feels immediate while demonstrating, slow
+    /// enough not to hammer the backend from every screen.
+    private let interval: Duration = .seconds(5)
+
+    func start(state: AppState) {
+        guard task == nil else { return }
+        task = Task { [weak self] in
+            while !Task.isCancelled {
+                await self?.poll(state: state)
+                try? await Task.sleep(for: self?.interval ?? .seconds(5))
+            }
+        }
+    }
+
+    func stop() {
+        task?.cancel()
+        task = nil
+    }
+
+    private func poll(state: AppState) async {
+        await notifier.refreshAuthorization()
+        guard notifier.authorized, state.isSignedIn else { return }
+
+        // A failed poll is silent on purpose. The backend being briefly
+        // unreachable is normal — the phone changes network, the Mac sleeps —
+        // and surfacing it here would put an error in front of someone who did
+        // not ask for one. The device screen already reports reachability.
+        guard let devices = try? await state.backend.devices() else { return }
+        for device in devices {
+            guard let events = try? await state.backend.events(deviceID: device.id, limit: 25)
+            else { continue }
+            // Dedup lives in AlertNotifier and is persisted, so polling from
+            // here as well as from the device screen cannot double-announce.
+            await notifier.announce(events, device: device, simulated: state.isDemo)
+        }
+    }
+}

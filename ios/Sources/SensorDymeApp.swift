@@ -17,6 +17,8 @@ struct SensorDymeApp: App {
 
 struct RootView: View {
     @EnvironmentObject private var state: AppState
+    @StateObject private var watcher = AlertWatcher()
+    @Environment(\.scenePhase) private var scenePhase
 
     var body: some View {
         if state.isSignedIn {
@@ -29,6 +31,15 @@ struct RootView: View {
                     .tabItem { Label("Settings", systemImage: "gearshape.fill") }
             }
             .tint(SD.Colors.accent)
+            // Watch for alerts from every screen, not just the device detail
+            // view — a notification you only receive while already looking at
+            // the device is not a notification.
+            .task { watcher.start(state: state) }
+            .onChange(of: scenePhase) { _, phase in
+                // Stop when suspended rather than leaving a task that iOS will
+                // freeze mid-request and resume against a stale network.
+                if phase == .active { watcher.start(state: state) } else { watcher.stop() }
+            }
         } else {
             AuthView()
         }
