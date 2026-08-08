@@ -6,6 +6,9 @@ struct APIError: LocalizedError {
     /// A 401. The stored token is dead, so retrying is pointless — the caller
     /// should send the user back to sign-in rather than keep polling.
     var isAuthFailure = false
+    /// No server was reached at all, as opposed to one that was reached and said
+    /// no. Only this kind is worth retrying at a different address.
+    var isUnreachable = false
     var errorDescription: String? { message }
 }
 
@@ -13,14 +16,40 @@ struct APIError: LocalizedError {
 struct APIClient {
     let baseURL: URL?
     let token: String?
+    /// Finds the backend when the saved address is missing or has stopped
+    /// answering. Supplied by AppState; see BackendLocator.
+    var relocate: (@Sendable () async -> URL?)?
 
     private func request(_ method: String, _ path: String, query: [String: String]? = nil, body: [String: Any]? = nil) async throws -> Data {
-        guard let baseURL else {
-            throw APIError(message: "No cloud backend configured. Open Settings → Cloud backend and enter your server's address.")
+        // A fresh install has no address saved, so ask the network for one rather
+        // than refusing. This is what lets a new phone sign in with nothing but an
+        // email and a password.
+        var resolved = baseURL
+        if resolved == nil, let relocate {
+            resolved = await relocate()
         }
+        guard let base = resolved else {
+            throw APIError(
+                message: "Couldn't find a SensorDyme server on this network. Make sure the server is running, or enter its address in Settings → Cloud backend.",
+                isUnreachable: true
+            )
+        }
+        do {
+            return try await send(method, path, query: query, body: body, base: base)
+        } catch let error as APIError where error.isUnreachable {
+            // The address stopped working — usually because the machine picked up
+            // a new DHCP lease. Look it up again and retry once, so a moved server
+            // heals itself instead of sending the user to Settings to fix an
+            // address they never set in the first place.
+            guard let relocate, let moved = await relocate(), moved != base else { throw error }
+            return try await send(method, path, query: query, body: body, base: moved)
+        }
+    }
+
+    private func send(_ method: String, _ path: String, query: [String: String]?, body: [String: Any]?, base: URL) async throws -> Data {
         // appendingPathComponent percent-escapes "?", so a query string baked into
         // `path` lands in the path and 404s. Queries go through URLComponents.
-        var comps = URLComponents(url: baseURL.appendingPathComponent(path), resolvingAgainstBaseURL: false)
+        var comps = URLComponents(url: base.appendingPathComponent(path), resolvingAgainstBaseURL: false)
         if let query {
             comps?.queryItems = query.map { URLQueryItem(name: $0.key, value: $0.value) }
         }
@@ -42,7 +71,10 @@ struct APIClient {
         do {
             (data, response) = try await URLSession.shared.data(for: req)
         } catch let error as URLError {
-            throw APIError(message: Self.explain(error, host: baseURL.host ?? "the server"))
+            throw APIError(
+                message: Self.explain(error, host: base.host ?? "the server"),
+                isUnreachable: Self.isUnreachable(error)
+            )
         }
         let status = (response as? HTTPURLResponse)?.statusCode ?? 0
         guard status != 401 else {
@@ -54,6 +86,18 @@ struct APIClient {
             throw APIError(message: (detail as? String) ?? "request failed (\(status))")
         }
         return data
+    }
+
+    /// Did this fail to reach a server at all, rather than reach one that refused?
+    /// Only the first kind can be fixed by trying somewhere else.
+    static func isUnreachable(_ error: URLError) -> Bool {
+        switch error.code {
+        case .cannotConnectToHost, .cannotFindHost, .dnsLookupFailed,
+             .timedOut, .networkConnectionLost, .cannotLoadFromNetwork:
+            return true
+        default:
+            return false
+        }
     }
 
     /// Turn opaque networking failures into messages that say what to actually fix.
@@ -119,7 +163,8 @@ struct APIClient {
 final class AppState: ObservableObject {
     // On the simulator, localhost genuinely is the dev Mac — keep the convenient
     // default there. On a real phone localhost is the phone itself, which is a
-    // trap: default to unconfigured and guide the user instead.
+    // trap: start unconfigured and let BackendLocator find the server on the
+    // network, so nobody has to know an address to sign in.
     #if targetEnvironment(simulator)
     static let defaultBaseURL = "http://localhost:8787"
     #else
@@ -144,6 +189,9 @@ final class AppState: ObservableObject {
 
     @Published var isSignedIn: Bool = false
     @Published var isDemo: Bool = false
+    /// True while the app is looking for the backend on the network, so the
+    /// sign-in screen can say what it is doing instead of appearing to hang.
+    @Published var isLocatingBackend = false
     /// Explains an involuntary sign-out on the auth screen, so a rotated server
     /// secret or an expired token doesn't just silently dump the user to login.
     @Published var signOutNotice: String?
@@ -169,8 +217,33 @@ final class AppState: ObservableObject {
     var api: APIClient {
         APIClient(
             baseURL: baseURLString.isEmpty ? nil : URL(string: baseURLString),
-            token: storedToken.isEmpty ? nil : storedToken
+            token: storedToken.isEmpty ? nil : storedToken,
+            relocate: { [weak self] in await self?.relocateBackend() ?? nil }
         )
+    }
+
+    /// Point the app at a backend that is answering, without asking anyone.
+    ///
+    /// Runs before sign-in. A saved address wins whenever it still works, so a
+    /// deployed public backend entered once is never quietly swapped for whatever
+    /// happens to be on the local Wi-Fi.
+    func ensureBackend() async {
+        guard !isDemo else { return }
+        isLocatingBackend = true
+        defer { isLocatingBackend = false }
+        guard let found = await BackendLocator.shared.locate(saved: baseURLString) else { return }
+        if found != baseURLString { baseURLString = found }
+    }
+
+    /// The saved address just failed. Search the network and remember where the
+    /// server moved to, so the next request goes straight there.
+    func relocateBackend() async -> URL? {
+        guard !isDemo else { return nil }
+        isLocatingBackend = true
+        defer { isLocatingBackend = false }
+        guard let found = await BackendLocator.shared.search() else { return nil }
+        baseURLString = found
+        return URL(string: found)
     }
 
     /// The single access point views use — the real cloud, or the built-in demo device.

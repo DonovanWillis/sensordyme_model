@@ -19,17 +19,19 @@ Create device: .venv/bin/python cloud/manage.py create-device "Car unit"
 
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import json
 import os
 import secrets
 import sqlite3
 import time
-from contextlib import contextmanager
+from contextlib import asynccontextmanager, contextmanager
 from pathlib import Path
 from typing import Optional
 
 import jwt
+from cloud import mdns
 from cloud.notify import COOLDOWN_S as NOTIFY_COOLDOWN_S, gate
 from core.presets import resolve_preset, same_preset
 from fastapi import Depends, FastAPI, Header, HTTPException
@@ -83,7 +85,28 @@ def _load_jwt_secret() -> str:
 
 JWT_SECRET = _load_jwt_secret()
 
-app = FastAPI(title="SensorDyme Cloud", version="0.1")
+@asynccontextmanager
+async def _lifespan(_app: FastAPI):
+    """Announce this server on the local network for as long as it is running.
+
+    This is what lets a phone sign in without being told an address (see
+    cloud/mdns.py). It is deliberately best-effort: if it fails, the server still
+    serves, and Settings still accepts a typed-in address.
+    """
+    advertiser = mdns.Advertiser(mdns.advertised_port()) if mdns.enabled() else None
+    # Registering probes the network for name conflicts and takes a couple of
+    # seconds. On the event loop that is two seconds during which the server is
+    # started but answering nothing, so it goes to a thread.
+    if advertiser is not None:
+        await asyncio.to_thread(advertiser.start)
+    try:
+        yield
+    finally:
+        if advertiser is not None:
+            await asyncio.to_thread(advertiser.stop)
+
+
+app = FastAPI(title="SensorDyme Cloud", version="0.1", lifespan=_lifespan)
 
 
 # ------------------------------------------------------------------------- storage

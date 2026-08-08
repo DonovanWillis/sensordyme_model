@@ -21,7 +21,23 @@ SENSORDYME_JWT_SECRET="$(cat .secrets/jwt_secret)" \
   .venv/bin/uvicorn cloud.app:app --host 0.0.0.0 --port 8787
 ```
 
-Then point the app at `http://<your-mac-ip>:8787` in Settings → Cloud backend.
+You should not have to tell the app where that is. Bound to all interfaces, the
+server announces itself on the LAN as `_sensordyme-api._tcp` (cloud/mdns.py) and
+the app finds it — which is what lets a new phone sign in with only an email and a
+password, and what stops a DHCP change from looking like a broken app. Settings →
+Cloud backend is still there for a server discovery cannot reach, such as a
+deployed public URL, and an address typed in there always wins while it answers.
+
+Two environment variables shape the announcement:
+
+| Variable | Default | Why you would set it |
+| --- | --- | --- |
+| `SENSORDYME_PORT` | `8787` | uvicorn owns the real port and does not tell the app which one it chose. **Run on a non-default port and you must set this too** — announcing the wrong port is worse than not announcing, because it sends the app somewhere definite and wrong. |
+| `SENSORDYME_MDNS` | `1` | Set to `0` on a deployed server, where announcing to the datacentre LAN is pointless. |
+
+Announcing is best-effort: if `zeroconf` is missing or the network refuses, the
+server logs a warning, serves normally, and the app falls back to Settings.
+
 Changing the secret invalidates existing tokens — the app will ask you to sign in again.
 
 ## Provision a device

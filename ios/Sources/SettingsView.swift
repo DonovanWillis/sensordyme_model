@@ -12,6 +12,7 @@ struct SettingsView: View {
     @State private var phoneSaved = false
     @State private var health: DeviceHealth?
     @State private var healthError: String?
+    @State private var findMessage: String?
 
     var body: some View {
         NavigationStack {
@@ -43,11 +44,26 @@ struct SettingsView: View {
                 }
 
                 Section("Cloud backend") {
-                    TextField("http://192.168.1.x:8787", text: state.$baseURLString)
+                    TextField("Found automatically", text: state.$baseURLString)
                         .keyboardType(.URL)
                         .autocapitalization(.none)
                         .autocorrectionDisabled()
-                    Text("Where cloud/app.py runs — your server's public URL, or your Mac's LAN address while developing. (Not \"localhost\": on a phone that means the phone itself.)")
+                    Button {
+                        Task { await findBackend() }
+                    } label: {
+                        if state.isLocatingBackend {
+                            Label("Searching this network…", systemImage: "antenna.radiowaves.left.and.right")
+                        } else {
+                            Label("Find my server on this network", systemImage: "antenna.radiowaves.left.and.right")
+                        }
+                    }
+                    .disabled(state.isLocatingBackend)
+                    if let findMessage {
+                        Text(findMessage)
+                            .font(.footnote)
+                            .foregroundStyle(SD.Colors.textSecondary)
+                    }
+                    Text("Leave this empty and SensorDyme finds the server on your Wi-Fi by itself — and finds it again if its address changes. Fill it in only to point somewhere the app cannot discover, such as a deployed public URL; a typed-in address is then used exactly as written. (Not \"localhost\": on a phone that means the phone itself.)")
                         .font(.footnote)
                         .foregroundStyle(SD.Colors.textSecondary)
                 }
@@ -183,6 +199,21 @@ struct SettingsView: View {
             }
             .navigationTitle("Settings")
             .sheet(isPresented: $showSetup) { SetupFlowView() }
+        }
+    }
+
+    /// Search the network on demand, and say what happened either way.
+    ///
+    /// Ignores whatever is currently saved: the reason to press this button is
+    /// that the saved address is wrong, so confirming it is not an answer.
+    private func findBackend() async {
+        findMessage = nil
+        if let found = await BackendLocator.shared.search() {
+            state.baseURLString = found
+            findMessage = "Found your server at \(found)."
+        } else {
+            findMessage = BackendLocator.shared.problem
+                ?? "No SensorDyme server answered on this Wi-Fi. Check that it is running and that this phone is on the same network."
         }
     }
 

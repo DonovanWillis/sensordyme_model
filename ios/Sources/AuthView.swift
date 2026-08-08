@@ -38,6 +38,16 @@ struct AuthView: View {
 
                         credentialsCard
 
+                        // The address is found on the network, not typed in, so
+                        // say so while it happens — otherwise the first seconds
+                        // on a new phone look like a frozen screen.
+                        if state.isLocatingBackend {
+                            Label("Finding your SensorDyme server…", systemImage: "antenna.radiowaves.left.and.right")
+                                .font(SD.Typography.caption)
+                                .foregroundStyle(SD.Colors.textTertiary)
+                                .frame(maxWidth: .infinity, alignment: .leading)
+                        }
+
                         if let errorMessage {
                             Label(errorMessage, systemImage: "exclamationmark.circle.fill")
                                 .font(SD.Typography.callout)
@@ -98,6 +108,9 @@ struct AuthView: View {
             }
         }
         .tint(SD.Colors.accent)
+        // Look for the server while the user is still typing, so signing in is
+        // usually instant rather than paying for the search after the tap.
+        .task { await state.ensureBackend() }
     }
 
     private var credentialsCard: some View {

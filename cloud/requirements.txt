@@ -4,6 +4,10 @@ fastapi==0.115.*
 uvicorn[standard]==0.32.*
 pyjwt==2.*
 requests==2.*
+# Announces the backend on the LAN (_sensordyme-cloud._tcp) so the app can find it
+# without anyone typing an address. Optional: cloud/mdns.py degrades to a warning
+# if it is missing, and a deployment with a real public address does not need it.
+zeroconf==0.132.*
 
 # Jupiter (local model) needs no extra package here — it speaks HTTP to a model
 # server, which keeps the API process light and restartable.

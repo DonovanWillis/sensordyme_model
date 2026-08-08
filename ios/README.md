@@ -21,9 +21,20 @@ The simulator reaches your Mac's backend at the default `http://localhost:8787`
 
 ## On a real iPhone
 
-Set your Team under Signing & Capabilities in Xcode, and point Settings → Cloud
-backend at a reachable URL (your deployed backend, or your Mac's LAN IP while
-developing).
+Set your Team under Signing & Capabilities in Xcode. You should not need to set a
+backend address: the server announces itself on the local network
+(`_sensordyme-api._tcp`, see cloud/mdns.py) and the app finds it. That is what
+lets a brand-new phone sign in with nothing but an email and a password, and it
+is also what heals the address when DHCP moves the server.
+
+Settings → Cloud backend remains, for the one case discovery cannot cover: a
+backend that is not on this network — a deployed public URL, say. An address
+typed in there is used exactly as written and is never replaced while it answers;
+discovery only takes over once it stops.
+
+Worth being precise about the limit: mDNS is link-local, so this makes the
+address irrelevant *on the server's network* and does nothing off it. Signing in
+over cellular still needs a backend with a real public address.
 
 ## Device connection features
 

@@ -16,9 +16,13 @@ targets:
         UILaunchScreen: {}
         NSAppTransportSecurity:
           NSAllowsArbitraryLoads: true # dev builds talk to http://localhost / LAN IPs; tighten before App Store
-        # Local-network + Bonjour: auto-discovering the device dashboard (_sensordyme._tcp)
-        NSLocalNetworkUsageDescription: SensorDyme finds your device on your Wi-Fi to show its live camera feed.
-        NSBonjourServices: [_sensordyme._tcp]
+        # Local-network + Bonjour: the device dashboard (_sensordyme._tcp, published by
+        # scripts/publish_mdns.py) and the cloud backend (_sensordyme-api._tcp, published
+        # by cloud/mdns.py) — the latter is how sign-in works without anyone typing an
+        # address. iOS returns nothing for a service type that is not declared here, and
+        # says nothing about why, so this list must stay in step with both publishers.
+        NSLocalNetworkUsageDescription: SensorDyme finds your device and your server on your Wi-Fi, so you can sign in and see the live feed without typing an address.
+        NSBonjourServices: [_sensordyme._tcp, _sensordyme-api._tcp]
         # Bluetooth: provisioning the device's Wi-Fi when it has no network yet
         NSBluetoothAlwaysUsageDescription: SensorDyme uses Bluetooth to set up your device's Wi-Fi connection.
     settings:
