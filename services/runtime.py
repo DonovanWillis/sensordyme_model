@@ -407,7 +407,10 @@ class DeviceRuntime:
             duration=alert.duration_s,
             confidence=alert.confidence,
             module_name=self.module_name,
-            contributing_signals=alert.description,
+            # message(), not description: for a counting rule the NUMBER is the
+            # answer someone asked for. "7 bottles visible" is what they wanted;
+            # "Count the bottles" is only what they typed.
+            contributing_signals=alert.message(),
         )
         self.logger.log(event)
         self.alert_manager.notify(event)

@@ -33,6 +33,13 @@ struct SetupDebugPanel: View {
                         .foregroundStyle(SD.Colors.textTertiary)
                 }
                 .foregroundStyle(SD.Colors.textSecondary)
+                // The dead-gap bug again, in code written to help debug it.
+                // Without these the target is the chevron glyph and the two
+                // text runs; the wide gap between them — most of the row — is
+                // not hit-testable. .frame before .contentShape, so the shape
+                // covers the enlarged frame rather than the text's height.
+                .frame(minHeight: 44)
+                .contentShape(Rectangle())
             }
             .buttonStyle(.plain)
 

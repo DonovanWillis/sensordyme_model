@@ -387,7 +387,19 @@ struct DeviceDetailView: View {
     }
 
     private func setMode(_ name: String) {
-        guard name != device.activePreset, Preset.split(switchingTo).base.isEmpty else { return }
+        // Only refuse a tap that would change nothing.
+        //
+        // This also required `switchingTo` to be empty, which latched: it was
+        // cleared only when the device echoed back the EXACT string, so on an
+        // offline or slow device — or whenever the device normalised the name,
+        // which "driver_safety" -> "driver_safety:teen_driver" does — it never
+        // cleared, and every mode row and variant chip silently returned for the
+        // rest of the session. The card simply stopped responding, with no
+        // press feedback and no message. That is the "I have to tap twice".
+        //
+        // A second tap re-targets instead. The server is last-write-wins on
+        // desired_preset, so an overlapping request is safe.
+        guard name != device.activePreset else { return }
         switchingTo = name
         Task {
             do {
@@ -403,9 +415,11 @@ struct DeviceDetailView: View {
         do {
             if let fresh = try await state.backend.devices().first(where: { $0.id == device.id }) {
                 device = fresh
-                if let switchingTo, fresh.activePreset == switchingTo {
-                    self.switchingTo = nil
-                }
+                // The server's own pending field, which the app already decodes
+                // and never used. It is cleared alias-awarely by the backend
+                // once the device reports the mode, so this cannot get stuck on
+                // a string mismatch the way exact comparison did.
+                switchingTo = fresh.desiredPreset
             }
             events = try await state.backend.events(deviceID: device.id, limit: 200)
             // The notifier dedupes by event id, so calling this on every poll

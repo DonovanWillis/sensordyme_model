@@ -243,9 +243,13 @@ struct Preset: Identifiable, Hashable {
                           .init(name: "long_haul", title: "Long Haul")]),
         Preset(name: "baby_monitoring", title: "Baby Monitoring",
                subtitle: "Face covered, crying, movement", icon: "figure.child",
-               variants: [.init(name: "newborn", title: "Newborn"),
-                          .init(name: "toddler", title: "Toddler"),
-                          .init(name: "nap_time", title: "Nap Time")]),
+               // Must match presets.yaml. "newborn" and "toddler" were offered
+               // here and exist on no device — tapping them queued a variant
+               // the device could never apply, which the backend then re-sent
+               // for ever. A test now pins this so it cannot drift again.
+               variants: [.init(name: "standard", title: "Standard"),
+                          .init(name: "nap_time", title: "Nap Time"),
+                          .init(name: "play_area", title: "Play Area")]),
         Preset(name: "elderly_monitoring", title: "Elderly Monitoring",
                subtitle: "Fall detection & inactivity", icon: "figure.fall",
                variants: [.init(name: "standard", title: "Standard"),

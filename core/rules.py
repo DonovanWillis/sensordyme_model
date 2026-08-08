@@ -56,6 +56,37 @@ class Alert:
     confidence: float
     duration_s: float
     zone: str = ""
+    # Set only by counting rules. `count` is how many are visible now;
+    # `previous_count` is what it was last reported as, or None the first time.
+    # Carried so the message can say what changed rather than only what is.
+    count: Optional[int] = None
+    previous_count: Optional[int] = None
+
+    def message(self) -> str:
+        """One sentence a person can read on a lock screen.
+
+        Counting rules say the number, because the number IS the answer someone
+        asked for — "7 bottles visible" rather than "bottle rule triggered".
+        """
+        if self.count is None:
+            return self.description
+        noun = self.detection if self.count == 1 else _plural(self.detection)
+        if self.previous_count is None:
+            return f"{self.count} {noun} visible"
+        if self.count > self.previous_count:
+            return f"{self.count} {noun} visible (was {self.previous_count})"
+        if self.count == 0:
+            return f"No {_plural(self.detection)} visible now (was {self.previous_count})"
+        return f"{self.count} {noun} visible (was {self.previous_count})"
+
+
+def _plural(noun: str) -> str:
+    """Good enough for the object labels a detector emits."""
+    if noun.endswith(("s", "x", "z", "ch", "sh")):
+        return noun + "es"
+    if noun.endswith("y") and len(noun) > 1 and noun[-2] not in "aeiou":
+        return noun[:-1] + "ies"
+    return noun + "s"
 
 
 def _boxes_overlap(a: tuple, b: tuple) -> bool:
@@ -106,7 +137,7 @@ class ConfiguredRule:
     rule_id: str
     detection: str          # the object label to watch ("person", "dog")
     description: str
-    predicate: str = "present"  # present | absent | in_zone | near | holding
+    predicate: str = "present"  # present | absent | in_zone | near | holding | count
     secondary: str = ""     # second object, for relational predicates
     zone: str = ""
     severity: str = "warning"
@@ -169,6 +200,45 @@ class ConfiguredRule:
         )
 
 
+class _CountWatcher:
+    """Tracks one counting rule, and reports only when the number settles anew.
+
+    Counting has a different shape from the other predicates. "Is a person
+    present" is a condition that becomes true and later false; "how many bottles
+    are there" is a value, and a value is worth mentioning when it CHANGES.
+
+    Reporting every frame would be hundreds of identical notifications. Reporting
+    every change would fire on detector flicker — one frame where a bottle is
+    occluded reads as 4, then 5, then 4 again. So a new number has to hold for
+    the rule's persistence window before it counts as real.
+    """
+
+    def __init__(self, persist_s: float) -> None:
+        self._persist_s = persist_s
+        self._reported: Optional[int] = None
+        self._candidate: Optional[int] = None
+        self._candidate_since: float = 0.0
+
+    def observe(self, count: int, now: float) -> Optional[tuple[int, Optional[int]]]:
+        """Feed one frame's count. Returns (count, previous) when worth saying."""
+        if count != self._candidate:
+            self._candidate = count
+            self._candidate_since = now
+            return None
+        if now - self._candidate_since < self._persist_s:
+            return None
+        if count == self._reported:
+            return None
+        first_report = self._reported is None
+        previous, self._reported = self._reported, count
+        if first_report and count == 0:
+            # Starting up pointed at an empty room is not news. Record it as the
+            # baseline so a later arrival reads "2 people visible (was 0)", but
+            # do not announce that nothing is there.
+            return None
+        return count, previous
+
+
 class RuleEngine:
     """Evaluates AI-configured rules against per-frame observations."""
 
@@ -182,6 +252,8 @@ class RuleEngine:
         self._zones = {z.name: z for z in (zones or [])}
         self._rules: dict[str, ConfiguredRule] = {}
         self._engine = EventEngine({})
+        self._counters: dict[str, _CountWatcher] = {}
+        self._persist: dict[str, float] = {}
         self.replace_rules(raw_rules or [])
 
     # ------------------------------------------------------------------ configuration
@@ -189,6 +261,11 @@ class RuleEngine:
         """Hot-swap the rule set (a new proposal arrived from the app)."""
         self._rules = {}
         self._engine = EventEngine({})  # drop in-flight tracks; they belong to old rules
+        # Counting state belongs to the old rules too. Keeping it would make a
+        # brand-new rule report "5 bottles (was 3)" from a previous
+        # configuration's history, which is a fact about nothing.
+        self._counters = {}
+        self._persist = {}
         for index, raw in enumerate(raw_rules or []):
             if not isinstance(raw, dict):
                 continue
@@ -196,7 +273,17 @@ class RuleEngine:
             if rule is None:
                 continue
             self._rules[rule.rule_id] = rule
-            self._engine.add_rule(rule.spec(raw))
+            spec = rule.spec(raw)
+            self._persist[rule.rule_id] = spec.persist_s
+            self._engine.add_rule(spec)
+
+    def _persist_for(self, rule: ConfiguredRule) -> float:
+        """How long a new count must hold before it is believed.
+
+        Same window the rule uses for everything else, so one setting governs
+        how twitchy the rule is rather than two that can disagree.
+        """
+        return self._persist.get(rule.rule_id, 2.0)
 
     def set_zones(self, zones: list[Zone]) -> None:
         self._zones = {z.name: z for z in (zones or [])}
@@ -274,6 +361,34 @@ class RuleEngine:
         for rule in self._rules.values():
             seen = rule.detection in frame.labels()
             boxes = frame.boxes(rule.detection)
+
+            # Counting is a value, not a condition, so it does not go through
+            # the event engine at all. "Is a person present" becomes true and
+            # later false; "how many bottles are there" is a number that is
+            # worth mentioning when it changes.
+            if rule.predicate == "count":
+                watcher = self._counters.get(rule.rule_id)
+                if watcher is None:
+                    watcher = self._counters[rule.rule_id] = _CountWatcher(
+                        self._persist_for(rule)
+                    )
+                settled = watcher.observe(frame.count(rule.detection), now)
+                if settled is not None and rule.notify != "silent":
+                    count, previous = settled
+                    alerts.append(Alert(
+                        rule_id=rule.rule_id,
+                        detection=rule.detection,
+                        description=rule.description,
+                        severity=rule.severity,
+                        notify=rule.notify,
+                        confidence=frame.mean_confidence(rule.detection) if seen else 1.0,
+                        duration_s=0.0,
+                        zone=rule.zone,
+                        count=count,
+                        previous_count=previous,
+                    ))
+                continue
+
             active = self._evaluate(rule, frame, seen, boxes)
 
             if active and not _in_window(rule.schedule, minute_of_day):
