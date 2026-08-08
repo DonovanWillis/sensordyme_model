@@ -30,6 +30,7 @@ from pathlib import Path
 from typing import Optional
 
 import jwt
+from cloud.notify import COOLDOWN_S as NOTIFY_COOLDOWN_S, gate
 from core.presets import resolve_preset, same_preset
 from fastapi import Depends, FastAPI, Header, HTTPException
 from pydantic import BaseModel
@@ -1029,12 +1030,25 @@ def ingest(body: IngestBody, device: sqlite3.Row = Depends(current_device)):
             conn.execute("UPDATE devices SET desired_preset = NULL WHERE id = ?", (device["id"],))
             desired = None
 
+    # Push is the path that works when the app is closed, so it is the path
+    # that most needs a filter. It had none: every "loud" event became a push,
+    # which on a real device is around 960 in two days. The app filtered
+    # locally, the server did not, so the channel that reaches someone when
+    # they are NOT looking was the unfiltered one.
+    #
+    # Every event is still stored above and still appears in the timeline. This
+    # decides interruptions only.
     for e in body.events:
-        if e.get("severity") == "loud" and owner is not None:
-            title = f"SensorDyme: {e.get('type', 'alert')}"
-            detail = str(e.get("signals", "")) or "alert"
-            send_push(owner, title, detail)
-            send_sms(owner, f"{title} — {detail} ({device['name']})")
+        owner_id = owner["id"] if owner is not None else None
+        send, held = gate.evaluate(owner_id, str(e.get("severity", "")))
+        if not send:
+            continue
+        title = f"SensorDyme: {e.get('type', 'alert')}"
+        detail = str(e.get("signals", "")) or "alert"
+        if held:
+            detail += f" (and {held} more in the last {int(NOTIFY_COOLDOWN_S)}s)"
+        send_push(owner, title, detail)
+        send_sms(owner, f"{title} — {detail} ({device['name']})")
 
     command = None
     if desired and desired != (body.active_preset or device["active_preset"]):

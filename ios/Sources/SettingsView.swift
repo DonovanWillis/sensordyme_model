@@ -170,32 +170,7 @@ struct SettingsView: View {
                         .foregroundStyle(SD.Colors.textSecondary)
                 }
 
-                Section("Push notifications") {
-                    TextField("your-secret-ntfy-topic", text: $ntfyTopic)
-                        .autocapitalization(.none)
-                        .autocorrectionDisabled()
-                    Button("Save topic") {
-                        Task {
-                            do {
-                                try await state.backend.setNtfyTopic(ntfyTopic)
-                                savedMessage = "Saved. Subscribe to this topic in the ntfy app to receive alerts."
-                                errorMessage = nil
-                            } catch {
-                                errorMessage = error.localizedDescription
-                            }
-                        }
-                    }
-                    .disabled(ntfyTopic.isEmpty)
-                    Text("Loud alerts push via ntfy.sh today (install the free ntfy app and subscribe to your topic). Native APNs push replaces this for the App Store build.")
-                        .font(.footnote)
-                        .foregroundStyle(SD.Colors.textSecondary)
-                    if let savedMessage {
-                        Text(savedMessage).font(.footnote).foregroundStyle(SD.Colors.success)
-                    }
-                    if let errorMessage {
-                        Text(errorMessage).font(.footnote).foregroundStyle(SD.Colors.danger)
-                    }
-                }
+                BackgroundAlertsSection(topic: $ntfyTopic)
 
                 if state.isSignedIn {
                     Section("Account") {
