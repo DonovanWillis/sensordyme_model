@@ -32,6 +32,7 @@ class CloudUplink:
         # Rule set currently enforced, reported upstream so the backend only
         # re-sends on a real change instead of on every poll.
         self._rules_version: str = ""
+        self._rules_instruction: str = ""
         self._pending_rules: Optional[list[dict]] = None
         self._health: Optional[dict] = None
         self._zones_version: str = ""
@@ -92,6 +93,21 @@ class CloudUplink:
         with self._lock:
             pending, self._pending_zones = self._pending_zones, None
             return pending
+
+    def rules_version(self) -> str:
+        """The version the backend last sent, so the stored copy can be tagged."""
+        with self._lock:
+            return self._rules_version
+
+    def pending_instruction(self) -> str:
+        """The sentence a person typed, if the backend sent one along.
+
+        Kept beside the rules because a rule list is what the machine executes
+        and the sentence is what someone recognises when the app asks them to
+        confirm the device is watching the right thing.
+        """
+        with self._lock:
+            return self._rules_instruction
 
     def pop_pending_rules(self) -> Optional[list[dict]]:
         """AI-configured rules awaiting the main loop, if a new set arrived.
@@ -156,6 +172,7 @@ class CloudUplink:
                         # its next tick, and re-sending every poll until then
                         # would restart in-flight rule tracking each time.
                         self._rules_version = str(command.get("rules_version") or "")
+                        self._rules_instruction = str(command.get("rules_instruction") or "")
                 if "set_zones" in command:
                     zones = command.get("set_zones")
                     with self._lock:

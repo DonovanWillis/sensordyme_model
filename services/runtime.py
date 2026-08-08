@@ -41,6 +41,7 @@ from core.logging_setup import get_logger, setup_logging
 from core import device_health
 from core.network import WifiManager, nmcli_available
 from core.dataset import CaptureStore
+from core.monitoring_config import load_or_empty
 from core.rules import RuleEngine
 from core.telemetry import TelemetryLogger
 from core.zones import load_zones
@@ -117,6 +118,16 @@ class DeviceRuntime:
         # AI-configured rules. Zones come from the active module's config, so a
         # rule naming "pool" resolves against the same polygon the module draws.
         self.rule_engine = RuleEngine(zones=self._zones_for_module(module_name))
+
+        # What someone configured survives the device being switched off.
+        #
+        # Rules used to arrive only from the cloud and live only in memory, so a
+        # reboot silently emptied them and a device with no Wi-Fi could never be
+        # configured at all. Restoring here means the device wakes up watching
+        # what it was asked to watch, with or without a network.
+        self.monitoring = load_or_empty()
+        if self.monitoring.rules:
+            self.rule_engine.replace_rules(self.monitoring.rules)
 
         # Opt-in training capture. Disabled unless config says otherwise, and
         # local-only either way — nothing here can upload.
@@ -532,6 +543,12 @@ class DeviceRuntime:
                 new_rules = self.uplink.pop_pending_rules()
                 if new_rules is not None:
                     self.rule_engine.replace_rules(new_rules)
+                    # Written down as it arrives, so the next boot still has it.
+                    self.monitoring.save(
+                        new_rules,
+                        instruction=self.uplink.pending_instruction(),
+                        version=self.uplink.rules_version(),
+                    )
                     self._apply_requested_labels()
                     pending_zones = self.rule_engine.pending_zones()
                     print(
@@ -542,6 +559,18 @@ class DeviceRuntime:
             with self._module_lock:
                 module = self.module
             events = module.process(frame)
+
+            # A custom configuration REPLACES the base mode rather than running
+            # beside it.
+            #
+            # Both used to run at once, so someone who asked "count the bottles"
+            # kept receiving drowsiness and phone-use alerts they had not asked
+            # for — and paid for that detection in CPU and heat. The module still
+            # runs, because its per-frame detections are what the rules are
+            # evaluated against; what is suppressed is its own opinion about what
+            # deserves an alert.
+            if self.monitoring.active:
+                events = []
             evidence_due = False
             for event in events:
                 self.logger.log(event)

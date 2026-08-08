@@ -1061,6 +1061,15 @@ def ingest(body: IngestBody, device: sqlite3.Row = Depends(current_device)):
     if version and version != (body.rules_version or ""):
         command = dict(command or {})
         command["set_rules"] = _rules_payload(ai_rules_json)
+        # Send what the rules are FOR, not only what they are. The device shows
+        # this back to the person so they can confirm it is watching the right
+        # thing; without it the device stores rules with no idea what they mean.
+        try:
+            command["rules_instruction"] = str(
+                (json.loads(ai_rules_json) or {}).get("explanation") or ""
+            )
+        except (TypeError, ValueError):
+            command["rules_instruction"] = ""
         command["rules_version"] = version
 
     # Zones travel the same way rules do. A zone rule without its polygon is
