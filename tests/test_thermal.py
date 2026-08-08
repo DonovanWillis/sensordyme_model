@@ -87,3 +87,30 @@ def test_the_snapshot_reports_headroom_not_just_temperature(monkeypatch):
     assert snap["cpu_temp_c"] == 68.0
     assert snap["headroom_c"] == 12.0
     assert snap["fan"]["spinning"] is True
+
+
+def test_under_voltage_is_reported_and_outranks_temperature(monkeypatch):
+    """These bits were parsed and never read by anything, so the one fault a
+    power-hungry peripheral actually causes was the one the device could not
+    report. Brownout-corrupted SD cards are this build's known field killer."""
+    fake(monkeypatch, temp=55.0)
+    monkeypatch.setattr(thermal, "throttling", lambda: {
+        "available": True, "raw": "0x1", "throttled_now": False, "capped_now": False,
+        "under_voltage_now": True, "throttled_since_boot": False,
+        "under_voltage_since_boot": True,
+    })
+    healthy, detail = status()
+    assert healthy is False
+    assert "power supply" in detail.lower() or "sagging" in detail.lower()
+
+
+def test_a_past_voltage_sag_is_reported_without_failing(monkeypatch):
+    fake(monkeypatch, temp=60.0)
+    monkeypatch.setattr(thermal, "throttling", lambda: {
+        "available": True, "raw": "0x10000", "throttled_now": False, "capped_now": False,
+        "under_voltage_now": False, "throttled_since_boot": False,
+        "under_voltage_since_boot": True,
+    })
+    healthy, detail = status()
+    assert healthy is True
+    assert "sagged" in detail

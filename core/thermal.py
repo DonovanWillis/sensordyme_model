@@ -143,6 +143,17 @@ def status() -> tuple[bool, str]:
             f"(duty {state['duty']}) — check it is plugged into the fan header"
         )
 
+    # Under-voltage before temperature: a sagging supply is the more urgent
+    # fault and the more likely one once peripherals are added. These bits were
+    # parsed and then never read by anything — so the single failure mode that
+    # a power-hungry add-on would cause was the one thing the device could not
+    # report. Corrupted SD cards from brownouts are this build's known field
+    # killer; detecting them cannot be dead code.
+    if limits.get("under_voltage_now"):
+        return False, (
+            "the power supply is sagging under load — use a 5V/5A supply, and give any "
+            "USB peripheral its own power"
+        )
     if limits.get("throttled_now"):
         return False, f"{temp:.1f}°C — the firmware is throttling to protect the hardware"
 
@@ -151,6 +162,8 @@ def status() -> tuple[bool, str]:
         detail += f", fan {state['rpm']} rpm (level {state['level']}/{state['level_max']})"
     if temp >= WARN_C:
         return True, detail + f" — warm; throttling starts at {SOFT_THROTTLE_C:.0f}°C"
+    if limits.get("under_voltage_since_boot"):
+        return True, detail + " — but the supply has sagged at least once since boot"
     if limits.get("throttled_since_boot"):
         return True, detail + " — has throttled since boot"
     return True, detail + f", {SOFT_THROTTLE_C - temp:.0f}°C below throttling"
