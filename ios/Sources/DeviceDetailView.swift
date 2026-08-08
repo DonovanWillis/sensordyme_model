@@ -21,10 +21,16 @@ struct DeviceDetailView: View {
     private let refreshTimer = Timer.publish(every: 4, on: .main, in: .common).autoconnect()
 
     /// A loud alert in the last minute lights up the feed border + status.
+    /// Whether to show the red alert state.
+    ///
+    /// Matches what the notification layer decides, so the screen and the phone
+    /// never disagree about the same moment. Testing severity alone excluded
+    /// configured rules — which default to "warning" -> "soft" — so someone who
+    /// said "alert me when you see a bottle" got a notification about it and a
+    /// perfectly calm screen.
     private var alertActive: Bool {
-        guard let latest = events.first(where: { $0.severity == "loud" }), let date = latest.date else {
-            return false
-        }
+        let latest = events.first { $0.isCritical || $0.isConfigured }
+        guard let latest, let date = latest.date else { return false }
         return Date().timeIntervalSince(date) < 60
     }
 

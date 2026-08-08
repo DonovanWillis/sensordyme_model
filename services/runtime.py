@@ -694,7 +694,12 @@ class DeviceRuntime:
                     time.monotonic(), datetime.now(timezone.utc).isoformat(), self.module_name, snapshot
                 )
             if self.dashboard is not None:
-                self.dashboard.push_status(module.is_alert_active(), snapshot)
+                # Either source can raise the alert state. A configured rule is
+                # someone explicitly asking to be alerted, so it must drive the
+                # red screen exactly as a preset's own detection does — the
+                # module's own opinion is not the only one that counts.
+                alert_active = module.is_alert_active() or self.rule_engine.is_alert_active()
+                self.dashboard.push_status(alert_active, snapshot)
 
             # Annotate + encode only when someone is watching, and never faster than
             # stream_fps — inference cadence and stream cadence are decoupled, so a

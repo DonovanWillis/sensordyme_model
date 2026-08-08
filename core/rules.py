@@ -295,6 +295,16 @@ class RuleEngine:
     def rules_for(self, detection: str) -> list[ConfiguredRule]:
         return [r for r in self._rules.values() if r.detection == detection]
 
+    def is_alert_active(self) -> bool:
+        """Whether any configured rule is currently in a confirmed, unresolved state.
+
+        Drives the same red-screen state a preset's own alerts do. Someone who
+        said "alert me when you see a bottle" asked for an alert, and it should
+        look like one — the picture and the notification describing the same
+        moment must not disagree about whether it is serious.
+        """
+        return bool(self._engine.active_detections())
+
     def pending_zones(self) -> list[str]:
         """Zones rules reference that the user hasn't drawn yet.
 

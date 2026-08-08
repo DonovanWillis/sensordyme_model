@@ -173,15 +173,54 @@ class OccupancyModule(VisionModule):
         )
 
     def annotate(self, frame: np.ndarray) -> np.ndarray:
-        """Draw zones, a box per detected person, and the current count."""
+        """Draw zones, and each detection labelled with what it actually is.
+
+        Every box used to be drawn in one colour under a "People: N" header,
+        because this began as a person counter. It is now also the detector
+        behind AI custom monitoring, where the whole point is that someone asked
+        about bottles or phones — so a bottle appeared in a box captioned
+        "People", which is the picture contradicting the notification sent about
+        the same frame.
+
+        The labels were always available; annotate simply threw them away.
+        """
         h, w = frame.shape[:2]
         for zone in self._zones:
             pts = np.array([[int(x * w), int(y * h)] for x, y in zone.polygon], dtype=np.int32)
             cv2.polylines(frame, [pts], isClosed=True, color=(0, 0, 220), thickness=2)
             cv2.putText(frame, zone.name, tuple(pts[0]), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 0, 220), 1)
-        for (x1, y1, x2, y2) in self._last_boxes:
-            cv2.rectangle(frame, (x1, y1), (x2, y2), (0, 200, 0), 2)
-        cv2.putText(
-            frame, f"People: {len(self._last_boxes)}", (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 200, 0), 2
-        )
+
+        labels = self._last_labels or []
+        for index, (x1, y1, x2, y2) in enumerate(self._last_boxes):
+            label = labels[index] if index < len(labels) else "object"
+            # What someone explicitly asked about is drawn in the alert colour,
+            # so the frame agrees with the alert rather than needing to be read
+            # alongside it.
+            requested = label in self._extra_labels
+            colour = (0, 0, 235) if requested else (0, 200, 0)   # BGR
+            cv2.rectangle(frame, (x1, y1), (x2, y2), colour, 3 if requested else 2)
+            caption = label.title()
+            (tw, th), _ = cv2.getTextSize(caption, cv2.FONT_HERSHEY_SIMPLEX, 0.55, 2)
+            # Filled plate behind the text: a thin label over a busy scene is
+            # unreadable exactly when someone is trying to check what fired.
+            cv2.rectangle(frame, (x1, max(0, y1 - th - 8)), (x1 + tw + 8, y1), colour, -1)
+            cv2.putText(frame, caption, (x1 + 4, max(th, y1 - 5)),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.55, (255, 255, 255), 2)
+
+        cv2.putText(frame, self._headline(labels), (10, 30),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 200, 0), 2)
         return frame
+
+    def _headline(self, labels: list[str]) -> str:
+        """A caption describing what is actually on screen.
+
+        "People: 0" while a bottle sits in a box is worse than no caption: it is
+        a specific, confident, wrong claim about the picture underneath it.
+        """
+        if self._extra_labels:
+            counts = {
+                name: sum(1 for label in labels if label == name)
+                for name in sorted(self._extra_labels)
+            }
+            return "  ".join(f"{name.title()}: {n}" for name, n in counts.items())
+        return f"People: {sum(1 for label in labels if label == 'person')}"
