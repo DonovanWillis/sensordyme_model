@@ -28,6 +28,7 @@ class CloudUplink:
         self._queue: deque[dict] = deque(maxlen=int(config.get("queue_max", 500)))
         self._lock = threading.Lock()
         self._active_preset: Optional[str] = None
+        self._monitoring: Optional[dict] = None
         self._pending_preset: Optional[str] = None
         # Rule set currently enforced, reported upstream so the backend only
         # re-sends on a real change instead of on every poll.
@@ -63,6 +64,17 @@ class CloudUplink:
                     "severity": severity,
                 }
             )
+
+    def set_monitoring(self, described: Optional[dict]) -> None:
+        """What custom configuration, if any, is currently in charge.
+
+        Reported because the device knowing is not enough: the app was showing
+        the base mode as selected while a custom configuration was the thing
+        actually running, so someone who asked it to count people was told it
+        was watching for driver distraction.
+        """
+        with self._lock:
+            self._monitoring = described
 
     def set_active_preset(self, name: Optional[str]) -> None:
         with self._lock:
@@ -145,6 +157,7 @@ class CloudUplink:
                     rules_version = self._rules_version
                     zones_version = self._zones_version
                     health = self._health
+                    monitoring = self._monitoring
                 # 1) push events (an empty batch doubles as the online heartbeat)
                 resp = self._requests.post(
                     f"{self._base_url}/v1/ingest",
@@ -154,6 +167,7 @@ class CloudUplink:
                         "rules_version": rules_version,
                         "zones_version": zones_version,
                         "health": health,
+                        "monitoring": monitoring,
                     },
                     headers=headers,
                     timeout=10,

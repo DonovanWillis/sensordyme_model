@@ -18,12 +18,43 @@ struct Device: Codable, Identifiable, Hashable {
     /// the backend withholds stale reports rather than let the app render a
     /// healthy camera for a Pi that was unplugged an hour ago.
     let health: DeviceHealthReport?
+    /// The custom configuration the device says is in charge, if any.
+    ///
+    /// When this is active it — not `activePreset` — is what the device is
+    /// really doing. Showing the base mode as selected while a custom
+    /// configuration ran meant someone who asked it to count people was told it
+    /// was watching for driver distraction.
+    let monitoring: CustomMonitoring?
 
     enum CodingKeys: String, CodingKey {
-        case id, name, online, health
+        case id, name, online, health, monitoring
         case activePreset = "active_preset"
         case desiredPreset = "desired_preset"
         case lastSeen = "last_seen"
+    }
+}
+
+/// A custom monitoring configuration, as the device reports it.
+struct CustomMonitoring: Codable, Hashable {
+    /// What the device understood it was asked to watch for. Shown verbatim,
+    /// because it is the sentence the person will recognise.
+    let instruction: String
+    let ruleCount: Int
+    /// Whether it has replaced the base mode rather than running beside it.
+    let active: Bool
+
+    enum CodingKeys: String, CodingKey {
+        case instruction, active
+        case ruleCount = "rule_count"
+    }
+
+    /// What to call it in the UI when there is no instruction recorded — an
+    /// older device, or rules configured before instructions were carried.
+    var title: String { "AI Custom Monitoring" }
+
+    var summary: String {
+        if !instruction.isEmpty { return instruction }
+        return ruleCount == 1 ? "1 custom rule" : "\(ruleCount) custom rules"
     }
 }
 

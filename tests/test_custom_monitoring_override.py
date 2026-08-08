@@ -54,3 +54,22 @@ def test_the_override_survives_a_restart(tmp_path):
     path = tmp_path / "m.json"
     MonitoringConfig(path).save(RULES, instruction="Count the bottles.", overrides_mode=True)
     assert load_or_empty(path).active is True
+
+
+def test_the_device_reports_enough_for_the_app_to_show_the_truth(tmp_path):
+    """The app showed "Driver Safety" selected while a custom configuration was
+    what the device was actually running — because the device never said so.
+    describe() is what closes that gap, so it must carry all three facts."""
+    config = MonitoringConfig(tmp_path / "m.json")
+    config.save(RULES, instruction="Count how many people are visible.")
+
+    described = config.describe()
+    assert described["active"] is True                       # a custom config is in charge
+    assert described["instruction"] == "Count how many people are visible."   # what was asked
+    assert described["rule_count"] == 1                      # something to fall back on
+
+
+def test_a_device_on_its_base_mode_reports_that_honestly(tmp_path):
+    described = MonitoringConfig(tmp_path / "m.json").describe()
+    assert described["active"] is False
+    assert described["instruction"] == ""

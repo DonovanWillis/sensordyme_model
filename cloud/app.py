@@ -117,7 +117,7 @@ def init_db() -> None:
                 id INTEGER PRIMARY KEY, name TEXT NOT NULL,
                 claim_code TEXT UNIQUE NOT NULL, device_key TEXT UNIQUE NOT NULL,
                 owner_id INTEGER REFERENCES users(id),
-                active_preset TEXT, desired_preset TEXT,
+                active_preset TEXT, desired_preset TEXT, monitoring TEXT,
                 last_seen REAL, created_at REAL NOT NULL
             );
             CREATE TABLE IF NOT EXISTS events (
@@ -141,6 +141,10 @@ def init_db() -> None:
             "ALTER TABLE devices ADD COLUMN ai_rules TEXT",  # validated AI-configure proposal (JSON)
             "ALTER TABLE devices ADD COLUMN health TEXT",  # last device-reported health (JSON)
             "ALTER TABLE devices ADD COLUMN zones TEXT",  # user-drawn areas (JSON)
+            # What custom configuration the device says is in charge. Without
+            # this the app showed the base mode as selected while a custom
+            # configuration was the thing actually running.
+            "ALTER TABLE devices ADD COLUMN monitoring TEXT",
         ):
             try:
                 conn.execute(statement)
@@ -318,6 +322,9 @@ class IngestBody(BaseModel):
     # re-deliver rules only when they actually changed, instead of every poll.
     rules_version: Optional[str] = None
     zones_version: Optional[str] = None
+    # What custom configuration the device says is in charge, if any: the
+    # instruction someone typed and whether it is overriding the base mode.
+    monitoring: Optional[dict] = None
 
 
 class AIConfigureBody(BaseModel):
@@ -443,6 +450,7 @@ def list_devices(uid: int = Depends(current_user)):
                 "name": r["name"],
                 "active_preset": r["active_preset"],
                 "desired_preset": r["desired_preset"],
+                "monitoring": json.loads(r["monitoring"]) if r["monitoring"] else None,
                 "online": bool(r["last_seen"] and now - r["last_seen"] < 30),
                 "last_seen": r["last_seen"],
                 # Whatever the device last said about itself. Withheld once the
@@ -986,11 +994,12 @@ def ingest(body: IngestBody, device: sqlite3.Row = Depends(current_device)):
     with db() as conn:
         conn.execute(
             "UPDATE devices SET last_seen = ?, active_preset = COALESCE(?, active_preset),"
-            " health = COALESCE(?, health) WHERE id = ?",
+            " health = COALESCE(?, health), monitoring = COALESCE(?, monitoring) WHERE id = ?",
             (
                 now,
                 body.active_preset,
                 json.dumps(body.health) if body.health is not None else None,
+                json.dumps(body.monitoring) if body.monitoring is not None else None,
                 device["id"],
             ),
         )

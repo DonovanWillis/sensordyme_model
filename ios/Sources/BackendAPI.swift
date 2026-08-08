@@ -318,7 +318,10 @@ final class MockAPI: BackendAPI {
             Device(id: 1, name: deviceName, activePreset: activePreset,
                    desiredPreset: desiredPreset, online: true,
                    lastSeen: Date().timeIntervalSince1970,
-                   health: Self.demoHealth)
+                   health: Self.demoHealth,
+                   // Demo runs a standard mode; a custom configuration in the
+                   // demo would claim a capability nobody had configured.
+                   monitoring: nil)
         ]
     }
 

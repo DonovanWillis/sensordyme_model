@@ -135,9 +135,11 @@ struct DeviceDetailView: View {
                 text: alertActive ? "Alert" : "All clear"
             )
             Spacer()
-            Text(Preset.title(for: device.activePreset))
+            Text(customMonitoringActive
+                 ? (device.monitoring?.title ?? "AI Custom Monitoring")
+                 : Preset.title(for: device.activePreset))
                 .font(SD.Typography.caption.weight(.semibold))
-                .foregroundStyle(SD.Colors.textSecondary)
+                .foregroundStyle(customMonitoringActive ? SD.Colors.accent : SD.Colors.textSecondary)
                 .lineLimit(1)
         }
     }
@@ -253,6 +255,9 @@ struct DeviceDetailView: View {
 
     // MARK: Mode
 
+    /// Whether a custom AI configuration has replaced the base mode.
+    private var customMonitoringActive: Bool { device.monitoring?.active == true }
+
     private var activeBase: String { Preset.split(device.activePreset).base }
     private var activeVariant: String? { Preset.split(device.activePreset).variant }
 
@@ -260,6 +265,43 @@ struct DeviceDetailView: View {
         SDCard {
             VStack(alignment: .leading, spacing: SD.Space.sm) {
                 SDSectionHeader(title: "Monitoring mode")
+
+                // What is ACTUALLY running, when it is not one of the presets
+                // below. The device reports this itself, so it cannot disagree
+                // with what the device is doing.
+                if customMonitoringActive, let custom = device.monitoring {
+                    VStack(alignment: .leading, spacing: SD.Space.xs) {
+                        HStack(spacing: SD.Space.sm) {
+                            Image(systemName: "sparkles")
+                                .frame(width: 26)
+                                .foregroundStyle(SD.Colors.accent)
+                            VStack(alignment: .leading, spacing: 1) {
+                                Text(custom.title)
+                                    .font(SD.Typography.body)
+                                    .foregroundStyle(SD.Colors.textPrimary)
+                                Text("Active — this replaces the modes below")
+                                    .font(SD.Typography.caption)
+                                    .foregroundStyle(SD.Colors.accent)
+                            }
+                            Spacer(minLength: 0)
+                            Image(systemName: "checkmark.circle.fill")
+                                .foregroundStyle(SD.Colors.accent)
+                        }
+
+                        Text(custom.summary)
+                            .font(SD.Typography.callout)
+                            .foregroundStyle(SD.Colors.textSecondary)
+                            .fixedSize(horizontal: false, vertical: true)
+                            .padding(.leading, 26 + SD.Space.sm)
+                    }
+                    .padding(.vertical, SD.Space.xxs)
+
+                    Text("Pick a mode below to go back to standard monitoring.")
+                        .font(SD.Typography.caption)
+                        .foregroundStyle(SD.Colors.textTertiary)
+
+                    Divider().overlay(SD.Colors.border)
+                }
 
                 ForEach(Preset.catalog) { preset in
                     modeRow(preset)
@@ -282,7 +324,10 @@ struct DeviceDetailView: View {
 
     @ViewBuilder
     private func modeRow(_ preset: Preset) -> some View {
-        let isActive = activeBase == preset.name
+        // No base mode is selected while a custom configuration is in charge.
+        // Ticking one alongside a custom config told someone the device was
+        // watching for driver distraction when it was counting people.
+        let isActive = !customMonitoringActive && activeBase == preset.name
         let isSwitching = Preset.split(switchingTo).base == preset.name
 
         VStack(alignment: .leading, spacing: SD.Space.xs) {

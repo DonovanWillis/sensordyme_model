@@ -249,6 +249,10 @@ class DeviceRuntime:
 
             self.uplink = CloudUplink(cloud_cfg)
             self.uplink.set_active_preset(self.active_preset)
+            # Report the restored configuration at startup too, not only when a
+            # new one arrives — otherwise a device that rebooted into a custom
+            # configuration shows the base mode until the next change.
+            self.uplink.set_monitoring(self.monitoring.describe())
             self.uplink.start()
             print(
                 f"SensorDyme: cloud uplink -> {cloud_cfg.get('base_url')} "
@@ -552,6 +556,7 @@ class DeviceRuntime:
                         instruction=self.uplink.pending_instruction(),
                         version=self.uplink.rules_version(),
                     )
+                    self.uplink.set_monitoring(self.monitoring.describe())
                     self._apply_requested_labels()
                     pending_zones = self.rule_engine.pending_zones()
                     print(
