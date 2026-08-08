@@ -16,6 +16,10 @@ struct DevicesView: View {
     @State private var showSetup = false
     @State private var hasLoaded = false
     @StateObject private var link = DeviceLink()
+    @StateObject private var notifier = AlertNotifier.shared
+    /// The device a tapped notification belongs to, so the alert can be opened
+    /// from anywhere in the app rather than only from the device screen.
+    @State private var notificationTarget: Device?
     @StateObject private var refreshing = ProgressTracker()
 
     private let refreshTimer = Timer.publish(every: 10, on: .main, in: .common).autoconnect()
@@ -53,6 +57,16 @@ struct DevicesView: View {
             }
             .background(SD.Colors.background)
             .navigationDestination(for: Device.self) { DeviceDetailView(device: $0) }
+            // A tapped notification opens its device, which then consumes
+            // pendingEventID and shows the alert. Without this the id was set
+            // and nothing was listening unless that screen was already open —
+            // so the tap appeared to do nothing.
+            .navigationDestination(item: $notificationTarget) { DeviceDetailView(device: $0) }
+            .onChange(of: notifier.pendingEventID) { _, id in
+                guard id != nil, notificationTarget == nil else { return }
+                notificationTarget = devices.first(where: { $0.id == notifier.pendingDeviceID })
+                    ?? devices.first
+            }
             .navigationTitle("SensorDyme")
             .navigationBarTitleDisplayMode(.large)
             .toolbar {

@@ -24,8 +24,34 @@ final class AlertNotifier: NSObject, ObservableObject {
 
     /// Set when a notification is tapped, so the app can open that alert.
     @Published var pendingEventID: Int?
+    /// Which device the tapped alert belongs to, so the app can open the right
+    /// one. Carried in the notification's userInfo since it was first posted;
+    /// nothing read it back until tapping had to work from any screen.
+    @Published var pendingDeviceID: Int?
     @Published var authorized = false
     @Published var lastError: String?
+
+    /// Minimum gap between notifications, in seconds.
+    ///
+    /// Not a detection setting. Jupiter keeps detecting and recording at full
+    /// rate; this governs only how often the phone is allowed to interrupt.
+    static let cooldown: TimeInterval = 20
+
+    /// How many red alerts were recorded but not notified because the cooldown
+    /// was active. Shown so the suppression is visible rather than silent —
+    /// "3 more alerts in this period" is information; quietly dropping them is
+    /// the same behaviour without the honesty.
+    @Published private(set) var suppressedDuringCooldown = 0
+
+    /// When the last notification was posted. Persisted so relaunching the app
+    /// during a busy period does not immediately fire another one.
+    private var lastNotifiedAt: Date? {
+        get {
+            let t = UserDefaults.standard.double(forKey: "lastNotifiedAt")
+            return t > 0 ? Date(timeIntervalSince1970: t) : nil
+        }
+        set { UserDefaults.standard.set(newValue?.timeIntervalSince1970 ?? 0, forKey: "lastNotifiedAt") }
+    }
 
     /// Event ids already announced. Persisted because the poller re-reads the
     /// same events every few seconds, and re-announcing them would turn one
@@ -63,28 +89,49 @@ final class AlertNotifier: NSObject, ObservableObject {
     func announce(_ events: [EventItem], device: Device, simulated: Bool) async {
         guard authorized else { return }
         var seen = announced
+        var suppressed = 0
 
         // Oldest first, so a burst arrives in the order it happened.
         for event in events.reversed() {
-            guard let id = event.eventID, !seen.contains(id) else { continue }
-            // Only things worth interrupting someone for. Informational events
-            // belong in the timeline, not on the lock screen — a product that
-            // buzzes for everything gets its notifications switched off.
-            guard event.severityStatus != .online else {
-                seen.insert(id)
-                continue
+            guard let id = event.eventID else { continue }
+
+            // The whole decision lives in NotificationPolicy, which is a pure
+            // function with tests. Inlining it here is how it drifted before:
+            // "not purely informational" quietly admitted both severities, and
+            // on a real device that was 942 "loud" plus 608 "soft" in a day
+            // from a driver-monitor doing exactly its job.
+            let decision = NotificationPolicy.decide(
+                isCritical: event.isCritical,
+                alreadySeen: seen.contains(id),
+                now: Date(),
+                lastNotifiedAt: lastNotifiedAt,
+                cooldown: Self.cooldown
+            )
+            seen.insert(id)   // considered, whatever we decide — never reconsidered
+
+            switch decision {
+            case .notify:
+                await post(event, device: device, simulated: simulated)
+                lastNotifiedAt = Date()
+            case .suppress(.withinCooldown):
+                // Recorded, not interrupted. Already in the event history.
+                suppressed += 1
+            case .suppress:
+                break
             }
-            await post(event, device: device, simulated: simulated)
-            seen.insert(id)
         }
+
         announced = seen
+        if suppressed > 0 {
+            suppressedDuringCooldown += suppressed
+        }
     }
 
     private func post(_ event: EventItem, device: Device, simulated: Bool) async {
         let content = UNMutableNotificationContent()
         content.title = event.isCritical ? "SensorDyme Alert" : "SensorDyme"
         content.subtitle = event.title
-        content.body = body(for: event, device: device)
+        content.body = body(for: event, device: device) + " Tap to view details."
         content.sound = event.isCritical ? .defaultCritical : .default
         content.userInfo = ["eventID": event.eventID ?? -1, "deviceID": device.id]
         content.threadIdentifier = "device-\(device.id)"
@@ -143,6 +190,12 @@ extension AlertNotifier: UNUserNotificationCenterDelegate {
     ) async {
         let info = response.notification.request.content.userInfo
         guard let id = info["eventID"] as? Int, id >= 0 else { return }
-        await MainActor.run { AlertNotifier.shared.pendingEventID = id }
+        // The device id has always been in the payload; read it back so the app
+        // can open the right device from whatever screen it happens to be on.
+        let deviceID = info["deviceID"] as? Int
+        await MainActor.run {
+            AlertNotifier.shared.pendingDeviceID = deviceID
+            AlertNotifier.shared.pendingEventID = id
+        }
     }
 }

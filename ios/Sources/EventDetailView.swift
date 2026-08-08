@@ -16,6 +16,9 @@ struct EventDetailView: View {
     @Environment(\.dismiss) private var dismiss
     let device: Device
     let event: EventItem
+    /// Everything else the device reported, so the alert can be shown in
+    /// context. Passed in rather than re-fetched: the caller already has it.
+    var allEvents: [EventItem] = []
 
     @State private var explanation: AlertExplanation?
     @State private var loading = true
@@ -26,6 +29,11 @@ struct EventDetailView: View {
             ScrollView {
                 VStack(alignment: .leading, spacing: SD.Space.md) {
                     header
+                    // The detections around the alert, including the ones that
+                    // never notified. One interruption, the whole story.
+                    if !allEvents.isEmpty {
+                        SurroundingDetections(alert: event, all: allEvents)
+                    }
                     if loading {
                         SDLoadingState(message: "Working out what happened…")
                     } else if let explanation {

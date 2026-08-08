@@ -99,7 +99,7 @@ struct DeviceDetailView: View {
             ZoneEditorView(device: device)
         }
         .sheet(item: $selectedEvent) { event in
-            EventDetailView(device: device, event: event)
+            EventDetailView(device: device, event: event, allEvents: events)
         }
         .sheet(isPresented: $showDemoTrigger) {
             DemoTriggerView(device: device) { await reload() }
