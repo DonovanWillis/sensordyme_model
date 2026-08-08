@@ -446,9 +446,19 @@ class DeviceRuntime:
     # ------------------------------------------------------------------ preset switching
     def _switch_preset(self, name: str) -> None:
         """Hot-swap the running module to a preset (optionally "preset:variant")."""
+        # Translate superseded names first. A `set_preset` command can have been
+        # sitting in the backend since before a mode was renamed, and the old
+        # code path simply returned on an unknown preset — so the device would
+        # ignore the instruction silently, for ever, with the app showing a mode
+        # the device was never in.
+        from main import resolve_preset
+
+        name = resolve_preset(name, self.presets)
         base_name, _, variant_name = name.partition(":")
         preset = self.presets.get(base_name)
         if preset is None or self.profile == "mac_max":
+            if preset is None:
+                print(f"SensorDyme: ignoring unknown preset '{name}'")
             return
         overrides = {}
         if variant_name:

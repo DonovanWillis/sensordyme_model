@@ -112,6 +112,42 @@ def load_presets(path: Union[str, Path] = "presets.yaml") -> dict:
         return (yaml.safe_load(f) or {}).get("presets", {}) or {}
 
 
+def load_preset_aliases(path: Union[str, Path] = "presets.yaml") -> dict:
+    """Superseded preset names -> their replacement."""
+    path = Path(path)
+    if not path.exists():
+        return {}
+    with path.open() as f:
+        return (yaml.safe_load(f) or {}).get("aliases", {}) or {}
+
+
+def resolve_preset(name: str, presets: dict, aliases: Optional[dict] = None) -> str:
+    """Map a possibly-superseded preset name onto one that exists.
+
+    Renaming a mode strands every device already holding the old name: an
+    unknown preset is a device stuck in a mode it cannot switch out of, and the
+    name can be anywhere — a deployed config.yaml, a `desired_preset` sitting in
+    the backend, a phone that has not been updated. Aliases mean the rename is
+    invisible to all of them.
+
+    A variant suffix ("driver_distraction:teen_driver") is carried across, since
+    the variant belongs to the preset and not to the name it used to have.
+    """
+    if not name:
+        return name
+    base, _, variant = name.partition(":")
+    if base in presets:
+        return name
+    target = (aliases if aliases is not None else load_preset_aliases()).get(base)
+    if target is None or target not in presets:
+        return name
+    # Only keep a variant the replacement actually defines; a variant that no
+    # longer exists would fail later, further from the cause.
+    if variant and variant in (presets[target].get("variants") or {}):
+        return f"{target}:{variant}"
+    return target
+
+
 def alert_types_for(module_name: str, preset: Optional[dict] = None) -> set:
     """The alertable event types for a module, with optional per-preset override."""
     if preset and preset.get("alert_types"):

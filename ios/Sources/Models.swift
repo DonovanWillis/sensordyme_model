@@ -232,16 +232,15 @@ struct Preset: Identifiable, Hashable {
     var id: String { name }
 
     static let catalog: [Preset] = [
-        Preset(name: "driver_distraction", title: "Driver Distraction",
-               subtitle: "Drowsiness, gaze, phone use", icon: "car.fill",
+        // One driver mode. There used to be two, differing only in which
+        // inference engine answered the same question — which is not a decision
+        // a consumer can make, and being asked to is itself a defect.
+        Preset(name: "driver_safety", title: "Driver Safety",
+               subtitle: "Eyes, gaze, phone use & drowsiness", icon: "car.fill",
                variants: [.init(name: "standard", title: "Standard"),
                           .init(name: "strict", title: "Strict"),
                           .init(name: "teen_driver", title: "Teen Driver"),
                           .init(name: "long_haul", title: "Long Haul")]),
-        Preset(name: "driver_distraction_openpilot", title: "Driver (openpilot)",
-               subtitle: "comma.ai's monitoring model", icon: "steeringwheel",
-               variants: [.init(name: "standard", title: "Standard"),
-                          .init(name: "strict", title: "Strict")]),
         Preset(name: "baby_monitoring", title: "Baby Monitoring",
                subtitle: "Face covered, crying, movement", icon: "figure.child",
                variants: [.init(name: "newborn", title: "Newborn"),

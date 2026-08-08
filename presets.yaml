@@ -1,4 +1,11 @@
-# SensorDyme presets: the modes a user can pick from the app / dashboard.
+# SensorDyme # Preset names that have been superseded. A deployed device, or a `desired_preset`
+# already sitting in the backend, can still be holding one of these — and an
+# unknown preset name is a device stuck in a mode it cannot switch out of.
+aliases:
+  driver_distraction: driver_safety
+  driver_distraction_openpilot: driver_safety
+
+presets: the modes a user can pick from the app / dashboard.
 # Each preset names a registered VisionModule (its thresholds stay in config.yaml's
 # modules: section) plus which event types alert in that mode. Switching presets
 # hot-swaps the module on the live camera loop — no restart.
@@ -8,10 +15,27 @@
 # A preset may define `variants`: named tuning profiles selectable from the app as
 # "<preset>:<variant>" (e.g. driver_distraction:teen). A variant's `overrides` are
 # merged over the module's config.yaml block at switch time.
+# Preset names that have been superseded. A deployed device, or a `desired_preset`
+# already sitting in the backend, can still be holding one of these — and an
+# unknown preset name is a device stuck in a mode it cannot switch out of.
+aliases:
+  driver_distraction: driver_safety
+  driver_distraction_openpilot: driver_safety
+
 presets:
-  driver_distraction:
-    title: Driver Distraction
-    description: Drowsiness, gaze, phone use, and risk fusion (the shipping product).
+  # One driver mode, not two.
+  #
+  # There used to be `driver_distraction` and `driver_distraction_openpilot`,
+  # which asked a consumer to choose between two inference engines to answer the
+  # same question — "is this person driving safely". Nobody buying a safety
+  # camera can make that choice, and being asked to is itself a defect.
+  #
+  # The openpilot engine is not deleted: modules/driver_attention_openpilot.py
+  # still exists and is still reachable with `--module` for benchmarking against
+  # comma.ai's model. It is simply no longer a product decision.
+  driver_safety:
+    title: Driver Safety
+    description: Eyes, gaze, head pose, hands, phone use, drowsiness and risk fusion.
     module: driver_attention
     variants:
       standard: { title: Standard }
@@ -24,16 +48,6 @@ presets:
       long_haul:
         title: Long Haul
         overrides: { perclos_threshold: 0.12, perclos_window_s: 45.0 }
-
-  driver_distraction_openpilot:
-    title: Driver Distraction (openpilot)
-    description: comma.ai openpilot's DM model and alert policy, plus phone/eyes-closed flags.
-    module: driver_attention_openpilot
-    variants:
-      standard: { title: Standard }
-      strict:
-        title: Strict
-        overrides: { eyes_closed_seconds: 1.5, phone_use_seconds: 0.8 }
 
   elderly_monitoring:
     title: Elderly Monitoring

@@ -215,7 +215,7 @@ final class MockAPI: BackendAPI {
 
     static let shared = MockAPI()
 
-    private var activePreset = "driver_distraction"
+    private var activePreset = "driver_safety"
     private var desiredPreset: String?
     private var switchRequestedAt: Date?
     private var history: [EventItem] = []
@@ -457,7 +457,7 @@ final class MockAPI: BackendAPI {
         }
         if has("drive", "driving", "car", "phone", "drowsy", "road") {
             return AIProposal(
-                preset: "driver_distraction", variant: "strict",
+                preset: "driver_safety", variant: "strict",
                 explanation: "Switching to Driver Distraction (Strict). Phone use while looking away alerts within a second; quick mirror checks never alarm.",
                 rules: [rule("cell phone", "present", "Alert on phone use while driving",
                              persist: 1, severity: "critical", cooldown: 30)],

@@ -128,10 +128,13 @@ def test_proposal_is_persisted_on_the_device(backend):
 def test_taxonomy_integrity():
     from core import taxonomy
 
-    assert set(taxonomy.TAXONOMY) == {
-        "driver_distraction", "driver_distraction_openpilot", "baby_monitoring",
-        "elderly_monitoring", "security_monitoring",
-    }
+    # Derived from the presets, not hardcoded. The capability sheet describes
+    # the modes on offer, so the two cannot be allowed to drift: a mode with no
+    # sheet has no honest answer about what it can do, and a sheet with no mode
+    # documents something nobody can select.
+    from main import load_presets
+
+    assert set(taxonomy.TAXONOMY) == set(load_presets())
     for mode, detections in taxonomy.TAXONOMY.items():
         ids = [d.id for d in detections]
         assert len(ids) == len(set(ids)), f"duplicate detection ids in {mode}"

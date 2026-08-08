@@ -5,7 +5,7 @@ taxonomy, not this file.* This is the honest contract of what each mode can and 
 detect. ✅ supported today · 🟡 partial (caveats listed) · 🔵 planned · ❌ not possible
 with the current camera/models (what it would need is listed).
 
-## driver_distraction
+## driver_safety
 
 | | Detection | How / Caveat / Requires |
 |---|---|---|
@@ -32,21 +32,6 @@ with the current camera/models (what it would need is listed).
 | 🟡 | Multiple occupants (`occupant_count`) | YOLO person class can count **Caveat:** not wired into driver mode's event set; enabled in security mode |
 | ❌ | Hands on/off steering wheel (`hands_on_wheel`) | hand + wheel detection; wheel rarely in frame at recommended mounting |
 | 🟡 | User-configured distraction behavior (`custom`) | AI-configure maps requests onto the supported detections above **Caveat:** requests outside this taxonomy are declined with the reason |
-
-## driver_distraction_openpilot
-
-| | Detection | How / Caveat / Requires |
-|---|---|---|
-| ✅ | Driver eyes on road / looking away / down (`eyes_on_road`) | openpilot dmonitoring model (production driver-state network) |
-| ✅ | Sleeping / drowsiness indicators (`drowsiness`) | model blink/eye-closure probabilities + eyes-closed timer |
-| ✅ | Attention duration + graded escalation (`attention_duration`) | openpilot's own pre/prompt/terminal alert policy (awareness decay) |
-| ✅ | Head orientation / posture (`head_orientation`) | model pose outputs with openpilot's calibration envelope |
-| ✅ | Looking at / holding phone (`phone_use`) | additive YOLO phone check (not stock openpilot) |
-| ✅ | Driver obstructing own face / camera (`face_obstructed`) | model face-probability drop -> driverUnresponsive path |
-| ❌ | Whether an assistance system is actually engaged (`autopilot_state`) | a vehicle-data feed (CAN/OBD); camera alone cannot know — the module deliberately describes only visual observations |
-| ❌ | Hands on steering wheel (`hands_on_wheel`) | wheel visibility + hand model; openpilot infers attention, not grip |
-| ❌ | Who is driving / driver change (`driver_identity`) | face recognition — deliberately not shipped (privacy) |
-| 🟡 | Interacting with dashboard/infotainment (`dashboard_interaction`) | sustained gaze-down/away fires the standard distraction path **Caveat:** cannot distinguish infotainment from other look-down causes |
 
 ## baby_monitoring
 

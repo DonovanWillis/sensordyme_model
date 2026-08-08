@@ -14,7 +14,7 @@ struct FeedCard: View {
     var body: some View {
         ZStack {
             if state.isDemo {
-                SimulatedFeedView(preset: device.activePreset ?? "driver_distraction", alert: alertActive)
+                SimulatedFeedView(preset: device.activePreset ?? "driver_safety", alert: alertActive)
             } else if isLiveFeed, let url = URL(string: state.deviceLocalURL) {
                 MJPEGView(url: url)  // MJPEGView appends /stream (and the device token) itself
             } else {

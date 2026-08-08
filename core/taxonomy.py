@@ -49,8 +49,8 @@ def _d(id: str, title: str, support: str, how: str = "", caveat: str = "", requi
 
 
 TAXONOMY: dict[str, list[Detection]] = {
-    # ------------------------------------------------------------- driver_distraction
-    "driver_distraction": [
+    # ------------------------------------------------------------------ driver_safety
+    "driver_safety": [
         _d("eyes_off_road", "Eyes/head away from road (sustained)", SUPPORTED,
            how="FaceMesh yaw vs calibrated baseline + SustainedConditionTracker"),
         _d("looking_down", "Looking down (sustained)", SUPPORTED,
@@ -99,31 +99,6 @@ TAXONOMY: dict[str, list[Detection]] = {
         _d("custom", "User-configured distraction behavior", PARTIAL,
            how="AI-configure maps requests onto the supported detections above",
            caveat="requests outside this taxonomy are declined with the reason"),
-    ],
-    # --------------------------------------------------- driver_distraction_openpilot
-    "driver_distraction_openpilot": [
-        _d("eyes_on_road", "Driver eyes on road / looking away / down", SUPPORTED,
-           how="openpilot dmonitoring model (production driver-state network)"),
-        _d("drowsiness", "Sleeping / drowsiness indicators", SUPPORTED,
-           how="model blink/eye-closure probabilities + eyes-closed timer"),
-        _d("attention_duration", "Attention duration + graded escalation", SUPPORTED,
-           how="openpilot's own pre/prompt/terminal alert policy (awareness decay)"),
-        _d("head_orientation", "Head orientation / posture", SUPPORTED,
-           how="model pose outputs with openpilot's calibration envelope"),
-        _d("phone_use", "Looking at / holding phone", SUPPORTED,
-           how="additive YOLO phone check (not stock openpilot)"),
-        _d("face_obstructed", "Driver obstructing own face / camera", SUPPORTED,
-           how="model face-probability drop -> driverUnresponsive path"),
-        _d("autopilot_state", "Whether an assistance system is actually engaged", UNSUPPORTED,
-           requires="a vehicle-data feed (CAN/OBD); camera alone cannot know — the module "
-                    "deliberately describes only visual observations"),
-        _d("hands_on_wheel", "Hands on steering wheel", UNSUPPORTED,
-           requires="wheel visibility + hand model; openpilot infers attention, not grip"),
-        _d("driver_identity", "Who is driving / driver change", UNSUPPORTED,
-           requires="face recognition — deliberately not shipped (privacy)"),
-        _d("dashboard_interaction", "Interacting with dashboard/infotainment", PARTIAL,
-           how="sustained gaze-down/away fires the standard distraction path",
-           caveat="cannot distinguish infotainment from other look-down causes"),
     ],
     # ----------------------------------------------------------------- baby_monitoring
     "baby_monitoring": [
