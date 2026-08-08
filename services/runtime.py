@@ -41,6 +41,7 @@ from core.logging_setup import get_logger, setup_logging
 from core import device_health
 from core.network import WifiManager, nmcli_available
 from core.dataset import CaptureStore
+from core import monitoring_mode
 from core.monitoring_config import load_or_empty
 from core.rules import RuleEngine
 from core.telemetry import TelemetryLogger
@@ -128,6 +129,13 @@ class DeviceRuntime:
         self.monitoring = load_or_empty()
         if self.monitoring.rules:
             self.rule_engine.replace_rules(self.monitoring.rules)
+        # What the selected preset wants to run, remembered separately from what
+        # is running now — AI_CUSTOM swaps the module out and must be able to
+        # hand it back when the custom configuration is cleared.
+        self._preset_module = module_name
+        self.mode = monitoring_mode.resolve(
+            monitoring_active=self.monitoring.active, preset_module=module_name
+        )
 
         # Opt-in training capture. Disabled unless config says otherwise, and
         # local-only either way — nothing here can upload.
@@ -253,6 +261,7 @@ class DeviceRuntime:
             # new one arrives — otherwise a device that rebooted into a custom
             # configuration shows the base mode until the next change.
             self.uplink.set_monitoring(self.monitoring.describe())
+            self._apply_monitoring_mode()
             self.uplink.start()
             print(
                 f"SensorDyme: cloud uplink -> {cloud_cfg.get('base_url')} "
@@ -400,6 +409,51 @@ class DeviceRuntime:
         module_cfg = modules_cfg.get(module_name, {}) if isinstance(modules_cfg, dict) else {}
         return load_zones(module_cfg.get("zones", {}) if isinstance(module_cfg, dict) else {})
 
+    def _apply_monitoring_mode(self) -> None:
+        """Run the detector the active mode calls for, and nothing else.
+
+        This is what makes "AI custom monitoring" mean something. Suppressing a
+        module's alerts leaves it running: MediaPipe FaceMesh, Hands and Pose
+        cost 85% of one core on this device, computing drowsiness and gaze for
+        a person who asked about phones. Switching the module stops the work.
+        """
+        mode = monitoring_mode.resolve(
+            monitoring_active=self.monitoring.active,
+            preset_module=self._preset_module or self.module_name,
+        )
+        wanted = monitoring_mode.module_for(mode, self._preset_module or self.module_name)
+        if wanted is None or wanted == self.module_name:
+            self.mode = mode
+            return
+
+        try:
+            module_cfg = self.config.get("modules", {}).get(wanted, {}) or {}
+            new_module = get_module_class(wanted)({**module_cfg, "recalibrate": False})
+        except Exception as exc:  # noqa: BLE001 - a bad switch must not kill the device
+            log.error("could not switch to '%s' for %s: %s", wanted, mode.value, exc)
+            return
+
+        with self._module_lock:
+            old_module, self.module, self.module_name = self.module, new_module, wanted
+        # Release the old graphs explicitly. MediaPipe holds native resources
+        # that a dropped reference does not free promptly, and a preset switch
+        # used to leak one FaceMesh graph per swap.
+        close = getattr(old_module, "close", None)
+        if callable(close):
+            try:
+                close()
+            except Exception:  # noqa: BLE001 - teardown must never raise
+                pass
+
+        self.rule_engine.set_zones(self._zones_for_module(wanted))
+        self.mode = mode
+        log.info(
+            "[MONITORING] mode=%s module=%s base_monitoring=%s%s",
+            mode.value, wanted,
+            "DISABLED" if mode is monitoring_mode.MonitoringMode.AI_CUSTOM else "enabled",
+            f" instruction={self.monitoring.instruction!r}" if self.monitoring.instruction else "",
+        )
+
     def _emit_rule_alert(self, alert) -> None:
         """Route a confirmed AI-rule alert through the same path as built-in events.
 
@@ -500,6 +554,9 @@ class DeviceRuntime:
             old_module = self.module
             self.module, self.module_name, self.active_preset = new_module, new_module_name, name
             self.alert_event_types = self.alert_types_for(new_module_name, preset)
+        # What the preset wants, remembered separately from what is running:
+        # AI_CUSTOM swaps the module out and must be able to hand it back.
+        self._preset_module = new_module_name
         # Zones belong to the module's config, so a mode switch re-points custom
         # rules at the new module's polygons instead of the previous mode's.
         self.rule_engine.set_zones(self._zones_for_module(new_module_name))
@@ -560,6 +617,8 @@ class DeviceRuntime:
                         version=self.uplink.rules_version(),
                     )
                     self.uplink.set_monitoring(self.monitoring.describe())
+                    # A new configuration can change which detector is needed.
+                    self._apply_monitoring_mode()
                     self._apply_requested_labels()
                     pending_zones = self.rule_engine.pending_zones()
                     print(
@@ -571,15 +630,12 @@ class DeviceRuntime:
                 module = self.module
             events = module.process(frame)
 
-            # A custom configuration REPLACES the base mode rather than running
-            # beside it.
-            #
-            # Both used to run at once, so someone who asked "count the bottles"
-            # kept receiving drowsiness and phone-use alerts they had not asked
-            # for — and paid for that detection in CPU and heat. The module still
-            # runs, because its per-frame detections are what the rules are
-            # evaluated against; what is suppressed is its own opinion about what
-            # deserves an alert.
+            # Belt and braces. The module running under AI_CUSTOM is a general
+            # detector with no opinions to suppress, so this should already be
+            # empty — but a mode switch that has not landed yet, or a detector
+            # that grows its own events later, must not leak alerts nobody asked
+            # for. The real saving is that the expensive module is not running
+            # at all; see _apply_monitoring_mode.
             if self.monitoring.active:
                 events = []
             evidence_due = False
