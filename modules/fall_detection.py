@@ -1,7 +1,17 @@
-"""Fall detection module: MediaPipe Pose hip/shoulder tracking for rapid-drop-then-stillness."""
+"""Fall detection module: MediaPipe Pose hip/shoulder tracking for rapid-drop-then-stillness.
+
+Also the elderly-mode zone and stillness detector, on the same landmarks: a
+restricted/boundary zone ("zone_violation", same event name occupancy.py uses,
+so the existing alert-severity wiring needs no change) tested against the
+ankle midpoint rather than a fabricated bounding box (see get_detections'
+docstring on why this module deliberately never invents one), and
+"unusual_stillness" from how little the hip/shoulder centroid has moved --
+reusing the same landmarks the fall detector already reads, no extra model.
+"""
 
 from __future__ import annotations
 
+import math
 import time
 from typing import Optional
 
@@ -14,10 +24,13 @@ from core.activity import ActivityRecognizer
 from core.detections import Detection, DetectionFrame
 from core.event_engine import CONFIRMED, RESOLVED, EventEngine, RuleSpec
 from core.events import Event
+from core.zones import load_zones
 from modules.base import VisionModule, register_module
 
 HIP_LANDMARKS = [23, 24]
 SHOULDER_LANDMARKS = [11, 12]
+ANKLE_LANDMARKS = [27, 28]
+_MIN_ANKLE_VISIBILITY = 0.5
 
 
 @register_module("fall_detection")
@@ -63,6 +76,28 @@ class FallDetectionModule(VisionModule):
         self._last_frame_size: tuple[int, int] = (0, 0)
         self._last_hip_y: Optional[float] = None
 
+        # Elderly-mode zones (restricted/boundary only -- "safe" zones are
+        # baby_monitoring's concern) and standalone stillness, both on the
+        # landmarks already being read. Separate engine from _activity_engine
+        # so a fall-adjacent bug in one can't cross-contaminate the other's
+        # per-detection state.
+        self._zones = load_zones(config.get("zones", {}))
+        self._watched_zones = [z for z in self._zones if z.kind in ("restricted", "boundary")]
+        self._zone_engine = EventEngine({})
+        zone_confirm_s = float(config.get("zone_confirm_s", 2.0))
+        for zone in self._watched_zones:
+            self._zone_engine.add_rule(RuleSpec(
+                detection=f"zone_violation:{zone.name}", severity="critical",
+                persist_s=zone_confirm_s, min_frames=3, resolve_after_s=5.0,
+            ))
+        self._still_max_motion = float(config.get("still_max_motion", 0.01))
+        self._zone_engine.add_rule(RuleSpec(
+            detection="unusual_stillness", severity="warning",
+            persist_s=float(config.get("unusual_stillness_s", 600.0)),
+            min_frames=10, occlusion_grace_s=3.0, resolve_after_s=10.0,
+        ))
+        self._prev_centroid: Optional[tuple[float, float]] = None
+
     def process(self, frame: np.ndarray) -> list[Event]:
         """Run pose estimation on `frame`, updating drop/stillness state and returning events."""
         now = time.monotonic()
@@ -82,6 +117,15 @@ class FallDetectionModule(VisionModule):
             self._last_hip_y = None
             self._prev_y = None
             self._prev_t = None
+            self._prev_centroid = None
+            # Gone, not merely still, and gone, not merely outside the zone --
+            # both are real absence, so both get an explicit False rather than
+            # being left to freeze mid-confirmation.
+            transitions = []
+            for zone in self._watched_zones:
+                transitions += self._zone_engine.update(f"zone_violation:{zone.name}", False, 0.85, now)
+            transitions += self._zone_engine.update("unusual_stillness", False, 0.8, now)
+            events += self._zone_transition_events(transitions)
             return events
 
         self._last_pose_proto = results.pose_landmarks
@@ -127,6 +171,60 @@ class FallDetectionModule(VisionModule):
 
         self._prev_y = avg_y
         self._prev_t = now
+
+        zone_transitions = []
+        # Ankle midpoint, not a fabricated box: zones.py's own point-in-polygon
+        # primitive, on the one point "is this person in this area" actually
+        # means for someone who might be lying down as easily as standing.
+        # Occluded/invisible ankles (legs behind furniture, off the bottom of
+        # frame) skip zone evaluation for this frame rather than guessing --
+        # "can't see the feet" is not evidence the zone was left.
+        if self._watched_zones:
+            ankle_vis = [landmarks[i].visibility for i in ANKLE_LANDMARKS]
+            if all(v >= _MIN_ANKLE_VISIBILITY for v in ankle_vis):
+                foot_x = sum(landmarks[i].x for i in ANKLE_LANDMARKS) / len(ANKLE_LANDMARKS)
+                foot_y = sum(landmarks[i].y for i in ANKLE_LANDMARKS) / len(ANKLE_LANDMARKS)
+                for zone in self._watched_zones:
+                    inside = zone.contains(foot_x, foot_y)
+                    zone_transitions += self._zone_engine.update(
+                        f"zone_violation:{zone.name}", inside, 0.85, now
+                    )
+
+        # Stillness from how little the hip/shoulder centroid has moved, in
+        # normalized landmark coordinates (so the threshold means the same
+        # thing at any capture resolution) -- independent of the vertical-only
+        # velocity above, which exists to catch a FAST drop, not a slow lack
+        # of movement over minutes.
+        centroid = (
+            sum(landmarks[i].x for i in indices) / len(indices),
+            sum(landmarks[i].y for i in indices) / len(indices),
+        )
+        motion = 0.0
+        if self._prev_centroid is not None:
+            motion = math.hypot(centroid[0] - self._prev_centroid[0], centroid[1] - self._prev_centroid[1])
+        self._prev_centroid = centroid
+        zone_transitions += self._zone_engine.update(
+            "unusual_stillness", motion < self._still_max_motion, 0.8, now
+        )
+        events += self._zone_transition_events(zone_transitions)
+
+        return events
+
+    def _zone_transition_events(self, transitions: list) -> list[Event]:
+        """CONFIRMED/RESOLVED transitions -> Events, for both the zone and
+        stillness engine and the person-gone early-return, so the translation
+        (and the event-type naming) is written once."""
+        events: list[Event] = []
+        for tr in transitions:
+            base, _, zone_name = tr.detection.partition(":")
+            detail = f"zone={zone_name} confirmed after {tr.duration_s:.1f}s" if zone_name else ""
+            if tr.state == CONFIRMED:
+                events.append(Event.now(base, tr.duration_s, tr.confidence, self.name, detail))
+            elif tr.state == RESOLVED:
+                events.append(Event.now(
+                    f"{base}_resolved", tr.duration_s, tr.confidence, self.name,
+                    f"zone={zone_name}" if zone_name else "",
+                ))
         return events
 
     def _activity_events(self, now: float) -> list[Event]:
@@ -209,5 +307,5 @@ class FallDetectionModule(VisionModule):
         return frame
 
     def is_alert_active(self) -> bool:
-        """True from the moment a fall is confirmed until the person moves again."""
-        return self._alert_active
+        """True while a fall, a zone violation, or unusual stillness is confirmed."""
+        return self._alert_active or bool(self._zone_engine.active_detections())

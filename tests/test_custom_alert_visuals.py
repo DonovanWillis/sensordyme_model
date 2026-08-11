@@ -78,6 +78,7 @@ def occupancy_showing(labels: list[str], requested: set[str]):
     module._last_confidences = [0.9] * len(labels)
     module._extra_labels = requested
     module._zones = []
+    module._last_tracked_boxes = {}
     return module
 
 

@@ -3,9 +3,19 @@
 Counting uses YOLO person detection with confirm_frames debounce (as before).
 Optional user-drawn zones (config `zones:`) add security events through the
 shared event lifecycle (core/event_engine.py):
-  * zone_violation — a person's feet inside a `restricted` zone, sustained;
-  * person_lingering — still inside the same zone past `linger_s`.
-Both resolve when the zone empties, and brief occlusions don't reset progress.
+  * zone_violation — any person's feet inside a `restricted` zone, sustained;
+  * person_lingering — one SPECIFIC tracked person's feet in the zone past
+    `linger_s`.
+Both resolve when their subject leaves, and brief occlusions don't reset progress.
+
+Lingering is per-person via core/tracking.py's PersonTracker, reused here on a
+coarse box-derived Skeleton (see core/keypoints.from_detection_box) rather than
+running a real pose model -- this module stays the cheap, always-on detector
+by design (modules/fall_detection.py is where real pose already runs). Without a
+tracked identity, "lingering" is really "has this ZONE been continuously
+occupied", which conflates two different four-second visits by two different
+people into one eight-second "someone lingered" report the moment the second
+person's arrival overlaps the first person's departure by even one frame.
 """
 
 from __future__ import annotations
@@ -20,6 +30,8 @@ from core.detections import Detection, DetectionFrame
 from core.detectors import get_yolo_model
 from core.event_engine import CONFIRMED, RESOLVED, EventEngine, RuleSpec
 from core.events import Event
+from core.keypoints import from_detection_box
+from core.tracking import PersonTracker
 from core.zones import load_zones
 from modules.base import VisionModule, register_module
 
@@ -56,18 +68,23 @@ class OccupancyModule(VisionModule):
         # Optional security zones (feet-point membership; see core/zones.py).
         self._zones = load_zones(config.get("zones", {}))
         self._engine = EventEngine({})
-        linger_s = float(config.get("linger_s", 30.0))
-        zone_confirm_s = float(config.get("zone_confirm_s", 2.0))
-        for zone in self._zones:
-            if zone.kind in ("restricted", "boundary"):
-                self._engine.add_rule(RuleSpec(
-                    detection=f"zone_violation:{zone.name}", severity="critical",
-                    persist_s=zone_confirm_s, min_frames=3, resolve_after_s=5.0,
-                ))
-                self._engine.add_rule(RuleSpec(
-                    detection=f"person_lingering:{zone.name}", severity="warning",
-                    persist_s=linger_s, min_frames=10, resolve_after_s=5.0,
-                ))
+        self._linger_s = float(config.get("linger_s", 30.0))
+        self._zone_confirm_s = float(config.get("zone_confirm_s", 2.0))
+        # The zones lingering/violation logic actually watches -- "safe" zones
+        # are someone else's business (modules/baby_monitoring.py).
+        self._watched_zones = [z for z in self._zones if z.kind in ("restricted", "boundary")]
+        for zone in self._watched_zones:
+            self._engine.add_rule(RuleSpec(
+                detection=f"zone_violation:{zone.name}", severity="critical",
+                persist_s=self._zone_confirm_s, min_frames=3, resolve_after_s=5.0,
+            ))
+        # Per-person lingering identity (see module docstring). Track ids are
+        # only ever added; a retired id is pruned once every zone's lingering
+        # rule for it has itself resolved or been dropped, so long-running
+        # lingering that outlives a brief detector dropout isn't cut short.
+        self._tracker = PersonTracker()
+        self._known_track_ids: set[int] = set()
+        self._last_tracked_boxes: dict[int, tuple[int, int, int, int]] = {}
 
     def process(self, frame: np.ndarray) -> list[Event]:
         """Detect people in `frame`; emit occupancy_change once a new count is confirmed."""
@@ -116,21 +133,72 @@ class OccupancyModule(VisionModule):
             events.append(Event.now("occupancy_change", 0.0, confidence, self.name))
             self._last_emitted_count = count
 
-        # Zone security events (only when zones are configured).
-        if self._zones:
+        # Zone security events (only when a restricted/boundary zone is configured
+        # -- occupancy has nothing to do with a "safe" zone, see baby_monitoring.py).
+        if self._watched_zones:
             now = time.monotonic()
             h, w = frame.shape[:2]
+
+            # Per-person identity for lingering (see module docstring): a coarse
+            # box-only Skeleton reuses PersonTracker's torso-length-normalized
+            # matching without paying for a pose model this module doesn't
+            # otherwise run.
+            skeletons = [from_detection_box(b) for b in self._last_person_boxes]
+            box_by_skeleton_id = {id(s): b for s, b in zip(skeletons, self._last_person_boxes)}
+            tracked = {t.track_id: t for t in self._tracker.update(skeletons, now)}
+            self._known_track_ids |= set(tracked)
+            self._last_tracked_boxes = {
+                tid: box_by_skeleton_id[id(t.skeleton)] for tid, t in tracked.items()
+            }
+
             transitions = []
-            for zone in self._zones:
-                if zone.kind not in ("restricted", "boundary"):
-                    continue
+            for zone in self._watched_zones:
                 # People only: zone_violation is a person event, and a dog in the
                 # zone must not raise one.
                 inside = any(zone.contains_box(b, w, h) for b in self._last_person_boxes)
                 transitions += self._engine.update(f"zone_violation:{zone.name}", inside, 0.85, now)
-                transitions += self._engine.update(f"person_lingering:{zone.name}", inside, 0.85, now)
+
+                for track_id in self._known_track_ids:
+                    key = f"person_lingering:{zone.name}:{track_id}"
+                    track = tracked.get(track_id)
+                    if track is not None:
+                        # (Re)registering every frame a track is live is cheap
+                        # (a dict assignment) and means a brand-new id's first
+                        # sighting always has a rule to update against.
+                        self._engine.add_rule(RuleSpec(
+                            detection=key, severity="warning",
+                            persist_s=self._linger_s, min_frames=10, resolve_after_s=5.0,
+                        ))
+                        box = box_by_skeleton_id[id(track.skeleton)]
+                        track_inside = zone.contains_box(box, w, h)
+                    else:
+                        # Gone from this frame (occluded within the tracker's own
+                        # grace, or retired outright): definitely not lingering.
+                        # Keep feeding False rather than skipping, so a CONFIRMED
+                        # track still gets its resolve_after_s and a real
+                        # person_lingering_resolved event, instead of the rule
+                        # being pruned out from under it below.
+                        track_inside = False
+                    transitions += self._engine.update(key, track_inside, 0.85, now)
+
+            # Prune ids the engine has itself fully forgotten (resolved-then-
+            # deleted, or dropped without ever confirming) so `_known_track_ids`
+            # and the engine's own rule table don't grow for the life of the
+            # process as visitors come and go.
+            for track_id in list(self._known_track_ids):
+                if track_id in tracked:
+                    continue
+                if all(
+                    self._engine.state_of(f"person_lingering:{z.name}:{track_id}") is None
+                    for z in self._watched_zones
+                ):
+                    for z in self._watched_zones:
+                        self._engine.remove_rule(f"person_lingering:{z.name}:{track_id}")
+                    self._known_track_ids.discard(track_id)
+
             for tr in transitions:
-                base, _, zone_name = tr.detection.partition(":")
+                base, _, rest = tr.detection.partition(":")
+                zone_name = rest.split(":", 1)[0]
                 if tr.state == CONFIRMED:
                     events.append(Event.now(
                         base, tr.duration_s, tr.confidence, self.name,
@@ -189,6 +257,13 @@ class OccupancyModule(VisionModule):
             pts = np.array([[int(x * w), int(y * h)] for x, y in zone.polygon], dtype=np.int32)
             cv2.polylines(frame, [pts], isClosed=True, color=(0, 0, 220), thickness=2)
             cv2.putText(frame, zone.name, tuple(pts[0]), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 0, 220), 1)
+
+        # Per-person track id (only populated when zones are configured — see
+        # process()), so "3 people entered" reads as Person 1/2/3 rather than
+        # three identical, indistinguishable boxes.
+        for track_id, (x1, y1, x2, y2) in self._last_tracked_boxes.items():
+            cv2.putText(frame, f"#{track_id}", (x1, min(h - 5, y2 + 18)),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.55, (255, 255, 0), 2)
 
         labels = self._last_labels or []
         for index, (x1, y1, x2, y2) in enumerate(self._last_boxes):

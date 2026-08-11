@@ -4,6 +4,8 @@ import time
 
 import numpy as np
 
+import modules.driver_attention as driver_attention_module
+from modules.base import CorroboratedGraceTracker
 from modules.driver_attention import DriverAttentionModule
 
 _CONFIG = {
@@ -72,3 +74,72 @@ def test_repeated_blank_frames_eventually_fire_attention_lost(tmp_path):
 
     assert "attention_lost" in fired_types
     assert module.is_alert_active() is True
+
+
+def test_face_lost_with_a_person_still_detected_does_not_fire_at_the_short_threshold(tmp_path, monkeypatch):
+    """A turned head the object detector still finds a person for (checking a
+    mirror/blind spot) must not be treated with the same urgency as a driver
+    who has vanished entirely -- see face_lost_with_body_seconds."""
+    t = {"now": 0.0}
+    monkeypatch.setattr(driver_attention_module.time, "monotonic", lambda: t["now"])
+    config = {
+        **_CONFIG, "calibration_path": str(tmp_path / "calibration.json"),
+        "face_lost_seconds": 2.5, "face_lost_with_body_seconds": 8.0,
+    }
+    module = DriverAttentionModule(config)
+    module._last_person_visible = True  # bypass real YOLO; this test is about the wiring
+    blank_frame = np.zeros((480, 640, 3), dtype=np.uint8)
+
+    fired_types = []
+    for _ in range(35):  # 4.375s: well past face_lost_seconds, short of face_lost_with_body_seconds
+        fired_types += [e.type for e in module.process(blank_frame)]
+        t["now"] += 0.125
+    assert "attention_lost" not in fired_types
+    assert module.is_alert_active() is False
+
+    for _ in range(35):  # continue on to 8.75s: past face_lost_with_body_seconds
+        fired_types += [e.type for e in module.process(blank_frame)]
+        t["now"] += 0.125
+    assert "attention_lost" in fired_types
+    assert module.is_alert_active() is True
+
+
+def test_person_disappearing_partway_through_face_loss_fires_promptly_not_late(tmp_path, monkeypatch):
+    """The regression this design exists to prevent: if the corroborating body
+    detection ALSO drops out partway through an episode, the alert must not be
+    slower than face_lost_seconds alone would have been."""
+    t = {"now": 0.0}
+    monkeypatch.setattr(driver_attention_module.time, "monotonic", lambda: t["now"])
+    config = {
+        **_CONFIG, "calibration_path": str(tmp_path / "calibration.json"),
+        "face_lost_seconds": 2.5, "face_lost_with_body_seconds": 8.0,
+    }
+    module = DriverAttentionModule(config)
+    blank_frame = np.zeros((480, 640, 3), dtype=np.uint8)
+
+    module._last_person_visible = True
+    for _ in range(32):  # 4.0s corroborated -- already past face_lost_seconds, nothing fired yet
+        module.process(blank_frame)
+        t["now"] += 0.125
+    assert module.is_alert_active() is False
+
+    module._last_person_visible = False  # body detection drops out too, at t=4.0s
+    fired_types = [e.type for e in module.process(blank_frame)]
+    assert "attention_lost" in fired_types  # fires on this exact frame, not 2.5s further out
+    assert module.is_alert_active() is True
+
+
+def test_distraction_tracker_reads_both_configured_thresholds(tmp_path):
+    """Construction-level check that the two-threshold config keys actually
+    reach the tracker (yaw-based end-to-end behavior is covered by
+    TestCorroboratedGraceTracker in test_driver_signal_conditioning.py, the
+    same tracker class driving this one)."""
+    config = {
+        **_CONFIG, "calibration_path": str(tmp_path / "calibration.json"),
+        "distraction_seconds": 3.0, "rearview_tolerance_seconds": 5.0, "mirror_check_yaw_deg": 55.0,
+    }
+    module = DriverAttentionModule(config)
+    assert isinstance(module._distract_tracker, CorroboratedGraceTracker)
+    assert module._distract_tracker._short_s == 3.0
+    assert module._distract_tracker._long_s == 5.0
+    assert module._mirror_check_yaw_deg == 55.0

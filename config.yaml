@@ -209,12 +209,26 @@ modules:
 
     # --- distraction (head pose, corrected for camera mounting angle -- see calibration above) ---
     yaw_threshold_deg: 35 # |calibrated yaw| beyond this = looking away from the road (sideways)
-    distraction_seconds: 3.0 # sustained duration required to fire "distraction" -- patient: mirror/blindspot checks are shorter
+    distraction_seconds: 3.0 # sustained duration required to fire "distraction" for an ordinary
+    # off-center glance (at a passenger, the console, ...)
+    mirror_check_yaw_deg: 55 # |calibrated yaw| beyond THIS = a wide-angle turn shaped like a
+    # rearview/side-mirror or blind-spot check, not an ordinary glance -- gets more patience
+    # (rearview_tolerance_seconds) rather than distraction_seconds. Reverts to distraction_seconds
+    # immediately if the yaw ever drops back to merely off-center partway through a turn, so a
+    # turn that gets LESS mirror-check-shaped over time is never slower to fire than today's flat
+    # threshold was -- see CorroboratedGraceTracker.
+    rearview_tolerance_seconds: 5.0 # sustained duration allowed for a wide-angle (mirror_check_yaw_deg+)
+    # turn before it counts as "distraction" -- a real mirror/blind-spot check, even a thorough one
+    # covering rearview + both mirrors + a shoulder check, is expected to be under this
     glance_window_s: 45.0 # rolling window (seconds) for the repeated short-glance counter
     glance_min_count: 5 # this many off-center glances within glance_window_s fires "frequent_glancing"
     pitch_threshold_deg: -20 # calibrated pitch below this = looking down (phone in lap); more sensitive than yaw
     eyes_down_seconds: 2.5 # sustained duration required to fire "eyes_down"
-    face_lost_seconds: 2.5 # camera can't find a face at all for this long -> "attention_lost" (turned away/slumped/obstructed)
+    face_lost_seconds: 2.5 # face gone AND no person detected either -> "attention_lost" (likely gone/slumped/obstructed)
+    face_lost_with_body_seconds: 8.0 # face gone but the object detector still finds a person in frame (a
+    # turned head checking a mirror/blind spot, not a vanished driver) -> the same "attention_lost" event,
+    # but more patient. Reverts to face_lost_seconds immediately if the person also stops being detected
+    # partway through -- see CorroboratedGraceTracker; never slower to fire than face_lost_seconds alone.
 
     # --- object detection: scans the ENTIRE frame (not just near the face) for anything
     # the driver could be holding, via YOLO11-nano run every Nth frame ---
@@ -334,6 +348,18 @@ modules:
     drop_velocity_threshold: 0.6 # fraction of frame-height/sec that counts as a "rapid drop"
     stillness_duration_s: 1.5 # seconds of stillness after a drop before a fall event fires
     stillness_velocity_threshold: 0.02 # fraction of frame-height/sec considered "still"
+    # Optional elderly-mode zones (restricted/boundary only -- same shape as
+    # occupancy's, tested against the ankle midpoint instead of a box; see
+    # core/zones.py). A person's feet inside -> zone_violation (sustained).
+    #   zones:
+    #     stairs: { polygon: [[0.0,0.6],[0.3,0.6],[0.3,1.0],[0.0,1.0]], kind: restricted }
+    zones: {}
+    zone_confirm_s: 2.0 # seconds inside a watched zone before zone_violation confirms
+    still_max_motion: 0.01 # normalized hip/shoulder-centroid movement floor below which
+    # the subject counts as "still" (independent of the fast-drop velocity above)
+    unusual_stillness_s: 600 # unusual_stillness confirms after this many seconds of it --
+    # deliberately long: a person resting or reading is not a safety event, only an
+    # absence of ANY movement for this long is worth a soft, warning-level nudge
 
 # ============================================================================
 # mac_max profile -- additive, Mac-only, GPU-backed high-accuracy mode.

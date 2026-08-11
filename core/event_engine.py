@@ -88,6 +88,20 @@ class EventEngine:
     def add_rule(self, rule: RuleSpec) -> None:
         self._rules[rule.detection] = rule
 
+    def remove_rule(self, detection: str) -> None:
+        """Forget a detection's rule and any in-progress/cooldown state for it.
+
+        For rule names that are per ephemeral identity (e.g. "label:zone:track_id",
+        made and discarded as tracked subjects come and go) rather than one fixed
+        name reused forever, add_rule alone leaves every id that ever appeared
+        sitting in `_rules` for the life of the process. Safe to call mid-lifecycle:
+        an active-but-unconfirmed track is simply dropped, not force-resolved --
+        there is nothing left to resolve it against once its rule is gone.
+        """
+        self._rules.pop(detection, None)
+        self._tracks.pop(detection, None)
+        self._last_resolved.pop(detection, None)
+
     def update(self, detection: str, present: bool, confidence: float = 1.0,
                now: Optional[float] = None) -> list[Transition]:
         """Advance one detection with this frame's observation; return transitions."""

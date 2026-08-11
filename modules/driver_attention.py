@@ -11,20 +11,35 @@ behavior (blinks, mirror checks) never fires an event:
   * Distraction — head yaw/pitch from solvePnP on 6 canonical landmarks,
     corrected against a calibrated neutral pose (see AttentionCalibrator)
     so a camera mounted off to the side of the dashboard doesn't read
-    ordinary forward driving as a head turn. A sustained sideways turn
-    fires "distraction"; a sustained downward tilt (phone in lap) fires
-    the separate, more sensitive "eyes_down"; several short glances within
-    a rolling window fires "frequent_glancing" (texting while still
-    looking up periodically).
+    ordinary forward driving as a head turn -- looking at the camera isn't
+    "attentive" and looking away from it isn't "distracted"; only the
+    calibrated deviation from wherever this driver's neutral forward gaze
+    actually is counts. A sustained sideways turn fires "distraction", but
+    a WIDE-angle turn (mirror_check_yaw_deg+, shaped like a rearview/side-
+    mirror or blind-spot check rather than an ordinary glance) gets more
+    patience before it does -- rearview_tolerance_seconds instead of
+    distraction_seconds, via CorroboratedGraceTracker, which reverts to the
+    short threshold immediately if the turn stops being wide-angle partway
+    through. A sustained downward tilt (phone in lap) fires the separate,
+    more sensitive "eyes_down"; several short glances within a rolling
+    window fires "frequent_glancing" (texting while still looking up
+    periodically).
   * Object context — YOLO11-nano (shared via core/detectors.py) run on the
     full frame on a stride, covering everything a driver's hands might be
     holding (phone, drinks, food), plus optional MediaPipe Hands, fired to
     distinguish a dashboard-mounted phone (benign, log-only "phone_detected")
     from actual phone use (eyes off the road while a phone is visible ->
-    "phone_use").
-  * Face lost — if the camera can't find a face at all (turned fully away,
-    slumped over, obstructed), that absence is itself a risk signal rather
-    than "nothing to report"; sustained loss fires "attention_lost".
+    "phone_use"). The same detector's "person" class (always requested,
+    never reported on its own) is the fallback signal for face loss below.
+  * Face lost — if the camera can't find a face at all, that absence is
+    itself a risk signal rather than "nothing to report"; sustained loss
+    fires "attention_lost" -- but face-unavailable does not mean
+    driver-disappeared. A turned head the object detector still finds a
+    person for (checking a mirror, looking over a shoulder) gets the same
+    CorroboratedGraceTracker treatment as a wide-angle turn: patient
+    (face_lost_with_body_seconds) while a body keeps being detected,
+    reverting immediately to the short bar (face_lost_seconds) the moment
+    it isn't -- slumped over, obstructed, or genuinely gone.
 
 On top of these atomic, independently-debounced signals sits RiskFusion: a
 cross-signal reasoning layer that catches compound danger no single
@@ -73,11 +88,19 @@ from core.detections import Detection, DetectionFrame
 from core.detectors import Box, get_yolo_model, iou
 from core.events import Event
 from core.eye_signal import AdaptiveBaseline, SignalSmoother, iris_openness
-from modules.base import GracedConditionTracker, SustainedConditionTracker, VisionModule, register_module
+from modules.base import (
+    CorroboratedGraceTracker,
+    GracedConditionTracker,
+    SustainedConditionTracker,
+    VisionModule,
+    register_module,
+)
 
 # MediaPipe Face Mesh landmark indices for the 6-point EAR eye model.
 LEFT_EYE = [362, 385, 387, 263, 373, 380]
 RIGHT_EYE = [33, 160, 158, 133, 153, 144]
+
+_PERSON_CLASS = 0  # COCO -- used only as a face-loss fallback signal, see below
 
 # Iris-openness (eyelid gap / iris diameter, see core/eye_signal.py) above which
 # the eye is unambiguously open: a closed lid physically cannot leave this much
@@ -566,7 +589,18 @@ class DriverAttentionModule(VisionModule):
 
         # --- distraction ---
         self._yaw_threshold_deg = float(config["yaw_threshold_deg"])
-        self._distract_tracker = GracedConditionTracker(float(config["distraction_seconds"]), release_s)
+        # A rearview/side-mirror or blind-spot check turns the head much further
+        # than an ordinary off-center glance (at a passenger, the center console,
+        # ...), so it gets more patience before counting as distraction -- see
+        # CorroboratedGraceTracker. Reverts to distraction_seconds immediately if
+        # the yaw ever drops back to merely off-center partway through, measured
+        # from when the turn started, not from when it stopped being a big one.
+        self._mirror_check_yaw_deg = float(config.get("mirror_check_yaw_deg", 55.0))
+        self._distract_tracker = CorroboratedGraceTracker(
+            short_s=float(config["distraction_seconds"]),
+            long_s=float(config.get("rearview_tolerance_seconds", 5.0)),
+            release_s=release_s,
+        )
         self._glance_min_count = int(config.get("glance_min_count", 5))
         self._glance_counter = GlanceCounter(
             window_s=float(config.get("glance_window_s", 45.0)),
@@ -580,10 +614,17 @@ class DriverAttentionModule(VisionModule):
         # --- face lost: the camera can't see the driver's face at all (turned fully away,
         # slumped over, obstructed) -- a real gap in naive logic, which otherwise treats
         # "no landmarks" as "nothing to report" instead of a risk signal in its own right.
-        self._face_lost_tracker = GracedConditionTracker(
-            float(config.get("face_lost_seconds", 2.5)), release_s
+        # Two thresholds: face lost with no corroborating body detection fires at the
+        # short one (today's face_lost_seconds); face lost while the object detector
+        # still finds a person in frame (a turned head, not a vanished driver) is more
+        # patient, up to face_lost_with_body_seconds -- see CorroboratedGraceTracker.
+        self._face_lost_tracker = CorroboratedGraceTracker(
+            short_s=float(config.get("face_lost_seconds", 2.5)),
+            long_s=float(config.get("face_lost_with_body_seconds", 8.0)),
+            release_s=release_s,
         )
         self._face_lost_active = False
+        self._last_person_visible = False
 
         # --- object detection (phone / food), lazily loaded on first stride tick ---
         self._yolo_weights = config.get("yolo_weights", "yolo11n.pt")
@@ -708,22 +749,35 @@ class DriverAttentionModule(VisionModule):
             self._last_overlay_boxes = []
             self._last_overlay_confidences = []
             self._hand_overlaps_phone = False
+            # No detector running to corroborate anything -- fail toward the
+            # tighter face-lost threshold, not the more patient one.
+            self._last_person_visible = False
             print(f"driver_attention: object detection disabled after an error: {exc}")
 
     def _run_object_detections(self, frame: np.ndarray) -> None:
         """The actual YOLO + Hands inference and box bookkeeping for one stride tick."""
         h, w = frame.shape[:2]
 
+        # _PERSON_CLASS rides along on the SAME pass (already running every
+        # stride tick for phone/food) purely so face-loss has a fallback
+        # signal -- see _face_lost_tracker's use of it. Not added to
+        # yolo_class_ids/overlay_boxes: it is a presence check, not a thing
+        # this module reports on.
         results = self._yolo_model.predict(
-            frame, verbose=False, classes=list(self._yolo_class_ids.keys()), conf=self._yolo_confidence_threshold
+            frame, verbose=False,
+            classes=sorted({*self._yolo_class_ids.keys(), _PERSON_CLASS}),
+            conf=self._yolo_confidence_threshold,
         )
         phone_boxes: list[Box] = []
         eating_boxes: list[Box] = []
         overlay_boxes: list[tuple[Box, str]] = []
         overlay_confidences: list[float] = []
+        person_visible = False
         for result in results:
             for box in result.boxes:
                 class_id = int(box.cls[0])
+                if class_id == _PERSON_CLASS:
+                    person_visible = True
                 event_type = self._yolo_class_ids.get(class_id)
                 if event_type is None:
                     continue
@@ -734,6 +788,7 @@ class DriverAttentionModule(VisionModule):
                     phone_boxes.append(xyxy)
                 else:
                     eating_boxes.append(xyxy)
+        self._last_person_visible = person_visible
 
         hand_boxes: list[Box] = []
         if self._hands is not None:
@@ -794,28 +849,38 @@ class DriverAttentionModule(VisionModule):
             # releases them within release_s, and face_lost takes over as the
             # active signal for it.
             self._drowsy_tracker.update(False, now)
-            self._distract_tracker.update(False, now)
+            self._distract_tracker.update(False, corroborated=False, now=now)
             self._eyes_down_tracker.update(False, now)
             self._drowsy_active = self._drowsy_tracker.is_active
             self._distracted_active = self._distract_tracker.is_active
             self._eyes_down_active = self._eyes_down_tracker.is_active
 
             # A face the camera can't see at all is its own risk signal, not "nothing to
-            # report" -- see the class docstring on _face_lost_tracker for why.
-            fired = self._face_lost_tracker.update(True, now)
+            # report" -- see the class docstring on _face_lost_tracker for why. But a
+            # turned head that the object detector still finds a person for is not the
+            # same situation as no evidence of the driver at all, so it gets the
+            # tracker's more patient threshold -- see CorroboratedGraceTracker.
+            fired = self._face_lost_tracker.update(True, corroborated=self._last_person_visible, now=now)
             self._face_lost_active = self._face_lost_tracker.is_active
             if fired is not None:
-                events.append(Event.now("attention_lost", fired, 0.9, self.name))
+                confidence = 0.9 if not self._face_lost_tracker.corroborated else 0.6
+                detail = "" if not self._face_lost_tracker.corroborated else "person still in frame; face turned away"
+                events.append(Event.now("attention_lost", fired, confidence, self.name, detail))
 
             # Can't confirm eyes-off-road without a face reading, so a visible phone here
             # gets partial (not full) phone_risk credit -- it might just be sitting in a
-            # mount while the driver's head is turned for an unrelated reason.
+            # mount while the driver's head is turned for an unrelated reason. Same idea
+            # for face-lost risk itself: a corroborated turn (body still visible) is real
+            # but lesser risk, not the full weight of no evidence at all.
+            face_lost_risk = 0.0
+            if self._face_lost_active:
+                face_lost_risk = 1.0 if not self._face_lost_tracker.corroborated else 0.5
             score, risk_event = self._risk_fusion.update(
                 eye_risk=0.0,
                 gaze_risk=0.0,
                 phone_risk=0.5 if phone_visible else 0.0,
                 eating_risk=eating_risk,
-                face_lost_risk=1.0 if self._face_lost_active else 0.0,
+                face_lost_risk=face_lost_risk,
                 now=now,
             )
             self._last_risk_score = score
@@ -823,7 +888,7 @@ class DriverAttentionModule(VisionModule):
                 events.append(Event.now(risk_event, 0.0, score, self.name))
             return events
 
-        self._face_lost_tracker.update(False, now)
+        self._face_lost_tracker.update(False, corroborated=self._last_person_visible, now=now)
         # The face returning after a SUSTAINED absence is a scene change: the
         # smoothers' samples describe whatever was there before, so they start
         # fresh. A one-frame dropout never reaches here with _face_lost_active
@@ -939,12 +1004,16 @@ class DriverAttentionModule(VisionModule):
             self._last_pitch = pitch
 
             distract_condition = abs(yaw) > self._yaw_threshold_deg
-            fired = self._distract_tracker.update(distract_condition, now)
+            mirror_check_angle = abs(yaw) > self._mirror_check_yaw_deg
+            fired = self._distract_tracker.update(distract_condition, corroborated=mirror_check_angle, now=now)
             # Same fix as drowsiness: the live alert only turns on once the turn has
-            # actually been sustained for distraction_seconds, not on every glance.
+            # actually been sustained for distraction_seconds (or, for a wide-angle
+            # turn the whole time, rearview_tolerance_seconds) -- not on every glance.
             self._distracted_active = self._distract_tracker.is_active
             if fired is not None:
-                events.append(Event.now("distraction", fired, min(1.0, abs(yaw) / 90.0), self.name))
+                confidence = min(1.0, abs(yaw) / 90.0)
+                detail = "" if not self._distract_tracker.corroborated else "sustained wide-angle turn (mirror/blind-spot check taking too long)"
+                events.append(Event.now("distraction", fired, confidence, self.name, detail))
 
             if self._glance_counter.update(distract_condition, now):
                 events.append(Event.now("frequent_glancing", 0.0, 1.0, self.name))
@@ -982,7 +1051,12 @@ class DriverAttentionModule(VisionModule):
         eye_risk = 1.0 if self._drowsy_active else min(1.0, perclos / self._perclos_threshold) * 0.6
         gaze_risk = (
             1.0
-            if (self._distracted_active or self._eyes_down_active)
+            if self._eyes_down_active
+            # A corroborated (wide-angle, mirror-check-shaped) sustained turn is
+            # real but lesser risk than an ordinary moderate-angle distraction --
+            # same reasoning as face_lost_risk below.
+            else 1.0 if (self._distracted_active and not self._distract_tracker.corroborated)
+            else 0.6 if self._distracted_active
             else min(1.0, self._glance_counter.count / self._glance_min_count) * 0.5
         )
         phone_risk = (

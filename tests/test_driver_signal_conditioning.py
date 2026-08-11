@@ -15,8 +15,10 @@ from __future__ import annotations
 
 import math
 
+import pytest
+
 from core.eye_signal import AdaptiveBaseline, SignalSmoother, iris_openness
-from modules.base import GracedConditionTracker, SustainedConditionTracker
+from modules.base import CorroboratedGraceTracker, GracedConditionTracker, SustainedConditionTracker
 
 
 class TestGracedConditionTracker:
@@ -220,3 +222,95 @@ class TestIrisOpenness:
 
     def test_short_landmark_list_gives_none(self):
         assert iris_openness([(0.0, 0.0)] * 100) is None
+
+
+class TestCorroboratedGraceTracker:
+    """The face-lost timer's two-threshold logic: patient if a body is
+    corroborating presence throughout, but never SLOWER than the short
+    threshold alone the moment that corroboration stops being true."""
+
+    def test_fires_at_the_short_threshold_when_never_corroborated(self):
+        tracker = CorroboratedGraceTracker(short_s=2.5, long_s=8.0, release_s=0.4)
+        fired = None
+        for i in range(30):
+            now = i * 0.125
+            result = tracker.update(True, corroborated=False, now=now)
+            if result is not None:
+                fired = (i, result)
+                break
+        assert fired is not None
+        assert fired[1] == pytest.approx(2.5, abs=0.13)
+
+    def test_fires_at_the_long_threshold_when_corroborated_the_entire_episode(self):
+        tracker = CorroboratedGraceTracker(short_s=2.5, long_s=8.0, release_s=0.4)
+        fired = None
+        for i in range(80):
+            now = i * 0.125
+            result = tracker.update(True, corroborated=True, now=now)
+            if result is not None:
+                fired = (now, result)
+                break
+        assert fired is not None
+        assert fired[0] == pytest.approx(8.0, abs=0.13)
+        # And it must NOT have fired anywhere near the short threshold.
+        early = CorroboratedGraceTracker(short_s=2.5, long_s=8.0, release_s=0.4)
+        for i in range(20):  # 2.5s worth of frames
+            assert early.update(True, corroborated=True, now=i * 0.125) is None
+
+    def test_corroboration_lost_mid_episode_fires_immediately_not_from_a_fresh_clock(self):
+        """The property the whole class exists for: the body disappearing
+        PARTWAY through must never make the alert slower than the short
+        threshold alone -- it must fire the instant elapsed time already
+        covers the short threshold, not restart counting from the moment
+        corroboration was lost."""
+        tracker = CorroboratedGraceTracker(short_s=2.5, long_s=8.0, release_s=0.4)
+        # 5 seconds of corroborated face-loss (body visible) -- past the short
+        # threshold already, still under the long one, so nothing has fired yet.
+        for i in range(40):
+            assert tracker.update(True, corroborated=True, now=i * 0.125) is None
+        assert not tracker.is_active
+        # Body disappears too, now at t=5.0s (already > short_s=2.5s).
+        result = tracker.update(True, corroborated=False, now=5.0)
+        assert result is not None  # fires on this exact frame
+        assert result == pytest.approx(5.0)  # elapsed since t=0, not since corroboration was lost
+        assert tracker.is_active
+
+    def test_corroboration_lost_before_the_short_threshold_still_waits_for_it(self):
+        tracker = CorroboratedGraceTracker(short_s=2.5, long_s=8.0, release_s=0.4)
+        assert tracker.update(True, corroborated=True, now=0.0) is None
+        assert tracker.update(True, corroborated=False, now=0.5) is None  # lost early: too soon to fire
+        assert tracker.is_active is False
+        fired = None
+        for i in range(30):
+            now = i * 0.125
+            result = tracker.update(True, corroborated=False, now=now)
+            if result is not None:
+                fired = now
+                break
+        assert fired is not None and fired == pytest.approx(2.5, abs=0.13)
+
+    def test_a_single_frame_recovery_does_not_reset_the_episode(self):
+        tracker = CorroboratedGraceTracker(short_s=2.0, long_s=6.0, release_s=0.4)
+        for i in range(12):  # 1.5s accumulating, uncorroborated
+            tracker.update(True, corroborated=False, now=i * 0.125)
+        tracker.update(False, corroborated=False, now=1.625)  # one bad frame (< release_s)
+        fired = None
+        for i in range(13, 30):
+            now = i * 0.125
+            result = tracker.update(True, corroborated=False, now=now)
+            if result is not None:
+                fired = now
+                break
+        assert fired is not None and fired == pytest.approx(2.0, abs=0.13)
+
+    def test_a_real_clear_rearms_for_a_fresh_episode(self):
+        tracker = CorroboratedGraceTracker(short_s=2.0, long_s=6.0, release_s=0.4)
+        for i in range(20):
+            tracker.update(True, corroborated=False, now=i * 0.125)
+        assert tracker.is_active
+        for i in range(20, 25):  # comfortably past release_s (0.4s) of continuous clear
+            tracker.update(False, corroborated=False, now=i * 0.125)
+        assert not tracker.is_active
+        # Fresh episode, fully corroborated this time -- gets the long threshold again.
+        for i in range(24, 40):  # under the long threshold, measured from the new start
+            assert tracker.update(True, corroborated=True, now=i * 0.125) is None

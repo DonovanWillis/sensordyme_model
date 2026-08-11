@@ -18,6 +18,7 @@ The schema is the contract in three places at once:
 
 from __future__ import annotations
 
+import re
 from dataclasses import dataclass, field
 from typing import Any, Optional
 
@@ -294,6 +295,74 @@ class Interpretation:
         }
 
 
+# Too generic to ever match a capability; kept out of the free-text scan below
+# so "alert if you see a package" doesn't waste a lookup on "if"/"see"/"a".
+_TARGET_GUESS_STOPWORDS = frozenset({
+    "a", "an", "the", "my", "me", "someone", "something", "if", "when", "for",
+    "of", "on", "in", "at", "to", "and", "or", "is", "are", "was", "were",
+    "watch", "monitor", "alert", "notify", "detect", "notice", "check", "see",
+    "there", "any", "please", "you",
+})
+
+
+def _target_guess_candidates(description: str) -> list[str]:
+    """Candidate object names pulled from a rule's free-text description.
+
+    Used only once the model has already said `target: "none"` -- the enum
+    forces that whenever the real word isn't a detectable label (see
+    schema_for_registry's NO_TARGET comment), which is exactly the case where
+    the word the user actually said would otherwise be thrown away. It
+    survives in `description`, which the prompt asks the model to fill with a
+    short restatement ("monitor for a can") even on a refusal. Bigrams come
+    first since some real labels are two words ("cell phone", "wine glass").
+    """
+    words = [w for w in re.findall(r"[a-z']+", description.lower()) if len(w) > 2]
+    words = [w for w in words if w not in _TARGET_GUESS_STOPWORDS]
+    bigrams = [f"{a} {b}" for a, b in zip(words, words[1:])]
+    return bigrams + words
+
+
+def _assess_no_target(description: str, predicate: str, reg) -> dict:
+    """Best-effort alternatives/reason for a target:"none" rule.
+
+    Without this, every "none" refusal carried the same generic text and an
+    always-empty `alternatives`, even for requests the registry actually has a
+    specific, useful answer for (e.g. "keys" -> objects.small_personal's real
+    explanation of what an open-vocabulary detector would take). Scans
+    candidate words through the SAME `reg.assess` a named target would get; it
+    does not guess meaning, only re-runs the existing capability lookup
+    (label match, category expansion, declared-but-unavailable capability, or
+    nearest-spelling) against words the model already wrote down. A match
+    against a real registered capability (`verdict.capabilities`) wins
+    outright and stops the scan; a weaker spelling-only match is kept only
+    until a stronger one turns up.
+    """
+    fallback = {
+        "reason": "no object SensorDyme can detect matches this request",
+        "requires": "a model trained on the thing you described",
+        "support": Support.NEEDS_TRAINING_DATA.value,
+        "alternatives": [],
+    }
+    best = None
+    for candidate in _target_guess_candidates(description):
+        verdict = reg.assess(candidate, predicate)
+        if verdict.support is Support.UNSUPPORTED:
+            continue
+        if verdict.capabilities:
+            best = verdict
+            break
+        if best is None and (verdict.alternatives or verdict.requires):
+            best = verdict
+    if best is None:
+        return fallback
+    return {
+        "reason": best.reason,
+        "requires": best.requires or fallback["requires"],
+        "support": best.support.value,
+        "alternatives": list(best.alternatives),
+    }
+
+
 def parse_response(payload: Any, reg=None) -> Interpretation:
     """Turn raw provider output into a validated Interpretation.
 
@@ -329,12 +398,10 @@ def parse_response(payload: Any, reg=None) -> Interpretation:
             continue
         draft = RuleDraft.from_dict(entry)
         if draft.target == NO_TARGET:
+            guess = _assess_no_target(draft.description, draft.predicate, reg)
             result.unsupported.append({
                 "request": draft.description or "(request)",
-                "reason": "no object SensorDyme can detect matches this request",
-                "requires": "a model trained on the thing you described",
-                "support": "needs_training_data",
-                "alternatives": [],
+                **guess,
             })
             continue
         ok, reason, extra = draft.validate(reg)

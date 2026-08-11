@@ -52,7 +52,8 @@ TAXONOMY: dict[str, list[Detection]] = {
     # ------------------------------------------------------------------ driver_safety
     "driver_safety": [
         _d("eyes_off_road", "Eyes/head away from road (sustained)", SUPPORTED,
-           how="FaceMesh yaw vs calibrated baseline + SustainedConditionTracker"),
+           how="FaceMesh yaw vs calibrated baseline; a wide-angle turn shaped like a "
+               "mirror/blind-spot check gets more patience than an ordinary glance"),
         _d("looking_down", "Looking down (sustained)", SUPPORTED,
            how="FaceMesh pitch vs calibrated baseline (eyes_down event)"),
         _d("phone_visible", "Phone visible", SUPPORTED, how="YOLO 'cell phone' class"),
@@ -144,10 +145,12 @@ TAXONOMY: dict[str, list[Detection]] = {
         _d("on_floor", "Person remaining on floor after fall", SUPPORTED,
            how="fall alert stays active until significant movement resumes"),
         _d("presence", "Person present / absent", SUPPORTED, how="YOLO person + event lifecycle"),
-        _d("zone_events", "Restricted areas / stairs / kitchen / bed area / wandering", SUPPORTED,
-           how="user-drawn zones + persistence (same zone engine as security/baby)"),
+        _d("zone_events", "Restricted areas / stairs / wandering", SUPPORTED,
+           how="user-drawn zones tested against the ankle midpoint + persistence "
+               "(restricted/boundary only; 'safe' zones are baby mode's concern)"),
         _d("stillness", "Motionless for an unusual period", SUPPORTED,
-           how="motion-energy stillness detection (shared with baby mode)"),
+           how="hip/shoulder centroid movement over a long window (deliberately "
+               "10 minutes by default, to not flag ordinary resting/reading)"),
         _d("posture", "Standing / sitting / lying classification", PARTIAL,
            how="pose landmarks exist in the fall module",
            caveat="explicit posture classification not implemented; falls are detected by "

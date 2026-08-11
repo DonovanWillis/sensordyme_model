@@ -442,3 +442,37 @@ def test_no_target_is_in_the_constrained_enum(reg):
 
     enum = schema_for_registry(reg)["properties"]["rules"]["items"]["properties"]["target"]["enum"]
     assert NO_TARGET in enum
+
+
+def test_no_target_gives_the_registrys_specific_reason_for_a_declared_capability(reg):
+    """"keys" is enum-refused (objects.small_personal exists but is unavailable),
+    so the model must say NO_TARGET -- but the registry knows exactly why keys
+    don't work and what would fix it. That real answer should reach the user
+    instead of the same generic line every refusal used to get."""
+    from jupiter.schema import NO_TARGET
+
+    result = parse_response({
+        "understood": "cannot", "unsupported": [],
+        "rules": [{"target": NO_TARGET, "predicate": "present",
+                   "description": "alert me if you see my keys"}],
+    }, reg)
+    entry = result.unsupported[0]
+    assert entry["support"] == "needs_model"
+    assert "open-vocabulary" in entry["requires"] or "fine-tune" in entry["requires"]
+    assert entry["reason"] != "no object SensorDyme can detect matches this request"
+
+
+def test_no_target_still_falls_back_to_the_generic_reason_for_true_nonsense(reg):
+    """A word that matches nothing in the registry -- not a label, not a
+    category, not a declared-but-unavailable capability -- must still produce
+    the honest generic refusal, not a fabricated specific one."""
+    from jupiter.schema import NO_TARGET
+
+    result = parse_response({
+        "understood": "cannot", "unsupported": [],
+        "rules": [{"target": NO_TARGET, "predicate": "present",
+                   "description": "monitor for xyzzy quux"}],
+    }, reg)
+    entry = result.unsupported[0]
+    assert entry["alternatives"] == []
+    assert "xyzzy" in entry["requires"] or entry["requires"] == "a model trained on the thing you described"

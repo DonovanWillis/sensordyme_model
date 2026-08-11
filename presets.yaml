@@ -48,7 +48,7 @@ presets:
     title: Elderly Monitoring
     description: Fall detection - rapid drop followed by stillness triggers a loud alert.
     module: fall_detection
-    alert_types: [fall]
+    alert_types: [fall, zone_violation, unusual_stillness]
     variants:
       standard: { title: Standard }
       post_surgery:

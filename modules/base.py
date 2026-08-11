@@ -241,3 +241,78 @@ class GracedConditionTracker:
     def is_active(self) -> bool:
         """True from firing until the condition has been clear for `release_s`."""
         return self._fired
+
+
+class CorroboratedGraceTracker:
+    """A GracedConditionTracker with two thresholds: a short one that always
+    applies, and a longer one usable only while a second, corroborating
+    condition has held for the ENTIRE episode so far.
+
+    Built for driver_attention.py's face-lost signal: a driver whose face the
+    camera can't find is more patient to alarm on if their body is still
+    visible the whole time (they turned to check a mirror) than if nothing
+    corroborates their presence at all (they may be genuinely gone) --
+    "face unavailable" should not mean "driver disappeared" outright.
+
+    The corroborating evidence can only ever LOWER urgency, never raise it
+    past what the short threshold alone would already give: the moment
+    corroboration drops out even once mid-episode, the tracker reverts to the
+    short threshold for the rest of it, measured from when the primary
+    condition first became true -- not from when it dropped out. So a
+    situation that gets WORSE partway through (the body disappears too) is
+    never slower to fire than the short threshold alone would have been; the
+    long threshold is a bonus available only to a fully-corroborated episode,
+    never a delay imposed on one that stopped being.
+    """
+
+    def __init__(self, short_s: float, long_s: float, release_s: float = 0.4) -> None:
+        self._short_s = short_s
+        self._long_s = max(short_s, long_s)
+        self._release_s = release_s
+        self._start: Optional[float] = None
+        self._corroborated = True
+        self._fired = False
+        self._false_since: Optional[float] = None
+
+    def update(self, condition: bool, corroborated: bool, now: float) -> Optional[float]:
+        """Advance with this frame's primary condition and corroborating evidence.
+
+        Returns the elapsed duration the moment the applicable threshold is
+        first crossed, else None (same contract as GracedConditionTracker).
+        """
+        if condition:
+            self._false_since = None
+            if self._start is None:
+                self._start = now
+                self._corroborated = corroborated
+            elif not corroborated:
+                self._corroborated = False  # latches for the rest of this episode
+            elapsed = now - self._start
+            threshold = self._long_s if self._corroborated else self._short_s
+            if elapsed >= threshold and not self._fired:
+                self._fired = True
+                return elapsed
+            return None
+
+        if self._start is None:
+            return None
+        if self._false_since is None:
+            self._false_since = now
+        if now - self._false_since >= self._release_s:
+            self._start = None
+            self._fired = False
+            self._corroborated = True
+            self._false_since = None
+        return None
+
+    @property
+    def is_active(self) -> bool:
+        """True from firing until the condition has been clear for `release_s`."""
+        return self._fired
+
+    @property
+    def corroborated(self) -> bool:
+        """Whether the current (or most recent) episode has had corroborating
+        evidence the whole way through -- for callers that want to vary an
+        event's reported confidence/severity by which threshold applied."""
+        return self._corroborated

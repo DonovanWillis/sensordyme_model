@@ -14,6 +14,7 @@ from core.keypoints import (
     Part,
     Skeleton,
     from_coco_keypoints,
+    from_detection_box,
     from_mediapipe,
 )
 from core.tracking import PersonTracker
@@ -71,6 +72,33 @@ def test_coco_keypoints_adapt_for_the_hailo_path():
 
 def test_a_short_landmark_list_does_not_raise():
     assert from_mediapipe([Landmark(0.5, 0.5)]).get(Part.LEFT_HIP) is None
+
+
+def test_detection_box_yields_a_trackable_torso_and_nothing_else():
+    """Only the two measurements PersonTracker's matcher reads (center_of_mass,
+    torso_length) come from a box; every part with no box-derived counterpart
+    (a knee, an elbow) must stay absent rather than implied."""
+    skeleton = from_detection_box((700, 300, 900, 800))  # x1,y1,x2,y2
+    assert skeleton.center_of_mass() is not None
+    assert skeleton.torso_length() is not None
+    assert skeleton.get(Part.LEFT_KNEE) is None
+    assert skeleton.left_knee_angle() is None
+
+
+def test_detection_box_degenerate_size_does_not_raise():
+    assert from_detection_box((10, 10, 10, 10)).torso_length() is None
+
+
+def test_two_box_only_people_still_get_separate_stable_ids():
+    """The exact reuse modules/occupancy.py relies on: PersonTracker matching
+    coarse box-derived skeletons the same way it matches real pose skeletons."""
+    tracker = PersonTracker()
+    far_apart = [(50, 100, 150, 500), (700, 100, 800, 500)]
+    first = tracker.update([from_detection_box(b) for b in far_apart], now=100.0)
+    assert len({t.track_id for t in first}) == 2
+
+    second = tracker.update([from_detection_box(b) for b in far_apart], now=100.1)
+    assert [t.track_id for t in first] == [t.track_id for t in second]
 
 
 # --------------------------------------------------------------------- occlusion

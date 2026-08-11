@@ -83,6 +83,68 @@ def test_zone_violation_confirms_then_lingering(module, monkeypatch):
     assert not module.is_alert_active()
 
 
+def test_two_different_people_in_sequence_dont_sum_into_one_lingering(module, monkeypatch):
+    """The bug per-person tracking fixes: an aggregate "has the zone been
+    occupied" clock read person A leaving and person B arriving moments later
+    as one continuous visit. linger_s=3.0 here; each visit lasts 1.8s (under
+    the threshold), separated by a 3.0s empty gap -- longer than
+    PersonTracker's own lost_grace_s (2.0s), so the second visit is a
+    genuinely different tracked identity, not a re-matched continuation of
+    the first."""
+    t = {"now": 0.0}
+    monkeypatch.setattr(occupancy_module.time, "monotonic", lambda: t["now"])
+    events = []
+
+    for _ in range(18):  # person A, 1.8s
+        module._fake.boxes_to_return = [IN_ENTRY]
+        events += module.process(FRAME)
+        t["now"] += 0.1
+
+    for _ in range(30):  # A leaves; empty long enough to retire the track
+        module._fake.boxes_to_return = []
+        events += module.process(FRAME)
+        t["now"] += 0.1
+
+    for _ in range(18):  # person B, 1.8s
+        module._fake.boxes_to_return = [IN_ENTRY]
+        events += module.process(FRAME)
+        t["now"] += 0.1
+
+    assert "person_lingering" not in [e.type for e in events]
+
+
+def test_one_person_lingering_the_full_duration_still_fires(module, monkeypatch):
+    """The positive case for the same fix: one continuous stay past linger_s
+    must still confirm -- per-person tracking narrows lingering, it must not
+    silently disable it."""
+    t = {"now": 0.0}
+    monkeypatch.setattr(occupancy_module.time, "monotonic", lambda: t["now"])
+    events = []
+    for _ in range(40):  # 4.0s, one continuous person, over linger_s=3.0
+        module._fake.boxes_to_return = [IN_ENTRY]
+        events += module.process(FRAME)
+        t["now"] += 0.1
+    assert "person_lingering" in [e.type for e in events]
+
+
+def test_person_lingering_state_is_pruned_after_a_visitor_leaves_for_good(module, monkeypatch):
+    """Regression guard for the leak EventEngine.remove_rule exists to prevent:
+    without it, every track id that ever entered the zone keeps its own
+    RuleSpec sitting in the engine for the life of the process."""
+    t = {"now": 0.0}
+    monkeypatch.setattr(occupancy_module.time, "monotonic", lambda: t["now"])
+    for _ in range(15):
+        module._fake.boxes_to_return = [IN_ENTRY]
+        module.process(FRAME)
+        t["now"] += 0.1
+    for _ in range(30):  # long enough for the tracker to retire, then the engine to drain
+        module._fake.boxes_to_return = []
+        module.process(FRAME)
+        t["now"] += 0.1
+    assert module._known_track_ids == set()
+    assert not any(key.startswith("person_lingering:") for key in module._engine._rules)
+
+
 def test_occupancy_change_debounce_still_works(module):
     events = _run(module, [OUTSIDE], 3)
     assert sum(1 for e in events if e.type == "occupancy_change") == 1  # confirmed once

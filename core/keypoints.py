@@ -282,6 +282,39 @@ def from_mediapipe(landmarks, aspect: float = 1.0) -> Skeleton:
     return Skeleton(keypoints=keypoints, aspect=aspect)
 
 
+def from_detection_box(box: tuple[float, float, float, float], aspect: float = 1.0) -> Skeleton:
+    """Coarse Skeleton for a plain detector box, no pose model involved.
+
+    core/tracking.py's PersonTracker matches on `center_of_mass()` and
+    `torso_length()`, which only ever read the shoulder and hip keypoints. A
+    module with nothing but object-detector boxes (no MediaPipe -- see
+    modules/occupancy.py, which deliberately doesn't run pose to stay the
+    cheap always-on detector) can still reuse that same torso-length-
+    normalized matcher instead of a second implementation of it, by fabricating
+    just those two landmark pairs from ordinary standing-body proportions
+    (shoulders ~15% down from the top of the box, hips ~50% down).
+
+    Every other Part is left unset on purpose. `Skeleton.get()` already treats
+    an unset part as "cannot say" rather than a default, so a knee angle or
+    anything else pose-specific correctly comes back None here -- this
+    fabricates only the two measurements it was built to supply, not a body.
+    """
+    x1, y1, x2, y2 = box
+    width, height = x2 - x1, y2 - y1
+    if width <= 0 or height <= 0:
+        return Skeleton(aspect=aspect)
+    center_x = (x1 + x2) / 2.0
+    shoulder_y = y1 + height * 0.15
+    hip_y = y1 + height * 0.50
+    keypoints = {
+        Part.LEFT_SHOULDER: Keypoint(Part.LEFT_SHOULDER, center_x, shoulder_y),
+        Part.RIGHT_SHOULDER: Keypoint(Part.RIGHT_SHOULDER, center_x, shoulder_y),
+        Part.LEFT_HIP: Keypoint(Part.LEFT_HIP, center_x, hip_y),
+        Part.RIGHT_HIP: Keypoint(Part.RIGHT_HIP, center_x, hip_y),
+    }
+    return Skeleton(keypoints=keypoints, aspect=aspect)
+
+
 def from_coco_keypoints(points: Iterable, aspect: float = 1.0,
                         order: Optional[list[Part]] = None) -> Skeleton:
     """Adapt a COCO-17 keypoint array — the format Hailo pose models emit.
