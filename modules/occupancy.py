@@ -5,8 +5,14 @@ Optional user-drawn zones (config `zones:`) add security events through the
 shared event lifecycle (core/event_engine.py):
   * zone_violation — any person's feet inside a `restricted` zone, sustained;
   * person_lingering — one SPECIFIC tracked person's feet in the zone past
-    `linger_s`.
-Both resolve when their subject leaves, and brief occlusions don't reset progress.
+    `linger_s`;
+  * vehicle_in_zone / animal_in_zone — a car/truck/... or a dog/cat/... inside
+    the zone, sustained. The vocabulary comes from core.capabilities'
+    `expand("vehicle")`/`expand("animal")` category words, the SAME lookup
+    Jupiter uses, so a class added there is picked up here with no separate
+    list to maintain -- see core/taxonomy.py's former "not wired into the
+    security event set yet" caveat on both.
+All resolve when their subject leaves, and brief occlusions don't reset progress.
 
 Lingering is per-person via core/tracking.py's PersonTracker, reused here on a
 coarse box-derived Skeleton (see core/keypoints.from_detection_box) rather than
@@ -26,6 +32,7 @@ import cv2
 import numpy as np
 
 from core.accel import COCO_NAMES
+from core.capabilities import registry as capability_registry
 from core.detections import Detection, DetectionFrame
 from core.detectors import get_yolo_model
 from core.event_engine import CONFIRMED, RESOLVED, EventEngine, RuleSpec
@@ -36,6 +43,12 @@ from core.zones import load_zones
 from modules.base import VisionModule, register_module
 
 _PERSON_CLASS = 0  # COCO
+# Zone-watched object categories beyond people. Kept to two: these are the
+# ones core/taxonomy.py already documented as "the classes exist, just not
+# wired into the security event set" -- everything else PARTIAL/UNSUPPORTED
+# there (package, door state, smoke/fire, ...) needs a model this repo
+# doesn't have, not more wiring.
+_ZONE_CATEGORIES = ("vehicle", "animal")
 
 
 @register_module("occupancy")
@@ -78,6 +91,30 @@ class OccupancyModule(VisionModule):
                 detection=f"zone_violation:{zone.name}", severity="critical",
                 persist_s=self._zone_confirm_s, min_frames=3, resolve_after_s=5.0,
             ))
+
+        # Vehicle/animal-in-zone: same zone engine, a category word's real
+        # labels resolved from the live capability registry rather than a
+        # second hardcoded list (see module docstring). Only requested from
+        # the detector when there's a zone to test them against -- a bare
+        # person-counting config pays nothing for this.
+        self._label_to_zone_category: dict[str, str] = {}
+        if self._watched_zones:
+            reg = capability_registry()
+            for category in _ZONE_CATEGORIES:
+                for label in reg.expand(category):
+                    self._label_to_zone_category[label] = category
+            name_to_id = {name: class_id for class_id, name in COCO_NAMES.items()}
+            extra_ids = {
+                name_to_id[label] for label in self._label_to_zone_category if label in name_to_id
+            }
+            self._requested_class_ids = sorted({_PERSON_CLASS, *extra_ids})
+            for category in _ZONE_CATEGORIES:
+                for zone in self._watched_zones:
+                    self._engine.add_rule(RuleSpec(
+                        detection=f"{category}_in_zone:{zone.name}", severity="warning",
+                        persist_s=self._zone_confirm_s, min_frames=3, resolve_after_s=5.0,
+                    ))
+
         # Per-person lingering identity (see module docstring). Track ids are
         # only ever added; a retired id is pruned once every zone's lingering
         # rule for it has itself resolved or been dropped, so long-running
@@ -119,6 +156,12 @@ class OccupancyModule(VisionModule):
         count = len(person_indices)
         confidences_for_count = [confidences[i] for i in person_indices]
 
+        category_boxes: dict[str, list[tuple[int, int, int, int]]] = {}
+        for i, label in enumerate(labels):
+            category = self._label_to_zone_category.get(label)
+            if category is not None:
+                category_boxes.setdefault(category, []).append(boxes[i])
+
         if count == self._pending_count:
             self._pending_streak += 1
         else:
@@ -157,6 +200,14 @@ class OccupancyModule(VisionModule):
                 # zone must not raise one.
                 inside = any(zone.contains_box(b, w, h) for b in self._last_person_boxes)
                 transitions += self._engine.update(f"zone_violation:{zone.name}", inside, 0.85, now)
+
+                for category in _ZONE_CATEGORIES:
+                    cat_inside = any(
+                        zone.contains_box(b, w, h) for b in category_boxes.get(category, [])
+                    )
+                    transitions += self._engine.update(
+                        f"{category}_in_zone:{zone.name}", cat_inside, 0.8, now
+                    )
 
                 for track_id in self._known_track_ids:
                     key = f"person_lingering:{zone.name}:{track_id}"

@@ -6,12 +6,20 @@ core/taxonomy.py under `baby_monitoring`. The short version:
   SUPPORTED: child present/absent, leaving a configured safe zone (crib/play
   area), entering configured restricted zones (stairs/pool/stove — the USER
   draws these; a camera cannot know what a pool is), unusual stillness,
-  person-count changes, activity bursts (logged observations).
+  person-count changes, activity bursts (logged observations), a bottle
+  overlapping the child's box (an approximation of "holding", not proof —
+  the SAME box-overlap approximation core/rules.py's `holding` predicate
+  already uses and discloses elsewhere in the product; nothing infant-model-
+  specific about it, which is why it's safe to claim where face state isn't).
 
   DELIBERATELY NOT CLAIMED: face-covered / face-down detection (adult face
   models are not reliable enough on infants for a safety-critical claim),
-  sleeping vs awake, crying (no microphone). Faking those would be worse than
-  omitting them.
+  sleeping vs awake, crying (no microphone), or anything requiring a
+  small-object vocabulary beyond what YOLO actually has classes for (COCO has
+  no "choking hazard" class, and a curated subset would create false
+  confidence about coverage it doesn't have — see core/capabilities.py's
+  objects.small_personal for the same reasoning applied product-wide).
+  Faking any of these would be worse than omitting them.
 
 All temporal reasoning goes through core/event_engine.py: nothing here alerts
 on a single frame, brief occlusions don't reset progress, and every alert has
@@ -26,14 +34,16 @@ from typing import Optional
 import cv2
 import numpy as np
 
+from core.accel import COCO_NAMES
 from core.detections import Detection, DetectionFrame
-from core.detectors import get_yolo_model
+from core.detectors import get_yolo_model, iou
 from core.event_engine import CONFIRMED, RESOLVED, EventEngine, RuleSpec
 from core.events import Event
 from core.zones import Zone, load_zones
 from modules.base import VisionModule, register_module
 
 _PERSON_CLASS = 0  # COCO
+_BOTTLE_CLASS = next(cid for cid, name in COCO_NAMES.items() if name == "bottle")
 
 
 @register_module("baby_monitoring")
@@ -82,11 +92,17 @@ class BabyMonitoringModule(VisionModule):
             detection="activity_burst", severity="info",
             persist_s=0.5, min_frames=2, resolve_after_s=3.0, cooldown_s=10.0,
         ))
+        self._engine.add_rule(RuleSpec(
+            detection="holding_bottle", severity="info",
+            persist_s=float(config.get("holding_bottle_confirm_s", 1.0)),
+            min_frames=3, resolve_after_s=2.0,
+        ))
 
         # --- per-frame state ---------------------------------------------------
         self._frame_index = 0
         self._last_boxes: list[tuple[int, int, int, int]] = []
         self._last_confidences: list[float] = []
+        self._last_bottle_boxes: list[tuple[int, int, int, int]] = []
         self._last_frame_size: tuple[int, int] = (0, 0)
         self._last_count = -1
         self._prev_gray: Optional[np.ndarray] = None
@@ -95,20 +111,33 @@ class BabyMonitoringModule(VisionModule):
 
     # ------------------------------------------------------------------ perception
     def _detect_people(self, frame: np.ndarray) -> list[tuple[int, int, int, int]]:
-        """YOLO person boxes (overridable in tests)."""
+        """YOLO person boxes (overridable in tests).
+
+        Bottle boxes ride along on the SAME detector pass (no added inference
+        cost) and are recorded as a side effect (self._last_bottle_boxes) --
+        the same pattern _last_confidences already uses, so subclasses and
+        tests that override this method for its person-box return value keep
+        working unchanged.
+        """
         if self._model is None:
             self._model = get_yolo_model(self._weights)
         results = self._model.predict(
-            frame, verbose=False, classes=[_PERSON_CLASS], conf=self._confidence_threshold
+            frame, verbose=False, classes=[_PERSON_CLASS, _BOTTLE_CLASS], conf=self._confidence_threshold
         )
-        boxes, confidences = [], []
+        boxes, confidences, bottle_boxes = [], [], []
         for result in results:
             for box in result.boxes:
-                boxes.append(tuple(int(v) for v in box.xyxy[0].tolist()))
-                confidences.append(float(box.conf[0]))
+                class_id = int(box.cls[0]) if getattr(box, "cls", None) is not None else _PERSON_CLASS
+                xyxy = tuple(int(v) for v in box.xyxy[0].tolist())
+                if class_id == _BOTTLE_CLASS:
+                    bottle_boxes.append(xyxy)
+                else:
+                    boxes.append(xyxy)
+                    confidences.append(float(box.conf[0]))
         # Recorded alongside rather than returned, so subclasses and tests that
         # override this method for its boxes keep working unchanged.
         self._last_confidences = confidences
+        self._last_bottle_boxes = bottle_boxes
         return boxes
 
     def _motion_energy(self, frame: np.ndarray) -> float:
@@ -132,9 +161,10 @@ class BabyMonitoringModule(VisionModule):
         self._last_motion = self._motion_energy(frame)
         h, w = frame.shape[:2]
         self._last_frame_size = (w, h)
-        return self._reason(boxes, self._last_motion, w, h, now)
+        return self._reason(boxes, self._last_motion, w, h, now, self._last_bottle_boxes)
 
-    def _reason(self, boxes: list, motion: float, w: int, h: int, now: float) -> list[Event]:
+    def _reason(self, boxes: list, motion: float, w: int, h: int, now: float,
+                bottle_boxes: list = ()) -> list[Event]:
         """Pure decision layer (unit-testable without camera or model)."""
         events: list[Event] = []
         present = len(boxes) > 0
@@ -168,6 +198,14 @@ class BabyMonitoringModule(VisionModule):
         )
         # Activity bursts: large motion while visible (logged, never an alarm).
         transitions += self._engine.update("activity_burst", present and motion > 6 * self._still_max_motion, 0.7, now)
+
+        # Bottle overlapping the child's box: an approximation of "holding", not
+        # proof (a bottle propped beside them in a bouncer would also match) --
+        # the same box-overlap approximation core/rules.py's `holding` predicate
+        # already uses and discloses. Bare bottle presence elsewhere in frame is
+        # NOT this signal on purpose: "bottle detected" alone isn't meaningful.
+        holding_bottle = any(iou(b, bottle) > 0 for b in boxes for bottle in bottle_boxes)
+        transitions += self._engine.update("holding_bottle", holding_bottle, 0.7, now)
 
         if self._expect_presence:
             transitions += self._engine.update("person_absent", not present, 0.9, now)

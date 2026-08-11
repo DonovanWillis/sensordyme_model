@@ -25,11 +25,11 @@ def _module(**overrides):
     return BabyMonitoringModule(config)
 
 
-def _run(module, boxes, motion, seconds, start=0.0, step=0.1):
+def _run(module, boxes, motion, seconds, start=0.0, step=0.1, bottle_boxes=()):
     events = []
     t = start
     while t < start + seconds:
-        events += module._reason(list(boxes), motion, W, H, t)
+        events += module._reason(list(boxes), motion, W, H, t, list(bottle_boxes))
         t += step
     return events, t
 
@@ -129,3 +129,36 @@ def test_get_detections_is_empty_before_any_frame():
     frame = module.get_detections()
     assert frame.count("person") == 0
     assert frame.size == (0, 0)
+
+
+# ------------------------------------------------------------------- holding_bottle
+BOTTLE_IN_CRIB = (460, 350, 520, 500)     # overlaps IN_CRIB
+BOTTLE_ELSEWHERE = (860, 300, 920, 500)   # does not overlap IN_CRIB
+
+
+def test_bottle_overlapping_the_child_confirms_holding_bottle():
+    module = _module(holding_bottle_confirm_s=1.0)
+    events, _ = _run(module, [IN_CRIB], motion=0.05, seconds=1.5, bottle_boxes=[BOTTLE_IN_CRIB])
+    assert "holding_bottle" in [e.type for e in events]
+
+
+def test_bare_bottle_away_from_the_child_does_not_confirm():
+    """'Bottle detected' alone is explicitly not meaningful -- only overlap is."""
+    module = _module(holding_bottle_confirm_s=1.0)
+    events, _ = _run(module, [IN_CRIB], motion=0.05, seconds=1.5, bottle_boxes=[BOTTLE_ELSEWHERE])
+    assert "holding_bottle" not in [e.type for e in events]
+
+
+def test_no_bottle_at_all_does_not_confirm():
+    module = _module(holding_bottle_confirm_s=1.0)
+    events, _ = _run(module, [IN_CRIB], motion=0.05, seconds=1.5)
+    assert "holding_bottle" not in [e.type for e in events]
+
+
+def test_holding_bottle_resolves_once_the_bottle_moves_away():
+    module = _module(holding_bottle_confirm_s=1.0)
+    events, t = _run(module, [IN_CRIB], motion=0.05, seconds=1.5, bottle_boxes=[BOTTLE_IN_CRIB])
+    assert "holding_bottle" in [e.type for e in events]
+
+    events, _ = _run(module, [IN_CRIB], motion=0.05, seconds=3.0, start=t, bottle_boxes=[BOTTLE_ELSEWHERE])
+    assert "holding_bottle_resolved" in [e.type for e in events]

@@ -4,13 +4,17 @@ import numpy as np
 import pytest
 
 import modules.occupancy as occupancy_module
+from core.accel import COCO_NAMES
 from modules.occupancy import OccupancyModule
+
+_NAME_TO_ID = {name: class_id for class_id, name in COCO_NAMES.items()}
 
 
 class _FakeBox:
-    def __init__(self, xyxy, conf=0.9):
+    def __init__(self, xyxy, conf=0.9, cls=0):
         self.xyxy = [np.array(xyxy, dtype=np.float32)]
         self.conf = [np.float32(conf)]
+        self.cls = [np.float32(cls)]
 
 
 class _FakeResult:
@@ -23,7 +27,16 @@ class _FakeModel:
         self.boxes_to_return = []
 
     def predict(self, frame, **kwargs):
-        return [_FakeResult([_FakeBox(b) for b in self.boxes_to_return])]
+        # Each item is a plain xyxy 4-tuple (defaults to person), or an
+        # (xyxy, class_id) pair for a specific class.
+        boxes = []
+        for item in self.boxes_to_return:
+            if len(item) == 2 and len(item[0]) == 4:
+                xyxy, cls = item
+            else:
+                xyxy, cls = item, 0
+            boxes.append(_FakeBox(xyxy, cls=cls))
+        return [_FakeResult(boxes)]
 
 
 @pytest.fixture()
@@ -81,6 +94,55 @@ def test_zone_violation_confirms_then_lingering(module, monkeypatch):
         t["now"] += 0.1
     assert "zone_violation_resolved" in [e.type for e in events]
     assert not module.is_alert_active()
+
+
+def test_vehicle_in_zone_confirms_and_resolves(module, monkeypatch):
+    """Vehicle detection reuses the same zone engine as zone_violation, gated
+    on the SAME live capability-registry vocabulary Jupiter uses (core.
+    taxonomy.py used to mark this 'not wired into the security event set')."""
+    t = {"now": 0.0}
+    monkeypatch.setattr(occupancy_module.time, "monotonic", lambda: t["now"])
+    car_id = _NAME_TO_ID["car"]
+    events = []
+    for _ in range(10):
+        module._fake.boxes_to_return = [(IN_ENTRY, car_id)]
+        events += module.process(FRAME)
+        t["now"] += 0.1
+    assert "vehicle_in_zone" in [e.type for e in events]
+    assert "zone_violation" not in [e.type for e in events]  # a car is not a person
+    assert module.is_alert_active()
+
+    for _ in range(60):
+        module._fake.boxes_to_return = []
+        events += module.process(FRAME)
+        t["now"] += 0.1
+    assert "vehicle_in_zone_resolved" in [e.type for e in events]
+
+
+def test_animal_in_zone_is_independent_of_vehicle_in_zone(module, monkeypatch):
+    t = {"now": 0.0}
+    monkeypatch.setattr(occupancy_module.time, "monotonic", lambda: t["now"])
+    dog_id = _NAME_TO_ID["dog"]
+    events = []
+    for _ in range(10):
+        module._fake.boxes_to_return = [(IN_ENTRY, dog_id)]
+        events += module.process(FRAME)
+        t["now"] += 0.1
+    types = [e.type for e in events]
+    assert "animal_in_zone" in types
+    assert "vehicle_in_zone" not in types
+
+
+def test_vehicle_outside_the_zone_does_not_confirm(module, monkeypatch):
+    t = {"now": 0.0}
+    monkeypatch.setattr(occupancy_module.time, "monotonic", lambda: t["now"])
+    car_id = _NAME_TO_ID["car"]
+    events = []
+    for _ in range(10):
+        module._fake.boxes_to_return = [(OUTSIDE, car_id)]
+        events += module.process(FRAME)
+        t["now"] += 0.1
+    assert "vehicle_in_zone" not in [e.type for e in events]
 
 
 def test_two_different_people_in_sequence_dont_sum_into_one_lingering(module, monkeypatch):

@@ -134,6 +134,11 @@ TAXONOMY: dict[str, list[Detection]] = {
                     "changes ARE detected"),
         _d("multiple_people", "Multiple people entering the area", SUPPORTED,
            how="person-count change events"),
+        _d("holding_bottle", "Bottle overlapping the child's box (feeding context)", PARTIAL,
+           how="YOLO bottle class + box overlap with the child, logged (not an alert by default)",
+           caveat="approximates 'holding' from overlap, same as core/rules.py's `holding` "
+                  "predicate elsewhere in the product — a bottle merely propped nearby can "
+                  "also match; bare bottle presence away from the child is NOT reported"),
         _d("medical", "Medical conditions / diagnoses", UNSUPPORTED,
            requires="out of scope by policy — the system reports observable safety conditions only"),
     ],
@@ -146,8 +151,11 @@ TAXONOMY: dict[str, list[Detection]] = {
            how="fall alert stays active until significant movement resumes"),
         _d("presence", "Person present / absent", SUPPORTED, how="YOLO person + event lifecycle"),
         _d("zone_events", "Restricted areas / stairs / wandering", SUPPORTED,
-           how="user-drawn zones tested against the ankle midpoint + persistence "
-               "(restricted/boundary only; 'safe' zones are baby mode's concern)"),
+           how="user-drawn zones tested against the ankle midpoint + persistence"),
+        _d("bed_exit", "Getting out of bed (a user-drawn 'bed' safe zone)", SUPPORTED,
+           how="safe_zone_exit -- the same mechanism baby_monitoring.py uses for a crib, "
+               "applied to a bed zone; soft severity by default (getting up is often benign; "
+               "a real fall afterward is caught separately by the fall detector above)"),
         _d("stillness", "Motionless for an unusual period", SUPPORTED,
            how="hip/shoulder centroid movement over a long window (deliberately "
                "10 minutes by default, to not flag ordinary resting/reading)"),
@@ -177,12 +185,14 @@ TAXONOMY: dict[str, list[Detection]] = {
         _d("lingering", "Person lingering in an area", SUPPORTED,
            how="zone membership with a longer persistence requirement"),
         _d("crowd", "Unusual crowd / activity level", SUPPORTED, how="person-count threshold"),
-        _d("vehicle", "Vehicle entering/leaving", PARTIAL,
-           how="YOLO car/truck/motorcycle classes exist in the deployed model",
-           caveat="not wired into the security event set yet; enable via class map"),
-        _d("animal", "Animal / pet in restricted area", PARTIAL,
-           how="YOLO cat/dog classes exist in the deployed model",
-           caveat="not wired into the security event set yet"),
+        _d("vehicle", "Vehicle entering/leaving a zone", SUPPORTED,
+           how="YOLO car/truck/bus/motorcycle/bicycle/train (core.capabilities' 'vehicle' "
+               "category) + zone membership + persistence -- vehicle_in_zone, same "
+               "zone engine as person zone_violation, requested automatically once any "
+               "zone is configured"),
+        _d("animal", "Animal / pet in a zone", SUPPORTED,
+           how="YOLO dog/cat/bird/... (core.capabilities' 'animal' category) + zone "
+               "membership + persistence -- animal_in_zone, same mechanism as vehicle"),
         _d("package", "Package placed / removed / object moved", UNSUPPORTED,
            requires="object permanence + change detection against a scene baseline; "
                     "COCO 'package' isn't a class — needs a custom model"),

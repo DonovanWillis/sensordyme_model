@@ -116,6 +116,51 @@ def test_person_leaving_resolves_a_confirmed_zone_violation(module):
     assert not module.is_alert_active()
 
 
+# ------------------------------------------------------------ bed monitoring
+_BED_ZONE_CONFIG = {"bed": {"polygon": [[0.0, 0.6], [0.6, 0.6], [0.6, 1.0], [0.0, 1.0]], "kind": "safe"}}
+
+
+@pytest.fixture()
+def bed_module(monkeypatch):
+    t = {"now": 0.0}
+    monkeypatch.setattr(fall_detection_module.time, "monotonic", lambda: t["now"])
+    mod = FallDetectionModule({
+        "drop_velocity_threshold": 0.6, "stillness_duration_s": 1.5, "stillness_velocity_threshold": 0.02,
+        "zones": _BED_ZONE_CONFIG, "zone_confirm_s": 0.5,
+        "still_max_motion": 0.01, "unusual_stillness_s": 600.0,
+    })
+    mod._pose = _FakePose()
+    mod._t = t
+    return mod
+
+
+def test_staying_in_bed_does_not_confirm_safe_zone_exit(bed_module):
+    events = _run(bed_module, _standing(x=0.3), 10)  # ankles at (0.3, 0.9) -- inside "bed"
+    assert "safe_zone_exit" not in [e.type for e in events]
+
+
+def test_getting_out_of_bed_confirms_safe_zone_exit(bed_module):
+    events = _run(bed_module, _standing(x=0.9), 10)  # ankles outside "bed"
+    assert "safe_zone_exit" in [e.type for e in events]
+    assert bed_module.is_alert_active()
+
+
+def test_leaving_the_frame_entirely_does_not_itself_confirm_safe_zone_exit(bed_module):
+    """Matches baby_monitoring.py's convention: gone-entirely is a different
+    concern from detected-but-outside-the-safe-zone."""
+    events = _run(bed_module, None, 10)
+    assert "safe_zone_exit" not in [e.type for e in events]
+
+
+def test_returning_to_bed_resolves_a_confirmed_safe_zone_exit(bed_module):
+    events = _run(bed_module, _standing(x=0.9), 10)
+    assert "safe_zone_exit" in [e.type for e in events]
+
+    events = _run(bed_module, _standing(x=0.3), 60)  # back in bed, long enough to resolve
+    assert "safe_zone_exit_resolved" in [e.type for e in events]
+    assert not bed_module.is_alert_active()
+
+
 # --------------------------------------------------------------- stillness
 def test_unusual_stillness_confirms_after_the_configured_duration(module):
     events = _run(module, _standing(x=0.9), 20)  # outside the zone; isolates stillness

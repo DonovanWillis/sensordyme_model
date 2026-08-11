@@ -325,8 +325,12 @@ modules:
     #   zones:
     #     front_door: { polygon: [[0.6,0.2],[0.95,0.2],[0.95,0.9],[0.6,0.9]], kind: restricted }
     zones: {}
-    zone_confirm_s: 2.0 # seconds inside a zone before zone_violation confirms
+    zone_confirm_s: 2.0 # seconds inside a zone before zone_violation/vehicle_in_zone/animal_in_zone confirms
     linger_s: 30.0 # seconds inside a zone before person_lingering confirms
+    # vehicle_in_zone / animal_in_zone need no separate config: whenever any zone above is
+    # configured, the detector automatically also requests car/truck/bus/motorcycle/bicycle/
+    # train and dog/cat/bird/... (core.capabilities' "vehicle"/"animal" category words --
+    # the same vocabulary Jupiter uses) and watches for them the same way it watches for people.
 
   baby_monitoring:
     confidence_threshold: 0.4 # YOLO person-detection confidence (children are smaller/lower-conf)
@@ -348,11 +352,15 @@ modules:
     drop_velocity_threshold: 0.6 # fraction of frame-height/sec that counts as a "rapid drop"
     stillness_duration_s: 1.5 # seconds of stillness after a drop before a fall event fires
     stillness_velocity_threshold: 0.02 # fraction of frame-height/sec considered "still"
-    # Optional elderly-mode zones (restricted/boundary only -- same shape as
-    # occupancy's, tested against the ankle midpoint instead of a box; see
-    # core/zones.py). A person's feet inside -> zone_violation (sustained).
+    # Optional elderly-mode zones -- same shape as occupancy's/baby's, tested
+    # against the ankle midpoint instead of a box (see core/zones.py).
+    #   restricted/boundary: feet inside -> zone_violation (sustained)
+    #   safe (e.g. a "bed" zone): feet outside ALL safe zones -> safe_zone_exit
+    #     -- bed monitoring: "getting out of bed", the same safe_zone_exit
+    #     baby_monitoring.py uses for a crib
     #   zones:
     #     stairs: { polygon: [[0.0,0.6],[0.3,0.6],[0.3,1.0],[0.0,1.0]], kind: restricted }
+    #     bed: { polygon: [[0.1,0.3],[0.7,0.3],[0.7,0.9],[0.1,0.9]], kind: safe }
     zones: {}
     zone_confirm_s: 2.0 # seconds inside a watched zone before zone_violation confirms
     still_max_motion: 0.01 # normalized hip/shoulder-centroid movement floor below which

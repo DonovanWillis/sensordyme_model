@@ -1,12 +1,17 @@
 """Fall detection module: MediaPipe Pose hip/shoulder tracking for rapid-drop-then-stillness.
 
-Also the elderly-mode zone and stillness detector, on the same landmarks: a
-restricted/boundary zone ("zone_violation", same event name occupancy.py uses,
-so the existing alert-severity wiring needs no change) tested against the
-ankle midpoint rather than a fabricated bounding box (see get_detections'
-docstring on why this module deliberately never invents one), and
-"unusual_stillness" from how little the hip/shoulder centroid has moved --
-reusing the same landmarks the fall detector already reads, no extra model.
+Also the elderly-mode zone and stillness detector, on the same landmarks:
+  * restricted/boundary zone -> "zone_violation" (same event name occupancy.py
+    uses, so the existing alert-severity wiring needs no change);
+  * safe zone (e.g. a "bed" zone) -> "safe_zone_exit" (same event name and
+    meaning baby_monitoring.py uses for a crib -- "getting out of bed", soft
+    severity by default since getting up is often benign; a real fall
+    afterward is caught separately by the fall detector above);
+  * "unusual_stillness" from how little the hip/shoulder centroid has moved.
+All three are tested against the ankle midpoint rather than a fabricated
+bounding box (see get_detections' docstring on why this module deliberately
+never invents one), reusing the same landmarks the fall detector already
+reads -- no extra model.
 """
 
 from __future__ import annotations
@@ -76,18 +81,28 @@ class FallDetectionModule(VisionModule):
         self._last_frame_size: tuple[int, int] = (0, 0)
         self._last_hip_y: Optional[float] = None
 
-        # Elderly-mode zones (restricted/boundary only -- "safe" zones are
-        # baby_monitoring's concern) and standalone stillness, both on the
-        # landmarks already being read. Separate engine from _activity_engine
-        # so a fall-adjacent bug in one can't cross-contaminate the other's
-        # per-detection state.
+        # Elderly-mode zones and standalone stillness, both on the landmarks
+        # already being read. Separate engine from _activity_engine so a
+        # fall-adjacent bug in one can't cross-contaminate the other's
+        # per-detection state. "safe" zones here are bed monitoring: a "bed"
+        # zone the person is expected to stay in overnight, same safe_zone_exit
+        # semantics baby_monitoring.py already uses for a crib -- "getting out
+        # of bed" is "leaving a safe zone" whether the subject is 6 months or
+        # 86 years old, so this reuses that meaning rather than inventing a
+        # bed-specific one.
         self._zones = load_zones(config.get("zones", {}))
         self._watched_zones = [z for z in self._zones if z.kind in ("restricted", "boundary")]
+        self._safe_zones = [z for z in self._zones if z.kind == "safe"]
         self._zone_engine = EventEngine({})
         zone_confirm_s = float(config.get("zone_confirm_s", 2.0))
         for zone in self._watched_zones:
             self._zone_engine.add_rule(RuleSpec(
                 detection=f"zone_violation:{zone.name}", severity="critical",
+                persist_s=zone_confirm_s, min_frames=3, resolve_after_s=5.0,
+            ))
+        if self._safe_zones:
+            self._zone_engine.add_rule(RuleSpec(
+                detection="safe_zone_exit", severity="warning",
                 persist_s=zone_confirm_s, min_frames=3, resolve_after_s=5.0,
             ))
         self._still_max_motion = float(config.get("still_max_motion", 0.01))
@@ -125,6 +140,12 @@ class FallDetectionModule(VisionModule):
             for zone in self._watched_zones:
                 transitions += self._zone_engine.update(f"zone_violation:{zone.name}", False, 0.85, now)
             transitions += self._zone_engine.update("unusual_stillness", False, 0.8, now)
+            # Matches baby_monitoring.py's safe_zone_exit convention exactly:
+            # "not detected at all" is a DIFFERENT concern (person_absent-style,
+            # not currently built here) from "detected, but outside the safe
+            # zone" -- so gone-entirely does not itself count as having exited.
+            if self._safe_zones:
+                transitions += self._zone_engine.update("safe_zone_exit", False, 0.85, now)
             events += self._zone_transition_events(transitions)
             return events
 
@@ -179,7 +200,7 @@ class FallDetectionModule(VisionModule):
         # Occluded/invisible ankles (legs behind furniture, off the bottom of
         # frame) skip zone evaluation for this frame rather than guessing --
         # "can't see the feet" is not evidence the zone was left.
-        if self._watched_zones:
+        if self._watched_zones or self._safe_zones:
             ankle_vis = [landmarks[i].visibility for i in ANKLE_LANDMARKS]
             if all(v >= _MIN_ANKLE_VISIBILITY for v in ankle_vis):
                 foot_x = sum(landmarks[i].x for i in ANKLE_LANDMARKS) / len(ANKLE_LANDMARKS)
@@ -189,6 +210,9 @@ class FallDetectionModule(VisionModule):
                     zone_transitions += self._zone_engine.update(
                         f"zone_violation:{zone.name}", inside, 0.85, now
                     )
+                if self._safe_zones:
+                    outside = not any(zone.contains(foot_x, foot_y) for zone in self._safe_zones)
+                    zone_transitions += self._zone_engine.update("safe_zone_exit", outside, 0.85, now)
 
         # Stillness from how little the hip/shoulder centroid has moved, in
         # normalized landmark coordinates (so the threshold means the same
