@@ -1,0 +1,42 @@
+# Jupiter model routing — OPTIONAL. Copy this to jupiter_config.yaml (or point
+# JUPITER_CONFIG_PATH at a copy elsewhere) to change which model answers which
+# role. With no file present at all, jupiter/router.py uses the defaults shown
+# below — a fresh install needs none of this to work, and needs no API key.
+#
+# Two roles exist because they have opposite requirements. See the docstring
+# in jupiter/router.py for the measured numbers behind these particular
+# defaults (jupiter/eval/harness.py can re-measure them against any model you
+# point this at):
+#
+#   configure   turn a typed sentence into a structured monitoring rule.
+#               Runs once per user action, not per frame — accuracy matters
+#               more than speed.
+#   explain     paraphrase an already-computed fact list into one sentence
+#               for a fired alert. Runs once per event, in a path where
+#               latency is user-visible; the model only ever polishes a
+#               deterministic answer that already exists without it.
+#
+# Environment variables always win over this file (JUPITER_ROLE_CONFIGURE_MODEL,
+# JUPITER_ROLE_EXPLAIN_MODEL, and their _PROVIDER / _BASE_URL counterparts) —
+# useful for a one-off override without editing a file that's checked in.
+
+roles:
+  configure:
+    provider: jupiter              # jupiter | jupiter_openai_compat | anthropic | scripted
+    model: qwen2.5:7b-instruct
+    # base_url: http://localhost:11434   # only needed if Ollama isn't local
+
+  explain:
+    provider: jupiter
+    model: qwen2.5:1.5b-instruct
+
+# Optional, and OFF by default. When enabled, a request that the local model
+# genuinely couldn't answer retries once against a cloud model — never as a
+# silent default, and only for the "configure" role (explain never needs a
+# cloud model; it has a complete, correct facts-only answer with none at all).
+# SENSORDYME_ALLOW_EXTERNAL_AI=1 does the same thing as enabled: true here —
+# either one turns it on.
+cloud_fallback:
+  enabled: false
+  provider: anthropic
+  model: claude-sonnet-5           # NOT claude-opus-5 — see jupiter/providers.py

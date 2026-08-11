@@ -182,3 +182,62 @@ class SustainedConditionTracker:
         every blink/glance, before debouncing; this is only true once debounced.
         """
         return self._fired
+
+
+class GracedConditionTracker:
+    """A SustainedConditionTracker that survives momentary signal dropouts.
+
+    The plain tracker resets COMPLETELY on a single False frame — start time,
+    fired state, everything. That is correct for a clean boolean, and wrong
+    for one derived from a noisy measurement: with glasses or glare, MediaPipe
+    lands one bad frame every few seconds, and each one silently restarted the
+    drowsiness clock. The sleepier the eyes (the more marginal the landmarks),
+    the harder the closure became to detect — the failure grew in exactly the
+    case the product exists for. The same reset made `is_active` flap, so the
+    alert screen flickered with the noise.
+
+    Here, the condition must be False for `release_s` CONTINUOUSLY before the
+    tracker resets or deactivates. Real state changes are slower than noise:
+    an eye that has genuinely reopened stays open for many frames; a landmark
+    glitch lasts one or two. The firing threshold is untouched — a condition
+    still fires at exactly `sustain_s` of (grace-bridged) persistence, so
+    detection latency does not change; only noise's power to restart the clock
+    does. Mirrors what EventEngine's occlusion_grace_s already does for the
+    module lifecycle path; this is the same idea for the in-module trackers.
+    """
+
+    def __init__(self, sustain_s: float, release_s: float = 0.4) -> None:
+        self._sustain_s = sustain_s
+        self._release_s = release_s
+        self._start: Optional[float] = None
+        self._fired = False
+        self._false_since: Optional[float] = None
+
+    def update(self, condition: bool, now: float) -> Optional[float]:
+        """Advance with this frame's condition. Returns the sustained duration
+        the first moment `sustain_s` is crossed, else None (same contract as
+        SustainedConditionTracker)."""
+        if condition:
+            self._false_since = None
+            if self._start is None:
+                self._start = now
+            elapsed = now - self._start
+            if elapsed >= self._sustain_s and not self._fired:
+                self._fired = True
+                return elapsed
+            return None
+
+        if self._start is None:
+            return None
+        if self._false_since is None:
+            self._false_since = now
+        if now - self._false_since >= self._release_s:
+            self._start = None
+            self._fired = False
+            self._false_since = None
+        return None
+
+    @property
+    def is_active(self) -> bool:
+        """True from firing until the condition has been clear for `release_s`."""
+        return self._fired

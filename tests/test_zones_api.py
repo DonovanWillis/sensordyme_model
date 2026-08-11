@@ -143,7 +143,11 @@ def test_zones_and_rules_ride_the_same_response(backend):
     app_module, client, headers = backend
     client.post("/v1/devices/1/zones", json={"zones": [zone()]}, headers=headers)
     with app_module.db() as conn:
-        conn.execute("UPDATE devices SET ai_rules = ? WHERE id = 1", (json.dumps({
+        # custom_monitoring_wanted=1: this test is about zones+rules riding
+        # together once a rule set is applied, not about whether it is
+        # currently requested (that gating has its own tests) — set directly
+        # since /v1/devices/{id}/preset is what normally sets it.
+        conn.execute("UPDATE devices SET ai_rules = ?, custom_monitoring_wanted = 1 WHERE id = 1", (json.dumps({
             "rules": [{"target": "person", "predicate": "in_zone", "zone": "pool",
                        "description": "someone in the pool area", "secondary": "",
                        "persist_s": 3, "min_count": 1, "confidence": 0.6,

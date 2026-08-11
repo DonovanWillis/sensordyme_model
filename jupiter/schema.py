@@ -130,6 +130,30 @@ class RuleDraft:
                 "alternatives": list(verdict.alternatives),
             }
 
+        # These predicates are meaningless without their second half, and the
+        # registry's per-label assessment above cannot see that — it only
+        # checked "person" and "in_zone" independently, both of which pass on
+        # their own. Left unchecked, a model that names the predicate but drops
+        # the zone/secondary produces a rule that VALIDATES, looks active in
+        # the app, and quietly means something much broader than asked: an
+        # `in_zone` rule with no zone skips the zone check entirely in
+        # core/rules.py and fires on a person ANYWHERE in frame — worse than
+        # the near/holding case, which at least fails closed (never fires) per
+        # RuleEngine._evaluate. Observed live: "alert if a vehicle enters the
+        # driveway" produced target=person, predicate=in_zone, zone="".
+        if self.predicate == "in_zone" and not self.zone:
+            return False, "'in_zone' needs a zone to watch, and none was named", {
+                "support": Support.UNSUPPORTED.value,
+                "requires": "a zone the user draws in the app",
+                "alternatives": [],
+            }
+        if self.predicate in ("near", "holding", "near_mouth") and not self.secondary:
+            return False, f"'{self.predicate}' needs a second object, and none was named", {
+                "support": Support.UNSUPPORTED.value,
+                "requires": "a second object for the relation",
+                "alternatives": [],
+            }
+
         # A relational rule is only as good as its second object.
         if self.secondary:
             secondary_verdict = reg.assess(self.secondary, "present")

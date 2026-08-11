@@ -1,8 +1,8 @@
 """Which events are allowed to interrupt someone, decided where it can be enforced.
 
 The same policy the app applies locally — only the red alert, and at most one
-notification per cooldown window — but here, on the server, because the server
-is the only part that is still running when the phone's app is not.
+notification per cooldown window — but here, on the server, because the
+server is the only part that is still running when the phone's app is not.
 
 That distinction is the whole point of this module. Local notifications are
 posted BY the app, so they need it alive; a push is delivered TO the phone by
@@ -15,6 +15,20 @@ did not, so every one of ~960 red alerts became a push.
 Deliberately independent of the delivery mechanism. ntfy today, APNs when
 there is a paid Apple account; the decision does not change, only the
 transport underneath it.
+
+THE POLICY, as of this revision (product decision, stated explicitly): a
+global 20-second cooldown per account. At most one notification every 20
+seconds; every OTHER qualifying alert inside that window is still stored and
+still shown in Recent Activity — only the notification is withheld. This is a
+reversal of an earlier revision that removed time-based cooldown entirely in
+favor of pure identity dedup, because distinct alerts arriving in a burst were
+producing a burst of notifications. Duplicate-retry protection is a SEPARATE,
+lower layer that stays in effect regardless of this cooldown: a device retry
+of an already-stored event (same event_key) never even reaches this gate —
+see cloud/app.py's ingest handler, which only evaluates notifications for
+`newly_inserted_events`. The two mechanisms answer different questions ("is
+this the same event as one already handled" vs. "has enough time passed to
+interrupt again") and neither can substitute for the other.
 """
 
 from __future__ import annotations
@@ -27,21 +41,22 @@ from typing import Optional
 # "soft" is a warning that belongs in the timeline, not on a lock screen.
 CRITICAL_SEVERITY = "loud"
 
-# Minimum gap between notifications to one account, in seconds.
+# Minimum gap between notifications to one account, in seconds. Product spec,
+# stated explicitly: "at most ONE notification every 20 seconds."
 #
 # Not a detection setting: the device keeps detecting and recording at full
-# rate. This governs only how often a person may be interrupted. Someone still
-# on the floor is not new information every four seconds.
+# rate. This governs only how often a person may be interrupted.
 COOLDOWN_S = 20.0
 
 
 class NotificationGate:
     """Per-account rate limit for outbound notifications.
 
-    In memory on purpose. A cooldown is a statement about the last few seconds,
-    so it does not need to survive a restart — and persisting it would mean a
-    database write on the hot ingest path for something whose whole value is
-    that it is cheap. A backend restart at worst allows one extra notification.
+    In memory on purpose. A cooldown is a statement about the last few
+    seconds, so it does not need to survive a restart — and persisting it
+    would mean a database write on the hot ingest path for something whose
+    whole value is that it is cheap. A backend restart at worst allows one
+    extra notification.
     """
 
     def __init__(self, cooldown_s: float = COOLDOWN_S) -> None:
@@ -60,19 +75,26 @@ class NotificationGate:
         "and 4 more" from every message it was meant to appear on.
 
         A False first element never means the event is discarded — it is
-        already stored, and the timeline shows it. It means only that the phone
-        will not buzz for it.
+        already stored, and the timeline shows it. It means only that the
+        phone will not buzz for it. Applies to EVERY notification path
+        uniformly — this is the one gate cloud/app.py's ingest handler calls
+        for both push and SMS, so the two can never disagree.
         """
         if user_id is None:
             return False, 0
 
-        # Something the user explicitly configured always qualifies.
+        # Something the user explicitly configured always qualifies for
+        # CONSIDERATION regardless of severity — it still has to clear the
+        # SAME cooldown below. This bypasses the severity filter, not the
+        # rate limit: "I asked to be told about this" does not mean "as
+        # often as it happens."
         #
-        # Severity alone cannot answer "should this interrupt someone". A custom
-        # rule defaults to `warning`, which maps to `soft`, which this dropped —
-        # so the one event a person asked to be told about was the only one that
-        # never arrived, while the preset's own alerts kept coming through. That
-        # is the exact opposite of what configuring it meant.
+        # Severity alone cannot answer "should this interrupt someone". A
+        # custom rule defaults to `warning`, which maps to `soft`, which this
+        # dropped — so the one event a person asked to be told about was the
+        # only one that never arrived, while the preset's own alerts kept
+        # coming through. That is the exact opposite of what configuring it
+        # meant.
         configured = source == "custom_rule"
         if not configured and severity != CRITICAL_SEVERITY:
             return False, 0
@@ -89,16 +111,16 @@ class NotificationGate:
             return True, held
 
     def should_notify(self, user_id: Optional[int], severity: str,
-                      now: Optional[float] = None) -> bool:
+                      now: Optional[float] = None, source: str = "module") -> bool:
         """Whether this event may interrupt `user_id` right now."""
-        return self.evaluate(user_id, severity, now)[0]
+        return self.evaluate(user_id, severity, now, source=source)[0]
 
     def suppressed_since_last(self, user_id: int) -> int:
         """How many red alerts were recorded but not sent since the last one.
 
         Reported rather than silently dropped: "and 4 more" is information a
-        person can act on, and it is the honest way to say that quietening the
-        phone did not quieten the device.
+        person can act on, and it is the honest way to say that quietening
+        the phone did not quieten the device.
         """
         with self._lock:
             return self._suppressed.get(user_id, 0)

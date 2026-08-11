@@ -21,6 +21,7 @@ from typing import Optional
 
 from core.capabilities import registry
 
+from jupiter import confidence as confidence_module
 from jupiter import prompt as prompt_module
 from jupiter import security
 from jupiter.grammar import build_grammar
@@ -51,25 +52,39 @@ def extract_json(text: str) -> Optional[dict]:
     to parse that would fail a response that is actually correct, so the widest
     balanced-looking block is tried before giving up.
     """
+    payload, _ = _extract_json_verbose(text)
+    return payload
+
+
+def _extract_json_verbose(text: str) -> tuple[Optional[dict], bool]:
+    """`extract_json`, plus whether the text needed repair to parse.
+
+    `needed_repair` feeds jupiter/confidence.py: a response whose JSON parsed
+    on the first, unmodified try is a real, checkable signal that the model
+    followed the output contract; one that only parsed after stripping fences
+    or falling back to a regex scan is a real signal that it didn't, distinct
+    from whether the JSON's *content* turned out to be a valid rule.
+    """
     if not text:
-        return None
+        return None, False
     candidate = text.strip()
-    if candidate.startswith("```"):
+    fenced = candidate.startswith("```")
+    if fenced:
         candidate = candidate.strip("`")
         candidate = candidate.split("\n", 1)[-1] if "\n" in candidate else candidate
     try:
         parsed = json.loads(candidate)
-        return parsed if isinstance(parsed, dict) else None
+        return (parsed if isinstance(parsed, dict) else None), fenced
     except (ValueError, TypeError):
         pass
     match = _JSON_BLOCK.search(text)
     if not match:
-        return None
+        return None, True
     try:
         parsed = json.loads(match.group(0))
     except (ValueError, TypeError):
-        return None
-    return parsed if isinstance(parsed, dict) else None
+        return None, True
+    return (parsed if isinstance(parsed, dict) else None), True
 
 
 def interpret(
@@ -151,7 +166,7 @@ def interpret(
             injection_suspected=injection,
         )
 
-    payload = extract_json(result.text)
+    payload, json_needed_repair = _extract_json_verbose(result.text)
     if payload is None:
         return InterpretOutcome(
             interpretation=Interpretation(understood="", rules=[], unsupported=[{
@@ -167,6 +182,14 @@ def interpret(
 
     bounded = security.clamp_response(payload)
     interpretation = parse_response(bounded, reg)
+    constrained = bool(result.meta.get("constrained", False))
+    report = confidence_module.score(
+        raw_rules=bounded.get("rules") or [],
+        rules_accepted=len(interpretation.rules),
+        fragments_unsupported=len(interpretation.unsupported),
+        json_needed_repair=json_needed_repair,
+        constrained=constrained,
+    )
     return InterpretOutcome(
         interpretation=interpretation,
         provider=result.provider,
@@ -177,8 +200,13 @@ def interpret(
         meta={
             "prompt_chars": result.prompt_chars,
             "completion_chars": result.completion_chars,
-            "constrained": result.meta.get("constrained", False),
+            "constrained": constrained,
             "rules": len(interpretation.rules),
             "rejected": len(interpretation.unsupported),
+            # How confident Jupiter is that it understood the REQUEST, not to
+            # be confused with RuleDraft.confidence (an alert-trigger
+            # threshold) or Event/Explanation.confidence (vision detection
+            # confidence) — see jupiter/confidence.py's module docstring.
+            "interpretation_confidence": report.as_dict(),
         },
     )

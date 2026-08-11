@@ -7,6 +7,12 @@ doing exactly its job.
 
 Nothing here discards an event. Every one is stored and appears in the app's
 timeline; this decides interruptions only.
+
+THE POLICY (product spec, stated explicitly): a global 20-second cooldown per
+account. At most one notification every 20 seconds; every other qualifying
+alert in that window is still stored and still shown in Recent Activity. This
+file tests exactly the worked example given: notify at :00, suppress :05 :10
+:15, notify again at :20+.
 """
 
 from cloud.notify import COOLDOWN_S, NotificationGate
@@ -21,13 +27,14 @@ def test_a_warning_does_not_notify():
     assert NotificationGate().should_notify(1, "soft", now=1000.0) is False
 
 
-def test_the_worked_example_holds():
-    """notify at :00, suppress :02 :05 :11 :18, eligible again at :20."""
+def test_the_worked_example_from_the_product_spec():
+    """10:00:00 A->notify, :05 B suppressed, :10 C suppressed, :15 D suppressed, :20+ E->notify."""
     gate = NotificationGate()
-    assert gate.should_notify(1, "loud", now=0.0) is True
-    for t in (2.0, 5.0, 11.0, 18.0):
-        assert gate.should_notify(1, "loud", now=t) is False, f"should be suppressed at {t}"
-    assert gate.should_notify(1, "loud", now=20.0) is True
+    assert gate.should_notify(1, "loud", now=0.0) is True     # A
+    assert gate.should_notify(1, "loud", now=5.0) is False    # B
+    assert gate.should_notify(1, "loud", now=10.0) is False   # C
+    assert gate.should_notify(1, "loud", now=15.0) is False   # D
+    assert gate.should_notify(1, "loud", now=20.0) is True    # E
 
 
 def test_a_sustained_incident_does_not_buzz_every_few_seconds():
@@ -122,7 +129,9 @@ def test_something_the_user_configured_always_qualifies():
 
 
 def test_a_configured_event_still_respects_the_cooldown():
-    """Honouring the intent must not reintroduce spam."""
+    """Honouring the intent must not reintroduce spam — 'configured' bypasses
+    the SEVERITY filter, never the rate limit itself. One clear policy, no
+    per-source exceptions to the cooldown."""
     gate = NotificationGate()
     assert gate.evaluate(1, "soft", now=0.0, source="custom_rule")[0] is True
     assert gate.evaluate(1, "soft", now=5.0, source="custom_rule")[0] is False

@@ -1,0 +1,69 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  Keeps the SensorDyme cloud backend (cloud/app.py) running on this Mac without
+  anyone remembering to open a terminal and type `uvicorn`.
+
+  Installed by scripts/install_backend_mac.sh, which fills in __REPO_DIR__ and
+  writes the result to ~/Library/LaunchAgents/com.sensordyme.backend.plist.
+
+  This is the actual root cause of a device/app that says "can't reach backend"
+  while Wi-Fi, DHCP and mDNS all look fine: the backend here is not a system
+  service, so it silently stops running on the very first reboot, sleep-related
+  hiccup, crash, or closed terminal window, and nothing tells the user. Every
+  other stage of connectivity (BLE provisioning, Wi-Fi join, mDNS discovery,
+  auto-relocate-on-failure) is validated in this repo's test suite and iOS
+  DiagnosticsView already; this file makes the one process none of that could
+  fix actually stay up.
+
+  KeepAlive restarts it if it crashes; RunAtLoad starts it the moment you log
+  in, so a reboot heals itself instead of reappearing as a support request.
+-->
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.sensordyme.backend</string>
+
+    <key>ProgramArguments</key>
+    <array>
+        <string>__REPO_DIR__/.venv/bin/uvicorn</string>
+        <string>cloud.app:app</string>
+        <string>--host</string>
+        <string>0.0.0.0</string>
+        <string>--port</string>
+        <string>8787</string>
+    </array>
+
+    <key>WorkingDirectory</key>
+    <string>__REPO_DIR__</string>
+
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>SENSORDYME_MDNS</key>
+        <string>1</string>
+        <key>SENSORDYME_PORT</key>
+        <string>8787</string>
+    </dict>
+
+    <key>RunAtLoad</key>
+    <true/>
+    <key>KeepAlive</key>
+    <dict>
+        <key>SuccessfulExit</key>
+        <false/>
+        <key>Crashed</key>
+        <true/>
+    </dict>
+    <!-- Restart budget, not an unconditional respawn loop: a genuinely broken
+         config (bad JWT secret file permissions, port already taken by
+         something else) should surface as "stopped", not spin forever eating
+         CPU and filling the log. -->
+    <key>ThrottleInterval</key>
+    <integer>10</integer>
+
+    <key>StandardOutPath</key>
+    <string>__REPO_DIR__/cloud/backend.log</string>
+    <key>StandardErrorPath</key>
+    <string>__REPO_DIR__/cloud/backend.log</string>
+</dict>
+</plist>

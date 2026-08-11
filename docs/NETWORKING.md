@@ -1,6 +1,34 @@
 # Taking SensorDyme somewhere else
 
-The single most likely reason a working device appears to break is that
+## First: is the backend even running?
+
+Before chasing Wi-Fi, rule out the simplest explanation, because it produces the
+identical symptom: the device joins the new network fine, the app says "Can't
+reach backend" anyway, and nothing about Wi-Fi is actually wrong.
+
+If the backend is a self-hosted Mac (`cloud/README.md`'s "Run locally" path) it
+is one `uvicorn` process in one terminal window. It does not survive that
+terminal closing, the Mac sleeping oddly, or a reboot — and unlike the device
+side (a systemd service with `Restart=always` and a watchdog), nothing restarts
+it automatically unless you installed it with `scripts/install_backend_mac.sh`.
+A device sitting on a perfectly good network with nothing answering at the other
+end reports exactly the same "can't reach backend" as a genuine network problem.
+
+Check it directly rather than guessing:
+
+```bash
+.venv/bin/python scripts/diagnose_backend_mac.py sensordyme.local
+```
+
+This checks the backend process itself (listening, answering, persisted JWT
+secret, advertising over mDNS) and, given a device hostname, that device's own
+wifi/cloud_uplink health in one report — so you don't have to reason about which
+side is actually broken. If it is not running: `./scripts/install_backend_mac.sh`
+starts it and keeps it running from then on.
+
+## Second: is `cloud.base_url` a fixed IP address?
+
+The next most likely reason a working device appears to break is that
 `cloud.base_url` on the Pi holds a **fixed IP address**. That address was
 correct on the network where it was configured and means nothing anywhere else.
 

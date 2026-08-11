@@ -97,8 +97,18 @@ class Camera:
         """
         try:
             if self.is_pi:
-                frame = self._picam.capture_array()
-                return cv2.cvtColor(frame, cv2.COLOR_RGB2BGR)
+                # No channel conversion: Picamera2's "RGB888" format delivers
+                # B,G,R byte order (the name is deliberately OpenCV-backwards —
+                # Picamera2 manual, Appendix A), so capture_array() is ALREADY
+                # the BGR this method promises. Verified on the device itself:
+                # capture_array correlates with libcamera's own JPEG at 0.998
+                # channel-identical vs 0.982 channel-swapped. The RGB2BGR
+                # conversion that used to sit here double-swapped every frame,
+                # feeding red/blue-exchanged images to FaceMesh and YOLO on the
+                # Pi only — degrading landmark quality most in exactly the
+                # marginal conditions (glasses, glare, low light) where
+                # detection needs the margin.
+                return self._picam.capture_array()
             ok, frame = self._cap.read()
             if not ok or frame is None:
                 raise CameraError("Failed to read a frame from the webcam.")

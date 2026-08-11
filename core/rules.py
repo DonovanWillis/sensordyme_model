@@ -98,6 +98,20 @@ def _any_overlap(boxes_a: list, boxes_b: list) -> bool:
     return any(_boxes_overlap(a, b) for a in boxes_a for b in boxes_b)
 
 
+def _upper_region(box: tuple, fraction: float = 0.35) -> tuple:
+    """The top `fraction` of a box — where a standing or seated person's face is.
+
+    The evidence upgrade behind `near_mouth`: a bottle overlapping a person
+    anywhere is "holding" at best (it also matches a bottle at their feet in
+    box terms); a bottle overlapping the region their face occupies has been
+    raised toward the mouth. Still an approximation — a box knows nothing about
+    an actual mouth — but it is the difference between "has a drink" and
+    "is drinking from it" at the fidelity a box detector can support.
+    """
+    x1, y1, x2, y2 = box
+    return (x1, y1, x2, y1 + (y2 - y1) * fraction)
+
+
 def _parse_schedule(text: str) -> Optional[tuple[int, int]]:
     """'23:00-06:00' -> (1380, 360) in minutes-since-midnight. None means always on.
 
@@ -137,7 +151,7 @@ class ConfiguredRule:
     rule_id: str
     detection: str          # the object label to watch ("person", "dog")
     description: str
-    predicate: str = "present"  # present | absent | in_zone | near | holding | count
+    predicate: str = "present"  # present | absent | in_zone | near | holding | near_mouth | count
     secondary: str = ""     # second object, for relational predicates
     zone: str = ""
     severity: str = "warning"
@@ -439,6 +453,13 @@ class RuleEngine:
             if not seen or not rule.secondary:
                 return False
             return _any_overlap(boxes, frame.boxes(rule.secondary))
+        if rule.predicate == "near_mouth":
+            # The secondary must overlap the target's FACE region, not just the
+            # target. This is what separates "drinking from a bottle" evidence
+            # from "standing next to a bottle" — see _upper_region.
+            if not seen or not rule.secondary:
+                return False
+            return _any_overlap([_upper_region(b) for b in boxes], frame.boxes(rule.secondary))
         # present / in_zone / count all start from "is it there, enough of it".
         return seen and frame.count(rule.detection) >= rule.min_count
 

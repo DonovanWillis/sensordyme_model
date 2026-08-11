@@ -140,22 +140,44 @@ def test_full_customer_journey(backend):
     # A superseded name is stored as the mode it now refers to: the device will
     # apply and report the CURRENT name, so keeping the old one would mean the
     # convergence check never matches and the command re-sends on every poll.
-    # The fall rule configured in 6b also rides down on this poll: the device has
-    # not acknowledged a rules_version yet, and rules the user configured are
-    # useless until the device that enforces them actually receives them.
+    #
+    # The fall rule configured in 6b must NOT ride along here. It was only
+    # ever proposed via /v1/ai/configure, never applied — and this switch is
+    # to a named preset, not AI Custom. Delivering it anyway was an actual bug
+    # found during live-hardware verification: ai_rules is never cleared by a
+    # normal preset switch (reopening Configure-with-AI later must still show
+    # it), so a version-mismatch-only check can't tell "never applied" apart
+    # from "applied, then the user picked a different preset" — either way it
+    # kept redelivering the rules and the device kept reapplying them, forcing
+    # the device back into full custom monitoring against the preset the user
+    # just explicitly chose. custom_monitoring_wanted is what now distinguishes
+    # them: it is only true right after an empty-preset ("AI Custom") request.
     client.post(f"/v1/devices/{device_id}/preset", json={"preset": "driver_distraction:teen_driver"}, headers=auth)
     r = client.post("/v1/ingest", json={"events": [], "active_preset": "elderly_monitoring"}, headers=device_headers)
     command = r.json()["command"]
-    assert command["set_preset"] == "driver_safety:teen_driver"
-    assert [rule["detection"] for rule in command["set_rules"]] == ["fall"]
+    assert command == {"set_preset": "driver_safety:teen_driver"}, (
+        "an unapplied AI proposal must never ride along on an unrelated preset switch"
+    )
 
-    # Once acknowledged, only the preset command remains outstanding.
+    # Once acknowledged, nothing remains outstanding.
     r = client.post(
         "/v1/ingest",
-        json={"events": [], "active_preset": "elderly_monitoring", "rules_version": command["rules_version"]},
+        json={"events": [], "active_preset": "driver_safety:teen_driver"},
         headers=device_headers,
     )
-    assert r.json()["command"] == {"set_preset": "driver_safety:teen_driver"}
+    assert r.json()["command"] is None
+
+    # Explicitly applying AI Custom (preset "") is what actually delivers the
+    # configured rules — this is what AIConfigureView's "Apply" does for a
+    # proposal with no named preset.
+    assert client.post(f"/v1/devices/{device_id}/preset", json={"preset": ""}, headers=auth).status_code == 200
+    r = client.post(
+        "/v1/ingest",
+        json={"events": [], "active_preset": "driver_safety:teen_driver"},
+        headers=device_headers,
+    )
+    command = r.json()["command"]
+    assert [rule["detection"] for rule in command["set_rules"]] == ["fall"]
 
     # 6g) and it CONVERGES: once the device reports the mode as active, the
     # command is cleared rather than re-sent for ever. Verified against the
@@ -177,3 +199,476 @@ def test_full_customer_journey(backend):
     assert client.get(f"/v1/devices/{device_id}/events", headers=stranger).status_code == 404
     assert client.post(f"/v1/devices/{device_id}/preset", json={"preset": "x"}, headers=stranger).status_code == 404
     assert client.post("/v1/devices/claim", json={"claim_code": "AB-CD-EF"}, headers=stranger).status_code == 409
+
+
+def _claim_a_device(app_module, client):
+    """Provision, sign up and claim one device — the setup every mode test needs."""
+    import time as _time
+    with app_module.db() as conn:
+        conn.execute(
+            "INSERT INTO devices (name, claim_code, device_key, created_at) VALUES (?, ?, ?, ?)",
+            ("Test unit", "ZZ-99-XX", "dk_modetest", _time.time()),
+        )
+    r = client.post("/v1/signup", json={"email": "mode-test@example.com", "password": "supersecret1"})
+    auth = {"Authorization": f"Bearer {r.json()['token']}"}
+    device_id = client.post("/v1/devices/claim", json={"claim_code": "ZZ-99-XX"}, headers=auth).json()["device_id"]
+    return auth, {"X-Device-Key": "dk_modetest"}, device_id
+
+
+def test_preset_command_survives_matching_name_while_custom_monitoring_active(backend):
+    """The bug this reproduces: AI Custom Monitoring layers on top of a preset
+    without changing active_preset, so "go back to the preset you were already
+    on" is a request whose desired name equals the device's current
+    active_preset from the very first poll. String-equality convergence reads
+    that as "already done" and never delivers the command, so a user who turns
+    on custom monitoring while already on Driver Safety can never tap Driver
+    Safety again to leave it — the exact symptom reported: the mode row looks
+    unresponsive.
+
+    The device's `monitoring.active` flag is what distinguishes the two cases
+    convergence cannot tell apart from active_preset alone, and it rides on
+    every ingest call in `body.monitoring`.
+    """
+    app_module, client = backend
+    auth, device_headers, device_id = _claim_a_device(app_module, client)
+
+    # Device starts on driver_safety, then the user turns on custom monitoring —
+    # active_preset never changes; only monitoring.active flips on.
+    client.post("/v1/ingest", json={"events": [], "active_preset": "driver_safety"}, headers=device_headers)
+    client.post(
+        "/v1/ingest",
+        json={"events": [], "active_preset": "driver_safety",
+              "monitoring": {"active": True, "instruction": "watch for phones"}},
+        headers=device_headers,
+    )
+
+    # User taps "Driver Safety" again to leave custom monitoring — the desired
+    # name is identical to what the device already reports.
+    assert client.post(
+        f"/v1/devices/{device_id}/preset", json={"preset": "driver_safety"}, headers=auth
+    ).status_code == 200
+
+    # The device's next poll still shows the OLD state (it hasn't acted on the
+    # command yet) — active_preset unchanged, monitoring still active. The
+    # command must still be delivered: nothing about this state means "done".
+    r = client.post(
+        "/v1/ingest",
+        json={"events": [], "active_preset": "driver_safety",
+              "monitoring": {"active": True, "instruction": "watch for phones"}},
+        headers=device_headers,
+    )
+    assert r.json()["command"] == {"set_preset": "driver_safety"}, (
+        "the command was dropped because the name already matched active_preset, "
+        "even though the device still reports custom monitoring active"
+    )
+
+    # Once the device actually exits custom monitoring and reports it, THEN it
+    # converges — not a moment before.
+    r = client.post(
+        "/v1/ingest",
+        json={"events": [], "active_preset": "driver_safety",
+              "monitoring": {"active": False}},
+        headers=device_headers,
+    )
+    assert "set_preset" not in (r.json().get("command") or {})
+
+
+def test_preset_command_to_a_different_mode_still_works_during_custom_monitoring(backend):
+    """The ordinary case — switching to a genuinely different preset while
+    custom monitoring is active — must keep working exactly as before."""
+    app_module, client = backend
+    auth, device_headers, device_id = _claim_a_device(app_module, client)
+
+    client.post(
+        "/v1/ingest",
+        json={"events": [], "active_preset": "driver_safety",
+              "monitoring": {"active": True, "instruction": "watch for phones"}},
+        headers=device_headers,
+    )
+    client.post(f"/v1/devices/{device_id}/preset", json={"preset": "baby_monitoring"}, headers=auth)
+    r = client.post(
+        "/v1/ingest",
+        json={"events": [], "active_preset": "driver_safety",
+              "monitoring": {"active": True, "instruction": "watch for phones"}},
+        headers=device_headers,
+    )
+    assert r.json()["command"] == {"set_preset": "baby_monitoring"}
+
+
+def test_leaving_ai_custom_does_not_resurrect_itself_next_poll(backend):
+    """The bug found during live hardware verification of the AI-Custom fix:
+    ai_rules is never cleared by switching to a normal preset (reopening
+    Configure-with-AI later must still show what was last configured), so a
+    naive rules_version comparison alone cannot tell "not delivered yet" apart
+    from "the user picked a different preset a while ago" — it kept resending
+    the same set_rules command forever, and the device kept reapplying it,
+    pulling itself back into custom monitoring within one poll of every single
+    switch away. Reproduced directly against the live device before this test
+    existed: `monitoring.active` flipped back to true within one poll cycle of
+    confirming it had gone false. custom_monitoring_wanted is the fix — it
+    tracks intent, separately from the ai_rules content itself.
+    """
+    app_module, client = backend
+    auth, device_headers, device_id = _claim_a_device(app_module, client)
+
+    # Configure AI Custom rules (a prompt matching no preset keyword -> "").
+    r = client.post(
+        "/v1/ai/configure",
+        json={"device_id": device_id, "prompt": "tell me if someone is in the kitchen after dark"},
+        headers=auth,
+    )
+    assert r.json()["preset"] == ""
+
+    # Apply it — this is what AIConfigureView's "Apply" actually does.
+    assert client.post(
+        f"/v1/devices/{device_id}/preset", json={"preset": ""}, headers=auth
+    ).status_code == 200
+
+    # Device picks up the rules and reports custom monitoring active.
+    r = client.post(
+        "/v1/ingest",
+        json={"events": [], "active_preset": "driver_safety"},
+        headers=device_headers,
+    )
+    rules_version = r.json()["command"]["rules_version"]
+    r = client.post(
+        "/v1/ingest",
+        json={"events": [], "active_preset": "driver_safety", "rules_version": rules_version,
+              "monitoring": {"active": True, "instruction": "kitchen watch"}},
+        headers=device_headers,
+    )
+    assert r.json().get("command") is None, "converged: rules applied, nothing left to deliver"
+
+    # User switches to a normal preset.
+    assert client.post(
+        f"/v1/devices/{device_id}/preset", json={"preset": "driver_safety"}, headers=auth
+    ).status_code == 200
+
+    # Device exits custom monitoring and reports it — the already-fixed half.
+    r = client.post(
+        "/v1/ingest",
+        json={"events": [], "active_preset": "driver_safety", "rules_version": rules_version,
+              "monitoring": {"active": False}},
+        headers=device_headers,
+    )
+    assert r.json().get("command") is None, "leaving custom monitoring must not itself trigger a command"
+
+    # The bug: several more polls after that, still reporting the OLD
+    # rules_version (the device has no reason to have changed it — nobody
+    # told it to). None of them may resend set_rules — that would silently
+    # re-arm custom monitoring the user just turned off.
+    for _ in range(5):
+        r = client.post(
+            "/v1/ingest",
+            json={"events": [], "active_preset": "driver_safety", "rules_version": rules_version,
+                  "monitoring": {"active": False}},
+            headers=device_headers,
+        )
+        command = r.json().get("command") or {}
+        assert "set_rules" not in command, (
+            "ai_rules was resent after the user left AI Custom — this is exactly what pulled "
+            "the device back into custom monitoring within one poll interval on real hardware"
+        )
+
+
+def test_reapplying_ai_custom_after_leaving_it_still_works(backend):
+    """The other half: custom_monitoring_wanted must not get stuck off. Turning
+    AI Custom back on after leaving it must still deliver the rules."""
+    app_module, client = backend
+    auth, device_headers, device_id = _claim_a_device(app_module, client)
+
+    client.post(
+        "/v1/ai/configure",
+        json={"device_id": device_id, "prompt": "tell me if someone is in the kitchen after dark"},
+        headers=auth,
+    )
+    client.post(f"/v1/devices/{device_id}/preset", json={"preset": ""}, headers=auth)
+    client.post(f"/v1/devices/{device_id}/preset", json={"preset": "driver_safety"}, headers=auth)
+
+    # Back to AI Custom.
+    assert client.post(
+        f"/v1/devices/{device_id}/preset", json={"preset": ""}, headers=auth
+    ).status_code == 200
+
+    r = client.post(
+        "/v1/ingest",
+        json={"events": [], "active_preset": "driver_safety"},
+        headers=device_headers,
+    )
+    assert "set_rules" in (r.json().get("command") or {}), (
+        "re-selecting AI Custom after having left it must still deliver the configured rules"
+    )
+
+
+def test_ai_configure_response_carries_interpretation_confidence(monkeypatch, tmp_path):
+    """jupiter/confidence.py's score must actually reach the app through
+    /v1/ai/configure, nested under `jupiter` alongside provider/model — this
+    is the API contract ios/Sources/BackendAPI.swift's AIJupiterMeta decodes.
+
+    Uses the `scripted` provider rather than the `backend` fixture's pinned
+    "unavailable" (which never calls _ai_configure_llm at all, so the
+    `jupiter` key would never appear) and rather than the real Ollama model
+    (keeping this test fast and offline, unlike the live checks already run
+    manually against qwen2.5:7b-instruct)."""
+    monkeypatch.setenv("SENSORDYME_AI_PROVIDER", "scripted")
+    monkeypatch.setenv("SENSORDYME_DB", str(tmp_path / "test.db"))
+    for mod in ("cloud.app", "cloud"):
+        sys.modules.pop(mod, None)
+    app_module = importlib.import_module("cloud.app")
+    client = TestClient(app_module.app)
+
+    auth, _, device_id = _claim_a_device(app_module, client)
+    r = client.post(
+        "/v1/ai/configure", json={"device_id": device_id, "prompt": "alert me if a person appears"},
+        headers=auth,
+    )
+    assert r.status_code == 200
+    jupiter_meta = r.json()["jupiter"]
+    assert jupiter_meta["provider"] == "scripted"
+    ic = jupiter_meta["interpretation_confidence"]
+    assert isinstance(ic["score"], (int, float))
+    assert 0.0 <= ic["score"] <= 1.0
+    assert isinstance(ic["basis"], list)
+
+
+def test_a_notification_never_fires_for_an_event_that_was_not_stored(backend, monkeypatch):
+    """The bug: a device that reconnects after an outage can flush its whole
+    backlog (the uplink's queue holds up to 500) in one /v1/ingest POST. The
+    INSERT loop only stores the first 200 (body.events[:200]), but the
+    notification-evaluation loop used to iterate body.events unsliced — so a
+    push notification could fire for an event beyond the 200th, one that was
+    never written to the database and therefore could never appear in Recent
+    Activity. "An alert was sent without being recorded" is the exact
+    complaint this reproduces and fixes.
+
+    Verified two ways: the row count actually stored, and — more directly —
+    that the notification gate is never even asked to evaluate an event past
+    the stored slice, by monkeypatching cloud.notify.gate.evaluate to record
+    every severity it was called with.
+    """
+    app_module, client = backend
+    auth, device_headers, device_id = _claim_a_device(app_module, client)
+
+    evaluated_severities = []
+    real_evaluate = app_module.gate.evaluate
+
+    def spying_evaluate(user_id, severity, source):
+        evaluated_severities.append(severity)
+        return real_evaluate(user_id, severity, source=source)
+
+    monkeypatch.setattr(app_module.gate, "evaluate", spying_evaluate)
+
+    # 250 loud events in one batch — over the 200 cap, and every one severe
+    # enough that, if evaluated, it would be a candidate for a push.
+    events = [
+        {"timestamp": f"2026-08-08T10:00:{i:02d}+00:00", "type": "test_event",
+         "severity": "loud", "signals": f"event-{i}"}
+        for i in range(250)
+    ]
+    r = client.post("/v1/ingest", json={"events": events}, headers=device_headers)
+    assert r.status_code == 200
+
+    stored = client.get(f"/v1/devices/{device_id}/events", params={"limit": 1000}, headers=auth).json()["events"]
+    assert len(stored) == 200, "storage cap should still apply"
+    assert len(evaluated_severities) == 200, (
+        f"the notification gate evaluated {len(evaluated_severities)} events but only "
+        f"{len(stored)} were stored — a notification could fire for an unstored event"
+    )
+
+
+def test_resending_the_same_event_key_does_not_create_a_duplicate(backend):
+    """The bug: core/uplink.py treats a lost HTTP response as a failed send and
+    re-queues the whole batch for the next poll — but the server may have
+    already inserted those events before the response was lost. Without an
+    idempotency key, the resend becomes a second row: a duplicate alert in
+    Recent Activity, and (per the notification-gate test above) a second
+    notification for something that already fired once.
+
+    Simulates exactly that: the same event, with the same event_key, arrives
+    in two separate /v1/ingest POSTs (a real retry spans two HTTP requests,
+    not two entries in one batch)."""
+    app_module, client = backend
+    auth, device_headers, device_id = _claim_a_device(app_module, client)
+
+    event = {
+        "timestamp": "2026-08-08T12:00:00+00:00", "type": "fall",
+        "severity": "loud", "signals": "rapid drop", "event_key": "retry-test-key-abc123",
+    }
+    r1 = client.post("/v1/ingest", json={"events": [event]}, headers=device_headers)
+    assert r1.status_code == 200
+    r2 = client.post("/v1/ingest", json={"events": [event]}, headers=device_headers)  # the retry
+    assert r2.status_code == 200
+
+    stored = client.get(f"/v1/devices/{device_id}/events", headers=auth).json()["events"]
+    assert len(stored) == 1, f"expected exactly one stored row for one event_key, got {len(stored)}"
+
+
+def test_two_genuinely_different_events_with_no_key_both_still_store(backend):
+    """The other half of the invariant: firmware that predates event_key (or
+    any event missing one) must not be deduplicated against unrelated events —
+    NULL must never collide with NULL in the partial unique index."""
+    app_module, client = backend
+    auth, device_headers, device_id = _claim_a_device(app_module, client)
+
+    events = [
+        {"timestamp": "2026-08-08T12:00:00+00:00", "type": "fall", "severity": "loud"},
+        {"timestamp": "2026-08-08T12:00:01+00:00", "type": "fall", "severity": "loud"},
+    ]
+    r = client.post("/v1/ingest", json={"events": events}, headers=device_headers)
+    assert r.status_code == 200
+
+    stored = client.get(f"/v1/devices/{device_id}/events", headers=auth).json()["events"]
+    assert len(stored) == 2, "two distinct keyless events must not be deduplicated against each other"
+
+
+def test_the_worked_example_end_to_end_through_the_real_ingest_endpoint(backend, monkeypatch):
+    """The exact sequence the product spec gives, driven through the real API
+    rather than the gate directly: 10:00:00 alert A notifies; :05 B suppressed
+    (still stored); :10 C suppressed (still stored); :15 D suppressed (still
+    stored); :20+ E notifies again. A retry of A (same event_key) notifies
+    zero additional times regardless of timing — that suppression is identity
+    based (event_key -> OR IGNORE -> never reaches the notification loop at
+    all) and stacks with, rather than substitutes for, the 20s cooldown.
+    """
+    app_module, client = backend
+    auth, device_headers, device_id = _claim_a_device(app_module, client)
+
+    pushed = []
+    monkeypatch.setattr(app_module, "send_push", lambda user, title, body: pushed.append((title, body)))
+    monkeypatch.setattr(app_module, "send_sms", lambda user, body: None)
+
+    import cloud.notify as notify_module
+
+    # The `gate` singleton is module-level and outlives any one test's
+    # `backend` fixture (the fixture reloads cloud.app but not cloud.notify),
+    # so a real-wall-clock timestamp left over from an earlier test could
+    # make this test's injected, much-smaller `now` look like it's already
+    # "inside" a cooldown that never actually happened for this account.
+    notify_module.gate.reset()
+    clock = {"t": 1_000_000.0}
+    monkeypatch.setattr(notify_module.time, "time", lambda: clock["t"])
+
+    def post(event_key, signals, ts="2026-08-08T12:00:00+00:00"):
+        r = client.post(
+            "/v1/ingest",
+            json={"events": [{
+                "timestamp": ts, "type": "fall", "severity": "loud",
+                "signals": signals, "event_key": event_key,
+            }]},
+            headers=device_headers,
+        )
+        assert r.status_code == 200
+
+    post("alert-a", "alert A")                              # 10:00:00
+    assert len(pushed) == 1, "alert A must notify"
+
+    post("alert-a", "alert A")                              # a retry, same instant
+    assert len(pushed) == 1, "a retry of the SAME event must not notify a second time"
+
+    clock["t"] += 5
+    post("alert-b", "alert B")                              # 10:00:05
+    assert len(pushed) == 1, "alert B, inside the 20s cooldown, must be suppressed"
+
+    clock["t"] += 5
+    post("alert-c", "alert C")                              # 10:00:10
+    assert len(pushed) == 1, "alert C, still inside the cooldown, must also be suppressed"
+
+    clock["t"] += 5
+    post("alert-d", "alert D")                              # 10:00:15
+    assert len(pushed) == 1, "alert D, still inside the cooldown, must also be suppressed"
+
+    clock["t"] += 5
+    post("alert-e", "alert E")                              # 10:00:20
+    assert len(pushed) == 2, "alert E, at the cooldown boundary, must notify again"
+
+    stored = client.get(f"/v1/devices/{device_id}/events", params={"limit": 100}, headers=auth).json()["events"]
+    assert len(stored) == 5, (
+        "every qualifying alert (A-E) must be stored and visible in Recent Activity, "
+        "whether or not the cooldown suppressed its notification — the retry of A is the "
+        "only one of the six posts that does not add a new row"
+    )
+
+
+def test_a_notification_failure_does_not_affect_event_storage(backend, monkeypatch):
+    """Recent Activity must stay independent of the notification pipeline: if
+    sending a push blows up, the event is already committed and must still be
+    there and still show up in the timeline."""
+    app_module, client = backend
+    auth, device_headers, device_id = _claim_a_device(app_module, client)
+
+    def boom(user, title, body):
+        raise RuntimeError("simulated push provider outage")
+
+    monkeypatch.setattr(app_module, "send_push", boom)
+    monkeypatch.setattr(app_module, "send_sms", lambda user, body: None)
+
+    r = client.post(
+        "/v1/ingest",
+        json={"events": [{
+            "timestamp": "2026-08-08T12:00:00+00:00", "type": "fall",
+            "severity": "loud", "signals": "rapid drop", "event_key": "storage-independence-key",
+        }]},
+        headers=device_headers,
+    )
+    assert r.status_code == 200, "a notification-delivery failure must not fail the ingest request"
+
+    stored = client.get(f"/v1/devices/{device_id}/events", headers=auth).json()["events"]
+    assert len(stored) == 1, "the event must still be stored even though notifying about it failed"
+
+
+def test_one_malformed_event_does_not_sink_the_whole_batch(backend, caplog):
+    """Discovered during the production QA pass, reproduced against the live
+    code before any fix existed: `events: list[dict]` is unvalidated by
+    Pydantic beyond "is a dict" — a malformed `confidence` (a string instead
+    of a number) reached `float(...)` uncaught, raised inside the `with db()`
+    block BEFORE conn.commit() ran, and took the whole transaction down with
+    it — losing every good event in the same batch, not just the bad one.
+
+    Worse than data loss on its own: the resulting 500 is exactly what
+    core/uplink.py's retry logic treats as a failed send, so it re-queues the
+    identical batch — and the same malformed event 500s again, forever,
+    permanently blocking every event queued behind it. This test is the
+    single highest-value regression test added this pass: a bad payload from
+    a buggy module or a corrupted queue entry must degrade to "one event
+    lost, logged" — never "the ingest pipeline wedges."
+    """
+    app_module, client = backend
+    auth, device_headers, device_id = _claim_a_device(app_module, client)
+
+    events = [
+        {"timestamp": "t1", "type": "fall", "severity": "loud", "confidence": 0.9},
+        {"timestamp": "t2", "type": "fall", "severity": "loud", "confidence": "not-a-number-at-all"},
+        {"timestamp": "t3", "type": "fall", "severity": "loud", "confidence": 0.8},
+    ]
+    r = client.post("/v1/ingest", json={"events": events}, headers=device_headers)
+    assert r.status_code == 200, "a malformed event in the batch must not 500 the whole request"
+
+    stored = client.get(f"/v1/devices/{device_id}/events", headers=auth).json()["events"]
+    stored_timestamps = {s["timestamp"] for s in stored}
+    assert stored_timestamps == {"t1", "t3"}, (
+        f"the two well-formed events must still be stored even though a third was malformed, "
+        f"got: {stored_timestamps}"
+    )
+
+    # And the queue does not deadlock: retrying (what the device's uplink
+    # actually does after a failed send) must not 500 a second time either.
+    r2 = client.post("/v1/ingest", json={"events": events}, headers=device_headers)
+    assert r2.status_code == 200, "a retry of the same malformed batch must not 500 either"
+
+
+def test_a_malformed_event_is_logged_not_silently_dropped(backend, caplog):
+    """Silently losing one event is an acceptable last resort; silently losing
+    it with no trace anywhere is not — an operator needs to be able to answer
+    "why is this device missing an event" for real."""
+    import logging as _logging
+
+    app_module, client = backend
+    _, device_headers, _ = _claim_a_device(app_module, client)
+
+    with caplog.at_level(_logging.WARNING, logger="uvicorn.error"):
+        client.post(
+            "/v1/ingest",
+            json={"events": [{"timestamp": "t1", "type": "fall", "confidence": "garbage"}]},
+            headers=device_headers,
+        )
+    assert any("malformed" in record.message for record in caplog.records)

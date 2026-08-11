@@ -230,13 +230,24 @@ class AnthropicProvider(Provider):
     Its purpose now is to be the thing Jupiter is measured against. Prompts
     leave the operator's infrastructure when this is selected, which is why it
     reports `local = False` and why selecting it is explicit.
+
+    Default model is Sonnet, not Opus. Configure-with-AI is schema-constrained
+    rule extraction against a fixed capability registry — the whole point of
+    `jupiter/schema.py` and `core/capabilities.py` is that the model does not
+    need to be a frontier reasoner, because anything it invents is rejected
+    before it reaches a device. Opus's extra reasoning is not spent on
+    anything this task asks for, and at roughly 1.7x the per-token price of
+    Sonnet (both current as of the pricing this comment was written against;
+    check platform.claude.com/docs/en/pricing before trusting the ratio), it
+    is the wrong default for a task this narrow. Still fully overridable via
+    SENSORDYME_AI_MODEL for anyone who wants Opus anyway.
     """
 
     name = "anthropic"
 
     def __init__(self, config: Optional[dict] = None, client: Optional[object] = None) -> None:
         super().__init__(config)
-        self.model = self.model or os.environ.get("SENSORDYME_AI_MODEL", "claude-opus-5")
+        self.model = self.model or os.environ.get("SENSORDYME_AI_MODEL", "claude-sonnet-5")
         self._client = client
 
     def available(self) -> tuple[bool, str]:

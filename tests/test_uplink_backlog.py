@@ -119,3 +119,36 @@ def test_an_unreachable_backend_still_says_so(capsys):
     uplink = make_uplink(status=None)
     drain_once(uplink)
     assert "cannot reach" in capsys.readouterr().out
+
+
+def test_every_pushed_event_gets_a_key():
+    """cloud/app.py deduplicates on (device_id, event_key). No key, no
+    protection against a resend becoming a duplicate row."""
+    uplink = make_uplink()
+    queue_event(uplink, "fall")
+    assert uplink._queue[-1]["event_key"], "push_event must generate a non-empty event_key"
+
+
+def test_two_different_events_get_two_different_keys():
+    uplink = make_uplink()
+    queue_event(uplink, "fall")
+    queue_event(uplink, "drowsiness")
+    keys = [e["event_key"] for e in uplink._queue]
+    assert keys[0] != keys[1]
+
+
+def test_a_retried_event_keeps_the_same_key():
+    """The property the whole fix depends on: a batch that fails to send and
+    gets re-queued (core/uplink.py's `appendleft` recovery path) must carry
+    the SAME event_key on the retry as the original attempt — a regenerated
+    key on each send would defeat server-side dedup entirely, since the
+    server would see two different keys for what is really one event."""
+    uplink = make_uplink(queue_max=5)
+    queue_event(uplink, "fall")
+    key_before_send = uplink._queue[-1]["event_key"]
+
+    drain_once(uplink)  # the send fails (FakeRequests always raises) and re-queues
+
+    assert len(uplink._queue) == 1, "the failed event should have been re-queued, not dropped"
+    assert uplink._queue[-1]["event_key"] == key_before_send, \
+        "a retry must not regenerate the event_key — the server dedups on it"

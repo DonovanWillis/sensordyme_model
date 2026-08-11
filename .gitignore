@@ -46,3 +46,6 @@ cloud/*.db
 
 # JWT signing key, generated and persisted by cloud/app.py on first run.
 cloud/.jwt_secret
+
+# launchd's log for the always-running backend (scripts/install_backend_mac.sh).
+cloud/backend.log

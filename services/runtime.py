@@ -362,6 +362,30 @@ class DeviceRuntime:
                 "cannot be enforced in this mode",
                 self.module_name, len(self.rule_engine.rules),
             )
+        elif labels:
+            # A module can expose detections and still not produce THIS label —
+            # occupancy reports objects, never a posture, so a "sleeping"
+            # (lying_down) rule left running under it would validate, look
+            # active in the app, and simply never see the label it needs.
+            # `_apply_monitoring_mode` already switches to the module that
+            # covers a pose-only rule set; this covers the rule sets it
+            # deliberately leaves on occupancy — mixed with an object rule, or
+            # running under a STANDARD preset that never runs pose either.
+            from core.capabilities import registry as capability_registry
+
+            reg = capability_registry()
+            covered = monitoring_mode.capabilities_covered_by(self.module_name)
+            uncovered = {
+                label for label in labels
+                if not ({c.id for c in reg.providers_of_label(label) if c.available} & covered)
+                and reg.providers_of_label(label)  # only warn about a label SOME module can serve
+            }
+            if uncovered:
+                log.warning(
+                    "module '%s' does not produce %s; the matching AI-configured rule(s) "
+                    "are active but cannot fire until monitoring switches to a module that does",
+                    self.module_name, ", ".join(sorted(uncovered)),
+                )
 
     def _model_version(self) -> str:
         """Which model produced a sample — useless data without it, since you
@@ -421,7 +445,13 @@ class DeviceRuntime:
             monitoring_active=self.monitoring.active,
             preset_module=self._preset_module or self.module_name,
         )
-        wanted = monitoring_mode.module_for(mode, self._preset_module or self.module_name)
+        requested_labels = None
+        if mode is monitoring_mode.MonitoringMode.AI_CUSTOM:
+            requested_labels = {rule.detection for rule in self.rule_engine.rules if rule.detection}
+            requested_labels |= {rule.secondary for rule in self.rule_engine.rules if rule.secondary}
+        wanted = monitoring_mode.module_for(
+            mode, self._preset_module or self.module_name, requested_labels=requested_labels
+        )
         if wanted is None or wanted == self.module_name:
             self.mode = mode
             return
@@ -491,6 +521,10 @@ class DeviceRuntime:
     def _restart_inference(self) -> None:
         if self.display:
             return  # display mode runs inference on the main thread; nothing to bounce
+        # Back to "starting": the restarted loop gets the same grace a fresh
+        # boot does, instead of being declared dead again on the very next
+        # check because the stamp still describes the loop being replaced.
+        self._heartbeat = 0.0
         self.supervisor.restart("inference")
 
     def _last_resort(self, component: str) -> None:
@@ -519,6 +553,30 @@ class DeviceRuntime:
         subprocess.run(["sudo", "-n", "systemctl", "reboot"], check=False)
 
     # ------------------------------------------------------------------ preset switching
+    def _exit_custom_monitoring(self) -> None:
+        """Someone explicitly picked a mode: that always wins over custom rules.
+
+        Before this, `_switch_preset` hot-swapped the running module but left
+        `self.monitoring` (the saved rules + `overrides_mode`) untouched. That
+        config drives `_apply_monitoring_mode()`, which runs on every rules/zones
+        poll — every few seconds, via the uplink. So a preset switch away from AI
+        Custom Monitoring would visibly take, then get silently reverted back to
+        AI_CUSTOM/occupancy on the next poll, because `self.monitoring.active`
+        had never stopped being true. Picking "Driver Safety" is not a request
+        to keep evaluating custom rules on top of it.
+
+        A no-op when custom monitoring was not active, so a normal
+        preset-to-preset switch does not write the monitoring file or push an
+        extra state update for nothing.
+        """
+        if not self.monitoring.active:
+            return
+        self.monitoring.clear()
+        self.rule_engine.replace_rules([])
+        if self.uplink is not None:
+            self.uplink.set_monitoring(self.monitoring.describe())
+        log.info("[MONITORING] custom monitoring exited: explicit mode switch")
+
     def _switch_preset(self, name: str) -> None:
         """Hot-swap the running module to a preset (optionally "preset:variant")."""
         # Translate superseded names first. A `set_preset` command can have been
@@ -529,6 +587,12 @@ class DeviceRuntime:
         from main import resolve_preset
 
         name = resolve_preset(name, self.presets)
+        # Post-resolution no-op guard, independent of the caller's gate: a
+        # rebuild of the module a device is already running costs a FaceMesh
+        # teardown and every accumulated timer/window, which is never worth it
+        # for a command that changes nothing.
+        if name == self.active_preset and not self.monitoring.active:
+            return
         base_name, _, variant_name = name.partition(":")
         preset = self.presets.get(base_name)
         if preset is None or self.profile == "mac_max":
@@ -550,6 +614,11 @@ class DeviceRuntime:
         except Exception as exc:  # noqa: BLE001 - a bad preset must not kill the device
             print(f"SensorDyme: preset switch to '{name}' failed: {exc}")
             return
+        # Exit custom monitoring BEFORE swapping the module, not after: an
+        # explicit preset choice always overrides whatever custom rules were
+        # running, and the module below must land as STANDARD, never as a
+        # STANDARD module with AI_CUSTOM still recorded as the active mode.
+        self._exit_custom_monitoring()
         with self._module_lock:
             old_module = self.module
             self.module, self.module_name, self.active_preset = new_module, new_module_name, name
@@ -557,6 +626,16 @@ class DeviceRuntime:
         # What the preset wants, remembered separately from what is running:
         # AI_CUSTOM swaps the module out and must be able to hand it back.
         self._preset_module = new_module_name
+        # self.mode was previously left stale here — only ever set in __init__
+        # and _apply_monitoring_mode(), never on a preset switch. It happened to
+        # be harmless when nothing but the preset changed (mode was STANDARD
+        # before and after), but AI_CUSTOM exiting through this path makes it
+        # actively wrong if left alone: resolve it the same way the mode
+        # decision is made everywhere else, so self.mode can never disagree
+        # with self.module_name.
+        self.mode = monitoring_mode.resolve(
+            monitoring_active=self.monitoring.active, preset_module=new_module_name
+        )
         # Zones belong to the module's config, so a mode switch re-points custom
         # rules at the new module's polygons instead of the previous mode's.
         self.rule_engine.set_zones(self._zones_for_module(new_module_name))
@@ -582,13 +661,39 @@ class DeviceRuntime:
         while not (stop.is_set() or self.shutdown.is_set()):
             frame, seq = self.bus.wait_for_fresh(last_seq, timeout=0.5)
             if seq == last_seq or frame is None:
+                # The heartbeat measures whether THIS LOOP is responsive; frame
+                # availability is the camera component's own check. Without this
+                # stamp, a camera outage >10s read as "inference dead", burned
+                # the inference restart budget on a healthy thread, and could
+                # escalate all the way to a mid-drive Pi reboot for a camera
+                # problem the camera check was already recovering.
+                self._heartbeat = time.monotonic()
                 continue  # timeout: no fresh frame — health watches bus.age_s()
             last_seq = seq
 
             pending = (self.dashboard.pop_pending_preset() if self.dashboard else None) or (
                 self.uplink.pop_pending_preset() if self.uplink else None
             )
-            if pending and pending != self.active_preset:
+            # Resolve superseded names BEFORE the equality gate, not only inside
+            # _switch_preset. A stale "driver_distraction" command from an old
+            # backend or app never string-equals the device's "driver_safety",
+            # so the unresolved comparison passed every time and each delivery
+            # rebuilt the running module — closing FaceMesh and zeroing every
+            # timer, PERCLOS window and risk EMA mid-drive. With a backend old
+            # enough to re-send the alias on every poll, that was a full module
+            # teardown every few seconds: nothing needing sustained evidence
+            # could ever fire.
+            if pending:
+                from main import resolve_preset
+
+                pending = resolve_preset(pending, self.presets)
+            # `pending == self.active_preset` is not "nothing to do" while custom
+            # monitoring is active: active_preset still names whichever preset was
+            # running before custom rules took over (entering custom monitoring
+            # never changes it), so a request to return to that exact preset has
+            # real work left — exiting custom monitoring — that this equality
+            # check would otherwise skip silently, with no error and no log line.
+            if pending and (pending != self.active_preset or self.monitoring.active):
                 self._switch_preset(pending)
 
             # A new AI-configured rule set from the app replaces the live one.

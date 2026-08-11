@@ -92,6 +92,37 @@ def test_relational_rule_needs_a_detectable_second_object(reg):
     assert "can" in reason
 
 
+def test_in_zone_rule_needs_a_zone_name(reg):
+    """Regression test for a live-model failure: 'alert if a vehicle enters the
+    driveway' produced target=person, predicate=in_zone, zone="". `person` and
+    `in_zone` each validate fine on their own, so nothing before this check
+    caught it — and with no zone, core/rules.py's `_in_zone` check never even
+    runs (`if active and rule.zone` is false on empty string), so the rule
+    silently became "alert on any person anywhere", not "in the driveway"."""
+    ok, reason, _ = RuleDraft(target="person", predicate="in_zone", zone="").validate(reg)
+    assert not ok
+    assert "zone" in reason
+
+    ok, _, _ = RuleDraft(target="person", predicate="in_zone", zone="driveway").validate(reg)
+    assert ok
+
+
+def test_near_and_holding_rules_need_a_secondary(reg):
+    """Same failure shape as the in_zone case, for the other relational
+    predicates: `person`/`holding` each validate independently, so an empty
+    `secondary` slipped through before this check. core/rules.py fails this
+    one closed (RuleEngine._evaluate returns False with no secondary) rather
+    than open, but a rule that can never fire must not be accepted as active
+    either — the user would see it listed as on."""
+    for predicate in ("near", "holding"):
+        ok, reason, _ = RuleDraft(target="person", predicate=predicate, secondary="").validate(reg)
+        assert not ok, predicate
+        assert predicate in reason
+
+        ok, _, _ = RuleDraft(target="person", predicate=predicate, secondary="bottle").validate(reg)
+        assert ok, predicate
+
+
 def test_parse_response_moves_invalid_rules_to_unsupported(reg):
     result = parse_response({
         "understood": "x",
@@ -260,6 +291,22 @@ def test_unknown_provider_is_refused_clearly():
     with pytest.raises(JupiterUnavailable) as excinfo:
         get_provider("mystery")
     assert "mystery" in str(excinfo.value)
+
+
+def test_anthropic_provider_defaults_to_sonnet_not_opus(monkeypatch):
+    """The Anthropic path is an optional benchmark/fallback, never the
+    default provider — but if it IS selected with no model specified, it must
+    not silently reach for the most expensive model available. Configure-with-AI
+    is schema-constrained rule extraction, not open-ended reasoning."""
+    monkeypatch.delenv("SENSORDYME_AI_MODEL", raising=False)
+    provider = get_provider("anthropic")
+    assert provider.model == "claude-sonnet-5"
+    assert "opus" not in provider.model.lower()
+
+
+def test_anthropic_provider_model_is_still_overridable(monkeypatch):
+    monkeypatch.setenv("SENSORDYME_AI_MODEL", "claude-opus-5")
+    assert get_provider("anthropic").model == "claude-opus-5"
 
 
 def test_every_provider_is_constructible_uniformly():

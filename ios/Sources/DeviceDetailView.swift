@@ -7,7 +7,27 @@ struct DeviceDetailView: View {
     @EnvironmentObject private var state: AppState
     @State var device: Device
     @State private var events: [EventItem] = []
-    @State private var switchingTo: String?
+    /// The mode switch this app instance most recently asked for and is still
+    /// waiting to see confirmed — reconciled against the server's own
+    /// `desiredPreset` on every reload (see `syncPendingSwitch`), so it never
+    /// drifts from what's actually outstanding.
+    @State private var pendingSwitch: ModeSwitchState.PendingSwitch?
+    /// A switch that failed — either the request itself failed, or it never
+    /// confirmed before ModeSwitchState.switchTimeout. Cleared the moment the
+    /// user retries that same mode; sticky until then, so "tap to try again"
+    /// has something to mean.
+    @State private var failedSwitch: ModeSwitchState.PendingSwitch?
+    /// Three independent triggers call reload() — on appear, a 4s timer, and
+    /// pull-to-refresh — with no guarantee their network responses arrive in
+    /// the order they were sent. Without this, a slow, stale response can
+    /// complete after a fresh one and silently overwrite it: a mode switch
+    /// that already confirmed could revert to "switching", or a just-fetched
+    /// alert could vanish again. See LatestRequestGuard's own docs.
+    @State private var reloadGuard = LatestRequestGuard()
+    /// The same problem, for rapid mode-switch taps: an older tap's outcome
+    /// (success or failure) must never land after a newer tap has already
+    /// taken over the UI.
+    @State private var setModeGuard = LatestRequestGuard()
     @State private var errorMessage: String?
     @State private var showAI = false
     @State private var showZones = false
@@ -112,12 +132,33 @@ struct DeviceDetailView: View {
         }
         // A tapped notification opens its alert, which is the last beat of the
         // demo: buzz, tap, "here is why".
+        // A notification can be tapped before this screen has ever loaded the
+        // event it's about — AlertWatcher polls independently, every 15s,
+        // from wherever the user happens to be in the app, so its fetch
+        // routinely gets there before this view's own events array does.
+        // Looking up `id` in whatever's currently loaded and giving up on a
+        // miss meant tapping the notification did nothing at all: no sheet,
+        // no error, no retry — the exact same "silently does nothing" shape
+        // as the mode-switching bugs elsewhere in this screen. One reload
+        // and a second look covers the ordinary case; if it's still not
+        // found the event is outside the 200-item window this screen loads,
+        // which is worth noting rather than swallowing silently.
         .onChange(of: notifier.pendingEventID) { _, id in
             guard let id else { return }
             if let match = events.first(where: { $0.eventID == id }) {
                 selectedEvent = match
+                notifier.pendingEventID = nil
+                return
             }
-            notifier.pendingEventID = nil
+            Task {
+                await reload()
+                if let match = events.first(where: { $0.eventID == id }) {
+                    selectedEvent = match
+                } else {
+                    errorMessage = "Couldn't open that alert — try Recent Activity below."
+                }
+                notifier.pendingEventID = nil
+            }
         }
         .task {
             await notifier.refreshAuthorization()
@@ -315,26 +356,23 @@ struct DeviceDetailView: View {
                         Divider().overlay(SD.Colors.border)
                     }
                 }
-
-                if let switchingTo {
-                    Label(
-                        "Switching to \(Preset.title(for: switchingTo)) — applies on the device's next sync.",
-                        systemImage: "arrow.triangle.2.circlepath"
-                    )
-                    .font(SD.Typography.caption)
-                    .foregroundStyle(SD.Colors.textSecondary)
-                }
             }
         }
     }
 
     @ViewBuilder
     private func modeRow(_ preset: Preset) -> some View {
-        // No base mode is selected while a custom configuration is in charge.
-        // Ticking one alongside a custom config told someone the device was
-        // watching for driver distraction when it was counting people.
-        let isActive = !customMonitoringActive && activeBase == preset.name
-        let isSwitching = Preset.split(switchingTo).base == preset.name
+        // The single source of truth for this row's state — see
+        // ModeSwitchState.swift for why "active"/"switching" alone weren't
+        // enough: no distinct failure state, no offline state, no timeout.
+        // `now: .now` is what lets a stuck switch age past switchTimeout and
+        // flip to failed on the app's own 4s refresh cycle, with no separate
+        // timer needed.
+        let rowState = ModeSwitchState.state(
+            for: preset.name, activeBase: activeBase, customMonitoringActive: customMonitoringActive,
+            pending: pendingSwitch, deviceOnline: device.online, failure: failedSwitch, now: .now
+        )
+        let isActive = rowState == .active
 
         VStack(alignment: .leading, spacing: SD.Space.xs) {
             Button { setMode(preset.name) } label: {
@@ -346,16 +384,36 @@ struct DeviceDetailView: View {
                         Text(preset.title)
                             .font(SD.Typography.body)
                             .foregroundStyle(SD.Colors.textPrimary)
-                        Text(preset.subtitle)
-                            .font(SD.Typography.caption)
-                            .foregroundStyle(SD.Colors.textSecondary)
+                        switch rowState {
+                        case .failed(let message):
+                            Text(message)
+                                .font(SD.Typography.caption)
+                                .foregroundStyle(SD.Colors.danger)
+                        case .queuedOffline:
+                            Text("Device offline — will apply when it reconnects")
+                                .font(SD.Typography.caption)
+                                .foregroundStyle(SD.Colors.warning)
+                        case .inactive, .switching, .active:
+                            Text(preset.subtitle)
+                                .font(SD.Typography.caption)
+                                .foregroundStyle(SD.Colors.textSecondary)
+                        }
                     }
                     Spacer(minLength: SD.Space.xxs)
-                    if isActive {
+                    switch rowState {
+                    case .active:
                         Image(systemName: "checkmark.circle.fill")
                             .foregroundStyle(SD.Colors.success)
-                    } else if isSwitching {
+                    case .switching:
                         ProgressView().controlSize(.small)
+                    case .queuedOffline:
+                        Image(systemName: "wifi.slash")
+                            .foregroundStyle(SD.Colors.warning)
+                    case .failed:
+                        Image(systemName: "exclamationmark.triangle.fill")
+                            .foregroundStyle(SD.Colors.danger)
+                    case .inactive:
+                        EmptyView()
                     }
                 }
                 .contentShape(Rectangle())
@@ -450,29 +508,66 @@ struct DeviceDetailView: View {
         //
         // A second tap re-targets instead. The server is last-write-wins on
         // desired_preset, so an overlapping request is safe.
-        guard name != device.activePreset else { return }
-        switchingTo = name
+        //
+        // "Change nothing" is NOT the same as "name equals device.activePreset".
+        // `activePreset` holds the last real preset the device ran even while AI
+        // Custom Monitoring is layered on top of it (custom rules replace the
+        // module, not the field) — so tapping that exact same mode row to exit
+        // custom monitoring and go back to it hit this guard and did literally
+        // nothing: no request sent, no error, no press feedback. That read as
+        // "the button doesn't work" rather than "already selected", and only for
+        // whichever preset happened to precede custom monitoring. The tap
+        // changes something real whenever custom monitoring is active, even if
+        // the target name matches — the device still has work to do (exit
+        // custom monitoring), so only skip the request when neither is true.
+        guard name != device.activePreset || customMonitoringActive else { return }
+
+        let base = Preset.split(name).base
+        // A retry supersedes its own prior failure — otherwise ModeSwitchState
+        // would keep showing the OLD failure (it's checked before `pending`)
+        // right on top of the new attempt.
+        if failedSwitch?.targetBase == base { failedSwitch = nil }
+
+        let requestedAt = Date()
+        // Set BEFORE the request is even sent: the row shows "switching"
+        // immediately, not after a round trip confirms the tap registered.
+        pendingSwitch = ModeSwitchState.PendingSwitch(targetBase: base, requestedAt: requestedAt)
+
+        let token = setModeGuard.begin()
         Task {
             do {
                 try await state.backend.setPreset(deviceID: device.id, preset: name)
+                guard setModeGuard.isLatest(token) else { return }
+                // Don't wait for the next 4s timer tick to find out whether it
+                // stuck — the entire point of this fix is that switching modes
+                // should feel fast, and a reload right after the command is
+                // accepted is most of that: see the latency notes in
+                // docs/ (mode-switch path) for where the remaining time goes.
+                await reload()
             } catch {
-                errorMessage = error.localizedDescription
-                switchingTo = nil
+                guard setModeGuard.isLatest(token) else { return }
+                if pendingSwitch?.targetBase == base { pendingSwitch = nil }
+                failedSwitch = ModeSwitchState.PendingSwitch(targetBase: base, requestedAt: requestedAt)
             }
         }
     }
 
     private func reload() async {
+        let token = reloadGuard.begin()
+        // Captured before either network call — this is what lets
+        // syncPendingSwitch tell "a tap that happened while I was already in
+        // flight" apart from "a tap that happened before I even started",
+        // which is the only distinction that matters for not clobbering it.
+        let reloadStartedAt = Date()
         do {
             if let fresh = try await state.backend.devices().first(where: { $0.id == device.id }) {
+                guard reloadGuard.isLatest(token) else { return }
                 device = fresh
-                // The server's own pending field, which the app already decodes
-                // and never used. It is cleared alias-awarely by the backend
-                // once the device reports the mode, so this cannot get stuck on
-                // a string mismatch the way exact comparison did.
-                switchingTo = fresh.desiredPreset
+                syncPendingSwitch(from: fresh, reloadStartedAt: reloadStartedAt)
             }
-            events = try await state.backend.events(deviceID: device.id, limit: 200)
+            let fetchedEvents = try await state.backend.events(deviceID: device.id, limit: 200)
+            guard reloadGuard.isLatest(token) else { return }
+            events = fetchedEvents
             // The notifier dedupes by event id, so calling this on every poll
             // announces each alert exactly once.
             // AlertWatcher owns notifications now, from the app root, so it
@@ -480,11 +575,42 @@ struct DeviceDetailView: View {
             // work on the one screen that was already the busiest.
             errorMessage = nil
         } catch let error as APIError where error.isAuthFailure {
+            guard reloadGuard.isLatest(token) else { return }
             state.expireSession(error.message)
         } catch {
+            guard reloadGuard.isLatest(token) else { return }
             errorMessage = error.localizedDescription
         }
-        hasLoaded = true
+        if reloadGuard.isLatest(token) { hasLoaded = true }
+    }
+
+    /// Reconcile this app instance's optimistic "I just tapped this" state
+    /// against the server's own authoritative record of what's still
+    /// outstanding (`desiredPreset`) — the same field cloud/app.py's
+    /// convergence logic clears once the device actually confirms, already
+    /// alias- and custom-monitoring-aware. Trusting it here means this view
+    /// never has to duplicate that reasoning, and it's also what lets
+    /// `pendingSwitch` correctly reflect a mode change made from somewhere
+    /// else (another client, the on-device dashboard) rather than only ever
+    /// tracking this app's own taps.
+    private func syncPendingSwitch(from fresh: Device, reloadStartedAt: Date) {
+        guard ModeSwitchState.shouldSyncPendingSwitch(current: pendingSwitch, reloadStartedAt: reloadStartedAt) else {
+            return  // a newer optimistic tap exists; this fetch predates it and must not touch it
+        }
+        guard let desired = fresh.desiredPreset else {
+            pendingSwitch = nil  // nothing outstanding server-side
+            return
+        }
+        let desiredBase = Preset.split(desired).base
+        if pendingSwitch?.targetBase == desiredBase {
+            return  // still the switch we're already tracking — keep its original timestamp for the timeout
+        }
+        // The server has an outstanding command this view wasn't already
+        // tracking — most often this app's own request having just landed
+        // server-side, occasionally another client's. Either way the server
+        // is authoritative for WHAT is pending; "now" is the best available
+        // timestamp for something first noticed this moment.
+        pendingSwitch = ModeSwitchState.PendingSwitch(targetBase: desiredBase, requestedAt: Date())
     }
 }
 

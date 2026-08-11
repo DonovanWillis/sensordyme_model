@@ -383,6 +383,39 @@ def default_registry() -> CapabilityRegistry:
             predicates=frozenset({"near", "holding"}),
             requirement_kind=Support.PARTIAL,
         ),
+        Capability(
+            id="spatial.near_mouth",
+            kind="objects",
+            summary="an object overlapping the upper part of a person — evidence it is "
+                    "raised toward the face, stronger than mere holding but still not "
+                    "proof of eating or drinking",
+            predicates=frozenset({"near_mouth"}),
+            requirement_kind=Support.PARTIAL,
+        ),
+        Capability(
+            id="gesture.arm",
+            kind="pose",
+            summary="arm gestures from wrist trajectories over about a second: a hand "
+                    "held above the shoulder, or waving (a raised hand swinging "
+                    "side-to-side repeatedly), in modes that run pose estimation",
+            labels=frozenset({"hand_raised", "waving"}),
+            predicates=frozenset(),
+            available=_pose_available(),
+            requires="mediapipe, and a monitoring mode that runs pose estimation",
+            requirement_kind=Support.NEEDS_MODEL,
+        ),
+        Capability(
+            id="state.resting",
+            kind="pose",
+            summary="a settled body: sitting or lying and still, in any furniture — "
+                    "chair, desk, couch, or bed. Sustained over minutes this is honest "
+                    "evidence of rest; it is never proof of sleep",
+            labels=frozenset({"resting"}),
+            predicates=frozenset(),
+            available=_pose_available(),
+            requires="mediapipe, and a monitoring mode that runs pose estimation",
+            requirement_kind=Support.NEEDS_MODEL,
+        ),
         # ---- declared but NOT available on a stock device --------------------
         Capability(
             id="tracking.identity",
@@ -476,7 +509,84 @@ def default_registry() -> CapabilityRegistry:
             labels=frozenset({"smoke", "fire"}),
             predicates=frozenset(),
             available=False,
-            requires="a smoke/fire detection model — the COCO detector has no such class",
+            # Not solvable with a heuristic: "gray moving region = smoke" fails
+            # on steam, fog and shadows; "orange region = fire" fires on
+            # clothing, sunsets and screens. Real smoke/fire detection models
+            # exist (e.g. YOLO fine-tuned on the D-Fire / FASDD open datasets)
+            # and would compile for the Hailo like any other YOLO — this is a
+            # genuine NEEDS_MODEL, not a NEEDS_RESEARCH.
+            requires="a smoke/fire detection model (a YOLO fine-tuned on an open "
+                     "fire/smoke dataset such as D-Fire, compiled for the Hailo) — "
+                     "the COCO detector has no such class and heuristics false-alarm "
+                     "on steam, fog, sunsets and orange clothing",
+            requirement_kind=Support.NEEDS_MODEL,
+        ),
+        Capability(
+            id="scene.water",
+            kind="objects",
+            summary="standing water, spills or flooding on a surface",
+            labels=frozenset({"water", "flood"}),
+            predicates=frozenset(),
+            available=False,
+            # Water is a segmentation problem, not a detection one: it has no
+            # box-shaped extent, and its appearance is entirely reflection and
+            # context. A color heuristic would alarm on blue rugs and glass.
+            requires="a water/spill segmentation model — box detectors are the wrong "
+                     "shape for a substance, and color heuristics false-alarm on "
+                     "blue objects, glass and reflections",
+            requirement_kind=Support.NEEDS_MODEL,
+        ),
+        Capability(
+            id="appearance.headwear",
+            kind="objects",
+            summary="whether a person is wearing a helmet or other headwear",
+            labels=frozenset({"helmet"}),
+            predicates=frozenset(),
+            available=False,
+            # Helmet-wearing is a person-attribute, not free-floating object
+            # presence: a helmet on a shelf must not satisfy "wearing a
+            # helmet". The standard solution (hardhat-detection YOLO variants,
+            # widely available pretrained) detects head+helmet jointly and
+            # would run on the Hailo; associating to a person then reuses the
+            # same box-overlap machinery `holding` uses today.
+            requires="a helmet/hardhat detection model (pretrained variants are "
+                     "common, Hailo-compilable), associated to a person's head "
+                     "region — COCO has no helmet class, and 'baseball glove' or "
+                     "similar labels are not helmets",
+            requirement_kind=Support.NEEDS_MODEL,
+        ),
+        Capability(
+            id="objects.package",
+            kind="objects",
+            summary="parcels and delivery packages",
+            labels=frozenset({"package", "parcel"}),
+            predicates=frozenset(),
+            available=False,
+            requires="a package-detection model or fine-tune — COCO's nearest "
+                     "classes (suitcase, handbag) are visually and semantically "
+                     "different objects, and substituting them produces alerts "
+                     "about things that are not packages",
+            requirement_kind=Support.NEEDS_TRAINING_DATA,
+        ),
+        Capability(
+            id="objects.small_personal",
+            kind="objects",
+            summary="small personal items: keys, wallets, remotes, chargers, glasses",
+            labels=frozenset({"keys", "wallet"}),
+            predicates=frozenset(),
+            available=False,
+            # The honest answer for the open-vocabulary ask: these need either
+            # a fine-tune per object or an open-vocabulary detector
+            # (YOLO-World / OWL-ViT class). The latter is the right long-term
+            # architecture but is NOT a drop-in: no Hailo-compiled build of
+            # those text-conditioned heads exists in this repo's toolchain
+            # today, and at typical camera distances a keyring is tens of
+            # pixels — below reliable recall for any current open-vocab model
+            # without a zoomed/cropped second stage.
+            requires="an open-vocabulary detector (YOLO-World class) or a per-object "
+                     "fine-tune, plus a high-resolution crop stage — small items are "
+                     "tens of pixels at room distance, below reliable single-pass "
+                     "recall; nothing in the current COCO vocabulary stands in for them",
             requirement_kind=Support.NEEDS_MODEL,
         ),
     ])

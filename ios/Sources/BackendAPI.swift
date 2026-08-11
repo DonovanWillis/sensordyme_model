@@ -62,6 +62,39 @@ struct AIUnsupported: Codable, Equatable, Identifiable {
     }
 }
 
+/// How confident Jupiter is that it correctly understood the REQUEST — not to
+/// be confused with `AIRule.confidence` (an alert-trigger threshold the rule
+/// carries, shown to the user as "Sensitivity") or an event's own detection
+/// confidence shown in EventDetailView. See jupiter/confidence.py's module
+/// docstring on the backend for why these three are kept separate.
+///
+/// Deterministic, not a number the model reported about itself: computed from
+/// how cleanly its response parsed and how many of its fields arrived
+/// well-formed. A score below 1.0 always comes with `basis` explaining why —
+/// there is no bare number with nothing behind it.
+struct AIInterpretationConfidence: Codable, Equatable {
+    let score: Double
+    let basis: [String]
+
+    /// Below this, something about the model's OWN output was malformed —
+    /// not merely that part of the request was unsupported (that case is
+    /// already covered by `AIProposal.unsupported` and would be redundant to
+    /// call out twice). A pure partial-understanding deduction alone does not
+    /// cross this line; see jupiter/confidence.py's fixed deduction constants.
+    static let reviewThreshold = 0.85
+    var worthFlagging: Bool { score < Self.reviewThreshold }
+}
+
+/// Jupiter's own metadata about how a proposal was produced — which model,
+/// how sure it was, how long it took. Optional because the demo backend and
+/// older server versions don't send it; nothing here is load-bearing for
+/// activating a rule.
+struct AIJupiterMeta: Codable, Equatable {
+    let provider: String?
+    let model: String?
+    let interpretation_confidence: AIInterpretationConfidence?
+}
+
 struct AIProposal: Codable, Equatable {
     let preset: String        // "" for a custom configuration belonging to no preset
     let variant: String
@@ -71,6 +104,7 @@ struct AIProposal: Codable, Equatable {
     let unsupported: [AIUnsupported]
     let source: String        // "claude" | "unavailable" | "demo" — shown so demos are honest
     var mode: String?         // "custom" | "preset"
+    var jupiter: AIJupiterMeta? = nil
 
     /// A custom configuration is the normal outcome, not a failure to match.
     var isCustom: Bool { preset.isEmpty }

@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import threading
 import time
+import uuid
 from collections import deque
 from typing import Optional
 
@@ -24,7 +25,11 @@ class CloudUplink:
     def __init__(self, config: dict) -> None:
         self._base_url = str(config.get("base_url", "")).rstrip("/")
         self._device_key = str(config.get("device_key", ""))
-        self._poll_interval_s = float(config.get("poll_interval_s", 5.0))
+        # Default kept in sync with config.yaml's cloud.poll_interval_s. This
+        # is the dominant term in mode-switch latency, not HTTP/DB processing
+        # (measured under 5ms end to end) -- see config.yaml's comment on that
+        # key for the full reasoning.
+        self._poll_interval_s = float(config.get("poll_interval_s", 2.0))
         self._queue: deque[dict] = deque(maxlen=int(config.get("queue_max", 500)))
         self._lock = threading.Lock()
         self._active_preset: Optional[str] = None
@@ -61,10 +66,21 @@ class CloudUplink:
         which maps to `soft`, which the notification gate drops — so the one
         event a person asked to be told about was the one that never arrived,
         while the preset's own alerts kept coming through.
+
+        `event_key` is generated once, here, and travels with this dict through
+        every retry. A POST can succeed on the server (events inserted) while
+        its response is lost to the device — a dropped connection, a timeout —
+        which reads as failure and re-queues the same batch for the next poll.
+        Without a stable key that arrives twice, the retry becomes a second row
+        for the same alert: a duplicate in Recent Activity, and a second
+        notification for something that already fired once. The server
+        deduplicates on (device_id, event_key) — see cloud/app.py's ingest
+        INSERT — so a resend is a no-op instead of a duplicate.
         """
         with self._lock:
             self._queue.append(
                 {
+                    "event_key": uuid.uuid4().hex,
                     "timestamp": event.timestamp.isoformat(),
                     "type": event.type,
                     "confidence": round(event.confidence, 3),

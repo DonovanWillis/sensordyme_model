@@ -11,6 +11,28 @@ Events only — frames never leave the device.
 .venv/bin/uvicorn cloud.app:app --port 8787
 ```
 
+That runs in the foreground of one terminal window: close the window, sleep the
+Mac funny, or reboot, and the backend is gone — silently, with no restart. From
+the device and the app this looks *exactly* like a Wi-Fi problem (device online,
+DHCP fine, mDNS fine, "can't reach backend" anyway), which makes it the single
+most common false alarm in this project. If that is ever what you are debugging,
+run `.venv/bin/python scripts/diagnose_backend_mac.py <device-hostname>` first —
+it checks the backend process itself, separately from everything the device and
+app can already tell you about themselves.
+
+For anything other than a five-minute test, install it as a background service
+instead so it survives all of that on its own:
+
+```bash
+./scripts/install_backend_mac.sh
+```
+
+This registers a launchd agent that starts the backend at login and restarts it
+if it ever crashes (see `deploy/launchd/com.sensordyme.backend.plist.template`).
+Re-run it any time after `git pull` to pick up code changes. Logs land in
+`cloud/backend.log`; `launchctl bootout gui/$(id -u)/com.sensordyme.backend`
+stops it.
+
 That binds loopback only, which is right for the simulator. A real phone needs the
 Mac's LAN address, so bind all interfaces — and once the port is reachable from the
 network, sign tokens with a real secret instead of the dev default in `app.py`:

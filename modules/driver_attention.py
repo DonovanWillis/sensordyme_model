@@ -36,6 +36,23 @@ Every frame's raw signals are also available via get_telemetry_snapshot()
 for main.py to log to data/telemetry.csv — real driving sessions build the
 labeled dataset needed to eventually replace these hand-tuned thresholds
 with a learned model.
+
+Signal conditioning (core/eye_signal.py) sits between the landmarks and every
+threshold above, because the raw readings are noisy measurements — especially
+with glasses, whose frames and glare corrupt the eyelid contour for single
+frames at a time. Three layers, all arithmetic, no new inference:
+
+  * a rolling median on EAR/yaw/pitch, so one bad frame moves nothing
+    (onset of a real state change lags by ~half the window — ~0.3s at 8fps —
+    which the sustain thresholds already dwarf);
+  * release-grace on the condition trackers (GracedConditionTracker), so one
+    bad frame can no longer reset an accumulating drowsiness clock or drop a
+    live alert — the mechanism that made detection DEGRADE as the driver got
+    drowsier, since marginal landmarks are exactly when noise frames appear;
+  * a session-adaptive open-eye reference banded to the calibration, plus an
+    iris-visibility veto (the iris landmarks were always computed and never
+    read), so a threshold calibrated bare-faced still means the right thing
+    the day glasses go on.
 """
 
 from __future__ import annotations
@@ -55,11 +72,19 @@ import numpy as np
 from core.detections import Detection, DetectionFrame
 from core.detectors import Box, get_yolo_model, iou
 from core.events import Event
-from modules.base import SustainedConditionTracker, VisionModule, register_module
+from core.eye_signal import AdaptiveBaseline, SignalSmoother, iris_openness
+from modules.base import GracedConditionTracker, SustainedConditionTracker, VisionModule, register_module
 
 # MediaPipe Face Mesh landmark indices for the 6-point EAR eye model.
 LEFT_EYE = [362, 385, 387, 263, 373, 380]
 RIGHT_EYE = [33, 160, 158, 133, 153, 144]
+
+# Iris-openness (eyelid gap / iris diameter, see core/eye_signal.py) above which
+# the eye is unambiguously open: a closed lid physically cannot leave this much
+# iris visible. Comfortably-open eyes measure ~0.7-1.1; half-lidded ~0.3-0.5.
+# 0.5 is deliberately above the ambiguous band so the veto only fires on
+# contradictions, never on genuinely droopy eyes.
+_IRIS_CLEARLY_OPEN = 0.5
 
 # The 6 canonical landmarks used for solvePnP head-pose estimation.
 POSE_LANDMARK_IDS = {
@@ -85,6 +110,36 @@ _MODEL_POINTS_3D = np.array(
 )
 
 Point = tuple[float, float]
+
+
+def angle_delta_deg(angle: float, baseline: float) -> float:
+    """Signed difference between two angles, wrapped to (-180, 180].
+
+    Euler angles from Rodrigues live on a circle, and with this 6-point face
+    model the pitch of an ordinary upright face rides near ±180 — so plain
+    subtraction produced deltas like +249° and -84° on CONSECUTIVE frames of
+    an unchanged pose (observed in the device's own telemetry). Every
+    threshold downstream compares the delta, so the wrap must be resolved
+    here, once, rather than survived by each consumer.
+    """
+    delta = (angle - baseline + 180.0) % 360.0 - 180.0
+    # The modulo maps +180 to -180; keep the documented half-open interval.
+    return 180.0 if delta == -180.0 else delta
+
+
+def circular_mean_deg(angles: list[float]) -> float:
+    """Mean of angles in degrees, computed on the circle.
+
+    fmean(+179, -179) is 0 — the exact opposite direction of both inputs.
+    That is not hypothetical: the deployed device's calibration file held
+    baseline_pitch = -90.3, an arithmetic mean over wrap-straddling samples,
+    pointing nowhere any head ever faced.
+    """
+    if not angles:
+        return 0.0
+    sines = sum(math.sin(math.radians(a)) for a in angles)
+    cosines = sum(math.cos(math.radians(a)) for a in angles)
+    return math.degrees(math.atan2(sines, cosines))
 
 
 def eye_aspect_ratio(p1: Point, p2: Point, p3: Point, p4: Point, p5: Point, p6: Point) -> float:
@@ -181,11 +236,21 @@ class AttentionCalibrator:
         if not force_recalibrate:
             self._load()
 
+    #: Bumped when the stored numbers' MEANING changes. Version 2: pose
+    #: baselines are circular means (v1 used an arithmetic mean, which for a
+    #: wrap-straddling pitch produced a direction no head ever faced — the
+    #: deployed device's file held baseline_pitch=-90.3 this way). A v1 file
+    #: is rejected so the device recalibrates once with the fixed math,
+    #: rather than keep thresholding against a corrupt baseline forever.
+    FORMAT_VERSION = 2
+
     def _load(self) -> None:
         if not self._path.exists():
             return
         try:
             data = json.loads(self._path.read_text())
+            if int(data.get("version", 1)) != self.FORMAT_VERSION:
+                return  # stale format: leave uncalibrated; a fresh window will rewrite it
             self._baseline_ear = float(data["baseline_ear"])
             self._ear_threshold = float(data["ear_threshold"])
             self._baseline_yaw = float(data["baseline_yaw"])
@@ -200,6 +265,15 @@ class AttentionCalibrator:
     def is_calibrated(self) -> bool:
         """Whether a personal EAR threshold (loaded or freshly computed) is in effect."""
         return self._ear_threshold is not None
+
+    @property
+    def baseline_ear(self) -> Optional[float]:
+        """The calibrated open-eye EAR, or None before calibration completes.
+
+        Exposed so the session-adaptive baseline can band its estimate around
+        the calibrated value rather than replace it — see AdaptiveBaseline.
+        """
+        return self._baseline_ear
 
     @property
     def ear_threshold(self) -> float:
@@ -231,12 +305,16 @@ class AttentionCalibrator:
         if now - self._start_time >= self._duration_s and self._ear_samples:
             self._baseline_ear = statistics.fmean(self._ear_samples)
             self._ear_threshold = self._baseline_ear * self._ear_threshold_ratio
-            self._baseline_yaw = statistics.fmean(self._yaw_samples) if self._yaw_samples else 0.0
-            self._baseline_pitch = statistics.fmean(self._pitch_samples) if self._pitch_samples else 0.0
+            # Circular means: pose angles live on a circle, and with this face
+            # model an upright face's pitch rides near ±180, where fmean points
+            # the opposite way — see circular_mean_deg.
+            self._baseline_yaw = circular_mean_deg(self._yaw_samples)
+            self._baseline_pitch = circular_mean_deg(self._pitch_samples)
             self._path.parent.mkdir(parents=True, exist_ok=True)
             self._path.write_text(
                 json.dumps(
                     {
+                        "version": self.FORMAT_VERSION,
                         "baseline_ear": self._baseline_ear,
                         "ear_threshold": self._ear_threshold,
                         "baseline_yaw": self._baseline_yaw,
@@ -458,27 +536,53 @@ class DriverAttentionModule(VisionModule):
             force_recalibrate=bool(config.get("recalibrate", False)),
         )
 
+        # --- signal conditioning: raw landmark-derived measurements are NOISY,
+        # especially with glasses (frames and glare degrade the eyelid contour),
+        # and every threshold below assumed they were clean. A rolling median
+        # means no single frame can flip a boolean; `release_s` grace on the
+        # trackers means no single frame can reset a timer or drop an alert.
+        smoothing_window = int(config.get("signal_median_window", 5))
+        release_s = float(config.get("signal_release_s", 0.4))
+        self._ear_smoother = SignalSmoother(smoothing_window)
+        self._yaw_smoother = SignalSmoother(smoothing_window)
+        self._pitch_smoother = SignalSmoother(smoothing_window)
+        # Session open-eye reference, so the effective closure threshold follows
+        # the face in front of the camera today (glasses on or off) instead of
+        # only the face that calibrated. Banded to the calibrated baseline so a
+        # genuinely deteriorating driver cannot drag the threshold with them.
+        self._ear_baseline = AdaptiveBaseline(
+            window_s=float(config.get("ear_baseline_window_s", 60.0)),
+            band_low=float(config.get("ear_baseline_band_low", 0.6)),
+            band_high=float(config.get("ear_baseline_band_high", 1.4)),
+        )
+        self._ear_threshold_ratio = float(config.get("ear_threshold_ratio", 0.75))
+        self._iris_veto = bool(config.get("iris_veto", True))
+
         # --- drowsiness ---
-        self._drowsy_tracker = SustainedConditionTracker(float(config["drowsy_seconds"]))
+        self._drowsy_tracker = GracedConditionTracker(float(config["drowsy_seconds"]), release_s)
         self._perclos_tracker = PerclosTracker(float(config.get("perclos_window_s", 60.0)))
         self._perclos_threshold = float(config.get("perclos_threshold", 0.15))
         self._fatigue_warned = False
 
         # --- distraction ---
         self._yaw_threshold_deg = float(config["yaw_threshold_deg"])
-        self._distract_tracker = SustainedConditionTracker(float(config["distraction_seconds"]))
+        self._distract_tracker = GracedConditionTracker(float(config["distraction_seconds"]), release_s)
         self._glance_min_count = int(config.get("glance_min_count", 5))
         self._glance_counter = GlanceCounter(
             window_s=float(config.get("glance_window_s", 45.0)),
             min_count=self._glance_min_count,
         )
         self._pitch_threshold_deg = float(config.get("pitch_threshold_deg", -20.0))
-        self._eyes_down_tracker = SustainedConditionTracker(float(config.get("eyes_down_seconds", 2.5)))
+        self._eyes_down_tracker = GracedConditionTracker(
+            float(config.get("eyes_down_seconds", 2.5)), release_s
+        )
 
         # --- face lost: the camera can't see the driver's face at all (turned fully away,
         # slumped over, obstructed) -- a real gap in naive logic, which otherwise treats
         # "no landmarks" as "nothing to report" instead of a risk signal in its own right.
-        self._face_lost_tracker = SustainedConditionTracker(float(config.get("face_lost_seconds", 2.5)))
+        self._face_lost_tracker = GracedConditionTracker(
+            float(config.get("face_lost_seconds", 2.5)), release_s
+        )
         self._face_lost_active = False
 
         # --- object detection (phone / food), lazily loaded on first stride tick ---
@@ -488,7 +592,9 @@ class DriverAttentionModule(VisionModule):
         self._yolo_class_map: dict[str, str] = dict(config.get("yolo_classes", {}))
         self._enable_hands = bool(config.get("enable_hands", True))
         self._hand_phone_iou_threshold = float(config.get("hand_phone_iou_threshold", 0.2))
-        self._phone_use_tracker = SustainedConditionTracker(float(config.get("phone_use_seconds", 2.0)))
+        self._phone_use_tracker = GracedConditionTracker(
+            float(config.get("phone_use_seconds", 2.0)), release_s
+        )
 
         # --- cross-signal risk fusion (reasons about combinations, not just individual signals) ---
         self._risk_fusion = RiskFusion(
@@ -520,14 +626,20 @@ class DriverAttentionModule(VisionModule):
         self._hand_overlaps_phone = False
 
         # --- live state, for annotate()/annotate_debug()/is_alert_active() ---
+        # Confidences are configurable because glasses wearers sit close to the
+        # tracking margin: lowering min_tracking_confidence a notch in the
+        # field trades a little landmark quality for far fewer dropouts, and
+        # that trade should not require a code change to make.
         self._face_mesh = mp.solutions.face_mesh.FaceMesh(
             max_num_faces=1,
             refine_landmarks=True,
-            min_detection_confidence=0.5,
-            min_tracking_confidence=0.5,
+            min_detection_confidence=float(config.get("face_detection_confidence", 0.5)),
+            min_tracking_confidence=float(config.get("face_tracking_confidence", 0.5)),
         )
         self._last_face_proto = None
         self._last_ear = 0.0
+        self._last_iris: Optional[float] = None
+        self._last_ear_threshold = 0.0
         self._last_yaw_raw = 0.0
         self._last_pitch_raw = 0.0
         self._last_yaw = 0.0  # calibration-corrected: 0 == "looking at the road" for this mount
@@ -585,6 +697,17 @@ class DriverAttentionModule(VisionModule):
             self._run_object_detections(frame)
         except Exception as exc:  # noqa: BLE001 - intentionally broad: never crash the video loop
             self._object_detection_error = str(exc)
+            # Clear the cached boxes along with disabling: a phone box frozen
+            # from the tick before the error would otherwise keep phone_visible
+            # true for the rest of the run — feeding permanent phone risk into
+            # the fusion and arming phone_use on any sustained glance away,
+            # with no detector running to ever contradict it.
+            self._last_phone_boxes = []
+            self._last_eating_boxes = []
+            self._last_hand_boxes = []
+            self._last_overlay_boxes = []
+            self._last_overlay_confidences = []
+            self._hand_overlaps_phone = False
             print(f"driver_attention: object detection disabled after an error: {exc}")
 
     def _run_object_detections(self, frame: np.ndarray) -> None:
@@ -664,9 +787,18 @@ class DriverAttentionModule(VisionModule):
 
         if not results.multi_face_landmarks:
             self._last_face_proto = None
-            self._drowsy_active = False
-            self._distracted_active = False
-            self._eyes_down_active = False
+            # Advance the condition trackers with False rather than forcing the
+            # active flags off: their release grace is what stops a one-frame
+            # tracking dropout (common with glasses glare) from flickering the
+            # alert screen and restarting every timer. A sustained loss still
+            # releases them within release_s, and face_lost takes over as the
+            # active signal for it.
+            self._drowsy_tracker.update(False, now)
+            self._distract_tracker.update(False, now)
+            self._eyes_down_tracker.update(False, now)
+            self._drowsy_active = self._drowsy_tracker.is_active
+            self._distracted_active = self._distract_tracker.is_active
+            self._eyes_down_active = self._eyes_down_tracker.is_active
 
             # A face the camera can't see at all is its own risk signal, not "nothing to
             # report" -- see the class docstring on _face_lost_tracker for why.
@@ -692,6 +824,14 @@ class DriverAttentionModule(VisionModule):
             return events
 
         self._face_lost_tracker.update(False, now)
+        # The face returning after a SUSTAINED absence is a scene change: the
+        # smoothers' samples describe whatever was there before, so they start
+        # fresh. A one-frame dropout never reaches here with _face_lost_active
+        # set (the tracker's grace holds), so brief noise keeps its history.
+        if self._face_lost_active:
+            self._ear_smoother.reset()
+            self._yaw_smoother.reset()
+            self._pitch_smoother.reset()
         self._face_lost_active = False
 
         face_proto = results.multi_face_landmarks[0]
@@ -702,8 +842,22 @@ class DriverAttentionModule(VisionModule):
         # --- raw signals: EAR + head pose (both feed calibration before any thresholding) ---
         left_ear = eye_aspect_ratio(*(points[i] for i in LEFT_EYE))
         right_ear = eye_aspect_ratio(*(points[i] for i in RIGHT_EYE))
-        ear = (left_ear + right_ear) / 2.0
+        # MAX of the two eyes, not the mean. Drowsy eyes close TOGETHER, so a
+        # real closure drops both and the max still reads closed. Glare on one
+        # spectacle lens corrupts ONE eye's landmarks — under a mean that read
+        # as half-closed eyes; under the max the clean eye simply outvotes it.
+        # (A wink also reads open, which is correct: a wink is not drowsiness.)
+        raw_ear = max(left_ear, right_ear)
+        # Median-smoothed: a single glare/glasses frame cannot move the value
+        # past the recent majority, so no downstream boolean sees the spike.
+        ear = self._ear_smoother.update(raw_ear)
         self._last_ear = ear
+        # Second opinion from the iris landmarks (already computed — FaceMesh
+        # runs with refine_landmarks=True; the indices were simply never read).
+        # The iris is fit from pupil/limbus contrast, which survives spectacle
+        # frames better than the eyelid contour this EAR is built from.
+        iris_ratio = iris_openness(points)
+        self._last_iris = iris_ratio
 
         image_points = np.array(
             [
@@ -720,8 +874,34 @@ class DriverAttentionModule(VisionModule):
 
         self._calibrator.observe(ear, raw_yaw, raw_pitch, now)
 
-        # --- drowsiness: calibrated EAR, sustained-closure + PERCLOS ---
-        drowsy_condition = ear < self._calibrator.ear_threshold
+        # --- drowsiness: calibrated EAR against a session-adaptive reference ---
+        # The stored calibration answers "what does an open eye measure" for
+        # whatever face calibrated — possibly bare-faced. Glasses shift that
+        # distribution, so the session's own open-eye level (upper percentile
+        # over the last minute, banded to the calibration) sets the effective
+        # threshold: same ratio, live reference.
+        self._ear_baseline.observe(ear, now)
+        reference = self._ear_baseline.reference(self._calibrator.baseline_ear)
+        if reference is not None:
+            effective_threshold = reference * self._ear_threshold_ratio
+        else:
+            effective_threshold = self._calibrator.ear_threshold
+        self._last_ear_threshold = effective_threshold
+
+        drowsy_condition = ear < effective_threshold
+        # Iris veto: when the eyelid-contour EAR says "closed" but the iris is
+        # plainly, measurably visible, the EAR reading is a glasses/glare
+        # artifact — a visible iris and a closed eye cannot both be true. The
+        # veto only ever suppresses a closure claim, never invents one, so it
+        # cannot cost a real drowsiness detection where the iris genuinely
+        # disappears behind the lids.
+        if (
+            drowsy_condition
+            and self._iris_veto
+            and iris_ratio is not None
+            and iris_ratio >= _IRIS_CLEARLY_OPEN
+        ):
+            drowsy_condition = False
         fired = self._drowsy_tracker.update(drowsy_condition, now)
         # is_active (not the raw per-frame drowsy_condition) drives the live alert: a
         # blink makes drowsy_condition briefly True on every frame, but is_active only
@@ -743,8 +923,18 @@ class DriverAttentionModule(VisionModule):
         # off-center-mounted camera doesn't misread ordinary forward driving as a head turn.
         eyes_off_road = False
         if pose is not None:
-            yaw = raw_yaw - self._calibrator.baseline_yaw
-            pitch = raw_pitch - self._calibrator.baseline_pitch
+            # Wrap-safe delta FIRST, median second. The delta (angle_delta_deg)
+            # is continuous around the baseline even when the raw angle rides
+            # the ±180 wrap — where raw values flip sign frame-to-frame and a
+            # median of them is as meaningless as their mean. Then the median,
+            # like EAR's: solvePnP on 6 landmarks (two of them eye corners,
+            # exactly where spectacle frames sit) spikes by tens of degrees on
+            # a single bad frame, and a spike was enough to seed a false
+            # glance "episode" in the counter below.
+            yaw = self._yaw_smoother.update(angle_delta_deg(raw_yaw, self._calibrator.baseline_yaw))
+            pitch = self._pitch_smoother.update(
+                angle_delta_deg(raw_pitch, self._calibrator.baseline_pitch)
+            )
             self._last_yaw = yaw
             self._last_pitch = pitch
 
@@ -850,6 +1040,8 @@ class DriverAttentionModule(VisionModule):
         """Raw per-frame signal snapshot for telemetry logging (future model-training data)."""
         return {
             "ear": self._last_ear,
+            "iris_openness": self._last_iris,
+            "ear_threshold": self._last_ear_threshold,
             "yaw_deg": self._last_yaw,
             "pitch_deg": self._last_pitch,
             "perclos": self._last_perclos,

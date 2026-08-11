@@ -10,6 +10,13 @@ struct ShopView: View {
     @State private var placedOrderID: Int?
     @State private var orderHistory: [Order] = []
     @State private var errorMessage: String?
+    /// The same race as DeviceDetailView/DevicesView: `.task` (on appear),
+    /// `.refreshable` (pull-to-refresh), and a successful placeOrder() all
+    /// call reloadOrders() independently, with no guarantee their network
+    /// responses land in the order they were sent. See LatestRequestGuard's
+    /// own docs — found by an explicit sweep of the codebase for this exact
+    /// pattern after fixing it on the two screens where it was first reported.
+    @State private var reloadGuard = LatestRequestGuard()
 
     private let unitPrice = 199
 
@@ -136,6 +143,9 @@ struct ShopView: View {
     }
 
     private func reloadOrders() async {
-        orderHistory = (try? await state.backend.orders()) ?? []
+        let token = reloadGuard.begin()
+        let fetched = (try? await state.backend.orders()) ?? []
+        guard reloadGuard.isLatest(token) else { return }
+        orderHistory = fetched
     }
 }

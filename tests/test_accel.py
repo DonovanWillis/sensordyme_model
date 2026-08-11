@@ -60,3 +60,38 @@ def test_shims_match_the_ultralytics_surface_modules_use():
             assert float(b.conf[0]) > 0.89
     assert accel.COCO_NAMES[67] == "cell phone"
     assert accel.COCO_NAMES[0] == "person"
+
+
+# The exact class ids the bottle/banana investigation depended on. Standard
+# COCO order (https://cocodataset.org, and identical in the Ultralytics and
+# Hailo Model Zoo COCO checkpoints this repo actually loads) — pinned here so
+# a future edit to COCO_NAMES that shifts an index is caught immediately,
+# rather than silently mislabeling whatever detector runs on top of it. This
+# is the single mapping every consumer (core/accel.py's HailoYOLO.names,
+# modules/occupancy.py's get_detections, modules/driver_attention.py's
+# yolo_classes config) reads from — verified correct here once rather than
+# trusted separately in each.
+_KNOWN_COCO_IDS = {
+    0: "person", 2: "car", 39: "bottle", 46: "banana", 56: "chair", 67: "cell phone",
+}
+
+
+def test_coco_names_pins_the_classes_the_bottle_banana_investigation_checked():
+    for class_id, name in _KNOWN_COCO_IDS.items():
+        assert accel.COCO_NAMES[class_id] == name, (
+            f"COCO_NAMES[{class_id}] is {accel.COCO_NAMES.get(class_id)!r}, expected {name!r} — "
+            "a shifted index here mislabels every detection built on top of it"
+        )
+    # bottle and banana specifically: 7 apart, not adjacent — a real class-id
+    # confusion between them would have to be a genuine indexing bug, not a
+    # simple off-by-one, which is worth asserting explicitly given that was
+    # the exact reported symptom.
+    assert accel.COCO_NAMES[39] == "bottle"
+    assert accel.COCO_NAMES[46] == "banana"
+    assert accel.COCO_NAMES[39] != accel.COCO_NAMES[46]
+
+
+def test_coco_names_is_the_full_standard_80_class_set_with_no_gaps_or_dupes():
+    assert set(accel.COCO_NAMES.keys()) == set(range(80)), "COCO_NAMES must cover ids 0..79 with no gaps"
+    names = list(accel.COCO_NAMES.values())
+    assert len(names) == len(set(names)), "no two class ids should share the same name"

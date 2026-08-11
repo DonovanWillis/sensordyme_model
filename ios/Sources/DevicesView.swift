@@ -21,6 +21,13 @@ struct DevicesView: View {
     /// from anywhere in the app rather than only from the device screen.
     @State private var notificationTarget: Device?
     @StateObject private var refreshing = ProgressTracker()
+    /// Same problem as DeviceDetailView's own copy of this: three independent
+    /// triggers (appear, a 10s timer, pull-to-refresh) can all have a
+    /// reload() in flight at once, with no guarantee their responses arrive
+    /// in the order they were sent — without this, a slow, stale fetch can
+    /// complete after a fresh one and silently overwrite it. See
+    /// LatestRequestGuard's own docs.
+    @State private var reloadGuard = LatestRequestGuard()
 
     private let refreshTimer = Timer.publish(every: 10, on: .main, in: .common).autoconnect()
 
@@ -62,10 +69,28 @@ struct DevicesView: View {
             // and nothing was listening unless that screen was already open —
             // so the tap appeared to do nothing.
             .navigationDestination(item: $notificationTarget) { DeviceDetailView(device: $0) }
+            // A cold launch from a tapped notification races this against
+            // `.task { await reload() }`: pendingEventID can already be set
+            // before `devices` has ever been fetched. Falling back straight to
+            // `devices.first` — the old behaviour — evaluates to nil on an
+            // empty array, and since .onChange only fires on pendingEventID
+            // actually CHANGING (not on `devices` populating a moment later),
+            // that was a permanent miss: notificationTarget stayed nil forever,
+            // no navigation, no error, the tap silently did nothing. The empty
+            // case now waits for the reload already in flight and retries once.
             .onChange(of: notifier.pendingEventID) { _, id in
                 guard id != nil, notificationTarget == nil else { return }
-                notificationTarget = devices.first(where: { $0.id == notifier.pendingDeviceID })
-                    ?? devices.first
+                if let match = devices.first(where: { $0.id == notifier.pendingDeviceID }) {
+                    notificationTarget = match
+                } else if devices.isEmpty {
+                    Task {
+                        await reload()
+                        notificationTarget = devices.first(where: { $0.id == notifier.pendingDeviceID })
+                            ?? devices.first
+                    }
+                } else {
+                    notificationTarget = devices.first
+                }
             }
             .navigationTitle("SensorDyme")
             .navigationBarTitleDisplayMode(.large)
@@ -122,19 +147,24 @@ struct DevicesView: View {
     }
 
     private func reload() async {
+        let token = reloadGuard.begin()
         refreshing.begin()
         do {
-            devices = try await state.backend.devices()
+            let fetched = try await state.backend.devices()
+            guard reloadGuard.isLatest(token) else { return }
+            devices = fetched
             errorMessage = nil
             refreshing.succeed()
         } catch let error as APIError where error.isAuthFailure {
+            guard reloadGuard.isLatest(token) else { return }
             refreshing.fail()
             state.expireSession(error.message)
         } catch {
+            guard reloadGuard.isLatest(token) else { return }
             refreshing.fail()
             errorMessage = error.localizedDescription
         }
-        hasLoaded = true
+        if reloadGuard.isLatest(token) { hasLoaded = true }
     }
 }
 

@@ -34,7 +34,9 @@ from typing import Optional, Sequence
 from core import posture
 
 # MediaPipe Pose indices this module reads.
+NOSE = 0
 LEFT_SHOULDER, RIGHT_SHOULDER = 11, 12
+LEFT_WRIST, RIGHT_WRIST = 15, 16
 LEFT_HIP, RIGHT_HIP = 23, 24
 LEFT_ANKLE, RIGHT_ANKLE = 27, 28
 
@@ -51,6 +53,31 @@ RUN_SPEED = 1.10
 RUN_BOUNCE = 0.10        # vertical hip oscillation amplitude, torso lengths
 JUMP_RISE = 0.18         # upward hip displacement that is not gait bounce
 JUMP_ANKLE_RISE = 0.12   # both ankles leaving their baseline together
+
+# --- gestures -----------------------------------------------------------
+# A raised hand is a wrist held above its own shoulder. Measured against the
+# SHOULDER rather than the head, because the head can droop (someone asleep at
+# a desk still has a head) while a wrist above the shoulder is a deliberate arm
+# position almost nowhere else in ordinary life.
+HAND_RAISED_MARGIN = 0.10   # wrist above shoulder by this many torso lengths
+# A wave is a raised hand OSCILLATING sideways: direction reversals, not just
+# motion. A wave needs at least three wide swings within the window
+# (out–back–out) — two would also match reaching toward something and pulling
+# straight back, which is the nearest innocent motion this must not fire on.
+# Each swing must be wide enough that landmark jitter can't fake it.
+WAVE_MIN_SWINGS = 3
+WAVE_MIN_SWING = 0.25       # horizontal wrist travel per swing, torso lengths
+
+# --- stillness (the evidence "resting" is built from) -------------------
+# Below this hip speed (torso lengths/s) across the whole window the person is
+# not going anywhere; the wrist bound is looser because people shift their
+# hands while dozing without being "active".
+STILL_MAX_HIP_SPEED = 0.08
+STILL_MAX_WRIST_SPEED = 0.30
+# Head droop: the nose sinking toward shoulder height. Upright and alert, the
+# nose sits well above the shoulder line; asleep at a desk it approaches or
+# passes it. Expressed as nose-above-shoulders distance in torso lengths.
+HEAD_DROOP_MAX_CLEARANCE = 0.18
 
 _MIN_VISIBILITY = 0.5
 
@@ -81,13 +108,25 @@ class ActivityState:
     running: Attribute = field(default_factory=lambda: Attribute("running", False, 0.0))
     jumping: Attribute = field(default_factory=lambda: Attribute("jumping", False, 0.0))
     lying_down: Attribute = field(default_factory=lambda: Attribute("lying_down", False, 0.0))
+    hand_raised: Attribute = field(default_factory=lambda: Attribute("hand_raised", False, 0.0))
+    waving: Attribute = field(default_factory=lambda: Attribute("waving", False, 0.0))
+    # Resting: a settled body (sitting OR lying) that is also still. THE point
+    # of this attribute is that it is not a posture — someone asleep in a
+    # chair, at a desk, or in bed all read as resting, where `lying_down`
+    # alone only ever caught the bed. Sustained duration is the rule engine's
+    # job (persist_s), so this answers only "is the body settled right now".
+    resting: Attribute = field(default_factory=lambda: Attribute("resting", False, 0.0))
     #: Why the classifier believes it — carried into alerts as evidence.
     signals: dict = field(default_factory=dict)
     ready: bool = False
 
+    def _all(self) -> tuple[Attribute, ...]:
+        return (self.standing, self.sitting, self.walking, self.running,
+                self.jumping, self.lying_down, self.hand_raised, self.waving,
+                self.resting)
+
     def active(self) -> list[Attribute]:
-        return [a for a in (self.standing, self.sitting, self.walking, self.running,
-                            self.jumping, self.lying_down) if a.present]
+        return [a for a in self._all() if a.present]
 
     def labels(self) -> list[str]:
         return [a.name for a in self.active()]
@@ -95,8 +134,7 @@ class ActivityState:
     def as_dict(self) -> dict:
         return {
             a.name: {"present": a.present, "confidence": round(a.confidence, 2)}
-            for a in (self.standing, self.sitting, self.walking, self.running,
-                      self.jumping, self.lying_down)
+            for a in self._all()
         }
 
 
@@ -107,6 +145,13 @@ class _Sample:
     hip_y: float
     ankle_y: float
     torso: float
+    # Wrist positions in aspect-corrected units, or None when not visible.
+    # Kept per-side: a wave is one arm's motion, and averaging a moving wrist
+    # with a stationary one would halve the signal.
+    left_wrist: Optional[tuple[float, float]] = None
+    right_wrist: Optional[tuple[float, float]] = None
+    shoulder_y: float = 0.0
+    nose_y: Optional[float] = None
 
 
 def _point(landmarks: Sequence, index: int) -> Optional[tuple[float, float]]:
@@ -159,9 +204,16 @@ class ActivityRecognizer:
         if torso < 1e-4:
             return ActivityState(ready=False, signals={"reason": "degenerate torso"})
 
+        left_wrist = _point(landmarks, LEFT_WRIST)
+        right_wrist = _point(landmarks, RIGHT_WRIST)
+        nose = _point(landmarks, NOSE)
         self._samples.append(_Sample(
             at=now, hip_x=hips[0] * self.aspect, hip_y=hips[1],
             ankle_y=ankles[1] if ankles else hips[1], torso=torso,
+            left_wrist=(left_wrist[0] * self.aspect, left_wrist[1]) if left_wrist else None,
+            right_wrist=(right_wrist[0] * self.aspect, right_wrist[1]) if right_wrist else None,
+            shoulder_y=shoulders[1],
+            nose_y=nose[1] if nose else None,
         ))
         while self._samples and now - self._samples[0].at > self.window_s:
             self._samples.popleft()
@@ -241,4 +293,124 @@ class ActivityRecognizer:
         # Moving and upright is not "standing": standing means still.
         if (state.walking or state.running or state.jumping) and state.standing.present:
             state.standing = Attribute("standing", False, 0.0)
+
+        self._classify_gestures(samples, torso, state)
+        self._classify_resting(samples, torso, speed, state)
         return state
+
+    def _classify_gestures(self, samples: list[_Sample], torso: float,
+                           state: ActivityState) -> None:
+        """Raised hand and waving, from wrist trajectories.
+
+        Both are decided per arm and OR-ed: one raised hand is a raised hand.
+        A wave requires the hand to already be raised — a wrist oscillating at
+        hip height is scrubbing a counter, not greeting anyone.
+        """
+        for side in ("left_wrist", "right_wrist"):
+            track = [(s.at, getattr(s, side), s.shoulder_y) for s in samples
+                     if getattr(s, side) is not None]
+            if len(track) < MIN_SAMPLES:
+                continue
+
+            # Raised: the wrist above the shoulder line for the whole window,
+            # not one frame — a hand tossed up mid-gesture must not count.
+            clearances = [(shoulder_y - wrist[1]) / torso for _, wrist, shoulder_y in track]
+            raised_throughout = all(c >= HAND_RAISED_MARGIN for c in clearances)
+            if raised_throughout:
+                lowest = min(clearances)
+                confidence = min(0.95, 0.6 + (lowest - HAND_RAISED_MARGIN) * 1.5)
+                if confidence > state.hand_raised.confidence:
+                    state.hand_raised = Attribute("hand_raised", True, round(confidence, 2))
+
+                # Waving = raised AND oscillating: count completed wide swings
+                # (runs of same-direction horizontal travel). Jitter produces
+                # direction changes with near-zero travel, so a swing only
+                # counts once the wrist has moved WAVE_MIN_SWING torso-lengths
+                # in one direction.
+                xs = [wrist[0] for _, wrist, _ in track]
+                swings = 0
+                swing = 0.0
+                direction = 0
+                for previous, current in zip(xs, xs[1:]):
+                    step = current - previous
+                    if abs(step) < 1e-6:
+                        continue
+                    step_dir = 1 if step > 0 else -1
+                    if direction == 0:
+                        direction = step_dir
+                        swing = abs(step) / torso
+                    elif step_dir == direction:
+                        swing += abs(step) / torso
+                    else:
+                        if swing >= WAVE_MIN_SWING:
+                            swings += 1
+                        direction = step_dir
+                        swing = abs(step) / torso
+                if swing >= WAVE_MIN_SWING:
+                    swings += 1  # the in-flight swing counts once it is wide enough
+                state.signals[f"{side}_swings"] = swings
+                if swings >= WAVE_MIN_SWINGS:
+                    confidence = min(0.95, 0.45 + 0.1 * swings)
+                    if confidence > state.waving.confidence:
+                        state.waving = Attribute("waving", True, round(confidence, 2))
+
+        # A wave is a moving raised hand; report the more specific of the two.
+        if state.waving.present and state.hand_raised.present:
+            state.hand_raised = Attribute("hand_raised", False, 0.0)
+
+    def _classify_resting(self, samples: list[_Sample], torso: float,
+                          speed: float, state: ActivityState) -> None:
+        """A settled body: sitting or lying, and still.
+
+        This is deliberately NOT called "sleeping". Vision cannot confirm sleep
+        — it can observe that a body has settled and stopped moving, which
+        sustained over minutes (the rule's persist_s) is honest evidence of
+        rest. Head droop, when the nose is visible, raises confidence for the
+        asleep-at-a-desk case without being required for the in-bed one.
+        """
+        if not (state.sitting.present or state.lying_down.present):
+            return
+        if speed > STILL_MAX_HIP_SPEED:
+            return
+
+        wrist_speed = self._max_wrist_speed(samples, torso)
+        if wrist_speed is not None and wrist_speed > STILL_MAX_WRIST_SPEED:
+            state.signals["wrist_speed_torso_per_s"] = round(wrist_speed, 2)
+            return
+
+        posture_confidence = max(state.sitting.confidence, state.lying_down.confidence)
+        confidence = min(0.9, 0.5 + posture_confidence * 0.3)
+
+        drooped = self._head_drooped(samples, torso)
+        if drooped:
+            confidence = min(0.95, confidence + 0.15)
+            state.signals["head_drooped"] = True
+        state.resting = Attribute("resting", True, round(confidence, 2))
+
+    def _max_wrist_speed(self, samples: list[_Sample], torso: float) -> Optional[float]:
+        """Fastest wrist, torso-lengths/second, or None with no wrist data."""
+        fastest = None
+        for side in ("left_wrist", "right_wrist"):
+            track = [(s.at, getattr(s, side)) for s in samples if getattr(s, side) is not None]
+            if len(track) < 2:
+                continue
+            elapsed = track[-1][0] - track[0][0]
+            if elapsed <= 0:
+                continue
+            path = sum(
+                math.hypot(b[0] - a[0], b[1] - a[1])
+                for (_, a), (_, b) in zip(track, track[1:])
+            ) / torso
+            speed = path / elapsed
+            fastest = speed if fastest is None else max(fastest, speed)
+        return fastest
+
+    def _head_drooped(self, samples: list[_Sample], torso: float) -> bool:
+        """Whether the nose sits near or below shoulder height, sustained."""
+        clearances = [
+            (s.shoulder_y - s.nose_y) / torso
+            for s in samples if s.nose_y is not None
+        ]
+        if len(clearances) < MIN_SAMPLES:
+            return False
+        return max(clearances) <= HEAD_DROOP_MAX_CLEARANCE

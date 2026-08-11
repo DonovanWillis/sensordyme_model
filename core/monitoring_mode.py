@@ -24,7 +24,7 @@ and pose estimation answer questions nobody asked.
 from __future__ import annotations
 
 from enum import Enum
-from typing import Optional
+from typing import Iterable, Optional
 
 
 class MonitoringMode(str, Enum):
@@ -40,6 +40,25 @@ class MonitoringMode(str, Enum):
 # It implements get_detections(), which is what the rule engine consumes.
 CUSTOM_DETECTOR_MODULE = "occupancy"
 
+# The other module custom rules can run against: MediaPipe Pose, for rules that
+# name a posture or an activity label (lying_down, sitting, running, ...) rather
+# than an object. core/capabilities.py's `pose.body` / `activity.gait` are what
+# make "alert if I'm sleeping" composable at all (see jupiter/prompt.py) — this
+# is the other half: if the active detector never runs pose estimation, that
+# composed rule validates, looks active in the app, and never fires, which is
+# worse than Jupiter refusing the request outright.
+POSE_DETECTOR_MODULE = "fall_detection"
+
+# Which capability IDs (core/capabilities.py) each candidate module actually
+# backs. Not derived from the registry automatically — the registry knows what
+# a capability can name, not which module's code produces it, so this is the
+# one place that link is stated. Keep in step with occupancy.py/fall_detection.py's
+# `get_detections()` if either widens what it reports.
+_MODULE_CAPABILITIES: dict[str, frozenset[str]] = {
+    CUSTOM_DETECTOR_MODULE: frozenset({"objects.coco"}),
+    POSE_DETECTOR_MODULE: frozenset({"pose.body", "activity.gait", "gesture.arm", "state.resting"}),
+}
+
 
 def resolve(*, monitoring_active: bool, preset_module: Optional[str]) -> MonitoringMode:
     """The one place the active mode is decided."""
@@ -50,11 +69,62 @@ def resolve(*, monitoring_active: bool, preset_module: Optional[str]) -> Monitor
     return MonitoringMode.OFF
 
 
-def module_for(mode: MonitoringMode, preset_module: Optional[str]) -> Optional[str]:
-    """Which detection module a mode should actually run."""
+def select_custom_module(requested_labels: Iterable[str], reg=None) -> str:
+    """Which detector actually covers today's custom rules.
+
+    Defaults to `CUSTOM_DETECTOR_MODULE` (occupancy) — the common case, and the
+    cheap one: no MediaPipe, matching `test_the_general_detector_carries_no_mediapipe`.
+    Only switches to the pose detector when EVERY requested label needs it and
+    NONE need plain object detection, so a rule set that mixes "sleeping" with
+    "see a phone" does not silently stop serving the phone half. See
+    `capabilities_covered_by` for the honest half of that mixed case.
+    """
+    from core.capabilities import registry as default_registry_fn
+
+    reg = reg or default_registry_fn()
+    labels = [label for label in requested_labels if label]
+    if not labels:
+        return CUSTOM_DETECTOR_MODULE
+
+    needed_capabilities: set[str] = set()
+    for label in labels:
+        providers = {c.id for c in reg.providers_of_label(label) if c.available}
+        if not providers:
+            # An unrecognised label shouldn't be possible post-validation, but
+            # guessing a module for it would be worse than the safe default.
+            return CUSTOM_DETECTOR_MODULE
+        needed_capabilities |= providers
+
+    if needed_capabilities and needed_capabilities <= _MODULE_CAPABILITIES[POSE_DETECTOR_MODULE]:
+        return POSE_DETECTOR_MODULE
+    return CUSTOM_DETECTOR_MODULE
+
+
+def capabilities_covered_by(module: str) -> frozenset[str]:
+    """The capability IDs `module` actually backs, for the mismatch warning in
+    services/runtime.py's `_apply_requested_labels`."""
+    return _MODULE_CAPABILITIES.get(module, frozenset())
+
+
+def module_for(
+    mode: MonitoringMode,
+    preset_module: Optional[str],
+    *,
+    requested_labels: Optional[Iterable[str]] = None,
+    reg=None,
+) -> Optional[str]:
+    """Which detection module a mode should actually run.
+
+    `requested_labels` is optional and AI_CUSTOM-only: omitting it (every
+    existing caller before this parameter existed) keeps today's behaviour —
+    always `CUSTOM_DETECTOR_MODULE`. Passing the current rule set's labels lets
+    AI_CUSTOM pick `POSE_DETECTOR_MODULE` when that is genuinely what is needed.
+    """
     if mode is MonitoringMode.OFF:
         return None
     if mode is MonitoringMode.AI_CUSTOM:
+        if requested_labels is not None:
+            return select_custom_module(requested_labels, reg=reg)
         return CUSTOM_DETECTOR_MODULE
     return preset_module
 

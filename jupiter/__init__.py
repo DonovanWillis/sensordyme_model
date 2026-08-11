@@ -6,7 +6,9 @@ and not a rename of the ones already here. The distinction matters:
     Jupiter
       ├─ Vision      YOLO11 (Hailo/CPU), MediaPipe FaceMesh/Hands/Pose,
       │              openpilot dmonitoring — each stays specialised
-      ├─ Reasoning   a small local instruct model, text only
+      ├─ Reasoning   a local instruct model, text only — which one depends on
+      │              the role (jupiter/router.py): accuracy for configuring a
+      │              rule, speed for explaining one that already fired
       ├─ Config      natural language -> validated SensorDyme rules
       └─ Safety      the deterministic engine, which Jupiter never overrides
 

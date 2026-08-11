@@ -39,8 +39,21 @@ class Service:
 
     # ------------------------------------------------------------------ lifecycle
     def start(self, health: Optional[HealthMonitor] = None) -> None:
+        # Refuse to double-run. A wedged thread that outlived stop()'s join
+        # timeout is still executing; starting a replacement beside it would
+        # put two loops on one module — MediaPipe graphs are not thread-safe,
+        # and interleaved tracker updates at double cadence read as detection
+        # flapping. Better to stay wedged (visibly, for the health monitor's
+        # escalation) than to run twice.
+        if self._thread is not None and self._thread.is_alive():
+            log.warning("service %s is still running; not starting a second instance", self.name)
+            return
         self._health = health if health is not None else self._health
-        self._stop.clear()
+        # A FRESH stop event per generation, never a cleared shared one: an
+        # abandoned thread from a previous generation still polls the old
+        # event, which stays set — so it exits at its next check instead of
+        # resuming forever alongside the new thread.
+        self._stop = threading.Event()
         self._thread = threading.Thread(target=self._guarded_run, daemon=True, name=self.name)
         self._thread.start()
 
@@ -49,7 +62,11 @@ class Service:
         if self._thread is not None:
             self._thread.join(timeout=timeout)
             if self._thread.is_alive():
+                # Keep the handle: start() must be able to see the thread is
+                # still alive and refuse to double-run. Dropping it here was
+                # how a wedged loop became two concurrent loops.
                 log.warning("service %s did not stop within %.1fs", self.name, timeout)
+                return
         self._thread = None
 
     def restart(self) -> None:
@@ -64,9 +81,13 @@ class Service:
 
     # ------------------------------------------------------------------ crash containment
     def _guarded_run(self) -> None:
-        while not self._stop.is_set():
+        # Bind THIS generation's stop event. The attribute is replaced on every
+        # start(), and a thread that read the live attribute could be steered
+        # by a successor generation's event instead of its own.
+        stop = self._stop
+        while not stop.is_set():
             try:
-                self.run(self._stop)
+                self.run(stop)
                 return  # clean exit
             except Exception as exc:  # noqa: BLE001 - a service crash must never kill the device
                 log.error("service %s crashed: %s", self.name, exc, exc_info=True)
@@ -80,7 +101,7 @@ class Service:
                     return
                 delay = _RESTART_BACKOFF_S[self._crashes]
                 self._crashes += 1
-                if self._stop.wait(delay):
+                if stop.wait(delay):
                     return
 
     def run(self, stop: threading.Event) -> None:

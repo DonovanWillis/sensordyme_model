@@ -27,22 +27,22 @@ check(decide(critical: false) == .suppress(.notCritical),
 // The spam: BOTH severities used to notify. On a real device that was 942
 // 'loud' plus 608 'soft' in a day, from a driver-monitor doing its job.
 
-print("\nthe 20-second cooldown, from the worked example:")
-// 12:00:00 notify, then :02 :05 :11 :18 suppressed, :20 eligible again.
-check(decide(at: 0, lastAt: nil) == .notify, "12:00:00 first alert notifies")
-for (offset, label) in [(2.0, "12:00:02"), (5.0, "12:00:05"), (11.0, "12:00:11"), (18.0, "12:00:18")] {
+print("\nthe 20-second cooldown, from the product's own worked example:")
+// 10:00:00 notify, then :05 :10 :15 suppressed, :20 eligible again.
+check(decide(at: 0, lastAt: nil) == .notify, "10:00:00 first alert notifies")
+for (offset, label) in [(5.0, "10:00:05"), (10.0, "10:00:10"), (15.0, "10:00:15")] {
     if case .suppress(.withinCooldown) = decide(at: offset, lastAt: 0) {
         print("  ok   \(label) suppressed")
     } else {
         print("  FAIL \(label) should be suppressed"); failures += 1
     }
 }
-check(decide(at: 20, lastAt: 0) == .notify, "12:00:20 eligible again")
+check(decide(at: 20, lastAt: 0) == .notify, "10:00:20 eligible again")
 check(decide(at: 20.001, lastAt: 0) == .notify, "just past the boundary is eligible")
 
 print("\nthe cooldown reports how long is left, so suppression can be shown:")
 if case let .suppress(.withinCooldown(remaining)) = decide(at: 7, lastAt: 0) {
-    check(remaining == 13, "13s remaining at 12:00:07 (got \(remaining))")
+    check(remaining == 13, "13s remaining at 10:00:07 (got \(remaining))")
 } else {
     check(false, "should report remaining seconds"); failures += 1
 }
@@ -55,24 +55,25 @@ check(decide(critical: false, at: 100, lastAt: 0) == .suppress(.notCritical),
 check(decide(critical: true, at: 100, lastAt: 0) == .notify,
       "a genuinely new alert long after the last one notifies")
 // A different high-priority event inside the window is still suppressed: the
-// cooldown is about how often the phone may interrupt, not about sameness.
+// cooldown is about how often the phone may interrupt, not about sameness —
+// this is the explicit product decision (global cooldown), not a bug.
 if case .suppress(.withinCooldown) = decide(critical: true, at: 3, lastAt: 0) {
-    print("  ok   a DIFFERENT red alert inside the window is also suppressed")
+    print("  ok   a DIFFERENT red alert inside the window is also suppressed (by design)")
 } else {
-    print("  FAIL different-alert-in-window should be suppressed"); failures += 1
+    print("  FAIL different-alert-in-window should be suppressed under the global-cooldown policy"); failures += 1
 }
 check(decide(critical: true, lastAt: nil) == .notify,
       "first ever alert, with no previous notification, notifies")
 
-print("\nsomething the user configured always qualifies:")
+print("\nsomething the user configured always qualifies for consideration:")
 check(decide(critical: false, configured: true) == .notify,
       "a configured rule notifies even at warning severity")
 check(decide(critical: false, configured: false) == .suppress(.notCritical),
       "a preset's own warning still does not")
 if case .suppress(.withinCooldown) = decide(critical: false, configured: true, at: 5, lastAt: 0) {
-    print("  ok   a configured rule still respects the cooldown")
+    print("  ok   a configured rule still respects the cooldown — 'configured' bypasses severity, not the rate limit")
 } else {
-    print("  FAIL configured rules must not bypass the cooldown"); failures += 1
+    print("  FAIL configured rules must not bypass the cooldown — one policy, no per-source exceptions"); failures += 1
 }
 
 print("\n\(failures == 0 ? "PASSED" : "\(failures) FAILED")")

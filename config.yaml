@@ -97,7 +97,19 @@ cloud:
   #   bad:  http://192.168.1.251:8787
   base_url: http://localhost:8787 # your deployed cloud/ backend URL
   device_key: "" # issued by `python cloud/manage.py create-device <name>` -- see cloud/README.md
-  poll_interval_s: 5
+  # How often the device checks in: pushes queued events, and picks up a
+  # pending mode-switch command. This is the dominant cost in "how long until
+  # a mode switch shows as confirmed" -- measured (tests/test_cloud_backend.py,
+  # a throwaway backend instance): the app<->cloud HTTP round trip itself is
+  # under 5ms end to end, so the wait is polling cadence, not processing. At
+  # 5s the worst case was ~2 poll cycles for the device round trip (pick up
+  # the command, then report back) plus up to one more for the app's own
+  # refresh to notice -- 10-14s worst case for something the product wants to
+  # feel immediate. The device is mains-powered and each poll is a tiny JSON
+  # POST, so there is no real battery or bandwidth cost to polling faster;
+  # revisit only if this is ever deployed as a battery-powered device or at a
+  # fleet size where per-device request volume becomes a real server cost.
+  poll_interval_s: 2
 
 logging:
   level: info # debug | info | warning | error — service log verbosity (journalctl -u sensordyme)
@@ -117,10 +129,23 @@ alerts:
   cooldown_s: 15 # minimum seconds between two alerts of the same type (patient: don't re-alert too soon)
   escalation_window_s: 60 # repeat within this window -> continuous tone (event types not in loud/soft_types below)
   loud_types: [drowsiness, phone_use, eyes_down, attention_lost, high_risk, # always the loud/continuous tone
+               distraction, # sustained sideways head turn (3s+). Was in NEITHER list: locally it
+               # escalated by repetition (a deliberate mechanism), but its severity tag fell back to
+               # "soft", so it never pushed to the phone — while eyes_down (looking down 2.5s) was
+               # loud and did. Looking away sideways is not less dangerous than looking down;
+               # tagging it loud makes tone, severity and push behavior consistent for both.
                driverDistracted, driverUnresponsive, # openpilot terminal (red) alerts -- continuous alarm, as in the car
                phoneUseDetected, eyesClosedDetected, # openpilot module's additive distracted-driving flags
                skinnemoen_distracted, skinnemoen_phone_use, # skinnemoen module: every alert audible (additive)
-               dashsentinel_drowsy] # DashSentinel's DROWSY status -- loud alarm
+               dashsentinel_drowsy, # DashSentinel's DROWSY status -- loud alarm
+               fall, zone_violation, safe_zone_exit] # elderly/baby/security presets' own red alerts -- were
+               # missing here entirely, so the device tagged them severity=soft. The app's BIG RED ALERT UI
+               # (EventItem.severityStatus in Models.swift) and jupiter/explain.py both special-case these
+               # three types as always-critical regardless of the stored severity string, but the cloud
+               # notification gate (cloud/notify.py) trusts the stored string, not the type -- so a real fall
+               # showed as a red alert on screen but never sent a push or SMS. Tagging it "loud" at the
+               # source fixes every downstream consumer that trusts severity, instead of teaching each one
+               # the type list separately.
   soft_types: [fatigue_warning, frequent_glancing, elevated_risk, # always the soft chime
                promptDriverDistracted, promptDriverUnresponsive, # openpilot prompt (orange) alerts -- chime, as in the car
                distractionDetected, # openpilot module's additive instant chime (fires ~0.3s after detection)
@@ -150,6 +175,29 @@ training:
 
 modules:
   driver_attention:
+    # --- signal conditioning (glasses/glare robustness; see core/eye_signal.py) ---
+    # Raw EAR and head-pose readings are noisy measurements, and glasses make
+    # them noisier: frames and glare corrupt the eyelid-contour landmarks for
+    # single frames at a time. These stages sit between the landmarks and every
+    # threshold below, so one bad frame can neither trigger nor reset anything.
+    signal_median_window: 5 # rolling median over this many frames for EAR/yaw/pitch; 1 disables
+    signal_release_s: 0.4 # a condition must be FALSE this long before its timer resets or its
+    # live alert clears -- bridges one-frame landmark dropouts without changing
+    # how fast anything fires (detection latency is unchanged; see
+    # tests/test_driver_signal_conditioning.py)
+    ear_baseline_window_s: 60.0 # session open-eye reference window: the effective closure
+    # threshold follows the upper percentile of the last minute's EAR, so putting
+    # glasses on (which shifts the whole EAR distribution) doesn't leave the
+    # threshold calibrated for a bare face
+    ear_baseline_band_low: 0.6 # the session reference may not drift below/above this
+    ear_baseline_band_high: 1.4 # fraction of the calibrated baseline -- glasses shift a
+    # baseline by tens of percent; genuinely closing eyes would need far more,
+    # so pathology cannot drag the threshold down with it
+    iris_veto: true # when the eyelid EAR claims "closed" but the iris landmarks (already
+    # computed; FaceMesh runs with refine_landmarks=true) show a plainly visible
+    # iris, trust the iris: a visible iris and a closed eye cannot both be true.
+    # Only ever suppresses a false closure, never invents one.
+
     # --- drowsiness (eye closure) ---
     ear_threshold_ratio: 0.75 # personal threshold = this * the calibrated open-eye baseline EAR
     ear_threshold_fallback: 0.20 # used only before calibration completes, or if calibration.json is unreadable

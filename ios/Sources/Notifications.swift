@@ -31,10 +31,15 @@ final class AlertNotifier: NSObject, ObservableObject {
     @Published var authorized = false
     @Published var lastError: String?
 
-    /// Minimum gap between notifications, in seconds.
+    /// Minimum gap between notifications, in seconds. Product spec, stated
+    /// explicitly: at most one notification every 20 seconds, globally per
+    /// account — matches cloud/notify.py's COOLDOWN_S exactly, so the two
+    /// notification paths (local, posted by this app; push, delivered by the
+    /// OS through the backend) never disagree about the same moment.
     ///
-    /// Not a detection setting. Jupiter keeps detecting and recording at full
-    /// rate; this governs only how often the phone is allowed to interrupt.
+    /// Not a detection setting. The device keeps detecting and recording at
+    /// full rate; this governs only how often the phone is allowed to
+    /// interrupt.
     static let cooldown: TimeInterval = 20
 
     /// How many red alerts were recorded but not notified because the cooldown

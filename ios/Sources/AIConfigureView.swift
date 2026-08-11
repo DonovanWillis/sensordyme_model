@@ -150,7 +150,35 @@ struct AIConfigureView: View {
                         .font(SD.Typography.caption)
                         .foregroundStyle(SD.Colors.warning)
                 }
+                if let confidence = proposal.jupiter?.interpretation_confidence, confidence.worthFlagging {
+                    interpretationConfidenceNotice(confidence)
+                }
             }
+        }
+    }
+
+    /// Plain language for everyone; the actual reasons behind a small
+    /// disclosure for anyone who wants them. `worthFlagging` already filtered
+    /// out the routine case (part of the request being unsupported) — the
+    /// `limitationsCard` below says that on its own, and repeating it here
+    /// would be the same fact twice. What's left when this shows is something
+    /// about the MODEL'S OWN OUTPUT that needed correcting, which nothing else
+    /// on this screen surfaces.
+    private func interpretationConfidenceNotice(_ confidence: AIInterpretationConfidence) -> some View {
+        DisclosureGroup {
+            VStack(alignment: .leading, spacing: SD.Space.xxs) {
+                ForEach(confidence.basis, id: \.self) { reason in
+                    Text("• \(reason)")
+                        .font(SD.Typography.caption)
+                        .foregroundStyle(SD.Colors.textSecondary)
+                        .fixedSize(horizontal: false, vertical: true)
+                }
+            }
+            .padding(.top, SD.Space.xxs)
+        } label: {
+            Label("Double-check this before turning it on", systemImage: "exclamationmark.circle")
+                .font(SD.Typography.caption)
+                .foregroundStyle(SD.Colors.warning)
         }
     }
 
@@ -358,13 +386,23 @@ struct AIConfigureView: View {
     private func apply(_ proposal: AIProposal) {
         Task {
             do {
-                // Rules are already persisted by the configure call. Only touch
-                // the preset when one was actually chosen — a custom rule set
-                // belongs to no preset, and sending "" would be a mode change
-                // the user never asked for.
-                if !proposal.isCustom {
-                    try await state.backend.setPreset(deviceID: device.id, preset: proposal.preset)
-                }
+                // Rules are already persisted by the configure call, but that
+                // alone does not tell the backend to actually turn them on —
+                // /v1/devices/{id}/preset is what marks intent
+                // (custom_monitoring_wanted on the device row), and nothing
+                // else does. This used to be skipped for a genuinely custom
+                // proposal (empty preset) on the theory that sending "" was a
+                // pointless or even unwanted mode change — but an empty
+                // desired_preset is falsy server-side and never produces a
+                // set_preset command, so it never actually changes what mode
+                // is selected. It only sets the "please deliver and run these
+                // rules" flag. Skipping it meant tapping Activate for any
+                // open-ended prompt (no named preset matched) saved the rules
+                // but never told the device to run them — the button showed
+                // "Active on {device}" while nothing was ever delivered. Both
+                // branches now call it; for a named-preset proposal this is
+                // unchanged from before.
+                try await state.backend.setPreset(deviceID: device.id, preset: proposal.preset)
                 withAnimation(SD.Motion.standard) { applied = true }
                 await onApplied()
             } catch {

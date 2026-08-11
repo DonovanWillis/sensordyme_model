@@ -22,6 +22,7 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import json
+import logging
 import os
 import secrets
 import sqlite3
@@ -40,6 +41,12 @@ from pydantic import BaseModel
 DB_PATH = os.environ.get("SENSORDYME_DB", str(Path(__file__).parent / "sensordyme.db"))
 JWT_TTL_S = 30 * 24 * 3600
 NTFY_BASE = os.environ.get("SENSORDYME_NTFY_BASE", "https://ntfy.sh")
+
+# uvicorn configures handlers for its own loggers and leaves the root logger
+# bare, so a logger named for this module would have its lines silently
+# dropped. Logging through uvicorn's own channel puts them in the server log
+# an operator is actually looking at.
+log = logging.getLogger("uvicorn.error")
 
 
 def _load_jwt_secret() -> str:
@@ -172,11 +179,41 @@ def init_db() -> None:
             # it the app cannot tell a preset's own warning from the one thing
             # someone explicitly asked to be told about.
             "ALTER TABLE events ADD COLUMN source TEXT",
+            # A device-generated idempotency key, present from firmware that
+            # sends one (see core/uplink.py's push_event). Lets ingest tell a
+            # genuine resend apart from a second, distinct event.
+            "ALTER TABLE events ADD COLUMN event_key TEXT",
+            # Whether the user's last preset request was "AI Custom" (preset
+            # == "") rather than a named mode. `ai_rules` itself is never
+            # cleared by switching presets — reopening Configure-with-AI must
+            # still show what was last configured — so without a separate
+            # signal for "and is it supposed to be running right now", the
+            # rules-delivery check below (comparing ai_rules' version against
+            # what the device reports) had no way to tell "the device hasn't
+            # picked this up yet" apart from "the user switched to a normal
+            # preset a while ago". It resent the same set_rules command
+            # forever, and the device kept reapplying it — silently pulling
+            # the device back into custom monitoring within one poll interval
+            # of every single preset switch, for any account that had ever
+            # used Configure-with-AI even once.
+            "ALTER TABLE devices ADD COLUMN custom_monitoring_wanted INTEGER DEFAULT 0",
         ):
             try:
                 conn.execute(statement)
             except sqlite3.OperationalError:
                 pass  # column already exists
+
+        # Must run AFTER the ALTER TABLE above: event_key does not exist yet
+        # on a database that predates it, and CREATE INDEX on a column that
+        # doesn't exist is an error, not a no-op. A resent batch (device
+        # treats a lost response as failure and retries the same events) must
+        # not become duplicate rows. Partial index: older devices sending no
+        # event_key are unaffected, since SQLite never treats two NULLs as
+        # equal for uniqueness.
+        conn.execute(
+            "CREATE UNIQUE INDEX IF NOT EXISTS idx_events_dedup "
+            "ON events(device_id, event_key) WHERE event_key IS NOT NULL"
+        )
 
 
 init_db()
@@ -513,7 +550,14 @@ def set_preset(device_id: int, body: PresetBody, uid: int = Depends(current_user
         # will apply and report the current name, so a stored alias could never
         # match on convergence and would re-send on every poll for ever.
         normalized = resolve_preset(body.preset)
-        conn.execute("UPDATE devices SET desired_preset = ? WHERE id = ?", (normalized, device_id))
+        # An empty preset IS the app's request for AI Custom (AIConfigureView's
+        # Apply calls this with preset=""). Anything else is an explicit
+        # request to leave custom monitoring in charge, whatever ai_rules
+        # still says from a previous configuration.
+        conn.execute(
+            "UPDATE devices SET desired_preset = ?, custom_monitoring_wanted = ? WHERE id = ?",
+            (normalized, 1 if normalized == "" else 0, device_id),
+        )
     return {"ok": True, "desired_preset": normalized}
 
 
@@ -751,23 +795,13 @@ def _legacy_system_prompt() -> str:
 # Which model interprets custom requests. Jupiter (a local model) is the
 # default, so a fresh install needs no third-party API key to configure a camera
 # its owner already paid for. Anthropic remains selectable as a benchmark.
+#
+# Model/base_url selection, per-role defaults, and the (off-by-default) cloud
+# fallback now live in jupiter/router.py — this stays only as the cheap
+# short-circuit for /v1/events/{id}/explain: "off" must skip even attempting a
+# provider, not just fail to find one, so a deployment that wants facts-only
+# explanations never pays for a provider construction + availability probe.
 JUPITER_PROVIDER = os.environ.get("SENSORDYME_AI_PROVIDER", "jupiter").strip().lower()
-JUPITER_MODEL = os.environ.get("JUPITER_MODEL", "").strip()
-JUPITER_BASE_URL = os.environ.get("JUPITER_BASE_URL", "").strip()
-# Off by default. An external provider must never be reached because it happens
-# to be installed — sending a user's words off the box is an explicit decision.
-JUPITER_ALLOW_EXTERNAL_FALLBACK = os.environ.get(
-    "SENSORDYME_ALLOW_EXTERNAL_AI", ""
-).strip().lower() in ("1", "true", "yes")
-
-
-def _jupiter_config() -> dict:
-    config = {}
-    if JUPITER_MODEL:
-        config["model"] = JUPITER_MODEL
-    if JUPITER_BASE_URL:
-        config["base_url"] = JUPITER_BASE_URL
-    return config
 
 
 def _ai_configure_llm(prompt: str) -> Optional[dict]:
@@ -777,25 +811,35 @@ def _ai_configure_llm(prompt: str) -> Optional[dict]:
     proposal that `_validate_proposal` then re-checks against the capability
     registry. Neither is trusted, so swapping the provider changes accuracy and
     cost, never what the device is willing to run.
+
+    Routed through jupiter/router.py's "configure" role rather than a provider
+    name and config assembled inline here — see that module for what decides
+    the model (measured accuracy per model, not just whichever was installed
+    first) and why the cloud fallback defaults to Sonnet rather than Opus.
     """
     try:
         from jupiter.interpret import interpret
+        from jupiter.router import cloud_fallback_config, role_config
     except ImportError:
         # Backend deployed without core/ + jupiter/ on the path. Say nothing
         # here; the caller's fallback explains it to the user.
         return None
 
-    outcome = interpret(prompt, provider_name=JUPITER_PROVIDER, config=_jupiter_config())
+    provider_name, config = role_config("configure")
+    outcome = interpret(prompt, provider_name=provider_name, config=config)
 
-    if not outcome.ok and JUPITER_ALLOW_EXTERNAL_FALLBACK and JUPITER_PROVIDER != "anthropic":
+    fallback = cloud_fallback_config()
+    if not outcome.ok and fallback["enabled"] and provider_name != fallback["provider"]:
         # Explicitly enabled, and only after the local path failed.
-        outcome = interpret(prompt, provider_name="anthropic")
+        outcome = interpret(
+            prompt, provider_name=fallback["provider"], config={"model": fallback["model"]}
+        )
 
     if not outcome.ok and not outcome.interpretation.rules:
         return None  # let the caller report why, rather than inventing a preset
 
     proposal = outcome.interpretation.as_proposal()
-    proposal["source"] = outcome.provider or JUPITER_PROVIDER
+    proposal["source"] = outcome.provider or provider_name
     proposal["jupiter"] = {
         "provider": outcome.provider,
         "model": outcome.model,
@@ -1003,9 +1047,9 @@ def explain_event(device_id: int, event_id: int, uid: int = Depends(current_user
     provider = None
     if JUPITER_PROVIDER not in ("", "off"):
         try:
-            from jupiter.providers import get_provider
+            from jupiter.router import get_role_provider
 
-            candidate = get_provider(JUPITER_PROVIDER, _jupiter_config())
+            candidate = get_role_provider("explain")
             ok, _ = candidate.available()
             provider = candidate if ok else None
         except Exception:  # noqa: BLE001 - the facts path never needs a model
@@ -1035,35 +1079,100 @@ def ingest(body: IngestBody, device: sqlite3.Row = Depends(current_device)):
             if device["owner_id"]
             else None
         )
+        newly_inserted_events = []
         for e in body.events[:200]:
-            conn.execute(
-                "INSERT INTO events (device_id, timestamp, type, confidence, signals, severity,"
-                " source, received_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
-                (
-                    device["id"],
-                    str(e.get("timestamp", "")),
-                    str(e.get("type", "unknown")),
-                    float(e.get("confidence", 0.0) or 0.0),
-                    str(e.get("signals", "")),
-                    str(e.get("severity", "log")),
-                    str(e.get("source") or "module"),
-                    now,
-                ),
-            )
+            # OR IGNORE + the partial unique index on (device_id, event_key):
+            # a device that treated a lost response as a failed send retries
+            # the identical batch next poll. Without this, that retry is a
+            # second row for the same alert — a duplicate in Recent Activity
+            # and a second notification for something that already fired.
+            # `event_key` is None (-> SQL NULL) for firmware that predates
+            # it; NULL never collides with itself, so those rows insert
+            # exactly as before — no behavior change for an older device.
+            #
+            # Every field is coerced defensively and the whole thing wrapped
+            # per-event, not per-batch. `events: list[dict]` is unvalidated —
+            # Pydantic checks the list holds dicts, never what's inside them —
+            # so a malformed value (a string where confidence needs a float)
+            # is a real, reachable input, not a hypothetical one. Reproduced
+            # directly: one bad `confidence` raised an uncaught ValueError
+            # INSIDE this loop, which propagated out of `with db()` before
+            # `conn.commit()` ran — losing every good event in the same batch,
+            # not just the bad one. Worse than losing one event: the device's
+            # uplink treats the resulting 500 as a failed send and re-queues
+            # the identical batch next poll — so the same malformed event
+            # would 500 again, forever, permanently blocking every event
+            # behind it in the queue. One skipped event, logged, is the
+            # entire cost of getting this wrong; the alternative was total
+            # queue deadlock.
+            try:
+                event_key = e.get("event_key")
+                confidence_raw = e.get("confidence", 0.0)
+                confidence = float(confidence_raw) if confidence_raw not in (None, "") else 0.0
+                cursor = conn.execute(
+                    "INSERT OR IGNORE INTO events (device_id, timestamp, type, confidence, signals,"
+                    " severity, source, received_at, event_key) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                    (
+                        device["id"],
+                        str(e.get("timestamp", "")),
+                        str(e.get("type", "unknown")),
+                        confidence,
+                        str(e.get("signals", "")),
+                        str(e.get("severity", "log")),
+                        str(e.get("source") or "module"),
+                        now,
+                        str(event_key) if event_key else None,
+                    ),
+                )
+                # rowcount is 0 when OR IGNORE silently dropped a retry of an
+                # event_key already stored — that upload is not new information,
+                # so it must not reach the notification loop below. Without this
+                # check that loop re-evaluated every event in `body.events`
+                # regardless of whether storage actually inserted a row, so a
+                # retried batch (the device's own recovery path after a lost
+                # response) could notify a second time for an alert already
+                # notified on its first arrival — the exact duplicate this
+                # gate exists to prevent, just moved from "database row" to
+                # "notification".
+                if cursor.rowcount > 0:
+                    newly_inserted_events.append(e)
+            except (TypeError, ValueError, sqlite3.Error) as exc:
+                log.warning(
+                    "ingest: skipped one malformed event from device %s (%s): %r",
+                    device["id"], exc, e,
+                )
+                continue
         row = conn.execute(
-            "SELECT desired_preset, ai_rules, zones FROM devices WHERE id = ?", (device["id"],)
+            "SELECT desired_preset, ai_rules, zones, custom_monitoring_wanted FROM devices WHERE id = ?",
+            (device["id"],),
         ).fetchone()
         desired, ai_rules_json, zones_json = row["desired_preset"], row["ai_rules"], row["zones"]
-        # Convergence: once the device reports the desired preset as active, the
-        # command is fulfilled — clear it. Without this, a stale desired_preset
-        # keeps re-delivering forever and FIGHTS local mode switches made on the
-        # device/dashboard (the device flips back within one poll interval).
+        custom_monitoring_wanted = bool(row["custom_monitoring_wanted"])
+        # A device can report the same active_preset string while AI Custom
+        # Monitoring runs on top of it — entering custom monitoring replaces the
+        # running module without touching active_preset, so the field still names
+        # whatever preset was selected before. A desired_preset equal to that
+        # name is genuinely NOT fulfilled yet in that case: the device still has
+        # to exit custom monitoring, which is real work "same string" hides.
+        device_reports_custom_active = bool((body.monitoring or {}).get("active"))
+        # Convergence: once the device reports the desired preset as active AND
+        # not layered under custom monitoring, the command is fulfilled — clear
+        # it. Without the first half, a stale desired_preset keeps re-delivering
+        # forever and FIGHTS local mode switches made on the device/dashboard
+        # (the device flips back within one poll interval). Without the second
+        # half, asking to return to the preset that was active before custom
+        # monitoring was turned on never converges — the string already matches
+        # today, so the command is dropped before the device ever sees it.
         # Compare by mode, not by string. A device handed a superseded name
         # applies — and correctly reports — the current one, so raw equality
         # never matches: the backend concludes the command was ignored and
         # re-sends it every poll, fighting whatever mode the user picks locally.
         # This also converges rows written before names were normalised.
-        if desired and same_preset(desired, body.active_preset or device["active_preset"]):
+        if (
+            desired
+            and same_preset(desired, body.active_preset or device["active_preset"])
+            and not device_reports_custom_active
+        ):
             conn.execute("UPDATE devices SET desired_preset = NULL WHERE id = ?", (device["id"],))
             desired = None
 
@@ -1073,9 +1182,30 @@ def ingest(body: IngestBody, device: sqlite3.Row = Depends(current_device)):
     # locally, the server did not, so the channel that reaches someone when
     # they are NOT looking was the unfiltered one.
     #
-    # Every event is still stored above and still appears in the timeline. This
-    # decides interruptions only.
-    for e in body.events:
+    # Iterates `newly_inserted_events`, not `body.events` again, for two
+    # reasons at once. First: every event THAT WAS STORED also still appears
+    # in the timeline, so a notification must never fire for one that was
+    # never written — "an alert was sent without being recorded" is exactly
+    # the bug that guards against. Second, and the reason it is
+    # `newly_inserted_events` rather than the full insert-attempted slice: a
+    # retry of an already-stored event_key is OR-IGNOREd (rowcount 0) because
+    # it is not new information, and it must not be new interruption either —
+    # otherwise the device's own retry-on-lost-response recovery would
+    # duplicate the notification for an alert that already fired, which is
+    # the identical duplicate bug at the notification layer instead of the
+    # database layer. Distinct alerts still each get their own notification:
+    # each has its own event_key and therefore its own inserted row.
+    #
+    # A 20-second global cooldown per account on top of that — product spec,
+    # stated explicitly: at most one notification every 20 seconds, with
+    # every other qualifying alert in that window still stored and still
+    # shown in Recent Activity, only the notification withheld. This is a
+    # DIFFERENT question from the event_key filtering above and does not
+    # replace it: `newly_inserted_events` keeps a retried duplicate from ever
+    # reaching this loop at all (there would be nothing distinct to notify
+    # about); the cooldown then rate-limits distinct, genuinely-new alerts
+    # against each other. Both are always active together.
+    for e in newly_inserted_events:
         owner_id = owner["id"] if owner is not None else None
         send, held = gate.evaluate(
             owner_id, str(e.get("severity", "")), source=str(e.get("source") or "module")
@@ -1086,18 +1216,49 @@ def ingest(body: IngestBody, device: sqlite3.Row = Depends(current_device)):
         detail = str(e.get("signals", "")) or "alert"
         if held:
             detail += f" (and {held} more in the last {int(NOTIFY_COOLDOWN_S)}s)"
-        send_push(owner, title, detail)
-        send_sms(owner, f"{title} — {detail} ({device['name']})")
+        # Isolated per event, same reasoning as the INSERT loop above: the
+        # event is already committed by this point, so a delivery failure —
+        # ntfy down, Twilio erroring, a future provider misbehaving — must
+        # never take the whole response down with it. Without this, one bad
+        # send here would also silently cancel every OTHER event's
+        # notification later in the same batch, even though each of those is
+        # already safely stored and would never be retried (their event_key
+        # is already inserted, so a client retry after the resulting 500
+        # would not surface them again either).
+        try:
+            send_push(owner, title, detail)
+            send_sms(owner, f"{title} — {detail} ({device['name']})")
+        except Exception as exc:  # noqa: BLE001 - a delivery bug must not affect storage or other events
+            log.warning(
+                "ingest: notification delivery failed for device %s event %r: %r",
+                device["id"], e.get("type"), exc,
+            )
 
     command = None
-    if desired and desired != (body.active_preset or device["active_preset"]):
+    # Same reasoning as the convergence check above: a matching name is not
+    # "nothing to do" while the device still reports custom monitoring active —
+    # the device has to exit custom monitoring, so the command must still go out.
+    if desired and (
+        desired != (body.active_preset or device["active_preset"])
+        or device_reports_custom_active
+    ):
         command = {"set_preset": desired}
 
     # Custom rules are configured in the app but enforced on the device, so they
     # have to travel down this channel — without it a saved proposal changed the
     # text in the app and nothing about what the camera actually watched for.
+    #
+    # Gated on `custom_monitoring_wanted`, not just on the version mismatch.
+    # `ai_rules` is never cleared by switching to a normal preset — reopening
+    # Configure-with-AI later must still show what was last configured — so
+    # the version comparison alone can't tell "not delivered yet" apart from
+    # "the user asked for a different preset a while ago". Without this gate,
+    # switching away from AI Custom did not stick: the very next poll saw the
+    # same version mismatch, resent set_rules, and the device reapplied it —
+    # pulling itself back into custom monitoring within one poll interval of
+    # every switch, for any account that had ever used Configure-with-AI.
     version = _rules_version(ai_rules_json)
-    if version and version != (body.rules_version or ""):
+    if custom_monitoring_wanted and version and version != (body.rules_version or ""):
         command = dict(command or {})
         command["set_rules"] = _rules_payload(ai_rules_json)
         # Send what the rules are FOR, not only what they are. The device shows

@@ -61,6 +61,16 @@ final class DeviceLink: ObservableObject {
     private let discovery = DeviceDiscovery()
     private var monitor: NWPathMonitor?
     private var lastPathID: String?
+    /// `resolve(force:)` has two independent callers — `ensureConnection()`
+    /// (from DevicesView's `.task`) and `handlePathChange` (fired whenever the
+    /// network itself changes) — and `force: true` deliberately bypasses the
+    /// "already searching" guard just below, so two discovery scans can be in
+    /// flight together with no ordering guarantee on which Bonjour answer
+    /// comes back first. Without this, a stale scan finishing after a fresh
+    /// one could silently rebind `state`/`cachedURL` back to a worse or
+    /// outdated address. Found and fixed while sweeping the app for the same
+    /// race class as DeviceDetailView/DevicesView/ShopView.
+    private let reloadGuard = LatestRequestGuard()
 
     // MARK: Lifecycle
 
@@ -106,9 +116,14 @@ final class DeviceLink: ObservableObject {
 
     /// Make sure there is a usable address, doing the least work that achieves it.
     func ensureConnection() async {
-        if !cachedURL.isEmpty, await reachable(cachedURL) {
-            state = .connected(url: cachedURL)
-            return
+        if !cachedURL.isEmpty {
+            let token = reloadGuard.begin()
+            let ok = await reachable(cachedURL)
+            guard reloadGuard.isLatest(token) else { return }  // a resolve() has since started/finished
+            if ok {
+                state = .connected(url: cachedURL)
+                return
+            }
         }
         await resolve(force: false)
     }
@@ -116,9 +131,11 @@ final class DeviceLink: ObservableObject {
     /// Re-discover the device and adopt its current address.
     func resolve(force: Bool) async {
         if !force, case .searching = state { return }
+        let token = reloadGuard.begin()
         state = .searching
 
         let found = await discovery.discoverOnce(timeout: 4.0)
+        guard reloadGuard.isLatest(token) else { return }  // a newer scan has since started
 
         // Prefer the device we were previously linked to. On a network with
         // several SensorDymes, silently adopting a different one would be worse

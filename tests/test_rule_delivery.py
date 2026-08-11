@@ -45,9 +45,17 @@ def backend(tmp_path, monkeypatch):
 
 
 def store_rules(app_module, rules):
+    """Store a rule set AND mark it as applied.
+
+    `custom_monitoring_wanted` is what these tests are not about — they cover
+    delivery of a rule set the user has already turned on, not the separate
+    question of whether turning it on is what's currently requested (that
+    gating is covered in tests/test_cloud_backend.py). Setting it here keeps
+    that concern out of every call site.
+    """
     with app_module.db() as conn:
         conn.execute(
-            "UPDATE devices SET ai_rules = ? WHERE id = 1",
+            "UPDATE devices SET ai_rules = ?, custom_monitoring_wanted = 1 WHERE id = 1",
             (json.dumps({"preset": "security_monitoring", "rules": rules}),),
         )
 
@@ -135,12 +143,37 @@ def test_malformed_stored_rules_do_not_break_ingest(backend):
     assert resp.json()["stored"] == 1
 
 
-def test_rule_delivery_coexists_with_a_preset_command(backend):
-    """Both commands ride the same response; neither may clobber the other."""
+def test_switching_to_a_named_preset_does_not_also_redeliver_stale_rules(backend):
+    """The bug found during live-hardware verification: `ai_rules` is never
+    cleared by switching to a named preset (reopening Configure-with-AI later
+    must still show what was last configured), so if a rule set was applied
+    and then the user picks a plain preset, the stale rules must NOT ride
+    along with that preset command — only the preset switch itself. Riding
+    along would silently force the device back into full custom monitoring,
+    fighting the very preset the user just chose. (Selecting `/preset` with
+    `preset: "baby_monitoring"` also flips `custom_monitoring_wanted` off,
+    which is what stops it.)
+    """
     app_module, client, headers = backend
     store_rules(app_module, [RULE])
     client.post("/v1/devices/1/preset", json={"preset": "baby_monitoring"}, headers=headers)
 
     command = poll(client)
-    assert command["set_preset"] == "baby_monitoring"
+    assert command == {"set_preset": "baby_monitoring"}, (
+        "a stale applied rule set must not ride along on a switch to a named preset"
+    )
+
+
+def test_rule_delivery_coexists_with_zones_when_ai_custom_is_what_was_requested(backend):
+    """The genuine coexistence case: applying AI Custom itself. There is no
+    `set_preset` command for it (empty preset is not a name to converge on),
+    so this exercises the one case that actually still combines two commands
+    in one response — rules and zones together."""
+    app_module, client, headers = backend
+    client.post("/v1/devices/1/zones", json={"zones": []}, headers=headers)
+    store_rules(app_module, [RULE])
+    client.post("/v1/devices/1/preset", json={"preset": ""}, headers=headers)
+
+    command = poll(client)
     assert command["set_rules"] == [RULE]
+    assert "set_preset" not in command

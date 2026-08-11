@@ -1,11 +1,5 @@
-# SensorDyme # Preset names that have been superseded. A deployed device, or a `desired_preset`
-# already sitting in the backend, can still be holding one of these — and an
-# unknown preset name is a device stuck in a mode it cannot switch out of.
-aliases:
-  driver_distraction: driver_safety
-  driver_distraction_openpilot: driver_safety
-
-presets: the modes a user can pick from the app / dashboard.
+# SensorDyme preset registry: the modes a user can pick from the app / dashboard.
+#
 # Each preset names a registered VisionModule (its thresholds stay in config.yaml's
 # modules: section) plus which event types alert in that mode. Switching presets
 # hot-swaps the module on the live camera loop — no restart.
@@ -15,6 +9,7 @@ presets: the modes a user can pick from the app / dashboard.
 # A preset may define `variants`: named tuning profiles selectable from the app as
 # "<preset>:<variant>" (e.g. driver_distraction:teen). A variant's `overrides` are
 # merged over the module's config.yaml block at switch time.
+#
 # Preset names that have been superseded. A deployed device, or a `desired_preset`
 # already sitting in the backend, can still be holding one of these — and an
 # unknown preset name is a device stuck in a mode it cannot switch out of.
