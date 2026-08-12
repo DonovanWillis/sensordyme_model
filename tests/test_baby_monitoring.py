@@ -25,11 +25,11 @@ def _module(**overrides):
     return BabyMonitoringModule(config)
 
 
-def _run(module, boxes, motion, seconds, start=0.0, step=0.1, bottle_boxes=()):
+def _run(module, boxes, motion, seconds, start=0.0, step=0.1, bottle_boxes=(), object_boxes=None):
     events = []
     t = start
     while t < start + seconds:
-        events += module._reason(list(boxes), motion, W, H, t, list(bottle_boxes))
+        events += module._reason(list(boxes), motion, W, H, t, list(bottle_boxes), object_boxes)
         t += step
     return events, t
 
@@ -162,3 +162,78 @@ def test_holding_bottle_resolves_once_the_bottle_moves_away():
 
     events, _ = _run(module, [IN_CRIB], motion=0.05, seconds=3.0, start=t, bottle_boxes=[BOTTLE_ELSEWHERE])
     assert "holding_bottle_resolved" in [e.type for e in events]
+
+
+# ------------------------------------------------------------------- holding_object
+# Before this, only "bottle" was ever requested from the object detector at all --
+# a phone, cup, or food item held up in frame was invisible to this module
+# regardless of confidence threshold, because the class was never in the YOLO
+# call's `classes` filter to begin with. These exercise the same reasoning path
+# holding_bottle already had, generalized to config.yaml's object_classes.
+PHONE_IN_CRIB = (460, 350, 520, 500)      # overlaps IN_CRIB
+PHONE_ELSEWHERE = (860, 300, 920, 500)    # does not overlap IN_CRIB
+
+
+def test_the_default_object_vocabulary_is_not_bottle_only():
+    """The literal regression: only 'bottle' reached the detector's class filter."""
+    module = _module()
+    from core.accel import COCO_NAMES
+    labels = {COCO_NAMES[cid] for cid in module._object_class_ids}
+    for expected in ("cell phone", "cup", "banana", "apple"):
+        assert expected in labels, f"{expected} should be requested from the detector by default"
+
+
+def test_a_phone_overlapping_the_child_confirms_holding_object():
+    module = _module(holding_object_confirm_s=1.0)
+    events, _ = _run(
+        module, [IN_CRIB], motion=0.05, seconds=1.5,
+        object_boxes={"phone": [PHONE_IN_CRIB]},
+    )
+    assert "holding_object" in [e.type for e in events]
+    fired = next(e for e in events if e.type == "holding_object")
+    assert "object=phone" in fired.contributing_signals
+
+
+def test_a_phone_elsewhere_in_frame_does_not_confirm():
+    """Same honest 'overlap, not bare presence' rule holding_bottle already applies."""
+    module = _module(holding_object_confirm_s=1.0)
+    events, _ = _run(
+        module, [IN_CRIB], motion=0.05, seconds=1.5,
+        object_boxes={"phone": [PHONE_ELSEWHERE]},
+    )
+    assert "holding_object" not in [e.type for e in events]
+
+
+def test_holding_object_resolves_once_the_object_moves_away():
+    module = _module(holding_object_confirm_s=1.0)
+    events, t = _run(
+        module, [IN_CRIB], motion=0.05, seconds=1.5,
+        object_boxes={"phone": [PHONE_IN_CRIB]},
+    )
+    assert "holding_object" in [e.type for e in events]
+
+    events, _ = _run(
+        module, [IN_CRIB], motion=0.05, seconds=3.0, start=t,
+        object_boxes={"phone": [PHONE_ELSEWHERE]},
+    )
+    assert "holding_object_resolved" in [e.type for e in events]
+
+
+def test_holding_bottle_and_holding_object_are_independent():
+    """A bottle AND a held phone must both be reportable -- one shouldn't mask the other."""
+    module = _module(holding_bottle_confirm_s=1.0, holding_object_confirm_s=1.0)
+    events, _ = _run(
+        module, [IN_CRIB], motion=0.05, seconds=1.5,
+        bottle_boxes=[BOTTLE_IN_CRIB], object_boxes={"phone": [PHONE_IN_CRIB]},
+    )
+    types = [e.type for e in events]
+    assert "holding_bottle" in types
+    assert "holding_object" in types
+
+
+def test_keys_are_honestly_not_in_the_default_vocabulary():
+    """COCO has no 'keys' class -- claiming one would be exactly the kind of
+    faked capability this module's own docstring refuses to ship."""
+    from modules.baby_monitoring import DEFAULT_OBJECT_CLASSES
+    assert "keys" not in DEFAULT_OBJECT_CLASSES
+    assert "key" not in DEFAULT_OBJECT_CLASSES

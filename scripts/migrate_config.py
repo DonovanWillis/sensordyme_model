@@ -41,6 +41,18 @@ MIGRATIONS: list[tuple[str, str, str]] = [
         "keep Bluetooth open this long after boot even when Wi-Fi is fine, so a"
         " device can be moved to a new network without being taken offline first",
     ),
+    (
+        "cloud.ca_cert_path",
+        '  ca_cert_path: ""',
+        "opt-in TLS: path to a self-signed cert's PEM file to trust for cloud.base_url,"
+        " or leave empty. Off (empty) is identical to not having this key at all.",
+    ),
+    (
+        "cloud.tls_insecure_skip_verify",
+        "  tls_insecure_skip_verify: false",
+        "opt-in TLS: skips certificate verification entirely when true -- genuinely"
+        " insecure, dev-only. See config.yaml's fuller comment on this key.",
+    ),
 ]
 
 
@@ -116,7 +128,12 @@ def migrate(path: Path) -> list[str]:
         if insert_at is None:
             print(f"  skip {dotted}: parent section not found", file=sys.stderr)
             continue
-        block = [f"    # {why}\n", literal + "\n"]
+        # Match the comment's indent to the key's own, not a hardcoded 4 --
+        # that was only ever right by coincidence, for keys nested exactly
+        # two levels deep (network.provisioning.*). A one-level key (cloud.*)
+        # inserted at indent 2 got a comment sitting at indent 4 above it.
+        indent = literal[: len(literal) - len(literal.lstrip(" "))]
+        block = [f"{indent}# {why}\n", literal + "\n"]
         lines[insert_at:insert_at] = block
         added.append(dotted)
     if added:

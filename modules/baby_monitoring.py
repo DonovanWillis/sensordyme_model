@@ -45,6 +45,39 @@ from modules.base import VisionModule, register_module
 _PERSON_CLASS = 0  # COCO
 _BOTTLE_CLASS = next(cid for cid, name in COCO_NAMES.items() if name == "bottle")
 
+# COCO class name -> label used on the generic "holding_object" event's detail
+# text. Configurable (`object_classes` in config.yaml, mirrors
+# driver_attention.py's `yolo_classes`) and shares the SAME detector pass
+# already running for person/bottle -- no added inference cost. Bottle keeps
+# its own dedicated "holding_bottle" event (feeding is the single most
+# safety-relevant "holding" signal in this mode, and existing rules/tests
+# depend on that exact name); everything here fires the shared, generic
+# event instead of one event type per class.
+#
+# "keys" is deliberately absent: COCO has no such class, and this module's
+# own principle (see the module docstring's DELIBERATELY NOT CLAIMED list) is
+# to refuse claiming detection capability the model doesn't actually have,
+# rather than silently no-op on a class nothing will ever match.
+DEFAULT_OBJECT_CLASSES: dict[str, str] = {
+    "cell phone": "phone",
+    "cup": "cup",
+    "wine glass": "cup",
+    "bowl": "bowl",
+    "banana": "food",
+    "apple": "food",
+    "orange": "food",
+    "sandwich": "food",
+    "hot dog": "food",
+    "pizza": "food",
+    "donut": "food",
+    "cake": "food",
+    "fork": "utensil",
+    "knife": "utensil",
+    "spoon": "utensil",
+    "scissors": "hazard",
+    "remote": "object",
+}
+
 
 @register_module("baby_monitoring")
 class BabyMonitoringModule(VisionModule):
@@ -60,6 +93,18 @@ class BabyMonitoringModule(VisionModule):
         self._expect_presence = bool(config.get("expect_presence", False))
         self._weights = config.get("model_weights", "yolo11n.pt")
         self._model = None  # lazy: loaded on first frame (keeps tests light)
+
+        object_class_map: dict[str, str] = dict(config.get("object_classes", DEFAULT_OBJECT_CLASSES))
+        self._object_class_ids: dict[int, str] = {}
+        for cid, coco_name in COCO_NAMES.items():
+            if coco_name in object_class_map:
+                self._object_class_ids[cid] = object_class_map[coco_name]
+        unmatched = set(object_class_map) - {COCO_NAMES[cid] for cid in self._object_class_ids}
+        if unmatched:
+            print(
+                f"baby_monitoring: object_classes entries {sorted(unmatched)} don't match any "
+                f"'{self._weights}' class name -- check config.yaml spelling"
+            )
 
         self._zones: list[Zone] = load_zones(config.get("zones", {}))
 
@@ -97,12 +142,20 @@ class BabyMonitoringModule(VisionModule):
             persist_s=float(config.get("holding_bottle_confirm_s", 1.0)),
             min_frames=3, resolve_after_s=2.0,
         ))
+        if self._object_class_ids:
+            self._engine.add_rule(RuleSpec(
+                detection="holding_object", severity="info",
+                persist_s=float(config.get("holding_object_confirm_s", 1.0)),
+                min_frames=3, resolve_after_s=2.0,
+            ))
 
         # --- per-frame state ---------------------------------------------------
         self._frame_index = 0
         self._last_boxes: list[tuple[int, int, int, int]] = []
         self._last_confidences: list[float] = []
         self._last_bottle_boxes: list[tuple[int, int, int, int]] = []
+        self._last_object_boxes: dict[str, list[tuple[int, int, int, int]]] = {}
+        self._last_holding_object_label: Optional[str] = None
         self._last_frame_size: tuple[int, int] = (0, 0)
         self._last_count = -1
         self._prev_gray: Optional[np.ndarray] = None
@@ -113,24 +166,27 @@ class BabyMonitoringModule(VisionModule):
     def _detect_people(self, frame: np.ndarray) -> list[tuple[int, int, int, int]]:
         """YOLO person boxes (overridable in tests).
 
-        Bottle boxes ride along on the SAME detector pass (no added inference
-        cost) and are recorded as a side effect (self._last_bottle_boxes) --
+        Bottle boxes and any configured `object_classes` boxes ride along on
+        the SAME detector pass (no added inference cost) and are recorded as
+        a side effect (self._last_bottle_boxes / self._last_object_boxes) --
         the same pattern _last_confidences already uses, so subclasses and
         tests that override this method for its person-box return value keep
         working unchanged.
         """
         if self._model is None:
             self._model = get_yolo_model(self._weights)
-        results = self._model.predict(
-            frame, verbose=False, classes=[_PERSON_CLASS, _BOTTLE_CLASS], conf=self._confidence_threshold
-        )
+        classes = sorted({_PERSON_CLASS, _BOTTLE_CLASS, *self._object_class_ids})
+        results = self._model.predict(frame, verbose=False, classes=classes, conf=self._confidence_threshold)
         boxes, confidences, bottle_boxes = [], [], []
+        object_boxes: dict[str, list[tuple[int, int, int, int]]] = {}
         for result in results:
             for box in result.boxes:
                 class_id = int(box.cls[0]) if getattr(box, "cls", None) is not None else _PERSON_CLASS
                 xyxy = tuple(int(v) for v in box.xyxy[0].tolist())
                 if class_id == _BOTTLE_CLASS:
                     bottle_boxes.append(xyxy)
+                elif class_id in self._object_class_ids:
+                    object_boxes.setdefault(self._object_class_ids[class_id], []).append(xyxy)
                 else:
                     boxes.append(xyxy)
                     confidences.append(float(box.conf[0]))
@@ -138,6 +194,7 @@ class BabyMonitoringModule(VisionModule):
         # override this method for its boxes keep working unchanged.
         self._last_confidences = confidences
         self._last_bottle_boxes = bottle_boxes
+        self._last_object_boxes = object_boxes
         return boxes
 
     def _motion_energy(self, frame: np.ndarray) -> float:
@@ -161,11 +218,14 @@ class BabyMonitoringModule(VisionModule):
         self._last_motion = self._motion_energy(frame)
         h, w = frame.shape[:2]
         self._last_frame_size = (w, h)
-        return self._reason(boxes, self._last_motion, w, h, now, self._last_bottle_boxes)
+        return self._reason(
+            boxes, self._last_motion, w, h, now, self._last_bottle_boxes, self._last_object_boxes
+        )
 
     def _reason(self, boxes: list, motion: float, w: int, h: int, now: float,
-                bottle_boxes: list = ()) -> list[Event]:
+                bottle_boxes: list = (), object_boxes: dict = None) -> list[Event]:
         """Pure decision layer (unit-testable without camera or model)."""
+        object_boxes = object_boxes or {}
         events: list[Event] = []
         present = len(boxes) > 0
 
@@ -207,6 +267,21 @@ class BabyMonitoringModule(VisionModule):
         holding_bottle = any(iou(b, bottle) > 0 for b in boxes for bottle in bottle_boxes)
         transitions += self._engine.update("holding_bottle", holding_bottle, 0.7, now)
 
+        # Same overlap approximation, generalized to every other configured
+        # class (phone, cup, food, ...) -- see DEFAULT_OBJECT_CLASSES. One
+        # shared event rather than one per class; which class is recorded in
+        # the CONFIRMED detail text below via self._last_holding_object_label,
+        # best-effort ("whichever is overlapping right now"), same as the
+        # rest of this module's honest, non-forensic approach to "holding".
+        holding_object_label = next(
+            (label for label, label_boxes in object_boxes.items()
+             if any(iou(b, obj) > 0 for b in boxes for obj in label_boxes)),
+            None,
+        )
+        if holding_object_label is not None:
+            self._last_holding_object_label = holding_object_label
+        transitions += self._engine.update("holding_object", holding_object_label is not None, 0.7, now)
+
         if self._expect_presence:
             transitions += self._engine.update("person_absent", not present, 0.9, now)
 
@@ -214,9 +289,12 @@ class BabyMonitoringModule(VisionModule):
             base = tr.detection.split(":")[0]
             zone_name = tr.detection.partition(":")[2]
             if tr.state == CONFIRMED:
+                object_label = (
+                    f"object={self._last_holding_object_label} " if base == "holding_object" else ""
+                )
                 events.append(Event.now(
                     base, tr.duration_s, tr.confidence, self.name,
-                    (f"zone={zone_name} " if zone_name else "") + f"confirmed after {tr.duration_s:.1f}s",
+                    object_label + (f"zone={zone_name} " if zone_name else "") + f"confirmed after {tr.duration_s:.1f}s",
                 ))
             elif tr.state == RESOLVED:
                 events.append(Event.now(

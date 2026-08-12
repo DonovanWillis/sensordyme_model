@@ -151,7 +151,7 @@ alerts:
 
   cooldown_s: 15 # minimum seconds between two alerts of the same type (patient: don't re-alert too soon)
   escalation_window_s: 60 # repeat within this window -> continuous tone (event types not in loud/soft_types below)
-  loud_types: [drowsiness, phone_use, eyes_down, attention_lost, high_risk, # always the loud/continuous tone
+  loud_types: [drowsiness, phone_use, eyes_down, eyes_up, attention_lost, high_risk, # always the loud/continuous tone
                distraction, # sustained sideways head turn (3s+). Was in NEITHER list: locally it
                # escalated by repetition (a deliberate mechanism), but its severity tag fell back to
                # "soft", so it never pushed to the phone — while eyes_down (looking down 2.5s) was
@@ -225,6 +225,11 @@ modules:
     ear_threshold_ratio: 0.75 # personal threshold = this * the calibrated open-eye baseline EAR
     ear_threshold_fallback: 0.20 # used only before calibration completes, or if calibration.json is unreadable
     calibration_duration_s: 10.0 # seconds of startup sampling (look at the road) used to compute EAR + head-pose baselines
+    calibration_max_pose_spread_deg: 20 # if yaw/pitch samples during the window haven't settled within this many
+    # degrees of their own mean (still glancing around -- phone, mirror, getting seated), the window is extended
+    # rather than averaging a glance-at-the-phone into "neutral". Never SHORTENS calibration, only extends it.
+    calibration_max_duration_s: 30 # hard ceiling on the extension above -- calibrates anyway past this point
+    # (imperfectly calibrated is better than stuck uncalibrated forever)
     calibration_path: data/calibration.json # persisted baseline; delete or pass --recalibrate to redo it
     drowsy_seconds: 2.0 # continuous eye closure (EAR < threshold) required to fire "drowsiness" -- blinks are far shorter
     perclos_window_s: 60.0 # rolling window (seconds) for PERCLOS = % of time eyes were closed
@@ -247,6 +252,9 @@ modules:
     glance_min_count: 5 # this many off-center glances within glance_window_s fires "frequent_glancing"
     pitch_threshold_deg: -20 # calibrated pitch below this = looking down (phone in lap); more sensitive than yaw
     eyes_down_seconds: 2.5 # sustained duration required to fire "eyes_down"
+    pitch_up_threshold_deg: 20 # calibrated pitch above this = looking all the way up (visor, overhead console,
+    # ceiling) -- the focused-driving zone is bounded above the neutral pose too, not just below it
+    eyes_up_seconds: 2.5 # sustained duration required to fire "eyes_up"
     face_lost_seconds: 2.5 # face gone AND no person detected either -> "attention_lost" (likely gone/slumped/obstructed)
     face_lost_with_body_seconds: 8.0 # face gone but the object detector still finds a person in frame (a
     # turned head checking a mirror/blind spot, not a vanished driver) -> the same "attention_lost" event,
@@ -376,6 +384,32 @@ modules:
     #     crib:   { polygon: [[0.2,0.2],[0.8,0.2],[0.8,0.9],[0.2,0.9]], kind: safe }
     #     stairs: { polygon: [[0.0,0.5],[0.15,0.5],[0.15,1.0],[0.0,1.0]], kind: restricted }
     zones: {}
+    holding_bottle_confirm_s: 1.0 # sustained overlap with a detected bottle before "holding_bottle" fires
+    holding_object_confirm_s: 1.0 # same, for object_classes below -> "holding_object"
+    # COCO class name -> label used in "holding_object"'s event detail (e.g. "object=phone").
+    # Same box-overlap-with-the-child approximation as holding_bottle (see modules/baby_monitoring.py),
+    # runs on the SAME detector pass already scanning for person/bottle -- no added inference cost.
+    # Logged (dashboard/Recent Activity), not an alert by default -- see presets.yaml's alert_types.
+    # "keys" is deliberately absent: COCO (what the object detector actually knows) has no such
+    # class; this module refuses to claim a detection the model can't perform.
+    object_classes:
+      cell phone: phone
+      cup: cup
+      wine glass: cup
+      bowl: bowl
+      banana: food
+      apple: food
+      orange: food
+      sandwich: food
+      hot dog: food
+      pizza: food
+      donut: food
+      cake: food
+      fork: utensil
+      knife: utensil
+      spoon: utensil
+      scissors: hazard
+      remote: object
 
   fall_detection:
     drop_velocity_threshold: 0.6 # fraction of frame-height/sec that counts as a "rapid drop"

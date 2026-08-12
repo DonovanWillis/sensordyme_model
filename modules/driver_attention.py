@@ -187,6 +187,22 @@ def estimate_head_pose_deg(image_points: np.ndarray, image_size: tuple[int, int]
 
     Positive yaw = turned toward the frame's right. Negative pitch = looking down.
     Returns None if pose estimation fails to converge.
+
+    The raw Rodrigues decomposition below is NEGATED on both axes before being
+    returned. Verified empirically (tests/test_head_pose_geometry.py), not just
+    reasoned about: with _MODEL_POINTS_3D's authored axes (+Y anatomically up,
+    +Z the direction the nose points) and OpenCV's camera convention (+Y down
+    the image, +Z into the scene), solving for the rotation that explains a
+    KNOWN, physically-constructed "looking down" pose returns a POSITIVE raw
+    pitch, and a KNOWN "turned toward the frame's right" pose returns a
+    NEGATIVE raw yaw -- the exact opposite of the two sentences above, which
+    every caller in this module was written to trust. That inversion meant
+    `eyes_down_condition = pitch < threshold` (modules/driver_attention.py)
+    could only ever fire on sustained sideways-then-up head tilts, never on
+    genuinely looking down at a phone -- the single largest reason a driver
+    staring at their lap produced no alert. Negating here, once, at the
+    source, makes the two documented sentences above actually true and needs
+    no change anywhere they're relied on.
     """
     h, w = image_size
     focal_length = w
@@ -211,7 +227,7 @@ def estimate_head_pose_deg(image_points: np.ndarray, image_size: tuple[int, int]
     else:
         pitch = math.atan2(-rotation_mat[1, 2], rotation_mat[1, 1])
         yaw = math.atan2(-rotation_mat[2, 0], sy)
-    return math.degrees(yaw), math.degrees(pitch)
+    return -math.degrees(yaw), -math.degrees(pitch)
 
 
 class AttentionCalibrator:
@@ -233,6 +249,18 @@ class AttentionCalibrator:
     look at the road as they normally would) and persisted to
     `calibration_path` so restarts skip recalibration unless
     `force_recalibrate` is set (wired to `main.py --recalibrate`).
+
+    The window is extended (never shortened) past `duration_s` if the pose
+    samples collected so far are not settled: a calibration run during which
+    the driver glanced at a phone, checked a mirror, or was otherwise not
+    steadily facing forward would otherwise get averaged into "neutral" —
+    silently teaching the whole distraction system that distraction is the
+    baseline. `max_pose_spread_deg` is the largest yaw/pitch deviation from
+    the running circular mean tolerated before that counts as "settled";
+    `max_duration_s` is a hard ceiling so a driver who can never hold still
+    for a few extra seconds still gets calibrated eventually (uncalibrated —
+    EAR on the generic fallback, pose baseline at the raw-zero default — is
+    worse than imperfectly calibrated, not better).
     """
 
     def __init__(
@@ -242,11 +270,15 @@ class AttentionCalibrator:
         ear_threshold_ratio: float,
         ear_threshold_fallback: float,
         force_recalibrate: bool,
+        max_pose_spread_deg: float = 20.0,
+        max_duration_s: float = 30.0,
     ) -> None:
         self._path = calibration_path
         self._duration_s = duration_s
         self._ear_threshold_ratio = ear_threshold_ratio
         self._ear_threshold_fallback = ear_threshold_fallback
+        self._max_pose_spread_deg = max_pose_spread_deg
+        self._max_duration_s = max(duration_s, max_duration_s)
         self._ear_samples: list[float] = []
         self._yaw_samples: list[float] = []
         self._pitch_samples: list[float] = []
@@ -255,6 +287,7 @@ class AttentionCalibrator:
         self._ear_threshold: Optional[float] = None
         self._baseline_yaw: Optional[float] = None
         self._baseline_pitch: Optional[float] = None
+        self._extended_notice_given = False
 
         if not force_recalibrate:
             self._load()
@@ -262,10 +295,15 @@ class AttentionCalibrator:
     #: Bumped when the stored numbers' MEANING changes. Version 2: pose
     #: baselines are circular means (v1 used an arithmetic mean, which for a
     #: wrap-straddling pitch produced a direction no head ever faced — the
-    #: deployed device's file held baseline_pitch=-90.3 this way). A v1 file
-    #: is rejected so the device recalibrates once with the fixed math,
-    #: rather than keep thresholding against a corrupt baseline forever.
-    FORMAT_VERSION = 2
+    #: deployed device's file held baseline_pitch=-90.3 this way). Version 3:
+    #: estimate_head_pose_deg's yaw/pitch sign was inverted (verified via
+    #: tests/test_head_pose_geometry.py) -- looking down produced a POSITIVE
+    #: pitch delta though every threshold in this file assumed negative, so
+    #: `eyes_down_condition = pitch < threshold` could only fire on a
+    #: sustained upward tilt, never a downward one. A v1 or v2 file was
+    #: computed from the old, inverted raw readings and is not merely stale
+    #: but actively backwards under the fix -- must be rejected, not kept.
+    FORMAT_VERSION = 3
 
     def _load(self) -> None:
         if not self._path.exists():
@@ -313,6 +351,20 @@ class AttentionCalibrator:
         """The pitch (degrees) that counts as "looking at the road" for this camera mount."""
         return self._baseline_pitch if self._baseline_pitch is not None else 0.0
 
+    @staticmethod
+    def _pose_spread_deg(samples: list[float]) -> float:
+        """Largest deviation of any sample from the circular mean of all of them.
+
+        A settled, steadily-forward-facing calibration window has a small
+        spread (ordinary head micro-movement); a window that included a
+        glance at a phone, a mirror check, or someone still getting seated
+        does not.
+        """
+        if not samples:
+            return 0.0
+        mean = circular_mean_deg(samples)
+        return max(abs(angle_delta_deg(s, mean)) for s in samples)
+
     def observe(self, ear: float, yaw: Optional[float], pitch: Optional[float], now: float) -> None:
         """Feed one frame's readings during the calibration window; no-op once calibrated."""
         if self.is_calibrated:
@@ -325,27 +377,44 @@ class AttentionCalibrator:
         if pitch is not None:
             self._pitch_samples.append(pitch)
 
-        if now - self._start_time >= self._duration_s and self._ear_samples:
-            self._baseline_ear = statistics.fmean(self._ear_samples)
-            self._ear_threshold = self._baseline_ear * self._ear_threshold_ratio
-            # Circular means: pose angles live on a circle, and with this face
-            # model an upright face's pitch rides near ±180, where fmean points
-            # the opposite way — see circular_mean_deg.
-            self._baseline_yaw = circular_mean_deg(self._yaw_samples)
-            self._baseline_pitch = circular_mean_deg(self._pitch_samples)
-            self._path.parent.mkdir(parents=True, exist_ok=True)
-            self._path.write_text(
-                json.dumps(
-                    {
-                        "version": self.FORMAT_VERSION,
-                        "baseline_ear": self._baseline_ear,
-                        "ear_threshold": self._ear_threshold,
-                        "baseline_yaw": self._baseline_yaw,
-                        "baseline_pitch": self._baseline_pitch,
-                    },
-                    indent=2,
+        elapsed = now - self._start_time
+        if elapsed < self._duration_s or not self._ear_samples:
+            return
+
+        settled = elapsed >= self._max_duration_s or (
+            self._pose_spread_deg(self._yaw_samples) <= self._max_pose_spread_deg
+            and self._pose_spread_deg(self._pitch_samples) <= self._max_pose_spread_deg
+        )
+        if not settled:
+            if not self._extended_notice_given:
+                self._extended_notice_given = True
+                print(
+                    "driver_attention: calibration window extended — head pose hasn't "
+                    "settled yet (still glancing around). Look at the road normally; "
+                    f"calibrating within the next {self._max_duration_s - elapsed:.0f}s regardless."
                 )
+            return
+
+        self._baseline_ear = statistics.fmean(self._ear_samples)
+        self._ear_threshold = self._baseline_ear * self._ear_threshold_ratio
+        # Circular means: pose angles live on a circle, and with this face
+        # model an upright face's pitch rides near ±180, where fmean points
+        # the opposite way — see circular_mean_deg.
+        self._baseline_yaw = circular_mean_deg(self._yaw_samples)
+        self._baseline_pitch = circular_mean_deg(self._pitch_samples)
+        self._path.parent.mkdir(parents=True, exist_ok=True)
+        self._path.write_text(
+            json.dumps(
+                {
+                    "version": self.FORMAT_VERSION,
+                    "baseline_ear": self._baseline_ear,
+                    "ear_threshold": self._ear_threshold,
+                    "baseline_yaw": self._baseline_yaw,
+                    "baseline_pitch": self._baseline_pitch,
+                },
+                indent=2,
             )
+        )
 
 
 class PerclosTracker:
@@ -557,6 +626,8 @@ class DriverAttentionModule(VisionModule):
             ear_threshold_ratio=float(config.get("ear_threshold_ratio", 0.75)),
             ear_threshold_fallback=float(config.get("ear_threshold_fallback", 0.20)),
             force_recalibrate=bool(config.get("recalibrate", False)),
+            max_pose_spread_deg=float(config.get("calibration_max_pose_spread_deg", 20.0)),
+            max_duration_s=float(config.get("calibration_max_duration_s", 30.0)),
         )
 
         # --- signal conditioning: raw landmark-derived measurements are NOISY,
@@ -609,6 +680,14 @@ class DriverAttentionModule(VisionModule):
         self._pitch_threshold_deg = float(config.get("pitch_threshold_deg", -20.0))
         self._eyes_down_tracker = GracedConditionTracker(
             float(config.get("eyes_down_seconds", 2.5)), release_s
+        )
+        # Symmetric to eyes_down: "looking all the way up" (sun visor, overhead
+        # console, or simply not the road) is just as much outside the focused
+        # forward zone as looking down is -- the zone is bounded on both sides
+        # of the calibrated neutral, not just the downward one.
+        self._pitch_up_threshold_deg = float(config.get("pitch_up_threshold_deg", 20.0))
+        self._eyes_up_tracker = GracedConditionTracker(
+            float(config.get("eyes_up_seconds", 2.5)), release_s
         )
 
         # --- face lost: the camera can't see the driver's face at all (turned fully away,
@@ -689,7 +768,9 @@ class DriverAttentionModule(VisionModule):
         self._drowsy_active = False
         self._distracted_active = False
         self._eyes_down_active = False
+        self._eyes_up_active = False
         self._phone_use_active = False
+        self._last_fired_event_types: list[str] = []
 
     def close(self) -> None:
         """Release the mediapipe FaceMesh graph (leaked per preset switch otherwise)."""
@@ -851,9 +932,11 @@ class DriverAttentionModule(VisionModule):
             self._drowsy_tracker.update(False, now)
             self._distract_tracker.update(False, corroborated=False, now=now)
             self._eyes_down_tracker.update(False, now)
+            self._eyes_up_tracker.update(False, now)
             self._drowsy_active = self._drowsy_tracker.is_active
             self._distracted_active = self._distract_tracker.is_active
             self._eyes_down_active = self._eyes_down_tracker.is_active
+            self._eyes_up_active = self._eyes_up_tracker.is_active
 
             # A face the camera can't see at all is its own risk signal, not "nothing to
             # report" -- see the class docstring on _face_lost_tracker for why. But a
@@ -886,6 +969,7 @@ class DriverAttentionModule(VisionModule):
             self._last_risk_score = score
             if risk_event is not None:
                 events.append(Event.now(risk_event, 0.0, score, self.name))
+            self._last_fired_event_types = [e.type for e in events]
             return events
 
         self._face_lost_tracker.update(False, corroborated=self._last_person_visible, now=now)
@@ -987,7 +1071,32 @@ class DriverAttentionModule(VisionModule):
         # angle -- "0" here means the calibrated neutral pose, not raw yaw=0/pitch=0, so an
         # off-center-mounted camera doesn't misread ordinary forward driving as a head turn.
         eyes_off_road = False
-        if pose is not None:
+        if pose is not None and not self._calibrator.is_calibrated:
+            # Not calibrated yet: baseline_yaw/baseline_pitch are the 0.0
+            # placeholder default, not a real reading. This face model's
+            # baseline pitch sits near the ±180 wrap for an ordinary upright
+            # pose (see AttentionCalibrator's docstring) -- computing a delta
+            # against a placeholder of 0.0 during this window can therefore
+            # be off by close to 180 degrees, easily crossing the distraction/
+            # eyes_down/eyes_up thresholds on pure calibration noise. Verified
+            # via tests/test_driver_attention_scenarios.py: without this
+            # branch, that spurious pre-calibration crossing could start a
+            # tracker's clock at t=0, so it fired shortly after calibration
+            # completed even though the driver had only just started looking
+            # away -- a false alarm with a real cause, but not the one it
+            # reported. Feeding False (not skipping the update) matters: the
+            # release-grace design means a skipped call leaves whatever state
+            # was already there untouched, while an explicit False update is
+            # what actually walks it back to clean over the calibration
+            # window's ~10s, comfortably past release_s.
+            self._distract_tracker.update(False, corroborated=False, now=now)
+            self._glance_counter.update(False, now)
+            self._eyes_down_tracker.update(False, now)
+            self._eyes_up_tracker.update(False, now)
+            self._distracted_active = False
+            self._eyes_down_active = False
+            self._eyes_up_active = False
+        if pose is not None and self._calibrator.is_calibrated:
             # Wrap-safe delta FIRST, median second. The delta (angle_delta_deg)
             # is continuous around the baseline even when the raw angle rides
             # the ±180 wrap — where raw values flip sign frame-to-frame and a
@@ -1024,7 +1133,13 @@ class DriverAttentionModule(VisionModule):
             if fired is not None:
                 events.append(Event.now("eyes_down", fired, min(1.0, abs(pitch) / 90.0), self.name))
 
-            eyes_off_road = distract_condition or eyes_down_condition
+            eyes_up_condition = pitch > self._pitch_up_threshold_deg
+            fired = self._eyes_up_tracker.update(eyes_up_condition, now)
+            self._eyes_up_active = self._eyes_up_tracker.is_active
+            if fired is not None:
+                events.append(Event.now("eyes_up", fired, min(1.0, abs(pitch) / 90.0), self.name))
+
+            eyes_off_road = distract_condition or eyes_down_condition or eyes_up_condition
 
         # --- object context: phone / eating, fused with where the eyes are ---
         phone_use_condition = phone_visible and eyes_off_road
@@ -1051,7 +1166,7 @@ class DriverAttentionModule(VisionModule):
         eye_risk = 1.0 if self._drowsy_active else min(1.0, perclos / self._perclos_threshold) * 0.6
         gaze_risk = (
             1.0
-            if self._eyes_down_active
+            if (self._eyes_down_active or self._eyes_up_active)
             # A corroborated (wide-angle, mirror-check-shaped) sustained turn is
             # real but lesser risk than an ordinary moderate-angle distraction --
             # same reasoning as face_lost_risk below.
@@ -1080,6 +1195,7 @@ class DriverAttentionModule(VisionModule):
         if risk_event is not None:
             events.append(Event.now(risk_event, 0.0, score, self.name))
 
+        self._last_fired_event_types = [e.type for e in events]
         return events
 
     def get_detections(self) -> DetectionFrame:
@@ -1125,6 +1241,89 @@ class DriverAttentionModule(VisionModule):
             "eating_visible": bool(self._last_eating_boxes),
         }
 
+    def _gaze_label(self) -> str:
+        """Which side of the focused-driving zone the calibrated gaze currently sits on.
+
+        Frame-relative ("Left"/"Right"), not vehicle-relative ("driver side"/
+        "passenger side"): this codebase has no config for vehicle handedness
+        or which side of the dashboard the camera sits on, and guessing that
+        mapping would print a confidently wrong label instead of an honestly
+        neutral one. A future config key (e.g. `camera_side: driver|passenger`)
+        could translate this correctly; until one exists, frame-relative is
+        the only claim the available geometry actually supports.
+        """
+        if self._eyes_down_active or self._last_pitch < self._pitch_threshold_deg:
+            return "Down"
+        if self._eyes_up_active or self._last_pitch > self._pitch_up_threshold_deg:
+            return "Up"
+        if self._last_yaw > self._yaw_threshold_deg:
+            return "Left"
+        if self._last_yaw < -self._yaw_threshold_deg:
+            return "Right"
+        return "Forward"
+
+    @staticmethod
+    def _phase_label(condition: bool, tracker) -> str:
+        """NONE (condition false) / DEVELOPING (true, not yet sustained) / CONFIRMED (active).
+
+        Mirrors the observed/developing/confirmed vocabulary core/event_engine.py
+        uses elsewhere in the product; this module doesn't run on EventEngine
+        (see the module docstring), so this is the equivalent concept computed
+        from the tracker this module actually uses, not a borrowed enum value.
+        """
+        if tracker.is_active:
+            return "CONFIRMED"
+        return "DEVELOPING" if condition else "NONE"
+
+    def get_debug_state(self) -> dict:
+        """Full, human-readable snapshot of why this module is (or isn't) about to alert.
+
+        Developer/debug use only (main.py --debug) -- this is intentionally
+        more detailed and more implementation-specific than get_telemetry_snapshot
+        (raw numbers for CSV logging) or annotate_debug (a fixed on-frame
+        overlay): it exists so "why didn't that alert" or "why did that alert"
+        has a direct answer instead of a re-read of this file. Never sent
+        anywhere (not to the cloud, not to end-user notification text) --
+        wire it into a local-only view if one is added.
+        """
+        now = time.monotonic()
+        phone_confidence = None
+        if self._last_phone_boxes and self._last_overlay_confidences:
+            phone_confidences = [
+                conf for (box, label), conf in zip(self._last_overlay_boxes, self._last_overlay_confidences)
+                if label == "cell phone"
+            ]
+            if phone_confidences:
+                phone_confidence = max(phone_confidences)
+        return {
+            "face_detected": self._last_face_proto is not None and not self._face_lost_active,
+            "focused": not (
+                self._distracted_active or self._eyes_down_active or self._eyes_up_active
+                or self._phone_use_active or self._drowsy_active or self._face_lost_active
+            ),
+            "gaze": self._gaze_label(),
+            "head_yaw_deg": round(self._last_yaw, 1),
+            "head_pitch_deg": round(self._last_pitch, 1),
+            "ear": round(self._last_ear, 3),
+            "ear_threshold": round(self._last_ear_threshold, 3),
+            "phone_detected": bool(self._last_phone_boxes),
+            "phone_confidence": phone_confidence,
+            "hand_overlaps_phone": self._hand_overlaps_phone,
+            "distraction_state": self._phase_label(abs(self._last_yaw) > self._yaw_threshold_deg, self._distract_tracker),
+            "distraction_duration_s": round(self._distract_tracker.elapsed(now), 1),
+            "eyes_down_state": self._phase_label(self._last_pitch < self._pitch_threshold_deg, self._eyes_down_tracker),
+            "eyes_down_duration_s": round(self._eyes_down_tracker.elapsed(now), 1),
+            "eyes_up_state": self._phase_label(self._last_pitch > self._pitch_up_threshold_deg, self._eyes_up_tracker),
+            "eyes_up_duration_s": round(self._eyes_up_tracker.elapsed(now), 1),
+            "phone_use_state": self._phase_label(bool(self._last_phone_boxes), self._phone_use_tracker),
+            "phone_use_duration_s": round(self._phone_use_tracker.elapsed(now), 1),
+            "drowsy_state": self._phase_label(self._last_ear < self._last_ear_threshold, self._drowsy_tracker),
+            "risk_score": round(self._last_risk_score, 2),
+            "state": self._state_label(),
+            "alert_active": self.is_alert_active(),
+            "events_fired_this_frame": list(self._last_fired_event_types),
+        }
+
     def _state_label(self) -> str:
         """A short human-readable label of the current dominant state, for the debug overlay."""
         if self._face_lost_active:
@@ -1135,6 +1334,8 @@ class DriverAttentionModule(VisionModule):
             return "PHONE_USE"
         if self._eyes_down_active:
             return "EYES_DOWN"
+        if self._eyes_up_active:
+            return "EYES_UP"
         if self._distracted_active:
             return "DISTRACTED"
         if self._risk_fusion.is_high_risk_active:
@@ -1220,6 +1421,7 @@ class DriverAttentionModule(VisionModule):
             self._drowsy_active
             or self._distracted_active
             or self._eyes_down_active
+            or self._eyes_up_active
             or self._phone_use_active
             or self._face_lost_active
             or self._risk_fusion.is_high_risk_active

@@ -124,6 +124,18 @@ class VisionModule(ABC):
         """
         return None
 
+    def get_debug_state(self) -> Optional[dict]:
+        """Human-readable snapshot of why this module is (or isn't) about to alert.
+
+        Developer/debug use only (main.py --debug) -- deliberately more
+        detailed and more implementation-specific than get_telemetry_snapshot
+        (which IS logged, and is product data). Never sent to the cloud or
+        surfaced to an end user. Default returns None (opt-in); override to
+        expose current thresholds, durations, and the reasoning behind the
+        live alert decision.
+        """
+        return None
+
     def close(self) -> None:
         """Release module-held resources (models, mediapipe graphs, device handles).
 
@@ -183,6 +195,14 @@ class SustainedConditionTracker:
         """
         return self._fired
 
+    def elapsed(self, now: float) -> float:
+        """Seconds the current episode has been running, 0.0 if none is in progress.
+
+        For debug/observability only (e.g. "distraction duration: 6.2s" on a
+        developer overlay) — no threshold or event decision reads this.
+        """
+        return now - self._start if self._start is not None else 0.0
+
 
 class GracedConditionTracker:
     """A SustainedConditionTracker that survives momentary signal dropouts.
@@ -241,6 +261,13 @@ class GracedConditionTracker:
     def is_active(self) -> bool:
         """True from firing until the condition has been clear for `release_s`."""
         return self._fired
+
+    def elapsed(self, now: float) -> float:
+        """Seconds the current episode has been running, 0.0 if none is in progress.
+
+        For debug/observability only -- see SustainedConditionTracker.elapsed.
+        """
+        return now - self._start if self._start is not None else 0.0
 
 
 class CorroboratedGraceTracker:
@@ -309,6 +336,13 @@ class CorroboratedGraceTracker:
     def is_active(self) -> bool:
         """True from firing until the condition has been clear for `release_s`."""
         return self._fired
+
+    def elapsed(self, now: float) -> float:
+        """Seconds the current episode has been running, 0.0 if none is in progress.
+
+        For debug/observability only -- see SustainedConditionTracker.elapsed.
+        """
+        return now - self._start if self._start is not None else 0.0
 
     @property
     def corroborated(self) -> bool:

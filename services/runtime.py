@@ -152,6 +152,7 @@ class DeviceRuntime:
         self._module_lock = threading.Lock()  # guards module swaps vs. the inference loop
         self._heartbeat = 0.0  # monotonic time of the last completed inference iteration
         self._last_stream_push = 0.0
+        self._last_debug_print = 0.0
 
         self.camera: Optional[Camera] = None
         self.capture: Optional[CaptureService] = None
@@ -798,6 +799,22 @@ class DeviceRuntime:
                 self.telemetry.log_if_due(
                     time.monotonic(), datetime.now(timezone.utc).isoformat(), self.module_name, snapshot
                 )
+
+            # Developer-only: "why did/didn't that alert" as a readable block,
+            # not a re-read of this module's source. --debug only, throttled
+            # (every frame would be unreadable), and never sent anywhere off
+            # this machine -- get_debug_state() is opt-in per module (most
+            # return None) and deliberately more detailed than the telemetry
+            # snapshot above, which IS logged and IS product data.
+            if self.debug:
+                now_dbg = time.monotonic()
+                if now_dbg - self._last_debug_print >= 1.0:
+                    state = module.get_debug_state()
+                    if state is not None:
+                        self._last_debug_print = now_dbg
+                        print(f"{self.module_name.upper()} STATE")
+                        for key, value in state.items():
+                            print(f"  {key}: {value}")
             if self.dashboard is not None:
                 # Either source can raise the alert state. A configured rule is
                 # someone explicitly asking to be alerted, so it must drive the

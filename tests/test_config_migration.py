@@ -68,6 +68,34 @@ def test_the_new_key_lands_inside_its_own_section(tmp_path):
     assert any(l.strip() == "provisioning:" for l in preceding)
 
 
+def test_a_one_level_key_gets_its_comment_at_the_same_indent_as_the_key(tmp_path):
+    """cloud.ca_cert_path sits one level deep (indent 2), unlike the
+    network.provisioning.* migrations (indent 4) this file's insertion logic
+    was first written for. A hardcoded 4-space comment indent looked correct
+    only because every existing migration happened to be nested two levels —
+    the bug was invisible until a one-level key exposed it: the key landed at
+    indent 2 with its own explanatory comment floating at indent 4 above it."""
+    path = write(tmp_path, DEVICE_CONFIG)
+    migrate(path)
+    lines = path.read_text().splitlines()
+    key_index = next(i for i, l in enumerate(lines) if l.strip().startswith("ca_cert_path:"))
+    comment_index = key_index - 1
+    assert lines[comment_index].strip().startswith("#")
+    key_indent = len(lines[key_index]) - len(lines[key_index].lstrip(" "))
+    comment_indent = len(lines[comment_index]) - len(lines[comment_index].lstrip(" "))
+    assert comment_indent == key_indent == 2
+
+
+def test_tls_keys_are_added_under_cloud_off_by_default(tmp_path):
+    path = write(tmp_path, DEVICE_CONFIG)
+    added = migrate(path)
+    assert "cloud.ca_cert_path" in added
+    assert "cloud.tls_insecure_skip_verify" in added
+    text = path.read_text()
+    assert 'ca_cert_path: ""' in text
+    assert "tls_insecure_skip_verify: false" in text
+
+
 def test_running_twice_changes_nothing_the_second_time(tmp_path):
     path = write(tmp_path, DEVICE_CONFIG)
     migrate(path)
@@ -132,3 +160,5 @@ def test_the_migrated_file_still_parses_as_yaml(tmp_path):
     assert parsed["network"]["provisioning"]["reconfigure_window_s"] == 300
     assert parsed["network"]["provisioning"]["grace_s"] == 45
     assert parsed["cloud"]["device_key"] == "dk_secret_value"
+    assert parsed["cloud"]["ca_cert_path"] == ""
+    assert parsed["cloud"]["tls_insecure_skip_verify"] is False

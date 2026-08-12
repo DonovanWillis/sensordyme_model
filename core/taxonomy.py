@@ -139,6 +139,13 @@ TAXONOMY: dict[str, list[Detection]] = {
            caveat="approximates 'holding' from overlap, same as core/rules.py's `holding` "
                   "predicate elsewhere in the product — a bottle merely propped nearby can "
                   "also match; bare bottle presence away from the child is NOT reported"),
+        _d("holding_object", "Phone / cup / food / small utensil overlapping the child's box", PARTIAL,
+           how="the same YOLO pass + box-overlap approximation as holding_bottle, generalized "
+               "to any COCO class in config.yaml's object_classes (phone, cup, food items, "
+               "utensils, scissors, remote by default), logged (not an alert by default)",
+           caveat="same overlap approximation as holding_bottle; 'keys' specifically cannot be "
+                  "detected — COCO (what the object detector actually knows) has no such class, "
+                  "and this module refuses to claim a detection the model can't perform"),
         _d("medical", "Medical conditions / diagnoses", UNSUPPORTED,
            requires="out of scope by policy — the system reports observable safety conditions only"),
     ],

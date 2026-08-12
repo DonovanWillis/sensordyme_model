@@ -39,6 +39,7 @@ ALERT_EVENT_TYPES_PI = {
     "fatigue_warning",
     "frequent_glancing",
     "eyes_down",
+    "eyes_up",
     "phone_use",
     "attention_lost",
     "elevated_risk",
