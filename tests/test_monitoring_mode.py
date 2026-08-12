@@ -41,12 +41,35 @@ def test_custom_monitoring_runs_a_general_detector_not_the_preset():
     assert module_for(MonitoringMode.AI_CUSTOM, "driver_attention") != "driver_attention"
 
 
-def test_the_general_detector_carries_no_mediapipe():
-    """If this ever stops being true, the saving disappears silently."""
+def test_the_general_detector_never_imports_mediapipe_unconditionally():
+    """If this ever stops being true, the saving disappears silently.
+
+    Checked at the AST level, specifically at MODULE level, rather than by
+    banning the word "mediapipe" from the file entirely: an unconditional
+    `import mediapipe` at the top of the file is exactly the accident this
+    guards against (custom monitoring silently costing as much as the
+    preset), but a lazy `import mediapipe` inside a function body, reachable
+    only through an explicit opt-in config flag nobody has to set, is a
+    different thing -- the module's runtime cost when that flag is off (the
+    default) is completely unaffected, which is the actual property this
+    test exists to protect.
+    """
+    import ast
     from pathlib import Path
-    source = Path(f"modules/{CUSTOM_DETECTOR_MODULE}.py").read_text()
-    assert "mediapipe" not in source.lower(), \
-        f"{CUSTOM_DETECTOR_MODULE} imports mediapipe; custom monitoring would cost as much as the preset"
+
+    tree = ast.parse(Path(f"modules/{CUSTOM_DETECTOR_MODULE}.py").read_text())
+    for node in tree.body:  # module level only -- not inside any function/class
+        if isinstance(node, ast.Import):
+            names = [alias.name for alias in node.names]
+        elif isinstance(node, ast.ImportFrom):
+            names = [node.module or ""]
+        else:
+            continue
+        assert not any(name.startswith("mediapipe") for name in names), (
+            f"{CUSTOM_DETECTOR_MODULE} imports mediapipe unconditionally at module level; "
+            "custom monitoring would cost as much as the preset for every deployment, "
+            "not just ones that opt into it"
+        )
 
 
 def test_the_general_detector_can_actually_feed_the_rules():

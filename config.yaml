@@ -97,6 +97,29 @@ cloud:
   #   bad:  http://192.168.1.251:8787
   base_url: http://localhost:8787 # your deployed cloud/ backend URL
   device_key: "" # issued by `python cloud/manage.py create-device <name>` -- see cloud/README.md
+  # TLS is opt-in and OFF by default: base_url above is plain http:// and stays
+  # that way unless you change it. Nothing below does anything until base_url
+  # itself starts with https://.
+  #
+  # For a backend behind a real, CA-signed certificate (Let's Encrypt, Caddy,
+  # a load balancer) -- the recommended setup for anything beyond a LAN, and
+  # required for the iOS app to trust it without extra work -- leave both of
+  # these alone; standard certificate verification against the system trust
+  # store already applies automatically to any https:// base_url.
+  #
+  # ca_cert_path is for a self-signed cert on a private/dev backend (see
+  # `python scripts/generate_dev_cert.py` and cloud/README.md's TLS section):
+  # point this at that cert's .pem file and the device will trust exactly
+  # that cert, and only that cert -- not "trust everything," which is what
+  # tls_insecure_skip_verify below does and why it's the worse option.
+  ca_cert_path: "" # path to a self-signed cert's PEM file, or leave empty
+  # Skips certificate verification entirely. This is genuinely insecure (any
+  # attacker on the network path can intercept and read/alter every event the
+  # device sends) and exists only so a self-signed backend can be exercised
+  # before ca_cert_path is set up, e.g. on a fresh dev machine. The device
+  # logs a warning once, at startup, whenever this is true -- never enable it
+  # outside of local development.
+  tls_insecure_skip_verify: false
   # How often the device checks in: pushes queued events, and picks up a
   # pending mode-switch command. This is the dominant cost in "how long until
   # a mode switch shows as confirmed" -- measured (tests/test_cloud_backend.py,
@@ -331,6 +354,12 @@ modules:
     # configured, the detector automatically also requests car/truck/bus/motorcycle/bicycle/
     # train and dog/cat/bird/... (core.capabilities' "vehicle"/"animal" category words --
     # the same vocabulary Jupiter uses) and watches for them the same way it watches for people.
+    verify_new_tracks_with_pose: false # opt-in cross-model corroboration: a real second model
+    # (MediaPipe Pose, cropped to just the new box) checked once per new tracked person, noted
+    # on person_lingering's event detail when it finds no pose -- never used to suppress an
+    # alert (see modules/occupancy.py's docstring for why). Off by default: it's a real added
+    # model this module is otherwise deliberately built without, so nothing about its resource
+    # footprint changes unless a deployment explicitly wants the extra corroboration.
 
   baby_monitoring:
     confidence_threshold: 0.4 # YOLO person-detection confidence (children are smaller/lower-conf)

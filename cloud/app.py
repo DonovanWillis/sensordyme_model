@@ -34,8 +34,9 @@ from typing import Optional
 import jwt
 from cloud import mdns
 from cloud.notify import COOLDOWN_S as NOTIFY_COOLDOWN_S, gate
+from cloud.ratelimit import CLAIM_LIMITER, LOGIN_LIMITER, SIGNUP_LIMITER
 from core.presets import resolve_preset, same_preset
-from fastapi import Depends, FastAPI, Header, HTTPException
+from fastapi import BackgroundTasks, Depends, FastAPI, Header, HTTPException, Request
 from pydantic import BaseModel
 
 DB_PATH = os.environ.get("SENSORDYME_DB", str(Path(__file__).parent / "sensordyme.db"))
@@ -162,6 +163,21 @@ def init_db() -> None:
                 quantity INTEGER NOT NULL, address TEXT NOT NULL,
                 status TEXT NOT NULL DEFAULT 'placed', created_at REAL NOT NULL
             );
+            -- Explicit logout / revocation. A JWT is normally trusted purely
+            -- by its signature for the full 30-day TTL, which means "sign
+            -- out" on the phone was cosmetic -- it cleared the local copy
+            -- and left the token itself valid anywhere else it existed
+            -- (another device, a log, an interception) until it naturally
+            -- expired. `jti` is generated once per token at issuance and
+            -- travels with it; a row here makes that ONE token invalid
+            -- immediately, everywhere, without touching any other session
+            -- the account has. `exp` is stored alongside so expired rows can
+            -- be pruned instead of growing this table forever -- a revoked
+            -- token past its own natural expiry is redundant to keep, the
+            -- signature check would already reject it.
+            CREATE TABLE IF NOT EXISTS revoked_tokens (
+                jti TEXT PRIMARY KEY, exp REAL NOT NULL
+            );
             """
         )
         # additive columns for existing databases (sqlite has no IF NOT EXISTS for columns)
@@ -197,6 +213,13 @@ def init_db() -> None:
             # of every single preset switch, for any account that had ever
             # used Configure-with-AI even once.
             "ALTER TABLE devices ADD COLUMN custom_monitoring_wanted INTEGER DEFAULT 0",
+            # Seconds the triggering condition was sustained before the event
+            # fired (Event.duration) -- every module already computes this,
+            # but it was silently dropped before reaching the cloud (see
+            # core/uplink.py's push_event). Real evidence for notification
+            # text ("remained down for 34 seconds") instead of a bare type
+            # name. NULL for events from firmware that predates this field.
+            "ALTER TABLE events ADD COLUMN duration REAL",
         ):
             try:
                 conn.execute(statement)
@@ -225,17 +248,40 @@ def _hash_pw(password: str, salt: str) -> str:
 
 
 def _issue_token(user_id: int) -> str:
-    return jwt.encode({"uid": user_id, "exp": int(time.time()) + JWT_TTL_S}, JWT_SECRET, algorithm="HS256")
+    return jwt.encode(
+        {"uid": user_id, "exp": int(time.time()) + JWT_TTL_S, "jti": secrets.token_hex(16)},
+        JWT_SECRET, algorithm="HS256",
+    )
 
 
-def current_user(authorization: str = Header(default="")) -> int:
-    """FastAPI dependency: resolve the JWT bearer token to a user id."""
+def current_token(authorization: str = Header(default="")) -> dict:
+    """FastAPI dependency: the decoded JWT payload, rejecting a revoked token.
+
+    Separate from `current_user` (which most routes want, just the uid)
+    because `/v1/logout` needs the jti too, and decoding twice per request
+    for the one route that needs both fields is worse than one dependency
+    two others can narrow.
+    """
     if not authorization.startswith("Bearer "):
         raise HTTPException(401, "missing bearer token")
     try:
         payload = jwt.decode(authorization[7:], JWT_SECRET, algorithms=["HS256"])
     except jwt.PyJWTError as exc:
         raise HTTPException(401, f"invalid token: {exc}") from exc
+    jti = payload.get("jti")
+    # Tokens issued before revocation existed have no jti — they simply
+    # cannot be revoked early and ride out their remaining TTL, the same
+    # behavior every token had before this. Never a reason to reject one.
+    if jti is not None:
+        with db() as conn:
+            revoked = conn.execute("SELECT 1 FROM revoked_tokens WHERE jti = ?", (jti,)).fetchone()
+        if revoked is not None:
+            raise HTTPException(401, "this session has been signed out")
+    return payload
+
+
+def current_user(payload: dict = Depends(current_token)) -> int:
+    """FastAPI dependency: resolve the JWT bearer token to a user id."""
     return int(payload["uid"])
 
 
@@ -293,18 +339,58 @@ def current_device(x_device_key: str = Header(default="")) -> sqlite3.Row:
 
 
 # ------------------------------------------------------------------------- push + SMS
+#: How many times a push/SMS send is attempted before giving up, and the
+#: delay between attempts. A transient provider blip (ntfy briefly down, a
+#: Twilio rate limit) at the exact moment a genuinely new critical alert
+#: lands used to lose that interruption permanently — the event stayed in
+#: Recent Activity, but the one thing that reaches someone NOT already
+#: looking at the app never arrived. 3 attempts, short backoff: enough to
+#: ride out a blip measured in seconds, not so much that a real outage stalls
+#: the background task for minutes.
+NOTIFY_SEND_ATTEMPTS = 3
+NOTIFY_RETRY_BACKOFF_S = 1.5
+
+
+def _send_with_retry(send_once) -> None:
+    """Call `send_once` (a zero-arg callable that raises on failure), retrying
+    with a short backoff. Re-raises the LAST failure rather than swallowing
+    it — retrying is not the same as succeeding, and a caller that can't tell
+    the difference logs a delivery that never actually happened.
+    """
+    last_exc: Optional[Exception] = None
+    for attempt in range(NOTIFY_SEND_ATTEMPTS):
+        try:
+            send_once()
+            return
+        except Exception as exc:  # noqa: BLE001 - genuinely any provider failure is retryable here
+            last_exc = exc
+            if attempt < NOTIFY_SEND_ATTEMPTS - 1:
+                time.sleep(NOTIFY_RETRY_BACKOFF_S * (attempt + 1))
+    assert last_exc is not None
+    raise last_exc
+
+
 def send_push(user_row: sqlite3.Row, title: str, body: str) -> None:
     """Push provider. ntfy today (topic-based, no accounts); replace with APNs for the
-    production iOS app (needs an Apple Developer p8 key — see cloud/README.md)."""
+    production iOS app (needs an Apple Developer p8 key — see cloud/README.md).
+
+    Raises on failure (after retrying) rather than swallowing it — a caller
+    that wants "never breaks the request this ran inside of" wraps this
+    explicitly, same as every other fallible call in this file. Swallowing
+    it HERE meant a bad ntfy response (a 500, a rejected topic) was
+    genuinely invisible: not logged, not retried, not distinguishable from
+    success anywhere in the system.
+    """
     topic = user_row["ntfy_topic"] if user_row else None
     if not topic:
         return
-    try:
-        import requests
+    import requests
 
-        requests.post(f"{NTFY_BASE}/{topic}", data=body.encode(), headers={"Title": title}, timeout=5)
-    except Exception:  # noqa: BLE001 - push failures must never break ingestion
-        pass
+    def once() -> None:
+        resp = requests.post(f"{NTFY_BASE}/{topic}", data=body.encode(), headers={"Title": title}, timeout=5)
+        resp.raise_for_status()
+
+    _send_with_retry(once)
 
 
 def send_sms(user_row: sqlite3.Row, body: str) -> None:
@@ -312,7 +398,7 @@ def send_sms(user_row: sqlite3.Row, body: str) -> None:
 
     Uses Twilio when TWILIO_ACCOUNT_SID / TWILIO_AUTH_TOKEN / TWILIO_FROM are set;
     otherwise logs the message (so the flow is fully exercisable before buying a
-    Twilio number)."""
+    Twilio number). Raises on failure after retrying — see send_push."""
     if user_row is None:
         return
     try:
@@ -328,17 +414,122 @@ def send_sms(user_row: sqlite3.Row, body: str) -> None:
     if not (sid and token and sender):
         print(f"sms (log-only, set TWILIO_* env to send for real) -> {phone}: {body}")
         return
-    try:
-        import requests
+    import requests
 
-        requests.post(
+    def once() -> None:
+        resp = requests.post(
             f"https://api.twilio.com/2010-04-01/Accounts/{sid}/Messages.json",
             data={"To": phone, "From": sender, "Body": body},
             auth=(sid, token),
             timeout=10,
         )
-    except Exception:  # noqa: BLE001 - SMS failures must never break ingestion
-        pass
+        resp.raise_for_status()
+
+    _send_with_retry(once)
+
+
+def _notify(owner: Optional[sqlite3.Row], title: str, detail: str, device_name: str) -> None:
+    """Push, then SMS, as a background task after `ingest()` has already
+    responded — a slow or retrying provider must never make a device wait
+    for its next poll. Each is independently caught and logged: a push
+    failure (after retries) must not cancel the SMS, and vice versa.
+    """
+    try:
+        send_push(owner, title, detail)
+    except Exception as exc:  # noqa: BLE001 - see send_push's own docstring
+        log.warning("notify: push delivery failed after retries: %r", exc)
+    try:
+        send_sms(owner, f"{title} — {detail} ({device_name})")
+    except Exception as exc:  # noqa: BLE001 - see send_sms's own docstring
+        log.warning("notify: sms delivery failed after retries: %r", exc)
+
+
+# ------------------------------------------------------------------------- alert copy
+#: Human title per event type. A push banner reading "SensorDyme: fall" tells
+#: nobody whether to be alarmed; unlisted types (a module this table hasn't
+#: caught up with) fall back to `_readable_title` below rather than erroring.
+_EVENT_TITLES = {
+    "fall": "🔴 Potential Fall Detected",
+    "drowsiness": "😴 Drowsiness Detected",
+    "microsleep_warning": "⚠️ Microsleep Detected",
+    "fatigue": "😴 Fatigue Detected",
+    "fatigue_critical": "🔴 Critical Fatigue Detected",
+    "fatigue_warning": "⚠️ Fatigue Warning",
+    "fatigue_pattern": "⚠️ Fatigue Pattern Detected",
+    "distraction": "⚠️ Distraction Detected",
+    "attention_lost": "⚠️ Attention Lost",
+    "eyes_off_road": "⚠️ Eyes Off Road",
+    "eyes_down": "⚠️ Eyes Down",
+    "frequent_glancing": "⚠️ Frequent Glancing Away",
+    "phone_use": "📱 Phone Use Detected",
+    "phone_detected": "📱 Phone Detected",
+    "phone_in_hand": "📱 Phone In Hand",
+    "eating_drinking": "🍔 Eating/Drinking Detected",
+    "occupancy_change": "🚶 Occupancy Changed",
+    "person_lingering": "🚨 Person Lingering",
+    "zone_violation": "🚨 Zone Violation",
+    "vehicle_in_zone": "🚗 Vehicle In Zone",
+    "animal_in_zone": "🐾 Animal In Zone",
+}
+
+#: Detail sentence per type, filled in with the event's own `duration` --
+#: real evidence (how long the condition was sustained) that every module
+#: already computes (Event.duration) but that used to be silently dropped
+#: before reaching here (see core/uplink.py's push_event). Used only when
+#: the module didn't already produce descriptive `signals` text of its own
+#: (occupancy's zone events do; fall_detection's "fall" does not) -- signals
+#: text, when present, is always better evidence than this generic fallback
+#: and takes priority. Unlisted types get a generic template further down.
+_EVENT_DETAIL_TEMPLATES = {
+    "fall": "Person transitioned rapidly and remained down for {duration:.0f} seconds",
+    "drowsiness": "Drowsiness signs sustained for {duration:.0f} seconds",
+    "microsleep_warning": "Eyes closed long enough to indicate a microsleep ({duration:.0f}s)",
+    "fatigue": "Fatigue signs sustained for {duration:.0f} seconds",
+    "fatigue_critical": "Severe fatigue signs sustained for {duration:.0f} seconds",
+    "fatigue_warning": "Early fatigue signs building for {duration:.0f} seconds",
+    "fatigue_pattern": "A recurring fatigue pattern was confirmed over {duration:.0f} seconds",
+    "distraction": "Attention off the task for {duration:.0f} seconds",
+    "attention_lost": "Attention lost for {duration:.0f} seconds",
+    "eyes_off_road": "Eyes off the road for {duration:.0f} seconds",
+    "eyes_down": "Eyes down for {duration:.0f} seconds",
+    "frequent_glancing": "Repeated glances away sustained for {duration:.0f} seconds",
+    "phone_use": "Phone use sustained for {duration:.0f} seconds",
+    "phone_detected": "Phone visible for {duration:.0f} seconds",
+    "phone_in_hand": "Phone held for {duration:.0f} seconds",
+    "eating_drinking": "Eating/drinking sustained for {duration:.0f} seconds",
+    "person_lingering": "Someone lingered in a watched zone for {duration:.0f} seconds",
+    "zone_violation": "A watched zone was violated for {duration:.0f} seconds",
+    "vehicle_in_zone": "A vehicle was in a watched zone for {duration:.0f} seconds",
+    "animal_in_zone": "An animal was in a watched zone for {duration:.0f} seconds",
+}
+
+
+def _readable_title(event_type: str) -> str:
+    return _EVENT_TITLES.get(event_type, f"SensorDyme: {event_type}")
+
+
+def _notification_detail(e: dict) -> str:
+    """Best available evidence for a notification body.
+
+    Priority: a module's own `signals` text (already descriptive — occupancy
+    writes "zone=pool confirmed after 12.4s") beats the generic duration
+    fallback beats the bare, contextless "alert" this used to always be.
+    """
+    signals = str(e.get("signals", "") or "").strip()
+    if signals:
+        return signals
+    duration = e.get("duration")
+    try:
+        duration = float(duration) if duration is not None else 0.0
+    except (TypeError, ValueError):
+        duration = 0.0
+    if duration <= 0:
+        return "alert"
+    event_type = str(e.get("type", ""))
+    template = _EVENT_DETAIL_TEMPLATES.get(event_type)
+    if template:
+        return template.format(duration=duration)
+    return f"{_readable_title(event_type)} — sustained for {duration:.0f} seconds"
 
 
 # ------------------------------------------------------------------------- schemas
@@ -404,8 +595,24 @@ def health():
     return {"ok": True, "service": "sensordyme-cloud", "time": time.time()}
 
 
+def _client_ip(request: Request) -> str:
+    """The caller's address, for rate limiting only (never trust this for auth).
+
+    `request.client` is the direct TCP peer, not an `X-Forwarded-For` header —
+    deliberately: a header is client-supplied and trivially spoofed by
+    whoever is being rate limited, unless a trusted proxy in front of this
+    process is known to overwrite it, which nothing here assumes. Falling
+    back to a fixed key when the peer is unknown (some ASGI transports in
+    testing) means every such caller shares one bucket rather than the check
+    silently never applying to them.
+    """
+    return request.client.host if request.client is not None else "unknown"
+
+
 @app.post("/v1/signup")
-def signup(body: Credentials):
+def signup(body: Credentials, request: Request):
+    if not SIGNUP_LIMITER.allow(_client_ip(request)):
+        raise HTTPException(429, "too many attempts — try again in a few minutes")
     email = body.email.strip().lower()
     if not email or "@" not in email or len(body.password) < 8:
         raise HTTPException(400, "valid email and a password of 8+ characters required")
@@ -422,12 +629,33 @@ def signup(body: Credentials):
 
 
 @app.post("/v1/login")
-def login(body: Credentials):
+def login(body: Credentials, request: Request):
+    if not LOGIN_LIMITER.allow(_client_ip(request)):
+        raise HTTPException(429, "too many attempts — try again in a few minutes")
     with db() as conn:
         row = conn.execute("SELECT * FROM users WHERE email = ?", (body.email.strip().lower(),)).fetchone()
     if row is None or _hash_pw(body.password, row["salt"]) != row["pw_hash"]:
         raise HTTPException(401, "wrong email or password")
     return {"token": _issue_token(row["id"]), "email": row["email"]}
+
+
+@app.post("/v1/logout")
+def logout(payload: dict = Depends(current_token)) -> dict:
+    """Revoke the CURRENT token only. Signing out on one device must never
+    sign out every device an account is using — this reads the jti straight
+    off the token that called it, not anything account-wide."""
+    jti = payload.get("jti")
+    if jti is not None:
+        with db() as conn:
+            conn.execute(
+                "INSERT OR REPLACE INTO revoked_tokens (jti, exp) VALUES (?, ?)",
+                (jti, float(payload.get("exp", time.time() + JWT_TTL_S))),
+            )
+            # Opportunistic cleanup, on the same write this table gets
+            # touched anyway, rather than a separate scheduled job for a
+            # table that is usually empty or near it.
+            conn.execute("DELETE FROM revoked_tokens WHERE exp < ?", (time.time(),))
+    return {"ok": True}
 
 
 @app.post("/v1/account/ntfy")
@@ -484,7 +712,9 @@ def rename_device(device_id: int, body: RenameBody, uid: int = Depends(current_u
 
 
 @app.post("/v1/devices/claim")
-def claim_device(body: ClaimBody, uid: int = Depends(current_user)):
+def claim_device(body: ClaimBody, request: Request, uid: int = Depends(current_user)):
+    if not CLAIM_LIMITER.allow(_client_ip(request)):
+        raise HTTPException(429, "too many attempts — try again in a few minutes")
     with db() as conn:
         row = conn.execute("SELECT * FROM devices WHERE claim_code = ?", (body.claim_code.strip(),)).fetchone()
         if row is None:
@@ -535,7 +765,7 @@ def device_events(device_id: int, limit: int = 100, uid: int = Depends(current_u
         # `id` is included so the app can ask why a specific alert fired.
         # Without it an event is unaddressable and /explain is unreachable.
         rows = conn.execute(
-            "SELECT id, timestamp, type, confidence, signals, severity, source FROM events "
+            "SELECT id, timestamp, type, confidence, signals, severity, source, duration FROM events "
             "WHERE device_id = ? ORDER BY id DESC LIMIT ?",
             (device_id, limit),
         ).fetchall()
@@ -1060,7 +1290,7 @@ def explain_event(device_id: int, event_id: int, uid: int = Depends(current_user
 
 # ------------------------------------------------------------------------- device API
 @app.post("/v1/ingest")
-def ingest(body: IngestBody, device: sqlite3.Row = Depends(current_device)):
+def ingest(body: IngestBody, background_tasks: BackgroundTasks, device: sqlite3.Row = Depends(current_device)):
     now = time.time()
     with db() as conn:
         conn.execute(
@@ -1080,7 +1310,16 @@ def ingest(body: IngestBody, device: sqlite3.Row = Depends(current_device)):
             else None
         )
         newly_inserted_events = []
-        for e in body.events[:200]:
+        # No cap here on purpose: the device's own queue is bounded
+        # (core/uplink.py's `queue_max`, default 500), so a batch is already
+        # naturally small, and a partial batch used to be silently dropped —
+        # the client clears its queue on ANY 200 response (uplink.py:180),
+        # so a `[:200]` slice here meant events 201+ of a large backlog (a
+        # long outage, then reconnect) were discarded with `stored` still
+        # claiming the full count arrived. One SQLite transaction over the
+        # whole list costs single-digit milliseconds even at the 500-event
+        # ceiling; there is no real cost to processing all of it.
+        for e in body.events:
             # OR IGNORE + the partial unique index on (device_id, event_key):
             # a device that treated a lost response as a failed send retries
             # the identical batch next poll. Without this, that retry is a
@@ -1109,9 +1348,11 @@ def ingest(body: IngestBody, device: sqlite3.Row = Depends(current_device)):
                 event_key = e.get("event_key")
                 confidence_raw = e.get("confidence", 0.0)
                 confidence = float(confidence_raw) if confidence_raw not in (None, "") else 0.0
+                duration_raw = e.get("duration")
+                duration = float(duration_raw) if duration_raw not in (None, "") else None
                 cursor = conn.execute(
                     "INSERT OR IGNORE INTO events (device_id, timestamp, type, confidence, signals,"
-                    " severity, source, received_at, event_key) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                    " severity, source, received_at, event_key, duration) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
                     (
                         device["id"],
                         str(e.get("timestamp", "")),
@@ -1122,6 +1363,7 @@ def ingest(body: IngestBody, device: sqlite3.Row = Depends(current_device)):
                         str(e.get("source") or "module"),
                         now,
                         str(event_key) if event_key else None,
+                        duration,
                     ),
                 )
                 # rowcount is 0 when OR IGNORE silently dropped a retry of an
@@ -1173,7 +1415,21 @@ def ingest(body: IngestBody, device: sqlite3.Row = Depends(current_device)):
             and same_preset(desired, body.active_preset or device["active_preset"])
             and not device_reports_custom_active
         ):
-            conn.execute("UPDATE devices SET desired_preset = NULL WHERE id = ?", (device["id"],))
+            # Compare-and-swap, not an unconditional clear: `desired` was read
+            # a few statements ago, and this whole request handler runs in
+            # FastAPI's threadpool alongside every other one, including
+            # POST .../preset (which writes a fresh desired_preset from a
+            # user's tap). An unconditional UPDATE here would clear whatever
+            # is in the column NOW, which is a stale write if a new command
+            # landed in that gap -- silently discarding a mode switch the
+            # user just made, with nothing to indicate it happened. Matching
+            # the WHERE to the value just read makes the clear a no-op
+            # instead whenever that's happened, leaving the fresh command
+            # alone.
+            conn.execute(
+                "UPDATE devices SET desired_preset = NULL WHERE id = ? AND desired_preset = ?",
+                (device["id"], desired),
+            )
             desired = None
 
     # Push is the path that works when the app is closed, so it is the path
@@ -1212,27 +1468,19 @@ def ingest(body: IngestBody, device: sqlite3.Row = Depends(current_device)):
         )
         if not send:
             continue
-        title = f"SensorDyme: {e.get('type', 'alert')}"
-        detail = str(e.get("signals", "")) or "alert"
+        title = _readable_title(str(e.get("type", "alert")))
+        detail = _notification_detail(e)
         if held:
             detail += f" (and {held} more in the last {int(NOTIFY_COOLDOWN_S)}s)"
-        # Isolated per event, same reasoning as the INSERT loop above: the
-        # event is already committed by this point, so a delivery failure —
-        # ntfy down, Twilio erroring, a future provider misbehaving — must
-        # never take the whole response down with it. Without this, one bad
-        # send here would also silently cancel every OTHER event's
-        # notification later in the same batch, even though each of those is
-        # already safely stored and would never be retried (their event_key
-        # is already inserted, so a client retry after the resulting 500
-        # would not surface them again either).
-        try:
-            send_push(owner, title, detail)
-            send_sms(owner, f"{title} — {detail} ({device['name']})")
-        except Exception as exc:  # noqa: BLE001 - a delivery bug must not affect storage or other events
-            log.warning(
-                "ingest: notification delivery failed for device %s event %r: %r",
-                device["id"], e.get("type"), exc,
-            )
+        # A background task, not a direct call: the event is already
+        # committed by this point, so neither a slow provider nor _notify's
+        # own retries (see NOTIFY_SEND_ATTEMPTS) should make the DEVICE wait
+        # for its response — this loop can queue several of these per batch,
+        # and the device's next poll is what everything else here is trying
+        # to keep prompt. `owner`/`device["name"]` are captured now, by
+        # value, since the request-scoped `device` row (and the connection
+        # that produced it) will be gone by the time this actually runs.
+        background_tasks.add_task(_notify, owner, title, detail, device["name"])
 
     command = None
     # Same reasoning as the convergence check above: a matching name is not
@@ -1285,4 +1533,12 @@ def ingest(body: IngestBody, device: sqlite3.Row = Depends(current_device)):
         else:
             command["zones_version"] = zone_version
 
-    return {"ok": True, "stored": len(body.events), "command": command}
+    # The count that actually landed in the database, not the size of the
+    # request -- these silently diverged before (see the `[:200]` removal
+    # above): a batch could report every event "stored" while most of them
+    # never reached a row. A malformed-and-skipped or already-stored
+    # (deduplicated retry) event legitimately isn't counted here; both are
+    # accounted for elsewhere (a warning log, and the dedup this endpoint
+    # relies on for retry-safety, respectively) -- this field means "how many
+    # of these are now durable", which is the number a caller actually needs.
+    return {"ok": True, "stored": len(newly_inserted_events), "command": command}

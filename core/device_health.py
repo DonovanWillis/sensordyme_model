@@ -30,6 +30,7 @@ from dataclasses import asdict, dataclass, field
 from typing import Optional
 
 from core import accel
+from core.thermal import SOFT_THROTTLE_C
 
 # States the app understands. Kept deliberately small so every surface can
 # render the same vocabulary.
@@ -218,7 +219,7 @@ def collect(
 
     system_state = OK
     system_detail = "nominal"
-    if temperature is not None and temperature >= 80:
+    if temperature is not None and temperature >= SOFT_THROTTLE_C:
         system_state, system_detail = WARNING, f"running hot ({temperature}°C)"
     elif throttled not in (None, "0x0"):
         system_state, system_detail = WARNING, f"throttled ({throttled})"

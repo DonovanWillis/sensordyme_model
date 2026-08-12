@@ -14,8 +14,12 @@ import cv2
 import numpy as np
 
 
-def _detect_pi() -> bool:
-    """Return True if Picamera2 is importable, i.e. this is a Raspberry Pi."""
+def detect_pi() -> bool:
+    """Return True if Picamera2 is importable, i.e. this is a Raspberry Pi.
+
+    Public: main.py needs this too (to decide which AlertManager sink set is
+    valid), not just Camera itself.
+    """
     try:
         from picamera2 import Picamera2  # noqa: F401
 
@@ -49,7 +53,7 @@ class Camera:
         # on the Pi (free — done by the ISP), in software on the dev webcam path.
         self._rotate_180 = bool(config.get("rotate_180", False))
 
-        self.is_pi = _detect_pi()
+        self.is_pi = detect_pi()
         self._picam: Optional[object] = None
         self._cap: Optional[cv2.VideoCapture] = None
 
@@ -144,8 +148,12 @@ class Camera:
 
             # PRIVACY: frames are never persisted — this array lives only in process
             # memory for the duration of one loop iteration and is discarded after
-            # the caller finishes processing it. No frame is ever written to disk,
-            # logged, or transmitted anywhere in this codebase.
+            # the caller finishes processing it. No frame is ever written to disk
+            # or logged anywhere in this codebase. The one deliberate exception:
+            # core/dashboard.py's opt-in local live-view streams annotated frames
+            # over HTTP (MJPEG) to a connected viewer -- bound to 127.0.0.1 by
+            # default -- for the person watching their own device. That frame
+            # still never touches disk; "transmitted" specifically means that path.
             yield self.read()
 
     @property

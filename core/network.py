@@ -253,8 +253,8 @@ class WifiManager:
                         if stop.is_set():
                             break
                         on_change()
-                except Exception:  # noqa: BLE001
-                    pass
+                except Exception as exc:  # noqa: BLE001
+                    log.warning("nmcli monitor stream died (%s) — restarting", exc)
                 finally:
                     process.terminate()
                 # nmcli monitor exits if NetworkManager restarts. Come back,

@@ -49,6 +49,27 @@ class CloudUplink:
         import requests  # already a dependency (VLM judge backends)
 
         self._requests = requests
+        # `verify` passed to every requests call below. True (the default) is
+        # normal certificate verification against the system trust store --
+        # exactly what a real, CA-signed cert (Let's Encrypt, Caddy) needs and
+        # nothing more; this path needs no config at all. A path string pins
+        # trust to one specific cert, for a self-signed backend (see
+        # scripts/generate_dev_cert.py). False disables verification
+        # entirely -- genuinely insecure, dev-only, and warned about loudly
+        # exactly once rather than on every single poll.
+        ca_cert_path = str(config.get("ca_cert_path", "") or "")
+        insecure = bool(config.get("tls_insecure_skip_verify", False))
+        if ca_cert_path:
+            self._verify: bool | str = ca_cert_path
+        elif insecure:
+            self._verify = False
+            print(
+                "cloud_uplink: tls_insecure_skip_verify is ON — certificate verification is "
+                "disabled and this connection can be intercepted. Development only; set "
+                "ca_cert_path instead, or use a CA-signed certificate, before deploying."
+            )
+        else:
+            self._verify = True
 
     def start(self) -> None:
         threading.Thread(target=self._run, daemon=True, name="cloud-uplink").start()
@@ -85,6 +106,14 @@ class CloudUplink:
                     "type": event.type,
                     "confidence": round(event.confidence, 3),
                     "signals": event.contributing_signals,
+                    # Seconds the condition was sustained before this fired --
+                    # already computed by every module (Event.duration), but
+                    # previously dropped here rather than sent, so a genuinely
+                    # informative number never reached a notification. Used as
+                    # a fallback when `signals` is empty (e.g. fall_detection's
+                    # "fall" event carries no signals text today) rather than
+                    # the bare, contextless "alert" that produced.
+                    "duration": round(event.duration, 3),
                     "severity": severity,
                     "source": source,
                 }
@@ -196,6 +225,7 @@ class CloudUplink:
                     },
                     headers=headers,
                     timeout=10,
+                    verify=self._verify,
                 )
                 resp.raise_for_status()
                 # 2) the ingest response carries any pending command

@@ -143,7 +143,17 @@ struct DeviceDetailView: View {
         // and a second look covers the ordinary case; if it's still not
         // found the event is outside the 200-item window this screen loads,
         // which is worth noting rather than swallowing silently.
-        .onChange(of: notifier.pendingEventID) { _, id in
+        // `initial: true`: this view can be pushed FRESH by a notification tap
+        // (DevicesView's own handler navigates here via .navigationDestination
+        // after matching the device), which means pendingEventID is already
+        // non-nil the moment this onChange modifier first attaches — and
+        // onChange only fires on a value actually CHANGING after that point,
+        // never for the value it already holds. Without `initial: true` this
+        // closure silently never ran for that id: no sheet, no error, no
+        // notifier.pendingEventID reset — the exact "last beat of the demo"
+        // this comment above already worried about, just from one screen
+        // earlier than where the retry logic was looking.
+        .onChange(of: notifier.pendingEventID, initial: true) { _, id in
             guard let id else { return }
             if let match = events.first(where: { $0.eventID == id }) {
                 selectedEvent = match

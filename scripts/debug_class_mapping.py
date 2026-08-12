@@ -21,12 +21,11 @@ name_to_id = {name: cid for cid, name in COCO_NAMES.items()}
 
 with open("config.yaml") as f:
     cfg = yaml.safe_load(f)
-driver_yolo_classes = (
-    cfg.get("presets", {}).get("driver_distraction", {}).get("module_config", {}).get("yolo_classes", {})
-    if "presets" in cfg else {}
-)
-# config.yaml's driver_attention block isn't under presets in this file layout;
-# fall back to a direct search for the yolo_classes block actually used.
+# The real location: modules.driver_attention.yolo_classes. (Presets live in
+# the separate presets.yaml, not under a "presets" key here, and the preset
+# itself was renamed driver_distraction -> driver_safety a while back — this
+# used to look in both wrong places before falling back to the search below.)
+driver_yolo_classes = cfg.get("modules", {}).get("driver_attention", {}).get("yolo_classes", {})
 if not driver_yolo_classes:
     def _find_yolo_classes(node):
         if isinstance(node, dict):

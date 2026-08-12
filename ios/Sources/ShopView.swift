@@ -143,9 +143,21 @@ struct ShopView: View {
     }
 
     private func reloadOrders() async {
+        // A transient failure here (`try?` … `?? []`) used to overwrite
+        // orderHistory with an empty list unconditionally — a real order
+        // history replaced by "no orders" on a one-off network blip, instead
+        // of leaving the stale-but-correct data on screen the way
+        // DevicesView/DeviceDetailView's own reload() already does for
+        // exactly this reason.
         let token = reloadGuard.begin()
-        let fetched = (try? await state.backend.orders()) ?? []
-        guard reloadGuard.isLatest(token) else { return }
-        orderHistory = fetched
+        do {
+            let fetched = try await state.backend.orders()
+            guard reloadGuard.isLatest(token) else { return }
+            orderHistory = fetched
+            errorMessage = nil
+        } catch {
+            guard reloadGuard.isLatest(token) else { return }
+            errorMessage = error.localizedDescription
+        }
     }
 }

@@ -78,7 +78,15 @@ struct DevicesView: View {
             // that was a permanent miss: notificationTarget stayed nil forever,
             // no navigation, no error, the tap silently did nothing. The empty
             // case now waits for the reload already in flight and retries once.
-            .onChange(of: notifier.pendingEventID) { _, id in
+            // `initial: true`: a cold launch FROM a tapped notification can have
+            // AlertNotifier already holding a non-nil pendingEventID by the
+            // moment this view's body first runs and this modifier attaches —
+            // onChange only fires on the value actually CHANGING afterward,
+            // never for whatever it already was, so without this the tap that
+            // launched the app was silently ignored. Same root cause as
+            // DeviceDetailView's own onChange just below in the navigation
+            // stack; see its comment for the in-app (not cold-launch) case.
+            .onChange(of: notifier.pendingEventID, initial: true) { _, id in
                 guard id != nil, notificationTarget == nil else { return }
                 if let match = devices.first(where: { $0.id == notifier.pendingDeviceID }) {
                     notificationTarget = match
@@ -177,8 +185,22 @@ struct DeviceCard: View {
 
     /// "Offline" alone leaves people wondering whether it just happened or has
     /// been down all week, which is the first thing anyone wants to know.
+    ///
+    /// Checks `device.monitoring?.active`, same as DeviceDetailView one tap
+    /// away — Models.swift's own doc comment on `CustomMonitoring` names the
+    /// exact bug this guards against: showing the base mode as selected while
+    /// a custom configuration is what the device is really doing, so someone
+    /// who asked it to count people is told from the home screen that it's
+    /// watching for driver distraction. That was fixed on the device screen;
+    /// this card had the identical unconditional read of `activePreset` and
+    /// wasn't.
     private var subtitle: String {
-        if device.online { return Preset.title(for: device.activePreset) }
+        if device.online {
+            if device.monitoring?.active == true {
+                return device.monitoring?.title ?? "AI Custom Monitoring"
+            }
+            return Preset.title(for: device.activePreset)
+        }
         guard let lastSeen = device.lastSeen else { return "Not seen yet" }
         let elapsed = Date().timeIntervalSince(Date(timeIntervalSince1970: lastSeen))
         return "Last seen \(Self.elapsed.localizedString(fromTimeInterval: -elapsed))"

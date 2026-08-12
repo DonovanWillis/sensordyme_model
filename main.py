@@ -247,7 +247,7 @@ def run(argv: Optional[list[str]] = None) -> None:
     debug = args.debug
     display = True if debug else (args.display if args.display is not None else bool(config.get("display", False)))
 
-    from core.camera import _detect_pi
+    from core.camera import detect_pi
     from services.runtime import DeviceRuntime
 
     DeviceRuntime(
@@ -255,7 +255,7 @@ def run(argv: Optional[list[str]] = None) -> None:
         profile=profile,
         module=module,
         module_name=module_name,
-        alert_manager=build_alert_manager(alert_cfg, _detect_pi()),
+        alert_manager=build_alert_manager(alert_cfg, detect_pi()),
         alert_cfg=alert_cfg,
         alert_event_types=alert_event_types,
         alert_types_for=alert_types_for,

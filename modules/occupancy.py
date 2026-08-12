@@ -22,6 +22,17 @@ tracked identity, "lingering" is really "has this ZONE been continuously
 occupied", which conflates two different four-second visits by two different
 people into one eight-second "someone lingered" report the moment the second
 person's arrival overlaps the first person's departure by even one frame.
+
+Optional cross-model verification (`verify_new_tracks_with_pose`, off by
+default): the first time a new track appears, a second, independent model
+(MediaPipe Pose, on just that box's crop) checks for a real human pose --
+genuine corroborating evidence for the detector's own "person" label, from a
+signal a box-only classifier cannot produce about itself. It is surfaced as
+an annotation on `person_lingering`'s event detail, never used to suppress an
+alert: a person facing away or poorly lit can genuinely have no detectable
+pose, and gating a security alert on that absence would trade a real signal
+against a false-negative risk with no measured data behind it to tune
+against. See _pose_confirms_person.
 """
 
 from __future__ import annotations
@@ -123,6 +134,62 @@ class OccupancyModule(VisionModule):
         self._known_track_ids: set[int] = set()
         self._last_tracked_boxes: dict[int, tuple[int, int, int, int]] = {}
 
+        # Optional cross-model verification (off by default -- see
+        # _pose_confirms_person). A brand-new track, the first time it's
+        # seen, gets ONE MediaPipe Pose check on its own crop: a second,
+        # independent model corroborating (or not) the detector's own
+        # "person" label. Event-driven -- once per track, not every frame --
+        # and opt-in, since it's a real model this module was deliberately
+        # built without (see module docstring); nothing about its footprint
+        # changes unless a deployment explicitly asks for the corroboration.
+        self._verify_new_tracks = bool(config.get("verify_new_tracks_with_pose", False))
+        self._pose_verifier = None
+        self._track_pose_confirmed: dict[int, bool] = {}
+
+    def _ensure_pose_verifier(self) -> None:
+        if self._pose_verifier is None:
+            import mediapipe as mp
+
+            # static_image_mode=True: each call below is an isolated crop of
+            # a different person at a different moment, never a continuous
+            # stream -- the opposite of fall_detection.py's own Pose usage,
+            # which deliberately leaves this False to track one subject
+            # across frames. Sharing that setting here would let MediaPipe's
+            # internal frame-to-frame smoothing carry state between unrelated
+            # people, which is wrong for what this is.
+            self._pose_verifier = mp.solutions.pose.Pose(
+                static_image_mode=True, min_detection_confidence=0.5,
+            )
+
+    def _pose_confirms_person(self, frame: np.ndarray, box: tuple[int, int, int, int]) -> bool:
+        """Whether a SECOND, independent model finds a human pose in `box`.
+
+        Corroborating evidence for the detector's own "person" label, from a
+        completely different signal (body-landmark geometry, not the object
+        detector's own classifier) -- the actual "detector A says person,
+        other evidence disagrees" case a box-only detector cannot answer
+        about itself. A margin is added around the box because a tight YOLO
+        box can crop through a limb MediaPipe would otherwise have found.
+
+        Absence of a pose is real evidence, not proof: a person facing away,
+        poorly lit, or partly out of frame can genuinely have no detectable
+        pose. That asymmetry is why this is surfaced as an annotation on
+        `person_lingering`'s event detail rather than used to suppress an
+        alert outright -- gating a security alert on this would trade a
+        real, if imperfect, signal against a false-negative risk with no
+        measured data behind it to tune against. See the module docstring.
+        """
+        h, w = frame.shape[:2]
+        x1, y1, x2, y2 = box
+        margin_x, margin_y = int((x2 - x1) * 0.15), int((y2 - y1) * 0.15)
+        cx1, cy1 = max(0, x1 - margin_x), max(0, y1 - margin_y)
+        cx2, cy2 = min(w, x2 + margin_x), min(h, y2 + margin_y)
+        if cx2 <= cx1 or cy2 <= cy1:
+            return False
+        self._ensure_pose_verifier()
+        crop_rgb = cv2.cvtColor(frame[cy1:cy2, cx1:cx2], cv2.COLOR_BGR2RGB)
+        return self._pose_verifier.process(crop_rgb).pose_landmarks is not None
+
     def process(self, frame: np.ndarray) -> list[Event]:
         """Detect people in `frame`; emit occupancy_change once a new count is confirmed."""
         events: list[Event] = []
@@ -189,10 +256,15 @@ class OccupancyModule(VisionModule):
             skeletons = [from_detection_box(b) for b in self._last_person_boxes]
             box_by_skeleton_id = {id(s): b for s, b in zip(skeletons, self._last_person_boxes)}
             tracked = {t.track_id: t for t in self._tracker.update(skeletons, now)}
+            newly_appeared_tracks = set(tracked) - self._known_track_ids
             self._known_track_ids |= set(tracked)
             self._last_tracked_boxes = {
                 tid: box_by_skeleton_id[id(t.skeleton)] for tid, t in tracked.items()
             }
+            if self._verify_new_tracks:
+                for track_id in newly_appeared_tracks:
+                    box = box_by_skeleton_id[id(tracked[track_id].skeleton)]
+                    self._track_pose_confirmed[track_id] = self._pose_confirms_person(frame, box)
 
             transitions = []
             for zone in self._watched_zones:
@@ -246,15 +318,22 @@ class OccupancyModule(VisionModule):
                     for z in self._watched_zones:
                         self._engine.remove_rule(f"person_lingering:{z.name}:{track_id}")
                     self._known_track_ids.discard(track_id)
+                    self._track_pose_confirmed.pop(track_id, None)
 
             for tr in transitions:
                 base, _, rest = tr.detection.partition(":")
-                zone_name = rest.split(":", 1)[0]
+                parts = rest.split(":", 1)
+                zone_name = parts[0]
                 if tr.state == CONFIRMED:
-                    events.append(Event.now(
-                        base, tr.duration_s, tr.confidence, self.name,
-                        f"zone={zone_name} confirmed after {tr.duration_s:.1f}s",
-                    ))
+                    detail = f"zone={zone_name} confirmed after {tr.duration_s:.1f}s"
+                    # Only person_lingering has a track_id in `rest` (zone:id) --
+                    # zone_violation/vehicle_in_zone/animal_in_zone are zone-
+                    # aggregate and have no single subject to attribute this to.
+                    if base == "person_lingering" and len(parts) > 1 and self._verify_new_tracks:
+                        track_id = int(parts[1])
+                        if self._track_pose_confirmed.get(track_id) is False:
+                            detail += " (no body pose confirmed for this detection — worth a manual check)"
+                    events.append(Event.now(base, tr.duration_s, tr.confidence, self.name, detail))
                 elif tr.state == RESOLVED:
                     events.append(Event.now(f"{base}_resolved", tr.duration_s, tr.confidence, self.name,
                                             f"zone={zone_name}"))

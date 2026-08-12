@@ -53,7 +53,7 @@ def queue_event(uplink, name):
     """push_event takes an alert object; only the fields it reads matter here."""
     event = types.SimpleNamespace(
         timestamp=types.SimpleNamespace(isoformat=lambda: "2026-08-07T00:00:00"),
-        type=name, confidence=1.0, contributing_signals={},
+        type=name, confidence=1.0, contributing_signals={}, duration=2.5,
     )
     uplink.push_event(event, "loud")
 

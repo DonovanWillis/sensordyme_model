@@ -116,6 +116,11 @@ struct AIProposal: Codable, Equatable {
 protocol BackendAPI {
     func signup(email: String, password: String) async throws -> AuthResponse
     func login(email: String, password: String) async throws -> AuthResponse
+    /// Revokes THIS session's token server-side, immediately, everywhere it's
+    /// used — not just the local copy this device is about to forget. Best
+    /// effort: the caller signs out locally regardless of whether this
+    /// succeeds, since a person must always be able to sign out even offline.
+    func logout() async throws
     func devices() async throws -> [Device]
     func claim(code: String) async throws
     func events(deviceID: Int, limit: Int) async throws -> [EventItem]
@@ -182,6 +187,11 @@ private struct OrderPlacedResponse: Codable {
 }
 
 extension APIClient: BackendAPI {
+    func logout() async throws {
+        struct OK: Codable { let ok: Bool }
+        let _: OK = try await postJSON("v1/logout", body: [:])
+    }
+
     func aiConfigure(deviceID: Int, prompt: String) async throws -> AIProposal {
         try await postJSON("v1/ai/configure", body: ["device_id": deviceID, "prompt": prompt])
     }
@@ -349,6 +359,9 @@ final class MockAPI: BackendAPI {
     func login(email: String, password: String) async throws -> AuthResponse {
         AuthResponse(token: "demo", email: email.isEmpty ? "demo@sensordyme.app" : email)
     }
+
+    /// Nothing to revoke — the demo device has no real backend session.
+    func logout() async throws {}
 
     func devices() async throws -> [Device] {
         settleModeSwitch()

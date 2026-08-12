@@ -267,6 +267,18 @@ final class AppState: ObservableObject {
     }
 
     func signOut() {
+        // Revoke the token server-side too, not just forget it locally --
+        // without this, "sign out" on this device left the same token still
+        // valid anywhere else it existed (another device, a log, an
+        // interception) for up to its full 30-day life. `api` is captured
+        // NOW, before storedToken is cleared below, so this instance carries
+        // the real token regardless of when the Task actually runs.
+        // Best-effort and fire-and-forget: local sign-out must never wait on
+        // or fail because of a network call — offline sign-out has to work.
+        if !isDemo {
+            let client = api
+            Task { try? await client.logout() }
+        }
         storedToken = ""
         accountEmail = ""
         storedDemo = false

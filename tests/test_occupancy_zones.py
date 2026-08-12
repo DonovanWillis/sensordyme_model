@@ -247,3 +247,95 @@ def test_get_detections_boxes_land_in_the_right_zone(module):
     _run(module, [OUTSIDE], 1)
     boxes = module.get_detections().boxes("person")
     assert not any(entry.contains_box(box, 1000, 1000) for box in boxes)
+
+
+# ------------------------------------------------------- cross-model verification
+@pytest.fixture()
+def verifying_module(monkeypatch):
+    """Same as `module`, but with pose corroboration turned on and a short
+    linger_s (this is testing the verification wiring, not lingering timing,
+    which already has its own dedicated tests above)."""
+    fake = _FakeModel()
+    monkeypatch.setattr(occupancy_module, "get_yolo_model", lambda weights: fake)
+    mod = OccupancyModule({
+        "confidence_threshold": 0.5, "confirm_frames": 2,
+        "zones": {"entry": {"polygon": [[0.6, 0.2], [0.95, 0.2], [0.95, 0.9], [0.6, 0.9]],
+                            "kind": "restricted"}},
+        "zone_confirm_s": 0.5, "linger_s": 0.5,
+        "verify_new_tracks_with_pose": True,
+    })
+    mod._fake = fake
+    return mod
+
+
+def _run_timed(module, boxes, frames, monkeypatch, step=0.1):
+    """Like _run, but with deterministic monotonic time -- needed once
+    persist_s/linger_s durations must actually elapse for a CONFIRMED event."""
+    t = {"now": 0.0}
+    monkeypatch.setattr(occupancy_module.time, "monotonic", lambda: t["now"])
+    events = []
+    module._fake.boxes_to_return = boxes
+    for _ in range(frames):
+        events += module.process(FRAME)
+        t["now"] += step
+    return events
+
+
+def test_verification_is_off_by_default_and_never_loads_pose(module, monkeypatch):
+    """The default config must not pay for or touch a pose model at all --
+    verify_new_tracks_with_pose defaults False in the `module` fixture."""
+    calls = []
+    monkeypatch.setattr(
+        occupancy_module.OccupancyModule, "_ensure_pose_verifier",
+        lambda self: calls.append(1),
+    )
+    _run(module, [IN_ENTRY], 5)
+    assert calls == [], "pose verification must never run unless explicitly enabled"
+
+
+def test_a_new_track_is_verified_exactly_once(verifying_module, monkeypatch):
+    calls = []
+
+    def fake_verify(self, frame, box):
+        calls.append(box)
+        return True
+
+    monkeypatch.setattr(occupancy_module.OccupancyModule, "_pose_confirms_person", fake_verify)
+    _run_timed(verifying_module, [IN_ENTRY], 10, monkeypatch)  # same person, ten frames
+    assert len(calls) == 1, "one new track must be pose-checked once, not every frame"
+
+
+def test_two_different_people_are_each_verified_once(verifying_module, monkeypatch):
+    calls = []
+    monkeypatch.setattr(
+        occupancy_module.OccupancyModule, "_pose_confirms_person",
+        lambda self, frame, box: (calls.append(box), True)[1],
+    )
+    # Two well-separated boxes in the same frame -> two distinct tracks.
+    two_people = [(650, 300, 750, 800), (850, 300, 950, 800)]
+    _run_timed(verifying_module, two_people, 5, monkeypatch)
+    assert len(calls) == 2
+
+
+def test_unconfirmed_pose_is_noted_on_person_lingering_but_does_not_block_it(verifying_module, monkeypatch):
+    """A contradicted 'person' still lingers and still confirms -- verification
+    annotates the alert, it does not gate it (see module docstring for why)."""
+    monkeypatch.setattr(
+        occupancy_module.OccupancyModule, "_pose_confirms_person",
+        lambda self, frame, box: False,  # pose never confirms this box
+    )
+    # linger_s=0.5, min_frames=10: 15 frames * 0.1s comfortably clears both.
+    events = _run_timed(verifying_module, [IN_ENTRY], 15, monkeypatch)
+    lingering = next(e for e in events if e.type == "person_lingering")
+    assert "no body pose confirmed" in lingering.contributing_signals
+    assert verifying_module.is_alert_active(), "the alert must still fire despite the contradiction"
+
+
+def test_confirmed_pose_adds_no_spurious_note(verifying_module, monkeypatch):
+    monkeypatch.setattr(
+        occupancy_module.OccupancyModule, "_pose_confirms_person",
+        lambda self, frame, box: True,
+    )
+    events = _run_timed(verifying_module, [IN_ENTRY], 15, monkeypatch)
+    lingering = next(e for e in events if e.type == "person_lingering")
+    assert "no body pose confirmed" not in lingering.contributing_signals

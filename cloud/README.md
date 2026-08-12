@@ -79,6 +79,51 @@ cloud:
   device_key: dk_...
 ```
 
+## TLS
+
+Plain HTTP is the default and stays that way until you change `base_url` — nothing
+in this section is required to keep the existing LAN setup working exactly as it
+does today.
+
+For anything a real customer's phone will reach — the investor demo, a public
+deploy — put a real, CA-signed certificate in front of the backend instead of
+anything below: Fly.io/Railway terminate TLS for you, or run Caddy/Let's Encrypt
+in front of uvicorn. iOS validates certificates against the system trust store, so
+a real cert is trusted with **zero app changes**; that's the recommended path.
+
+For local development — exercising HTTPS itself (e.g. the Pi's uplink talking to a
+Mac-hosted backend over TLS) before a real deployment target exists — generate a
+self-signed cert and pin the device to it directly:
+
+```bash
+.venv/bin/python scripts/generate_dev_cert.py        # writes .secrets/dev-cert.{pem,key}
+.venv/bin/uvicorn cloud.app:app --host 0.0.0.0 --port 8787 \
+    --ssl-keyfile .secrets/dev-cert.key --ssl-certfile .secrets/dev-cert.pem
+```
+
+Then on the device's config.yaml:
+
+```yaml
+cloud:
+  base_url: https://your-mac.local:8787
+  ca_cert_path: /path/to/.secrets/dev-cert.pem   # trust exactly this cert, nothing else
+```
+
+Verification stays fully on by default — `ca_cert_path` pins trust to one specific
+cert rather than turning verification off. `tls_insecure_skip_verify: true` is also
+available (genuinely insecure — see config.yaml's comment on it) for the rare case
+where even generating a dev cert is in the way; the device logs a warning once at
+startup whenever it's on.
+
+**The iOS app will not trust a self-signed cert.** `URLSession` validates against
+the system trust store regardless of the app's `NSAllowsArbitraryLoads` (which
+relaxes ATS's connection *requirements* — TLS version, forward secrecy — not
+certificate trust, a separate check). Making the app accept a specific self-signed
+cert needs a `URLSessionDelegate` that pins to it, which is real client code, not a
+config change, and does not exist yet — this is genuinely the one piece TLS support
+does not close, and the reason the real-cert path above is the one to use for
+anything the app must reach.
+
 ## Deploy
 
 Anything that runs Python works (Fly.io, Railway, a small VPS).

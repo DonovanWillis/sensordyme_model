@@ -17,7 +17,7 @@ def backend(tmp_path, monkeypatch):
     # _ai_configure_llm falls through to the deterministic path.
     monkeypatch.setenv("SENSORDYME_AI_PROVIDER", "unavailable")
     monkeypatch.setenv("SENSORDYME_DB", str(tmp_path / "test.db"))
-    for mod in ("cloud.app", "cloud"):
+    for mod in ("cloud.app", "cloud", "cloud.ratelimit"):
         sys.modules.pop(mod, None)
     app_module = importlib.import_module("cloud.app")
     return app_module, TestClient(app_module.app)
@@ -29,6 +29,52 @@ def test_health_probe_is_unauthenticated(backend):
     assert resp.status_code == 200
     body = resp.json()
     assert body["ok"] is True and body["service"] == "sensordyme-cloud"
+
+
+def test_logout_revokes_only_that_token(backend):
+    """Signing out on one device must invalidate that session immediately and
+    everywhere -- not just clear the local copy -- and must not touch a
+    DIFFERENT session the same account is using elsewhere."""
+    _, client = backend
+    client.post("/v1/signup", json={"email": "two-devices@example.com", "password": "supersecret1"})
+
+    # Two independent logins -> two independent tokens for the same account
+    # (e.g. phone + tablet).
+    token_a = client.post(
+        "/v1/login", json={"email": "two-devices@example.com", "password": "supersecret1"}
+    ).json()["token"]
+    token_b = client.post(
+        "/v1/login", json={"email": "two-devices@example.com", "password": "supersecret1"}
+    ).json()["token"]
+    auth_a = {"Authorization": f"Bearer {token_a}"}
+    auth_b = {"Authorization": f"Bearer {token_b}"}
+
+    assert client.get("/v1/devices", headers=auth_a).status_code == 200
+    assert client.get("/v1/devices", headers=auth_b).status_code == 200
+
+    assert client.post("/v1/logout", headers=auth_a).status_code == 200
+
+    # Device A's session is dead immediately...
+    resp = client.get("/v1/devices", headers=auth_a)
+    assert resp.status_code == 401
+    # ...but device B, a completely different session for the same account,
+    # is untouched.
+    assert client.get("/v1/devices", headers=auth_b).status_code == 200
+
+
+def test_logging_out_twice_does_not_error(backend):
+    """The same token revoked a second time (a retried request, a double
+    tap) must not 500 -- INSERT OR REPLACE, not a unique-constraint crash."""
+    _, client = backend
+    client.post("/v1/signup", json={"email": "double-logout@example.com", "password": "supersecret1"})
+    token = client.post(
+        "/v1/login", json={"email": "double-logout@example.com", "password": "supersecret1"}
+    ).json()["token"]
+    auth = {"Authorization": f"Bearer {token}"}
+    assert client.post("/v1/logout", headers=auth).status_code == 200
+    # Second call is unauthenticated now (the token it would revoke is
+    # already revoked) -- 401, not a crash.
+    assert client.post("/v1/logout", headers=auth).status_code == 401
 
 
 def test_full_customer_journey(backend):
@@ -412,7 +458,7 @@ def test_ai_configure_response_carries_interpretation_confidence(monkeypatch, tm
     manually against qwen2.5:7b-instruct)."""
     monkeypatch.setenv("SENSORDYME_AI_PROVIDER", "scripted")
     monkeypatch.setenv("SENSORDYME_DB", str(tmp_path / "test.db"))
-    for mod in ("cloud.app", "cloud"):
+    for mod in ("cloud.app", "cloud", "cloud.ratelimit"):
         sys.modules.pop(mod, None)
     app_module = importlib.import_module("cloud.app")
     client = TestClient(app_module.app)
@@ -432,19 +478,22 @@ def test_ai_configure_response_carries_interpretation_confidence(monkeypatch, tm
 
 
 def test_a_notification_never_fires_for_an_event_that_was_not_stored(backend, monkeypatch):
-    """The bug: a device that reconnects after an outage can flush its whole
-    backlog (the uplink's queue holds up to 500) in one /v1/ingest POST. The
-    INSERT loop only stores the first 200 (body.events[:200]), but the
-    notification-evaluation loop used to iterate body.events unsliced — so a
-    push notification could fire for an event beyond the 200th, one that was
-    never written to the database and therefore could never appear in Recent
-    Activity. "An alert was sent without being recorded" is the exact
-    complaint this reproduces and fixes.
+    """The invariant: the notification gate must never be asked to evaluate an
+    event that was not actually written to the database — "an alert was sent
+    without being recorded" is the complaint this guards against.
 
-    Verified two ways: the row count actually stored, and — more directly —
-    that the notification gate is never even asked to evaluate an event past
-    the stored slice, by monkeypatching cloud.notify.gate.evaluate to record
-    every severity it was called with.
+    This used to be enforced by capping both the INSERT loop and the
+    notification-evaluation loop at the same 200-event slice of a batch. That
+    cap was itself a separate bug (see test_a_large_backlog_batch_is_not_
+    silently_truncated in test_cloud_backend.py): a device flushing a backlog
+    of more than 200 events after an outage had everything past the 200th
+    silently discarded while `stored` claimed the full count arrived. Now
+    there is no cap — the invariant instead holds because the notification
+    loop iterates `newly_inserted_events` (rows that actually landed),
+    never `body.events` (what was merely in the request). Verified two ways:
+    the row count actually stored, and — more directly — that the
+    notification gate is called exactly once per stored row, by
+    monkeypatching cloud.notify.gate.evaluate to record every call.
     """
     app_module, client = backend
     auth, device_headers, device_id = _claim_a_device(app_module, client)
@@ -458,8 +507,8 @@ def test_a_notification_never_fires_for_an_event_that_was_not_stored(backend, mo
 
     monkeypatch.setattr(app_module.gate, "evaluate", spying_evaluate)
 
-    # 250 loud events in one batch — over the 200 cap, and every one severe
-    # enough that, if evaluated, it would be a candidate for a push.
+    # 250 loud events in one batch — over the OLD 200 cap, and every one
+    # severe enough that, if evaluated, it would be a candidate for a push.
     events = [
         {"timestamp": f"2026-08-08T10:00:{i:02d}+00:00", "type": "test_event",
          "severity": "loud", "signals": f"event-{i}"}
@@ -469,10 +518,11 @@ def test_a_notification_never_fires_for_an_event_that_was_not_stored(backend, mo
     assert r.status_code == 200
 
     stored = client.get(f"/v1/devices/{device_id}/events", params={"limit": 1000}, headers=auth).json()["events"]
-    assert len(stored) == 200, "storage cap should still apply"
-    assert len(evaluated_severities) == 200, (
-        f"the notification gate evaluated {len(evaluated_severities)} events but only "
-        f"{len(stored)} were stored — a notification could fire for an unstored event"
+    assert len(stored) == 250, "every event in the batch must now be stored -- no silent cap"
+    assert len(evaluated_severities) == 250, (
+        f"the notification gate evaluated {len(evaluated_severities)} events but "
+        f"{len(stored)} were stored — every stored event must be evaluated exactly once, "
+        f"and nothing must be evaluated that wasn't stored"
     )
 
 
@@ -616,6 +666,110 @@ def test_a_notification_failure_does_not_affect_event_storage(backend, monkeypat
     assert len(stored) == 1, "the event must still be stored even though notifying about it failed"
 
 
+def test_send_with_retry_recovers_from_a_transient_failure(backend, monkeypatch):
+    """The bug this exists to fix: a blip at the exact moment a genuinely new
+    critical alert lands used to lose that notification permanently, with
+    zero visibility. A transient failure must not need a second real-world
+    event to arrive before the user hears about the first one."""
+    app_module, _ = backend
+    monkeypatch.setattr(app_module.time, "sleep", lambda s: None)  # don't actually wait in tests
+
+    attempts = []
+
+    def flaky():
+        attempts.append(1)
+        if len(attempts) < 3:
+            raise RuntimeError("simulated transient provider error")
+
+    app_module._send_with_retry(flaky)
+    assert len(attempts) == 3, "must keep retrying through transient failures, not give up on the first"
+
+
+def test_send_with_retry_gives_up_and_raises_after_exhausting_attempts(backend, monkeypatch):
+    """A GENUINE outage (not a blip) must still surface as a real failure to
+    the caller -- retrying forever, or swallowing the final failure, would
+    just move "silently lost" from the first attempt to the last one."""
+    app_module, _ = backend
+    monkeypatch.setattr(app_module.time, "sleep", lambda s: None)
+
+    attempts = []
+
+    def always_fails():
+        attempts.append(1)
+        raise RuntimeError("simulated persistent provider outage")
+
+    with pytest.raises(RuntimeError, match="persistent provider outage"):
+        app_module._send_with_retry(always_fails)
+    assert len(attempts) == app_module.NOTIFY_SEND_ATTEMPTS
+
+
+def test_send_push_now_detects_a_bad_http_status_instead_of_treating_it_as_success(backend, monkeypatch):
+    """Before this pass, send_push never called raise_for_status() -- an ntfy
+    500 or a rejected topic looked EXACTLY like success everywhere in the
+    system: no exception, no log line, no retry. This is the regression test
+    for that specific gap, independent of the retry mechanism itself."""
+    import requests as real_requests
+
+    app_module, _ = backend
+    monkeypatch.setattr(app_module.time, "sleep", lambda s: None)
+
+    class _FailingResponse:
+        def raise_for_status(self):
+            raise real_requests.HTTPError("500 Server Error")
+
+    monkeypatch.setattr(real_requests, "post", lambda *a, **kw: _FailingResponse())
+
+    with pytest.raises(real_requests.HTTPError):
+        app_module.send_push({"ntfy_topic": "some-topic"}, "title", "body")
+
+
+def test_notify_logs_each_channel_independently_after_retries_are_exhausted(backend, monkeypatch, caplog):
+    """A push failure must not cancel the SMS attempt, and either failure
+    must be visible in the logs -- not silently absorbed the way both were
+    before this pass."""
+    import logging as _logging
+
+    import cloud.notify as notify_module
+
+    app_module, client = backend
+    _, device_headers, _ = _claim_a_device(app_module, client)
+    # _claim_a_device always uses the same account, and the 20s per-account
+    # cooldown gate is process-wide state that outlives any one test -- a
+    # test that ran moments ago in the same process can otherwise suppress
+    # this one's notification before it's ever attempted, independent of
+    # anything this test is actually checking.
+    notify_module.gate.reset()
+    monkeypatch.setattr(app_module.time, "sleep", lambda s: None)
+
+    push_calls, sms_calls = [], []
+
+    def failing_push(user, title, body):
+        push_calls.append(1)
+        raise RuntimeError("push provider down")
+
+    def failing_sms(user, body):
+        sms_calls.append(1)
+        raise RuntimeError("sms provider down")
+
+    monkeypatch.setattr(app_module, "send_push", failing_push)
+    monkeypatch.setattr(app_module, "send_sms", failing_sms)
+
+    with caplog.at_level(_logging.WARNING, logger="uvicorn.error"):
+        client.post(
+            "/v1/ingest",
+            json={"events": [{
+                "timestamp": "2026-08-08T13:00:00+00:00", "type": "fall",
+                "severity": "loud", "signals": "rapid drop", "event_key": "both-channels-fail",
+            }]},
+            headers=device_headers,
+        )
+
+    assert push_calls and sms_calls, "both channels must actually be attempted"
+    messages = [r.message for r in caplog.records]
+    assert any("push delivery failed" in m for m in messages)
+    assert any("sms delivery failed" in m for m in messages)
+
+
 def test_one_malformed_event_does_not_sink_the_whole_batch(backend, caplog):
     """Discovered during the production QA pass, reproduced against the live
     code before any fix existed: `events: list[dict]` is unvalidated by
@@ -672,3 +826,187 @@ def test_a_malformed_event_is_logged_not_silently_dropped(backend, caplog):
             headers=device_headers,
         )
     assert any("malformed" in record.message for record in caplog.records)
+
+
+def test_a_large_backlog_batch_is_not_silently_truncated(backend):
+    """The bug: ingest() only processed `body.events[:200]` while reporting
+    `stored` as the FULL request size regardless -- and core/uplink.py clears
+    its entire local queue (up to `queue_max`, 500) the moment it gets ANY 200
+    response, never re-queuing what was dropped. A device reconnecting after
+    an outage long enough to queue more than 200 events would silently lose
+    every one past the 200th, with both sides believing the upload succeeded.
+    This sends more than the old cap to prove nothing is thrown away, and that
+    `stored` reflects what is actually in the database, not the request size.
+    """
+    app_module, client = backend
+    auth, device_headers, device_id = _claim_a_device(app_module, client)
+
+    batch_size = 250  # over the old 200-event cap
+    events = [
+        {"timestamp": f"t{i}", "type": "fall", "severity": "loud", "confidence": 0.9,
+         "event_key": f"key-{i}"}
+        for i in range(batch_size)
+    ]
+    r = client.post("/v1/ingest", json={"events": events}, headers=device_headers)
+    assert r.status_code == 200
+    assert r.json()["stored"] == batch_size, (
+        "every event in a backlog batch over the old 200-event cap must be stored, "
+        "and `stored` must reflect that -- not silently truncate"
+    )
+
+    stored = client.get(f"/v1/devices/{device_id}/events?limit=1000", headers=auth).json()["events"]
+    assert len({s["timestamp"] for s in stored}) == batch_size, (
+        "every event must actually be a row in the database, not just claimed as stored"
+    )
+
+
+def test_stored_count_reflects_actual_inserts_not_request_size(backend):
+    """`stored` must count what landed in the database. A retried event_key
+    (already stored, correctly deduplicated) and a malformed event (correctly
+    skipped) are both real, intentional non-inserts -- neither should be
+    reported as "stored", even though both were present in the request."""
+    app_module, client = backend
+    _, device_headers, _ = _claim_a_device(app_module, client)
+
+    first = client.post(
+        "/v1/ingest",
+        json={"events": [{"timestamp": "t1", "type": "fall", "event_key": "dup-key"}]},
+        headers=device_headers,
+    )
+    assert first.json()["stored"] == 1
+
+    retry_plus_bad = client.post(
+        "/v1/ingest",
+        json={"events": [
+            {"timestamp": "t1", "type": "fall", "event_key": "dup-key"},  # already stored
+            {"timestamp": "t2", "type": "fall", "confidence": "not-a-number"},  # malformed
+            {"timestamp": "t3", "type": "fall", "event_key": "fresh-key"},  # genuinely new
+        ]},
+        headers=device_headers,
+    )
+    assert retry_plus_bad.json()["stored"] == 1, (
+        "of 3 events in the request, only 1 is a genuinely new row -- `stored` must say 1, not 3"
+    )
+
+
+def test_repeated_wrong_logins_are_rate_limited(backend):
+    """Nothing else stands between /v1/login and an online password-guessing
+    script but this. 10 attempts/5min per IP (cloud/ratelimit.py); the 11th
+    within the window must be refused before it even checks the password,
+    not just fail auth the normal way."""
+    _, client = backend
+    client.post("/v1/signup", json={"email": "target@example.com", "password": "correct-horse-1"})
+
+    for _ in range(10):
+        r = client.post("/v1/login", json={"email": "target@example.com", "password": "wrong"})
+        assert r.status_code == 401
+
+    r = client.post("/v1/login", json={"email": "target@example.com", "password": "wrong"})
+    assert r.status_code == 429, "the 11th attempt in the window must be throttled, not evaluated"
+
+    # And the real password doesn't get through the throttle either -- this
+    # is a rate limit on the endpoint, not a smarter "let good guesses past".
+    r = client.post("/v1/login", json={"email": "target@example.com", "password": "correct-horse-1"})
+    assert r.status_code == 429
+
+
+def test_rate_limit_is_per_ip_not_global(backend):
+    """A limiter keyed globally instead of per-caller would let one abusive
+    client lock out every legitimate one sharing the process -- worse than
+    the bug it exists to prevent. Verified directly against the class, since
+    TestClient itself always presents as one fixed peer address."""
+    from cloud.ratelimit import RateLimiter
+
+    limiter = RateLimiter(max_attempts=3, window_s=60.0)
+    for _ in range(3):
+        assert limiter.allow("1.2.3.4")
+    assert not limiter.allow("1.2.3.4")
+    # A different caller has its own, untouched budget.
+    assert limiter.allow("5.6.7.8")
+
+
+def test_rate_limit_window_expires(backend):
+    from cloud.ratelimit import RateLimiter
+
+    t = {"now": 0.0}
+    limiter = RateLimiter(max_attempts=2, window_s=10.0)
+    assert limiter.allow("1.2.3.4", now=t["now"])
+    assert limiter.allow("1.2.3.4", now=t["now"])
+    assert not limiter.allow("1.2.3.4", now=t["now"])
+
+    t["now"] = 11.0  # past the window
+    assert limiter.allow("1.2.3.4", now=t["now"]), "an expired attempt must age out of the window"
+
+
+# ------------------------------------------------------------------ evidence-based alert text
+def test_readable_title_maps_known_types_and_falls_back_for_unknown(backend):
+    app_module, _ = backend
+    assert app_module._readable_title("fall") == "🔴 Potential Fall Detected"
+    assert app_module._readable_title("something_new") == "SensorDyme: something_new"
+
+
+def test_notification_detail_prefers_signals_over_duration(backend):
+    """A module's own signals text (e.g. occupancy's "zone=pool confirmed
+    after 12.4s") is already better evidence than the generic duration
+    fallback and must win when both are present."""
+    app_module, _ = backend
+    detail = app_module._notification_detail(
+        {"type": "fall", "signals": "zone=pool confirmed after 12.4s", "duration": 34.0}
+    )
+    assert detail == "zone=pool confirmed after 12.4s"
+
+
+def test_notification_detail_falls_back_to_duration_when_signals_empty(backend):
+    """The worked example from the product spec: fall_detection's "fall"
+    event carries no signals text, but Event.duration (how long the person
+    was down) is real, already-computed evidence."""
+    app_module, _ = backend
+    detail = app_module._notification_detail({"type": "fall", "signals": "", "duration": 34.0})
+    assert detail == "Person transitioned rapidly and remained down for 34 seconds"
+
+
+def test_notification_detail_uses_generic_template_for_an_unlisted_type_with_duration(backend):
+    app_module, _ = backend
+    detail = app_module._notification_detail({"type": "something_new", "signals": "", "duration": 12.0})
+    assert detail == "SensorDyme: something_new — sustained for 12 seconds"
+
+
+def test_notification_detail_is_bare_alert_when_neither_signals_nor_duration_available(backend):
+    """No evidence to show beats inventing some -- the old, honest fallback."""
+    app_module, _ = backend
+    assert app_module._notification_detail({"type": "fall", "signals": ""}) == "alert"
+    assert app_module._notification_detail({"type": "fall", "signals": "", "duration": 0.0}) == "alert"
+
+
+def test_a_fall_event_with_no_signals_produces_evidence_based_notification_text(backend, monkeypatch):
+    """End to end through the real ingest endpoint: a fall event with the
+    same shape core/uplink.py now actually sends (signals empty, duration
+    real) must produce a push notification with a real title and evidence,
+    not "SensorDyme: fall" / "alert"."""
+    app_module, client = backend
+    auth, device_headers, device_id = _claim_a_device(app_module, client)
+
+    pushed = []
+    monkeypatch.setattr(app_module, "send_push", lambda user, title, body: pushed.append((title, body)))
+    monkeypatch.setattr(app_module, "send_sms", lambda user, body: None)
+
+    import cloud.notify as notify_module
+
+    notify_module.gate.reset()  # process-wide singleton; see the worked-example test above
+
+    r = client.post(
+        "/v1/ingest",
+        json={"events": [{
+            "timestamp": "2026-08-08T12:00:00+00:00", "type": "fall", "severity": "loud",
+            "signals": "", "duration": 34.0, "event_key": "fall-1",
+        }]},
+        headers=device_headers,
+    )
+    assert r.status_code == 200
+    assert len(pushed) == 1
+    title, body = pushed[0]
+    assert title == "🔴 Potential Fall Detected"
+    assert body == "Person transitioned rapidly and remained down for 34 seconds"
+
+    stored = client.get(f"/v1/devices/{device_id}/events", headers=auth).json()["events"]
+    assert stored[0]["duration"] == 34.0, "duration must reach the timeline, not just the notification"

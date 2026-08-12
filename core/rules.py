@@ -36,6 +36,7 @@ from datetime import datetime
 from typing import Callable, Optional
 
 from core.detections import DetectionFrame
+from core.detectors import iou
 from core.event_engine import CONFIRMED, EventEngine, RuleSpec
 from core.zones import Zone
 
@@ -89,13 +90,13 @@ def _plural(noun: str) -> str:
     return noun + "s"
 
 
-def _boxes_overlap(a: tuple, b: tuple) -> bool:
-    """Whether two pixel-space (x1, y1, x2, y2) boxes intersect at all."""
-    return not (a[2] <= b[0] or b[2] <= a[0] or a[3] <= b[1] or b[3] <= a[1])
-
-
 def _any_overlap(boxes_a: list, boxes_b: list) -> bool:
-    return any(_boxes_overlap(a, b) for a in boxes_a for b in boxes_b)
+    """Whether any pixel-space (x1, y1, x2, y2) box in `boxes_a` intersects
+    any in `boxes_b` at all -- reuses core/detectors.py's iou() (the same
+    overlap math driver_attention.py's hand/phone check and occupancy.py's
+    tracker matching already use) rather than a second implementation of
+    box intersection."""
+    return any(iou(a, b) > 0 for a in boxes_a for b in boxes_b)
 
 
 def _upper_region(box: tuple, fraction: float = 0.35) -> tuple:

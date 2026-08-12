@@ -190,7 +190,7 @@ def backend(tmp_path, monkeypatch):
 
     monkeypatch.setenv("SENSORDYME_AI_PROVIDER", "unavailable")
     monkeypatch.setenv("SENSORDYME_DB", str(tmp_path / "test.db"))
-    for mod in ("cloud.app", "cloud"):
+    for mod in ("cloud.app", "cloud", "cloud.ratelimit"):
         sys.modules.pop(mod, None)
     app_module = importlib.import_module("cloud.app")
     client = TestClient(app_module.app)
