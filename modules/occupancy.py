@@ -344,6 +344,19 @@ class OccupancyModule(VisionModule):
         """True while any zone violation is confirmed and unresolved."""
         return bool(self._engine.active_detections())
 
+    def close(self) -> None:
+        """Release the pose-verification MediaPipe graph, if it was ever created
+        (opt-in via verify_new_tracks_with_pose -- most deployments never build
+        one). Leaked per preset/mode switch otherwise: found in a repo-wide
+        audit -- this is one of the two modules _apply_monitoring_mode/
+        _switch_preset hot-swap between, and both already call
+        old_module.close(), but this override was missing."""
+        if self._pose_verifier is not None:
+            try:
+                self._pose_verifier.close()
+            except Exception:  # noqa: BLE001 - closing twice must be harmless
+                pass
+
     def set_requested_labels(self, labels: set[str]) -> None:
         """Ask the detector for these classes too, on top of people.
 

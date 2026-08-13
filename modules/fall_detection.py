@@ -333,3 +333,14 @@ class FallDetectionModule(VisionModule):
     def is_alert_active(self) -> bool:
         """True while a fall, a zone violation, or unusual stillness is confirmed."""
         return self._alert_active or bool(self._zone_engine.active_detections())
+
+    def close(self) -> None:
+        """Release the MediaPipe Pose graph (leaked per preset/mode switch otherwise --
+        found in a repo-wide audit: this is one of the two modules
+        _apply_monitoring_mode/_switch_preset hot-swap between, and both already call
+        old_module.close(), but this override was missing, so every swap away from
+        fall_detection leaked a live Pose graph)."""
+        try:
+            self._pose.close()
+        except Exception:  # noqa: BLE001 - closing twice must be harmless
+            pass

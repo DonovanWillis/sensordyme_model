@@ -180,3 +180,15 @@ def test_person_leaving_resolves_stillness_too(module):
 
     events = _run(module, None, 150)  # occlusion_grace_s=3.0 + resolve_after_s=10.0
     assert "unusual_stillness_resolved" in [e.type for e in events]
+
+
+def test_close_releases_the_pose_graph_without_raising():
+    """Found in a repo-wide audit: fall_detection is one of the two modules
+    _apply_monitoring_mode/_switch_preset hot-swap between on every mode
+    change, and close() was previously a no-op here (base class default),
+    leaking a live MediaPipe Pose graph on every swap away from this module."""
+    mod = FallDetectionModule({
+        "drop_velocity_threshold": 0.6, "stillness_duration_s": 1.5, "stillness_velocity_threshold": 0.02,
+    })
+    mod.close()
+    mod.close()  # closing twice must be harmless

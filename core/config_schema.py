@@ -102,6 +102,46 @@ def validate(config: dict) -> tuple[list[str], list[str]]:
     else:
         errors.append("`health:` must be a mapping")
 
+    # Previously entirely unvalidated (found in a repo-wide audit) despite
+    # holding the security-relevant TLS settings: a typo'd or wrong-typed key
+    # here didn't error OR warn at boot, it just silently never connected --
+    # exactly the kind of failure that's confusing to diagnose right before a
+    # launch, when "did the config even load" shouldn't be in question.
+    cloud = config.get("cloud", {})
+    if isinstance(cloud, dict):
+        if "enabled" in cloud:
+            _check(errors, isinstance(cloud["enabled"], bool),
+                   f"`cloud.enabled:` must be true or false, got {cloud['enabled']!r}")
+        if "base_url" in cloud and cloud["base_url"]:
+            _check(errors, isinstance(cloud["base_url"], str),
+                   f"`cloud.base_url:` must be a string, got {cloud['base_url']!r}")
+        if "device_key" in cloud:
+            _check(errors, isinstance(cloud["device_key"], str),
+                   f"`cloud.device_key:` must be a string, got {cloud['device_key']!r}")
+        if "ca_cert_path" in cloud:
+            _check(errors, isinstance(cloud["ca_cert_path"], str),
+                   f"`cloud.ca_cert_path:` must be a string, got {cloud['ca_cert_path']!r}")
+        skip_verify = cloud.get("tls_insecure_skip_verify", False)
+        _check(errors, isinstance(skip_verify, bool),
+               f"`cloud.tls_insecure_skip_verify:` must be true or false, got {skip_verify!r}")
+        if "poll_interval_s" in cloud:
+            poll = cloud["poll_interval_s"]
+            _check(errors, _is_num(poll) and poll > 0,
+                   f"`cloud.poll_interval_s:` must be a positive number, got {poll!r}")
+        if cloud.get("enabled") and not str(cloud.get("base_url", "")).startswith(("http://", "https://")):
+            errors.append(
+                f"`cloud.base_url:` must start with http:// or https:// when cloud.enabled is true, "
+                f"got {cloud.get('base_url')!r}"
+            )
+        if skip_verify and str(cloud.get("base_url", "")).startswith("https://"):
+            warnings.append(
+                "cloud.tls_insecure_skip_verify is true with an https:// base_url: certificate "
+                "verification is OFF -- any attacker on the network path can intercept every event; "
+                "only ever use this for a self-signed dev backend, never in the field"
+            )
+    else:
+        errors.append("`cloud:` must be a mapping")
+
     module_name = config.get("module")
     modules_cfg = config.get("modules", {})
     if profile != "mac_max" and isinstance(module_name, str) and isinstance(modules_cfg, dict):

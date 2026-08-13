@@ -19,6 +19,7 @@ from dataclasses import dataclass
 
 from core.activity import (
     ActivityRecognizer,
+    FLAIL_MIN_REVERSALS,
     HAND_RAISED_MARGIN,
     MIN_SAMPLES,
     WAVE_MIN_SWINGS,
@@ -187,3 +188,80 @@ class TestHandRaisedMargin:
         """A drooped head must not turn a normal wrist position into 'raised':
         the margin is against the shoulder line, which droop does not move."""
         assert HAND_RAISED_MARGIN > 0
+
+
+class TestFlailing:
+    def _flail(self, count: int, amplitude: float = 0.15, height: float = 0.30) -> list[dict]:
+        """A wrist reversing direction EVERY frame -- fast and chaotic, unlike
+        a wave's period-3 rhythmic swing. height=0.30 sits BELOW the shoulder
+        line (0.20) on purpose: flailing must not require a raised hand."""
+        frames = []
+        for step in range(count):
+            x = 0.55 + amplitude * (1 if step % 2 else -1)
+            frames.append({**_STANDING, 16: (x, height)})
+        return frames
+
+    def test_fast_chaotic_wrist_motion_at_any_height_is_flailing(self):
+        state = _feed(ActivityRecognizer(), self._flail(12))
+        assert state.flailing.present
+        assert not state.hand_raised.present  # height=0.30 is below the shoulder line
+
+    def test_flailing_reports_kinematic_signals(self):
+        state = _feed(ActivityRecognizer(), self._flail(12))
+        assert state.signals["right_wrist_peak_speed"] > 0
+        assert state.signals["right_wrist_reversals"] >= FLAIL_MIN_REVERSALS
+
+    def test_a_single_fast_reach_with_no_reversal_is_not_flailing(self):
+        """High speed alone (one direction, no chaos) is the nearest innocent
+        motion this must not fire on -- reaching quickly for something."""
+        frames = _repeat({**_STANDING, 16: (0.40, 0.30)}, 3)
+        frames += _repeat({**_STANDING, 16: (0.85, 0.30)}, 9)  # one fast, sustained move
+        state = _feed(ActivityRecognizer(), frames)
+        assert not state.flailing.present
+
+    def test_slow_deliberate_back_and_forth_is_not_flailing(self):
+        """Low speed, few reversals -- ordinary hand movement, not distress."""
+        frames = []
+        for step in range(12):
+            x = 0.55 + 0.06 * (1 if (step // 4) % 2 else -1)
+            frames.append({**_STANDING, 16: (x, 0.30)})
+        state = _feed(ActivityRecognizer(), frames)
+        assert not state.flailing.present
+
+    def test_deliberate_wave_is_not_automatically_flailing(self):
+        """A greeting wave (period-3, wide swings, 3 reversals) sits below
+        flailing's higher reversal-count bar (FLAIL_MIN_REVERSALS=4) -- the two
+        are related but distinct motions, not the same detector twice."""
+        state = _feed(ActivityRecognizer(), TestWaving()._oscillate(12))
+        assert state.waving.present
+        assert not state.flailing.present
+
+    def test_jitter_sized_oscillation_is_not_flailing(self):
+        """Landmark noise produces direction changes with near-zero travel --
+        must not cross the per-reversal amplitude floor."""
+        frames = []
+        for step in range(12):
+            x = 0.55 + 0.005 * (1 if step % 2 else -1)
+            frames.append({**_STANDING, 16: (x, 0.30)})
+        state = _feed(ActivityRecognizer(), frames)
+        assert not state.flailing.present
+
+    def test_both_arms_flailing_boosts_confidence_over_one_arm(self):
+        one_arm = self._flail(12)  # left wrist (15) stays unset/invisible -- one arm only
+        both_arms = []
+        for step in range(12):
+            x = 0.55 + 0.15 * (1 if step % 2 else -1)
+            lx = 0.40 + 0.15 * (1 if step % 2 else -1)
+            both_arms.append({**_STANDING, 16: (x, 0.30), 15: (lx, 0.30)})
+        one_state = _feed(ActivityRecognizer(), one_arm)
+        both_state = _feed(ActivityRecognizer(), both_arms)
+        assert one_state.flailing.present and both_state.flailing.present
+        assert both_state.flailing.confidence > one_state.flailing.confidence
+
+    def test_flailing_thresholds_are_configurable(self):
+        """The product requirement is a configurable threshold, not a fixed
+        constant -- a stricter override must reject the same motion the
+        default thresholds accept."""
+        strict = ActivityRecognizer(flail_min_reversals=50)
+        state = _feed(strict, self._flail(12))
+        assert not state.flailing.present

@@ -339,3 +339,21 @@ def test_confirmed_pose_adds_no_spurious_note(verifying_module, monkeypatch):
     events = _run_timed(verifying_module, [IN_ENTRY], 15, monkeypatch)
     lingering = next(e for e in events if e.type == "person_lingering")
     assert "no body pose confirmed" not in lingering.contributing_signals
+
+
+def test_close_releases_the_pose_verifier_once_created(verifying_module):
+    """Found in a repo-wide audit: occupancy is one of the two modules
+    _apply_monitoring_mode/_switch_preset hot-swap between on every mode
+    change, and close() was previously a no-op here (base class default) --
+    the opt-in pose verifier this module can create leaked on every swap."""
+    verifying_module._ensure_pose_verifier()
+    assert verifying_module._pose_verifier is not None
+    verifying_module.close()
+    verifying_module.close()  # closing twice must be harmless
+
+
+def test_close_is_a_safe_no_op_when_no_pose_verifier_was_ever_created(module):
+    """Most deployments never turn on verify_new_tracks_with_pose -- close()
+    must not try to release something that was never built."""
+    assert module._pose_verifier is None
+    module.close()  # must not raise

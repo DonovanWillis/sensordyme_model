@@ -33,6 +33,17 @@ a noisy measurement — before any boolean is derived from it.
                      survives spectacle frames better than the eyelid contour,
                      and the ratio is normalised by the iris's own diameter so
                      it is distance- and lens-magnification-invariant.
+`eye_gaze_offset_deg` eye-IN-HEAD deviation (yaw, pitch), from the same iris
+                     landmarks, independent of head pose -- what lets a driver-
+                     attention threshold tell "head forward, eyes on the road"
+                     apart from "head forward, eyes in the driver's lap": whole-
+                     head yaw/pitch (solvePnP on 6 landmarks) cannot see the
+                     eyes move without the head moving. Added to head yaw/pitch
+                     this produces a fused gaze vector -- the same approach
+                     modules/driver_attention_max.py's `_compute_gaze_components`
+                     already validated on the Mac-only profile, reimplemented
+                     independently here (that module imports FROM this one, so
+                     the reverse would be circular) rather than shared code.
 
 Everything here is arithmetic on a handful of floats per frame — nothing runs
 inference, so the Pi's frame budget is untouched.
@@ -96,6 +107,69 @@ def iris_openness(points: Sequence[Point]) -> Optional[float]:
     if not ratios:
         return None
     return sum(ratios) / len(ratios)
+
+
+# Eye "socket" landmarks -- the same 6-point EAR box modules/driver_attention.py's
+# LEFT_EYE/RIGHT_EYE already use, duplicated here (not imported) because these are
+# stable, independent MediaPipe FaceMesh index constants and this module already
+# holds its own eye-landmark knowledge (see RIGHT_EYE_VERTICALS/LEFT_EYE_VERTICALS
+# above, themselves subsets of the same 6 points).
+_LEFT_EYE_SOCKET = (362, 385, 387, 263, 373, 380)
+_RIGHT_EYE_SOCKET = (33, 160, 158, 133, 153, 144)
+
+# Extreme iris deflection to the edge of its socket reads as roughly this many
+# degrees of eye-in-head rotation. An approximation (irises don't sweep through a
+# literal angle the way a pinhole-camera model would compute) -- the SAME
+# approximation already validated on the mac_max profile
+# (modules/driver_attention_max.py's EYE_GAZE_SCALE_DEG), reused here rather than
+# re-derived from nothing.
+EYE_GAZE_SCALE_DEG = 40.0
+
+
+def eye_gaze_offset_deg(
+    points: Sequence[Point], scale_deg: float = EYE_GAZE_SCALE_DEG
+) -> Optional[tuple[float, float]]:
+    """Eye-in-head deviation (yaw, pitch), in pseudo-degrees, from iris position
+    within each eye's own socket -- averaged across both eyes, independent of
+    head pose.
+
+    Returns None when neither eye's socket geometry is usable (degenerate width/
+    height -- an extreme angle or a landmark dropout), never a wrong number.
+    """
+
+    def _eye_component(socket: tuple[int, ...], iris_index: int) -> Optional[tuple[float, float]]:
+        try:
+            eye_points = [points[i] for i in socket]
+            iris = points[iris_index]
+        except (IndexError, TypeError):
+            return None
+        xs = [p[0] for p in eye_points]
+        ys = [p[1] for p in eye_points]
+        center_x, center_y = sum(xs) / len(xs), sum(ys) / len(ys)
+        width, height = max(xs) - min(xs), max(ys) - min(ys)
+        if width <= 0 or height <= 0:
+            return None
+        return (iris[0] - center_x) / width, (iris[1] - center_y) / height
+
+    right = _eye_component(_RIGHT_EYE_SOCKET, RIGHT_IRIS[0])
+    left = _eye_component(_LEFT_EYE_SOCKET, LEFT_IRIS[0])
+    components = [c for c in (right, left) if c is not None]
+    if not components:
+        return None
+    h_ratio = sum(c[0] for c in components) / len(components)
+    v_ratio = sum(c[1] for c in components) / len(components)
+    # v_ratio is POSITIVE when the iris sits toward the LOWER eyelid (larger
+    # image y = physically looking down) -- but this module's pitch convention
+    # (shared with modules/driver_attention.py's estimate_head_pose_deg, whose
+    # own docstring documents the same head-pose sign fix) is NEGATIVE = down,
+    # so the vertical component is negated to fuse consistently with head
+    # pitch: "head level, eyes cast down" must ADD toward eyes_down (more
+    # negative), not partially cancel it. Verified against
+    # estimate_head_pose_deg's own already-confirmed sign
+    # (tests/test_eye_gaze.py), not assumed. h_ratio needs no such flip: image-
+    # right already matches this module's "positive yaw = turned toward the
+    # frame's right" convention directly.
+    return h_ratio * scale_deg, -v_ratio * scale_deg
 
 
 class SignalSmoother:

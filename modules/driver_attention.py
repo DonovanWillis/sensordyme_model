@@ -9,7 +9,13 @@ behavior (blinks, mirror checks) never fires an event:
     "fatigue_warning" for a driver who blinks heavily but never has one long
     closure.
   * Distraction — head yaw/pitch from solvePnP on 6 canonical landmarks,
-    corrected against a calibrated neutral pose (see AttentionCalibrator)
+    FUSED with eye-in-head offset from the iris landmarks (core/eye_signal.py's
+    eye_gaze_offset_deg) into one gaze vector, so "head forward, eyes down"
+    is not invisible the way head-pose-alone would make it -- iris landmarks
+    are already computed every frame (refine_landmarks=True below), so this
+    is arithmetic on numbers already paid for. `enable_gaze: false` reverts
+    to head-pose-only. The fused yaw/pitch is then corrected against a
+    calibrated neutral pose (see AttentionCalibrator)
     so a camera mounted off to the side of the dashboard doesn't read
     ordinary forward driving as a head turn -- looking at the camera isn't
     "attentive" and looking away from it isn't "distracted"; only the
@@ -87,7 +93,8 @@ import numpy as np
 from core.detections import Detection, DetectionFrame
 from core.detectors import Box, get_yolo_model, iou
 from core.events import Event
-from core.eye_signal import AdaptiveBaseline, SignalSmoother, iris_openness
+from core.eye_signal import AdaptiveBaseline, SignalSmoother, eye_gaze_offset_deg, iris_openness
+from core.tracking import BoxTracker
 from modules.base import (
     CorroboratedGraceTracker,
     GracedConditionTracker,
@@ -303,7 +310,14 @@ class AttentionCalibrator:
     #: sustained upward tilt, never a downward one. A v1 or v2 file was
     #: computed from the old, inverted raw readings and is not merely stale
     #: but actively backwards under the fix -- must be rejected, not kept.
-    FORMAT_VERSION = 3
+    #: Version 4: baseline_yaw/baseline_pitch now calibrate against the FUSED
+    #: gaze vector (head pose + eye-in-head offset from the iris landmarks --
+    #: see core/eye_signal.py's eye_gaze_offset_deg) instead of head pose
+    #: alone. A v3 file's baseline was learned from head angle only, so
+    #: reusing it against the new fused signal would offset every threshold
+    #: by whatever the calibration-window eye position happened to be --
+    #: must be rejected and recalibrated, not silently reinterpreted.
+    FORMAT_VERSION = 4
 
     def _load(self) -> None:
         if not self._path.exists():
@@ -690,6 +704,22 @@ class DriverAttentionModule(VisionModule):
             float(config.get("eyes_up_seconds", 2.5)), release_s
         )
 
+        # --- eye gaze (independent of head pose) -----------------------------
+        # Whole-head yaw/pitch (solvePnP) cannot see the eyes move without the
+        # head moving, so "head forward, eyes down" was structurally invisible
+        # before this: eyes_down/eyes_up/distraction all read the fused gaze
+        # vector (head + eye-in-head offset) below, not head pose alone. Iris
+        # landmarks 468-477 are already computed every frame (refine_landmarks=
+        # True below), so this is arithmetic on numbers already paid for, not
+        # new inference. `enable_gaze: false` restores pure head-pose behavior
+        # (e.g. for A/B comparison, or a face crop too small for a reliable iris
+        # fit) with zero other code changes.
+        self._enable_gaze = bool(config.get("enable_gaze", True))
+        self._gaze_scale_deg = float(config.get("eye_gaze_scale_deg", 40.0))
+        self._last_head_yaw = 0.0  # head pose alone, uncalibrated -- debug/comparison only
+        self._last_head_pitch = 0.0
+        self._last_gaze_offset: Optional[tuple[float, float]] = None
+
         # --- face lost: the camera can't see the driver's face at all (turned fully away,
         # slumped over, obstructed) -- a real gap in naive logic, which otherwise treats
         # "no landmarks" as "nothing to report" instead of a risk signal in its own right.
@@ -712,6 +742,24 @@ class DriverAttentionModule(VisionModule):
         self._yolo_class_map: dict[str, str] = dict(config.get("yolo_classes", {}))
         self._enable_hands = bool(config.get("enable_hands", True))
         self._hand_phone_iou_threshold = float(config.get("hand_phone_iou_threshold", 0.2))
+
+        # --- erratic hand movement (hands leaving the wheel / frantic motion) ---
+        # Reuses the SAME hand boxes already computed for phone-IoU checking below
+        # (no added inference), tracked over time via core.tracking.BoxTracker so
+        # "erratic" is judged from trajectory (peak speed AND a direction-reversal
+        # count, the same two-signal pattern core/activity.py's Baby Mode flailing
+        # detector uses) rather than a two-frame position delta. Driver Mode has no
+        # full-body Pose model (only MediaPipe Hands, strided with the object
+        # detector), so this is coarser-grained than Baby Mode's every-frame
+        # wrist kinematics -- see the module's final report for that limitation.
+        self._hand_tracker = BoxTracker()
+        self._erratic_hand_min_speed = float(config.get("erratic_hand_min_speed", 2.0))
+        self._erratic_hand_min_reversals = int(config.get("erratic_hand_min_reversals", 3))
+        self._erratic_hands_tracker = GracedConditionTracker(
+            float(config.get("erratic_hands_seconds", 1.0)), release_s
+        )
+        self._erratic_hands_active = False
+        self._hands_erratic_raw = False
         self._phone_use_tracker = GracedConditionTracker(
             float(config.get("phone_use_seconds", 2.0)), release_s
         )
@@ -893,6 +941,23 @@ class DriverAttentionModule(VisionModule):
             for phone_box in phone_boxes
         )
 
+        # Erratic hand movement: peak speed AND a direction-reversal count over
+        # this hand's own tracked trajectory -- a single fast, smooth reach (one
+        # direction, no reversals) must not qualify, same false-positive
+        # boundary core/activity.py's flailing detector draws for Baby Mode.
+        # Sampled at the object-detector's own stride (this method only runs on
+        # a stride tick), debounced in process() like every other raw signal here.
+        aspect = w / max(h, 1)
+        hand_detections = [("hand", box, 1.0) for box in hand_boxes]
+        matched_hands = self._hand_tracker.update(hand_detections, time.monotonic(), aspect)
+        erratic = False
+        for track in matched_hands:
+            speed = track.velocity(aspect)
+            if speed is not None and speed > self._erratic_hand_min_speed:
+                if track.reversals(min_amplitude=0.15, aspect=aspect) >= self._erratic_hand_min_reversals:
+                    erratic = True
+        self._hands_erratic_raw = erratic
+
         phone_now_visible = bool(phone_boxes)
         if phone_now_visible and not self._phone_visible_prev:
             self._pending_phone_detected_edge = True
@@ -921,22 +986,75 @@ class DriverAttentionModule(VisionModule):
         eating_visible = bool(self._last_eating_boxes)
         eating_risk = 1.0 if eating_visible else 0.0
 
+        # Independent of face state -- a driver's hands leaving the wheel or
+        # moving erratically matters whether or not their face is currently
+        # resolvable, so this runs unconditionally every frame, not inside
+        # the face-found/face-lost branches below.
+        fired = self._erratic_hands_tracker.update(self._hands_erratic_raw, now)
+        self._erratic_hands_active = self._erratic_hands_tracker.is_active
+        if fired is not None:
+            events.append(Event.now(
+                "erratic_hand_movement", fired, 0.7, self.name,
+                "sustained rapid, chaotic hand motion",
+            ))
+
         if not results.multi_face_landmarks:
             self._last_face_proto = None
-            # Advance the condition trackers with False rather than forcing the
-            # active flags off: their release grace is what stops a one-frame
-            # tracking dropout (common with glasses glare) from flickering the
-            # alert screen and restarting every timer. A sustained loss still
-            # releases them within release_s, and face_lost takes over as the
-            # active signal for it.
+            # A significant head turn is a common way to LOSE FaceMesh lock
+            # entirely -- it is tuned for near-frontal faces, so "no landmarks"
+            # can BE the very thing being measured, not merely "nothing to
+            # report". Naively feeding False here resets the distraction/
+            # eyes-down/eyes-up clocks to zero the instant that happens, so a
+            # fast, wide turn (which breaks landmark tracking almost
+            # immediately) would only ever reach the far more patient
+            # face_lost/attention_lost path below -- never "distraction".
+            #
+            # If the object detector still finds a person-shaped body
+            # (self._last_person_visible -- the driver hasn't left, just turned
+            # far enough that their face isn't resolvable) AND the last
+            # calibrated gaze reading before losing lock already showed yaw/
+            # pitch past its threshold, that condition is carried forward
+            # rather than reset: a head doesn't snap back to centered between
+            # frames, so "we can no longer measure the angle" is not evidence
+            # the turn ended. This is what lets a fast, wide turn still
+            # accumulate toward "distraction" on its own few-second clock
+            # instead of silently losing all progress. Bounded, not invented:
+            # only coasts an ALREADY-observed condition, never manufactures one,
+            # and face_lost's own tracker (below) keeps running in parallel in
+            # case the driver has actually left rather than merely turned.
+            coast = self._last_person_visible and self._calibrator.is_calibrated
+            coasted_distract = coast and abs(self._last_yaw) > self._yaw_threshold_deg
+            coasted_mirror = coast and abs(self._last_yaw) > self._mirror_check_yaw_deg
+            coasted_eyes_down = coast and self._last_pitch < self._pitch_threshold_deg
+            coasted_eyes_up = coast and self._last_pitch > self._pitch_up_threshold_deg
+
+            # Eye state has no such physical continuity to coast on (closed eyes
+            # do not imply anything about the next moment), so drowsiness still
+            # resets on face loss exactly as before.
             self._drowsy_tracker.update(False, now)
-            self._distract_tracker.update(False, corroborated=False, now=now)
-            self._eyes_down_tracker.update(False, now)
-            self._eyes_up_tracker.update(False, now)
+            fired = self._distract_tracker.update(coasted_distract, corroborated=coasted_mirror, now=now)
             self._drowsy_active = self._drowsy_tracker.is_active
             self._distracted_active = self._distract_tracker.is_active
+            if fired is not None:
+                confidence = min(1.0, abs(self._last_yaw) / 90.0)
+                events.append(Event.now(
+                    "distraction", fired, confidence, self.name,
+                    "face lost mid-turn; extrapolated from last known gaze",
+                ))
+            fired = self._eyes_down_tracker.update(coasted_eyes_down, now)
             self._eyes_down_active = self._eyes_down_tracker.is_active
+            if fired is not None:
+                events.append(Event.now(
+                    "eyes_down", fired, min(1.0, abs(self._last_pitch) / 90.0), self.name,
+                    "face lost mid-glance; extrapolated from last known gaze",
+                ))
+            fired = self._eyes_up_tracker.update(coasted_eyes_up, now)
             self._eyes_up_active = self._eyes_up_tracker.is_active
+            if fired is not None:
+                events.append(Event.now(
+                    "eyes_up", fired, min(1.0, abs(self._last_pitch) / 90.0), self.name,
+                    "face lost mid-glance; extrapolated from last known gaze",
+                ))
 
             # A face the camera can't see at all is its own risk signal, not "nothing to
             # report" -- see the class docstring on _face_lost_tracker for why. But a
@@ -958,9 +1076,18 @@ class DriverAttentionModule(VisionModule):
             face_lost_risk = 0.0
             if self._face_lost_active:
                 face_lost_risk = 1.0 if not self._face_lost_tracker.corroborated else 0.5
+            # Coasting (above) can make these active even without a face reading
+            # this frame, so gaze risk mirrors the normal path's weighting
+            # rather than being hardcoded to zero the moment the face is lost.
+            gaze_risk = (
+                1.0 if (self._eyes_down_active or self._eyes_up_active)
+                else 1.0 if (self._distracted_active and not self._distract_tracker.corroborated)
+                else 0.6 if self._distracted_active
+                else 0.0
+            )
             score, risk_event = self._risk_fusion.update(
                 eye_risk=0.0,
-                gaze_risk=0.0,
+                gaze_risk=gaze_risk,
                 phone_risk=0.5 if phone_visible else 0.0,
                 eating_risk=eating_risk,
                 face_lost_risk=face_lost_risk,
@@ -1017,11 +1144,25 @@ class DriverAttentionModule(VisionModule):
         )
         pose = estimate_head_pose_deg(image_points, (h, w))
         raw_yaw, raw_pitch = pose if pose is not None else (None, None)
+        raw_gaze_yaw, raw_gaze_pitch = raw_yaw, raw_pitch
         if raw_yaw is not None:
             self._last_yaw_raw = raw_yaw
             self._last_pitch_raw = raw_pitch
+            self._last_head_yaw = raw_yaw
+            self._last_head_pitch = raw_pitch
+            # Eye-in-head offset from the iris, fused onto head pose -- see the
+            # module docstring and core/eye_signal.eye_gaze_offset_deg. Falls
+            # back to head-pose-only for this frame if the iris fit is
+            # degenerate (extreme angle, a blink) rather than propagating None
+            # into calibration/thresholds; EAR-based drowsiness already covers
+            # the closed-eye case independently.
+            gaze_offset = eye_gaze_offset_deg(points, self._gaze_scale_deg) if self._enable_gaze else None
+            self._last_gaze_offset = gaze_offset
+            if gaze_offset is not None:
+                raw_gaze_yaw = raw_yaw + gaze_offset[0]
+                raw_gaze_pitch = raw_pitch + gaze_offset[1]
 
-        self._calibrator.observe(ear, raw_yaw, raw_pitch, now)
+        self._calibrator.observe(ear, raw_gaze_yaw, raw_gaze_pitch, now)
 
         # --- drowsiness: calibrated EAR against a session-adaptive reference ---
         # The stored calibration answers "what does an open eye measure" for
@@ -1105,9 +1246,9 @@ class DriverAttentionModule(VisionModule):
             # exactly where spectacle frames sit) spikes by tens of degrees on
             # a single bad frame, and a spike was enough to seed a false
             # glance "episode" in the counter below.
-            yaw = self._yaw_smoother.update(angle_delta_deg(raw_yaw, self._calibrator.baseline_yaw))
+            yaw = self._yaw_smoother.update(angle_delta_deg(raw_gaze_yaw, self._calibrator.baseline_yaw))
             pitch = self._pitch_smoother.update(
-                angle_delta_deg(raw_pitch, self._calibrator.baseline_pitch)
+                angle_delta_deg(raw_gaze_pitch, self._calibrator.baseline_pitch)
             )
             self._last_yaw = yaw
             self._last_pitch = pitch
@@ -1234,11 +1375,14 @@ class DriverAttentionModule(VisionModule):
             "ear_threshold": self._last_ear_threshold,
             "yaw_deg": self._last_yaw,
             "pitch_deg": self._last_pitch,
+            "head_yaw_deg": self._last_head_yaw,
+            "head_pitch_deg": self._last_head_pitch,
             "perclos": self._last_perclos,
             "risk_score": self._last_risk_score,
             "phone_visible": bool(self._last_phone_boxes),
             "hand_count": len(self._last_hand_boxes),
             "eating_visible": bool(self._last_eating_boxes),
+            "erratic_hands": self._erratic_hands_active,
         }
 
     def _gaze_label(self) -> str:
@@ -1302,13 +1446,21 @@ class DriverAttentionModule(VisionModule):
                 or self._phone_use_active or self._drowsy_active or self._face_lost_active
             ),
             "gaze": self._gaze_label(),
-            "head_yaw_deg": round(self._last_yaw, 1),
-            "head_pitch_deg": round(self._last_pitch, 1),
+            "gaze_yaw_deg": round(self._last_yaw, 1),
+            "gaze_pitch_deg": round(self._last_pitch, 1),
+            "head_yaw_deg": round(self._last_head_yaw, 1),
+            "head_pitch_deg": round(self._last_head_pitch, 1),
+            "eye_gaze_offset_deg": (
+                (round(self._last_gaze_offset[0], 1), round(self._last_gaze_offset[1], 1))
+                if self._last_gaze_offset is not None else None
+            ),
             "ear": round(self._last_ear, 3),
             "ear_threshold": round(self._last_ear_threshold, 3),
             "phone_detected": bool(self._last_phone_boxes),
             "phone_confidence": phone_confidence,
             "hand_overlaps_phone": self._hand_overlaps_phone,
+            "erratic_hands_state": self._phase_label(self._hands_erratic_raw, self._erratic_hands_tracker),
+            "erratic_hands_duration_s": round(self._erratic_hands_tracker.elapsed(now), 1),
             "distraction_state": self._phase_label(abs(self._last_yaw) > self._yaw_threshold_deg, self._distract_tracker),
             "distraction_duration_s": round(self._distract_tracker.elapsed(now), 1),
             "eyes_down_state": self._phase_label(self._last_pitch < self._pitch_threshold_deg, self._eyes_down_tracker),
@@ -1338,6 +1490,8 @@ class DriverAttentionModule(VisionModule):
             return "EYES_UP"
         if self._distracted_active:
             return "DISTRACTED"
+        if self._erratic_hands_active:
+            return "ERRATIC_HANDS"
         if self._risk_fusion.is_high_risk_active:
             return "HIGH_RISK"
         return "OK"
@@ -1361,8 +1515,17 @@ class DriverAttentionModule(VisionModule):
             color = (0, 0, 255) if is_active_phone_use else (0, 165, 255)
             cv2.rectangle(frame, (x1, y1), (x2, y2), color, 2)
             cv2.putText(frame, label, (x1, max(0, y1 - 5)), cv2.FONT_HERSHEY_SIMPLEX, 0.55, color, 2)
+        hand_color = (0, 0, 255) if self._erratic_hands_active else (255, 0, 255)
         for x1, y1, x2, y2 in self._last_hand_boxes:
-            cv2.rectangle(frame, (x1, y1), (x2, y2), (255, 0, 255), 2)
+            cv2.rectangle(frame, (x1, y1), (x2, y2), hand_color, 2)
+        if self._erratic_hands_active:
+            # y=270: below every debug-overlay line annotate_debug() may have
+            # already drawn (gaze pitch/raw pose/eye-offset/PERCLOS/state, up
+            # to y=240), so this never collides whether or not --debug is on.
+            cv2.putText(
+                frame, "ERRATIC HAND MOVEMENT", (10, 270),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 0, 255), 2,
+            )
         if self._face_lost_active:
             cv2.putText(
                 frame, "FACE NOT VISIBLE", (10, 120), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 0, 255), 2
@@ -1373,6 +1536,23 @@ class DriverAttentionModule(VisionModule):
                 cv2.FONT_HERSHEY_SIMPLEX, 0.55, (0, 0, 255), 2,
             )
         return frame
+
+    def _draw_gaze_arrow(self, frame: np.ndarray, eye_yaw: float, eye_pitch: float) -> None:
+        """Debug-only: a short arrow from the face center in the eye-in-head
+        offset direction -- lets a developer visually confirm the iris signal
+        is tracking real eye movement, separate from the head-pose axes."""
+        if self._last_face_proto is None:
+            return
+        h, w = frame.shape[:2]
+        xs = [lm.x * w for lm in self._last_face_proto.landmark]
+        ys = [lm.y * h for lm in self._last_face_proto.landmark]
+        center = (int(sum(xs) / len(xs)), int(sum(ys) / len(ys)))
+        scale = max(1.0, self._gaze_scale_deg)
+        tip = (
+            int(center[0] + (eye_yaw / scale) * 80),
+            int(center[1] + (eye_pitch / scale) * 80),
+        )
+        cv2.arrowedLine(frame, center, tip, (255, 0, 255), 2, tipLength=0.3)
 
     def _draw_risk_bar(self, frame: np.ndarray) -> None:
         """Draw the composite risk score as a labeled, color-coded bar."""
@@ -1389,11 +1569,12 @@ class DriverAttentionModule(VisionModule):
         """Full tuning overlay: raw + calibrated yaw/pitch, PERCLOS, risk inputs, state label."""
         frame = self.annotate(frame)
         cv2.putText(
-            frame, f"Pitch: {self._last_pitch:.1f} deg", (10, 145), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 255), 2
+            frame, f"Gaze pitch: {self._last_pitch:.1f} deg (head {self._last_head_pitch:.1f})",
+            (10, 145), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 255), 2
         )
         cv2.putText(
             frame,
-            f"Raw yaw/pitch: {self._last_yaw_raw:.1f} / {self._last_pitch_raw:.1f} deg "
+            f"Raw head yaw/pitch: {self._last_yaw_raw:.1f} / {self._last_pitch_raw:.1f} deg "
             f"(baseline {self._calibrator.baseline_yaw:.1f} / {self._calibrator.baseline_pitch:.1f})",
             (10, 170),
             cv2.FONT_HERSHEY_SIMPLEX,
@@ -1401,6 +1582,13 @@ class DriverAttentionModule(VisionModule):
             (0, 255, 255),
             1,
         )
+        if self._last_gaze_offset is not None:
+            eye_yaw, eye_pitch = self._last_gaze_offset
+            cv2.putText(
+                frame, f"Eye-in-head offset: {eye_yaw:+.1f} / {eye_pitch:+.1f} deg",
+                (10, 240), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 255), 1,
+            )
+            self._draw_gaze_arrow(frame, eye_yaw, eye_pitch)
         cv2.putText(
             frame,
             f"PERCLOS: {self._last_perclos * 100:.1f}%  Glances: {self._glance_counter.count}/{self._glance_min_count}",
@@ -1424,5 +1612,6 @@ class DriverAttentionModule(VisionModule):
             or self._eyes_up_active
             or self._phone_use_active
             or self._face_lost_active
+            or self._erratic_hands_active
             or self._risk_fusion.is_high_risk_active
         )

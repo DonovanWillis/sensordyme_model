@@ -44,6 +44,7 @@ ALERT_EVENT_TYPES_PI = {
     "attention_lost",
     "elevated_risk",
     "high_risk",
+    "erratic_hand_movement",
 }
 # openpilot's own alert names (modules/driver_attention_openpilot.py): the orange
 # "prompt" tier chimes (soft), the red terminal tier is continuous (loud); the green

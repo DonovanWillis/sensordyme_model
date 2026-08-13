@@ -35,6 +35,15 @@ _STREAM_FPS = 12  # cap on frames pushed to a connected viewer (detection still 
 _MAX_EVENTS = 200
 _MAX_RISK_POINTS = 360  # ~6 minutes at 1 sample/s
 
+# How long the "flash red" signal stays true after a new event lands in Recent
+# Activity. Deliberately EDGE-triggered (once per event, for this long), not
+# tied to is_alert_active()'s continuous "is a condition still ongoing" state:
+# an object that remains visible must not keep the screen flashing, but every
+# genuinely new event must produce a visible flash even for a page polling at
+# 1 sample/s. services/runtime.py tracks the same duration independently for
+# the baked-in MJPEG/cv2 overlay; this one drives the web page's own flash.
+FLASH_DURATION_S = 1.5
+
 
 class DashboardServer:
     """Threaded local web app fed by the main loop; never blocks the camera."""
@@ -71,6 +80,7 @@ class DashboardServer:
         self._counts: Counter = Counter()
         self._status: dict = {}
         self._alert_active = False
+        self._flash_until = 0.0
         self._risk_series: deque[tuple[float, float]] = deque(maxlen=_MAX_RISK_POINTS)
         self._last_risk_sample = 0.0
         self._started_at = time.time()
@@ -254,7 +264,15 @@ class DashboardServer:
                 self._jpeg_seq += 1
 
     def push_event(self, event, severity: str = "log") -> None:
-        """Record one Event for the timeline. severity: 'loud' | 'soft' | 'log'."""
+        """Record one Event for the timeline. severity: 'loud' | 'soft' | 'log'.
+
+        Every call here is a genuinely new event reaching Recent Activity (this
+        is THE single choke point every event type -- built-in or AI-configured
+        rule -- passes through; see services/runtime.py), so this is also
+        where the edge-triggered flash signal is armed. Deliberately NOT
+        gated on severity: the product requirement is "every new event
+        flashes", not just loud ones.
+        """
         with self._lock:
             self._events.appendleft(
                 {
@@ -266,6 +284,18 @@ class DashboardServer:
                 }
             )
             self._counts[event.type] += 1
+            self._flash_until = time.time() + FLASH_DURATION_S
+
+    def flash_active(self, now: Optional[float] = None) -> bool:
+        """True for FLASH_DURATION_S after the most recent push_event() call.
+
+        Edge-triggered, not level-triggered: this is what lets the web page
+        flash red once per new event and then return to normal, instead of
+        flashing continuously for as long as an underlying condition (an
+        object still visible, a driver still distracted) remains true.
+        """
+        with self._lock:
+            return (time.time() if now is None else now) < self._flash_until
 
     def push_status(self, alert_active: bool, snapshot: Optional[dict]) -> None:
         """Update the live status card; samples the risk sparkline at ~1Hz."""
@@ -361,6 +391,7 @@ class DashboardServer:
                 "module": self._module_name,
                 "uptime_s": int(time.time() - self._started_at),
                 "alert_active": self._alert_active,
+                "flash_active": time.time() < self._flash_until,
                 "status": dict(self._status),
                 "events": list(self._events)[:60],
                 "counts": [{"type": t, "n": n} for t, n in top_counts],
@@ -430,6 +461,14 @@ _PAGE = """<!DOCTYPE html>
           box-shadow:0 2px 8px rgba(0,0,0,.25); transition:background .2s; }
   .pill.alert { background:var(--bad); animation:pulse 1s infinite; }
   @keyframes pulse { 50% { opacity:.55; } }
+  /* Event-driven flash: a brief red wash over the video, once per NEW event
+     landing in Recent Activity -- decoupled from .pill.alert above, which
+     tracks whether a condition is still ONGOING. Fades in fast, out slower,
+     so a rapid string of events reads as "still flashing" rather than
+     visibly stuttering. */
+  .flash-overlay { position:absolute; inset:0; background:var(--bad); opacity:0;
+                    pointer-events:none; transition:opacity .6s ease-out; border-radius:16px; }
+  .flash-overlay.on { opacity:.5; transition:opacity .08s ease-in; }
   h2 { font-size:13px; text-transform:uppercase; letter-spacing:.06em; color:var(--muted);
        margin-bottom:10px; }
   .stats { display:grid; grid-template-columns:repeat(3,1fr); gap:8px; margin-bottom:12px; }
@@ -455,6 +494,7 @@ _PAGE = """<!DOCTYPE html>
     <div class="card video">
       <img src="/stream" alt="live camera">
       <div class="pill" id="pill">OK</div>
+      <div class="flash-overlay" id="flashOverlay"></div>
     </div>
     <div class="card" style="margin-top:14px">
       <h2>Risk — last 6 minutes</h2>
@@ -494,6 +534,7 @@ async function tick(){
     const pill = document.getElementById("pill");
     pill.textContent = s.alert_active ? "ALERT" : "OK";
     pill.className = "pill" + (s.alert_active ? " alert" : "");
+    document.getElementById("flashOverlay").classList.toggle("on", !!s.flash_active);
     document.getElementById("counts").innerHTML = s.counts.map(c=>`<span class="chip">${c.type} <b>${c.n}</b></span>`).join("") || '<span class="empty">no alerts yet</span>';
     document.getElementById("timeline").innerHTML = s.events.length ? s.events.map(e=>
       `<li><span class="dot ${e.severity}"></span><span class="t">${e.time}</span>
@@ -525,6 +566,6 @@ async function setMode(name){
                               body:JSON.stringify({preset:name})});
   setTimeout(loadModes, 800);
 }
-tick(); setInterval(tick, 1000); loadModes(); setInterval(loadModes, 5000);
+tick(); setInterval(tick, 400); loadModes(); setInterval(loadModes, 5000);
 </script></body></html>
 """

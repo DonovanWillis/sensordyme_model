@@ -9,7 +9,7 @@ with the current camera/models (what it would need is listed).
 
 | | Detection | How / Caveat / Requires |
 |---|---|---|
-| ✅ | Eyes/head away from road (sustained) (`eyes_off_road`) | FaceMesh yaw vs calibrated baseline + SustainedConditionTracker |
+| ✅ | Eyes/head away from road (sustained) (`eyes_off_road`) | FaceMesh yaw vs calibrated baseline; a wide-angle turn shaped like a mirror/blind-spot check gets more patience than an ordinary glance |
 | ✅ | Looking down (sustained) (`looking_down`) | FaceMesh pitch vs calibrated baseline (eyes_down event) |
 | ✅ | Phone visible (`phone_visible`) | YOLO 'cell phone' class |
 | ✅ | Phone use (phone + gaze off road, sustained) (`phone_use`) | YOLO phone + gaze-off fusion, sustained |
@@ -42,6 +42,7 @@ with the current camera/models (what it would need is listed).
 | ✅ | Approaching configured danger areas (stairs, pool, stove, outlets…) (`restricted_zone`) | user-drawn restricted zones; the camera can't know what a pool is — the USER defines the areas, the device enforces them |
 | ✅ | Unusually still for an abnormal period (`unusual_stillness`) | motion energy inside the person box below threshold for a configured duration |
 | 🟡 | Changing position / rolling / motion bursts (`position_change`) | motion-energy spikes are logged as activity observations **Caveat:** cannot classify the movement type (rolling vs settling); needs pose/action models |
+| ✅ | Frantic / flailing arm movement (`flailing`) | MediaPipe Pose wrist trajectories over a rolling ~1.2s window: peak speed, peak acceleration, and direction-reversal frequency (core/activity.py) -- not a two-frame position delta, and not gated on the hand being raised |
 | ❌ | Baby sleeping vs awake (`sleeping_vs_awake`) | reliable infant eye-state models; adult FaceMesh underperforms on infants |
 | ❌ | Baby crying (`crying`) | a microphone + audio classifier (none fitted) |
 | ❌ | Face covered by blanket / face-down position (`face_covered`) | infant-specific face/occlusion model; adult face detectors are not reliable enough on infants for a safety-critical claim — we refuse to fake this one |
@@ -50,6 +51,8 @@ with the current camera/models (what it would need is listed).
 | 🟡 | Adult leaving baby unattended (`unattended`) | person-count drop while presence continues in the safe zone **Caveat:** cannot reliably distinguish adult from child by detection alone |
 | ❌ | Unknown person approaching baby (`unknown_person`) | face recognition — deliberately not shipped (privacy); person-count changes ARE detected |
 | ✅ | Multiple people entering the area (`multiple_people`) | person-count change events |
+| 🟡 | Bottle overlapping the child's box (feeding context) (`holding_bottle`) | YOLO bottle class + box overlap with the child, logged (not an alert by default) **Caveat:** approximates 'holding' from overlap, same as core/rules.py's `holding` predicate elsewhere in the product — a bottle merely propped nearby can also match; bare bottle presence away from the child is NOT reported |
+| 🟡 | Phone / cup / food / small utensil overlapping the child's box (`holding_object`) | the same YOLO pass + box-overlap approximation as holding_bottle, generalized to any COCO class in config.yaml's object_classes (phone, cup, food items, utensils, scissors, remote by default), logged (not an alert by default) **Caveat:** same overlap approximation as holding_bottle; 'keys' specifically cannot be detected — COCO (what the object detector actually knows) has no such class, and this module refuses to claim a detection the model can't perform |
 | ❌ | Medical conditions / diagnoses (`medical`) | out of scope by policy — the system reports observable safety conditions only |
 
 ## elderly_monitoring
@@ -59,8 +62,9 @@ with the current camera/models (what it would need is listed).
 | ✅ | Fall (rapid drop then stillness) (`fall`) | MediaPipe Pose hip/shoulder velocity + stillness confirmation (temporal, not single-frame; sitting/lying deliberately does NOT trigger it) |
 | ✅ | Person remaining on floor after fall (`on_floor`) | fall alert stays active until significant movement resumes |
 | ✅ | Person present / absent (`presence`) | YOLO person + event lifecycle |
-| ✅ | Restricted areas / stairs / kitchen / bed area / wandering (`zone_events`) | user-drawn zones + persistence (same zone engine as security/baby) |
-| ✅ | Motionless for an unusual period (`stillness`) | motion-energy stillness detection (shared with baby mode) |
+| ✅ | Restricted areas / stairs / wandering (`zone_events`) | user-drawn zones tested against the ankle midpoint + persistence |
+| ✅ | Getting out of bed (a user-drawn 'bed' safe zone) (`bed_exit`) | safe_zone_exit -- the same mechanism baby_monitoring.py uses for a crib, applied to a bed zone; soft severity by default (getting up is often benign; a real fall afterward is caught separately by the fall detector above) |
+| ✅ | Motionless for an unusual period (`stillness`) | hip/shoulder centroid movement over a long window (deliberately 10 minutes by default, to not flag ordinary resting/reading) |
 | 🟡 | Standing / sitting / lying classification (`posture`) | pose landmarks exist in the fall module **Caveat:** explicit posture classification not implemented; falls are detected by trajectory, not posture, precisely to avoid lying-down false alarms |
 | ❌ | Struggling to stand / loss of balance / stumble / gait analysis (`struggling`) | temporal gait models; current pose pipeline detects falls, not gait quality |
 | 🔵 | Time-conditioned rules (nighttime activity, outside hours) (`schedule`) | rule schedules — representable in AI-configure rules, enforcement lands with the scheduler |
@@ -76,8 +80,8 @@ with the current camera/models (what it would need is listed).
 | ✅ | Entering prohibited zone / crossing boundary / approaching door (`zone_violation`) | user-drawn zones + feet-point membership + persistence |
 | ✅ | Person lingering in an area (`lingering`) | zone membership with a longer persistence requirement |
 | ✅ | Unusual crowd / activity level (`crowd`) | person-count threshold |
-| 🟡 | Vehicle entering/leaving (`vehicle`) | YOLO car/truck/motorcycle classes exist in the deployed model **Caveat:** not wired into the security event set yet; enable via class map |
-| 🟡 | Animal / pet in restricted area (`animal`) | YOLO cat/dog classes exist in the deployed model **Caveat:** not wired into the security event set yet |
+| ✅ | Vehicle entering/leaving a zone (`vehicle`) | YOLO car/truck/bus/motorcycle/bicycle/train (core.capabilities' 'vehicle' category) + zone membership + persistence -- vehicle_in_zone, same zone engine as person zone_violation, requested automatically once any zone is configured |
+| ✅ | Animal / pet in a zone (`animal`) | YOLO dog/cat/bird/... (core.capabilities' 'animal' category) + zone membership + persistence -- animal_in_zone, same mechanism as vehicle |
 | ❌ | Package placed / removed / object moved (`package`) | object permanence + change detection against a scene baseline; COCO 'package' isn't a class — needs a custom model |
 | ❌ | Door/window open or closed (`door_window_state`) | per-installation scene understanding or contact sensors (the honest answer) |
 | ❌ | Smoke / fire visible (`smoke_fire`) | dedicated detection models; a smoke detector is the honest hardware answer |

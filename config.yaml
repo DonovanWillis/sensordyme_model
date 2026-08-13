@@ -169,7 +169,7 @@ alerts:
                # showed as a red alert on screen but never sent a push or SMS. Tagging it "loud" at the
                # source fixes every downstream consumer that trusts severity, instead of teaching each one
                # the type list separately.
-  soft_types: [fatigue_warning, frequent_glancing, elevated_risk, # always the soft chime
+  soft_types: [fatigue_warning, frequent_glancing, elevated_risk, flailing, erratic_hand_movement, # always the soft chime
                promptDriverDistracted, promptDriverUnresponsive, # openpilot prompt (orange) alerts -- chime, as in the car
                distractionDetected, # openpilot module's additive instant chime (fires ~0.3s after detection)
                skinnemoen_calibration_complete, # skinnemoen calibration-done chime (the original beeped here)
@@ -198,6 +198,14 @@ training:
 
 modules:
   driver_attention:
+    # --- eye gaze (independent of head pose; see core/eye_signal.py) ---
+    enable_gaze: true # fuse eye-in-head offset (iris landmarks, already computed --
+    # refine_landmarks is on below) onto head yaw/pitch, so "head forward, eyes down"
+    # is detectable and not just head pose renamed. false = old head-pose-only behavior.
+    eye_gaze_scale_deg: 40.0 # extreme iris deflection to the socket edge ~= this many
+    # degrees of eye-in-head rotation (approximation, matches the value already
+    # validated on the mac_max profile's own gaze fusion)
+
     # --- signal conditioning (glasses/glare robustness; see core/eye_signal.py) ---
     # Raw EAR and head-pose readings are noisy measurements, and glasses make
     # them noisier: frames and glare corrupt the eyelid-contour landmarks for
@@ -288,6 +296,17 @@ modules:
     phone_use_seconds: 2.0 # phone visible AND (eyes_down OR yaw off-center), sustained this long -> "phone_use"
     enable_hands: true # MediaPipe Hands: a hand overlapping the phone box raises phone_use confidence
     hand_phone_iou_threshold: 0.2 # hand/phone box IoU above this counts as "holding it"
+
+    # --- erratic hand movement (hands leaving the wheel / frantic motion) ---
+    # Reuses the SAME hand boxes already computed above (no added inference), tracked
+    # via core.tracking.BoxTracker so "erratic" is judged from trajectory (peak speed
+    # AND a direction-reversal count -- core/activity.py's Baby Mode flailing detector
+    # uses the same two-signal pattern), not a two-frame position delta. Coarser than
+    # Baby Mode's every-frame Pose kinematics: hands are only sampled on the object-
+    # detector's own stride (yolo_every_n_frames above).
+    erratic_hand_min_speed: 2.0 # box-diagonals/s, peak hand speed
+    erratic_hand_min_reversals: 3 # direction reversals within the tracked trail
+    erratic_hands_seconds: 1.0 # continuous erratic state required before it confirms
 
     # --- risk fusion: reasons across signals together (see modules/driver_attention.py::RiskFusion) ---
     risk_ema_alpha: 0.3 # smoothing for the composite score; higher = reacts faster but noisier
@@ -386,6 +405,20 @@ modules:
     zones: {}
     holding_bottle_confirm_s: 1.0 # sustained overlap with a detected bottle before "holding_bottle" fires
     holding_object_confirm_s: 1.0 # same, for object_classes below -> "holding_object"
+    holding_cooldown_s: 3.0 # re-confirmation suppression after a holding_* event resolves --
+    # deliberately much shorter than the 30s the event engine defaults to elsewhere (zone/
+    # presence rules, where a long cooldown avoids re-alerting on flapping): a child puts an
+    # object down and picks up a DIFFERENT one constantly, and each is a legitimate new
+    # observation, not repeat noise. holding_object is ALSO keyed per-label internally (see
+    # modules/baby_monitoring.py), so this cooldown can never let one object class's timer
+    # suppress a different class picked up moments later.
+    # --- human-object interaction: a tracked item's TRAJECTORY closing on the child,
+    # before it ever overlaps -- an anticipatory, log-only signal a single-frame
+    # overlap test can't see (see core.tracking.BoxTracker / modules/baby_monitoring.py).
+    object_approaching_min_speed: 0.15 # box-diagonals/s -- floor so a barely-jittering
+    # stationary item never qualifies
+    object_approaching_confirm_s: 0.3 # continuous approach required before it confirms
+    object_approaching_cooldown_s: 2.0 # re-confirmation suppression after it resolves
     # COCO class name -> label used in "holding_object"'s event detail (e.g. "object=phone").
     # Same box-overlap-with-the-child approximation as holding_bottle (see modules/baby_monitoring.py),
     # runs on the SAME detector pass already scanning for person/bottle -- no added inference cost.
@@ -410,6 +443,25 @@ modules:
       spoon: utensil
       scissors: hazard
       remote: object
+
+    # --- arm/body motion: MediaPipe Pose, for frantic/flailing-movement detection.
+    # See core/activity.py's FLAIL_* constants for the full rationale -- this uses
+    # temporal trajectory analysis (peak wrist speed/acceleration + direction-
+    # reversal frequency over a rolling ~1.2s window), not a two-frame position
+    # delta. Reuses the exact landmark model modules/fall_detection.py already runs
+    # every frame elsewhere in this product (proven affordable on a Pi).
+    enable_pose: true # false = fully opt out of pose inference (no flailing detection,
+    # lower CPU) for a deployment that can't spare the extra model
+    pose_every_n_frames: 1 # 1 = every frame (matches fall_detection.py); raise to
+    # trade flailing-detection latency/precision for CPU on a heavily loaded Pi
+    flailing_confirm_s: 0.5 # continuous flailing state (already smoothed by the
+    # rolling window itself) required before "flailing" confirms
+    flailing_cooldown_s: 5.0 # re-confirmation suppression after flailing resolves --
+    # short on purpose: repeated episodes (calm, flail again) should each be reported
+    # flail_min_peak_speed: 1.6 # torso-lengths/s, peak wrist speed -- uncomment to override
+    # flail_min_peak_accel: 6.0 # torso-lengths/s^2, peak wrist acceleration
+    # flail_min_reversals: 4 # direction reversals within the window
+    # flail_min_reversal_amplitude: 0.10 # torso-lengths of travel per reversal leg
 
   fall_detection:
     drop_velocity_threshold: 0.6 # fraction of frame-height/sec that counts as a "rapid drop"

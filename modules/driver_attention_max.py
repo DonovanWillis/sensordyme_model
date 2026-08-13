@@ -571,7 +571,19 @@ class DriverAttentionMaxModule(VisionModule):
         left_h, left_v = eye_component(LEFT_EYE, LEFT_IRIS_CENTER)
         h_ratio = (right_h + left_h) / 2.0
         v_ratio = (right_v + left_v) / 2.0
-        return h_ratio * EYE_GAZE_SCALE_DEG, v_ratio * EYE_GAZE_SCALE_DEG
+        # v_ratio is POSITIVE when the iris sits toward the LOWER eyelid (larger
+        # image y = physically looking down) -- but estimate_head_pose_deg's own
+        # verified convention (its docstring, and tests/test_head_pose_geometry.py)
+        # is NEGATIVE = down, and gaze_pitch_down_threshold_deg above is negative
+        # too. Un-negated, "head level, eyes cast down" would ADD a positive
+        # value onto head_pitch and partially CANCEL it instead of reinforcing
+        # it -- confirmed by direct comparison against estimate_head_pose_deg's
+        # sign for an equivalent physical rotation, not assumed (see
+        # core/eye_signal.py's eye_gaze_offset_deg, the pi-profile port of this
+        # same fusion, and tests/test_eye_gaze.py, which found and fixed the
+        # identical issue there). h_ratio needs no such flip: image-right
+        # already matches this module's yaw convention directly.
+        return h_ratio * EYE_GAZE_SCALE_DEG, -v_ratio * EYE_GAZE_SCALE_DEG
 
     def _hand_near_face(self, hand_boxes: list[Box], face_bbox: Box) -> bool:
         """Whether any hand box is within `hand_face_distance_ratio` of the face box."""

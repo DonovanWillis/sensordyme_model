@@ -42,17 +42,59 @@ class CaptureService:
 
     # ------------------------------------------------------------------ Service lifecycle
     def start(self, health: HealthMonitor | None = None) -> None:
+        # Refuse to double-run -- mirrors services/supervisor.py's Service.start(),
+        # which this class duck-types but (found in a repo-wide audit) had
+        # reimplemented without this guard. A wedged read (real CameraError
+        # aside, e.g. a driver-level hang) can leave the old thread still
+        # inside a blocking read() past stop()'s join timeout; starting a
+        # second pump thread on the same non-thread-safe Camera object is
+        # exactly the "two loops on one camera" failure this guard exists to
+        # prevent everywhere else in the codebase.
+        if self._thread is not None and self._thread.is_alive():
+            log.warning("capture service is still running; not starting a second pump thread")
+            return
         if health is not None:
             self._health = health
-        self._stop.clear()
-        self._thread = threading.Thread(target=self.run, args=(self._stop,), daemon=True, name=self.name)
+        # A FRESH Event per generation, never a cleared shared one -- an
+        # abandoned thread from a previous generation still polls the OLD
+        # event object, which stays set, so it exits at its next check
+        # instead of resuming forever alongside a new one (same reasoning as
+        # Service.start()).
+        self._stop = threading.Event()
+        self._thread = threading.Thread(
+            target=self._guarded_run, args=(self._stop,), daemon=True, name=self.name
+        )
         self._thread.start()
 
     def stop(self, timeout: float = 5.0) -> None:
         self._stop.set()
         if self._thread is not None:
             self._thread.join(timeout=timeout)
+            if self._thread.is_alive():
+                # Keep the handle: start() must be able to see the thread is
+                # still alive and refuse to double-run. Dropping it here was
+                # how a wedged pump became two concurrent ones.
+                log.warning("capture service did not stop within %.1fs", timeout)
+                return
         self._thread = None
+
+    def _guarded_run(self, stop: threading.Event) -> None:
+        """Crash containment for the pump loop -- CaptureService predates
+        services/supervisor.py's Service base class and (found in a repo-wide
+        audit) was never wrapped the way every other supervised thread is:
+        `run()` was the raw thread target, so any exception NOT already
+        handled inside it (anything but CameraError -- e.g. a FrameBus bug)
+        killed the pump thread silently, discoverable only later via
+        FrameBus staleness. Not a Service subclass (kept import-light so
+        tests can drive `run` directly with a fake camera), so this is a
+        thin, local equivalent of Service._guarded_run rather than
+        inheritance."""
+        try:
+            self.run(stop)
+        except Exception as exc:  # noqa: BLE001 - a capture crash must never kill the device silently
+            log.error("capture service crashed: %s", exc, exc_info=True)
+            if self._health is not None:
+                self._health.report_failure(self.name, f"crashed: {exc}")
 
     def restart(self) -> None:
         """Full recovery: stop the pump, reopen the device, start again."""

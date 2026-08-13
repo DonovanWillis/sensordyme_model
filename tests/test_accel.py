@@ -3,7 +3,7 @@
 import numpy as np
 
 from core import accel
-from core.accel import AcceleratorInfo, _ShimBox, _ShimResult
+from core.accel import AcceleratorInfo, _ShimBox, _ShimResult, letterbox_transform
 
 
 def teardown_function():
@@ -89,6 +89,37 @@ def test_coco_names_pins_the_classes_the_bottle_banana_investigation_checked():
     assert accel.COCO_NAMES[39] == "bottle"
     assert accel.COCO_NAMES[46] == "banana"
     assert accel.COCO_NAMES[39] != accel.COCO_NAMES[46]
+
+
+# ------------------------------------------------------------------ letterbox transform
+# The Hailo path used to cv2.resize straight to a square model input, stretching a
+# non-square camera frame (the Pi's 640x480, 4:3) and measurably hurting thin/small
+# objects (a phone) vs. the CPU/.pt path's own letterboxed preprocessing. These pin
+# the aspect-preserving scale+pad math against hand-computed expectations.
+def test_letterbox_fits_a_4_3_frame_into_a_square_input_with_top_bottom_bars():
+    scale, left, top = letterbox_transform(640, 480, 640, 640)
+    assert scale == 1.0  # width already matches; height is the binding constraint
+    assert left == 0
+    assert top == 80  # (640 - 480*1.0) / 2 = 80px bars top and bottom
+
+
+def test_letterbox_scales_down_a_larger_frame_to_fit():
+    scale, left, top = letterbox_transform(1280, 960, 640, 640)
+    assert scale == 0.5
+    assert left == 0
+    assert top == 80
+
+
+def test_letterbox_is_a_no_op_for_a_frame_already_matching_the_input_shape():
+    scale, left, top = letterbox_transform(640, 640, 640, 640)
+    assert (scale, left, top) == (1.0, 0, 0)
+
+
+def test_letterbox_pads_left_right_for_a_tall_frame():
+    scale, left, top = letterbox_transform(480, 640, 640, 640)
+    assert scale == 1.0
+    assert left == 80
+    assert top == 0
 
 
 def test_coco_names_is_the_full_standard_80_class_set_with_no_gaps_or_dupes():

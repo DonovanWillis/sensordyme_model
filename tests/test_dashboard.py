@@ -6,7 +6,7 @@ import urllib.request
 
 import numpy as np
 
-from core.dashboard import DashboardServer
+from core.dashboard import FLASH_DURATION_S, DashboardServer
 from core.events import Event
 
 
@@ -186,6 +186,65 @@ def test_health_endpoint_without_provider_is_unknown():
 def test_apply_wifi_dry_runs_off_pi():
     ok, message = DashboardServer(host="127.0.0.1", port=0).apply_wifi("HomeNet", "pw")
     assert ok and "dry-run" in message
+
+
+def test_flash_is_edge_triggered_not_continuous():
+    """Every push_event() call arms a brief flash window; is_alert_active-style
+    continuous state must never drive it -- see services/runtime.py's own
+    edge-triggered overlay for the video-frame counterpart. push_event uses
+    the real wall clock internally (like push_status's risk sampling already
+    does), so this asserts relative to a timestamp captured around the call
+    rather than injecting now=0.0."""
+    server = DashboardServer(host="127.0.0.1", port=0)
+    try:
+        before = time.time()
+        assert server.flash_active(now=before) is False
+        server.push_event(Event.now("holding_object", 1.0, 0.9, "baby_monitoring", "object=phone"), "log")
+        assert server.flash_active(now=before) is True  # armed the instant the event lands
+        assert server.flash_active(now=before + FLASH_DURATION_S - 0.05) is True
+        assert server.flash_active(now=before + FLASH_DURATION_S + 0.5) is False  # flashed, then back to normal
+    finally:
+        server.close()
+
+
+def test_flash_is_not_gated_on_severity():
+    """The product requirement is 'every new event flashes', not just loud
+    ones -- a log-severity event must arm the flash exactly like a loud one."""
+    server = DashboardServer(host="127.0.0.1", port=0)
+    try:
+        server.push_event(Event.now("person_count_change", 0.0, 0.9, "baby_monitoring"), "log")
+        assert server.flash_active(now=0.0) is True
+    finally:
+        server.close()
+
+
+def test_state_exposes_flash_active():
+    server = DashboardServer(host="127.0.0.1", port=0)
+    url = server.start()
+    try:
+        _, _, body = _get(url + "/api/state")
+        assert json.loads(body)["flash_active"] is False
+
+        server.push_event(Event.now("fall", 0.0, 0.9, "fall_detection"), "loud")
+        _, _, body = _get(url + "/api/state")
+        assert json.loads(body)["flash_active"] is True
+    finally:
+        server.close()
+
+
+def test_a_second_event_within_the_flash_window_extends_it_not_stacks_it():
+    """Two events in quick succession must read as one continuous flash window
+    (extended), not stack/queue -- the spec is 'flash, then return to normal'
+    per event, and extension is what keeps a burst of events from looking
+    broken (flickering on/off between two flashes 50ms apart)."""
+    server = DashboardServer(host="127.0.0.1", port=0)
+    try:
+        before = time.time()
+        server.push_event(Event.now("holding_object", 1.0, 0.9, "baby_monitoring"), "log")
+        server.push_event(Event.now("holding_object", 1.0, 0.9, "baby_monitoring"), "log")
+        assert server.flash_active(now=before + FLASH_DURATION_S - 0.05) is True
+    finally:
+        server.close()
 
 
 def test_dashboard_unknown_path_is_404():

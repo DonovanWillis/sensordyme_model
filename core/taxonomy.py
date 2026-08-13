@@ -115,6 +115,10 @@ TAXONOMY: dict[str, list[Detection]] = {
         _d("position_change", "Changing position / rolling / motion bursts", PARTIAL,
            how="motion-energy spikes are logged as activity observations",
            caveat="cannot classify the movement type (rolling vs settling); needs pose/action models"),
+        _d("flailing", "Frantic / flailing arm movement", SUPPORTED,
+           how="MediaPipe Pose wrist trajectories over a rolling ~1.2s window: peak speed, peak "
+               "acceleration, and direction-reversal frequency (core/activity.py) -- not a two-frame "
+               "position delta, and not gated on the hand being raised"),
         _d("sleeping_vs_awake", "Baby sleeping vs awake", UNSUPPORTED,
            requires="reliable infant eye-state models; adult FaceMesh underperforms on infants"),
         _d("crying", "Baby crying", UNSUPPORTED, requires="a microphone + audio classifier (none fitted)"),

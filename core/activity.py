@@ -68,6 +68,26 @@ HAND_RAISED_MARGIN = 0.10   # wrist above shoulder by this many torso lengths
 WAVE_MIN_SWINGS = 3
 WAVE_MIN_SWING = 0.25       # horizontal wrist travel per swing, torso lengths
 
+# Flailing: fast, chaotic wrist motion -- no "raised above the shoulder"
+# precondition (unlike waving; distress/flailing happens at any height), judged
+# on velocity, acceleration, and how often the wrist reverses direction rather
+# than on total displacement in one direction. A deliberate wave is a WIDE,
+# roughly rhythmic swing (few reversals, each one big); flailing is CHAOTIC —
+# many short, fast reversals with no consistent rhythm. Requiring both a speed
+# floor AND a reversal-count floor is what keeps a single fast reach (one big
+# motion, zero reversals) and an ordinary gesture (a couple of slow reversals)
+# from crossing this bar.
+FLAIL_MIN_PEAK_SPEED = 1.6      # torso-lengths/s, peak instantaneous wrist speed
+FLAIL_MIN_PEAK_ACCEL = 6.0      # torso-lengths/s^2, peak instantaneous wrist acceleration --
+# an alternative gate to peak speed: a sharp, jerky direction change can flag
+# flailing even in a window where peak speed alone is borderline
+FLAIL_MIN_REVERSALS = 4         # direction reversals within the window -- a higher bar than a
+# wave's 3, because flailing is chaotic (many quick reversals) rather than a
+# rhythmic swing
+FLAIL_MIN_REVERSAL_AMPLITUDE = 0.10  # torso-lengths of 2D travel per reversal leg -- smaller
+# than a wave's 0.25 (flailing is short, fast segments, not one wide swing), but
+# well above landmark jitter
+
 # --- stillness (the evidence "resting" is built from) -------------------
 # Below this hip speed (torso lengths/s) across the whole window the person is
 # not going anywhere; the wrist bound is looser because people shift their
@@ -110,6 +130,10 @@ class ActivityState:
     lying_down: Attribute = field(default_factory=lambda: Attribute("lying_down", False, 0.0))
     hand_raised: Attribute = field(default_factory=lambda: Attribute("hand_raised", False, 0.0))
     waving: Attribute = field(default_factory=lambda: Attribute("waving", False, 0.0))
+    #: Fast, chaotic arm motion (flailing/frantic movement) -- see FLAIL_* above.
+    #: Independent of hand_raised/waving: it fires at any arm height and does
+    #: not require the rhythmic swing a wave does.
+    flailing: Attribute = field(default_factory=lambda: Attribute("flailing", False, 0.0))
     # Resting: a settled body (sitting OR lying) that is also still. THE point
     # of this attribute is that it is not a posture — someone asleep in a
     # chair, at a desk, or in bed all read as resting, where `lying_down`
@@ -123,7 +147,7 @@ class ActivityState:
     def _all(self) -> tuple[Attribute, ...]:
         return (self.standing, self.sitting, self.walking, self.running,
                 self.jumping, self.lying_down, self.hand_raised, self.waving,
-                self.resting)
+                self.flailing, self.resting)
 
     def active(self) -> list[Attribute]:
         return [a for a in self._all() if a.present]
@@ -173,9 +197,21 @@ def _mid(a, b):
 class ActivityRecognizer:
     """Rolling-window activity classifier over pose landmarks."""
 
-    def __init__(self, window_s: float = WINDOW_S, aspect: float = 1.0) -> None:
+    def __init__(
+        self,
+        window_s: float = WINDOW_S,
+        aspect: float = 1.0,
+        flail_min_peak_speed: float = FLAIL_MIN_PEAK_SPEED,
+        flail_min_peak_accel: float = FLAIL_MIN_PEAK_ACCEL,
+        flail_min_reversals: int = FLAIL_MIN_REVERSALS,
+        flail_min_reversal_amplitude: float = FLAIL_MIN_REVERSAL_AMPLITUDE,
+    ) -> None:
         self.window_s = window_s
         self.aspect = aspect
+        self._flail_min_peak_speed = flail_min_peak_speed
+        self._flail_min_peak_accel = flail_min_peak_accel
+        self._flail_min_reversals = flail_min_reversals
+        self._flail_min_reversal_amplitude = flail_min_reversal_amplitude
         self._samples: deque[_Sample] = deque()
         self._baseline_ankle: Optional[float] = None
 
@@ -354,9 +390,90 @@ class ActivityRecognizer:
                     if confidence > state.waving.confidence:
                         state.waving = Attribute("waving", True, round(confidence, 2))
 
+            # --- flailing: fast, chaotic 2D wrist motion, no "raised" precondition ---
+            # Deliberately reads the FULL track (not just frames where the wrist
+            # was raised): distress/flailing motion happens at any height.
+            self._classify_flailing(side, samples, torso, state)
+
         # A wave is a moving raised hand; report the more specific of the two.
         if state.waving.present and state.hand_raised.present:
             state.hand_raised = Attribute("hand_raised", False, 0.0)
+
+        # Two arms flailing together is more clearly distress than one -- a real
+        # signal boost, not just the max of independent per-arm confidences.
+        if state.signals.get("left_wrist_flailing") and state.signals.get("right_wrist_flailing"):
+            state.flailing = Attribute("flailing", True, round(min(0.99, state.flailing.confidence + 0.15), 2))
+
+    def _classify_flailing(self, side: str, samples: list[_Sample], torso: float,
+                           state: ActivityState) -> None:
+        """Peak speed/acceleration + direction-reversal frequency for one wrist.
+
+        Velocity and acceleration alone can't tell a single fast reach from
+        flailing (both can hit a high peak speed) -- requiring several direction
+        reversals too is what rejects the single-motion case. Reversal count
+        alone can't tell a slow, deliberate back-and-forth from flailing --
+        requiring speed/acceleration too is what rejects that case. Together
+        they need BOTH chaos (reversals) AND intensity (speed or acceleration).
+        """
+        track = [(s.at, getattr(s, side)) for s in samples if getattr(s, side) is not None]
+        if len(track) < MIN_SAMPLES:
+            return
+
+        speeds: list[tuple[float, float]] = []  # (dt-midpoint speed, dt)
+        for (t0, p0), (t1, p1) in zip(track, track[1:]):
+            dt = t1 - t0
+            if dt <= 0:
+                continue
+            speeds.append((math.hypot((p1[0] - p0[0]), p1[1] - p0[1]) / torso / dt, dt))
+        if not speeds:
+            return
+        peak_speed = max(v for v, _ in speeds)
+
+        peak_accel = 0.0
+        for (v0, _), (v1, dt1) in zip(speeds, speeds[1:]):
+            if dt1 > 0:
+                peak_accel = max(peak_accel, abs(v1 - v0) / dt1)
+
+        # Direction reversals over the full 2D displacement vector (flailing
+        # isn't purely horizontal, unlike the wave counter above): accumulate
+        # travel in roughly one direction (dot product with the running
+        # direction stays positive) and count a reversal each time the wrist
+        # commits to a new direction after covering at least
+        # flail_min_reversal_amplitude torso-lengths in the old one.
+        reversals = 0
+        seg_dx = seg_dy = 0.0
+        prev_dir: Optional[tuple[float, float]] = None
+        for (_, p0), (_, p1) in zip(track, track[1:]):
+            dx, dy = (p1[0] - p0[0]) / torso, (p1[1] - p0[1]) / torso
+            step = math.hypot(dx, dy)
+            if step < 1e-6:
+                continue
+            direction = (dx / step, dy / step)
+            if prev_dir is None:
+                seg_dx, seg_dy = dx, dy
+            elif direction[0] * prev_dir[0] + direction[1] * prev_dir[1] > 0.3:
+                seg_dx += dx
+                seg_dy += dy
+            else:
+                if math.hypot(seg_dx, seg_dy) >= self._flail_min_reversal_amplitude:
+                    reversals += 1
+                seg_dx, seg_dy = dx, dy
+            prev_dir = direction
+        if math.hypot(seg_dx, seg_dy) >= self._flail_min_reversal_amplitude:
+            reversals += 1
+
+        state.signals[f"{side}_peak_speed"] = round(peak_speed, 2)
+        state.signals[f"{side}_peak_accel"] = round(peak_accel, 2)
+        state.signals[f"{side}_reversals"] = reversals
+
+        intense = peak_speed >= self._flail_min_peak_speed or peak_accel >= self._flail_min_peak_accel
+        if intense and reversals >= self._flail_min_reversals:
+            confidence = min(0.95, 0.5
+                              + (peak_speed - self._flail_min_peak_speed) * 0.1
+                              + 0.05 * (reversals - self._flail_min_reversals))
+            state.signals[f"{side}_flailing"] = True
+            if confidence > state.flailing.confidence:
+                state.flailing = Attribute("flailing", True, round(max(confidence, 0.5), 2))
 
     def _classify_resting(self, samples: list[_Sample], torso: float,
                           speed: float, state: ActivityState) -> None:

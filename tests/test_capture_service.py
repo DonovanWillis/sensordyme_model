@@ -76,3 +76,44 @@ def test_service_restart_reopens_the_camera():
         assert _wait_until(lambda: bus.latest()[1] > seq_after_restart)
     finally:
         service.stop()
+
+
+def test_start_refuses_to_double_run_while_already_alive():
+    """Found in a repo-wide audit: start() previously had no guard against
+    running twice, unlike every Service subclass -- two pump threads on one
+    non-thread-safe Camera object is a real hazard, not a theoretical one."""
+    camera, bus = FakeCamera(), FrameBus()
+    service = CaptureService(camera, bus)
+    service.start()
+    try:
+        first_thread = service._thread
+        assert _wait_until(lambda: bus.latest()[1] >= 1)
+        service.start()  # must be a no-op: still alive
+        assert service._thread is first_thread
+    finally:
+        service.stop()
+
+
+def test_a_crash_inside_run_is_contained_not_silent():
+    """Found in a repo-wide audit: run() was the raw thread target with no
+    crash containment (unlike every Service subclass's _guarded_run), so any
+    exception other than CameraError killed the pump thread silently."""
+
+    class ExplodingCamera(FakeCamera):
+        def read(self):
+            raise RuntimeError("not a CameraError -- simulates a genuine bug")
+
+    reported = []
+
+    class _FakeHealth:
+        def report_failure(self, name, detail):
+            reported.append((name, detail))
+
+    camera, bus = ExplodingCamera(), FrameBus()
+    service = CaptureService(camera, bus, health=_FakeHealth())
+    service.start()
+    try:
+        assert _wait_until(lambda: len(reported) >= 1)
+        assert reported[0][0] == "camera"
+    finally:
+        service.stop()

@@ -14,11 +14,13 @@ from pathlib import Path
 import yaml
 
 import main as main_module
+import test_driver_attention_scenarios as das
 from modules.base import SustainedConditionTracker
-from modules.driver_attention import GlanceCounter
+from modules.driver_attention import GlanceCounter, angle_delta_deg, estimate_head_pose_deg
 from modules.driver_attention_max import (
     BlinkRateTracker,
     CumulativeConditionTracker,
+    DriverAttentionMaxModule,
     GazeCalibrator,
     RollingMedianFilter,
 )
@@ -302,3 +304,39 @@ def test_glance_counter_reused_for_hand_to_face_approach_pattern():
     counter.update(False, now)
     now += 5.0
     assert counter.update(True, now) is True  # second approach within 30s -> fires
+
+
+# --- _compute_gaze_components sign convention ---------------------------------------
+# Found while porting the same fusion to the pi profile (core/eye_signal.py's
+# eye_gaze_offset_deg, tests/test_eye_gaze.py): the un-negated formula pushes pitch
+# the WRONG way relative to estimate_head_pose_deg's own verified "down = negative"
+# convention. _compute_gaze_components has no `self.*` access at all (pure function
+# of `points`), so it's called unbound, without constructing the full module (which
+# would require MPS + eagerly load a ~109MB YOLO checkpoint on first process()).
+def _shift_iris(landmarks, dy_px: float):
+    out = list(landmarks)
+    for idx in (468, 469, 470, 471, 472, 473, 474, 475, 476, 477):
+        out[idx] = das._FakeLandmark(out[idx].x, out[idx].y + dy_px / das.H)
+    return out
+
+
+def test_compute_gaze_components_pitch_matches_head_pitchs_down_is_negative_convention():
+    pose_neutral = estimate_head_pose_deg(das._pose_pixel_points(0.0, 0.0), (das.H, das.W))
+    pose_down = estimate_head_pose_deg(das._pose_pixel_points(10.0, 0.0), (das.H, das.W))
+    assert angle_delta_deg(pose_down[1], pose_neutral[1]) < 0  # verified "looking down" rotation
+
+    landmarks = _shift_iris(das.make_fake_landmarks(), dy_px=8.0)  # iris toward the lower lid
+    points = [(lm.x * das.W, lm.y * das.H) for lm in landmarks]
+    _, eye_pitch = DriverAttentionMaxModule._compute_gaze_components(None, points)
+    assert eye_pitch < 0, (
+        "iris shifted toward the lower lid must produce a NEGATIVE pitch component, "
+        "matching estimate_head_pose_deg's own 'down = negative' convention -- the "
+        "same bug found and fixed in the pi profile's eye_gaze_offset_deg"
+    )
+
+
+def test_compute_gaze_components_is_zero_for_a_centered_iris():
+    points = [(lm.x * das.W, lm.y * das.H) for lm in das.make_fake_landmarks()]
+    yaw, pitch = DriverAttentionMaxModule._compute_gaze_components(None, points)
+    assert abs(yaw) < 1e-6
+    assert abs(pitch) < 1e-6

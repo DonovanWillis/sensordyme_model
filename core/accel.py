@@ -226,6 +226,24 @@ class _ShimResult:
         self.boxes = boxes
 
 
+def letterbox_transform(frame_w: int, frame_h: int, input_w: int, input_h: int) -> tuple[float, int, int]:
+    """Scale + left/top pad that fits (frame_w, frame_h) into (input_w, input_h)
+    WITHOUT changing aspect ratio -- the same preprocessing ultralytics' own CPU/
+    .pt path already does by default.
+
+    A plain `cv2.resize` straight to a square model input (the common case: the
+    Pi camera is 640x480, 4:3, while most Hailo Model Zoo YOLO .hefs are 640x640)
+    stretches every object horizontally, which measurably hurts thin/small
+    classes -- a phone held at an angle is exactly the shape most distorted by a
+    non-uniform stretch. Letterboxing (scale to fit, pad the rest) keeps what the
+    model actually sees geometrically consistent with the CPU/.pt backend.
+    """
+    scale = min(input_w / frame_w, input_h / frame_h)
+    new_w, new_h = round(frame_w * scale), round(frame_h * scale)
+    pad_w, pad_h = input_w - new_w, input_h - new_h
+    return scale, pad_w // 2, pad_h // 2
+
+
 class HailoYOLO:
     """Runs a Model-Zoo YOLO .hef on the AI HAT+ behind the ultralytics call surface.
 
@@ -273,8 +291,15 @@ class HailoYOLO:
         import cv2
 
         h, w = frame.shape[:2]
-        resized = cv2.resize(frame, (self._input_w, self._input_h))
-        rgb = cv2.cvtColor(resized, cv2.COLOR_BGR2RGB)
+        scale, left, top = letterbox_transform(w, h, self._input_w, self._input_h)
+        new_w, new_h = round(w * scale), round(h * scale)
+        resized = cv2.resize(frame, (new_w, new_h), interpolation=cv2.INTER_LINEAR)
+        pad_w, pad_h = self._input_w - new_w, self._input_h - new_h
+        letterboxed = cv2.copyMakeBorder(
+            resized, top, pad_h - top, left, pad_w - left,
+            cv2.BORDER_CONSTANT, value=(114, 114, 114),
+        )
+        rgb = cv2.cvtColor(letterboxed, cv2.COLOR_BGR2RGB)
         batch = np.expand_dims(rgb, axis=0)
 
         with self._infer_pipeline as pipeline:
@@ -295,13 +320,13 @@ class HailoYOLO:
                 ymin, xmin, ymax, xmax, score = (float(v) for v in row)
                 if score < conf:
                     continue
-                boxes.append(
-                    _ShimBox(
-                        np.asarray([xmin * w, ymin * h, xmax * w, ymax * h]),
-                        cls_id,
-                        score,
-                    )
-                )
+                # Normalized coords are relative to the LETTERBOXED (padded, scaled)
+                # input; undo padding then scale to get back to original-frame pixels.
+                x1 = min(max((xmin * self._input_w - left) / scale, 0.0), w)
+                y1 = min(max((ymin * self._input_h - top) / scale, 0.0), h)
+                x2 = min(max((xmax * self._input_w - left) / scale, 0.0), w)
+                y2 = min(max((ymax * self._input_h - top) / scale, 0.0), h)
+                boxes.append(_ShimBox(np.asarray([x1, y1, x2, y2]), cls_id, score))
         return [_ShimResult(boxes)]
 
     def close(self) -> None:

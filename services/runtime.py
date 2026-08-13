@@ -59,6 +59,21 @@ _HEALTH_SAMPLE_S = 5.0
 _CAMERA_OPEN_RETRIES = 5
 _CAMERA_OPEN_BACKOFF_S = 2.0
 _VERSION = "0.2"
+# A module.process() call that keeps failing this many frames IN A ROW is not
+# a transient hiccup -- propagate so the existing recovery ladder (in-thread
+# restart headless, process exit under --display) can recover a genuinely
+# wedged module, rather than looping forever silently dropping every frame.
+_MAX_CONSECUTIVE_PROCESS_FAILURES = 10
+# How long the video overlay (_apply_alert_overlay, below) stays on after a new
+# event reaches Recent Activity -- edge-triggered on push_event, not tied to
+# module.is_alert_active()'s continuous "still ongoing" state, so a persistent
+# condition (an object still visible, a driver still distracted) does not keep
+# the screen flashing. Tracked independently of core.dashboard.FLASH_DURATION_S
+# (that one drives the web page's own DOM flash) -- same value, kept in sync
+# deliberately rather than imported, since this module only imports
+# DashboardServer lazily and this constant governs a different renderer (the
+# baked-in frame overlay used by both the cv2 --display window and /stream).
+_FLASH_DURATION_S = 1.5
 
 
 class _InferenceService(Service):
@@ -152,6 +167,8 @@ class DeviceRuntime:
         self._module_lock = threading.Lock()  # guards module swaps vs. the inference loop
         self._heartbeat = 0.0  # monotonic time of the last completed inference iteration
         self._last_stream_push = 0.0
+        self._flash_until = 0.0  # monotonic time; see _FLASH_DURATION_S
+        self._consecutive_process_failures = 0  # see _MAX_CONSECUTIVE_PROCESS_FAILURES
         self._last_debug_print = 0.0
 
         self.camera: Optional[Camera] = None
@@ -506,6 +523,7 @@ class DeviceRuntime:
         severity = "loud" if alert.severity == "critical" else "soft"
         if self.dashboard is not None:
             self.dashboard.push_event(event, severity)
+        self._flash_until = time.monotonic() + _FLASH_DURATION_S
         if self.uplink is not None and alert.notify != "silent":
             # Marked as configured. `notify: "push"` on a rule IS someone asking
             # to be told; the severity field is about how prominent it looks,
@@ -649,6 +667,7 @@ class DeviceRuntime:
             self.uplink.set_active_preset(name)
         switch_event = Event.now("preset_changed", 0.0, 1.0, "system", f"mode -> {name}")
         self.logger.log(switch_event)
+        self._flash_until = time.monotonic() + _FLASH_DURATION_S
         if self.dashboard is not None:
             self.dashboard.push_event(switch_event, "log")
         print(f"SensorDyme: switched to preset '{name}' (module '{new_module_name}')")
@@ -734,7 +753,40 @@ class DeviceRuntime:
 
             with self._module_lock:
                 module = self.module
-            events = module.process(frame)
+            # A single bad frame must never crash the process -- found in a repo-
+            # wide audit: previously this call was unguarded, so in --display mode
+            # (a documented, first-class runtime mode, not dev-only) an exception
+            # here took down the entire process instead of the graceful in-place
+            # recovery headless mode already got from Service._guarded_run. Even
+            # in headless mode, letting ONE bad frame propagate meant restarting
+            # the whole inference loop (reopening everything, a visible pause)
+            # rather than just skipping that frame — the finer-grained recovery
+            # here is strictly better for both. A module that keeps failing is
+            # NOT silently tolerated forever, though: past
+            # _MAX_CONSECUTIVE_PROCESS_FAILURES in a row this re-raises, handing
+            # off to the same recovery ladder a truly wedged module already had.
+            try:
+                events = module.process(frame)
+                self._consecutive_process_failures = 0
+            except Exception as exc:  # noqa: BLE001 - see comment above
+                self._consecutive_process_failures += 1
+                log.error(
+                    "module.process() failed (%d/%d consecutive): %s",
+                    self._consecutive_process_failures, _MAX_CONSECUTIVE_PROCESS_FAILURES, exc,
+                    exc_info=True,
+                )
+                if self._consecutive_process_failures >= _MAX_CONSECUTIVE_PROCESS_FAILURES:
+                    log.critical(
+                        "module.process() failed %d times in a row; propagating "
+                        "for a full restart instead of dropping frames forever",
+                        self._consecutive_process_failures,
+                    )
+                    raise
+                # The inference LOOP is alive and responsive; only the module call
+                # failed, so the heartbeat should say so rather than let a string
+                # of caught failures look like a wedged/dead loop to health checks.
+                self._heartbeat = time.monotonic()
+                continue
 
             # Belt and braces. The module running under AI_CUSTOM is a general
             # detector with no opinions to suppress, so this should already be
@@ -758,6 +810,10 @@ class DeviceRuntime:
                     evidence_due = True
                 if self.dashboard is not None:
                     self.dashboard.push_event(event, severity)
+                # Edge-triggered: every genuinely new event reaching Recent
+                # Activity arms the flash window, regardless of severity --
+                # see _apply_alert_overlay's caller below and _FLASH_DURATION_S.
+                self._flash_until = time.monotonic() + _FLASH_DURATION_S
                 if self.uplink is not None and event.type in self.alert_event_types:
                     self.uplink.push_event(event, severity)
 
@@ -835,7 +891,11 @@ class DeviceRuntime:
             view = None
             if self.display or want_stream:
                 view = module.annotate_debug(frame.copy()) if self.debug else module.annotate(frame.copy())
-                if module.is_alert_active():
+                # Event-driven, not level-driven: flashes once per new event
+                # (see push_event/_emit_rule_alert above), not continuously for
+                # as long as module.is_alert_active() stays true -- an object
+                # that remains visible must not keep the screen flashing.
+                if now < self._flash_until:
                     view = _apply_alert_overlay(view)
                 if want_stream:
                     self.dashboard.push_frame(view)

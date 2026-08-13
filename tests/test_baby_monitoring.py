@@ -2,6 +2,7 @@
 
 import numpy as np
 
+from core.activity import ActivityState, Attribute
 from modules.baby_monitoring import BabyMonitoringModule
 
 ZONES = {
@@ -237,3 +238,224 @@ def test_keys_are_honestly_not_in_the_default_vocabulary():
     from modules.baby_monitoring import DEFAULT_OBJECT_CLASSES
     assert "keys" not in DEFAULT_OBJECT_CLASSES
     assert "key" not in DEFAULT_OBJECT_CLASSES
+
+
+# --------------------------------------------------------- the reported cooldown bug
+# Before the per-label fix, a single shared "holding_object" engine key meant putting
+# an object down (which resolves after resolve_after_s=2.0 and then serves a 30s-
+# default cooldown) could silently swallow a COMPLETELY DIFFERENT object picked up
+# moments later, because the cooldown was keyed by the rule name, not by what was
+# actually being held.
+CUP_IN_CRIB = (460, 350, 520, 500)  # overlaps IN_CRIB, same box as PHONE_IN_CRIB
+
+
+def test_putting_down_one_object_and_picking_up_a_different_one_is_not_suppressed():
+    module = _module(holding_object_confirm_s=0.5, holding_cooldown_s=3.0)
+
+    events, t = _run(
+        module, [IN_CRIB], motion=0.05, seconds=1.0, object_boxes={"phone": [PHONE_IN_CRIB]}
+    )
+    assert "holding_object" in [e.type for e in events]
+
+    # Phone put down (moves out of overlap) -- resolves after resolve_after_s=2.0.
+    events, t = _run(
+        module, [IN_CRIB], motion=0.05, seconds=2.5, start=t, object_boxes={"phone": [PHONE_ELSEWHERE]}
+    )
+    assert "holding_object_resolved" in [e.type for e in events]
+
+    # Immediately (well within the old 30s-default / even within this test's own
+    # 3s holding_cooldown_s) a DIFFERENT class is picked up -- must be detected,
+    # not swallowed by the phone's own cooldown.
+    events, _ = _run(
+        module, [IN_CRIB], motion=0.05, seconds=1.0, start=t, object_boxes={"cup": [CUP_IN_CRIB]}
+    )
+    fired = [e for e in events if e.type == "holding_object"]
+    assert fired, "a different object class must confirm immediately, not be suppressed by phone's cooldown"
+    assert "object=cup" in fired[0].contributing_signals
+
+
+def test_holding_cooldown_s_is_configurable_and_applies_per_label():
+    """The SAME class picked back up quickly still respects its own cooldown
+    (this was never the reported bug -- flapping on one object is legitimately
+    debounced) -- but with a short cooldown configured, it re-confirms well
+    inside a test, proving the cooldown is real and per-label, not removed."""
+    module = _module(holding_object_confirm_s=0.3, holding_cooldown_s=0.5)
+
+    events, t = _run(
+        module, [IN_CRIB], motion=0.05, seconds=0.6, object_boxes={"phone": [PHONE_IN_CRIB]}
+    )
+    assert "holding_object" in [e.type for e in events]
+
+    events, t = _run(
+        module, [IN_CRIB], motion=0.05, seconds=2.5, start=t, object_boxes={"phone": [PHONE_ELSEWHERE]}
+    )
+    assert "holding_object_resolved" in [e.type for e in events]
+
+    # Within the cooldown: picking the SAME class back up must not re-confirm yet.
+    events, t = _run(
+        module, [IN_CRIB], motion=0.05, seconds=0.3, start=t, object_boxes={"phone": [PHONE_IN_CRIB]}
+    )
+    assert "holding_object" not in [e.type for e in events]
+
+    # Past the (short, configured) cooldown: it can re-confirm.
+    events, _ = _run(
+        module, [IN_CRIB], motion=0.05, seconds=1.0, start=t + 0.5, object_boxes={"phone": [PHONE_IN_CRIB]}
+    )
+    assert "holding_object" in [e.type for e in events]
+
+
+def test_two_different_objects_held_at_once_are_both_reported():
+    """Per-label keys mean a phone AND a cup held simultaneously are two
+    independent, simultaneously-active detections -- not a single
+    'whichever was found first' winner."""
+    module = _module(holding_object_confirm_s=0.5)
+    events, _ = _run(
+        module, [IN_CRIB], motion=0.05, seconds=1.0,
+        object_boxes={"phone": [PHONE_IN_CRIB], "cup": [CUP_IN_CRIB]},
+    )
+    labels = {
+        e.contributing_signals.split("object=")[1].split()[0]
+        for e in events if e.type == "holding_object"
+    }
+    assert labels == {"phone", "cup"}
+
+
+# ------------------------------------------------------------------------- flailing
+def _flailing_state(present=True, confidence=0.8):
+    return ActivityState(flailing=Attribute("flailing", present, confidence), ready=True)
+
+
+def test_flailing_confirms_after_persistence():
+    module = _module(flailing_confirm_s=0.5)
+    events = []
+    t = 0.0
+    while t < 1.0:
+        events += module._reason(
+            [IN_CRIB], 0.05, W, H, t, activity_state=_flailing_state(),
+        )
+        t += 0.1
+    assert "flailing" in [e.type for e in events]
+    assert module.is_alert_active()
+
+
+def test_flailing_does_not_fire_on_a_brief_burst():
+    module = _module(flailing_confirm_s=0.5)
+    events = []
+    t = 0.0
+    while t < 0.3:  # under flailing_confirm_s
+        events += module._reason([IN_CRIB], 0.05, W, H, t, activity_state=_flailing_state())
+        t += 0.1
+    assert "flailing" not in [e.type for e in events]
+
+
+def test_flailing_is_false_when_activity_is_not_ready():
+    module = _module(flailing_confirm_s=0.2)
+    not_ready = ActivityState(ready=False)
+    events = []
+    t = 0.0
+    while t < 1.0:
+        events += module._reason([IN_CRIB], 0.05, W, H, t, activity_state=not_ready)
+        t += 0.1
+    assert "flailing" not in [e.type for e in events]
+
+
+def test_flailing_defaults_to_false_with_no_activity_state_at_all():
+    """process()-less callers (and the old _reason() signature) must not crash
+    or spuriously flag flailing when no pose data is supplied."""
+    module = _module(flailing_confirm_s=0.2)
+    events = []
+    t = 0.0
+    while t < 1.0:
+        events += module._reason([IN_CRIB], 0.05, W, H, t)  # no activity_state kwarg at all
+        t += 0.1
+    assert "flailing" not in [e.type for e in events]
+
+
+# ------------------------------------------------------------- human-object interaction
+def test_an_object_moving_toward_the_child_fires_object_approaching_before_it_overlaps():
+    """Trajectory, not proximity: a tracked item closing in on the child, still
+    short of any overlap, is a real signal a single-frame overlap test can't
+    see at all -- the anticipatory half of "about to be picked up"."""
+    module = _module()
+    t = 0.0
+    events = []
+    x = 750  # object box never overlaps IN_CRIB=(400,300,600,800) at any step below
+    for _ in range(10):
+        events += module._reason(
+            [IN_CRIB], 0.05, W, H, t, object_boxes={"phone": [(x, 530, x + 60, 590)]},
+        )
+        x -= 20  # closing in on the child every frame
+        t += 0.1
+    fired = [e for e in events if e.type == "object_approaching"]
+    assert fired, "a phone tracked moving toward the child must fire object_approaching"
+    assert "object=phone" in fired[0].contributing_signals
+
+
+def test_a_stationary_object_never_fires_approaching():
+    module = _module()
+    events = []
+    t = 0.0
+    for _ in range(10):
+        events += module._reason(
+            [IN_CRIB], 0.05, W, H, t, object_boxes={"phone": [(750, 530, 810, 590)]},
+        )
+        t += 0.1
+    assert "object_approaching" not in [e.type for e in events]
+
+
+def test_an_object_moving_away_never_fires_approaching():
+    module = _module()
+    events = []
+    t = 0.0
+    x = 650
+    for _ in range(10):
+        events += module._reason(
+            [IN_CRIB], 0.05, W, H, t, object_boxes={"phone": [(x, 530, x + 60, 590)]},
+        )
+        x += 20  # receding
+        t += 0.1
+    assert "object_approaching" not in [e.type for e in events]
+
+
+def test_holding_confidence_is_fused_not_a_flat_constant():
+    """Confidence at the moment holding CONFIRMS reflects how long that exact
+    item had already been reliably tracked beforehand (TrackedBox.stability),
+    not a hardcoded 0.7 regardless of track history: an item tracked nearby
+    for a while before it starts overlapping the child must confirm with
+    higher confidence than one that appears already overlapping with no
+    track history at all."""
+    brief = _module(holding_object_confirm_s=0.1)
+    events = []
+    t = 0.0
+    for _ in range(4):  # crosses min_frames=3 with no prior track history
+        events += brief._reason([IN_CRIB], 0.05, W, H, t, object_boxes={"phone": [PHONE_IN_CRIB]})
+        t += 0.1
+    brief_conf = next(e.confidence for e in events if e.type == "holding_object")
+
+    established = _module(holding_object_confirm_s=0.1)
+    events = []
+    t = 0.0
+    NEAR_CRIB_NOT_OVERLAPPING = (620, 350, 680, 500)  # close enough to stay the SAME track
+    # once it moves into PHONE_IN_CRIB below (within BoxTracker's match gate),
+    # but not yet overlapping IN_CRIB=(400,300,600,800) (x1=620 > x2=600)
+    for _ in range(20):  # tracked nearby (NOT overlapping) for ~2s first
+        events += established._reason(
+            [IN_CRIB], 0.05, W, H, t, object_boxes={"phone": [NEAR_CRIB_NOT_OVERLAPPING]},
+        )
+        t += 0.1
+    for _ in range(4):  # then moves into overlap -- same track, now well-established
+        events += established._reason([IN_CRIB], 0.05, W, H, t, object_boxes={"phone": [PHONE_IN_CRIB]})
+        t += 0.1
+    established_conf = next(e.confidence for e in events if e.type == "holding_object")
+
+    assert established_conf > brief_conf
+
+
+def test_enable_pose_false_never_touches_mediapipe_pose(monkeypatch):
+    """A deployment can fully opt out of the extra pose inference; process()
+    must not construct or call a Pose model at all in that case."""
+    module = _module(enable_pose=False)
+    assert module._pose is None
+    monkeypatch.setattr(module, "_detect_people", lambda frame: [IN_CRIB])
+    events = module.process(np.zeros((H, W, 3), dtype=np.uint8))  # must not raise
+    assert isinstance(events, list)

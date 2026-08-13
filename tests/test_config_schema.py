@@ -47,3 +47,51 @@ def test_token_with_lan_host_warns():
          "dashboard": {"host": "0.0.0.0", "token": "secret"}}
     )
     assert any("token" in w for w in warnings)
+
+
+# ------------------------------------------------------------------ cloud:
+# Previously entirely unvalidated (found in a repo-wide audit) despite holding
+# the security-relevant TLS settings -- a typo'd/wrong-typed key produced
+# neither an error nor a warning at boot, just a device that silently never
+# connected.
+def test_cloud_bad_types_are_reported():
+    errors, _ = validate({
+        "module": "m", "modules": {"m": {}},
+        "cloud": {"enabled": "yes", "tls_insecure_skip_verify": "nah", "poll_interval_s": -1},
+    })
+    joined = "\n".join(errors)
+    assert "cloud.enabled" in joined
+    assert "cloud.tls_insecure_skip_verify" in joined
+    assert "cloud.poll_interval_s" in joined
+
+
+def test_cloud_enabled_requires_an_http_base_url():
+    errors, _ = validate({
+        "module": "m", "modules": {"m": {}},
+        "cloud": {"enabled": True, "base_url": "not-a-url"},
+    })
+    assert any("cloud.base_url" in e for e in errors)
+
+
+def test_cloud_disabled_does_not_require_a_base_url():
+    errors, _ = validate({"module": "m", "modules": {"m": {}}, "cloud": {"enabled": False}})
+    assert errors == []
+
+
+def test_cloud_missing_entirely_is_fine():
+    errors, _ = validate({"module": "m", "modules": {"m": {}}})
+    assert errors == []
+
+
+def test_cloud_insecure_tls_over_https_warns():
+    _, warnings = validate({
+        "module": "m", "modules": {"m": {}},
+        "cloud": {"enabled": True, "base_url": "https://example.com",
+                  "tls_insecure_skip_verify": True},
+    })
+    assert any("tls_insecure_skip_verify" in w for w in warnings)
+
+
+def test_cloud_must_be_a_mapping():
+    errors, _ = validate({"module": "m", "modules": {"m": {}}, "cloud": "nope"})
+    assert any("cloud:" in e for e in errors)
