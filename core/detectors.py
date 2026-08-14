@@ -69,6 +69,43 @@ def _model_device(model) -> str:
         return "unknown"
 
 
+def predict_roi(
+    model, frame, roi: Box, classes: Optional[list[int]] = None, conf: float = 0.25
+) -> list[tuple[Box, int, float]]:
+    """Run `model` on a CROPPED sub-image of `frame` (a region of interest,
+    e.g. around a detected hand) instead of the whole frame, returning boxes
+    already translated back into full-frame pixel coordinates.
+
+    A crop makes a small object take up a much larger fraction of the model's
+    input resolution than it would in the full frame -- the same lever a
+    security camera's "digital PTZ" zoom uses for small/distant subjects, and
+    free of any new model: it's the SAME loaded detector (`model`, from
+    get_yolo_model), called on fewer pixels. Works with either backend behind
+    get_yolo_model (ultralytics YOLO or the Hailo shim), since both share the
+    same `.predict(frame, verbose=, classes=, conf=)` -> per-box `.xyxy`/
+    `.cls`/`.conf` call surface.
+
+    Returns (box_in_frame_coords, class_id, confidence) tuples; empty if the
+    roi is degenerate (zero width/height after clamping to the frame).
+    """
+    h, w = frame.shape[:2]
+    x1, y1, x2, y2 = (int(v) for v in roi)
+    x1, y1 = max(0, x1), max(0, y1)
+    x2, y2 = min(w, x2), min(h, y2)
+    if x2 <= x1 or y2 <= y1:
+        return []
+    crop = frame[y1:y2, x1:x2]
+    results = model.predict(crop, verbose=False, classes=classes, conf=conf)
+    out: list[tuple[Box, int, float]] = []
+    for result in results:
+        for box in result.boxes:
+            class_id = int(box.cls[0])
+            score = float(box.conf[0])
+            cx1, cy1, cx2, cy2 = (float(v) for v in box.xyxy[0].tolist())
+            out.append(((int(cx1 + x1), int(cy1 + y1), int(cx2 + x1), int(cy2 + y1)), class_id, score))
+    return out
+
+
 def iou(box_a: Box, box_b: Box) -> float:
     """Compute the Intersection-over-Union of two (x1, y1, x2, y2) pixel boxes."""
     ax1, ay1, ax2, ay2 = box_a

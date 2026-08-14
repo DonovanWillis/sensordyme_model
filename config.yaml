@@ -161,7 +161,7 @@ alerts:
                phoneUseDetected, eyesClosedDetected, # openpilot module's additive distracted-driving flags
                skinnemoen_distracted, skinnemoen_phone_use, # skinnemoen module: every alert audible (additive)
                dashsentinel_drowsy, # DashSentinel's DROWSY status -- loud alarm
-               fall, zone_violation, safe_zone_exit] # elderly/baby/security presets' own red alerts -- were
+               fall, zone_violation, safe_zone_exit, # elderly/baby/security presets' own red alerts -- were
                # missing here entirely, so the device tagged them severity=soft. The app's BIG RED ALERT UI
                # (EventItem.severityStatus in Models.swift) and jupiter/explain.py both special-case these
                # three types as always-critical regardless of the stored severity string, but the cloud
@@ -169,7 +169,24 @@ alerts:
                # showed as a red alert on screen but never sent a push or SMS. Tagging it "loud" at the
                # source fixes every downstream consumer that trusts severity, instead of teaching each one
                # the type list separately.
-  soft_types: [fatigue_warning, frequent_glancing, elevated_risk, flailing, erratic_hand_movement, # always the soft chime
+               unusual_stillness, person_absent, flailing, # baby/elderly presets' own alerts -- same bug as
+               # the fall/zone fix above, found live: a real flailing event (device event id 3255) was
+               # correctly registered as one of baby_monitoring's alert_types, which the severity formula
+               # in services/runtime.py (`"loud" if in loud_types else "soft" if in soft_types OR in
+               # alert_event_types else "log"`) defaults to "soft" for anything not EXPLICITLY loud --
+               # meaning it reached Recent Activity and the local buzzer, but cloud/notify.py's
+               # NotificationGate requires severity=="loud" (or a custom rule) and silently dropped every
+               # push. unusual_stillness/person_absent have the identical gap. Baby Mode has no equivalent
+               # of "the driver is in danger, interrupt them" signal in loud_types at all before this --
+               # every one of its alert-worthy events, notification-wise, was unreachable by default.
+               person_lingering, vehicle_in_zone, animal_in_zone] # security_monitoring's own alert_types --
+               # the SAME class of bug, found by generalizing the fix above into a regression test
+               # (tests/test_config.py) that checks every preset, not just baby_monitoring's. (Security's
+               # fourth alert type, occupancy_change, was intentionally REMOVED from alert_types instead
+               # of promoted here -- it fires on every person entering/leaving frame, and as a loud type
+               # would interrupt constantly rather than never; matches baby_monitoring's own
+               # person_count_change, log-only by the same reasoning.)
+  soft_types: [fatigue_warning, frequent_glancing, elevated_risk, erratic_hand_movement, # always the soft chime
                promptDriverDistracted, promptDriverUnresponsive, # openpilot prompt (orange) alerts -- chime, as in the car
                distractionDetected, # openpilot module's additive instant chime (fires ~0.3s after detection)
                skinnemoen_calibration_complete, # skinnemoen calibration-done chime (the original beeped here)

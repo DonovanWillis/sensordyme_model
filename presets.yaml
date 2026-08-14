@@ -62,7 +62,14 @@ presets:
     title: Security Monitoring
     description: Person counting, restricted zones, and lingering detection.
     module: occupancy
-    alert_types: [occupancy_change, zone_violation, person_lingering, vehicle_in_zone, animal_in_zone]
+    # occupancy_change deliberately excluded -- it fires on every person entering/
+    # leaving frame (modules/occupancy.py's own count-change bookkeeping), which as
+    # an alert type would either interrupt constantly or (found alongside the Baby
+    # Mode notification fix, same root cause: a preset alert type absent from
+    # config.yaml's alerts.loud_types silently can never notify at all) never
+    # actually reach a phone -- matches baby_monitoring's own person_count_change,
+    # which was never in ITS alert_types either. Recent Activity still shows it.
+    alert_types: [zone_violation, person_lingering, vehicle_in_zone, animal_in_zone]
     variants:
       home: { title: Home }
       away:

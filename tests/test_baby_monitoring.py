@@ -1,8 +1,11 @@
 """Tests for the baby monitoring module's reasoning layer (no camera, no YOLO)."""
 
 import numpy as np
+import pytest
 
 from core.activity import ActivityState, Attribute
+from core.hand_perception import HandPerceptionResult, UNKNOWN_OBJECT
+from core.tracking import TrackedBox
 from modules.baby_monitoring import BabyMonitoringModule
 
 ZONES = {
@@ -459,3 +462,176 @@ def test_enable_pose_false_never_touches_mediapipe_pose(monkeypatch):
     monkeypatch.setattr(module, "_detect_people", lambda frame: [IN_CRIB])
     events = module.process(np.zeros((H, W, 3), dtype=np.uint8))  # must not raise
     assert isinstance(events, list)
+
+
+# ------------------------------------------------------------- hand-anchored perception
+# _reason()'s new `hand_result` kwarg is fed directly with a synthetic
+# HandPerceptionResult here (core/hand_perception.py's own 28 tests cover the
+# engine's internal reasoning -- hand ROI sizing, association scoring,
+# adaptive scheduling); these test the INTEGRATION layer: what
+# modules/baby_monitoring.py does with an association once it has one.
+def _hand_result(track_id=1, label="phone", side="right", score=0.9, box=(460, 350, 520, 500)):
+    track = TrackedBox(
+        track_id=track_id, label=label, box=box, confidence=score,
+        first_seen=0.0, last_seen=0.0, hits=5,
+    )
+    return HandPerceptionResult(hands=[], objects=[track], associations={f"{side}_hand": (track, score)})
+
+
+def _run_hand(module, boxes, motion, seconds, hand_result_fn, start=0.0, step=0.1,
+              bottle_boxes=(), object_boxes=None):
+    events = []
+    t = start
+    while t < start + seconds:
+        events += module._reason(
+            list(boxes), motion, W, H, t, list(bottle_boxes), object_boxes,
+            hand_result=hand_result_fn(t),
+        )
+        t += step
+    return events, t
+
+
+def test_hand_associated_object_confirms_holding_object_and_fires_picked_up():
+    """A hand-anchored association alone -- with NO full-frame bottle/object
+    box at all -- must be able to drive holding_object AND the new, more
+    specific object_picked_up event. This is the whole point of hand-anchored
+    perception: catching what the full-frame pass misses."""
+    module = _module(holding_object_confirm_s=1.0, hand_hold_confirm_s=1.0)
+    events, _ = _run_hand(module, [IN_CRIB], 0.05, 1.5, lambda t: _hand_result())
+    types = [e.type for e in events]
+    assert "holding_object" in types
+    assert "object_picked_up" in types
+    picked = next(e for e in events if e.type == "object_picked_up")
+    assert "object=phone" in picked.contributing_signals
+    assert "hand=right" in picked.contributing_signals
+
+
+def test_hand_associated_bottle_confirms_holding_bottle():
+    module = _module(holding_bottle_confirm_s=1.0, hand_hold_confirm_s=1.0)
+    events, _ = _run_hand(
+        module, [IN_CRIB], 0.05, 1.5, lambda t: _hand_result(label="bottle", side="left"),
+    )
+    assert "holding_bottle" in [e.type for e in events]
+
+
+def test_object_put_down_fires_when_the_hand_association_ends():
+    module = _module(hand_hold_confirm_s=0.5)
+    events, t = _run_hand(module, [IN_CRIB], 0.05, 1.0, lambda tt: _hand_result())
+    assert "object_picked_up" in [e.type for e in events]
+
+    events, _ = _run_hand(module, [IN_CRIB], 0.05, 3.0, lambda tt: None, start=t)
+    types = [e.type for e in events]
+    assert "object_put_down" in types
+    put_down = next(e for e in events if e.type == "object_put_down")
+    assert "object=phone" in put_down.contributing_signals
+    assert "hand=right" in put_down.contributing_signals
+
+
+def test_unknown_object_in_hand_is_reported_honestly_not_hallucinated_into_a_class():
+    """UNKNOWN_OBJECT must surface as its own honest event -- and must NOT be
+    silently folded into holding_object/holding_bottle for some configured
+    label just because the engine found *something* in the hand."""
+    module = _module(hand_hold_confirm_s=0.5)
+    events, _ = _run_hand(
+        module, [IN_CRIB], 0.05, 1.0, lambda t: _hand_result(label=UNKNOWN_OBJECT),
+    )
+    types = [e.type for e in events]
+    assert "object_picked_up" in types
+    picked = next(e for e in events if e.type == "object_picked_up")
+    assert "object=unknown_object" in picked.contributing_signals
+    assert "holding_object" not in types
+    assert "holding_bottle" not in types
+
+
+def test_object_transferred_between_hands_within_the_window():
+    module = _module(hand_hold_confirm_s=0.3, object_transfer_window_s=2.0)
+    events, t = _run_hand(module, [IN_CRIB], 0.05, 0.6, lambda tt: _hand_result(track_id=7, side="left"))
+    assert "object_picked_up" in [e.type for e in events]
+
+    # Left hand releases it -- resolve_after_s=2.0 for object_in_hand.
+    events, t = _run_hand(module, [IN_CRIB], 0.05, 2.2, lambda tt: None, start=t)
+    assert "object_put_down" in [e.type for e in events]
+
+    # The SAME track id confirms in the OTHER hand shortly after: a transfer,
+    # not an unrelated pickup.
+    events, _ = _run_hand(
+        module, [IN_CRIB], 0.05, 0.6, lambda tt: _hand_result(track_id=7, side="right"), start=t,
+    )
+    types = [e.type for e in events]
+    assert "object_transferred" in types
+    assert "object_picked_up" not in types
+    transferred = next(e for e in events if e.type == "object_transferred")
+    assert "left->right" in transferred.contributing_signals
+    assert "object=phone" in transferred.contributing_signals
+
+
+def test_transfer_outside_the_window_is_two_separate_pickups_not_a_transfer():
+    module = _module(hand_hold_confirm_s=0.3, object_transfer_window_s=0.5)
+    events, t = _run_hand(module, [IN_CRIB], 0.05, 0.6, lambda tt: _hand_result(track_id=9, side="left"))
+    assert "object_picked_up" in [e.type for e in events]
+
+    events, t = _run_hand(module, [IN_CRIB], 0.05, 2.2, lambda tt: None, start=t)
+    assert "object_put_down" in [e.type for e in events]
+
+    t += 1.0  # well past the configured 0.5s transfer window
+    events, _ = _run_hand(
+        module, [IN_CRIB], 0.05, 0.6, lambda tt: _hand_result(track_id=9, side="right"), start=t,
+    )
+    types = [e.type for e in events]
+    assert "object_picked_up" in types
+    assert "object_transferred" not in types
+
+
+def test_both_hands_holding_different_objects_are_independently_reported():
+    module = _module(hand_hold_confirm_s=0.3, holding_object_confirm_s=0.3)
+
+    def hands(t):
+        left = TrackedBox(track_id=1, label="cup", box=(300, 300, 340, 340), confidence=0.9,
+                           first_seen=0.0, last_seen=t, hits=5)
+        right = TrackedBox(track_id=2, label="phone", box=(700, 300, 740, 340), confidence=0.9,
+                            first_seen=0.0, last_seen=t, hits=5)
+        return HandPerceptionResult(
+            hands=[], objects=[left, right],
+            associations={"left_hand": (left, 0.9), "right_hand": (right, 0.9)},
+        )
+
+    events, _ = _run_hand(module, [IN_CRIB], 0.05, 0.6, hands)
+    picked = {e.contributing_signals for e in events if e.type == "object_picked_up"}
+    assert any("object=cup" in s and "hand=left" in s for s in picked)
+    assert any("object=phone" in s and "hand=right" in s for s in picked)
+    held_labels = {
+        e.contributing_signals.split("object=")[1].split()[0]
+        for e in events if e.type == "holding_object"
+    }
+    assert held_labels == {"cup", "phone"}
+
+
+def test_full_frame_corroboration_boosts_hand_association_confidence():
+    # Deliberately NOT overlapping IN_CRIB, so the legacy overlap-with-child
+    # fallback stays silent and this isolates the corroboration bonus itself.
+    box = (850, 300, 910, 500)
+    module = _module(holding_object_confirm_s=0.3)
+    events, _ = _run_hand(module, [IN_CRIB], 0.05, 0.6, lambda t: _hand_result(score=0.6, box=box))
+    base_conf = next(e.confidence for e in events if e.type == "holding_object")
+    assert base_conf == pytest.approx(0.6)
+
+    module2 = _module(holding_object_confirm_s=0.3)
+    events2, _ = _run_hand(
+        module2, [IN_CRIB], 0.05, 0.6, lambda t: _hand_result(score=0.6, box=box),
+        object_boxes={"phone": [box]},
+    )
+    corroborated_conf = next(e.confidence for e in events2 if e.type == "holding_object")
+    assert corroborated_conf == pytest.approx(0.75)
+
+
+def test_no_hand_result_falls_back_to_the_legacy_overlap_signal():
+    """hand_result=None (pose disabled, or the caller predates this feature)
+    must not disable holding_object/holding_bottle -- the legacy full-frame
+    overlap test alone must still be able to confirm them."""
+    module = _module(holding_object_confirm_s=1.0)
+    events, _ = _run_hand(
+        module, [IN_CRIB], 0.05, 1.5, lambda t: None,
+        object_boxes={"phone": [PHONE_IN_CRIB]},
+    )
+    assert "holding_object" in [e.type for e in events]
+    assert "object_picked_up" not in [e.type for e in events]  # no hand data -> no hand-level event

@@ -61,6 +61,45 @@ def test_alerts_config_has_the_escalation_type_map():
     assert "elevated_risk" in alerts_config["soft_types"]
 
 
+def test_every_presets_alert_types_can_actually_notify():
+    """Regression test for a real, live bug: unusual_stillness/person_absent/
+    flailing were registered in baby_monitoring's alert_types (presets.yaml)
+    but absent from alerts.loud_types, so services/runtime.py's severity
+    formula ("loud" if in loud_types else "soft" if in soft_types OR in
+    alert_event_types else "log") defaulted them to "soft" -- which reached
+    Recent Activity and the local buzzer fine, but cloud/notify.py's
+    NotificationGate requires severity=="loud" (or a custom rule) and
+    silently dropped every push. Confirmed live: device event id 3255
+    (type=flailing) was ingested with severity=soft and never notified.
+
+    Every event type a PRESET (not a user's custom rule -- those get their
+    own bypass in NotificationGate) declares as alert-worthy must resolve to
+    "loud", or it is structurally unable to ever produce a phone notification,
+    silently, regardless of how real or repeated the underlying detection is.
+    """
+    from main import load_presets
+
+    config = load_config(REPO_ROOT / "config.yaml")
+    loud = set(config["alerts"]["loud_types"])
+    presets = load_presets()
+
+    unreachable = []
+    for preset_name, preset in presets.items():
+        for event_type in preset.get("alert_types", []):
+            # Reproduces services/runtime.py's exact severity formula. Every
+            # type here is (by construction, from alert_types) a member of
+            # alert_event_types, so the formula's third disjunct is always
+            # satisfied -- it resolves to "loud" if explicitly listed, else
+            # "soft" (never "log") for anything checked in this loop.
+            if event_type not in loud:
+                unreachable.append(f"{preset_name}:{event_type}")
+
+    assert not unreachable, (
+        f"these preset alert types can never produce a phone notification "
+        f"(not in alerts.loud_types): {unreachable}"
+    )
+
+
 def test_logging_config_has_telemetry_settings():
     config = load_config(REPO_ROOT / "config.yaml")
     logging_config = config["logging"]

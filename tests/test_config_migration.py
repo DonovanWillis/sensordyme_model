@@ -10,6 +10,25 @@ from pathlib import Path
 
 from scripts.migrate_config import has_key, migrate
 
+# A device already carrying an OLDER alerts.loud_types/soft_types list -- the
+# exact shape a real deployed unit had: unusual_stillness/person_absent/
+# flailing/person_lingering/vehicle_in_zone/animal_in_zone are all ABSENT,
+# which is precisely why those preset alert types could never produce a
+# phone notification (services/runtime.py's severity formula defaulted them
+# to "soft", and cloud/notify.py's NotificationGate requires "loud").
+DEVICE_CONFIG_OLD_ALERTS = """\
+alerts:
+  sinks: [console, sound, gpio_buzzer]
+  cooldown_s: 15
+  loud_types: [drowsiness, phone_use, eyes_down, attention_lost, high_risk,
+               fall, zone_violation, safe_zone_exit]
+  soft_types: [fatigue_warning, frequent_glancing, elevated_risk]
+  gpio_buzzer_pin: 17
+
+cloud:
+  device_key: dk_secret_value
+"""
+
 DEVICE_CONFIG = """\
 camera:
   rotate_180: true
@@ -149,6 +168,79 @@ def test_a_new_key_is_not_filed_under_the_next_section_s_comment(tmp_path):
     key_line = next(i for i, l in enumerate(lines) if "reconfigure_window_s:" in l)
     health_comment = next(i for i, l in enumerate(lines) if "Health monitoring" in l)
     assert key_line < health_comment, "new key landed under the health section's comment"
+
+
+# ------------------------------------------------------------------ list migrations
+# A device that already HAS a key (unlike the missing-key migrations above)
+# but whose VALUE needs a new member -- a repo fix to config.yaml's own
+# loud_types list is invisible to an already-deployed device, since it has
+# that key already and the missing-key rule leaves it untouched.
+def test_a_missing_member_is_added_to_an_existing_list(tmp_path):
+    path = write(tmp_path, DEVICE_CONFIG_OLD_ALERTS)
+    added = migrate(path)
+    assert "alerts.loud_types+=unusual_stillness" in added
+    assert "alerts.loud_types+=flailing" in added
+    text = path.read_text()
+    assert "unusual_stillness" in text
+    assert "flailing" in text
+
+
+def test_a_member_already_present_is_not_duplicated(tmp_path):
+    path = write(tmp_path, DEVICE_CONFIG_OLD_ALERTS)
+    migrate(path)
+    text_after_first = path.read_text()
+    assert text_after_first.count("zone_violation") == 1  # already present before migrating
+
+
+def test_running_the_list_migration_twice_changes_nothing_the_second_time(tmp_path):
+    path = write(tmp_path, DEVICE_CONFIG_OLD_ALERTS)
+    migrate(path)
+    after_first = path.read_text()
+    assert migrate(path) == []
+    assert path.read_text() == after_first
+
+
+def test_existing_loud_types_and_other_sections_are_preserved(tmp_path):
+    path = write(tmp_path, DEVICE_CONFIG_OLD_ALERTS)
+    migrate(path)
+    text = path.read_text()
+    for existing in ("drowsiness", "phone_use", "eyes_down", "attention_lost", "high_risk",
+                      "fall", "zone_violation", "safe_zone_exit"):
+        assert existing in text
+    assert "dk_secret_value" in text  # unrelated device-identity value untouched
+    assert "cooldown_s: 15" in text
+
+
+def test_a_single_line_flow_sequence_is_handled_too(tmp_path):
+    """The migration must work whether the device's list happens to be on one
+    line or wrapped across many -- not assume the repo's own multi-line style."""
+    text = "alerts:\n  loud_types: [drowsiness, phone_use]\n  soft_types: [fatigue_warning]\n"
+    path = write(tmp_path, text)
+    added = migrate(path)
+    assert "alerts.loud_types+=unusual_stillness" in added
+    result = path.read_text()
+    assert "drowsiness" in result and "phone_use" in result and "unusual_stillness" in result
+
+
+def test_list_migration_result_still_parses_as_yaml(tmp_path):
+    yaml = __import__("yaml")
+    path = write(tmp_path, DEVICE_CONFIG_OLD_ALERTS)
+    migrate(path)
+    parsed = yaml.safe_load(path.read_text())
+    loud = parsed["alerts"]["loud_types"]
+    for expected in ("unusual_stillness", "person_absent", "flailing",
+                      "person_lingering", "vehicle_in_zone", "animal_in_zone",
+                      "drowsiness", "zone_violation"):  # new + pre-existing, all present
+        assert expected in loud
+    assert parsed["cloud"]["device_key"] == "dk_secret_value"
+
+
+def test_a_key_migration_and_a_list_migration_both_trigger_one_backup(tmp_path):
+    path = write(tmp_path, DEVICE_CONFIG_OLD_ALERTS)
+    added = migrate(path)
+    assert any("+=" in a for a in added)  # a list migration ran
+    assert any("+=" not in a for a in added)  # a key migration ran too (e.g. cloud.ca_cert_path)
+    assert list(tmp_path.glob("config.yaml.bak-*"))
 
 
 def test_the_migrated_file_still_parses_as_yaml(tmp_path):
