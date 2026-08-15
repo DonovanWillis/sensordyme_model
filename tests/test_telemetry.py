@@ -113,6 +113,41 @@ def test_a_non_driver_modules_own_signals_are_not_silently_zeroed(tmp_path):
     assert as_dict["hands_visible"] == "2"
 
 
+def test_a_schema_change_rotates_the_stale_file_instead_of_misaligning_it(tmp_path):
+    """Found live: a device already running baby_monitoring's sibling file
+    from an older code version (fewer snapshot fields) kept appending newer,
+    wider rows under the old, narrower header after a deploy -- silently
+    misaligning every column for anyone reading the file by name. A schema
+    change must rotate the old file aside and start a fresh one instead."""
+    path = tmp_path / "telemetry.csv"
+    sibling = tmp_path / "telemetry_baby_monitoring.csv"
+
+    old_logger = TelemetryLogger(path, interval_s=0.0)
+    old_logger.log_if_due(now=0.0, timestamp_iso="t0", module_name="baby_monitoring",
+                           snapshot={"person_count": 1, "motion_energy": 0.1})
+    old_logger.close()
+    with sibling.open() as f:
+        old_rows = list(csv.reader(f))
+    assert old_rows[0] == ["timestamp", "module", "motion_energy", "person_count"]
+
+    new_logger = TelemetryLogger(path, interval_s=0.0)
+    new_logger.log_if_due(now=0.0, timestamp_iso="t1", module_name="baby_monitoring", snapshot=_BABY_SNAPSHOT)
+    new_logger.close()
+
+    # The old, narrower file is rotated aside, not extended with wider rows.
+    rotated = tmp_path / "telemetry_baby_monitoring.old1.csv"
+    assert rotated.exists()
+    with rotated.open() as f:
+        assert list(csv.reader(f)) == old_rows
+
+    # The live path now has ONLY the new schema, correctly aligned throughout.
+    with sibling.open() as f:
+        rows = list(csv.reader(f))
+    assert len(rows) == 2  # fresh header + the one new-schema row
+    header, row = rows[0], rows[1]
+    assert dict(zip(header, row))["flailing"] == "1"
+
+
 def test_driver_family_and_other_modules_coexist_in_the_same_run(tmp_path):
     """Switching from a preset to AI Custom (occupancy) and back, in one
     process lifetime, must not corrupt either file's schema."""

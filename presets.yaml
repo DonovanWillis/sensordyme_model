@@ -83,7 +83,7 @@ presets:
     title: Baby Monitoring
     description: Presence, safe/danger zones, unusual-stillness, and frantic-movement alerts with staged confirmation.
     module: baby_monitoring
-    alert_types: [zone_violation, safe_zone_exit, unusual_stillness, person_absent, flailing]
+    alert_types: [zone_violation, safe_zone_exit, unusual_stillness, person_absent, flailing, choking_hazard]
     variants:
       standard: { title: Standard }
       nap_time:

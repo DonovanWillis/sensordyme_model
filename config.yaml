@@ -169,7 +169,7 @@ alerts:
                # showed as a red alert on screen but never sent a push or SMS. Tagging it "loud" at the
                # source fixes every downstream consumer that trusts severity, instead of teaching each one
                # the type list separately.
-               unusual_stillness, person_absent, flailing, # baby/elderly presets' own alerts -- same bug as
+               unusual_stillness, person_absent, flailing, choking_hazard, # baby/elderly presets' own alerts -- same bug as
                # the fall/zone fix above, found live: a real flailing event (device event id 3255) was
                # correctly registered as one of baby_monitoring's alert_types, which the severity formula
                # in services/runtime.py (`"loud" if in loud_types else "soft" if in soft_types OR in
@@ -473,6 +473,13 @@ modules:
     # lower CPU) for a deployment that can't spare the extra model
     pose_every_n_frames: 1 # 1 = every frame (matches fall_detection.py); raise to
     # trade flailing-detection latency/precision for CPU on a heavily loaded Pi
+    hand_association_threshold: 0.35 # core.hand_perception's per-frame "is this object
+    # really in this hand" bar (engine default 0.55). Lowered here, empirically: hardware
+    # testing found a hand near the FACE (the choking-hazard case this exists for) produces
+    # a smaller ROI than a hand at chest/lap height -- torso-length-based sizing shrinks in
+    # that posture -- and a genuine held object peaked at 0.38 association, never crossing
+    # the shared default. Scoped to this module's config only; the shared engine default is
+    # unchanged for any other future caller (see core/hand_perception.py's module docstring).
     flailing_confirm_s: 0.5 # continuous flailing state (already smoothed by the
     # rolling window itself) required before "flailing" confirms
     flailing_cooldown_s: 5.0 # re-confirmation suppression after flailing resolves --
@@ -481,6 +488,18 @@ modules:
     # flail_min_peak_accel: 6.0 # torso-lengths/s^2, peak wrist acceleration
     # flail_min_reversals: 4 # direction reversals within the window
     # flail_min_reversal_amplitude: 0.10 # torso-lengths of travel per reversal leg
+
+    # --- choking hazard: a hand-held object on a closing trajectory toward the
+    # baby's mouth region. Requires enable_pose above (needs hand tracking, the
+    # SAME core.hand_perception engine holding_object/object_picked_up already
+    # use) -- see modules/baby_monitoring.py's _assess_choking_hazard for the
+    # full risk model (held + small-relative-to-hand + closing distance +
+    # trajectory, multiplied together, never a single-frame trigger).
+    choking_hazard_risk_threshold: 0.4 # minimum combined risk score (0-1) before this
+    # even starts counting toward confirmation -- see the risk formula above
+    choking_hazard_confirm_s: 0.4 # continuous risk >= threshold required before it
+    # confirms -- short (this is meant to interrupt immediately), but never single-frame
+    choking_hazard_cooldown_s: 6.0 # re-confirmation suppression after it resolves
 
   fall_detection:
     drop_velocity_threshold: 0.6 # fraction of frame-height/sec that counts as a "rapid drop"

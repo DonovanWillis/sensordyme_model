@@ -478,6 +478,26 @@ def _hand_result(track_id=1, label="phone", side="right", score=0.9, box=(460, 3
     return HandPerceptionResult(hands=[], objects=[track], associations={f"{side}_hand": (track, score)})
 
 
+def _moving_hand_result(trail, box, side="right", label="bottle", score=0.85, track_id=1,
+                         hand_box=(440, 330, 560, 460)):
+    """Like _hand_result, but with an explicit trail (list of (t, x, y)) on
+    the held object's track -- lets choking-hazard tests control trajectory
+    (approaching/receding/stationary) directly, which TrackedBox.approaching()
+    reads from the trail, not from a single static box. hand_box defaults to
+    something noticeably bigger than a "small" object's box, matching a real
+    hand-ROI's typical size relative to a coin/button/battery-scale item."""
+    obj = TrackedBox(
+        track_id=track_id, label=label, box=box, confidence=score,
+        first_seen=trail[0][0] if trail else 0.0, last_seen=trail[-1][0] if trail else 0.0,
+        hits=5, trail=list(trail),
+    )
+    hand = TrackedBox(
+        track_id=100, label=f"{side}_hand", box=hand_box, confidence=0.9,
+        first_seen=0.0, last_seen=trail[-1][0] if trail else 0.0, hits=5,
+    )
+    return HandPerceptionResult(hands=[hand], objects=[obj], associations={f"{side}_hand": (obj, score)})
+
+
 def _run_hand(module, boxes, motion, seconds, hand_result_fn, start=0.0, step=0.1,
               bottle_boxes=(), object_boxes=None):
     events = []
@@ -678,3 +698,164 @@ def test_no_hand_result_falls_back_to_the_legacy_overlap_signal():
     )
     assert "holding_object" in [e.type for e in events]
     assert "object_picked_up" not in [e.type for e in events]  # no hand data -> no hand-level event
+
+
+# --------------------------------------------------------------------- choking hazard
+# Mouth zone geometry for IN_CRIB=(400,300,600,800), MOUTH_ZONE_FRACTION=0.4:
+#   upper_region -> (400, 300, 600, 500); center -> (500, 400)
+# baby box diagonal = hypot(200, 500) ~= 538.5 (aspect=1.0, since W==H==1000)
+MOUTH_CENTER = (500.0, 400.0)
+
+
+def _converging_trajectory_fn(start=(750.0, 650.0), end=MOUTH_CENTER, duration=1.0,
+                               half_size=20, label="bottle", hand_box=(440, 330, 560, 460)):
+    """A hand_result_fn for _run_hand: an object that moves in a straight
+    line from `start` toward `end` over `duration` seconds, then holds at
+    `end` -- a realistic multi-frame converging approach, not a synthetic
+    2-point jump. `half_size` controls the object's box (and therefore its
+    diagonal, and therefore whether it reads as "small" relative to hand_box)."""
+    trail = []
+    def hand_result_fn(t):
+        frac = min(1.0, t / duration) if duration > 0 else 1.0
+        x = start[0] + (end[0] - start[0]) * frac
+        y = start[1] + (end[1] - start[1]) * frac
+        trail.append((t, x, y))
+        if len(trail) > 15:
+            trail.pop(0)
+        box = (int(x - half_size), int(y - half_size), int(x + half_size), int(y + half_size))
+        return _moving_hand_result(trail, box, label=label, hand_box=hand_box)
+    return hand_result_fn
+
+
+def test_small_object_approaching_mouth_triggers_choking_hazard():
+    """The core requested scenario: a small object, genuinely held, on a
+    sustained multi-frame trajectory into the baby's mouth region."""
+    module = _module(choking_hazard_confirm_s=0.3)
+    events, _ = _run_hand(
+        module, [IN_CRIB], 0.05, 2.0, _converging_trajectory_fn(half_size=20, label="bottle"), step=0.1,
+    )
+    types = [e.type for e in events]
+    assert "choking_hazard" in types
+    fired = next(e for e in events if e.type == "choking_hazard")
+    assert "object=bottle" in fired.contributing_signals
+    assert "right hand" in fired.contributing_signals
+    assert module.is_alert_active()
+
+
+def test_empty_hand_near_face_does_not_trigger_choking_hazard():
+    """"Do not simply alert whenever a hand is near the baby's face" -- a
+    hand with nothing associated (forehead touch, adjusting clothing) must
+    never reach risk scoring at all, regardless of how close it is."""
+    module = _module()
+    def hand_result_fn(t):
+        hand = TrackedBox(
+            track_id=100, label="right_hand", box=(460, 330, 560, 430),
+            confidence=0.9, first_seen=0.0, last_seen=t, hits=5,
+        )
+        return HandPerceptionResult(hands=[hand], objects=[], associations={})
+    events, _ = _run_hand(module, [IN_CRIB], 0.05, 2.0, hand_result_fn)
+    assert "choking_hazard" not in [e.type for e in events]
+
+
+def test_object_moving_away_from_mouth_does_not_trigger():
+    """"Moves their hand across the camera without approaching the mouth"
+    must not alert -- an object genuinely held but on a trajectory AWAY from
+    the mouth region."""
+    module = _module(choking_hazard_confirm_s=0.3)
+    events, _ = _run_hand(
+        module, [IN_CRIB], 0.05, 2.0,
+        _converging_trajectory_fn(start=MOUTH_CENTER, end=(700.0, 650.0), half_size=20), step=0.1,
+    )
+    assert "choking_hazard" not in [e.type for e in events]
+
+
+def test_large_object_approaching_scores_far_lower_risk_than_small():
+    """"Give higher priority to small objects": the SAME trajectory and hand,
+    only the object's size relative to the hand differs. A large object
+    (e.g. a big toy) must not cross the default risk threshold the way a
+    small one does."""
+    module = _module(choking_hazard_confirm_s=0.3)
+    small_events, _ = _run_hand(
+        module, [IN_CRIB], 0.05, 2.0, _converging_trajectory_fn(half_size=20, label="bottle"), step=0.1,
+    )
+    large_module = _module(choking_hazard_confirm_s=0.3)
+    large_events, _ = _run_hand(
+        large_module, [IN_CRIB], 0.05, 2.0,
+        _converging_trajectory_fn(half_size=100, label="remote"), step=0.1,
+    )
+    assert "choking_hazard" in [e.type for e in small_events]
+    assert "choking_hazard" not in [e.type for e in large_events]
+
+
+def test_a_single_frame_does_not_trigger_choking_hazard():
+    """Must never fire from a single frame -- even a frame whose object is
+    already inside the mouth zone with a convincing trail."""
+    module = _module(choking_hazard_confirm_s=0.5)
+    box = (480, 380, 520, 420)
+    trail = [(0.0, 700.0, 600.0), (0.05, 500.0, 400.0)]
+    events = module._reason(
+        [IN_CRIB], 0.05, W, H, 0.05, [], {}, None,
+        _moving_hand_result(trail, box, label="bottle"),
+    )
+    assert "choking_hazard" not in [e.type for e in events]
+
+
+def test_sustained_hazard_fires_once_not_every_frame():
+    """A single, ongoing hazard must confirm once, not repeat every frame it
+    stays true -- the anti-spam behavior EventEngine already gives every
+    other detection in this module."""
+    module = _module(choking_hazard_confirm_s=0.3)
+    events, _ = _run_hand(
+        module, [IN_CRIB], 0.05, 3.0,
+        _converging_trajectory_fn(duration=0.5, half_size=20, label="bottle"), step=0.1,
+    )
+    confirmed = [e for e in events if e.type == "choking_hazard"]
+    assert len(confirmed) == 1
+
+
+def test_choking_hazard_resolves_and_respects_cooldown_after_release():
+    """Picking the object up again shortly after putting it down (right
+    after a confirmed hazard) must not spam a second alert inside the
+    cooldown window -- it should resolve cleanly (the object_in_hand-style
+    resolve_after_s=3.0 grace has to actually elapse) and then stay quiet
+    until choking_hazard_cooldown_s has passed."""
+    module = _module(choking_hazard_confirm_s=0.3, choking_hazard_cooldown_s=5.0)
+    events, t = _run_hand(
+        module, [IN_CRIB], 0.05, 1.5,
+        _converging_trajectory_fn(duration=0.3, half_size=20, label="bottle"), step=0.1,
+    )
+    assert "choking_hazard" in [e.type for e in events]
+
+    # Hand released for longer than the 3.0s resolve grace, so it genuinely
+    # resolves, then immediately re-offered on the same converging path --
+    # well inside the 5.0s cooldown above.
+    events2, t2 = _run_hand(module, [IN_CRIB], 0.05, 3.2, lambda tt: None, start=t)
+    events3, _ = _run_hand(
+        module, [IN_CRIB], 0.05, 1.0,
+        _converging_trajectory_fn(duration=0.3, half_size=20, label="bottle"), start=t2, step=0.1,
+    )
+    all_events = events + events2 + events3
+    assert "choking_hazard_resolved" in [e.type for e in all_events]
+    assert [e.type for e in all_events].count("choking_hazard") == 1  # cooldown held
+
+
+def test_get_debug_state_reports_the_required_fields():
+    """Explicit product requirement: what object was detected, whether it was
+    associated with a hand, distance to mouth, movement direction, risk
+    score, and why an alert did/didn't trigger."""
+    module = _module(choking_hazard_confirm_s=0.3)
+    fn = _converging_trajectory_fn(half_size=20, label="bottle")
+    for i in range(15):
+        t = i * 0.1
+        module._reason([IN_CRIB], 0.05, W, H, t, [], {}, None, fn(t))
+    state = module.get_debug_state()
+    assert state is not None
+    right = state["choking_hazard"]["right"]
+    assert right["object_detected"] is True
+    assert right["object_label"] == "bottle"
+    assert right["associated_with_hand"] is True
+    assert right["distance_to_mouth_norm"] is not None
+    assert right["movement_direction"] in ("toward mouth", "away from / not toward mouth", "stationary")
+    assert 0.0 <= right["risk_score"] <= 1.0
+    assert isinstance(right["alert_triggered"], bool)
+    assert right["reason"]  # never blank -- always says something

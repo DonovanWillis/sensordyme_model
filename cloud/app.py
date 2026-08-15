@@ -470,6 +470,7 @@ _EVENT_TITLES = {
     "zone_violation": "🚨 Zone Violation",
     "vehicle_in_zone": "🚗 Vehicle In Zone",
     "animal_in_zone": "🐾 Animal In Zone",
+    "choking_hazard": "⚠️ Possible Choking Hazard",
 }
 
 #: Detail sentence per type, filled in with the event's own `duration` --

@@ -82,6 +82,16 @@ class TelemetryLogger:
         self._other: dict[str, tuple] = {}
 
     @staticmethod
+    def _existing_header(path: Path) -> Optional[list[str]]:
+        """The first line of an already-written CSV, or None if there isn't one."""
+        try:
+            with path.open("r", newline="") as f:
+                row = next(csv.reader(f), None)
+            return row
+        except (FileNotFoundError, StopIteration):
+            return None
+
+    @staticmethod
     def _open(path: Path, header: list[str]):
         is_new = not path.exists()
         file = path.open("a", newline="")
@@ -98,7 +108,23 @@ class TelemetryLogger:
         entry = self._other.get(module_name)
         if entry is None:
             header = ["timestamp", "module"] + sorted(snapshot.keys())
-            entry = self._open(self._sibling_path(module_name), header)
+            path = self._sibling_path(module_name)
+            # A module's snapshot shape is fixed by its code, but a device that
+            # deployed an older version of that code (or switched module
+            # variants) can already have a file on disk from a DIFFERENT
+            # shape. Appending under a stale header — found live, this exact
+            # file — silently misaligns every row after it for anyone reading
+            # by column name. Rather than guess how to migrate old rows, this
+            # rotates the mismatched file aside (its data isn't lost, just not
+            # extended) and starts a fresh one with today's header.
+            existing = self._existing_header(path)
+            if existing is not None and existing != header:
+                for n in range(1, 100):
+                    stamp = path.with_name(f"{path.stem}.old{n}{path.suffix}")
+                    if not stamp.exists():
+                        path.rename(stamp)
+                        break
+            entry = self._open(path, header)
             self._other[module_name] = entry
         return entry
 

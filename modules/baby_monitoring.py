@@ -10,16 +10,26 @@ core/taxonomy.py under `baby_monitoring`. The short version:
   overlapping the child's box (an approximation of "holding", not proof —
   the SAME box-overlap approximation core/rules.py's `holding` predicate
   already uses and discloses elsewhere in the product; nothing infant-model-
-  specific about it, which is why it's safe to claim where face state isn't).
+  specific about it, which is why it's safe to claim where face state isn't),
+  and a hand-held object on a closing trajectory toward the baby's mouth
+  region (choking-hazard risk scoring — see _assess_choking_hazard below).
+  The "mouth region" is core/detectors.py's upper_region geometric proxy
+  (the same one `holding`/`near_mouth` already use elsewhere), not a facial
+  landmark: this module still does not claim to see an actual mouth, on the
+  same infant-face-model grounds as the DELIBERATELY NOT CLAIMED list below.
 
   DELIBERATELY NOT CLAIMED: face-covered / face-down detection (adult face
   models are not reliable enough on infants for a safety-critical claim),
-  sleeping vs awake, crying (no microphone), or anything requiring a
-  small-object vocabulary beyond what YOLO actually has classes for (COCO has
-  no "choking hazard" class, and a curated subset would create false
-  confidence about coverage it doesn't have — see core/capabilities.py's
-  objects.small_personal for the same reasoning applied product-wide).
-  Faking any of these would be worse than omitting them.
+  sleeping vs awake, crying (no microphone), or NAMING which small object is
+  in a hand — COCO has no "coin"/"button"/"battery"/"bead" class, and a
+  curated subset would create false confidence about coverage it doesn't
+  have (see core/capabilities.py's objects.small_personal for the same
+  reasoning applied product-wide). Choking-hazard risk scoring works around
+  this rather than pretending it isn't true: it never asks "what is this
+  object", only "how big is it relative to the hand holding it, and is it
+  closing on the mouth region" — questions a box detector CAN honestly
+  answer even for an object with no COCO class at all (core/hand_perception.
+  py's UNKNOWN_OBJECT). Faking identification would be worse than omitting it.
 
 All temporal reasoning goes through core/event_engine.py: nothing here alerts
 on a single frame, brief occlusions don't reset progress, and every alert has
@@ -28,8 +38,10 @@ an observed → developing → confirmed lifecycle with a resolution.
 
 from __future__ import annotations
 
+import math
 import time
 from collections import deque
+from dataclasses import dataclass
 from typing import Optional
 
 import cv2
@@ -46,7 +58,7 @@ from core.activity import (
     FLAIL_MIN_REVERSALS,
 )
 from core.detections import Detection, DetectionFrame
-from core.detectors import get_yolo_model, iou
+from core.detectors import get_yolo_model, iou, upper_region
 from core.event_engine import CONFIRMED, RESOLVED, EventEngine, RuleSpec
 from core.events import Event
 from core.hand_perception import HandPerceptionEngine, HandPerceptionResult, UNKNOWN_OBJECT, association_score
@@ -84,6 +96,179 @@ def _smoothed_hold_label(history: "deque[str]") -> str:
         counts[label] = counts.get(label, 0) + 1
     label, votes = max(counts.items(), key=lambda item: item[1])
     return label if votes >= _HOLD_LABEL_MIN_VOTES else UNKNOWN_OBJECT
+
+
+# --- choking-hazard risk scoring --------------------------------------------
+# "object detected + held in hand + closing on the mouth + small relative to
+# the hand = high risk" (product spec), built ENTIRELY from signals this
+# module already computes elsewhere -- no new inference, no object
+# classification, no infant facial landmarks. See _assess_choking_hazard.
+
+#: An object's box diagonal at or below this fraction of the holding hand's
+#: own diagonal counts as fully "small" for risk purposes -- a coin, button,
+#: battery, or bead pinched between fingers is much smaller than the hand
+#: itself. A ratio, not a pixel size, so it means the same thing near or far
+#: from the camera (the same reasoning core/hand_perception.py's ROI sizing
+#: and core/activity.py's motion thresholds use).
+SMALL_OBJECT_MAX_DIAGONAL_RATIO = 0.7
+#: _size_factor's floor for a large object -- never zero. A toy too big to
+#: swallow moving into an infant's mouth is still worth flagging, just less
+#: urgently than something that actually fits, so "large" fades the risk
+#: rather than erasing it.
+_SIZE_FACTOR_FLOOR = 0.35
+#: How close an object must get to the mouth region, in units of the baby's
+#: own box diagonal (scale-invariant the same way as above), before
+#: proximity alone starts contributing meaningful risk. 1.0 means "roughly
+#: one baby-box-diagonal away or closer starts to matter"; risk fades to
+#: zero beyond that, same shape as core/hand_perception.py's proximity term.
+MOUTH_PROXIMITY_RANGE = 1.4
+#: The fraction of the (possibly inferred) baby's box treated as the mouth
+#: region -- see core/detectors.py's upper_region. Wider than that
+#: function's own 0.35 default because a reclined/lying infant (the common
+#: crib-cam framing) doesn't present the same tight, upright head-in-top-
+#: third geometry an adult standing at a driver/security camera does.
+MOUTH_ZONE_FRACTION = 0.4
+
+
+@dataclass(frozen=True)
+class ChokingHazardAssessment:
+    """One frame's read on one hand's held object, for choking-hazard risk.
+
+    Carries every signal the risk score was built from, not just the score
+    itself -- "why did/didn't this fire" (an explicit product requirement)
+    needs the breakdown, not a single opaque number. See get_debug_state().
+    """
+
+    side: str
+    held: bool
+    object_label: str = UNKNOWN_OBJECT
+    object_track_id: Optional[int] = None
+    distance_to_mouth_norm: Optional[float] = None
+    approaching: Optional[bool] = None
+    size_factor: float = 0.0
+    association_confidence: float = 0.0
+    risk_score: float = 0.0
+    reason: str = "nothing held"
+
+
+def _infer_baby_box(
+    boxes: list[tuple[int, int, int, int]],
+) -> Optional[tuple[int, int, int, int]]:
+    """Which detected person box is (most likely) the baby's, when more than
+    one person is in frame.
+
+    This module has never distinguished a caregiver from the child by
+    detection alone (unusual_stillness, zone checks, "holding" — all already
+    apply to "the person in frame" generically; core/taxonomy.py's own
+    `unattended` entry discloses this exact limitation). For mouth-proximity
+    risk specifically the choice matters, so: the SMALLEST box is treated as
+    the baby's, since an infant occupies a much smaller fraction of frame
+    than an adult at any camera distance/mounting this product ships with.
+    An honest geometric approximation, not a classifier — if it guesses
+    wrong (e.g. a caregiver crouched far from camera reads smaller than a
+    baby close to it), risk scoring is computed against the wrong box for
+    that frame rather than failing safe silently; disclosed in
+    core/taxonomy.py alongside every other box-only heuristic here.
+    """
+    if not boxes:
+        return None
+    def _area(box: tuple[int, int, int, int]) -> int:
+        x1, y1, x2, y2 = box
+        return max(0, x2 - x1) * max(0, y2 - y1)
+    return min(boxes, key=_area)
+
+
+def _size_factor(object_diagonal: float, hand_diagonal: float) -> float:
+    """[_SIZE_FACTOR_FLOOR, 1.0]: how much a held object's size, RELATIVE to
+    the hand holding it, should weight choking-hazard risk.
+
+    No object classification involved: a coin and an unclassified
+    UNKNOWN_OBJECT of the same relative size score identically, which is the
+    point (see the module docstring on why this repo won't claim to NAME
+    small objects even though it can flag their presence and size honestly).
+    """
+    if hand_diagonal <= 1e-6:
+        return _SIZE_FACTOR_FLOOR
+    ratio = object_diagonal / hand_diagonal
+    if ratio <= SMALL_OBJECT_MAX_DIAGONAL_RATIO:
+        return 1.0
+    return max(_SIZE_FACTOR_FLOOR, SMALL_OBJECT_MAX_DIAGONAL_RATIO / ratio)
+
+
+def _point_to_box_distance(
+    point: tuple[float, float], box: tuple[float, float, float, float], aspect: float = 1.0,
+) -> float:
+    """Straight-line distance from `point` to the nearest edge of `box` (0 if
+    `point` is already inside it) — the standard clamped point-to-rectangle
+    distance, aspect-corrected the same way core/tracking.py's velocity/
+    distance math already is elsewhere in this product."""
+    px, py = point
+    x1, y1, x2, y2 = box
+    dx = max(x1 - px, 0.0, px - x2)
+    dy = max(y1 - py, 0.0, py - y2)
+    return math.hypot(dx * aspect, dy)
+
+
+def _assess_choking_hazard(
+    side: str,
+    assoc: Optional[tuple],
+    hand_track,
+    baby_box: Optional[tuple[int, int, int, int]],
+    aspect: float,
+) -> ChokingHazardAssessment:
+    """Everything about one hand's held object that matters for choking-hazard
+    risk, computed from signals this module already has (hand-object
+    association, box trackers with trail/velocity) — no new inference.
+
+    Deliberately multiplicative once every factor is known, matching
+    core/hand_perception.py's association_score for the same reason: this is
+    a claim that several things are true AT ONCE (held AND small AND closing
+    on the mouth), not a claim that a strong reading on one axis should be
+    able to paper over a weak one on another. A large, stationary,
+    far-from-the-mouth object must not score high just because it happens to
+    be confidently tracked.
+    """
+    if assoc is None:
+        return ChokingHazardAssessment(side=side, held=False, reason="nothing held")
+    object_track, association_confidence = assoc
+    if baby_box is None:
+        return ChokingHazardAssessment(
+            side=side, held=True, object_label=object_track.label, object_track_id=object_track.track_id,
+            association_confidence=association_confidence, reason="no baby detected in frame this frame",
+        )
+    x1, y1, x2, y2 = baby_box
+    baby_diagonal = math.hypot((x2 - x1) * aspect, y2 - y1)
+    if baby_diagonal <= 1e-6:
+        return ChokingHazardAssessment(
+            side=side, held=True, object_label=object_track.label, object_track_id=object_track.track_id,
+            association_confidence=association_confidence, reason="degenerate baby box",
+        )
+    mouth_zone = upper_region(baby_box, MOUTH_ZONE_FRACTION)
+    mx1, my1, mx2, my2 = mouth_zone
+    mouth_center = ((mx1 + mx2) / 2.0, (my1 + my2) / 2.0)
+
+    distance = _point_to_box_distance(object_track.centroid, mouth_zone, aspect)
+    distance_norm = distance / baby_diagonal
+    proximity_factor = max(0.0, 1.0 - distance_norm / MOUTH_PROXIMITY_RANGE)
+
+    approaching = object_track.approaching(mouth_center, aspect)
+    trajectory_factor = 1.0 if approaching else (0.5 if approaching is None else 0.2)
+
+    hand_diagonal = hand_track.diagonal if hand_track is not None else 0.0
+    size_factor = _size_factor(object_track.diagonal, hand_diagonal)
+
+    risk = association_confidence * size_factor * proximity_factor * trajectory_factor
+    reason = (
+        f"distance_norm={distance_norm:.2f} approaching={approaching} "
+        f"size_factor={size_factor:.2f} proximity_factor={proximity_factor:.2f}"
+    )
+    return ChokingHazardAssessment(
+        side=side, held=True, object_label=object_track.label, object_track_id=object_track.track_id,
+        distance_to_mouth_norm=round(distance_norm, 3), approaching=approaching,
+        size_factor=round(size_factor, 3), association_confidence=round(association_confidence, 3),
+        risk_score=round(max(0.0, min(1.0, risk)), 3), reason=reason,
+    )
+
 
 # COCO class name -> label used on the generic "holding_object" event's detail
 # text. Configurable (`object_classes` in config.yaml, mirrors
@@ -289,6 +474,27 @@ class BabyMonitoringModule(VisionModule):
                 persist_s=float(config.get("hand_hold_confirm_s", 1.0)),
                 min_frames=3, resolve_after_s=2.0, cooldown_s=holding_cooldown_s,
             ))
+
+        # --- choking hazard: a held object on a closing trajectory toward the
+        # baby's mouth region -- see _assess_choking_hazard for the risk model.
+        # A SEPARATE, critical-severity signal from object_in_hand above (which
+        # fires for ANY held object, held anywhere): this one requires the
+        # object to actually be approaching the mouth, weighted toward small
+        # objects, and is meant to interrupt someone immediately, not log
+        # quietly like ordinary holding does.
+        self._choking_hazard_risk_threshold = float(config.get("choking_hazard_risk_threshold", 0.4))
+        for side in ("left", "right"):
+            self._engine.add_rule(RuleSpec(
+                detection=f"choking_hazard:{side}", severity="critical",
+                persist_s=float(config.get("choking_hazard_confirm_s", 0.4)),
+                min_frames=3, resolve_after_s=3.0,
+                cooldown_s=float(config.get("choking_hazard_cooldown_s", 6.0)),
+            ))
+        # This frame's per-hand risk breakdown, for get_debug_state() -- see
+        # ChokingHazardAssessment for why the full breakdown is kept, not just
+        # a pass/fail bit.
+        self._last_choking_assessments: dict[str, ChokingHazardAssessment] = {}
+
         # Per-hand memory the engine itself doesn't keep (it's stateless about
         # "events" on purpose -- see its module docstring): what's currently
         # believed to be in each hand, and a short-lived record of what was
@@ -624,6 +830,11 @@ class BabyMonitoringModule(VisionModule):
             track_id: v for track_id, v in self._recent_release.items()
             if now - v[1] <= self._transfer_window_s
         }
+        # Computed ONCE per frame, shared by both hands below -- see
+        # _infer_baby_box for why the smallest box stands in for the baby's
+        # when more than one person is in frame.
+        baby_box = _infer_baby_box(boxes)
+        choking_assessments: dict[str, ChokingHazardAssessment] = {}
         for side in ("left", "right"):
             assoc = hand_result.associations.get(f"{side}_hand") if hand_result is not None else None
             held = assoc is not None
@@ -642,6 +853,24 @@ class BabyMonitoringModule(VisionModule):
                 # module's other per-subject resets on loss of the subject.
                 self._hold_label_history[side].clear()
             transitions += self._engine.update(f"object_in_hand:{side}", held, confidence, now)
+
+            # Choking hazard: reuses the SAME association this frame (no
+            # re-detection), scored against the baby's mouth region. Gated on
+            # `held` up front -- an empty hand near the face never reaches
+            # risk scoring at all, which is the product's core distinction
+            # ("do not simply alert whenever a hand is near the baby's face").
+            hand_track = None
+            if held and hand_result is not None:
+                hand_track = next((h for h in hand_result.hands if h.label == f"{side}_hand"), None)
+            assessment = _assess_choking_hazard(side, assoc, hand_track, baby_box, aspect)
+            choking_assessments[side] = assessment
+            transitions += self._engine.update(
+                f"choking_hazard:{side}",
+                assessment.held and assessment.risk_score >= self._choking_hazard_risk_threshold,
+                assessment.risk_score,
+                now,
+            )
+        self._last_choking_assessments = choking_assessments
 
         # Human-object interaction beyond simple overlap: a tracked item's
         # TRAJECTORY closing on the child, before it ever overlaps, is a real,
@@ -708,6 +937,26 @@ class BabyMonitoringModule(VisionModule):
                         self._recent_release[track_id] = (side, now, label)
                     events.append(Event.now(
                         "object_put_down", tr.duration_s, tr.confidence, self.name,
+                        f"object={label} hand={side}",
+                    ))
+                continue
+            if base == "choking_hazard":
+                side = detail_suffix
+                assessment = self._last_choking_assessments.get(side)
+                label = assessment.object_label if assessment else UNKNOWN_OBJECT
+                if tr.state == CONFIRMED:
+                    # Kept short on purpose: this text goes verbatim into the push/SMS
+                    # notification body (cloud/app.py's _notification_detail prefers a
+                    # module's own signals text over its generic templates), which is
+                    # read in a moment of real urgency, not a debug log. The full
+                    # risk/distance breakdown lives in get_debug_state() instead.
+                    events.append(Event.now(
+                        "choking_hazard", tr.duration_s, tr.confidence, self.name,
+                        f"Small object detected near baby's mouth (object={label}, {side} hand)",
+                    ))
+                elif tr.state == RESOLVED:
+                    events.append(Event.now(
+                        "choking_hazard_resolved", tr.duration_s, tr.confidence, self.name,
                         f"object={label} hand={side}",
                     ))
                 continue
@@ -844,6 +1093,9 @@ class BabyMonitoringModule(VisionModule):
 
     def get_telemetry_snapshot(self) -> Optional[dict]:
         flailing = self._last_activity.flailing if self._last_activity else None
+        choking_risk_max = max(
+            (a.risk_score for a in self._last_choking_assessments.values()), default=0.0,
+        )
         return {
             "person_count": max(self._last_count, 0),
             "motion_energy": round(self._last_motion, 4),
@@ -852,4 +1104,52 @@ class BabyMonitoringModule(VisionModule):
             "flailing_confidence": round(flailing.confidence, 3) if flailing else 0.0,
             "hands_visible": len(self._last_hand_result.hands) if self._last_hand_result else 0,
             "objects_in_hand": len(self._last_hand_result.associations) if self._last_hand_result else 0,
+            "choking_hazard_risk_max": round(choking_risk_max, 3),
+            "choking_hazard_active": any(
+                d.startswith("choking_hazard:") for d in self._engine.active_detections()
+            ),
         }
+
+    def get_debug_state(self) -> Optional[dict]:
+        """Full, human-readable snapshot of choking-hazard risk scoring: what
+        object was seen, whether it was associated with a hand, distance to
+        the mouth region, movement direction, the risk score, and why an
+        alert was or wasn't triggered -- one entry per hand.
+
+        Developer/debug use only (main.py --debug), same as every other
+        module's get_debug_state -- never sent to the cloud or end-user
+        notification text. get_telemetry_snapshot above carries the single
+        max risk number into the logged CSV stream; this carries the full
+        per-hand reasoning behind it.
+        """
+        active = set(self._engine.active_detections())
+        per_hand = {}
+        for side, assessment in self._last_choking_assessments.items():
+            track = None
+            if self._last_hand_result is not None:
+                for obj_track, _score in self._last_hand_result.associations.values():
+                    if obj_track.track_id == assessment.object_track_id:
+                        track = obj_track
+                        break
+            if assessment.approaching is True:
+                direction = "toward mouth"
+            elif assessment.approaching is False:
+                speed = track.velocity() if track is not None else None
+                direction = "away from / not toward mouth" if (speed or 0) > 0.05 else "stationary"
+            else:
+                direction = "unknown (insufficient trail)"
+            triggered = f"choking_hazard:{side}" in active
+            per_hand[side] = {
+                "object_detected": assessment.held,
+                "object_label": assessment.object_label,
+                "associated_with_hand": assessment.held,
+                "distance_to_mouth_norm": assessment.distance_to_mouth_norm,
+                "movement_direction": direction,
+                "size_factor": assessment.size_factor,
+                "association_confidence": assessment.association_confidence,
+                "risk_score": assessment.risk_score,
+                "risk_threshold": self._choking_hazard_risk_threshold,
+                "alert_triggered": triggered,
+                "reason": assessment.reason if not triggered else "risk >= threshold, sustained",
+            }
+        return {"choking_hazard": per_hand, "active_alerts": sorted(active)}

@@ -38,6 +38,7 @@ from typing import Callable, Optional
 
 from core.detections import DetectionFrame
 from core.detectors import iou
+from core.detectors import upper_region as _upper_region
 from core.event_engine import CONFIRMED, EventEngine, RuleSpec
 from core.zones import Zone
 
@@ -113,20 +114,6 @@ def _any_overlap(boxes_a: list, boxes_b: list) -> bool:
     tracker matching already use) rather than a second implementation of
     box intersection."""
     return any(iou(a, b) > 0 for a in boxes_a for b in boxes_b)
-
-
-def _upper_region(box: tuple, fraction: float = 0.35) -> tuple:
-    """The top `fraction` of a box — where a standing or seated person's face is.
-
-    The evidence upgrade behind `near_mouth`: a bottle overlapping a person
-    anywhere is "holding" at best (it also matches a bottle at their feet in
-    box terms); a bottle overlapping the region their face occupies has been
-    raised toward the mouth. Still an approximation — a box knows nothing about
-    an actual mouth — but it is the difference between "has a drink" and
-    "is drinking from it" at the fidelity a box detector can support.
-    """
-    x1, y1, x2, y2 = box
-    return (x1, y1, x2, y1 + (y2 - y1) * fraction)
 
 
 def _parse_schedule(text: str) -> Optional[tuple[int, int]]:

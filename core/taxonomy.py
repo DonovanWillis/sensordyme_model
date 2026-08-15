@@ -150,6 +150,19 @@ TAXONOMY: dict[str, list[Detection]] = {
            caveat="same overlap approximation as holding_bottle; 'keys' specifically cannot be "
                   "detected — COCO (what the object detector actually knows) has no such class, "
                   "and this module refuses to claim a detection the model can't perform"),
+        _d("choking_hazard", "A hand-held object on a closing trajectory toward the baby's mouth", PARTIAL,
+           how="hand-anchored object association (core/hand_perception.py) + a geometric mouth-"
+               "region proxy (core/detectors.py's upper_region, the same one holding_bottle/"
+               "near_mouth already use) + trajectory (is distance to that region decreasing) + "
+               "a size factor weighting objects small relative to the holding hand — critical, "
+               "immediate alert when all combine past a risk threshold, never on a single frame",
+           caveat="approximates 'mouth' from a box region, not a facial landmark (same infant-"
+                  "face-model reasoning as face_covered below); does not and cannot NAME the "
+                  "object — a coin and an unclassified UNKNOWN_OBJECT of the same relative size "
+                  "score identically, honestly, rather than guessing a class the detector doesn't "
+                  "have (see objects.small_personal); when more than one person is in frame, the "
+                  "smallest detected box stands in for 'the baby', which can misattribute risk if "
+                  "that heuristic guesses wrong"),
         _d("medical", "Medical conditions / diagnoses", UNSUPPORTED,
            requires="out of scope by policy — the system reports observable safety conditions only"),
     ],

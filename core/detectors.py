@@ -106,6 +106,25 @@ def predict_roi(
     return out
 
 
+def upper_region(box: Box, fraction: float = 0.35) -> Box:
+    """The top `fraction` of a box — where a standing or seated person's face is.
+
+    The evidence upgrade behind core/rules.py's `near_mouth` and
+    modules/baby_monitoring.py's choking-hazard risk scoring: an object
+    overlapping a person anywhere is "holding" at best (it also matches an
+    object at their feet in box terms); an object overlapping the region
+    their face occupies has been raised toward the mouth. Still an
+    approximation — a box knows nothing about an actual mouth, and this
+    module has no opinion on WHOSE face, standing/seated/reclined, or infant
+    vs adult — but it is the difference between "has a drink" and "is
+    drinking from it" at the fidelity a box detector can support, without
+    claiming a facial-landmark capability this repo does not have (see
+    modules/baby_monitoring.py's module docstring on infant face models).
+    """
+    x1, y1, x2, y2 = box
+    return (x1, y1, x2, y1 + (y2 - y1) * fraction)
+
+
 def iou(box_a: Box, box_b: Box) -> float:
     """Compute the Intersection-over-Union of two (x1, y1, x2, y2) pixel boxes."""
     ax1, ay1, ax2, ay2 = box_a
