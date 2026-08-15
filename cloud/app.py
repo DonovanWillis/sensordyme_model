@@ -1486,6 +1486,15 @@ def ingest(body: IngestBody, background_tasks: BackgroundTasks, device: sqlite3.
     # Same reasoning as the convergence check above: a matching name is not
     # "nothing to do" while the device still reports custom monitoring active —
     # the device has to exit custom monitoring, so the command must still go out.
+    #
+    # Deliberately truthy, not `is not None`: "" (AI Custom's sentinel, see
+    # POST .../preset) is not a name to converge on — active_preset names the
+    # underlying module and never becomes "" itself, so `desired != active_preset`
+    # would be true forever and re-send this every poll, indefinitely. Custom
+    # monitoring is activated by custom_monitoring_wanted + ai_rules below
+    # instead, which converges on the right signal (monitoring.active) — see
+    # tests/test_rule_delivery.py's coexistence test for why this one has no
+    # set_preset command at all.
     if desired and (
         desired != (body.active_preset or device["active_preset"])
         or device_reports_custom_active

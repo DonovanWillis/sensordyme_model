@@ -606,6 +606,17 @@ class DeviceRuntime:
         from main import resolve_preset
 
         name = resolve_preset(name, self.presets)
+        # "" is not an unknown preset name — it is cloud/app.py's own sentinel
+        # for "apply AI Custom" (POST .../preset with preset=""), which names no
+        # module to hot-swap to at all: entering custom monitoring is driven
+        # entirely by self.monitoring.active, set independently by the rules
+        # (set_rules) delivery path and applied by _apply_monitoring_mode(),
+        # not by this method. There is nothing for _switch_preset to DO with
+        # it beyond what that path already does — so this is a real, named
+        # no-op, not "ignoring unknown preset ''" (which reads as a dropped or
+        # misdelivered command rather than the expected shape of this one).
+        if name == "":
+            return
         # Post-resolution no-op guard, independent of the caller's gate: a
         # rebuild of the module a device is already running costs a FaceMesh
         # teardown and every accumulated timer/window, which is never worth it
@@ -691,7 +702,14 @@ class DeviceRuntime:
                 continue  # timeout: no fresh frame — health watches bus.age_s()
             last_seq = seq
 
-            pending = (self.dashboard.pop_pending_preset() if self.dashboard else None) or (
+            # `is not None`, not `or`: dashboard's own "" is cloud/app.py's sentinel
+            # for "apply AI Custom" (see POST .../preset), a real, meaningful value
+            # distinct from "nothing pending" (None) — an `or` chain treats an
+            # empty-string result from the dashboard as falsy and silently falls
+            # through to whatever the uplink has instead, discarding the actual
+            # command.
+            dashboard_pending = self.dashboard.pop_pending_preset() if self.dashboard else None
+            pending = dashboard_pending if dashboard_pending is not None else (
                 self.uplink.pop_pending_preset() if self.uplink else None
             )
             # Resolve superseded names BEFORE the equality gate, not only inside
@@ -703,7 +721,11 @@ class DeviceRuntime:
             # enough to re-send the alias on every poll, that was a full module
             # teardown every few seconds: nothing needing sustained evidence
             # could ever fire.
-            if pending:
+            #
+            # `is not None`, not truthy: the same "" sentinel above must reach
+            # resolve_preset/_switch_preset rather than being silently dropped
+            # here — see _switch_preset's own handling of an empty name.
+            if pending is not None:
                 from main import resolve_preset
 
                 pending = resolve_preset(pending, self.presets)
@@ -713,7 +735,7 @@ class DeviceRuntime:
             # never changes it), so a request to return to that exact preset has
             # real work left — exiting custom monitoring — that this equality
             # check would otherwise skip silently, with no error and no log line.
-            if pending and (pending != self.active_preset or self.monitoring.active):
+            if pending is not None and (pending != self.active_preset or self.monitoring.active):
                 self._switch_preset(pending)
 
             # A new AI-configured rule set from the app replaces the live one.

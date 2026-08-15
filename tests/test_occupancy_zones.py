@@ -66,6 +66,57 @@ def _run(module, boxes, frames):
     return events
 
 
+def test_crowd_confirms_and_resolves_with_no_zone_configured(monkeypatch):
+    """crowd needs no drawn zone (core/taxonomy.py has always documented it as
+    a plain person-count threshold) -- unlike zone_violation/lingering/vehicle/
+    animal, which all require one."""
+    fake = _FakeModel()
+    monkeypatch.setattr(occupancy_module, "get_yolo_model", lambda weights: fake)
+    mod = OccupancyModule({
+        "confidence_threshold": 0.5, "confirm_frames": 1,
+        "crowd_threshold": 3, "crowd_confirm_s": 0.5,
+    })
+    mod._fake = fake
+    t = {"now": 0.0}
+    monkeypatch.setattr(occupancy_module.time, "monotonic", lambda: t["now"])
+
+    events = []
+    crowd_boxes = [(10, 10, 60, 300), (200, 10, 260, 300), (400, 10, 460, 300)]
+    for _ in range(10):
+        mod._fake.boxes_to_return = crowd_boxes
+        events += mod.process(FRAME)
+        t["now"] += 0.1
+    assert "crowd" in [e.type for e in events]
+    assert mod.is_alert_active()
+
+    for _ in range(70):
+        mod._fake.boxes_to_return = [crowd_boxes[0]]  # drops below threshold
+        events += mod.process(FRAME)
+        t["now"] += 0.1
+    assert "crowd_resolved" in [e.type for e in events]
+    assert not mod.is_alert_active()
+
+
+def test_crowd_does_not_confirm_below_threshold(monkeypatch):
+    fake = _FakeModel()
+    monkeypatch.setattr(occupancy_module, "get_yolo_model", lambda weights: fake)
+    mod = OccupancyModule({
+        "confidence_threshold": 0.5, "confirm_frames": 1,
+        "crowd_threshold": 3, "crowd_confirm_s": 0.5,
+    })
+    mod._fake = fake
+    t = {"now": 0.0}
+    monkeypatch.setattr(occupancy_module.time, "monotonic", lambda: t["now"])
+
+    events = []
+    for _ in range(10):
+        mod._fake.boxes_to_return = [(10, 10, 60, 300), (200, 10, 260, 300)]  # 2 < threshold
+        events += mod.process(FRAME)
+        t["now"] += 0.1
+    assert "crowd" not in [e.type for e in events]
+    assert not mod.is_alert_active()
+
+
 def test_person_outside_zone_only_counts(module):
     events = _run(module, [OUTSIDE], 20)
     types = {e.type for e in events}

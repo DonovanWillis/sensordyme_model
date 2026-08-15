@@ -14,6 +14,14 @@ shared event lifecycle (core/event_engine.py):
     security event set yet" caveat on both.
 All resolve when their subject leaves, and brief occlusions don't reset progress.
 
+crowd is the one event in this module that does NOT need a zone: core/taxonomy.py
+has always documented it as "person-count threshold", but no code here ever
+implemented it -- the taxonomy (and therefore docs/DETECTIONS.md, generated from
+it) claimed a capability that silently never fired. `crowd_threshold` confirmed
+people on screen at once, sustained `crowd_confirm_s`, resolves once the count
+drops back below threshold -- the same confirm/resolve lifecycle as the zone
+events above, just not gated on anyone having drawn an area.
+
 Lingering is per-person via core/tracking.py's PersonTracker, reused here on a
 coarse box-derived Skeleton (see core/keypoints.from_detection_box) rather than
 running a real pose model -- this module stays the cheap, always-on detector
@@ -94,6 +102,17 @@ class OccupancyModule(VisionModule):
         self._engine = EventEngine({})
         self._linger_s = float(config.get("linger_s", 30.0))
         self._zone_confirm_s = float(config.get("zone_confirm_s", 2.0))
+
+        # crowd: unusual person count, sustained -- independent of any zone
+        # (see module docstring). Always registered, not gated on zones being
+        # configured, since "how many people are here at once" needs nothing
+        # a user has to draw first.
+        self._crowd_threshold = int(config.get("crowd_threshold", 4))
+        self._crowd_confirm_s = float(config.get("crowd_confirm_s", 5.0))
+        self._engine.add_rule(RuleSpec(
+            detection="crowd", severity="warning",
+            persist_s=self._crowd_confirm_s, min_frames=3, resolve_after_s=5.0,
+        ))
         # The zones lingering/violation logic actually watches -- "safe" zones
         # are someone else's business (modules/baby_monitoring.py).
         self._watched_zones = [z for z in self._zones if z.kind in ("restricted", "boundary")]
@@ -243,10 +262,21 @@ class OccupancyModule(VisionModule):
             events.append(Event.now("occupancy_change", 0.0, confidence, self.name))
             self._last_emitted_count = count
 
+        now = time.monotonic()
+
+        # crowd: sustained person count over threshold, independent of any zone.
+        for tr in self._engine.update("crowd", count >= self._crowd_threshold, 0.85, now):
+            if tr.state == CONFIRMED:
+                events.append(Event.now(
+                    "crowd", tr.duration_s, tr.confidence, self.name,
+                    f"{count} people present (threshold {self._crowd_threshold})",
+                ))
+            elif tr.state == RESOLVED:
+                events.append(Event.now("crowd_resolved", tr.duration_s, tr.confidence, self.name))
+
         # Zone security events (only when a restricted/boundary zone is configured
         # -- occupancy has nothing to do with a "safe" zone, see baby_monitoring.py).
         if self._watched_zones:
-            now = time.monotonic()
             h, w = frame.shape[:2]
 
             # Per-person identity for lingering (see module docstring): a coarse

@@ -29,6 +29,7 @@ an observed → developing → confirmed lifecycle with a resolution.
 from __future__ import annotations
 
 import time
+from collections import deque
 from typing import Optional
 
 import cv2
@@ -55,6 +56,34 @@ from modules.base import VisionModule, register_module
 
 _PERSON_CLASS = 0  # COCO
 _BOTTLE_CLASS = next(cid for cid, name in COCO_NAMES.items() if name == "bottle")
+
+# How many recent per-frame classifications a held object's label is smoothed
+# over, and how many of them must agree before it's trusted (see
+# _smoothed_hold_label). A tight, close-up hand-ROI crop classifies right at
+# the confidence margin, so a single frame's opinion is not reliable evidence
+# on its own -- but consistent agreement across several frames is.
+_HOLD_LABEL_HISTORY_WINDOW = 5
+_HOLD_LABEL_MIN_VOTES = 3
+
+
+def _smoothed_hold_label(history: "deque[str]") -> str:
+    """The label recent observations actually agree on, or UNKNOWN_OBJECT.
+
+    Deliberately a plurality-with-a-floor, not "whatever the last frame said":
+    UNKNOWN_OBJECT is itself a real, honest observation (the classifier
+    wasn't confident that frame) and must be able to win the vote same as any
+    class name, rather than being filtered out before counting -- a hand
+    genuinely holding something the model can't confidently name should
+    report as unknown, not flicker to whichever class happened to win a
+    single frame.
+    """
+    if not history:
+        return UNKNOWN_OBJECT
+    counts: dict[str, int] = {}
+    for label in history:
+        counts[label] = counts.get(label, 0) + 1
+    label, votes = max(counts.items(), key=lambda item: item[1])
+    return label if votes >= _HOLD_LABEL_MIN_VOTES else UNKNOWN_OBJECT
 
 # COCO class name -> label used on the generic "holding_object" event's detail
 # text. Configurable (`object_classes` in config.yaml, mirrors
@@ -270,6 +299,20 @@ class BabyMonitoringModule(VisionModule):
         self._current_hold_track_id: dict[str, Optional[int]] = {}
         self._recent_release: dict[int, tuple[str, float, str]] = {}
         self._transfer_window_s = float(config.get("object_transfer_window_s", 2.0))
+        # Per-hand history of raw per-frame classifications, for smoothing (see
+        # _smoothed_hold_label): a tight, close-up hand ROI crop classifies
+        # right at the confidence margin, and a single frame's opinion flickers
+        # between plausible classes (bottle/phone/cup) for what is one held
+        # object -- found live, holding one bottle produced object_picked_up
+        # events labelled phone, cup, and object across one session. The
+        # per-hand key (not per-track) is deliberate: core.tracking.BoxTracker
+        # only matches a new detection to an existing track when their labels
+        # are EQUAL, so a classification flip doesn't relabel a track, it
+        # fragments into a new one -- a per-track history would restart on
+        # every flip, which is exactly the problem this exists to smooth over.
+        self._hold_label_history: dict[str, deque[str]] = {
+            "left": deque(maxlen=_HOLD_LABEL_HISTORY_WINDOW), "right": deque(maxlen=_HOLD_LABEL_HISTORY_WINDOW),
+        }
 
         # --- per-frame state ---------------------------------------------------
         self._frame_index = 0
@@ -351,10 +394,13 @@ class BabyMonitoringModule(VisionModule):
         if not results.pose_landmarks:
             self._last_pose_proto = None
             self._last_pose_landmarks = None
-            # The subject left (or the pose model lost them): motion history
-            # describes someone who may no longer be there and would misclassify
-            # whoever appears next -- same reasoning as fall_detection.py's reset.
-            self._activity.reset()
+            # Tolerant of a brief dropout (core/activity.py's pose_lost, up to
+            # POSE_LOST_GRACE_S) rather than an immediate reset(): fast, chaotic
+            # motion is both what flailing detection exists to catch AND a
+            # common cause of MediaPipe losing lock for a frame or two, so
+            # treating every dropout as "the subject left" would blind the
+            # window exactly when genuine distress motion needs it most.
+            self._activity.pose_lost(now)
             return None
         self._last_pose_proto = results.pose_landmarks
         self._last_pose_landmarks = results.pose_landmarks.landmark
@@ -584,10 +630,17 @@ class BabyMonitoringModule(VisionModule):
             confidence = 0.0
             if held:
                 obj_track, confidence = assoc
-                if obj_track.label != UNKNOWN_OBJECT and _corroborated(obj_track.label, obj_track.box):
+                self._hold_label_history[side].append(obj_track.label)
+                label = _smoothed_hold_label(self._hold_label_history[side])
+                if label != UNKNOWN_OBJECT and _corroborated(label, obj_track.box):
                     confidence = min(1.0, confidence + 0.15)
-                self._current_hold_label[side] = obj_track.label
+                self._current_hold_label[side] = label
                 self._current_hold_track_id[side] = obj_track.track_id
+            else:
+                # Nothing held: stale classification history must not bias
+                # whatever gets picked up next, same reasoning as this
+                # module's other per-subject resets on loss of the subject.
+                self._hold_label_history[side].clear()
             transitions += self._engine.update(f"object_in_hand:{side}", held, confidence, now)
 
         # Human-object interaction beyond simple overlap: a tracked item's

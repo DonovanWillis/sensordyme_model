@@ -150,6 +150,18 @@ def test_pending_zones_clears_once_drawn():
     assert engine.pending_zones() == []
 
 
+def test_zone_matching_ignores_spacing_casing_and_punctuation():
+    """A rule names a zone the way it was described in plain language ("front
+    door"); the zone itself is named however it was drawn ("front_door"). Both
+    refer to the same place and must match, or a correctly-drawn zone is
+    indistinguishable from an undrawn one — see core/rules.py's _zone_key."""
+    front_door = Zone(name="front_door", polygon=((0.5, 0.5), (1.0, 0.5), (1.0, 1.0), (0.5, 1.0)))
+    engine = RuleEngine([rule(zone="Front Door")], zones=[front_door])
+    assert engine.pending_zones() == []
+    alerts = drive(engine, "person_present", 6.0, boxes=INSIDE_POOL, frame_size=FRAME)
+    assert len(alerts) == 1
+
+
 # --------------------------------------------------------------------- rule set handling
 def test_malformed_rules_are_skipped_not_fatal():
     engine = RuleEngine([rule(), {"description": "no detection id"}, "not a dict", None])

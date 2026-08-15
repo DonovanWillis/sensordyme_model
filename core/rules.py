@@ -30,6 +30,7 @@ EventEngine, so custom rules get exactly the same debouncing as built-in ones.
 
 from __future__ import annotations
 
+import re
 import time
 from dataclasses import dataclass
 from datetime import datetime
@@ -43,6 +44,21 @@ from core.zones import Zone
 # Severity -> whether a confirmation should reach the user at all.
 _NOTIFY_KINDS = ("push", "sms", "silent")
 _SEVERITIES = ("info", "warning", "critical")
+
+
+def _zone_key(name: str) -> str:
+    """Fold a zone name to a comparison key that ignores spacing/casing/punctuation.
+
+    A rule names a zone the way a user or Jupiter phrased it in plain language
+    ("front door"); the zone itself is named the way it was drawn ("front_door",
+    "Front Door", ...) — same place, different string. Without this, the two
+    never compare equal and a correctly-drawn zone looks identical to an
+    undrawn one: the rule goes inert with no way to tell the two apart from the
+    data model alone. Stripping everything but letters/digits is deliberately
+    aggressive — a zone name has no reason to depend on which separator someone
+    happened to type.
+    """
+    return re.sub(r"[^a-z0-9]", "", name.strip().lower())
 
 
 @dataclass(frozen=True)
@@ -264,7 +280,7 @@ class RuleEngine:
         clock: Optional[Callable[[], datetime]] = None,
     ) -> None:
         self._clock = clock or datetime.now
-        self._zones = {z.name: z for z in (zones or [])}
+        self._zones = {_zone_key(z.name): z for z in (zones or [])}
         self._rules: dict[str, ConfiguredRule] = {}
         self._engine = EventEngine({})
         self._counters: dict[str, _CountWatcher] = {}
@@ -301,7 +317,7 @@ class RuleEngine:
         return self._persist.get(rule.rule_id, 2.0)
 
     def set_zones(self, zones: list[Zone]) -> None:
-        self._zones = {z.name: z for z in (zones or [])}
+        self._zones = {_zone_key(z.name): z for z in (zones or [])}
 
     @property
     def rules(self) -> list[ConfiguredRule]:
@@ -326,7 +342,9 @@ class RuleEngine:
         Surfaced so the app can say "draw the pool zone to activate this rule"
         instead of the rule silently never firing.
         """
-        return sorted({r.zone for r in self._rules.values() if r.zone and r.zone not in self._zones})
+        return sorted({
+            r.zone for r in self._rules.values() if r.zone and _zone_key(r.zone) not in self._zones
+        })
 
     # ------------------------------------------------------------------ evaluation
     def observe(
@@ -479,7 +497,7 @@ class RuleEngine:
         boxes: Optional[list[tuple[float, float, float, float]]],
         frame_size: Optional[tuple[int, int]],
     ) -> bool:
-        zone = self._zones.get(zone_name)
+        zone = self._zones.get(_zone_key(zone_name))
         if zone is None or not boxes or not frame_size:
             # An undrawn zone makes the rule inert rather than frame-wide: firing
             # everywhere is worse than not firing, and pending_zones() tells the

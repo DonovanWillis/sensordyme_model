@@ -22,6 +22,7 @@ from core.activity import (
     FLAIL_MIN_REVERSALS,
     HAND_RAISED_MARGIN,
     MIN_SAMPLES,
+    POSE_LOST_GRACE_S,
     WAVE_MIN_SWINGS,
 )
 
@@ -264,4 +265,37 @@ class TestFlailing:
         default thresholds accept."""
         strict = ActivityRecognizer(flail_min_reversals=50)
         state = _feed(strict, self._flail(12))
+        assert not state.flailing.present
+
+    def test_a_brief_pose_dropout_mid_flail_does_not_reset_the_window(self):
+        """Fast, chaotic motion is exactly what causes MediaPipe to lose lock
+        for a frame or two (motion blur) -- the same motion flailing exists to
+        catch. A one-frame dropout must not wipe the rolling window, or the
+        more genuinely distressed the motion, the less likely it is caught."""
+        recognizer = ActivityRecognizer()
+        frames = self._flail(12)
+        for step, overrides in enumerate(frames[:6]):
+            recognizer.update(_make_landmarks(overrides), now=step * 0.08)
+        recognizer.pose_lost(now=6 * 0.08 + 0.05)  # one missed frame, well under the grace period
+        state = None
+        for step, overrides in enumerate(frames[6:], start=7):
+            state = recognizer.update(_make_landmarks(overrides), now=step * 0.08)
+        assert state.flailing.present
+
+    def test_a_sustained_pose_loss_still_clears_the_window(self):
+        """A dropout that OUTLASTS the grace period is the subject actually
+        being gone (or a new person arriving) -- stale flailing evidence must
+        not carry over to whoever the camera sees next."""
+        recognizer = ActivityRecognizer()
+        state = _feed(recognizer, self._flail(12))
+        assert state.flailing.present  # sanity: baseline behavior still works
+
+        last_t = 11 * 0.1
+        recognizer.pose_lost(now=last_t + 0.1)          # loss begins
+        recognizer.pose_lost(now=last_t + 0.1 + POSE_LOST_GRACE_S + 0.1)  # outlasts the grace period
+
+        state = None
+        for step in range(3):  # a few calm frames for whoever appears next
+            t = last_t + 0.1 + POSE_LOST_GRACE_S + 0.1 + step * 0.1
+            state = recognizer.update(_make_landmarks(_STANDING), now=t)
         assert not state.flailing.present

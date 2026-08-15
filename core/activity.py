@@ -101,6 +101,15 @@ HEAD_DROOP_MAX_CLEARANCE = 0.18
 
 _MIN_VISIBILITY = 0.5
 
+# How long a momentary pose-tracking dropout is tolerated before the rolling
+# window is actually cleared, matching core/tracking.py's lost_grace_s
+# reasoning (occlusion is handled by patience, not an instant reset). Fast,
+# chaotic motion -- exactly what flailing detection exists to catch -- is also
+# a common cause of MediaPipe Pose losing lock for a frame or two (motion
+# blur), so clearing the window on the very first missing frame would make it
+# least reliable exactly when genuine distress motion needs it most.
+POSE_LOST_GRACE_S = 0.5
+
 
 @dataclass(frozen=True)
 class Attribute:
@@ -205,6 +214,7 @@ class ActivityRecognizer:
         flail_min_peak_accel: float = FLAIL_MIN_PEAK_ACCEL,
         flail_min_reversals: int = FLAIL_MIN_REVERSALS,
         flail_min_reversal_amplitude: float = FLAIL_MIN_REVERSAL_AMPLITUDE,
+        pose_lost_grace_s: float = POSE_LOST_GRACE_S,
     ) -> None:
         self.window_s = window_s
         self.aspect = aspect
@@ -212,18 +222,36 @@ class ActivityRecognizer:
         self._flail_min_peak_accel = flail_min_peak_accel
         self._flail_min_reversals = flail_min_reversals
         self._flail_min_reversal_amplitude = flail_min_reversal_amplitude
+        self._pose_lost_grace_s = pose_lost_grace_s
         self._samples: deque[_Sample] = deque()
         self._baseline_ankle: Optional[float] = None
+        self._lost_since: Optional[float] = None
 
     def reset(self) -> None:
         """Forget history — the subject left, or a new one arrived."""
         self._samples.clear()
         self._baseline_ankle = None
+        self._lost_since = None
+
+    def pose_lost(self, now: Optional[float] = None) -> None:
+        """Pose landmarks were unavailable this frame.
+
+        Tolerant of a brief dropout (up to `pose_lost_grace_s`), unlike
+        `reset()`: a caller expected to call this every frame pose is missing,
+        and only a dropout that OUTLASTS the grace period actually clears the
+        window (see POSE_LOST_GRACE_S for why a single missing frame must not).
+        """
+        now = time.monotonic() if now is None else now
+        if self._lost_since is None:
+            self._lost_since = now
+        elif now - self._lost_since >= self._pose_lost_grace_s:
+            self.reset()
 
     def update(self, landmarks: Sequence, now: Optional[float] = None,
                aspect: Optional[float] = None) -> ActivityState:
         """Add one frame of landmarks and classify."""
         now = time.monotonic() if now is None else now
+        self._lost_since = None  # pose is back, whatever streak was building ends
         if aspect is not None:
             self.aspect = aspect
 

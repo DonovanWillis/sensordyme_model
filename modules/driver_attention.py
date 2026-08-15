@@ -116,6 +116,18 @@ _PERSON_CLASS = 0  # COCO -- used only as a face-loss fallback signal, see below
 # contradictions, never on genuinely droopy eyes.
 _IRIS_CLEARLY_OPEN = 0.5
 
+# A calibrated yaw/pitch delta beyond this cannot be a real gaze angle from a
+# windshield-mounted camera -- solvePnP on 6 landmarks degenerates as tracking
+# breaks down (observed live: -92deg pitch, -76deg yaw, right as a fast turn
+# lost FaceMesh lock) and the rolling median (core/eye_signal.py's
+# SignalSmoother) only rejects an ISOLATED bad frame, not several consecutive
+# ones. This matters specifically because the face-loss coast path below
+# holds whatever self._last_yaw/_last_pitch last were for up to
+# face_lost_with_body_seconds and feeds it straight into eyes_down/distraction
+# confidence and risk fusion -- an implausible value there does not just look
+# wrong in a debug overlay, it can drive a real, misleadingly-confident alert.
+MAX_PLAUSIBLE_GAZE_DEG = 90.0
+
 # The 6 canonical landmarks used for solvePnP head-pose estimation.
 POSE_LANDMARK_IDS = {
     "nose_tip": 1,
@@ -1250,6 +1262,10 @@ class DriverAttentionModule(VisionModule):
             pitch = self._pitch_smoother.update(
                 angle_delta_deg(raw_gaze_pitch, self._calibrator.baseline_pitch)
             )
+            # Plausibility floor UNDER the median filter, not instead of it —
+            # see MAX_PLAUSIBLE_GAZE_DEG.
+            yaw = max(-MAX_PLAUSIBLE_GAZE_DEG, min(MAX_PLAUSIBLE_GAZE_DEG, yaw))
+            pitch = max(-MAX_PLAUSIBLE_GAZE_DEG, min(MAX_PLAUSIBLE_GAZE_DEG, pitch))
             self._last_yaw = yaw
             self._last_pitch = pitch
 

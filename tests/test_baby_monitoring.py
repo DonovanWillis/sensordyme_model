@@ -606,6 +606,49 @@ def test_both_hands_holding_different_objects_are_independently_reported():
     assert held_labels == {"cup", "phone"}
 
 
+def test_flickering_classification_smooths_to_the_majority_label():
+    """Found live: holding one bottle the whole time, the hand-ROI classifier's
+    per-frame opinion flickered between bottle/phone/cup/object across a real
+    session -- a tight, close-up crop classifies right at the confidence
+    margin. The label reported on object_picked_up/holding_object must reflect
+    what the recent frames actually agree on, not whichever class the exact
+    confirming frame happened to land on."""
+    module = _module(hand_hold_confirm_s=0.5)
+    # "bottle" is the true, dominant signal; the others are single-frame noise.
+    labels = ["bottle", "phone", "bottle", "cup", "bottle", "bottle", "bottle", "bottle",
+              "bottle", "bottle", "phone", "bottle", "bottle", "bottle", "bottle"]
+    calls = {"i": 0}
+
+    def hand_result_fn(t):
+        label = labels[min(calls["i"], len(labels) - 1)]
+        calls["i"] += 1
+        return _hand_result(label=label)
+
+    events, _ = _run_hand(module, [IN_CRIB], 0.05, 1.5, hand_result_fn)
+    picked = next(e for e in events if e.type == "object_picked_up")
+    assert "object=bottle" in picked.contributing_signals
+
+
+def test_no_clear_majority_reports_unknown_object_not_the_last_frame_seen():
+    """With no label holding a real majority, the honest answer is
+    UNKNOWN_OBJECT -- not whichever class happened to be seen on the exact
+    frame the hold confirmed, which is exactly the flicker this exists to
+    smooth over, not relocate to a different frame."""
+    module = _module(hand_hold_confirm_s=0.5)
+    labels = ["bottle", "phone", "cup", "bottle", "phone", "cup", "bottle", "phone",
+              "cup", "bottle", "phone", "cup", "bottle", "phone", "cup"]
+    calls = {"i": 0}
+
+    def hand_result_fn(t):
+        label = labels[min(calls["i"], len(labels) - 1)]
+        calls["i"] += 1
+        return _hand_result(label=label)
+
+    events, _ = _run_hand(module, [IN_CRIB], 0.05, 1.5, hand_result_fn)
+    picked = next(e for e in events if e.type == "object_picked_up")
+    assert "object=unknown_object" in picked.contributing_signals
+
+
 def test_full_frame_corroboration_boosts_hand_association_confidence():
     # Deliberately NOT overlapping IN_CRIB, so the legacy overlap-with-child
     # fallback stays silent and this isolates the corroboration bonus itself.

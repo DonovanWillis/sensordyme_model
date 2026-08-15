@@ -125,9 +125,15 @@ class FallDetectionModule(VisionModule):
         if not results.pose_landmarks:
             self._last_pose_proto = None
             self._last_posture = None
-            # The subject left: motion history describes someone who is no
-            # longer there and would misclassify whoever arrives next.
-            self._activity.reset()
+            # Tolerant of a brief dropout (core/activity.py's pose_lost, up to
+            # POSE_LOST_GRACE_S) rather than an immediate reset(): fast, chaotic
+            # motion is both what flailing/jumping detection exists to catch AND
+            # a common cause of MediaPipe losing lock for a frame or two, so
+            # treating every dropout as "the subject left" would blind the
+            # window exactly when genuine distress motion needs it most. This
+            # is scoped to the shared activity window only -- the fall-specific
+            # state reset below (hip/centroid tracking) is unrelated and unchanged.
+            self._activity.pose_lost(now)
             self._last_activity = None
             self._last_hip_y = None
             self._prev_y = None

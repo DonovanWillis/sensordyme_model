@@ -179,7 +179,7 @@ alerts:
                # push. unusual_stillness/person_absent have the identical gap. Baby Mode has no equivalent
                # of "the driver is in danger, interrupt them" signal in loud_types at all before this --
                # every one of its alert-worthy events, notification-wise, was unreachable by default.
-               person_lingering, vehicle_in_zone, animal_in_zone] # security_monitoring's own alert_types --
+               person_lingering, vehicle_in_zone, animal_in_zone, crowd] # security_monitoring's own alert_types --
                # the SAME class of bug, found by generalizing the fix above into a regression test
                # (tests/test_config.py) that checks every preset, not just baby_monitoring's. (Security's
                # fourth alert type, occupancy_change, was intentionally REMOVED from alert_types instead
@@ -404,6 +404,8 @@ modules:
     # alert (see modules/occupancy.py's docstring for why). Off by default: it's a real added
     # model this module is otherwise deliberately built without, so nothing about its resource
     # footprint changes unless a deployment explicitly wants the extra corroboration.
+    crowd_threshold: 4 # confirmed people on screen at once -> "crowd" (sustained, no zone needed)
+    crowd_confirm_s: 5.0 # seconds at/above crowd_threshold before it confirms
 
   baby_monitoring:
     confidence_threshold: 0.4 # YOLO person-detection confidence (children are smaller/lower-conf)

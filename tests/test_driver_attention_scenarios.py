@@ -289,6 +289,22 @@ def test_looking_all_the_way_up_triggers(tmp_path, clock):
     assert module.is_alert_active() is True
 
 
+def test_an_anatomically_impossible_pose_still_clamps_to_a_plausible_gaze_angle(tmp_path, clock):
+    """Found live: a fast head turn broke FaceMesh lock mid-motion, and
+    solvePnP on the degrading landmarks briefly produced pitch=-92deg,
+    yaw=-76.51deg -- angles no real gaze delta from a windshield-mounted
+    camera can reach. Those values then got HELD by the face-loss coast path
+    (see MAX_PLAUSIBLE_GAZE_DEG's own comment) and fed straight into
+    eyes_down/distraction confidence. An anatomically extreme synthetic pose
+    (well past any real head rotation) exercises the same solvePnP-extremity
+    path; regardless of what raw angle it produces, self._last_pitch/_last_yaw
+    must never carry a value outside the plausible range."""
+    module, frame = _make_module(tmp_path, clock)
+    _feed(module, frame, clock, pitch_deg=-150.0, yaw_deg=170.0, seconds=0.5)
+    assert abs(module._last_pitch) <= driver_attention_module.MAX_PLAUSIBLE_GAZE_DEG
+    assert abs(module._last_yaw) <= driver_attention_module.MAX_PLAUSIBLE_GAZE_DEG
+
+
 def test_looking_down_at_a_phone_for_over_five_seconds_is_very_high_confidence(tmp_path, clock):
     """Phone + downward gaze + sustained duration -- the exact combination the
     product brief calls out as needing a hard, non-averaged trigger."""
