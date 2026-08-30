@@ -2,6 +2,8 @@
 PersonTracker, for modules that reason about held/nearby items (phone, bottle, cup)
 where no pose skeleton exists to supply a torso-length scale reference."""
 
+import pytest
+
 from core.tracking import BoxTracker, TrackedBox
 
 
@@ -79,6 +81,46 @@ def test_velocity_is_none_with_only_one_sample():
     tracker = BoxTracker()
     track = tracker.update([("phone", (0, 0, 40, 40), 0.9)], now=0.0)[0]
     assert track.velocity() is None
+
+
+def test_peak_speed_sees_oscillation_that_net_displacement_cannot():
+    """The defect peak_speed exists for: a box snapping back and forth ends up
+    where it started, so velocity() (net displacement / elapsed) reports it as
+    barely moving no matter how violent the motion was. Both readings are
+    correct answers to different questions -- this pins that they differ."""
+    tracker = BoxTracker(max_distance=5.0)
+    t = 0.0
+    for step in range(9):  # odd count -> ends one step from where it started
+        x = 100 + 60 * (1 if step % 2 else -1)
+        track = tracker.update([("hand", (x, 80, x + 40, 120), 0.9)], now=t)[0]
+        t += 0.1
+    # 120px of travel every 0.1s against a ~56.6px diagonal -> >20 diagonals/s.
+    assert track.peak_speed() > 20.0
+    # ...while the net displacement over the whole 0.8s trail is one step.
+    assert track.velocity() < 3.0
+
+
+def test_peak_speed_matches_velocity_for_steady_one_direction_travel():
+    """No oscillation to hide: the fastest single step and the whole-trail
+    average agree, so peak_speed isn't systematically inflating anything."""
+    tracker = BoxTracker()
+    track = _move_across(tracker, "phone", [0, 20, 40, 60, 80], dt=0.2)
+    assert track.peak_speed() == pytest.approx(track.velocity(), rel=0.02)
+
+
+def test_peak_speed_is_none_with_only_one_sample():
+    tracker = BoxTracker()
+    track = tracker.update([("phone", (0, 0, 40, 40), 0.9)], now=0.0)[0]
+    assert track.peak_speed() is None
+
+
+def test_peak_speed_is_none_when_no_time_passed_between_samples():
+    """Two detections stamped with the same instant carry no speed information;
+    reporting 0.0 would be a claim the trail cannot support."""
+    tracker = BoxTracker()
+    tracker.update([("phone", (0, 0, 40, 40), 0.9)], now=0.0)
+    track = tracker.update([("phone", (40, 0, 80, 40), 0.9)], now=0.0)[0]
+    assert track.peak_speed() is None
 
 
 def _move_across(tracker, label, xs, y=80, size=40, dt=0.2, conf=0.9):

@@ -223,7 +223,13 @@ def test_full_customer_journey(backend):
         headers=device_headers,
     )
     command = r.json()["command"]
-    assert [rule["detection"] for rule in command["set_rules"]] == ["fall"]
+    # (target, predicate), which is the shape core/rules.py executes. This
+    # used to read `rule["detection"] == "fall"` -- an EVENT TYPE, which no
+    # detector emits as a label, so the rule this journey delivered was one
+    # the device could never fire. See tests/test_phase1_cloud_ai_fallback.py.
+    assert [(rule["target"], rule["predicate"]) for rule in command["set_rules"]] == [
+        ("on_floor", "present")
+    ]
 
     # 6g) and it CONVERGES: once the device reports the mode as active, the
     # command is cleared rather than re-sent for ever. Verified against the

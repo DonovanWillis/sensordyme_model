@@ -1,0 +1,430 @@
+"""Headless accuracy measurement against the State Farm distracted-driver dataset.
+
+Why this exists
+---------------
+`run_benchmarks.py` measures latency/FPS. `accuracy_protocol.py` measures accuracy
+but needs a HUMAN to act out timed scenarios in front of a camera, so it has never
+been run. That left the product with no accuracy number of any kind for any vision
+model, while a labelled 44,848-image driver dataset sat unused in `data/`.
+
+This module closes that gap for the detector half of driver_attention: it scores the
+SAME models the product actually loads, at the SAME thresholds config.yaml actually
+ships, against a subject-disjoint held-out split, with no human in the loop. It runs
+in ~30s for the default sample and is safe to gate CI on.
+
+What it measures
+----------------
+  * phone PR curve  -- YOLO 'cell phone' recall/precision across a confidence sweep,
+                       scored on the four phone classes (c1-c4) as positives and
+                       c0/c9 (safe driving, talking to passenger) as negatives.
+  * person recall   -- YOLO 'person' availability. Gates presence, zones, stillness,
+                       occupancy and baby_monitoring's smallest-box heuristic.
+  * face  recall    -- MediaPipe FaceMesh availability. Gates EVERY drowsiness (EAR,
+                       PERCLOS) and gaze (yaw/pitch) detection in the product; when
+                       the face is not found those detections cannot run at all.
+
+READ THIS BEFORE QUOTING ANY NUMBER FROM HERE
+---------------------------------------------
+State Farm's camera is mounted high on the PASSENGER side looking ACROSS the cabin.
+SensorDyme's recommended mount is dash-centre, DRIVER-FACING. These are therefore
+domain-shifted LOWER BOUNDS, not measurements of SensorDyme's operating accuracy --
+face availability in particular should be materially higher in the intended geometry.
+They bound the signal; they do not certify it. Their value is regression detection:
+a change that moves these numbers moved something real, and that is exactly what the
+threshold-tuning passes in this repo have historically lacked.
+
+Usage
+-----
+    python benchmarks/accuracy_state_farm.py                     # default 60/class
+    python benchmarks/accuracy_state_farm.py --per-class 150     # tighter CIs
+    python benchmarks/accuracy_state_farm.py --sweep             # full PR curve
+    python benchmarks/accuracy_state_farm.py --baseline out.json # write a baseline
+    python benchmarks/accuracy_state_farm.py --compare out.json  # regression gate
+"""
+
+from __future__ import annotations
+
+import argparse
+import csv
+import json
+import random
+import sys
+import time
+from pathlib import Path
+from typing import Optional
+
+import cv2
+import numpy as np
+
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))  # repo root
+
+DATA_ROOT = Path(__file__).resolve().parent.parent / "data" / "state_farm"
+RESULTS_DIR = Path(__file__).resolve().parent / "results"
+
+#: State Farm's own class definitions. c1-c4 are the four phone-in-hand poses, so a
+#: 'cell phone' detection on them is a true positive by construction. c0 and c9 have
+#: no phone, which makes them the honest negative set -- c5-c8 are excluded from the
+#: negative set because a phone may legitimately be visible in frame during them.
+CLASS_LABELS = {
+    "c0": "safe driving",
+    "c1": "texting - right",
+    "c2": "phone - right",
+    "c3": "texting - left",
+    "c4": "phone - left",
+    "c5": "operating radio",
+    "c6": "drinking",
+    "c7": "reaching behind",
+    "c8": "hair and makeup",
+    "c9": "talking to passenger",
+}
+PHONE_POSITIVE = ("c1", "c2", "c3", "c4")
+PHONE_NEGATIVE = ("c0", "c9")
+
+DEFAULT_SWEEP = (0.05, 0.10, 0.15, 0.20, 0.25, 0.30, 0.35, 0.40, 0.50)
+
+
+#: Exit codes, kept distinct ON PURPOSE. A caller has to be able to tell "the gate
+#: failed" apart from "the gate could not run", and `raise SystemExit("some string")`
+#: cannot: Python exits 1 for any non-integer argument, which is the same code a real
+#: regression returns. That collision meant the only way to stop a missing dataset
+#: from reddening CI was `continue-on-error`, which would have swallowed genuine
+#: regressions too — i.e. disabled the exact thing the job exists to catch.
+EXIT_OK = 0
+EXIT_REGRESSION = 1
+EXIT_CANNOT_RUN = 2
+
+
+class DatasetMissing(SystemExit):
+    """Raised when the dataset is absent. Exits EXIT_CANNOT_RUN, never EXIT_REGRESSION."""
+
+    def __init__(self, message: str) -> None:
+        print(message, file=sys.stderr)
+        super().__init__(EXIT_CANNOT_RUN)
+
+
+def load_sample(per_class: int, seed: int, split: str = "val") -> list[dict]:
+    """Deterministic per-class sample from the subject-disjoint manifest.
+
+    Sampling per class rather than uniformly keeps every behaviour represented even
+    at small n; the seed makes a run reproducible so two runs are comparable.
+    """
+    manifest = DATA_ROOT / f"{split}_manifest.csv"
+    if not manifest.exists():
+        raise DatasetMissing(
+            f"missing {manifest}.\n"
+            "The State Farm dataset is gitignored (~6GB). Prepare it with:\n"
+            "    python scripts/prepare_state_farm.py\n"
+            f"(exit {EXIT_CANNOT_RUN} = could not run, NOT a regression)"
+        )
+    rows = list(csv.DictReader(manifest.open()))
+    by_class: dict[str, list[dict]] = {}
+    for row in rows:
+        by_class.setdefault(row["classname"], []).append(row)
+
+    rng = random.Random(seed)
+    sample: list[dict] = []
+    for name in sorted(by_class):
+        pool = by_class[name]
+        sample.extend(rng.sample(pool, min(per_class, len(pool))))
+    return sample
+
+
+def _image_path(row: dict) -> Path:
+    return DATA_ROOT / "train" / row["classname"] / row["img"]
+
+
+def score_sample(sample: list[dict], sweep: tuple[float, ...], quiet: bool = False) -> dict:
+    """Run the product's real models over `sample`, recording per-image raw scores.
+
+    Scores are recorded ONCE at a floor confidence and thresholded afterwards, so a
+    full sweep costs the same as a single threshold -- which is what makes the PR
+    curve cheap enough to run in CI.
+    """
+    from ultralytics import YOLO
+    import mediapipe as mp
+
+    yolo = YOLO("yolo11n.pt")
+    names = yolo.names
+    phone_id = next(k for k, v in names.items() if v == "cell phone")
+    person_id = next(k for k, v in names.items() if v == "person")
+
+    face_mesh = mp.solutions.face_mesh.FaceMesh(
+        max_num_faces=1, refine_landmarks=True, min_detection_confidence=0.5
+    )
+
+    floor = min(sweep)
+    per_class: dict[str, dict] = {}
+    started = time.perf_counter()
+    skipped = 0
+
+    for index, row in enumerate(sample):
+        path = _image_path(row)
+        image = cv2.imread(str(path))
+        if image is None:
+            skipped += 1
+            continue
+
+        stats = per_class.setdefault(
+            row["classname"],
+            {"n": 0, "face": 0, "person": 0, "person_conf": [], "phone_scores": [], "multi_person": 0},
+        )
+        stats["n"] += 1
+
+        if face_mesh.process(cv2.cvtColor(image, cv2.COLOR_BGR2RGB)).multi_face_landmarks:
+            stats["face"] += 1
+
+        people = yolo.predict(image, verbose=False, classes=[person_id], conf=0.25)[0]
+        person_boxes = list(people.boxes or [])
+        if person_boxes:
+            stats["person"] += 1
+            stats["person_conf"].append(float(max(b.conf[0] for b in person_boxes)))
+            if len(person_boxes) > 1:
+                stats["multi_person"] += 1
+
+        phones = yolo.predict(image, verbose=False, classes=[phone_id], conf=floor)[0]
+        stats["phone_scores"].append(
+            float(max((b.conf[0] for b in (phones.boxes or [])), default=0.0))
+        )
+
+        if not quiet and (index + 1) % 100 == 0:
+            print(f"  ...{index + 1}/{len(sample)}", file=sys.stderr)
+
+    return {
+        "per_class": per_class,
+        "skipped": skipped,
+        "elapsed_s": round(time.perf_counter() - started, 1),
+    }
+
+
+def phone_curve(per_class: dict, sweep: tuple[float, ...]) -> list[dict]:
+    """Recall / FP-rate / precision at each confidence threshold."""
+    positives = [s for c in PHONE_POSITIVE for s in per_class.get(c, {}).get("phone_scores", [])]
+    negatives = [s for c in PHONE_NEGATIVE for s in per_class.get(c, {}).get("phone_scores", [])]
+    curve = []
+    for threshold in sweep:
+        true_pos = sum(1 for s in positives if s >= threshold)
+        false_pos = sum(1 for s in negatives if s >= threshold)
+        recall = true_pos / len(positives) if positives else 0.0
+        fp_rate = false_pos / len(negatives) if negatives else 0.0
+        precision = true_pos / (true_pos + false_pos) if (true_pos + false_pos) else float("nan")
+        f1 = (
+            2 * precision * recall / (precision + recall)
+            if precision == precision and (precision + recall) > 0
+            else 0.0
+        )
+        curve.append(
+            {
+                "conf": threshold,
+                "recall": round(recall, 4),
+                "fp_rate": round(fp_rate, 4),
+                "precision": None if precision != precision else round(precision, 4),
+                "f1": round(f1, 4),
+                "true_pos": true_pos,
+                "false_pos": false_pos,
+                "n_pos": len(positives),
+                "n_neg": len(negatives),
+            }
+        )
+    return curve
+
+
+def summarise(scored: dict, sweep: tuple[float, ...], shipped_conf: float) -> dict:
+    per_class = scored["per_class"]
+    total_n = sum(s["n"] for s in per_class.values())
+    total_face = sum(s["face"] for s in per_class.values())
+    total_person = sum(s["person"] for s in per_class.values())
+    total_multi = sum(s["multi_person"] for s in per_class.values())
+    all_person_conf = [c for s in per_class.values() for c in s["person_conf"]]
+
+    curve = phone_curve(per_class, sweep)
+    at_shipped = min(curve, key=lambda r: abs(r["conf"] - shipped_conf))
+    best_f1 = max(curve, key=lambda r: r["f1"])
+
+    positives = [s for c in PHONE_POSITIVE for s in per_class.get(c, {}).get("phone_scores", [])]
+    undetectable = sum(1 for s in positives if s == 0.0) / len(positives) if positives else 0.0
+
+    return {
+        "images_scored": total_n,
+        "images_skipped": scored["skipped"],
+        "elapsed_s": scored["elapsed_s"],
+        "face_availability": round(total_face / total_n, 4) if total_n else 0.0,
+        "person_availability": round(total_person / total_n, 4) if total_n else 0.0,
+        "person_mean_conf": round(float(np.mean(all_person_conf)), 4) if all_person_conf else None,
+        "multi_person_rate": round(total_multi / total_n, 4) if total_n else 0.0,
+        "phone_curve": curve,
+        "phone_at_shipped_conf": at_shipped,
+        "phone_best_f1": best_f1,
+        "phone_undetectable_at_any_conf": round(undetectable, 4),
+        "per_class": {
+            name: {
+                "label": CLASS_LABELS.get(name, name),
+                "n": s["n"],
+                "face_rate": round(s["face"] / s["n"], 4) if s["n"] else 0.0,
+                "person_rate": round(s["person"] / s["n"], 4) if s["n"] else 0.0,
+            }
+            for name, s in sorted(per_class.items())
+        },
+    }
+
+
+def print_report(summary: dict, shipped_conf: float) -> None:
+    print()
+    print("=" * 74)
+    print("SensorDyme accuracy baseline -- State Farm val split (subject-disjoint)")
+    print("=" * 74)
+    print(
+        f"{summary['images_scored']} images scored in {summary['elapsed_s']}s"
+        + (f" ({summary['images_skipped']} unreadable)" if summary["images_skipped"] else "")
+    )
+    print()
+
+    print("SIGNAL AVAILABILITY  (what fraction of frames the signal exists at all)")
+    face = summary["face_availability"]
+    print(f"  MediaPipe FaceMesh finds a face : {100 * face:5.1f}%")
+    print("      gates EVERY drowsiness (EAR/PERCLOS) and gaze (yaw/pitch) detection")
+    print(f"  YOLO11n finds a person          : {100 * summary['person_availability']:5.1f}%"
+          + (f"   (mean conf {summary['person_mean_conf']:.2f})" if summary["person_mean_conf"] else ""))
+    print("      gates presence, zones, stillness, occupancy, baby-box heuristic")
+    print(f"  >1 person box on a 1-person img : {100 * summary['multi_person_rate']:5.1f}%")
+    print("      baby_monitoring uses 'smallest box == the baby' when >1 person")
+    print()
+
+    print("PER CLASS")
+    print(f"  {'class':<26} {'n':>4} {'face':>7} {'person':>8}")
+    for name, row in summary["per_class"].items():
+        print(
+            f"  {name} {row['label']:<22} {row['n']:>4} "
+            f"{100 * row['face_rate']:6.1f}% {100 * row['person_rate']:7.1f}%"
+        )
+    print()
+
+    print("PHONE DETECTION -- operating curve")
+    print(f"  {'conf':>6} {'recall':>9} {'FP rate':>9} {'precision':>10} {'F1':>7}")
+    for row in summary["phone_curve"]:
+        marker = "  <- shipped" if abs(row["conf"] - shipped_conf) < 1e-9 else ""
+        precision = "  n/a" if row["precision"] is None else f"{100 * row['precision']:8.1f}%"
+        print(
+            f"  {row['conf']:>6.2f} {100 * row['recall']:8.1f}% "
+            f"{100 * row['fp_rate']:8.1f}% {precision} {row['f1']:>7.3f}{marker}"
+        )
+    shipped = summary["phone_at_shipped_conf"]
+    best = summary["phone_best_f1"]
+    print()
+    print(f"  at the shipped conf={shipped['conf']:.2f} : recall {100 * shipped['recall']:.1f}%, "
+          f"F1 {shipped['f1']:.3f}  (n={shipped['n_pos']} pos / {shipped['n_neg']} neg)")
+    print(f"  best F1 at      conf={best['conf']:.2f} : recall {100 * best['recall']:.1f}%, "
+          f"F1 {best['f1']:.3f}")
+    print(f"  {100 * summary['phone_undetectable_at_any_conf']:.1f}% of phone-present frames yield NO box "
+          "at any confidence")
+    print("      -- a model ceiling; no threshold change recovers those")
+    print()
+    print("CAVEAT: State Farm's camera is passenger-side looking across the cabin;")
+    print("SensorDyme's mount is dash-centre driver-facing. These are domain-shifted")
+    print("LOWER BOUNDS, not SensorDyme's operating accuracy. Use them for regression")
+    print("detection, not for certification.")
+    print("=" * 74)
+
+
+def compare(summary: dict, baseline_path: Path, tolerance: float) -> int:
+    """Regression gate: fail if a headline metric dropped by more than `tolerance`."""
+    baseline = json.loads(baseline_path.read_text())["summary"]
+    checks = [
+        ("face_availability", summary["face_availability"], baseline["face_availability"]),
+        ("person_availability", summary["person_availability"], baseline["person_availability"]),
+        (
+            "phone_recall_at_shipped",
+            summary["phone_at_shipped_conf"]["recall"],
+            baseline["phone_at_shipped_conf"]["recall"],
+        ),
+        ("phone_best_f1", summary["phone_best_f1"]["f1"], baseline["phone_best_f1"]["f1"]),
+    ]
+    print("\nREGRESSION CHECK vs", baseline_path)
+    failed = 0
+    for name, now, was in checks:
+        delta = now - was
+        status = "ok"
+        if delta < -tolerance:
+            status = "REGRESSION"
+            failed += 1
+        elif delta > tolerance:
+            status = "improved"
+        print(f"  {name:<26} {was:.4f} -> {now:.4f}  ({delta:+.4f})  {status}")
+    if failed:
+        print(f"\n{failed} metric(s) regressed by more than {tolerance}")
+    else:
+        print(f"\nno metric regressed by more than {tolerance}")
+    return EXIT_REGRESSION if failed else EXIT_OK
+
+
+def main(argv: Optional[list[str]] = None) -> int:
+    parser = argparse.ArgumentParser(description=__doc__.split("\n")[0])
+    parser.add_argument("--per-class", type=int, default=60,
+                        help="images sampled per class (10 classes; default 60 = 600 images)")
+    parser.add_argument("--seed", type=int, default=0, help="sampling seed, for reproducibility")
+    parser.add_argument("--split", default="val", choices=["val", "train"],
+                        help="which manifest to sample (default val -- subject-disjoint)")
+    parser.add_argument("--sweep", action="store_true",
+                        help="score the full confidence sweep (default: sweep is always computed)")
+    parser.add_argument("--shipped-conf", type=float, default=None,
+                        help="the threshold to headline; default reads config.yaml")
+    parser.add_argument("--baseline", type=Path, help="write results here as a new baseline")
+    parser.add_argument("--compare", type=Path, help="compare against a baseline and exit nonzero on regression")
+    parser.add_argument("--tolerance", type=float, default=0.03,
+                        help="allowed metric drop before --compare fails (default 0.03)")
+    parser.add_argument("--quiet", action="store_true")
+    args = parser.parse_args(argv)
+
+    shipped_conf = args.shipped_conf
+    if shipped_conf is None:
+        # Read the value the product actually ships, so the headline number is always
+        # the one the device really uses rather than a benchmark-only constant.
+        import yaml
+        config = yaml.safe_load((Path(__file__).resolve().parent.parent / "config.yaml").read_text())
+        shipped_conf = float(
+            config.get("modules", {}).get("driver_attention", {}).get("yolo_confidence_threshold", 0.35)
+        )
+
+    sweep = tuple(sorted(set(DEFAULT_SWEEP) | {shipped_conf}))
+
+    sample = load_sample(args.per_class, args.seed, args.split)
+    if not args.quiet:
+        subjects = sorted({r["subject"] for r in sample})
+        print(f"sampling {len(sample)} images ({args.per_class}/class) from the "
+              f"{args.split} split; subjects: {', '.join(subjects)}")
+
+    scored = score_sample(sample, sweep, quiet=args.quiet)
+    summary = summarise(scored, sweep, shipped_conf)
+    print_report(summary, shipped_conf)
+
+    payload = {
+        "generated_at": time.strftime("%Y-%m-%dT%H:%M:%S%z"),
+        "dataset": "state_farm",
+        "split": args.split,
+        "per_class": args.per_class,
+        "seed": args.seed,
+        "shipped_conf": shipped_conf,
+        "models": {"detector": "yolo11n.pt", "face": "mediapipe face_mesh (refine_landmarks)"},
+        "summary": summary,
+    }
+
+    RESULTS_DIR.mkdir(parents=True, exist_ok=True)
+    out = RESULTS_DIR / f"accuracy_state_farm_{time.strftime('%Y%m%d_%H%M%S')}.json"
+    out.write_text(json.dumps(payload, indent=2))
+    print(f"\nwrote {out}")
+
+    if args.baseline:
+        args.baseline.parent.mkdir(parents=True, exist_ok=True)
+        args.baseline.write_text(json.dumps(payload, indent=2))
+        print(f"wrote baseline {args.baseline}")
+
+    if args.compare:
+        if not args.compare.exists():
+            print(f"\nno baseline at {args.compare} — nothing to compare against.\n"
+                  f"Write one with --baseline {args.compare}", file=sys.stderr)
+            return EXIT_CANNOT_RUN
+        return compare(summary, args.compare, args.tolerance)
+    return EXIT_OK
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

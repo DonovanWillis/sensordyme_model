@@ -115,19 +115,34 @@ SMALL_OBJECT_MAX_DIAGONAL_RATIO = 0.7
 #: swallow moving into an infant's mouth is still worth flagging, just less
 #: urgently than something that actually fits, so "large" fades the risk
 #: rather than erasing it.
-_SIZE_FACTOR_FLOOR = 0.35
+#:
+#: Lowered from 0.35 alongside the risk threshold coming down to its
+#: arithmetically reachable range (see _choking_hazard_risk_threshold): the
+#: gate and this floor have to move together, or dropping the gate to where
+#: a REAL hazard can reach it would drag every oversized toy over the line
+#: with it. The floor fell by less than the gate did, so a genuine
+#: small-object hazard is strictly easier to detect than before, and a large
+#: one strictly harder.
+_SIZE_FACTOR_FLOOR = 0.25
 #: How close an object must get to the mouth region, in units of the baby's
 #: own box diagonal (scale-invariant the same way as above), before
 #: proximity alone starts contributing meaningful risk. 1.0 means "roughly
 #: one baby-box-diagonal away or closer starts to matter"; risk fades to
 #: zero beyond that, same shape as core/hand_perception.py's proximity term.
-MOUTH_PROXIMITY_RANGE = 1.4
+#: Tightened from 1.4 (was treating anywhere on roughly the upper half of the
+#: body as mouth-proximate -- too generous for a signal meant to mean "near
+#: the mouth specifically", found live alongside the false-alert review that
+#: also tightened MOUTH_ZONE_FRACTION below).
+MOUTH_PROXIMITY_RANGE = 1.2
 #: The fraction of the (possibly inferred) baby's box treated as the mouth
 #: region -- see core/detectors.py's upper_region. Wider than that
 #: function's own 0.35 default because a reclined/lying infant (the common
 #: crib-cam framing) doesn't present the same tight, upright head-in-top-
-#: third geometry an adult standing at a driver/security camera does.
-MOUTH_ZONE_FRACTION = 0.4
+#: third geometry an adult standing at a driver/security camera does. Still
+#: tightened from 0.4 to 0.3 (was reading as far down as the upper chest on
+#: a typical crib-cam framing, not just the head) -- see the false-alert
+#: review this constant was tuned alongside.
+MOUTH_ZONE_FRACTION = 0.3
 
 
 @dataclass(frozen=True)
@@ -192,7 +207,14 @@ def _size_factor(object_diagonal: float, hand_diagonal: float) -> float:
     ratio = object_diagonal / hand_diagonal
     if ratio <= SMALL_OBJECT_MAX_DIAGONAL_RATIO:
         return 1.0
-    return max(_SIZE_FACTOR_FLOOR, SMALL_OBJECT_MAX_DIAGONAL_RATIO / ratio)
+    # Squared, not linear: "give higher priority to small objects" is the
+    # product requirement, and the old linear falloff left a toy 1.6x the
+    # hand's own size holding 44% of a swallowable object's risk -- close
+    # enough that no single risk threshold could separate a big toy at the
+    # mouth from a genuine choking hazard a fraction of a body-diagonal
+    # away. Diagonals are a linear measure of what is really a volume
+    # problem, so squaring is also the better physical analogue.
+    return max(_SIZE_FACTOR_FLOOR, (SMALL_OBJECT_MAX_DIAGONAL_RATIO / ratio) ** 2)
 
 
 def _point_to_box_distance(
@@ -251,8 +273,15 @@ def _assess_choking_hazard(
     distance_norm = distance / baby_diagonal
     proximity_factor = max(0.0, 1.0 - distance_norm / MOUTH_PROXIMITY_RANGE)
 
+    # Tightened from (True->1.0, None->0.5, False->0.2): the product spec is
+    # "moving toward mouth", not "not obviously moving away" -- an
+    # insufficient-trail read (None, e.g. an object just barely picked up
+    # this frame) must not carry nearly as much weight as an actually
+    # observed closing trajectory. Ambiguous evidence now sits close to,
+    # not far above, the "moving away" reading it was previously double the
+    # size of.
     approaching = object_track.approaching(mouth_center, aspect)
-    trajectory_factor = 1.0 if approaching else (0.5 if approaching is None else 0.2)
+    trajectory_factor = 1.0 if approaching else (0.25 if approaching is None else 0.15)
 
     hand_diagonal = hand_track.diagonal if hand_track is not None else 0.0
     size_factor = _size_factor(object_track.diagonal, hand_diagonal)
@@ -315,7 +344,15 @@ class BabyMonitoringModule(VisionModule):
         self._confidence_threshold = float(config.get("confidence_threshold", 0.4))
         self._detect_every_n = max(1, int(config.get("detect_every_n_frames", 2)))
         self._still_max_motion = float(config.get("still_max_motion", 0.015))
-        self._expect_presence = bool(config.get("expect_presence", False))
+        # Defaults TRUE: in a baby-monitoring deployment the child not being
+        # detected at all is the single most alarming observation this module
+        # can make (covered by a blanket, face-down in bedding, rolled where
+        # the small low-contrast box is lost), and person_absent is the only
+        # rule that reports it. With this false the rule is not even
+        # REGISTERED below, so those cases produced zero alertable events for
+        # as long as they lasted. An explicit `expect_presence: false` still
+        # opts a deployment out.
+        self._expect_presence = bool(config.get("expect_presence", True))
         self._weights = config.get("model_weights", "yolo11n.pt")
         self._model = None  # lazy: loaded on first frame (keeps tests light)
 
@@ -354,10 +391,30 @@ class BabyMonitoringModule(VisionModule):
                 detection="safe_zone_exit", severity="critical",
                 persist_s=zone_s, min_frames=3, resolve_after_s=5.0,
             ))
+        stillness_grace_s, stillness_resolve_s = 3.0, 10.0
         self._engine.add_rule(RuleSpec(
             detection="unusual_stillness", severity="warning",
-            persist_s=still_s, min_frames=10, occlusion_grace_s=3.0, resolve_after_s=10.0,
+            persist_s=still_s, min_frames=10, occlusion_grace_s=stillness_grace_s,
+            resolve_after_s=stillness_resolve_s,
         ))
+        # occlusion_grace_s bridges ABSENCE without resetting the held-time
+        # clock -- correct for zone rules ("walked behind a chair"), wrong
+        # here: for a stillness rule a False frame means THE SUBJECT MOVED,
+        # which is contradicting evidence, not missing evidence. Bridged, a
+        # baby moving 1s in every 3.5s accumulated a continuous "stillness"
+        # and emitted BOTH activity_burst AND unusual_stillness -- a loud/
+        # push alert on a demonstrably active child.
+        #
+        # The engine can't tell the two apart and isn't this module's to
+        # change, so the distinction is made at the FEED (see _reason):
+        # observed motion suppresses the stillness feed for longer than the
+        # engine can bridge -- past occlusion_grace_s so an unconfirmed
+        # track is dropped and its clock restarts from zero, and past
+        # resolve_after_s so an already-confirmed stillness actually
+        # resolves. Losing the person's box (real missing evidence) sets no
+        # lockout and is still bridged exactly as before.
+        self._stillness_motion_lockout_s = max(stillness_grace_s, stillness_resolve_s) + 0.5
+        self._stillness_locked_until: Optional[float] = None
         if self._expect_presence:
             self._engine.add_rule(RuleSpec(
                 detection="person_absent", severity="warning",
@@ -431,8 +488,17 @@ class BabyMonitoringModule(VisionModule):
         self._engine.add_rule(RuleSpec(
             detection="flailing", severity="warning",
             persist_s=float(config.get("flailing_confirm_s", 0.5)),
-            min_frames=4, resolve_after_s=1.5,
-            cooldown_s=float(config.get("flailing_cooldown_s", 5.0)),
+            min_frames=4,
+            # resolve_after_s widened from 1.5 to 3.0 (config.get so a
+            # deployment can retune it): a real flailing episode isn't
+            # perfectly continuous -- a brief lull well under 3s must not
+            # resolve the event and force a fresh observed/developing/
+            # confirmed cycle (and a second notification) for what is one
+            # ongoing episode. cooldown_s default likewise widened
+            # (5.0 -> 8.0) for the same reason on the other side of a
+            # genuine resolve.
+            resolve_after_s=float(config.get("flailing_resolve_after_s", 3.0)),
+            cooldown_s=float(config.get("flailing_cooldown_s", 8.0)),
         ))
 
         # --- hand-anchored object perception: hands (from the SAME Pose pass
@@ -482,12 +548,44 @@ class BabyMonitoringModule(VisionModule):
         # object to actually be approaching the mouth, weighted toward small
         # objects, and is meant to interrupt someone immediately, not log
         # quietly like ordinary holding does.
-        self._choking_hazard_risk_threshold = float(config.get("choking_hazard_risk_threshold", 0.4))
+        # NOT raised as part of the same false-alert tightening pass that
+        # narrowed the mouth zone/trajectory factor above: hand_association_
+        # threshold is deliberately LOWERED to 0.35 (see its own config.yaml
+        # comment) because hardware testing found a REAL held object near the
+        # face peaks around 0.38 association -- risk_score multiplies that
+        # value directly, so raising this threshold much above ~0.4 would
+        # start silently missing the exact near-mouth case this exists to
+        # catch. Precision comes instead from confirm_s/min_frames below and
+        # the trajectory/mouth-zone tightening above.
+        #
+        # The threshold is 0.30, and that number is arithmetic, not taste.
+        # risk = association * size * proximity * trajectory and every factor
+        # after the first is <= 1.0, so risk can NEVER exceed the association
+        # score -- 0.38 in the field, per the hardware measurement above.
+        # Measured end-to-end against that ceiling: a small object genuinely
+        # held and genuinely closing on the mouth scores 0.380 at the mouth
+        # and 0.348 a tenth of a baby-diagonal out; an object with no
+        # observed closing trajectory tops out at 0.212 even at a
+        # (field-unrealistic) 0.85 association. The previous 0.40 sat ABOVE
+        # the physical ceiling, so this critical alert could not fire at all.
+        self._choking_hazard_risk_threshold = float(config.get("choking_hazard_risk_threshold", 0.30))
         for side in ("left", "right"):
             self._engine.add_rule(RuleSpec(
                 detection=f"choking_hazard:{side}", severity="critical",
-                persist_s=float(config.get("choking_hazard_confirm_s", 0.4)),
-                min_frames=3, resolve_after_s=3.0,
+                # Bound to the SAME number, because _reason passes
+                # assessment.risk_score as this rule's engine confidence.
+                # Left unset it inherited EventEngine's 0.50 default, which
+                # became the real gate and silently overrode the configured
+                # threshold entirely -- a second, invisible bar above the
+                # 0.38 ceiling. Tying them together means the configured
+                # threshold is the only gate there is.
+                min_confidence=self._choking_hazard_risk_threshold,
+                # Widened from 0.4s/3 frames: a genuinely closing trajectory
+                # sustained for closer to a second is meaningfully stronger
+                # evidence than three frames' worth (~0.1-0.3s of real time)
+                # without giving up much real-world response latency.
+                persist_s=float(config.get("choking_hazard_confirm_s", 0.8)),
+                min_frames=4, resolve_after_s=3.0,
                 cooldown_s=float(config.get("choking_hazard_cooldown_s", 6.0)),
             ))
         # This frame's per-hand risk breakdown, for get_debug_state() -- see
@@ -716,10 +814,18 @@ class BabyMonitoringModule(VisionModule):
             )
             transitions += self._engine.update("safe_zone_exit", outside, 0.85, now)
 
-        # Stillness: subject visible with very little motion.
-        transitions += self._engine.update(
-            "unusual_stillness", present and motion < self._still_max_motion, 0.8, now
-        )
+        # Stillness: subject visible with very little motion. Motion observed
+        # WHILE the subject is visible is contradicting evidence and locks
+        # the feed False long enough that the engine's occlusion grace cannot
+        # bridge it (see _stillness_motion_lockout_s in __init__); the
+        # subject not being visible at all is missing evidence and sets no
+        # lockout, so a brief detection dropout is bridged exactly as before.
+        if present and motion >= self._still_max_motion:
+            self._stillness_locked_until = now + self._stillness_motion_lockout_s
+        elif self._stillness_locked_until is not None and now >= self._stillness_locked_until:
+            self._stillness_locked_until = None
+        still = present and motion < self._still_max_motion and self._stillness_locked_until is None
+        transitions += self._engine.update("unusual_stillness", still, 0.8, now)
         # Activity bursts: large motion while visible (logged, never an alarm).
         transitions += self._engine.update("activity_burst", present and motion > 6 * self._still_max_motion, 0.7, now)
 

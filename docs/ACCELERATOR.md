@@ -9,11 +9,55 @@ Hailo's Dataflow Compiler. This page is the honest map of what runs where.
 | Model | Backend | Notes |
 |---|---|---|
 | YOLO object detection (phone/food/person — occupancy, driver_attention, openpilot phone check) | **Hailo when `accelerator.yolo_hef` is set**; CPU otherwise | via `core/accel.py` → `core/detectors.py`; automatic fallback |
-| MediaPipe Face Mesh (EAR/yaw/pitch/PERCLOS) | **CPU always** | no Hailo build of mediapipe exists; this is the main CPU consumer and it stays |
+| MediaPipe Face Mesh (EAR/yaw/pitch/PERCLOS) | **CPU today** | see the correction below — a Hailo build of the *landmark* net does exist |
 | openpilot dmonitoring_model.onnx | **CPU** (onnxruntime) | would need its own Hailo compilation; not done |
 
-So: the HAT accelerates the object-detection half of the pipeline. Face
-landmarks stay on CPU regardless — plan capacity accordingly.
+**As shipped, `accelerator.yolo_hef` is `null` and no `.hef` exists in this repo,
+so the AI HAT+ contributes nothing and every inference runs on the Pi CPU.**
+`/api/health` reports this honestly ("Hailo present and runtime OK, but no
+compiled model configured").
+
+### Correction (2026-08-29): you do not need the Dataflow Compiler to start
+
+An earlier version of this page said "no Hailo build of mediapipe exists; this is
+the main CPU consumer and it stays", and implied that using the HAT required
+compiling your own model. Both were wrong, and the second one is why the HAT has
+been idle. Hailo publish **prebuilt Hailo-8L `.hef` files** you can download
+directly — no compiler, no calibration dataset, no x86 machine:
+
+```
+https://hailo-model-zoo.s3.eu-west-2.amazonaws.com/ModelZoo/Compiled/v2.19.0/hailo8l/<name>.hef
+```
+
+Verified reachable (HTTP 200, sizes as served) on 2026-08-29:
+
+| File | Size | Relevance |
+|---|---|---|
+| `yolov11n.hef` | 11 MB | drop-in for the current `yolo11n.pt` detection path |
+| `yolov8n.hef` | 11 MB | alternative detector |
+| `damoyolo_tinynasL20_T.hef` | 19 MB | higher mAP than yolov11n **and Apache-2.0** — see the licensing note in docs/HUGGINGFACE.md |
+| `scrfd_2.5g.hef` | 5 MB | face **detection** |
+| `face_landmarks_lite.hef` | 4 MB | face **landmarks** — the MediaPipe-equivalent net |
+| `hand_landmark_lite.hef` | 3 MB | hand landmarks |
+| `yolov8s_pose.hef` | 26 MB | body pose (fall detection, flailing) |
+| `tddfa_mobilenet_v1.hef` | 5 MB | 3D head pose |
+| `r3d_18.hef` | 55 MB | spatio-temporal video classifier (16-frame clips) |
+
+Two honest caveats before anyone plans around this:
+
+* **The landmark nets are not a MediaPipe drop-in.** MediaPipe ships a detector,
+  a landmark net, and a good deal of tracking/post-processing glue. The zoo gives
+  you the *landmark net only* — you would pair it with `scrfd_2.5g` for detection
+  and reimplement the post-processing yourself. That is a real project, not a
+  config change. What is now false is the claim that it is *impossible*.
+* **Every FPS figure Hailo publishes was measured with an x86 host driving the
+  NPU.** Throughput on a Pi 5 host is UNVERIFIED and the host CPU may well be the
+  bottleneck for the pre/post-processing around the accelerated part.
+
+Compiling a *custom* model (your own fine-tuned weights) still needs the Hailo
+Dataflow Compiler, which is **x86-64 Linux only** — it will not run on an Apple
+Silicon Mac. That is a real constraint on any fine-tuning roadmap: plan for an
+x86 Linux box or a cloud instance.
 
 ## Setup on the Pi
 

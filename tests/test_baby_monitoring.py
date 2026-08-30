@@ -859,3 +859,59 @@ def test_get_debug_state_reports_the_required_fields():
     assert 0.0 <= right["risk_score"] <= 1.0
     assert isinstance(right["alert_triggered"], bool)
     assert right["reason"]  # never blank -- always says something
+
+
+# ------------------------------------------------- false-alert precision pass
+# Regression tests for the tightening in modules/baby_monitoring.py's
+# trajectory_factor and MOUTH_ZONE_FRACTION/MOUTH_PROXIMITY_RANGE: an object
+# genuinely associated with a hand and geometrically near the mouth region,
+# but with NO evidence of actually closing on it, must not be treated as
+# nearly as risky as one that is.
+def test_ambiguous_trajectory_alone_never_confirms_choking_hazard():
+    """A held object sitting motionless right at the mouth region -- no
+    established closing trajectory (approaching() reads None for a
+    non-moving trail) -- must not accumulate enough risk to confirm on its
+    own. "Moving toward mouth?" must mean observed motion, not merely
+    "not moving away"."""
+    module = _module(choking_hazard_confirm_s=0.3)
+    stationary_trail = [(0.0, 500.0, 400.0), (0.05, 500.0, 400.0)]  # zero net movement
+    result = _moving_hand_result(stationary_trail, (480, 380, 520, 420), label="bottle")
+    events, _ = _run_hand(module, [IN_CRIB], 0.05, 2.0, lambda t: result)
+    assert "choking_hazard" not in [e.type for e in events]
+
+
+def test_object_detected_but_not_hand_associated_never_confirms_choking_hazard():
+    """A configured object class detected in the full frame (the LEGACY
+    overlap signal that still drives holding_object) but with no hand
+    association at all must never reach choking-hazard risk scoring --
+    "hands not visible (or object not in a hand at all)" means no alert for
+    this rule specifically, regardless of what the full-frame detector sees."""
+    module = _module()
+    events, _ = _run(module, [IN_CRIB], 0.05, 2.0, object_boxes={"phone": [PHONE_IN_CRIB]})
+    assert "choking_hazard" not in [e.type for e in events]
+    # The legacy signal still logs the observation -- this rule's silence is
+    # specific to choking_hazard, not a claim that nothing happened at all.
+    assert "holding_object" in [e.type for e in events]
+
+
+def test_flailing_brief_lull_mid_episode_does_not_reconfirm_or_spam():
+    """One continuous flailing episode with a brief calm dip in the middle
+    (well under flailing_resolve_after_s) must produce exactly ONE
+    confirmation and ZERO resolutions -- not resolve-and-reconfirm (a second
+    notification) for what a person watching would call one event."""
+    module = _module(flailing_confirm_s=0.3)
+    events = []
+    t = 0.0
+    while t < 0.6:  # confirms
+        events += module._reason([IN_CRIB], 0.05, W, H, t, activity_state=_flailing_state())
+        t += 0.1
+    while t < 1.6:  # brief lull -- 1.0s, under the 3.0s default resolve_after_s
+        events += module._reason([IN_CRIB], 0.05, W, H, t, activity_state=_flailing_state(present=False))
+        t += 0.1
+    while t < 2.2:  # flailing resumes
+        events += module._reason([IN_CRIB], 0.05, W, H, t, activity_state=_flailing_state())
+        t += 0.1
+    types = [e.type for e in events]
+    assert types.count("flailing") == 1
+    assert "flailing_resolved" not in types
+    assert module.is_alert_active()

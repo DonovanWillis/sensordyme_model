@@ -38,6 +38,12 @@ def backend(tmp_path, monkeypatch):
 
 
 def test_fallback_produces_valid_structured_proposal(backend):
+    """"Valid" has to mean runnable. This used to assert
+    `rules[0]["detection"] == "unusual_stillness"` -- an EVENT TYPE, not a
+    detection label, so the rule passed validation, reached the device and
+    could never fire. See tests/test_phase1_cloud_ai_fallback.py, which checks every
+    fallback branch against the capability registry and builds each rule
+    through the device's own ConfiguredRule."""
     _, client, headers = backend
     resp = client.post("/v1/ai/configure",
                        json={"device_id": 1, "prompt": "watch my baby in the crib"}, headers=headers)
@@ -45,8 +51,11 @@ def test_fallback_produces_valid_structured_proposal(backend):
     data = resp.json()
     assert data["preset"] == "baby_monitoring"
     assert data["source"] == "fallback"
-    assert data["rules"] and data["rules"][0]["detection"] == "unusual_stillness"
-    assert 0.2 <= data["rules"][0]["confidence"] <= 0.95
+    assert data["rules"]
+    rule = data["rules"][0]
+    assert (rule["target"], rule["predicate"]) == ("person", "absent")
+    assert 0.2 <= rule["confidence"] <= 0.95
+    assert data["unsupported"] == []
 
 
 def test_unmatched_prompt_is_honest_not_fake(backend):
@@ -100,12 +109,21 @@ def test_validation_clamps_out_of_range_values(backend):
     app_module._ai_configure_llm = lambda prompt: {
         "preset": "security_monitoring", "variant": "", "explanation": "t", "settings": {},
         "unsupported": [], "source": "claude",
-        "rules": [{"detection": "zone_violation", "description": "zone", "zone": "entry",
+        # A RUNNABLE rule with out-of-range numbers, which is what this test
+        # is about. It used to name `detection: "zone_violation"` -- an event
+        # type no detector emits as a label -- so it was really asserting
+        # that clamping happens on a rule the device would silently never
+        # run. Validation now rejects that shape outright (see
+        # tests/test_phase1_cloud_ai_fallback.py), which would leave nothing here
+        # to clamp.
+        "rules": [{"target": "person", "predicate": "in_zone", "secondary": "",
+                   "description": "someone in the entry", "zone": "entry",
                    "persist_s": -5, "min_count": 0, "confidence": 99, "severity": "LOUD",
                    "cooldown_s": 1, "schedule": "", "notify": "push"}],
     }
     data = client.post("/v1/ai/configure",
                        json={"device_id": 1, "prompt": "guard the door"}, headers=headers).json()
+    assert data["rules"], data["unsupported"]
     rule = data["rules"][0]
     assert rule["persist_s"] >= 0.5
     assert rule["min_count"] >= 1
@@ -114,15 +132,37 @@ def test_validation_clamps_out_of_range_values(backend):
     assert rule["cooldown_s"] >= 10
 
 
-def test_proposal_is_persisted_on_the_device(backend):
+def test_proposal_is_persisted_on_the_device_as_a_draft(backend):
+    """The validated proposal is kept, so Activate has something to apply —
+    but as a DRAFT, not as the running configuration.
+
+    This endpoint is the preview: AIConfigureView calls it from `configure()`,
+    before the person has read the result. It used to write straight into
+    `ai_rules`, which is the column the ingest handler delivers from, so on a
+    device already in AI Custom the next 2-second poll shipped and committed
+    rules nobody had accepted. `ai_rules` now changes only when set_preset
+    (Activate) promotes the draft. See tests/test_phase1_cloud_ai_draft.py.
+    """
     app_module, client, headers = backend
     client.post("/v1/ai/configure",
                 json={"device_id": 1, "prompt": "watch grandpa for falls"}, headers=headers)
     with app_module.db() as conn:
-        stored = conn.execute("SELECT ai_rules FROM devices WHERE id = 1").fetchone()["ai_rules"]
-    saved = json.loads(stored)
+        row = conn.execute(
+            "SELECT ai_rules, ai_rules_draft FROM devices WHERE id = 1"
+        ).fetchone()
+    assert row["ai_rules"] is None, "a preview must never become the running configuration"
+    saved = json.loads(row["ai_rules_draft"])
     assert saved["preset"] == "elderly_monitoring"
-    assert saved["rules"][0]["detection"] == "fall"
+    assert (saved["rules"][0]["target"], saved["rules"][0]["predicate"]) == ("on_floor", "present")
+
+    # Activate promotes it, and that is the only thing that does.
+    client.post("/v1/devices/1/preset", json={"preset": ""}, headers=headers)
+    with app_module.db() as conn:
+        row = conn.execute(
+            "SELECT ai_rules, ai_rules_draft FROM devices WHERE id = 1"
+        ).fetchone()
+    assert json.loads(row["ai_rules"]) == saved
+    assert row["ai_rules_draft"] is None
 
 
 def test_taxonomy_integrity():

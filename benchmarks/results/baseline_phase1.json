@@ -1,0 +1,207 @@
+{
+  "generated_at": "2026-08-29T19:46:34-0400",
+  "dataset": "state_farm",
+  "split": "val",
+  "per_class": 100,
+  "seed": 0,
+  "shipped_conf": 0.35,
+  "models": {
+    "detector": "yolo11n.pt",
+    "face": "mediapipe face_mesh (refine_landmarks)"
+  },
+  "summary": {
+    "images_scored": 1000,
+    "images_skipped": 0,
+    "elapsed_s": 41.4,
+    "face_availability": 0.397,
+    "person_availability": 1.0,
+    "person_mean_conf": 0.7775,
+    "multi_person_rate": 0.054,
+    "phone_curve": [
+      {
+        "conf": 0.05,
+        "recall": 0.6775,
+        "fp_rate": 0.095,
+        "precision": 0.9345,
+        "f1": 0.7855,
+        "true_pos": 271,
+        "false_pos": 19,
+        "n_pos": 400,
+        "n_neg": 200
+      },
+      {
+        "conf": 0.1,
+        "recall": 0.5175,
+        "fp_rate": 0.045,
+        "precision": 0.9583,
+        "f1": 0.6721,
+        "true_pos": 207,
+        "false_pos": 9,
+        "n_pos": 400,
+        "n_neg": 200
+      },
+      {
+        "conf": 0.15,
+        "recall": 0.3725,
+        "fp_rate": 0.02,
+        "precision": 0.9739,
+        "f1": 0.5389,
+        "true_pos": 149,
+        "false_pos": 4,
+        "n_pos": 400,
+        "n_neg": 200
+      },
+      {
+        "conf": 0.2,
+        "recall": 0.2725,
+        "fp_rate": 0.005,
+        "precision": 0.9909,
+        "f1": 0.4275,
+        "true_pos": 109,
+        "false_pos": 1,
+        "n_pos": 400,
+        "n_neg": 200
+      },
+      {
+        "conf": 0.25,
+        "recall": 0.21,
+        "fp_rate": 0.0,
+        "precision": 1.0,
+        "f1": 0.3471,
+        "true_pos": 84,
+        "false_pos": 0,
+        "n_pos": 400,
+        "n_neg": 200
+      },
+      {
+        "conf": 0.3,
+        "recall": 0.1475,
+        "fp_rate": 0.0,
+        "precision": 1.0,
+        "f1": 0.2571,
+        "true_pos": 59,
+        "false_pos": 0,
+        "n_pos": 400,
+        "n_neg": 200
+      },
+      {
+        "conf": 0.35,
+        "recall": 0.1075,
+        "fp_rate": 0.0,
+        "precision": 1.0,
+        "f1": 0.1941,
+        "true_pos": 43,
+        "false_pos": 0,
+        "n_pos": 400,
+        "n_neg": 200
+      },
+      {
+        "conf": 0.4,
+        "recall": 0.07,
+        "fp_rate": 0.0,
+        "precision": 1.0,
+        "f1": 0.1308,
+        "true_pos": 28,
+        "false_pos": 0,
+        "n_pos": 400,
+        "n_neg": 200
+      },
+      {
+        "conf": 0.5,
+        "recall": 0.0325,
+        "fp_rate": 0.0,
+        "precision": 1.0,
+        "f1": 0.063,
+        "true_pos": 13,
+        "false_pos": 0,
+        "n_pos": 400,
+        "n_neg": 200
+      }
+    ],
+    "phone_at_shipped_conf": {
+      "conf": 0.35,
+      "recall": 0.1075,
+      "fp_rate": 0.0,
+      "precision": 1.0,
+      "f1": 0.1941,
+      "true_pos": 43,
+      "false_pos": 0,
+      "n_pos": 400,
+      "n_neg": 200
+    },
+    "phone_best_f1": {
+      "conf": 0.05,
+      "recall": 0.6775,
+      "fp_rate": 0.095,
+      "precision": 0.9345,
+      "f1": 0.7855,
+      "true_pos": 271,
+      "false_pos": 19,
+      "n_pos": 400,
+      "n_neg": 200
+    },
+    "phone_undetectable_at_any_conf": 0.3225,
+    "per_class": {
+      "c0": {
+        "label": "safe driving",
+        "n": 100,
+        "face_rate": 0.31,
+        "person_rate": 1.0
+      },
+      "c1": {
+        "label": "texting - right",
+        "n": 100,
+        "face_rate": 0.44,
+        "person_rate": 1.0
+      },
+      "c2": {
+        "label": "phone - right",
+        "n": 100,
+        "face_rate": 0.03,
+        "person_rate": 1.0
+      },
+      "c3": {
+        "label": "texting - left",
+        "n": 100,
+        "face_rate": 0.28,
+        "person_rate": 1.0
+      },
+      "c4": {
+        "label": "phone - left",
+        "n": 100,
+        "face_rate": 0.47,
+        "person_rate": 1.0
+      },
+      "c5": {
+        "label": "operating radio",
+        "n": 100,
+        "face_rate": 0.5,
+        "person_rate": 1.0
+      },
+      "c6": {
+        "label": "drinking",
+        "n": 100,
+        "face_rate": 0.52,
+        "person_rate": 1.0
+      },
+      "c7": {
+        "label": "reaching behind",
+        "n": 100,
+        "face_rate": 0.38,
+        "person_rate": 1.0
+      },
+      "c8": {
+        "label": "hair and makeup",
+        "n": 100,
+        "face_rate": 0.39,
+        "person_rate": 1.0
+      },
+      "c9": {
+        "label": "talking to passenger",
+        "n": 100,
+        "face_rate": 0.65,
+        "person_rate": 1.0
+      }
+    }
+  }
+}

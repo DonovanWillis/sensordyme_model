@@ -24,9 +24,11 @@ behavior (blinks, mirror checks) never fires an event:
     a WIDE-angle turn (mirror_check_yaw_deg+, shaped like a rearview/side-
     mirror or blind-spot check rather than an ordinary glance) gets more
     patience before it does -- rearview_tolerance_seconds instead of
-    distraction_seconds, via CorroboratedGraceTracker, which reverts to the
-    short threshold immediately if the turn stops being wide-angle partway
-    through. A sustained downward tilt (phone in lap) fires the separate,
+    distraction_seconds, via PeakCorroboratedGraceTracker, which grants that
+    patience to any episode REACHING the wide angle at some point (a head
+    passes through the ordinary-glance range on its way out and back, so
+    keying it to the episode's first frame made the setting unreachable).
+    A sustained downward tilt (phone in lap) fires the separate,
     more sensitive "eyes_down"; several short glances within a rolling
     window fires "frequent_glancing" (texting while still looking up
     periodically).
@@ -35,8 +37,14 @@ behavior (blinks, mirror checks) never fires an event:
     holding (phone, drinks, food), plus optional MediaPipe Hands, fired to
     distinguish a dashboard-mounted phone (benign, log-only "phone_detected")
     from actual phone use (eyes off the road while a phone is visible ->
-    "phone_use"). The same detector's "person" class (always requested,
-    never reported on its own) is the fallback signal for face loss below.
+    "phone_use"). Food and drink are SPATIALLY GATED rather than reported on
+    sight: only a box overlapping the driver's own face region (core/
+    detectors.py's upper_region, the proxy `near_mouth` and Baby Mode's
+    choking-hazard scoring already use) fires "eating_drinking", because the
+    class of an object cannot tell a bottle in a cupholder from a bottle
+    being drunk from -- see _eating_boxes_near_face. The same detector's
+    "person" class (always requested, never reported on its own) supplies
+    that driver box, and is the fallback signal for face loss below.
   * Face lost — if the camera can't find a face at all, that absence is
     itself a risk signal rather than "nothing to report"; sustained loss
     fires "attention_lost" -- but face-unavailable does not mean
@@ -91,10 +99,10 @@ import mediapipe as mp
 import numpy as np
 
 from core.detections import Detection, DetectionFrame
-from core.detectors import Box, get_yolo_model, iou
+from core.detectors import Box, get_yolo_model, iou, upper_region
 from core.events import Event
 from core.eye_signal import AdaptiveBaseline, SignalSmoother, eye_gaze_offset_deg, iris_openness
-from core.tracking import BoxTracker
+from core.tracking import MAX_MATCH_DISTANCE_DIAGONAL_HAND, BoxTracker
 from modules.base import (
     CorroboratedGraceTracker,
     GracedConditionTracker,
@@ -199,6 +207,20 @@ def eye_aspect_ratio(p1: Point, p2: Point, p3: Point, p4: Point, p5: Point, p6: 
     if horizontal == 0:
         return 0.0
     return vertical / horizontal
+
+
+def _saturating_ratio(value: float, threshold: float) -> float:
+    """`value` as a fraction of `threshold`, capped at 1.0 and safe at 0.
+
+    Used to turn a raw measurement into "how far along toward its threshold"
+    for RiskFusion's partial credit. A threshold of 0 comes straight from
+    config and used to be an unguarded ZeroDivisionError inside the frame
+    loop; it means "any amount at all already counts as fully there", which is
+    the limit this ratio approaches as the threshold shrinks anyway.
+    """
+    if threshold <= 0:
+        return 1.0 if value > 0 else 0.0
+    return min(1.0, value / threshold)
 
 
 def estimate_head_pose_deg(image_points: np.ndarray, image_size: tuple[int, int]) -> Optional[tuple[float, float]]:
@@ -443,15 +465,85 @@ class AttentionCalibrator:
         )
 
 
+#: How much observed time PERCLOS needs before it will report a number at all.
+#:
+#: PERCLOS is, by its own definition, the PERCENTAGE OF TIME the eyes are
+#: closed OVER A WINDOW -- a fatigue measure precisely because it integrates
+#: many blinks; the research measure it comes from uses a one-minute window,
+#: which is what perclos_window_s defaults to. Below its window the ratio is
+#: not a noisy estimate of fatigue, it is undefined: divide closed time by the
+#: span of whatever samples happen to be in hand and the FIRST closed frame of
+#: a session reports 1.00 against a 0.15 threshold, from a "window" 33ms wide.
+#: That is what shipped -- every session opened by declaring the driver
+#: fatigued if their first measured frames caught a blink.
+#:
+#: Ten seconds is the smallest span over which the answer means anything: at
+#: the 0.15 threshold it takes 1.5 seconds of accumulated closure to cross,
+#: which is a real closure and not a blink. It is a floor on EVIDENCE, not a
+#: second window -- once passed, the metric is the full configured window's.
+PERCLOS_MIN_WINDOW_S = 10.0
+
+
+class PeakCorroboratedGraceTracker(CorroboratedGraceTracker):
+    """A CorroboratedGraceTracker whose corroboration reflects the episode's
+    PEAK evidence rather than the evidence present on its FIRST frame.
+
+    The base class latches corroboration from the opening frame of an episode
+    and can only ever drop it afterward. That is exactly right for the signal
+    it was built for -- face-lost corroborated by a still-visible body, where
+    the body disappearing mid-episode means the situation got WORSE and the
+    patient threshold should be withdrawn.
+
+    It is structurally wrong for the mirror-check yaw signal, to the point of
+    making rearview_tolerance_seconds unreachable config. A distraction
+    episode BEGINS the instant |yaw| crosses yaw_threshold_deg (35), which is
+    by definition BELOW mirror_check_yaw_deg (55): a head does not teleport to
+    70 degrees, it passes through 35 on the way. So every real head turn --
+    including every blind-spot check the setting exists for -- opened its
+    episode uncorroborated and latched there. Measured before this class
+    existed: a 0->70 degree sweep held at 70 never corroborated once and fired
+    distraction at 3.45s, the short threshold, in every configuration.
+
+    Here corroboration ACCUMULATES within an episode instead: once seen it
+    holds until the episode ends. Applied to yaw that reads as "this turn
+    reached blind-spot magnitude at some point", which is what makes it a
+    mirror check -- the return sweep back through 40 degrees is part of the
+    same maneuver, not evidence it was never one. Everything else is the base
+    class untouched: the two thresholds, the release grace, and the invariant
+    that corroboration only ever buys MORE patience and never less. It does
+    not leak between episodes; the base class resets it on release.
+    """
+
+    def update(self, condition: bool, corroborated: bool, now: float) -> Optional[float]:
+        if condition and self._start is not None:
+            # Mid-episode only. On the opening frame the base class's own
+            # "set it from this frame" behavior is already correct, and
+            # pre-empting it there would hand an ordinary glance -- which has
+            # never corroborated anything -- the patient threshold.
+            if corroborated:
+                self._corroborated = True
+            corroborated = corroborated or self._corroborated
+        return super().update(condition, corroborated, now)
+
+
 class PerclosTracker:
     """Tracks the rolling fraction of elapsed time a condition (eye closure) has been true."""
 
-    def __init__(self, window_s: float) -> None:
+    def __init__(self, window_s: float, min_window_s: float = PERCLOS_MIN_WINDOW_S) -> None:
         self._window_s = window_s
+        # A configured window SHORTER than the default minimum is a deliberate
+        # statement about how much evidence this deployment wants, so it caps
+        # the floor rather than being overruled by it -- otherwise the metric
+        # would be permanently zero, which is a worse answer than a short one.
+        self._min_window_s = min(min_window_s, window_s)
         self._samples: deque[tuple[float, bool]] = deque()
 
     def update(self, closed: bool, now: float) -> float:
-        """Record the current closed/open state and return the PERCLOS fraction in [0, 1]."""
+        """Record the current closed/open state and return the PERCLOS fraction in [0, 1].
+
+        Returns 0.0 until `min_window_s` of observation has actually
+        accumulated -- see PERCLOS_MIN_WINDOW_S.
+        """
         self._samples.append((now, closed))
         cutoff = now - self._window_s
         while len(self._samples) > 1 and self._samples[0][0] < cutoff:
@@ -470,6 +562,8 @@ class PerclosTracker:
                 closed_time += dt
             prev_t, prev_closed = t, closed_state
 
+        if total_time < self._min_window_s:
+            return 0.0
         return closed_time / total_time if total_time > 0 else 0.0
 
 
@@ -688,12 +782,14 @@ class DriverAttentionModule(VisionModule):
         self._yaw_threshold_deg = float(config["yaw_threshold_deg"])
         # A rearview/side-mirror or blind-spot check turns the head much further
         # than an ordinary off-center glance (at a passenger, the center console,
-        # ...), so it gets more patience before counting as distraction -- see
-        # CorroboratedGraceTracker. Reverts to distraction_seconds immediately if
-        # the yaw ever drops back to merely off-center partway through, measured
-        # from when the turn started, not from when it stopped being a big one.
+        # ...), so it gets more patience before counting as distraction. The
+        # patience applies to any episode whose yaw REACHES this angle at any
+        # point -- see PeakCorroboratedGraceTracker for why keying it to the
+        # episode's FIRST frame (the base tracker's behavior) made the setting
+        # dead config: an episode necessarily opens at yaw_threshold_deg, below
+        # this one. An episode that never reaches it gets distraction_seconds.
         self._mirror_check_yaw_deg = float(config.get("mirror_check_yaw_deg", 55.0))
-        self._distract_tracker = CorroboratedGraceTracker(
+        self._distract_tracker = PeakCorroboratedGraceTracker(
             short_s=float(config["distraction_seconds"]),
             long_s=float(config.get("rearview_tolerance_seconds", 5.0)),
             release_s=release_s,
@@ -750,7 +846,16 @@ class DriverAttentionModule(VisionModule):
         # --- object detection (phone / food), lazily loaded on first stride tick ---
         self._yolo_weights = config.get("yolo_weights", "yolo11n.pt")
         self._yolo_every_n_frames = max(1, int(config.get("yolo_every_n_frames", 3)))
-        self._yolo_confidence_threshold = float(config.get("yolo_confidence_threshold", 0.35))
+        # Kept in step with config.yaml's shipped value, so a config-less run
+        # behaves like the product. 0.35 (the previous default) measured 10.8%
+        # phone recall at 100% precision on held-out in-car imagery -- it
+        # missed close to nine phones in ten. 0.10 measures 51.7% / 95.8%.
+        # Not lower: 0.05 buys another 16 points of recall for 2.3 of
+        # precision, and the precision loss is NOT fully absorbed downstream --
+        # phone_use is protected by its 2.0s sustain gate, but "phone_detected"
+        # fires on the rising edge with no sustain at all and phone_risk feeds
+        # RiskFusion on mere visibility.
+        self._yolo_confidence_threshold = float(config.get("yolo_confidence_threshold", 0.10))
         self._yolo_class_map: dict[str, str] = dict(config.get("yolo_classes", {}))
         self._enable_hands = bool(config.get("enable_hands", True))
         self._hand_phone_iou_threshold = float(config.get("hand_phone_iou_threshold", 0.2))
@@ -764,7 +869,13 @@ class DriverAttentionModule(VisionModule):
         # full-body Pose model (only MediaPipe Hands, strided with the object
         # detector), so this is coarser-grained than Baby Mode's every-frame
         # wrist kinematics -- see the module's final report for that limitation.
-        self._hand_tracker = BoxTracker()
+        # A looser match gate than BoxTracker's default -- see
+        # MAX_MATCH_DISTANCE_DIAGONAL_HAND. A hand frantic enough to be worth
+        # reporting moves further between two stride ticks than its own box
+        # diagonal, so at the default gate the association broke on exactly the
+        # motion this feature exists to catch: each tick started a fresh track
+        # with an empty trail, leaving no trajectory to judge.
+        self._hand_tracker = BoxTracker(max_distance=MAX_MATCH_DISTANCE_DIAGONAL_HAND)
         self._erratic_hand_min_speed = float(config.get("erratic_hand_min_speed", 2.0))
         self._erratic_hand_min_reversals = int(config.get("erratic_hand_min_reversals", 3))
         self._erratic_hands_tracker = GracedConditionTracker(
@@ -895,13 +1006,52 @@ class DriverAttentionModule(VisionModule):
             self._last_person_visible = False
             print(f"driver_attention: object detection disabled after an error: {exc}")
 
+    def _eating_boxes_near_face(
+        self, eating_boxes: list[Box], person_boxes: list[Box]
+    ) -> list[Box]:
+        """The food/drink boxes actually related to the DRIVER, not merely present.
+
+        Without this, "eating_drinking" fired on any box of a food or drink
+        class anywhere in the frame: a bottle standing in a cupholder, a
+        takeaway cup in the passenger footwell, and a bottle raised to the
+        driver's lips produced identical, indistinguishable events. The class
+        of the object was the whole claim, and the class of the object is
+        exactly what cannot separate "has a drink" from "is drinking".
+
+        The relation used is core/detectors.upper_region -- the top fraction
+        of the driver's own detected box, where a seated person's face is --
+        which is the same geometric proxy core/rules.py's `near_mouth` and
+        modules/baby_monitoring.py's choking-hazard scoring already stand on.
+        It is an approximation and is documented as one in that function: a
+        box knows nothing about an actual mouth. It is nonetheless the whole
+        difference between an object being in the car and an object being at
+        the driver's face, at the fidelity a box detector can support.
+
+        The largest person box is taken as the driver: in a driver-facing
+        camera the driver is the nearest and largest person in frame, and a
+        rear-seat passenger's snack is not this module's event to fire.
+
+        With NO person detected there is nothing to be near, so nothing
+        qualifies. That is the same direction this module already fails in
+        when its detector cannot corroborate anything (see the error path in
+        _update_object_detections), and it is the honest one: the alternative
+        is to keep firing the ungated event and call the missing evidence a
+        pass.
+        """
+        if not eating_boxes or not person_boxes:
+            return []
+        driver = max(person_boxes, key=lambda b: (b[2] - b[0]) * (b[3] - b[1]))
+        face_region = upper_region(driver)
+        return [box for box in eating_boxes if iou(box, face_region) > 0.0]
+
     def _run_object_detections(self, frame: np.ndarray) -> None:
         """The actual YOLO + Hands inference and box bookkeeping for one stride tick."""
         h, w = frame.shape[:2]
 
         # _PERSON_CLASS rides along on the SAME pass (already running every
-        # stride tick for phone/food) purely so face-loss has a fallback
-        # signal -- see _face_lost_tracker's use of it. Not added to
+        # stride tick for phone/food) so face-loss has a fallback signal (see
+        # _face_lost_tracker's use of it) and so the eating/drinking spatial
+        # gate below has a driver to be spatially related TO. Not added to
         # yolo_class_ids/overlay_boxes: it is a presence check, not a thing
         # this module reports on.
         results = self._yolo_model.predict(
@@ -913,12 +1063,12 @@ class DriverAttentionModule(VisionModule):
         eating_boxes: list[Box] = []
         overlay_boxes: list[tuple[Box, str]] = []
         overlay_confidences: list[float] = []
-        person_visible = False
+        person_boxes: list[Box] = []
         for result in results:
             for box in result.boxes:
                 class_id = int(box.cls[0])
                 if class_id == _PERSON_CLASS:
-                    person_visible = True
+                    person_boxes.append(tuple(int(v) for v in box.xyxy[0].tolist()))
                 event_type = self._yolo_class_ids.get(class_id)
                 if event_type is None:
                     continue
@@ -929,7 +1079,8 @@ class DriverAttentionModule(VisionModule):
                     phone_boxes.append(xyxy)
                 else:
                     eating_boxes.append(xyxy)
-        self._last_person_visible = person_visible
+        self._last_person_visible = bool(person_boxes)
+        eating_boxes = self._eating_boxes_near_face(eating_boxes, person_boxes)
 
         hand_boxes: list[Box] = []
         if self._hands is not None:
@@ -946,7 +1097,6 @@ class DriverAttentionModule(VisionModule):
         self._last_hand_boxes = hand_boxes
         self._last_overlay_boxes = overlay_boxes
         self._last_overlay_confidences = overlay_confidences
-        self._last_frame_size = (w, h)
         self._hand_overlaps_phone = any(
             iou(hand_box, phone_box) > self._hand_phone_iou_threshold
             for hand_box in hand_boxes
@@ -964,7 +1114,13 @@ class DriverAttentionModule(VisionModule):
         matched_hands = self._hand_tracker.update(hand_detections, time.monotonic(), aspect)
         erratic = False
         for track in matched_hands:
-            speed = track.velocity(aspect)
+            # PEAK instantaneous speed, not net displacement over the trail:
+            # oscillation returns to where it started, so a net-displacement
+            # reading of chaotic motion is ~0 by construction and could never
+            # clear this gate at the same time as the reversal count below.
+            # See TrackedBox.peak_speed and core/activity.py's flailing
+            # detector, which has always measured intensity this way.
+            speed = track.peak_speed(aspect)
             if speed is not None and speed > self._erratic_hand_min_speed:
                 if track.reversals(min_amplitude=0.15, aspect=aspect) >= self._erratic_hand_min_reversals:
                     erratic = True
@@ -986,6 +1142,14 @@ class DriverAttentionModule(VisionModule):
         now = time.monotonic()
         events: list[Event] = []
         h, w = frame.shape[:2]
+        # From the ACTUAL frame, every frame -- not only on an object-detector
+        # tick. get_detections() reports this size and core/zones.py divides
+        # pixel boxes by it to reach the 0..1 space every AI-configured zone
+        # polygon lives in. Written only inside _run_object_detections, it
+        # stayed (0, 0) whenever detection was disabled or had errored out,
+        # making max(frame_w, 1) == 1 and every normalized polygon test fail
+        # for every box, forever, with no error and no log line.
+        self._last_frame_size = (w, h)
 
         self._frame_index += 1
         if self._frame_index % self._yolo_every_n_frames == 0:
@@ -1320,7 +1484,14 @@ class DriverAttentionModule(VisionModule):
             events.append(Event.now("eating_drinking", 0.0, 0.6, self.name))
 
         # --- risk fusion: reason about the signals above *together*, not just individually ---
-        eye_risk = 1.0 if self._drowsy_active else min(1.0, perclos / self._perclos_threshold) * 0.6
+        # Both of these turn a raw count into "how far along toward the
+        # threshold" for partial credit, and both divide by a number that comes
+        # straight from config with nothing stopping it being 0 -- a plausible
+        # "switch this contribution off" edit, which was instead an unguarded
+        # ZeroDivisionError raised once per frame inside the video loop. A
+        # threshold of 0 means "any amount at all already counts as fully
+        # there", which is the limit these ratios approach anyway.
+        eye_risk = 1.0 if self._drowsy_active else _saturating_ratio(perclos, self._perclos_threshold) * 0.6
         gaze_risk = (
             1.0
             if (self._eyes_down_active or self._eyes_up_active)
@@ -1329,7 +1500,7 @@ class DriverAttentionModule(VisionModule):
             # same reasoning as face_lost_risk below.
             else 1.0 if (self._distracted_active and not self._distract_tracker.corroborated)
             else 0.6 if self._distracted_active
-            else min(1.0, self._glance_counter.count / self._glance_min_count) * 0.5
+            else _saturating_ratio(self._glance_counter.count, self._glance_min_count) * 0.5
         )
         phone_risk = (
             1.0

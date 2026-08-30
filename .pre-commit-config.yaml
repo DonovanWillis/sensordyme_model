@@ -1,0 +1,131 @@
+# Pre-commit hooks for SensorDyme.
+#
+# NOT INSTALLED YET. pre-commit is not on this machine and this file does
+# nothing until somebody runs:
+#
+#     make setup-dev     # installs pre-commit (and ruff, pyright, pip-audit)
+#     make hooks         # == pre-commit install; writes .git/hooks/pre-commit
+#
+# To check the whole tree once, without committing:
+#     .venv/bin/pre-commit run --all-files
+#
+# To skip the hooks for one commit (use sparingly, and say why in the message):
+#     git commit --no-verify
+#
+# WHAT IS AND IS NOT HERE
+# -----------------------
+# A pre-commit hook that takes longer than a few seconds gets bypassed, and a
+# hook that is routinely bypassed is worse than no hook because it creates a
+# false sense of a gate. So:
+#
+#   * ruff --fix runs, because it is milliseconds.
+#   * pyright does NOT. It needs .venv populated and takes ~3s on a warm cache
+#     and much longer cold. It is a CI gate and a `make typecheck` command.
+#   * pytest does NOT. The suite is ~20s. That is a `make test` before you push,
+#     not a hook on every commit.
+#   * `ruff format` does NOT. It would rewrite 144 of the 209 source files —
+#     see the [format] section of ruff.toml.
+#
+# The secrets and large-file hooks are the ones that matter most here. This
+# repository has already had cloud/*.db — containing real account emails,
+# password hashes, salts, device keys and claim codes — committed and then
+# purged from history on 2026-08-06 (see .gitignore). A pre-commit gate is what
+# makes that a caught mistake instead of a history rewrite.
+
+# Hooks are pinned to a tag AND that tag's meaning is fixed by the repo's own
+# release process; `pre-commit autoupdate` moves them, so review that diff.
+repos:
+  # ==========================================================================
+  # Lint — the same ruff, with the same ruff.toml, that CI runs
+  # ==========================================================================
+  - repo: https://github.com/astral-sh/ruff-pre-commit
+    # MUST match requirements-dev.txt and .github/workflows/ci.yml. If the hook
+    # and CI disagree about the version, they disagree about the findings, and
+    # the hook stops being a preview of CI.
+    rev: v0.16.4
+    hooks:
+      - id: ruff
+        name: ruff (lint, safe autofix)
+        # --fix applies only the fixes ruff classifies as safe. --unsafe-fixes
+        # is deliberately absent: it rewrites semantics, and a hook is the
+        # wrong place to do that to code you are about to commit unread.
+        args: [--fix, --exit-non-zero-on-fix]
+
+  # ==========================================================================
+  # Secrets and things that must never enter history
+  # ==========================================================================
+  - repo: https://github.com/pre-commit/pre-commit-hooks
+    rev: v6.0.0
+    hooks:
+      - id: detect-private-key
+        name: detect private keys
+        # Catches an SSH or TLS private key pasted into a file. The repo has a
+        # .secrets/ directory (gitignored) holding the real JWT signing key,
+        # and deploy/ contains TLS material for the LAN backend — both are
+        # exactly the shape of thing that gets copied to the wrong path.
+
+      - id: check-added-large-files
+        name: block large files (>2MB)
+        # The repo is 26MB of git history with exactly ONE large tracked file
+        # (dmonitoring_model.onnx, 15.4MB, openpilot's driver-monitoring model).
+        # Everything else large is gitignored: data/state_farm alone is 5.9GB,
+        # plus *.pt and *.hef model weights. The failure this prevents is
+        # somebody adding a dataset sample, a captured video, or a .pt
+        # checkpoint from a directory that is not covered by a gitignore rule —
+        # unrecoverable without rewriting history.
+        #
+        # 2048KB, not the 500KB default: 500KB would reject legitimate
+        # additions to ios/Assets.xcassets and benchmark result images.
+        args: [--maxkb=2048]
+        # dmonitoring_model.onnx is already tracked, so this hook (which only
+        # examines ADDED files) will not trip on it.
+
+      - id: check-merge-conflict
+        name: block merge-conflict markers
+
+      - id: check-case-conflict
+        name: block case-only filename collisions
+        # macOS is case-insensitive, the Raspberry Pi is not. Two files
+        # differing only in case are invisible here and break the deploy.
+
+      - id: end-of-file-fixer
+        name: fix missing trailing newline
+        # third_party/ is vendored verbatim at a known commit; rewriting even
+        # whitespace there breaks the "this is upstream's code" claim that the
+        # comparison benchmarks rest on.
+        exclude: ^third_party/
+
+      - id: trailing-whitespace
+        name: strip trailing whitespace
+        exclude: ^third_party/
+        args: [--markdown-linebreak-ext=md]
+
+      # ---- config files that break things silently when malformed ----------
+      - id: check-yaml
+        name: validate YAML
+        # config.yaml is DEVICE STATE, not code, and a malformed one is a
+        # device that will not boot. presets.yaml drives what the iOS app
+        # offers. .github/workflows/ci.yml has never run, so a YAML error there
+        # would otherwise only surface after a remote exists.
+        #
+        # --unsafe: parse for syntax only, without resolving custom tags.
+        # Nothing here uses them today, and this keeps the hook from choking on
+        # anchors in a large config.
+        args: [--unsafe]
+        exclude: ^third_party/
+
+      - id: check-json
+        name: validate JSON
+        # pyrightconfig.json is JSONC (pyright parses // comments), which this
+        # strict JSON hook cannot read. It is checked by pyright itself, which
+        # prints "Config contains unrecognized setting" on any mistake — run
+        # `make typecheck` after editing it.
+        exclude: |
+          (?x)^(
+            pyrightconfig\.json|
+            third_party/.*|
+            ios/.*\.xcodeproj/.*
+          )$
+
+      - id: check-toml
+        name: validate TOML

@@ -203,6 +203,13 @@ class CloudUplink:
     def _run(self) -> None:
         headers = {"X-Device-Key": self._device_key}
         while not self._stop.is_set():
+            # Bound OUTSIDE the try. The except handler below re-queues `batch`, so if
+            # anything raised before it was assigned the handler itself would raise
+            # NameError -- and since this loop has no outer try, that kills the uplink
+            # thread outright. The device would then keep detecting and alerting
+            # locally while silently never reaching the backend again, which is the
+            # worst failure shape available: no events, no error, no reconnect.
+            batch: list = []
             try:
                 with self._lock:
                     batch = list(self._queue)

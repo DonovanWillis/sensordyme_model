@@ -195,6 +195,20 @@ class PersonTracker:
 #: lengths since held/handled objects can move faster relative to their own
 #: size than a walking person does relative to their torso.
 MAX_MATCH_DISTANCE_DIAGONAL = 1.2
+#: The same gate for a BARE HAND, which is the fastest thing any of these
+#: trackers has to follow relative to its own size: a hand is small (its box
+#: diagonal is a fraction of a torso's) while its reachable envelope is a whole
+#: arm, so a genuinely frantic hand covers well over one of its own diagonals
+#: between two samples -- and Driver Mode samples hands only on the object
+#: detector's stride (yolo_every_n_frames), which multiplies the gap further.
+#: At the default 1.2, exactly the motion "erratic hand movement" exists to
+#: catch was the motion that broke the association: every tick spawned a fresh
+#: track with an empty trail, so the trajectory this feature reasons about
+#: never existed. The looser gate's cost is the documented failure mode of a
+#: centroid matcher -- two same-class boxes can swap ids when they cross --
+#: bounded here by greedy nearest-first assignment (with both hands detected,
+#: the closest pairing still wins) and by there being at most two of them.
+MAX_MATCH_DISTANCE_DIAGONAL_HAND = 3.0
 #: How long a vanished object stays tracked before its id is retired.
 BOX_LOST_GRACE_S = 2.0
 
@@ -255,6 +269,40 @@ class TrackedBox:
         if elapsed <= 0 or diagonal <= 1e-6:
             return None
         return round(math.hypot((x1 - x0) * aspect, y1 - y0) / diagonal / elapsed, 3)
+
+    def peak_speed(self, aspect: float = 1.0) -> Optional[float]:
+        """Highest INSTANTANEOUS centroid speed over the trail, in box-diagonals
+        per second -- the fastest single step, not `velocity`'s net displacement
+        from trail start to trail end divided by the elapsed time.
+
+        The two answer different questions and only one of them can describe
+        oscillation. Net displacement is the right measure for "is this thing
+        travelling somewhere" (velocity's callers: is a held object closing on a
+        mouth, is a person crossing a room). It is structurally blind to motion
+        that returns to where it started -- which is the DEFINITION of the
+        chaotic back-and-forth that `reversals` counts, so pairing the two in
+        one AND condition (fast AND reversing) made the pair near-mutually-
+        exclusive: whatever reversed enough to clear the reversal bar had, by
+        reversing, cancelled its own net displacement to nearly zero.
+
+        This mirrors core/activity.py's flailing detector, which has always
+        measured intensity as the max of per-step speeds for exactly this
+        reason; it is that primitive made available to any tracked box.
+        """
+        if len(self.trail) < 2:
+            return None
+        diagonal = self.diagonal
+        if diagonal <= 1e-6:
+            return None
+        peak: Optional[float] = None
+        for (t0, x0, y0), (t1, x1, y1) in zip(self.trail, self.trail[1:]):
+            dt = t1 - t0
+            if dt <= 0:
+                continue
+            step = math.hypot((x1 - x0) * aspect, y1 - y0) / diagonal / dt
+            if peak is None or step > peak:
+                peak = step
+        return None if peak is None else round(peak, 3)
 
     def approaching(self, point: tuple[float, float], aspect: float = 1.0) -> Optional[bool]:
         """Whether this track's recent motion has been heading TOWARD `point`

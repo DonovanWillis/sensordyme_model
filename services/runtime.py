@@ -19,6 +19,7 @@ runs on SIGTERM (systemd stop) and SIGINT alike, and always releases the camera.
 
 from __future__ import annotations
 
+import json
 import os
 import signal
 import subprocess
@@ -548,7 +549,27 @@ class DeviceRuntime:
 
     def _last_resort(self, component: str) -> None:
         """A critical component is down and restarts are spent: reboot the Pi —
-        config-gated, rate-limited, and never on a dev machine."""
+        config-gated, rate-limited, TOTAL-bounded, and never on a dev machine.
+
+        Two independent limits, because they fail differently:
+
+          * `reboot_min_interval_s` spaces reboots out. On its own it does not
+            bound anything: a permanently dead camera satisfies it forever and
+            reboots the device every 30 minutes until someone notices.
+          * `reboot_max_total` bounds the campaign. Past it the device stays up
+            in its degraded state and keeps reporting through /api/health, which
+            is strictly more useful than a box that power-cycles all night: a
+            fault that survived N reboots is not going to be fixed by N+1.
+
+        The rate-limit state is CONSULTED AND PERSISTED BEFORE the reboot, and a
+        failure to persist it BLOCKS the reboot rather than being swallowed. That
+        ordering is the whole point. `data/` going read-only or full is a real
+        field failure on a worn SD card (see core/logger.py's own notes on it) —
+        and it is precisely the condition under which an unrecorded reboot would
+        loop unbounded, because every boot would then re-read "no reboots yet".
+        Refusing to reboot when we cannot remember having done so is the only
+        safe direction.
+        """
         health_cfg = self.config.get("health", {})
         if not bool(health_cfg.get("allow_reboot", False)) or not nmcli_available():
             log.critical(
@@ -557,19 +578,82 @@ class DeviceRuntime:
                 component,
             )
             return
-        marker = Path("data/.last_reboot_request")
+
         min_interval = float(health_cfg.get("reboot_min_interval_s", 1800))
+        max_total = int(health_cfg.get("reboot_max_total", 5))
+        state = self._reboot_state()
         now = time.time()
-        try:
-            if marker.exists() and now - marker.stat().st_mtime < min_interval:
-                log.critical("reboot suppressed: last one was <%.0fs ago", min_interval)
-                return
-            marker.parent.mkdir(parents=True, exist_ok=True)
-            marker.touch()
-        except OSError:
-            pass
-        log.critical("LAST RESORT: rebooting because '%s' is unrecoverable", component)
+
+        if state["count"] >= max_total > 0:
+            log.critical(
+                "reboot suppressed: %d reboot(s) already requested (health.reboot_max_total=%d) "
+                "and '%s' is still down — a fault that survived those will not be fixed by "
+                "another. Staying up degraded; see /api/health.",
+                state["count"], max_total, component,
+            )
+            return
+        if state["last_at"] and now - state["last_at"] < min_interval:
+            log.critical(
+                "reboot suppressed: last one was %.0fs ago (<%.0fs)",
+                now - state["last_at"], min_interval,
+            )
+            return
+
+        if not self._record_reboot_request(state, now):
+            log.critical(
+                "reboot ABORTED: could not persist the reboot record to %s. Without it "
+                "the next boot cannot know this reboot happened, so the rate limit and "
+                "the total bound would both reset and the device could power-cycle "
+                "indefinitely. Staying up degraded instead ('%s' remains down).",
+                self._REBOOT_STATE_PATH, component,
+            )
+            return
+
+        log.critical(
+            "LAST RESORT: rebooting because '%s' is unrecoverable (reboot %d of %d)",
+            component, state["count"] + 1, max_total,
+        )
         subprocess.run(["sudo", "-n", "systemctl", "reboot"], check=False)
+
+    #: Persisted across reboots, which is what makes the total bound meaningful --
+    #: systemd's own StartLimitBurst counter does NOT survive a reboot, so it can
+    #: never bound a reboot campaign.
+    _REBOOT_STATE_PATH = Path("data/.reboot_state.json")
+
+    def _reboot_state(self) -> dict:
+        """{"count": int, "last_at": float} — zeros when absent or unreadable.
+
+        An unreadable file reads as "no reboots yet", which is the permissive
+        direction; that is safe ONLY because _record_reboot_request must succeed
+        before any reboot proceeds, so an unwritable state file stops the reboot
+        rather than uncapping it.
+        """
+        try:
+            raw = json.loads(self._REBOOT_STATE_PATH.read_text())
+            return {"count": int(raw.get("count", 0)), "last_at": float(raw.get("last_at", 0.0))}
+        except (OSError, ValueError, TypeError):
+            return {"count": 0, "last_at": 0.0}
+
+    def _record_reboot_request(self, state: dict, now: float) -> bool:
+        """Persist the incremented reboot record. False if it could not be written.
+
+        Atomic (tmp + fsync + replace) for the same reason core/monitoring_config.py
+        is: a half-written record on a device that is about to power-cycle is worse
+        than no record, and this file's whole job is to survive that power-cycle.
+        """
+        payload = {"count": state["count"] + 1, "last_at": now}
+        try:
+            self._REBOOT_STATE_PATH.parent.mkdir(parents=True, exist_ok=True)
+            tmp = self._REBOOT_STATE_PATH.with_suffix(".json.tmp")
+            with open(tmp, "w") as handle:
+                json.dump(payload, handle)
+                handle.flush()
+                os.fsync(handle.fileno())
+            os.replace(tmp, self._REBOOT_STATE_PATH)
+            return True
+        except OSError as exc:
+            log.critical("could not persist reboot state: %s", exc)
+            return False
 
     # ------------------------------------------------------------------ preset switching
     def _exit_custom_monitoring(self) -> None:

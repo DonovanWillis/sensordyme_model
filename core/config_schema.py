@@ -15,6 +15,11 @@ from __future__ import annotations
 _KNOWN_TOP_LEVEL = {
     "module", "profile", "display", "camera", "dashboard", "cloud", "alerts",
     "logging", "modules", "mac_max", "accelerator", "network", "health", "hardware",
+    # `training:` drives the CaptureStore (services/runtime.py builds it from this
+    # block). It was missing here, so every device printed "unknown top-level section
+    # 'training:' (typo?)" on every boot for a section that is real and is read --
+    # which is how an operator learns to ignore this validator's output entirely.
+    "training",
 }
 
 

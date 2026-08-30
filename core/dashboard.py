@@ -19,6 +19,7 @@ no new dependencies.
 
 from __future__ import annotations
 
+import hmac
 import json
 import threading
 import time
@@ -101,8 +102,15 @@ class DashboardServer:
                     return True
                 sent = self.headers.get("X-Device-Token", "")
                 if not sent and "token=" in self.path:
+                    # Kept for the MJPEG <img> case, which cannot set a header. It is
+                    # a real leak -- a token in a URL lands in proxy logs, browser
+                    # history and Referer -- so it stays the fallback, never the
+                    # documented path, and the app itself uses the header.
                     sent = self.path.rsplit("token=", 1)[1].split("&")[0]
-                return sent == dashboard._token
+                # compare_digest, not ==: a plain string compare short-circuits on the
+                # first differing byte, which leaks the token's prefix to anyone who
+                # can time responses. Cheap to get right, awkward to retrofit later.
+                return hmac.compare_digest(sent, dashboard._token)
 
             def _json(self, obj: dict, status: int = 200) -> None:
                 body = json.dumps(obj).encode()
@@ -347,16 +355,45 @@ class DashboardServer:
                 ],
             }
 
+    #: How many bytes off the end of the event log to consider for `history`. The log
+    #: is append-only and unrotated, so it grows for the life of the device -- reading
+    #: all of it to return the last 200 rows made every /api/history request cost
+    #: O(file size). That endpoint is reachable over the LAN and, with the shipped
+    #: `dashboard.token: null`, unauthenticated, so the cost was an amplification
+    #: vector that got worse the longer a device had been deployed. 512KB is far more
+    #: than any plausible `limit` needs (rows are ~100 bytes) while staying bounded.
+    _HISTORY_TAIL_BYTES = 512 * 1024
+
     def history(self, limit: int = 200) -> list[dict]:
-        """The last `limit` rows of the on-device event log (data/events.csv)."""
+        """The last `limit` rows of the on-device event log (data/events.csv).
+
+        Reads only the tail of the file, not the whole thing -- see
+        `_HISTORY_TAIL_BYTES`. The first (possibly partial) line of the tail is
+        dropped, and the header is re-supplied from the file's own first line so the
+        DictReader still keys correctly.
+        """
         import csv
         from pathlib import Path
 
         path = Path(self._events_csv_path)
         if not path.exists():
             return []
-        with path.open() as f:
-            rows = list(csv.DictReader(f))
+
+        with path.open("rb") as handle:
+            header = handle.readline().decode("utf-8", "replace").strip()
+            if not header:
+                return []
+            body_start = handle.tell()
+            handle.seek(0, 2)
+            size = handle.tell()
+            if size - body_start > self._HISTORY_TAIL_BYTES:
+                handle.seek(size - self._HISTORY_TAIL_BYTES)
+                handle.readline()  # discard the partial row we almost certainly landed in
+            else:
+                handle.seek(body_start)
+            tail = handle.read().decode("utf-8", "replace")
+
+        rows = list(csv.DictReader(tail.splitlines(), fieldnames=header.split(",")))
         return [
             {
                 "timestamp": r.get("timestamp", ""),

@@ -80,6 +80,29 @@ LIST_MIGRATIONS: list[tuple[str, str, str]] = [
      "security_monitoring's alert type had the identical gap"),
     ("alerts.loud_types", "animal_in_zone",
      "security_monitoring's alert type had the identical gap"),
+    # The five below were fixed in the REPO's config.yaml but never added
+    # here, which is invisible in a fresh checkout and total on a deployed
+    # unit: `make deploy` rsyncs with --exclude='config.yaml', so this list
+    # is the ONLY way a change to loud_types ever reaches a device. A unit
+    # deployed before they were added kept tagging them "soft" for ever --
+    # and "soft" is precisely what cloud/notify.py's NotificationGate drops.
+    # A real fall on a deployed elderly-monitoring device therefore lit the
+    # screen red and sounded the local buzzer while sending NO push and NO
+    # SMS: the one path that reaches somebody who is not already watching.
+    # tests/test_phase1_config_invariant.py now checks this list against
+    # presets.yaml directly, so a sixth cannot go missing the same way.
+    ("alerts.loud_types", "fall",
+     "elderly_monitoring's PRIMARY alert. Absent here, a deployed device tagged a real fall"
+     " severity=soft and the cloud gate dropped the push and the SMS -- red screen, buzzer,"
+     " nobody told"),
+    ("alerts.loud_types", "zone_violation",
+     "elderly/baby/security all declare it; same silent-soft gap as fall"),
+    ("alerts.loud_types", "safe_zone_exit",
+     "elderly/baby presets' alert type; same silent-soft gap as fall"),
+    ("alerts.loud_types", "choking_hazard",
+     "baby_monitoring's alert type; same silent-soft gap as fall"),
+    ("alerts.loud_types", "crowd",
+     "security_monitoring's alert type; same silent-soft gap as fall"),
 ]
 
 

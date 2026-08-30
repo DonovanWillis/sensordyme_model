@@ -1,5 +1,39 @@
 """Fall detection module: MediaPipe Pose hip/shoulder tracking for rapid-drop-then-stillness.
 
+The fall detector is a small state machine, not a single-frame threshold:
+
+    upright (seen recently) --[rapid drop OR pose lost right after upright,
+    reacquired lying down]--> pending --[sustained, corroborated by posture,
+    stillness]--> CONFIRMED (via core/event_engine.py, so resolve/cooldown
+    behave exactly like every other detection in this product)
+
+Two failure modes drove this design, both found by reading the previous
+single-signal version rather than by guessing at new thresholds:
+
+  1. MISSED falls: the previous version measured velocity from the raw
+     landmark average with NO visibility gating, and reset all fall state
+     the instant `pose_landmarks` came back None. A real fall is exactly
+     the motion most likely to make MediaPipe lose lock for a frame or two
+     (motion blur, extreme non-standing pose) -- so a fall whose violent
+     phase coincided with a tracking dropout would recover into a
+     `_prev_y = None` state, produce a velocity of 0.0 on the first
+     recovered frame, and never cross the drop threshold at all. The
+     stillness-after-a-fall check only runs once `_fall_pending_since` is
+     set, so a fall that never triggers that flag is invisible regardless
+     of how still the person is afterward. Fixed by tracking "last time
+     this person was confidently upright" and treating "upright, pose lost,
+     reacquired lying down within a bounded window" as a second, independent
+     way to enter the pending state.
+  2. Spurious LATER false positives: `_fall_pending_since`, once set by any
+     velocity spike (including an ungated single-frame landmark glitch), was
+     never cleared unless a confirmed fall was followed by a sharp upward
+     velocity spike. Any unrelated later stillness (standing at the counter,
+     reading) could then confirm a "fall" with no relationship to the
+     original spike. Fixed by requiring posture to actually read
+     LYING_DOWN (not just "not moving") before confirming, by clearing a
+     pending state the moment posture reasserts a confident standing
+     posture, and by a hard timeout as a backstop.
+
 Also the elderly-mode zone and stillness detector, on the same landmarks:
   * restricted/boundary zone -> "zone_violation" (same event name occupancy.py
     uses, so the existing alert-severity wiring needs no change);
@@ -36,6 +70,23 @@ HIP_LANDMARKS = [23, 24]
 SHOULDER_LANDMARKS = [11, 12]
 ANKLE_LANDMARKS = [27, 28]
 _MIN_ANKLE_VISIBILITY = 0.5
+#: Below this, a hip/shoulder landmark is a guess by MediaPipe, not an
+#: observation -- excluded from the drop-velocity average rather than
+#: silently trusted (see module docstring, missed-fall cause #1).
+_MIN_TORSO_LANDMARK_VISIBILITY = 0.5
+#: Minimum of the 4 hip/shoulder landmarks that must be visible for a
+#: frame's average to be trusted for velocity at all.
+_MIN_TORSO_LANDMARKS_FOR_VELOCITY = 2
+#: Posture confidence a STANDING reading must EXCEED before it is allowed to
+#: cancel a pending fall. Deliberately above core/posture.py's 0.5 partial-
+#: observation sentinel: classify() returns exactly Posture(STANDING, 0.5,
+#: "upright; lower body not visible") for ANY near-vertical torso whose
+#: knees AND ankles are occluded -- which is precisely what a camera sees
+#: mid-fall behind a sofa or for a fall along the camera axis. Treating that
+#: guess as proof the person caught themselves made the most-occluded falls
+#: the least detectable ones. Only the full-body reading (0.8, "upright with
+#: extended legs") clears this bar.
+_STANDING_CANCEL_MIN_CONFIDENCE = 0.7
 
 
 @register_module("fall_detection")
@@ -57,12 +108,55 @@ class FallDetectionModule(VisionModule):
         self._prev_t: Optional[float] = None
         self._fall_pending_since: Optional[float] = None
         self._still_since: Optional[float] = None
-        self._fired_for_current_fall = False
         self._last_pose_proto = None
-        self._alert_active = False
         self._last_posture: Optional[posture.Posture] = None
         self._activity = ActivityRecognizer()
         self._last_activity = None
+
+        # --- fall state machine: see module docstring for why both an
+        # upright-recency clock and a pose-loss clock exist independently of
+        # the raw velocity/stillness numbers below.
+        self._last_upright_at: Optional[float] = None
+        self._pose_lost_since: Optional[float] = None
+        self._fall_via_recovery = False
+        self._fall_confidence = 0.0
+        self._last_drop_velocity = 0.0
+        # How long after losing tracking entirely a reacquired LYING_DOWN
+        # posture still counts as "found where the fall put them", not an
+        # unrelated later event (missed-fall cause #1's fix).
+        self._pose_recovery_max_gap_s = float(config.get("fall_pose_recovery_max_gap_s", 2.5))
+        # How recently the person must have been confidently upright,
+        # relative to the MOMENT tracking was lost, for a reacquired
+        # lying-down posture to count as a fall rather than "was already
+        # down, camera glitched".
+        self._upright_recency_s = float(config.get("fall_upright_recency_s", 0.5))
+        # Backstop: abandon a pending fall that never resolves either way
+        # (never confirms, never clearly recovers to standing) so it cannot
+        # sit around and confirm against an unrelated later stillness
+        # (spurious-later-alert fix, see module docstring). Measured from the
+        # last frame the person was actually SEEN DOWN, not from the drop --
+        # see _fall_pending_evidence_at below.
+        self._fall_pending_timeout_s = float(config.get("fall_pending_timeout_s", 6.0))
+        # Last time this pending fall had positive corroborating evidence
+        # (an observed LYING_DOWN posture). Backdated to the pending start so
+        # a drop that is never followed by a down reading still expires.
+        self._fall_pending_evidence_at: Optional[float] = None
+        self._fall_engine = EventEngine({})
+        self._fall_engine.add_rule(RuleSpec(
+            detection="fall", severity="critical",
+            persist_s=self._stillness_duration_s, min_frames=3, occlusion_grace_s=1.0,
+            resolve_after_s=float(config.get("fall_resolve_after_s", 4.0)),
+            # No cooldown by default. EventEngine's cooldown gate returns
+            # BEFORE a track is even created, so any non-zero value here
+            # means a second fall inside the window never enters the
+            # lifecycle at all -- and repeat falls (syncope, a failed
+            # attempt to stand) are the clinically most alarming pattern
+            # this product can see, not detector jitter to be debounced.
+            # resolve_after_s already prevents one fall re-reporting itself:
+            # re-confirming requires being seen NOT down for that long and
+            # then down-and-still again for a full stillness_duration_s.
+            cooldown_s=float(config.get("fall_cooldown_s", 0.0)),
+        ))
 
         # Activity events go through the shared lifecycle, which is what turns
         # "running" into ONE alert with a start and an end rather than one per
@@ -106,11 +200,31 @@ class FallDetectionModule(VisionModule):
                 persist_s=zone_confirm_s, min_frames=3, resolve_after_s=5.0,
             ))
         self._still_max_motion = float(config.get("still_max_motion", 0.01))
+        stillness_grace_s, stillness_resolve_s = 3.0, 10.0
         self._zone_engine.add_rule(RuleSpec(
             detection="unusual_stillness", severity="warning",
             persist_s=float(config.get("unusual_stillness_s", 600.0)),
-            min_frames=10, occlusion_grace_s=3.0, resolve_after_s=10.0,
+            min_frames=10, occlusion_grace_s=stillness_grace_s,
+            resolve_after_s=stillness_resolve_s,
         ))
+        # occlusion_grace_s bridges ABSENCE without resetting the held-time
+        # clock, which is right for zone rules ("walked behind a chair") and
+        # WRONG for a stillness rule: there, a False frame means THE SUBJECT
+        # MOVED -- contradicting evidence, not missing evidence. Bridged, it
+        # let a subject moving 1s in every 3.5s accumulate a continuous
+        # ten-minute "stillness" and fire a loud/push alert on someone
+        # demonstrably active.
+        #
+        # The engine itself can't tell the two apart (and isn't this module's
+        # to change), so the distinction is made HERE, at the feed: observed
+        # motion suppresses the stillness feed for long enough that the
+        # engine cannot bridge it -- past occlusion_grace_s so an unconfirmed
+        # track is genuinely dropped and its clock restarts from zero, and
+        # past resolve_after_s so an already-confirmed stillness actually
+        # resolves. A pose dropout (real missing evidence) sets no lockout
+        # and is still bridged exactly as before.
+        self._stillness_motion_lockout_s = max(stillness_grace_s, stillness_resolve_s) + 0.5
+        self._stillness_locked_until: Optional[float] = None
         self._prev_centroid: Optional[tuple[float, float]] = None
 
     def process(self, frame: np.ndarray) -> list[Event]:
@@ -139,12 +253,38 @@ class FallDetectionModule(VisionModule):
             self._prev_y = None
             self._prev_t = None
             self._prev_centroid = None
+            # Deliberately NOT resetting _fall_pending_since/_still_since here:
+            # a fall's violent phase is exactly when pose tracking is most
+            # likely to drop out (see module docstring). Recording only WHEN
+            # tracking was lost -- not clearing anything -- is what lets the
+            # "reacquired lying down shortly after" path below recognize a
+            # fall that happened during this exact gap.
+            if self._pose_lost_since is None:
+                self._pose_lost_since = now
             # Gone, not merely still, and gone, not merely outside the zone --
             # both are real absence, so both get an explicit False rather than
             # being left to freeze mid-confirmation.
+            # A CONFIRMED fall must be fed here too. EventEngine advances a
+            # confirmed track ONLY on an explicit update -- it has no
+            # time-based reaper -- so skipping this call left a confirmed
+            # fall latched forever the moment tracking dropped, and while
+            # latched every subsequent real fall was silently absorbed into
+            # the same never-resolving track with no new alert. False is the
+            # right value for the same reason it is for the zone rules: we
+            # cannot see the person, and resolve_after_s (not a single
+            # frame) is what decides when that becomes a resolution. This
+            # deliberately does NOT touch _fall_pending_since -- an
+            # unconfirmed pending fall is state-machine state, preserved
+            # across the gap exactly as before so a fall that happens DURING
+            # the dropout is still recognized by the recovery path below.
+            fall_transitions = self._fall_engine.update("fall", False, self._fall_confidence, now)
+            events += self._fall_transition_events(fall_transitions)
             transitions = []
             for zone in self._watched_zones:
                 transitions += self._zone_engine.update(f"zone_violation:{zone.name}", False, 0.85, now)
+            # Not observed is not "moved": no motion lockout is set here, so
+            # a brief dropout is still bridged by occlusion_grace_s and does
+            # not restart a long stillness window (see __init__).
             transitions += self._zone_engine.update("unusual_stillness", False, 0.8, now)
             # Matches baby_monitoring.py's safe_zone_exit convention exactly:
             # "not detected at all" is a DIFFERENT concern (person_absent-style,
@@ -165,39 +305,157 @@ class FallDetectionModule(VisionModule):
         aspect = frame_w / max(frame_h, 1)
         self._last_posture = posture.classify(landmarks, aspect=aspect)
         self._last_hip_y = posture.hip_height(landmarks)
+        if self._last_posture.label in (posture.STANDING, posture.SITTING):
+            self._last_upright_at = now
+
+        # A tracking gap just ended (results.pose_landmarks is truthy again
+        # this frame) -- capture when it started and clear the marker before
+        # any of the logic below, which reads self._pose_lost_since as "are
+        # we still inside a gap" (we are not, we're evaluating the frame
+        # right after one).
+        gap_start = self._pose_lost_since
+        self._pose_lost_since = None
+
+        # Visibility-gated drop velocity: an average built from a landmark
+        # MediaPipe is guessing at (low visibility) is not evidence, and
+        # averaging it in unconditionally is missed-fall cause #1 (see module
+        # docstring) -- a fast, blurry fall is exactly when this matters most.
+        indices = HIP_LANDMARKS + SHOULDER_LANDMARKS
+        visible_ys = [
+            landmarks[i].y for i in indices
+            if getattr(landmarks[i], "visibility", 1.0) >= _MIN_TORSO_LANDMARK_VISIBILITY
+        ]
+        avg_y = (
+            sum(visible_ys) / len(visible_ys) * h
+            if len(visible_ys) >= _MIN_TORSO_LANDMARKS_FOR_VELOCITY else None
+        )
+
+        velocity = 0.0
+        if avg_y is not None:
+            if self._prev_y is not None and self._prev_t is not None and now > self._prev_t:
+                velocity = (avg_y - self._prev_y) / (now - self._prev_t)
+            self._prev_y = avg_y
+            self._prev_t = now
+
+        # --- entering "pending": two independent ways in, see module docstring.
+        pending_opened_this_frame = False
+        if velocity > self._drop_velocity_threshold * h:
+            self._fall_pending_since = now
+            self._fall_pending_evidence_at = now
+            self._still_since = None
+            self._fall_via_recovery = False
+            self._last_drop_velocity = velocity
+            pending_opened_this_frame = True
+        elif (
+            gap_start is not None
+            and self._fall_pending_since is None
+            and self._last_upright_at is not None
+            and gap_start - self._last_upright_at <= self._upright_recency_s
+            and now - gap_start <= self._pose_recovery_max_gap_s
+            and self._last_posture.label == posture.LYING_DOWN
+        ):
+            # Upright right up until tracking broke, reacquired lying down
+            # shortly after: the fall almost certainly happened inside the
+            # gap we couldn't see. Backdate to when tracking was lost so
+            # duration/confidence reflect the real event, not just the
+            # recovery frame.
+            self._fall_pending_since = gap_start
+            self._fall_pending_evidence_at = now
+            self._still_since = now
+            self._fall_via_recovery = True
+            self._last_drop_velocity = 0.0
+            pending_opened_this_frame = True
+
+        # Seeing the person actually down is the pending state's positive
+        # corroboration, and it is what the backstop timeout below is
+        # measured from.
+        if self._fall_pending_since is not None and self._last_posture.label == posture.LYING_DOWN:
+            self._fall_pending_evidence_at = now
+
+        # A confident return to standing means they caught themselves --
+        # abandon the pending window rather than let it sit around to
+        # possibly confirm against unrelated stillness much later (spurious-
+        # later-alert fix, see module docstring). Only while not yet
+        # CONFIRMED: once an actual fall is active, recovery is handled by
+        # `fall_present` going False below and the engine's own
+        # resolve_after_s, not by ripping the pending state out from under it.
+        #
+        # Two guards, both fixing cases where this branch erased real falls:
+        #   * NEVER in the frame the pending state was opened. There is no
+        #     ordering in which "they dropped at 11x the threshold" and "they
+        #     are standing" can both be evidence about the same instant, and
+        #     without this the cancellation ran in the SAME process() call as
+        #     the drop, erasing the pending window before anything could ever
+        #     confirm against it.
+        #   * The posture reading must be a real full-body observation
+        #     (_STANDING_CANCEL_MIN_CONFIDENCE), not core/posture.py's 0.5
+        #     "lower body not visible" sentinel -- which is exactly what a
+        #     fall behind furniture or along the camera axis produces.
+        if (
+            self._fall_pending_since is not None
+            and not pending_opened_this_frame
+            and self._last_posture.label == posture.STANDING
+            and self._last_posture.confidence >= _STANDING_CANCEL_MIN_CONFIDENCE
+            and not self._fall_engine.is_active("fall")
+        ):
+            self._fall_pending_since = None
+            self._fall_pending_evidence_at = None
+            self._still_since = None
+            self._fall_via_recovery = False
+
+        # Backstop timeout: a pending state that never resolves either way.
+        # Measured from the last frame the person was SEEN DOWN, not as a
+        # wall clock from the drop. Counting wall clock inverted detection
+        # probability against severity: someone who fell and lay still for
+        # 2s was detected, and someone who fell, struggled to get up for ten
+        # seconds and then lost consciousness -- this product's actual use
+        # case, and the worse outcome -- was permanently missed, because the
+        # pending state was thrown away mid-struggle with no re-entry path.
+        # A spike that is never corroborated by an observed lying-down
+        # posture still expires on exactly the old schedule.
+        if (
+            self._fall_pending_since is not None
+            and not self._fall_engine.is_active("fall")
+            and now - (self._fall_pending_evidence_at or self._fall_pending_since)
+            > self._fall_pending_timeout_s
+        ):
+            self._fall_pending_since = None
+            self._fall_pending_evidence_at = None
+            self._still_since = None
+            self._fall_via_recovery = False
+
+        # --- confirmation/resolution: must be pending AND currently still AND
+        # currently observed lying down -- fed through EventEngine every
+        # frame exactly like every other sustained detection in this module,
+        # so persist_s/resolve_after_s/cooldown_s give this the same
+        # anti-spam behavior as zone_violation/unusual_stillness above, and
+        # occlusion_grace_s (not a bespoke sticky flag) is what tolerates a
+        # single noisy posture frame either during the initial confirmation
+        # countdown or while genuinely down -- reusing the SAME mechanism
+        # the rest of this module already relies on for that, rather than a
+        # second, parallel one. Deliberately CURRENT-frame, not "ever seen
+        # lying down while pending": once the person is confirmed down and
+        # then gets back up, THIS frame's posture must be able to say so
+        # immediately, or resolution could never begin.
+        fall_present = False
+        if self._fall_pending_since is not None:
+            is_still = abs(velocity) < self._stillness_velocity_threshold * h
+            is_down = self._last_posture.label == posture.LYING_DOWN
+            if is_still:
+                if self._still_since is None:
+                    self._still_since = now
+            else:
+                self._still_since = None
+            fall_present = is_still and is_down
+            self._fall_confidence = self._compute_fall_confidence(h)
+        else:
+            self._fall_confidence = 0.0
+        fall_transitions = self._fall_engine.update("fall", fall_present, self._fall_confidence, now)
+        events += self._fall_transition_events(fall_transitions)
 
         # Activity from the same landmarks — no extra inference.
         self._last_activity = self._activity.update(landmarks, now=now, aspect=aspect)
         events += self._activity_events(now)
-        indices = HIP_LANDMARKS + SHOULDER_LANDMARKS
-        avg_y = sum(landmarks[i].y for i in indices) / len(indices) * h
-
-        velocity = 0.0
-        if self._prev_y is not None and self._prev_t is not None and now > self._prev_t:
-            velocity = (avg_y - self._prev_y) / (now - self._prev_t)
-
-        if velocity > self._drop_velocity_threshold * h:
-            self._fall_pending_since = now
-            self._still_since = None
-
-        if self._fall_pending_since is not None:
-            if abs(velocity) < self._stillness_velocity_threshold * h:
-                if self._still_since is None:
-                    self._still_since = now
-                elif now - self._still_since >= self._stillness_duration_s and not self._fired_for_current_fall:
-                    events.append(Event.now("fall", now - self._fall_pending_since, 0.8, self.name))
-                    self._fired_for_current_fall = True
-                    self._alert_active = True
-            else:
-                self._still_since = None
-
-        if self._fired_for_current_fall and velocity > self._stillness_velocity_threshold * h * 3:
-            self._fall_pending_since = None
-            self._fired_for_current_fall = False
-            self._alert_active = False
-
-        self._prev_y = avg_y
-        self._prev_t = now
 
         zone_transitions = []
         # Ankle midpoint, not a fabricated box: zones.py's own point-in-polygon
@@ -233,9 +491,16 @@ class FallDetectionModule(VisionModule):
         if self._prev_centroid is not None:
             motion = math.hypot(centroid[0] - self._prev_centroid[0], centroid[1] - self._prev_centroid[1])
         self._prev_centroid = centroid
-        zone_transitions += self._zone_engine.update(
-            "unusual_stillness", motion < self._still_max_motion, 0.8, now
-        )
+        # Observed motion is contradicting evidence, not missing evidence:
+        # it locks the stillness feed False long enough that the engine's
+        # occlusion grace cannot bridge it and the held-time clock genuinely
+        # restarts (see _stillness_motion_lockout_s in __init__).
+        if motion >= self._still_max_motion:
+            self._stillness_locked_until = now + self._stillness_motion_lockout_s
+        elif self._stillness_locked_until is not None and now >= self._stillness_locked_until:
+            self._stillness_locked_until = None
+        still = motion < self._still_max_motion and self._stillness_locked_until is None
+        zone_transitions += self._zone_engine.update("unusual_stillness", still, 0.8, now)
         events += self._zone_transition_events(zone_transitions)
 
         return events
@@ -255,6 +520,48 @@ class FallDetectionModule(VisionModule):
                     f"{base}_resolved", tr.duration_s, tr.confidence, self.name,
                     f"zone={zone_name}" if zone_name else "",
                 ))
+        return events
+
+    def _compute_fall_confidence(self, h: float) -> float:
+        """How strongly the evidence for an in-progress fall supports it.
+
+        Deliberately lower base confidence for a pose-recovery-inferred fall
+        than a directly-measured one: the recovery path never actually saw
+        the drop, only "confidently upright, then untracked, then found lying
+        down" -- strong circumstantial evidence, not a measurement. Posture
+        confidence and how far the measured drop exceeded the configured
+        threshold both nudge it, never dominate it -- this is a supporting
+        detail for get_debug_state/telemetry, not what gates the alert
+        itself (that's the state machine in process()).
+        """
+        base = 0.55 if self._fall_via_recovery else 0.65
+        if not self._fall_via_recovery and self._drop_velocity_threshold > 0:
+            excess = max(0.0, (self._last_drop_velocity / (self._drop_velocity_threshold * h)) - 1.0)
+            base += min(0.2, excess * 0.15)
+        posture_confidence = self._last_posture.confidence if self._last_posture else 0.0
+        base += 0.15 * posture_confidence
+        return round(min(0.99, base), 3)
+
+    def _fall_transition_events(self, transitions: list) -> list[Event]:
+        """CONFIRMED/RESOLVED -> Events for the fall engine specifically (kept
+        separate from _zone_transition_events: "fall" isn't a `label:name`
+        keyed detection, and RESOLVED here also clears the state-machine
+        fields so a future, independent fall can be detected from scratch)."""
+        events: list[Event] = []
+        for tr in transitions:
+            if tr.state == CONFIRMED:
+                trigger = "tracking-loss recovery" if self._fall_via_recovery else "measured rapid drop"
+                posture_label = self._last_posture.label if self._last_posture else "unknown"
+                events.append(Event.now(
+                    "fall", tr.duration_s, tr.confidence, self.name,
+                    f"trigger={trigger} posture={posture_label}",
+                ))
+            elif tr.state == RESOLVED:
+                events.append(Event.now("fall_resolved", tr.duration_s, tr.confidence, self.name))
+                self._fall_pending_since = None
+                self._fall_pending_evidence_at = None
+                self._still_since = None
+                self._fall_via_recovery = False
         return events
 
     def _activity_events(self, now: float) -> list[Event]:
@@ -338,7 +645,53 @@ class FallDetectionModule(VisionModule):
 
     def is_alert_active(self) -> bool:
         """True while a fall, a zone violation, or unusual stillness is confirmed."""
-        return self._alert_active or bool(self._zone_engine.active_detections())
+        return self._fall_engine.is_active("fall") or bool(self._zone_engine.active_detections())
+
+    def get_telemetry_snapshot(self) -> Optional[dict]:
+        """Raw per-frame fall-relevant signals, for the CSV telemetry stream
+        (core/telemetry.py gives every module its own sibling file keyed off
+        this dict's fields -- see that module's docstring)."""
+        return {
+            "person_detected": self._last_posture is not None,
+            "posture": self._last_posture.label if self._last_posture else "unknown",
+            "posture_confidence": round(self._last_posture.confidence, 3) if self._last_posture else 0.0,
+            "hip_y": round(self._last_hip_y, 3) if self._last_hip_y is not None else None,
+            "fall_pending": self._fall_pending_since is not None,
+            "fall_active": self._fall_engine.is_active("fall"),
+            "fall_confidence": round(self._fall_confidence, 3),
+        }
+
+    def get_debug_state(self) -> Optional[dict]:
+        """Full, human-readable breakdown of the fall state machine: current
+        posture, how long ago the subject was last confidently upright,
+        whether a fall is pending and via which trigger, how long they've
+        been still, and the resulting confidence -- developer/debug use only
+        (main.py --debug), same contract as baby_monitoring.py's
+        get_debug_state (never sent to the cloud or a notification)."""
+        now = time.monotonic()
+        if self._fall_pending_since is None:
+            trigger = "none"
+        elif self._fall_via_recovery:
+            trigger = "tracking_loss_recovery"
+        else:
+            trigger = "measured_rapid_drop"
+        active = list(self._zone_engine.active_detections())
+        if self._fall_engine.is_active("fall"):
+            active.append("fall")
+        return {
+            "posture": self._last_posture.label if self._last_posture else "unknown",
+            "posture_confidence": round(self._last_posture.confidence, 3) if self._last_posture else 0.0,
+            "torso_angle_deg": self._last_posture.torso_angle_deg if self._last_posture else None,
+            "seconds_since_last_upright": (
+                round(now - self._last_upright_at, 2) if self._last_upright_at is not None else None
+            ),
+            "fall_pending": self._fall_pending_since is not None,
+            "fall_trigger": trigger,
+            "seconds_still": round(now - self._still_since, 2) if self._still_since is not None else None,
+            "fall_confidence": round(self._fall_confidence, 3),
+            "fall_state": self._fall_engine.state_of("fall"),
+            "active_alerts": sorted(active),
+        }
 
     def close(self) -> None:
         """Release the MediaPipe Pose graph (leaked per preset/mode switch otherwise --

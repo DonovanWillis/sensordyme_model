@@ -1,0 +1,169 @@
+// Pyright configuration for SensorDyme.
+//
+// (pyright parses this file as JSONC, so these // comments are legal here even
+// though the extension is .json.)
+//
+// WHY THIS FILE EXISTS
+// --------------------
+// Without it, pyright ran against the SYSTEM python, so numpy, cv2, mediapipe,
+// pytest, fastapi and friends resolved to nothing: 160 of the 596 errors were
+// "import could not be resolved" for packages that ARE installed, and hundreds
+// more were downstream fallout (every attribute on an Unknown module). Pointing
+// pyright at .venv, teaching it the flat layout, and stubbing the modules that
+// genuinely only exist on a Raspberry Pi takes that to 15 errors — every one of
+// which is a real, specific finding in this repo (a missing `import threading`
+// in core/network.py, three possibly-unbound `batch` uses in core/uplink.py, ...).
+//
+// Type checking stays at "basic". Large parts of this codebase are unannotated;
+// "strict" would report thousands of missing-annotation errors and drown the
+// real ones. Tighten per-directory via executionEnvironments as code gets typed.
+{
+  "venvPath": ".",
+  "venv": ".venv",
+
+  // This project uses a FLAT layout: there is no package root, and core/,
+  // modules/, services/, cloud/ and jupiter/ are imported by name from the repo
+  // root. Tests do this explicitly (tests/conftest.py inserts the repo root on
+  // sys.path) and main.py relies on being run from here. Without "." on
+  // extraPaths, pyright cannot resolve `from core.presets import ...` inside
+  // tests/, nor anything outside cloud/ from within the cloud/ execution
+  // environment.
+  // scripts/ is on the list because tests/test_dataset.py imports export_dataset
+  // from there (it does `sys.path.insert(0, "scripts")` at call time).
+  "extraPaths": [".", "scripts"],
+
+  // requirements.txt: "Python 3.11+ required (mediapipe does not yet support
+  // 3.13+)". The Pi ships 3.11; the dev venv is 3.12. Check against the floor.
+  "pythonVersion": "3.11",
+  "pythonPlatform": "Darwin",
+
+  "include": [
+    "core",
+    "modules",
+    "services",
+    "cloud",
+    "hardware",
+    "jupiter",
+    "scripts",
+    "benchmarks",
+    "tests",
+    "main.py"
+  ],
+
+  // third_party/DashSentinel is vendored verbatim at commit 3874e05b so its
+  // results stay comparable; it also uses `src.*` imports that only resolve
+  // when run from inside its own directory. Type errors there are not ours to
+  // fix. modules/driver_attention_dashsentinel.py, which imports it, IS checked.
+  "exclude": [
+    "**/__pycache__",
+    "**/node_modules",
+    ".venv",
+    "data",
+    "site",
+    "ios",
+    "third_party"
+  ],
+
+  "typeCheckingMode": "basic",
+
+  // Files whose diagnostics are suppressed entirely.
+  //
+  // The three driver_attention_* comparison modules reproduce openpilot v0.9.7,
+  // erlendskinnemoen's FaceMesh DMS and DashSentinel VERBATIM (see each file's
+  // docstring). Their quirks are the thing being measured, so a type error
+  // there is a finding about the original author's code, not about this repo.
+  // They are still LINTED for correctness (see ruff.toml) — only pyright's type
+  // diagnostics are off.
+  //
+  // hardware/enclosure needs cadquery/trimesh, a CAD toolchain nobody installs
+  // in order to run the detector.
+  "ignore": [
+    "modules/driver_attention_openpilot.py",
+    "modules/driver_attention_skinnemoen.py",
+    "modules/driver_attention_dashsentinel.py",
+    "hardware/enclosure"
+  ],
+
+  // typings/ holds hand-written .pyi stubs for modules that genuinely do not
+  // exist on a Mac: they are Raspberry Pi OS system packages (picamera2 and
+  // libcamera ship as apt python3-* packages; dbus/gi come from the system
+  // GObject bindings; gpiozero and hailo_platform are Pi-only). Every import of
+  // them in this codebase is already inside a try/except ImportError with a CPU
+  // or stub fallback — see core/camera.py, core/accel.py, core/alerts.py,
+  // services/ble_gatt.py. Without stubs pyright reported 14 errors that nobody
+  // on a Mac can ever fix.
+  //
+  // The stubs are deliberately Any-typed. They exist to make the import
+  // resolve, NOT to type-check the Pi paths; pretending to know those APIs
+  // would produce confidently wrong errors. Pi paths are verified by running on
+  // the device (docs/TESTING.md).
+  "stubPath": "typings",
+
+  // "stub found but source not installed" — exactly what the typings/ stubs
+  // above produce by design, plus packages shipping types-* stubs separately.
+  "reportMissingModuleSource": "warning",
+
+  // ---- kept as ERRORS: each of these means "this will raise at runtime" ----
+  "reportMissingImports": "error",
+  "reportUndefinedVariable": "error",
+  "reportPossiblyUnboundVariable": "error",
+  "reportSelfClsParameterName": "error",
+  "reportUnusedExpression": "error",
+  "reportUnboundVariable": "error",
+  "reportUnsupportedDunderAll": "error",
+  "reportAssertAlwaysTrue": "error",
+  "reportUnusedCoroutine": "error",
+  // Measured: these four total 6 findings across the whole repo and every one is
+  // a genuine "this raises at runtime" (iterating a None result in
+  // benchmarks/accuracy_state_farm.py, calling a None callback in
+  // services/ble_gatt.py, returning the wrong shape from core/detectors.py).
+  // Cheap to keep strict, so they stay errors rather than joining the softened
+  // block below.
+  "reportOptionalIterable": "error",
+  "reportOptionalCall": "error",
+  "reportGeneralTypeIssues": "error",
+  "reportReturnType": "error",
+
+  // ---- softened to WARNING -------------------------------------------------
+  // These account for the bulk of the remaining diagnostics and are dominated
+  // by test code reaching into Optional results and duck-typed fakes (e.g.
+  // `module.detector.frames[0]` where detector is Optional[Detector]) and by
+  // numpy/opencv/mediapipe signatures that are loosely typed upstream. They stay
+  // visible in `make typecheck` output but do not fail the gate, so the gate
+  // means "something here will actually break" rather than "there is red". As
+  // an area gets annotated, promote it in executionEnvironments below.
+  "reportOptionalMemberAccess": "warning",
+  "reportOptionalSubscript": "warning",
+  "reportOptionalOperand": "warning",
+  "reportAttributeAccessIssue": "warning",
+  "reportArgumentType": "warning",
+  "reportIndexIssue": "warning",
+  "reportCallIssue": "warning",
+  "reportOperatorIssue": "warning",
+  "reportRedeclaration": "warning",
+  "reportIncompatibleMethodOverride": "warning",
+
+  // Unused imports and variables are ruff's job (F401 / F841). Reporting them
+  // in two tools means fixing the same thing twice and disagreeing about it.
+  "reportUnusedImport": "none",
+  "reportUnusedVariable": "none",
+
+  "executionEnvironments": [
+    {
+      // cloud/ is the FastAPI backend holding real accounts, device keys and
+      // claim codes. It is small (6 files), largely annotated, and the code
+      // most worth catching a type error in — so the softened rules above are
+      // promoted back to errors here. pythonPlatform is Linux because it
+      // deploys to a VPS, not to this Mac.
+      "root": "cloud",
+      "extraPaths": ["."],
+      "pythonPlatform": "Linux",
+      "reportOptionalMemberAccess": "error",
+      "reportOptionalSubscript": "error",
+      "reportOptionalOperand": "error",
+      "reportOptionalIterable": "error",
+      "reportOptionalCall": "error",
+      "reportIndexIssue": "error"
+    }
+  ]
+}

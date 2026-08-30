@@ -266,10 +266,23 @@ modules:
     # off-center glance (at a passenger, the console, ...)
     mirror_check_yaw_deg: 55 # |calibrated yaw| beyond THIS = a wide-angle turn shaped like a
     # rearview/side-mirror or blind-spot check, not an ordinary glance -- gets more patience
-    # (rearview_tolerance_seconds) rather than distraction_seconds. Reverts to distraction_seconds
-    # immediately if the yaw ever drops back to merely off-center partway through a turn, so a
-    # turn that gets LESS mirror-check-shaped over time is never slower to fire than today's flat
-    # threshold was -- see CorroboratedGraceTracker.
+    # (rearview_tolerance_seconds) rather than distraction_seconds. This applies to any episode
+    # whose yaw REACHES mirror_check_yaw_deg at any point -- the return sweep back through a
+    # smaller angle is part of the same maneuver, not evidence it was never one.
+    #
+    # CORRECTED 2026-08-29. The old comment claimed the opposite ("reverts to distraction_seconds
+    # immediately if the yaw ever drops back to merely off-center"), and that behaviour is what
+    # made this setting DEAD: CorroboratedGraceTracker latched corroboration from an episode's
+    # FIRST frame, and an episode necessarily opens at yaw_threshold_deg (35), which is below
+    # mirror_check_yaw_deg (55) -- a head passes through 35 on its way to 70. So the first frame
+    # always latched "not a mirror check" and rearview_tolerance_seconds could never apply to any
+    # real head turn in any configuration. Measured before the fix: a 0->70 degree sweep held at
+    # 70 fired distraction at 3.45s (the SHORT threshold) with corroborated=False on every frame.
+    # modules/driver_attention.py now uses PeakCorroboratedGraceTracker for distraction, which
+    # accumulates corroboration within an episode (and resets between them, so a wide turn never
+    # lends its patience to the ordinary glance that follows it). face_lost deliberately KEEPS the original
+    # revert-on-dropout semantics -- a body that stops being detected is a situation getting
+    # worse, which is not the same shape of evidence as a yaw returning through 40 degrees.
     rearview_tolerance_seconds: 5.0 # sustained duration allowed for a wide-angle (mirror_check_yaw_deg+)
     # turn before it counts as "distraction" -- a real mirror/blind-spot check, even a thorough one
     # covering rearview + both mirrors + a shoulder check, is expected to be under this
@@ -290,7 +303,29 @@ modules:
     # the driver could be holding, via YOLO11-nano run every Nth frame ---
     yolo_weights: yolo11n.pt # shared with occupancy.py via core/detectors.py (loaded once, cached)
     yolo_every_n_frames: 3 # run YOLO (+ hands) on 1 out of every N frames; Face Mesh still runs every frame
-    yolo_confidence_threshold: 0.35 # minimum YOLO detection confidence to count -- phones are small/thin, keep this forgiving
+    yolo_confidence_threshold: 0.10 # minimum YOLO detection confidence to count.
+    # LOWERED from 0.35 (2026-08-29), from measurement rather than intuition. Scored on
+    # the State Farm val split (subject-disjoint, 400 phone-present / 200 phone-absent
+    # frames) with `python benchmarks/accuracy_state_farm.py`:
+    #     conf   phone recall   precision
+    #     0.35        10.8%       100.0%   <- the old value: missed ~9 phones in 10
+    #     0.10        51.7%        95.8%   <- here
+    #     0.05        67.8%        93.5%   (best F1, but see below)
+    # Re-run that command after ANY change here; it writes a JSON baseline and has a
+    # --compare mode that fails on regression.
+    #
+    # Why 0.10 and not the best-F1 0.05: per-frame false positives are NOT all absorbed
+    # downstream. `phone_use` is protected (it needs phone_visible AND eyes_off_road
+    # sustained for phone_use_seconds), but `phone_detected` fires on the RISING EDGE of
+    # visibility with no sustain gate, and phone_risk feeds RiskFusion on mere
+    # visibility. Both scale directly with per-frame FPs, so the extra 16 points of
+    # recall at 0.05 is not free.
+    #
+    # NOTE this threshold gates EVERY class in the same YOLO pass, not just phones --
+    # including the COCO person class used to corroborate face-loss (more detections =
+    # more patience before attention_lost, the safer direction) and the food/drink
+    # classes (whose false positives are now spatially gated to the driver's upper
+    # region in modules/driver_attention.py, so a bottle in a footwell fires nothing).
     yolo_classes: # COCO class name -> event type this module emits when that class appears
       cell phone: phone_detected
       cup: eating_drinking
@@ -414,7 +449,14 @@ modules:
     still_warning_s: 120 # unusually-still warning after this many seconds of low motion
     still_max_motion: 0.015 # motion-energy floor below which the subject counts as "still"
     absence_warning_s: 30 # person_absent confirms after this long (only if expect_presence)
-    expect_presence: false # true = alert when nobody is visible (e.g. nap monitoring)
+    expect_presence: true # true = alert when nobody is visible (e.g. nap monitoring)
+    # CHANGED from false (2026-08-29). person_absent is only REGISTERED as a rule when
+    # this is true, so with it off the default and play_area presets said NOTHING when
+    # the baby stopped being detected at all -- measured: 10 minutes of no detection
+    # produced zero alertable events. A baby covered by a blanket, face-down in bedding,
+    # or rolled where the detector loses the small low-contrast box is exactly the case
+    # that must not be silent. Only the nap_time preset variant enabled it before.
+    # Setting this explicitly to false still opts out (there is a test for that).
     zone_confirm_s: 2.0
     # Safe zone = where the child should stay (crib/play area): leaving it alerts.
     # Restricted zones = user-drawn danger areas (stairs/pool/stove): entering alerts.
@@ -482,7 +524,10 @@ modules:
     # unchanged for any other future caller (see core/hand_perception.py's module docstring).
     flailing_confirm_s: 0.5 # continuous flailing state (already smoothed by the
     # rolling window itself) required before "flailing" confirms
-    flailing_cooldown_s: 5.0 # re-confirmation suppression after flailing resolves --
+    flailing_resolve_after_s: 3.0 # absence of flailing needed to resolve an active
+    # episode -- widened from 1.5s so a brief lull inside one real episode doesn't
+    # resolve+reconfirm (and re-notify) for what is a single ongoing event
+    flailing_cooldown_s: 8.0 # re-confirmation suppression after flailing resolves --
     # short on purpose: repeated episodes (calm, flail again) should each be reported
     # flail_min_peak_speed: 1.6 # torso-lengths/s, peak wrist speed -- uncomment to override
     # flail_min_peak_accel: 6.0 # torso-lengths/s^2, peak wrist acceleration
@@ -495,16 +540,62 @@ modules:
     # use) -- see modules/baby_monitoring.py's _assess_choking_hazard for the
     # full risk model (held + small-relative-to-hand + closing distance +
     # trajectory, multiplied together, never a single-frame trigger).
-    choking_hazard_risk_threshold: 0.4 # minimum combined risk score (0-1) before this
-    # even starts counting toward confirmation -- see the risk formula above
-    choking_hazard_confirm_s: 0.4 # continuous risk >= threshold required before it
-    # confirms -- short (this is meant to interrupt immediately), but never single-frame
+    choking_hazard_risk_threshold: 0.30 # minimum combined risk score (0-1) before this
+    # even starts counting toward confirmation -- see the risk formula above.
+    #
+    # LOWERED from 0.4 (2026-08-29). The previous value was ABOVE the physical ceiling
+    # of the signal, so this critical alert could not fire in any deployment. The
+    # arithmetic: risk = association * size * proximity * trajectory, and every factor
+    # after the first is <= 1.0, so risk can never exceed the association score -- and
+    # hand_association_threshold's own comment below records that hardware testing
+    # measured a genuine held object near the face at ~0.38 association. Measured by
+    # execution: the best case (small object, held, at the mouth, actively closing)
+    # scores 0.380; a genuine hazard still ~0.1 baby-diagonals out scores 0.348; the
+    # strongest FALSE-evidence case (high association, motionless at the mouth, no
+    # observed trajectory) scores 0.212. 0.30 sits between them.
+    #
+    # The old comment here reasoned carefully about not raising this value while a
+    # SECOND, invisible gate already sat above it: the rule's RuleSpec did not set
+    # min_confidence, so it inherited EventEngine's default of 0.50, and the risk
+    # score is passed AS that confidence. The effective gate was 0.50 against a 0.38
+    # ceiling. modules/baby_monitoring.py now sets min_confidence explicitly -- if you
+    # retune this value, check that one too or you will be tuning the wrong number.
+    choking_hazard_confirm_s: 0.8 # continuous risk >= threshold required before it
+    # confirms -- widened from 0.4s/3 frames (still short enough to interrupt promptly)
+    # so a one-off jittery frame can't confirm; see modules/baby_monitoring.py's
+    # trajectory_factor tightening for the other half of this precision pass
     choking_hazard_cooldown_s: 6.0 # re-confirmation suppression after it resolves
 
   fall_detection:
     drop_velocity_threshold: 0.6 # fraction of frame-height/sec that counts as a "rapid drop"
-    stillness_duration_s: 1.5 # seconds of stillness after a drop before a fall event fires
+    stillness_duration_s: 1.5 # seconds of stillness after a drop before a fall event fires --
+    # ALSO the fall EventEngine rule's persist_s (see modules/fall_detection.py), so a preset
+    # variant that overrides this (presets.yaml's post_surgery/active_senior) tunes both together
     stillness_velocity_threshold: 0.02 # fraction of frame-height/sec considered "still"
+    # --- fall state-machine tuning: see modules/fall_detection.py's module docstring for
+    # the two failure modes (missed falls, spurious later false positives) these exist to fix.
+    fall_pose_recovery_max_gap_s: 2.5 # a total pose-tracking dropout (motion blur/extreme pose
+    # during the violent part of a real fall) reacquired as lying-down within this long still
+    # counts as a fall, even though the drop itself was never directly measured
+    fall_upright_recency_s: 0.5 # the person must have read as confidently upright THIS
+    # recently before tracking was lost for the recovery path above to apply -- excludes
+    # "was already down, camera glitched" from ever looking like a fall
+    fall_pending_timeout_s: 6.0 # abandon a pending fall that never resolves either way
+    # (never confirms, never clearly returns to standing) so a stale pending flag can't
+    # confirm against unrelated stillness much later
+    fall_resolve_after_s: 4.0 # must be seen NOT lying down for this long before a confirmed
+    # fall clears -- generous on purpose: a brief sit-up-then-back-down after a real fall
+    # must not clear the alert
+    fall_cooldown_s: 0.0 # re-confirmation suppression after a fall resolves.
+    # SET TO ZERO from 20.0 (2026-08-29). EventEngine's cooldown gate returns BEFORE a
+    # track is created, so a second fall inside the window never entered the lifecycle
+    # at all -- no event, no alert, no log row. Measured: fall #1 alerts, an identical
+    # real fall ~6s later produces []. Repeat falls in quick succession (syncope, a
+    # failed attempt to stand) are the clinically most alarming pattern and were being
+    # reported as one. A fall is not detector jitter, so it gets no cooldown:
+    # resolve_after_s below is sufficient anti-spam, because re-confirming requires
+    # being observed lying down AND still for stillness_duration_s, which jitter cannot
+    # fake. Cooldowns remain appropriate for chattier detections (zone_violation etc).
     # Optional elderly-mode zones -- same shape as occupancy's/baby's, tested
     # against the ankle midpoint instead of a box (see core/zones.py).
     #   restricted/boundary: feet inside -> zone_violation (sustained)

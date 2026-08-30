@@ -24,6 +24,7 @@ import hashlib
 import json
 import logging
 import os
+import re
 import secrets
 import sqlite3
 import time
@@ -35,7 +36,7 @@ import jwt
 from cloud import mdns
 from cloud.notify import COOLDOWN_S as NOTIFY_COOLDOWN_S, gate
 from cloud.ratelimit import CLAIM_LIMITER, LOGIN_LIMITER, SIGNUP_LIMITER
-from core.presets import resolve_preset, same_preset
+from core.presets import load_presets, resolve_preset, same_preset
 from fastapi import BackgroundTasks, Depends, FastAPI, Header, HTTPException, Request
 from pydantic import BaseModel
 
@@ -220,11 +221,30 @@ def init_db() -> None:
             # text ("remained down for 34 seconds") instead of a bare type
             # name. NULL for events from firmware that predates this field.
             "ALTER TABLE events ADD COLUMN duration REAL",
+            # The proposal the user is LOOKING AT, which is not the same thing
+            # as the proposal they asked to run. /v1/ai/configure is called by
+            # AIConfigureView's `configure()` — the preview, before the person
+            # has seen a word of the result, let alone tapped Activate — and
+            # it used to write straight to `ai_rules`. On a device already in
+            # AI Custom that is the column the ingest handler delivers from,
+            # so merely previewing a new idea rewrote the running
+            # configuration: the very next 2-second poll shipped, committed
+            # and persisted rules nobody had accepted, and hot-swapped the
+            # detection module underneath a live camera. Previews land here;
+            # only set_preset (Activate) promotes a draft into `ai_rules`.
+            "ALTER TABLE devices ADD COLUMN ai_rules_draft TEXT",
         ):
             try:
                 conn.execute(statement)
-            except sqlite3.OperationalError:
-                pass  # column already exists
+            except sqlite3.OperationalError as exc:
+                # ONLY the expected "this database already has that column".
+                # Catching every OperationalError here meant a genuinely
+                # broken migration — a typo'd statement, a missing table, a
+                # locked database — started the server anyway, in a schema
+                # nobody had checked, and surfaced later as a confusing
+                # runtime error a long way from the cause.
+                if "duplicate column name" not in str(exc).lower():
+                    raise
 
         # Must run AFTER the ALTER TABLE above: event_key does not exist yet
         # on a database that predates it, and CREATE INDEX on a column that
@@ -265,24 +285,74 @@ def current_token(authorization: str = Header(default="")) -> dict:
     if not authorization.startswith("Bearer "):
         raise HTTPException(401, "missing bearer token")
     try:
-        payload = jwt.decode(authorization[7:], JWT_SECRET, algorithms=["HS256"])
+        # Every claim this file goes on to rely on is required HERE, where a
+        # missing one is a MissingRequiredClaimError — a PyJWTError, caught
+        # below, answered with 401. Read off the payload later instead and a
+        # validly-signed token with unexpected claims reaches raw dict access
+        # on the hot auth path and comes back as a 500: an unhandled server
+        # error for what is simply a token this server will not accept.
+        #
+        # `exp` is the one that matters most. PyJWT only enforces an
+        # expiry that is PRESENT, so a token minted without one was accepted
+        # for ever — a 30-day TTL that silently did not apply, and a session
+        # nothing could age out. Requiring it makes the TTL real.
+        #
+        # `jti` is required too. THIS DELIBERATELY REVERSES an earlier
+        # decision — do not "restore" it. The code here used to read the jti
+        # off the payload with .get() and skip the revocation check when it
+        # was absent, carrying the comment: "Tokens issued before revocation
+        # existed have no jti — they simply cannot be revoked early and ride
+        # out their remaining TTL, the same behavior every token had before
+        # this. Never a reason to reject one."
+        #
+        # That reasoning treated "cannot be revoked" as a harmless property
+        # of old tokens. It is not harmless: it is a token for which "sign
+        # out" is cosmetic. The phone clears its local copy and reports
+        # success while the credential stays valid anywhere else it exists —
+        # another device, a log, an interception — until its own expiry. A
+        # security property people rely on and that silently does not apply
+        # is worse than one that is plainly absent, because nobody knows to
+        # compensate for it.
+        #
+        # The cost is bounded and one-time: every token this backend issues
+        # has carried a jti since revocation was added, so the only tokens
+        # refused are older than that, and their owners sign in once more.
+        # Reconsider only if that population ever becomes large enough that
+        # a forced re-login is worse than an unrevokable session — which is
+        # the trade, stated plainly, rather than the absolute the old
+        # comment implied.
+        payload = jwt.decode(
+            authorization[7:], JWT_SECRET, algorithms=["HS256"],
+            options={"require": ["exp", "uid", "jti"]},
+        )
     except jwt.PyJWTError as exc:
         raise HTTPException(401, f"invalid token: {exc}") from exc
-    jti = payload.get("jti")
-    # Tokens issued before revocation existed have no jti — they simply
-    # cannot be revoked early and ride out their remaining TTL, the same
-    # behavior every token had before this. Never a reason to reject one.
-    if jti is not None:
-        with db() as conn:
-            revoked = conn.execute("SELECT 1 FROM revoked_tokens WHERE jti = ?", (jti,)).fetchone()
-        if revoked is not None:
-            raise HTTPException(401, "this session has been signed out")
+    with db() as conn:
+        revoked = conn.execute(
+            "SELECT 1 FROM revoked_tokens WHERE jti = ?", (payload["jti"],)
+        ).fetchone()
+    if revoked is not None:
+        raise HTTPException(401, "this session has been signed out")
     return payload
 
 
 def current_user(payload: dict = Depends(current_token)) -> int:
-    """FastAPI dependency: resolve the JWT bearer token to a user id."""
-    return int(payload["uid"])
+    """FastAPI dependency: resolve the JWT bearer token to a user id.
+
+    The type check is not defensive noise. `uid` is required by
+    `current_token`, so it is always present — but a validly-signed token
+    whose `uid` is a string, a list or null used to reach `int(...)` and
+    raise ValueError/TypeError out of a dependency, which FastAPI turns into
+    a 500. A token this server will not accept is a 401; a 500 says the
+    server broke, which sends the app's Connection doctor looking for an
+    outage that isn't there.
+    """
+    uid = payload["uid"]
+    # Not `isinstance(uid, int)` alone: bool is a subclass of int, and
+    # `True` would otherwise authenticate as user 1.
+    if type(uid) is not int:  # noqa: E721 - bool must not pass as an int here
+        raise HTTPException(401, "invalid token: uid claim is not a user id")
+    return uid
 
 
 _HEALTH_STALE_S = 30  # matches the `online` window
@@ -356,18 +426,51 @@ def _send_with_retry(send_once) -> None:
     with a short backoff. Re-raises the LAST failure rather than swallowing
     it — retrying is not the same as succeeding, and a caller that can't tell
     the difference logs a delivery that never actually happened.
+
+    UnicodeEncodeError is excluded from the retry, deliberately. Retrying is
+    for a provider that MIGHT answer differently a second later; an encoding
+    error is decided entirely by the bytes we are holding, so the second and
+    third attempts are guaranteed to fail identically. That is not free: this
+    runs on a FastAPI threadpool worker, and three attempts with the backoff
+    below occupy one for ~4.5 seconds to reach a conclusion that was already
+    available at attempt one. It still raises — the caller must never be told
+    a notification was delivered — it just stops pretending the failure is
+    transient.
     """
     last_exc: Optional[Exception] = None
     for attempt in range(NOTIFY_SEND_ATTEMPTS):
         try:
             send_once()
             return
+        except UnicodeEncodeError:
+            raise
         except Exception as exc:  # noqa: BLE001 - genuinely any provider failure is retryable here
             last_exc = exc
             if attempt < NOTIFY_SEND_ATTEMPTS - 1:
                 time.sleep(NOTIFY_RETRY_BACKOFF_S * (attempt + 1))
     assert last_exc is not None
     raise last_exc
+
+
+def _header_value(text: str) -> str:
+    """A header-safe carrier for a title that contains non-ASCII characters.
+
+    Every entry in `_EVENT_TITLES` opens with an emoji, and an HTTP header
+    value is latin-1 by the spec urllib3 enforces — so `headers={"Title":
+    "🔴 Potential Fall Detected"}` raised UnicodeEncodeError *before the
+    request left the process*. The effect was exactly inverted delivery:
+    every recognised safety event (fall, drowsiness, zone violation — the 22
+    types this backend has copy for) failed to send, while an UNRECOGNISED
+    type, whose title comes from `_readable_title`'s plain-ASCII fallback,
+    was the only kind that got through.
+
+    ntfy's documented convention for this is to send the UTF-8 bytes in the
+    header and let the server decode them as UTF-8. Encoding to UTF-8 and
+    decoding back as latin-1 produces a str whose code points are exactly
+    those bytes, which is what urllib3 then puts on the wire unchanged.
+    ASCII titles are unaffected: their UTF-8 bytes are themselves.
+    """
+    return text.encode("utf-8").decode("latin-1")
 
 
 def send_push(user_row: sqlite3.Row, title: str, body: str) -> None:
@@ -387,7 +490,12 @@ def send_push(user_row: sqlite3.Row, title: str, body: str) -> None:
     import requests
 
     def once() -> None:
-        resp = requests.post(f"{NTFY_BASE}/{topic}", data=body.encode(), headers={"Title": title}, timeout=5)
+        resp = requests.post(
+            f"{NTFY_BASE}/{topic}",
+            data=body.encode(),
+            headers={"Title": _header_value(title)},
+            timeout=5,
+        )
         resp.raise_for_status()
 
     _send_with_retry(once)
@@ -659,10 +767,29 @@ def logout(payload: dict = Depends(current_token)) -> dict:
     return {"ok": True}
 
 
+#: What ntfy itself accepts as a topic name, and nothing else.
+#
+# The topic IS the credential: ntfy has no accounts, so anyone who knows the
+# string receives that account's alerts. It was stored after nothing but a
+# .strip() and then interpolated into `f"{NTFY_BASE}/{topic}"`, so the value
+# chose the whole path — "../../anything", a query string, a second path
+# segment. That is a request this backend never intended to make, aimed
+# wherever the topic said, carrying whatever a safety alert says.
+_NTFY_TOPIC_RE = re.compile(r"^[A-Za-z0-9_-]{1,64}$")
+
+
 @app.post("/v1/account/ntfy")
 def set_ntfy(body: NtfyBody, uid: int = Depends(current_user)):
+    topic = body.ntfy_topic.strip()
+    # Empty is how the app turns push off, and stays allowed: send_push
+    # returns early on a falsy topic.
+    if topic and not _NTFY_TOPIC_RE.match(topic):
+        raise HTTPException(
+            400,
+            "ntfy topic may only contain letters, numbers, - and _ (max 64 characters)",
+        )
     with db() as conn:
-        conn.execute("UPDATE users SET ntfy_topic = ? WHERE id = ?", (body.ntfy_topic.strip(), uid))
+        conn.execute("UPDATE users SET ntfy_topic = ? WHERE id = ?", (topic, uid))
     return {"ok": True}
 
 
@@ -789,6 +916,31 @@ def set_preset(device_id: int, body: PresetBody, uid: int = Depends(current_user
             "UPDATE devices SET desired_preset = ?, custom_monitoring_wanted = ? WHERE id = ?",
             (normalized, 1 if normalized == "" else 0, device_id),
         )
+        # This endpoint is the ONLY act of acceptance anywhere in the flow, so
+        # it is where a previewed proposal (see /v1/ai/configure, which now
+        # only ever writes a draft) becomes the one the device actually runs.
+        #
+        # Promotion is limited to the AI Custom request. preset == "" is what
+        # AIConfigureView's Activate sends for a genuinely custom proposal,
+        # and — being the only request that sets custom_monitoring_wanted — the
+        # only one that turns rule delivery on at all. A named preset leaves
+        # the draft where it is rather than promoting or discarding it, which
+        # is the pre-existing contract for `ai_rules`: a configuration is kept
+        # across a mode switch so that coming back to Configure-with-AI still
+        # shows what was last configured, and delivery is gated on
+        # custom_monitoring_wanted rather than on the column being empty.
+        #
+        # The draft is consumed on promotion, so a second Activate has nothing
+        # left to re-promote and `ai_rules` stays the record of what is running.
+        if normalized == "":
+            draft = conn.execute(
+                "SELECT ai_rules_draft FROM devices WHERE id = ?", (device_id,)
+            ).fetchone()["ai_rules_draft"]
+            if draft:
+                conn.execute(
+                    "UPDATE devices SET ai_rules = ?, ai_rules_draft = NULL WHERE id = ?",
+                    (draft, device_id),
+                )
     return {"ok": True, "desired_preset": normalized}
 
 
@@ -866,10 +1018,48 @@ def set_zones(device_id: int, body: ZonesBody, uid: int = Depends(current_user))
 # Without an ANTHROPIC_API_KEY the deterministic keyword fallback still returns
 # valid (if less nuanced) configurations, so the demo never dies with the network.
 
-_MODES = (
-    "driver_distraction", "driver_distraction_openpilot", "baby_monitoring",
-    "elderly_monitoring", "security_monitoring",
-)
+def _modes() -> tuple[str, ...]:
+    """The whole-scenario modes a proposal is allowed to name.
+
+    Read from presets.yaml, never written out here. The hardcoded tuple this
+    replaces had drifted to the point of being wrong in both directions: it
+    still listed `driver_distraction` and `driver_distraction_openpilot`,
+    which were consolidated into one mode and now exist only as aliases, and
+    it did not list `driver_safety`, which is the mode that actually exists.
+
+    Both halves of that mattered, because this list does two jobs at once. It
+    is the enum in the structured-output schema, so the model could not emit
+    `driver_safety` at all; and it is the server-side filter
+    (`preset if preset in _MODES else ""`), so a model that emitted it anyway
+    was silently downgraded to "no preset". Meanwhile `_ai_fallback` returned
+    the superseded alias, which the iOS app's `Preset.catalog` has no entry
+    for, so the mode picker rendered the raw string `driver_distraction` at
+    the user.
+
+    Deriving it means the list cannot drift from presets.yaml again.
+    Superseded names still resolve (see `_resolve_mode`), so a proposal that
+    names one is corrected rather than thrown away.
+    """
+    return tuple(load_presets())
+
+
+def _resolve_mode(preset: object) -> str:
+    """A proposal's `preset` as a mode that exists, or "" for none.
+
+    Aliases are resolved rather than rejected: a model trained on, or a
+    prompt quoting, a superseded name means the mode the name now refers to,
+    and answering "" would silently discard a correct request.
+    """
+    name = str(preset or "").strip()
+    if not name:
+        return ""
+    resolved = resolve_preset(name)
+    return resolved if resolved in _modes() else ""
+
+
+#: Snapshot for the schema and prompt strings built at import time. The
+#: functions above stay the authority for anything evaluated per request.
+_MODES = _modes()
 
 _RULE_SCHEMA = {
     "type": "object",
@@ -1081,22 +1271,54 @@ def _ai_configure_llm(prompt: str) -> Optional[dict]:
     return proposal
 
 
+# Keyword -> (mode, explanation, rules), where a rule is
+# (target, predicate, description, persist_s, severity).
+#
+# The rules are (target, predicate) pairs, which is the shape the device can
+# actually execute — `core/rules.py`'s ConfiguredRule reads `target` and
+# `predicate`, and evaluates the target as a DETECTION LABEL against each
+# frame. They used to be keyed `detection` with EVENT-TYPE names ("fall",
+# "phone_use", "zone_violation", "unusual_stillness"): names no detector ever
+# produces as a label. `_validate_proposal` read `target`, found it absent,
+# and assessed "" — which the capability layer accepts as a whole-frame
+# condition — so the rule passed validation, was delivered, was stored, and
+# then sat on the device permanently unable to fire. Silently: nothing in the
+# app, the backend or the device said the rule was inert.
+#
+# That is the path taken when the language model is UNREACHABLE, which is
+# exactly when it has to be trustworthy. Each pair below is checked against
+# `core.capabilities.registry()` by tests/test_phase1_cloud_ai_fallback.py, and
+# built through the device's own ConfiguredRule.from_dict, so "the fallback
+# only ships rules that can fire" is a property under test rather than a
+# claim in a comment.
+#
+# Predicates are kept to the ones core/rules.py evaluates explicitly
+# (`present`, `absent`) rather than the wider set the registry declares, so
+# what the description promises is what the device does.
 _AI_FALLBACKS = [
     (("baby", "infant", "crib", "nursery", "toddler"), "baby_monitoring",
-     "Baby Monitoring: presence, safe/danger zones, and unusual-stillness alerts. Draw a safe "
-     "zone around the crib (and any danger zones) in the app to enable area alerts.",
-     [("unusual_stillness", "Alert if unusually still for a long period", 120.0, "warning")]),
+     "Baby Monitoring: the mode watches for unusual stillness, frantic movement and "
+     "safe/danger zones. Added on top: an alert if the baby stops being visible at all. "
+     "Draw a safe zone around the crib (and any danger zones) in the app to enable area alerts.",
+     [("person", "absent", "Alert if nobody is visible in the camera's view for 30 seconds",
+       30.0, "critical")]),
     (("fall", "elder", "senior", "grandma", "grandpa"), "elderly_monitoring",
      "Elderly Monitoring: immediate fall alerts (rapid drop then stillness — sitting down "
-     "won't trigger it), staying active until movement resumes.",
-     [("fall", "Alert immediately on a confirmed fall", 1.5, "critical")]),
+     "won't trigger it), staying active until movement resumes. Added on top: an alert if "
+     "someone is on the floor, which also covers a slow slide down that never looks like a drop.",
+     [("on_floor", "present", "Alert if someone is on the floor for more than 5 seconds",
+       5.0, "critical")]),
     (("security", "intruder", "door", "burglar", "lurk", "linger", "trespass"), "security_monitoring",
      "Security: person-count changes, plus restricted-zone and lingering alerts once you draw "
-     "zones in the app.",
-     [("zone_violation", "Alert when someone enters a restricted zone", 2.0, "critical")]),
-    (("drive", "driving", "car", "phone", "drowsy", "road"), "driver_distraction",
-     "Driver Distraction: loud alerts for phone use while looking away and sustained eye closure.",
-     [("phone_use", "Alert on sustained phone use while driving", 2.0, "critical")]),
+     "zones in the app. Added on top: an alert for anyone who stays in view for half a minute, "
+     "which needs no zone drawn to work.",
+     [("person", "present", "Alert when someone stays in view for 30 seconds",
+       30.0, "critical")]),
+    (("drive", "driving", "car", "phone", "drowsy", "road"), "driver_safety",
+     "Driver Safety: loud alerts for phone use while looking away and sustained eye closure. "
+     "Added on top: an alert whenever a phone is visible for more than a couple of seconds.",
+     [("cell phone", "present", "Alert when a phone is visible for more than 2 seconds",
+       2.0, "critical")]),
 ]
 
 
@@ -1109,10 +1331,11 @@ def _ai_fallback(prompt: str) -> dict:
             return {
                 "preset": preset, "variant": "", "explanation": explanation,
                 "rules": [
-                    {"detection": det, "description": desc, "zone": "", "persist_s": persist,
+                    {"target": target, "predicate": predicate, "secondary": "",
+                     "description": desc, "zone": "", "persist_s": persist,
                      "min_count": 1, "confidence": 0.6, "severity": sev, "cooldown_s": 60.0,
                      "schedule": "", "notify": "push"}
-                    for det, desc, persist, sev in rules
+                    for target, predicate, desc, persist, sev in rules
                 ],
                 "settings": {}, "unsupported": [], "source": "fallback",
             }
@@ -1157,14 +1380,37 @@ def _validate_proposal(data: dict) -> dict:
         return _legacy_validate_proposal(data)
 
     reg = caps.registry()
-    preset = data.get("preset") if data.get("preset") in _MODES else ""
+    preset = _resolve_mode(data.get("preset"))
     valid_rules, unsupported = [], list(data.get("unsupported") or [])
 
     for rule in data.get("rules") or []:
-        target = str(rule.get("target", "")).strip().lower()
+        # Resolve the target the way the DEVICE resolves it — `target`, then
+        # the legacy `detection` key — because that is the string it will
+        # look for as a detection label (core/rules.py, ConfiguredRule.
+        # from_dict). Assessing only `target` is what let dead rules through:
+        # a rule carrying `detection` and no `target` was assessed as "",
+        # which the capability layer accepts as a whole-frame condition, so
+        # it passed here and was then evaluated against a label no detector
+        # produces. A rule with NEITHER is dropped outright by from_dict, so
+        # it can never fire under any circumstances.
+        target = str(rule.get("target") or rule.get("detection") or "").strip().lower()
         predicate = str(rule.get("predicate", "")).strip().lower() or "present"
         secondary = str(rule.get("secondary", "")).strip().lower()
         described = str(rule.get("description") or f"{predicate} {target}".strip())
+
+        if not target:
+            # Refused, not silently kept. A rule the device discards is worse
+            # than a rule the user is told it cannot run: the first looks like
+            # protection and is not.
+            unsupported.append({
+                "request": described,
+                "reason": "this rule does not name anything to watch, so the device "
+                          "would have nothing to look for.",
+                "requires": "an object, posture or activity from the capability sheet",
+                "support": caps.Support.UNSUPPORTED.value,
+                "alternatives": [],
+            })
+            continue
 
         verdict = reg.assess(target, predicate)
         if not verdict.ok:
@@ -1215,7 +1461,7 @@ def _validate_proposal(data: dict) -> dict:
 def _legacy_validate_proposal(data: dict) -> dict:
     """Taxonomy-based validation, for a backend running without core/ available."""
     tax = _taxonomy()
-    preset = data.get("preset") if data.get("preset") in _MODES else ""
+    preset = _resolve_mode(data.get("preset"))
     valid_rules, unsupported = [], list(data.get("unsupported") or [])
     for rule in data.get("rules") or []:
         det_id = str(rule.get("detection", "") or rule.get("target", ""))
@@ -1239,12 +1485,24 @@ def ai_configure(body: AIConfigureBody, uid: int = Depends(current_user)):
     with db() as conn:
         _owned_device(conn, body.device_id, uid)
     result = _validate_proposal(_ai_configure_llm(body.prompt) or _ai_fallback(body.prompt))
-    # Persist the validated proposal on the device so the app's Apply (set_preset)
-    # and future device-side rule sync both have it.
+    # Persist the validated proposal as a DRAFT, so the app's Activate
+    # (set_preset) has it to promote.
+    #
+    # Not into `ai_rules`, which is what this did and what made previewing
+    # destructive. This endpoint is the PREVIEW: AIConfigureView calls it from
+    # `configure()`, the moment the person stops typing, before the proposal
+    # has been rendered and long before Activate. `ai_rules` is the column the
+    # ingest handler delivers from, and on a device already in AI Custom
+    # (custom_monitoring_wanted stays set — only set_preset ever writes it, so
+    # a preview cannot clear it) the delivery gate is a content-hash mismatch,
+    # which a preview flips by definition. So the next 2-second poll shipped
+    # and committed a configuration the user was still reading, and the device
+    # hot-swapped its detection module to match. Writing a draft leaves the
+    # running configuration exactly where it is until someone accepts this one.
     import json as _json
 
     with db() as conn:
-        conn.execute("UPDATE devices SET ai_rules = ? WHERE id = ?",
+        conn.execute("UPDATE devices SET ai_rules_draft = ? WHERE id = ?",
                      (_json.dumps(result), body.device_id))
     return result
 

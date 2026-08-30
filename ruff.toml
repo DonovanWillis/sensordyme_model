@@ -1,0 +1,218 @@
+# Ruff configuration for SensorDyme.
+#
+# WHY THIS FILE EXISTS
+# --------------------
+# Before this file, the repo had no ruff config anywhere. Ruff then walks UP the
+# directory tree looking for one, so `ruff check` in this project silently
+# inherited whatever lived in a parent directory (or fell back to defaults) —
+# running it from different working directories produced 321 / 523 / 648 / 687
+# findings for the same code. Lint results that depend on where you stand are
+# not a signal. This file pins the rule set so every run, on every machine and
+# in CI, checks exactly the same things.
+#
+# ruff.toml rather than pyproject.toml: this project uses a flat layout (core/,
+# modules/, services/ imported directly from the repo root via sys.path, see
+# tests/conftest.py). Adding a pyproject.toml makes the directory look like a
+# packaged project to pip/uv/pytest and risks changing import resolution for no
+# benefit — there is nothing to package. ruff.toml is config-only.
+#
+# WHAT THIS SET IS TUNED FOR
+# --------------------------
+# Three kinds of code live here and each wants something different:
+#   * Edge/embedded Python (core/, modules/, services/, hardware/) running
+#     unattended for days on a Pi under systemd. Silent failures and unbound
+#     names are the expensive bugs; they surface as "the device stopped
+#     detecting" hours later. Hence F, B, BLE, PLW, S.
+#   * A FastAPI backend (cloud/) holding real accounts and device credentials.
+#     Hence the bandit (S) rules, kept ON for cloud/ specifically.
+#   * Vendored comparison implementations (third_party/, and the three
+#     driver_attention_* adapters) that exist to reproduce someone else's
+#     algorithm faithfully. Reformatting or renaming in those destroys the
+#     benchmark's meaning, so they are excluded or heavily narrowed below.
+#
+# Every rule family below was measured against this codebase before being
+# selected; the counts are recorded in the comments so the next person can see
+# what was traded away.
+
+line-length = 100
+# The code is written to about 88 columns (p95 = 88, p99 = 103, max = 175).
+# 100 is the honest description of the existing style. NOTE: E501 is
+# deliberately NOT in the lint select set — this value is here for `ruff
+# format` and as documentation of the target for new code. See docs/DEVELOPMENT.md
+# for why formatting is not a CI gate today.
+
+target-version = "py311"
+# requirements.txt says "Python 3.11+ required (mediapipe does not yet support
+# 3.13+)". The dev venv is 3.12 and the Pi ships 3.11, so 3.11 is the floor.
+
+# Vendored verbatim for benchmark fidelity — see modules/driver_attention_dashsentinel.py.
+# Linting someone else's repo produces findings nobody is allowed to fix.
+extend-exclude = [
+    "third_party",
+    "site",
+    "data",
+    ".venv",
+    "ios",
+    "jupiter_config.yaml.example",
+]
+
+[lint]
+select = [
+    # --- correctness: these have already caught real bugs in this repo -------
+    "F",       # pyflakes. F821 found a missing `import threading` in core/network.py
+    "E4",      # import placement/shadowing (24 existing `# noqa: E402` show this
+               # rule was already in use before the config was lost)
+    "E7",      # comparison/statement errors (E711/E712/E722 bare except)
+    "E9",      # syntax and IO errors — never suppress these
+    "B",       # flake8-bugbear. B023 found a real loop-variable closure bug in
+               # scripts/jupiter_eval.py; B008 mutable defaults; B904 lost tracebacks
+    "PLE",     # pylint errors (0 today — this is a tripwire, keep it)
+
+    # --- silent failure, the dominant failure mode of an unattended device ---
+    "BLE",     # blind `except Exception`. 69 sites already carry `# noqa: BLE001`,
+               # i.e. someone triaged these once; this makes that durable and
+               # makes RUF100 flag the noqas that stop being true.
+    "SIM",     # SIM105 (contextlib.suppress) and SIM115 (unclosed file) matter on
+               # a process that runs for days
+    "RET",     # inconsistent returns from a rules/decision function
+    "PLW",     # PLW1510 subprocess-run-without-check (9 sites: a failing shell
+               # command currently returns quietly), PLW0603 global-statement
+
+    # --- security: cloud/ serves real accounts and device keys ---------------
+    "S",       # bandit. S110 try-except-pass, S506 unsafe yaml.load, S603/S607
+               # subprocess, S104 bind-all-interfaces, S310 url-open
+    "A",       # builtin shadowing (an `id`/`type` shadow inside a request handler)
+
+    # --- correctness-adjacent hygiene, all low-count here --------------------
+    "C4",      # comprehension misuse
+    "DTZ",     # naive datetimes — this project timestamps events and reports
+    "ISC",     # implicit string concat (a missing comma in a list of alert strings)
+    "PIE",
+    "PGH",     # blanket `# type: ignore` / `# noqa` with no code
+    "ICN",
+    "TID",     # relative-import discipline (0 today; tripwire for the flat layout)
+    "RUF",     # incl. RUF100 unused-noqa, RUF012 mutable class defaults,
+               # RUF013 implicit Optional
+
+    # --- test-suite quality: 84 test files, 1090 tests ----------------------
+    "PT",      # PT011 too-broad pytest.raises, PT015/PT017 assertions that can
+               # never fail — these hide regressions rather than catching them
+
+    # --- consistency --------------------------------------------------------
+    "I",       # import sorting (25 sites, all in tests/)
+    "N",       # naming (27 sites)
+    "UP",      # pyupgrade — see the UP ignores below
+]
+
+ignore = [
+    # ---- deliberately off, with the measured cost of turning them on -------
+
+    "S101",
+    # `assert` is the pytest idiom (2137 of the 2138 hits are in tests/, which
+    # is also per-file-ignored below) and is used for internal invariants
+    # elsewhere. The one hit outside tests/ (cloud/) is left visible.
+
+    "PLC0415",
+    # import-outside-top-level, 148 sites. Deliberate here: optional Pi-only
+    # imports (picamera2, hailo_platform, gpiozero) and heavy imports
+    # (ultralytics, mediapipe, onnxruntime) are loaded lazily so a Mac dev run
+    # and a Pi run can share one codebase and so startup stays fast.
+
+    "UP045", "UP007", "UP037",
+    # 385 sites of `Optional[X]` -> `X | None` and quoted annotations. All
+    # auto-fixable and all purely stylistic. Enabling them today would bury the
+    # ~130 real findings. Turn these on in the same commit that runs
+    # `ruff check --select UP045,UP007,UP037 --fix` across the tree.
+
+    "ISC001",
+    # conflicts with `ruff format`.
+
+    "PT018",
+    # composite-assertion, 70 sites in tests. Splitting `assert a and b` into
+    # two asserts is a readability preference, not a correctness one.
+
+    "PT001",
+    # `@pytest.fixture` vs `@pytest.fixture()`, 18 sites. Pure style.
+
+    "RET504",
+    # assign-then-return is often clearer at the end of a scoring function.
+
+    "SIM108",
+    # ternary-instead-of-if-else hurts readability in threshold logic.
+]
+
+# Rules that were evaluated and left OUT of the gate entirely, with counts, so
+# the decision is reviewable rather than an accident:
+#
+#   T20  (197) print statements. 130 are in scripts/, benchmarks/ and main.py
+#        where print IS the user interface. The other 67, inside core/, modules/,
+#        services/ and cloud/, arguably should be logging on a systemd service —
+#        that is a real cleanup, but it is a refactor, not a bug hunt, and it
+#        would be the single largest category in the report. Track separately:
+#        `ruff check --select T20 core modules services cloud hardware`
+#   ANN (2546) missing type annotations. Pyright already covers the type story.
+#   D   (2000) docstring style. The codebase's docstrings are prose-rich and
+#        deliberately non-pep257-shaped; enforcing D would rewrite all of them.
+#   PLR  (466) mostly PLR2004 magic-value-comparison. This is a codebase full of
+#        numeric safety thresholds; every one of them is a "magic value" by
+#        construction, and they live in config.yaml, not in a constants module.
+#   ARG  (194) unused arguments — nearly all are interface implementations
+#        satisfying modules/base.py.
+#   COM  (244) / Q (13) / W — handled by `ruff format`, not by the linter.
+#   TRY   (96) / EM (73) / FBT (200) — opinionated style; no bug value here.
+
+[lint.per-file-ignores]
+
+# ---- Vendored comparison implementations ----------------------------------
+# These three files reproduce someone else's algorithm VERBATIM (openpilot
+# v0.9.7, erlendskinnemoen's FaceMesh DMS, DashSentinel @3874e05b) so their
+# accuracy can be measured head-to-head against this repo's own pipeline. Their
+# constants, names, structure and quirks are the thing being measured. Only the
+# rules that would indicate the vendoring itself is broken stay on (F, B, E9, S).
+"modules/driver_attention_openpilot.py" = ["N", "I", "UP", "SIM", "RET", "PLW", "RUF", "ISC", "PIE", "C4", "A", "ICN", "DTZ", "PT", "E4", "E7"]
+"modules/driver_attention_skinnemoen.py" = ["N", "I", "UP", "SIM", "RET", "PLW", "RUF", "ISC", "PIE", "C4", "A", "ICN", "DTZ", "PT", "E4", "E7"]
+"modules/driver_attention_dashsentinel.py" = ["N", "I", "UP", "SIM", "RET", "PLW", "RUF", "ISC", "PIE", "C4", "A", "ICN", "DTZ", "PT", "E4", "E7"]
+
+# ---- Tests ----------------------------------------------------------------
+"tests/**" = [
+    "S101",    # assert is the point
+    "S105", "S106", "S107",  # fake tokens/passwords in fixtures
+    "S311",    # random for test data, not crypto
+    "S108",    # /tmp paths in fixtures
+    "N802",    # test helper names mirror the API under test
+    "PLW0603", # module-global patching in fixtures
+]
+"third_party/DashSentinel/tests/**" = ["ALL"]
+
+# ---- Scripts, benchmarks, and the CLI entrypoint ---------------------------
+# These are operator tools run by hand from a terminal.
+"scripts/**" = ["S603", "S607", "PLW1510"]   # subprocess with a PATH-resolved
+                                             # binary is intended in dev tooling
+"benchmarks/**" = ["S603", "S607", "PLW1510"]
+"setup_mac.sh" = ["ALL"]
+
+[lint.flake8-tidy-imports]
+ban-relative-imports = "parents"
+
+[lint.isort]
+known-first-party = ["core", "modules", "services", "hardware", "jupiter", "cloud", "benchmarks", "scripts"]
+
+[lint.flake8-bugbear]
+# FastAPI's Depends()/Query() in a default argument is the framework's idiom,
+# not the B008 mutable-default bug.
+extend-immutable-calls = [
+    "fastapi.Depends",
+    "fastapi.Query",
+    "fastapi.Header",
+    "fastapi.Body",
+    "fastapi.File",
+    "fastapi.Form",
+]
+
+[format]
+# `ruff format` is NOT a CI gate today: it would rewrite 144 of the 209 source
+# files in one commit, destroying `git blame` across the whole project and
+# reformatting the vendored adapters. `make fmt-check` exists so the diff can be
+# inspected, and the decision to take that commit belongs to a human.
+quote-style = "double"
+indent-style = "space"

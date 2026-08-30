@@ -99,12 +99,50 @@ class ProvisioningService:
         # a successful one, which is the worst way for this to be wrong.
         self._provision: Optional[dict] = None
         self.state = "starting"  # starting | online | waiting | provisioning | unavailable
+        #: Set by _guarded_run when the thread dies of an unhandled exception, so
+        #: status() can report the failure instead of the stale `state` string.
+        self._crashed: Optional[str] = None
+        self._health = None
 
     # ------------------------------------------------------------------ Service lifecycle
     def start(self, health=None) -> None:  # noqa: ANN001 - supervisor duck-type
-        self._stop.clear()
-        self._thread = threading.Thread(target=self.run, args=(self._stop,), daemon=True, name=self.name)
+        # Same three guarantees services/capture.py and services/supervisor.py both
+        # make, and which this class -- which duck-types Service rather than
+        # subclassing it -- was missing entirely:
+        #
+        #   1. refuse to double-run. `stop()` sets `self._thread = None` even when the
+        #      join TIMED OUT, so a wedged thread (BLE calls can block) left nothing
+        #      to detect it and a restart started a second one alongside it, both
+        #      driving the same BlueZ objects.
+        #   2. a FRESH stop Event per generation, never a cleared shared one. An
+        #      abandoned thread polls the OLD object; clearing it told that thread to
+        #      resume forever instead of exiting at its next check.
+        #   3. crash containment via _guarded_run, so an exception marks the component
+        #      failed instead of killing the thread silently. This one mattered most:
+        #      status() reports `self.state`, a plain string the dead thread left
+        #      behind, so a crashed provisioning service went on reporting HEALTHY
+        #      indefinitely while Wi-Fi setup quietly stopped working.
+        if self._thread is not None and self._thread.is_alive():
+            log.warning("provisioning service is still running; not starting a second thread")
+            return
+        if health is not None:
+            self._health = health
+        self._stop = threading.Event()
+        self._thread = threading.Thread(
+            target=self._guarded_run, args=(self._stop,), daemon=True, name=self.name
+        )
         self._thread.start()
+
+    def _guarded_run(self, stop: threading.Event) -> None:
+        """Crash containment: a provisioning crash must be visible, not silent."""
+        try:
+            self.run(stop)
+        except Exception as exc:  # noqa: BLE001 - see start()'s note 3
+            log.error("provisioning service crashed: %s", exc, exc_info=True)
+            self._crashed = f"crashed: {exc}"
+            health = getattr(self, "_health", None)
+            if health is not None:
+                health.report_failure(self.name, self._crashed)
 
     def stop(self, timeout: float = 5.0) -> None:
         self._stop.set()
@@ -232,7 +270,22 @@ class ProvisioningService:
         }
 
     def status(self) -> tuple[bool, str]:
-        """(healthy, detail) for the health monitor (non-critical component)."""
+        """(healthy, detail) for the health monitor (non-critical component).
+
+        `self.state` is a string the run loop last wrote, so on its own it describes
+        the thread's last known intention, not whether the thread still exists. A
+        crashed or exited thread left its final state behind and this reported it
+        forever as healthy -- exactly the "guessing in its own favour" that
+        core/device_health.py's own docstring says a monitoring product must not do.
+        Liveness is therefore checked before the state is trusted.
+        """
+        crashed = getattr(self, "_crashed", None)
+        if crashed:
+            return False, crashed
+        # `unavailable` is a legitimate terminal state (dev Mac, hotspot install):
+        # run() returns immediately by design, so a dead thread there is expected.
+        if self.state != "unavailable" and self._thread is not None and not self._thread.is_alive():
+            return False, f"provisioning thread is not running (last state: {self.state})"
         if self.state == "provisioning":
             return True, "offline — Bluetooth setup open so the app can hand it a network"
         if self.state == "reconfigurable":

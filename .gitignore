@@ -5,6 +5,36 @@ __pycache__/
 .pytest_cache/
 *.egg-info/
 
+# Tool caches. ruff writes .ruff_cache on every run; it was untracked-but-not-
+# ignored until now, so it showed up as noise in `git status` on every machine.
+.ruff_cache/
+.mypy_cache/
+.pyright_cache/
+
+# --- Coverage artifacts -------------------------------------------------------
+# `make test-cov` writes these. coverage.xml is what CI uploads; none of it is
+# meaningful outside the run that produced it.
+.coverage
+.coverage.*
+coverage.xml
+htmlcov/
+
+# --- Mutation testing ---------------------------------------------------------
+# mutmut's session database (`make mutants`). Large, machine-local, and only
+# valid for the exact source tree that produced it.
+.mutmut-cache
+mutants/
+html/
+
+# --- Benchmark output ---------------------------------------------------------
+# Timestamped runs from benchmarks/accuracy_state_farm.py, accuracy_protocol.py
+# (protocol_<ts>.json) and run_benchmarks.py are machine- and moment-specific.
+# The committed BASELINE is different: it is the regression reference that
+# `--compare` scores against, so it must be versioned or the gate has nothing to
+# compare to.
+benchmarks/results/*
+!benchmarks/results/baseline_*.json
+
 # --- Runtime output & downloaded data ---------------------------------------
 # data/ holds event logs, telemetry, per-device calibration, generated reports,
 # and downloaded training datasets (state_farm is ~6GB). All of it is either
@@ -28,6 +58,10 @@ ios/Info.plist
 *.swp
 .idea/
 .vscode/
+
+# Local agent/tooling scratch state (session databases, routing caches). Purely
+# machine-local; nothing here reproduces on another checkout.
+.claude-flow/
 
 # --- Local operational artifacts --------------------------------------------
 setup.log

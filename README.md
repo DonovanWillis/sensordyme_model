@@ -7,6 +7,20 @@ A modular edge computer-vision platform. One codebase, two targets:
 
 The platform auto-detects which one it's on at startup (by trying to import `picamera2`) — no flags, no branching config.
 
+> **⚠️ Licensing: resolve before any commercial release.**
+> The object detector runs on **Ultralytics, which is AGPL-3.0** — confirmed from the
+> installed package metadata (`License: AGPL-3.0`), and imported in the shipping
+> inference path at `core/detectors.py`. The AGPL's network clause is triggered by
+> conveying a program's output over a network, and this device serves annotated
+> inference over `/stream` and pushes events to a backend. YOLO11 weights inherit the
+> same license. Ultralytics sells an Enterprise License for exactly this situation.
+>
+> This is a factual observation about a dependency's stated license, not legal advice
+> — get counsel. Two paths exist: buy the commercial license, or migrate to an
+> Apache-2.0 detector. `docs/HUGGINGFACE.md` evaluates the second option, including a
+> candidate (`damoyolo_tinynasL20_T`) that is Apache-2.0, scores higher than the
+> current model, **and** has a prebuilt Hailo-8L binary.
+
 ## Quickstart: Mac (30 seconds)
 
 ```bash

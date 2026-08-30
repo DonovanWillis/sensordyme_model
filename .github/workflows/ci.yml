@@ -1,0 +1,395 @@
+# SensorDyme CI
+#
+# ############################################################################
+# # UNVERIFIED. This workflow has NEVER RUN.                                 #
+# #                                                                          #
+# # As of 2026-08-29 this repository has no git remote at all (`git remote    #
+# # -v` is empty) — it exists only on one laptop. There is no GitHub Actions  #
+# # runner that has ever executed a line of this file, and `gh` is not        #
+# # installed locally either, so it could not even be linted against the real #
+# # schema. Every command below was run by hand on macOS and works there;     #
+# # what is unproven is the Ubuntu runner, the caching, and the YAML wiring.  #
+# #                                                                          #
+# # Expect the FIRST run to fail. The most likely reasons, in order:          #
+# #   1. `uv pip install -r requirements.txt` on Linux. mediapipe, opencv,    #
+# #      ultralytics (which pulls torch, ~800MB) and onnxruntime all publish  #
+# #      manylinux wheels for cp312, but this exact pin set has only ever     #
+# #      been resolved on macOS/arm64 and on Raspberry Pi OS/aarch64.         #
+# #   2. Tests that pass locally but need a display, a camera, or an audio    #
+# #      device. Headless-safe env vars are set below as a first guess.       #
+# #   3. The job timeout, if the dependency install is slower than expected   #
+# #      on a cold uv cache.                                                  #
+# #                                                                          #
+# # Do not treat a green badge as meaningful until this has actually run.     #
+# ############################################################################
+#
+# WHAT IT GATES
+#   lint       ruff, rule set pinned in ruff.toml            (blocking)
+#   typecheck  pyright, config in pyrightconfig.json         (blocking)
+#   test       the full pytest suite, with coverage          (blocking)
+#   audit      pip-audit over the pinned requirements        (NON-blocking)
+#
+# `audit` is deliberately non-blocking. It queries the PyPI advisory database,
+# which changes without this repository changing — a new CVE published against
+# starlette on a Tuesday must not turn every open PR red. It reports into the
+# job summary instead, so somebody sees it without it becoming noise to click
+# past. There are already 16 known advisories here (see the job below); making
+# it blocking on day one would mean disabling it on day two.
+#
+# All four jobs are the same commands `make check` and `make audit` run locally.
+# If CI is red, reproduce it with `make check` before pushing again.
+
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  # Lets a human run it from the Actions tab, which is how you will test this
+  # file the first time without pushing junk commits.
+  workflow_dispatch:
+
+# A second push to the same branch cancels the first. The dependency install
+# here is expensive; there is no value in finishing a run for a commit that has
+# already been superseded. `main` is excluded from cancellation so the history
+# of what actually passed on main stays complete.
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
+
+# Read-only by default. Nothing in this workflow writes to the repository, and
+# a workflow that cannot push cannot be turned into a supply-chain foothold by
+# a compromised action.
+permissions:
+  contents: read
+
+env:
+  # requirements.txt: "Python 3.11+ required (mediapipe does not yet support
+  # 3.13+)". 3.12 matches the development venv. Do NOT bump to 3.13 without
+  # first checking that mediapipe publishes a wheel for it — `make audit`
+  # already fails on 3.13 for exactly this reason.
+  PYTHON_VERSION: "3.12"
+  # Pinned to match requirements-dev.txt. A lint gate that reports different
+  # findings in CI than on a developer's machine is worse than no lint gate.
+  RUFF_VERSION: "0.16.4"
+  PYRIGHT_VERSION: "1.1.411"
+  PIP_AUDIT_VERSION: "2.10.1"
+
+jobs:
+  # ==========================================================================
+  # lint — fast, needs no dependencies at all
+  # ==========================================================================
+  lint:
+    name: ruff
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      # Actions are pinned to a commit SHA, not a tag. A tag is mutable: whoever
+      # controls the action's repository can move v5 to point at new code, and
+      # that code runs with this workflow's token on this checkout. The trailing
+      # comment records which release the SHA corresponds to so it stays
+      # readable. Re-pin deliberately, checking the diff.
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+
+      - uses: astral-sh/setup-uv@d0cc045d04ccac9d8b7881df0226f9e82c39688e # v6
+        with:
+          enable-cache: true
+
+      # uvx fetches the pinned ruff on demand — no venv, no requirements
+      # install. This job should finish in well under a minute, so a syntax
+      # error or an undefined name is reported before the expensive jobs have
+      # finished installing torch.
+      - name: ruff check
+        run: uvx ruff@${{ env.RUFF_VERSION }} check --output-format=github .
+
+      # Informational only, and never fails the build. `ruff format` would
+      # rewrite 144 of the 209 source files, including the vendored comparison
+      # modules whose exact formatting is part of what makes them a faithful
+      # copy of the upstream they reproduce. See the [format] section of
+      # ruff.toml. This step exists so the size of that pending diff stays
+      # visible rather than quietly growing.
+      - name: ruff format (informational, never fails)
+        continue-on-error: true
+        run: |
+          uvx ruff@${{ env.RUFF_VERSION }} format --check . \
+            | tee -a "$GITHUB_STEP_SUMMARY"
+
+  # ==========================================================================
+  # typecheck — needs the real dependencies installed, or every numpy/cv2
+  # attribute resolves to Unknown and pyright reports hundreds of phantom
+  # errors. pyrightconfig.json points at .venv via venvPath/venv, so the venv
+  # must exist at the repo root with the same name it has locally.
+  # ==========================================================================
+  typecheck:
+    name: pyright
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+
+      - uses: astral-sh/setup-uv@d0cc045d04ccac9d8b7881df0226f9e82c39688e # v6
+        with:
+          enable-cache: true
+          cache-dependency-glob: |
+            requirements.txt
+            cloud/requirements.txt
+            requirements-dev.txt
+
+      - name: Create .venv and install dependencies
+        run: |
+          uv venv --python ${{ env.PYTHON_VERSION }} .venv
+          uv pip install --python .venv/bin/python \
+            -r requirements.txt -r cloud/requirements.txt
+
+      # The Pi-only imports (picamera2, libcamera, gpiozero, hailo_platform,
+      # dbus, gi) do not exist on a Linux runner any more than they do on a
+      # Mac. typings/ stubs them; see pyrightconfig.json -> stubPath. Nothing
+      # extra is needed here.
+      - name: pyright
+        run: uvx pyright@${{ env.PYRIGHT_VERSION }}
+
+  # ==========================================================================
+  # test — the suite that actually says whether a fall is still detected
+  # ==========================================================================
+  test:
+    name: pytest
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+
+      - uses: astral-sh/setup-uv@d0cc045d04ccac9d8b7881df0226f9e82c39688e # v6
+        with:
+          enable-cache: true
+          cache-dependency-glob: |
+            requirements.txt
+            cloud/requirements.txt
+            requirements-dev.txt
+
+      # opencv-python links against libGL even in code paths that never open a
+      # window; on a bare Ubuntu runner `import cv2` fails with
+      # "libGL.so.1: cannot open shared object file". This is the single most
+      # likely first-run failure after the dependency install itself.
+      - name: Install headless OpenCV system libraries
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends libgl1 libglib2.0-0
+
+      - name: Create .venv and install dependencies
+        run: |
+          uv venv --python ${{ env.PYTHON_VERSION }} .venv
+          uv pip install --python .venv/bin/python \
+            -r requirements.txt -r cloud/requirements.txt -r requirements-dev.txt
+
+      - name: pytest
+        env:
+          # No display and no audio device on a runner. simpleaudio and the
+          # opencv display path both check these.
+          QT_QPA_PLATFORM: offscreen
+          SDL_AUDIODRIVER: dummy
+          MPLBACKEND: Agg
+        run: |
+          .venv/bin/python -m pytest -q \
+            --cov=core --cov=modules --cov=services --cov=cloud --cov=jupiter --cov=hardware \
+            --cov-report=term-missing --cov-report=xml \
+            --junitxml=junit.xml
+        # NOTE: no --cov-fail-under. A coverage floor is worth adding, but it
+        # has to be set from a measured baseline, and this workflow has never
+        # produced one. Set it in the commit that reads the first real number.
+
+      - name: Upload coverage and test results
+        # Runs even when the tests failed — that is exactly when the report is
+        # worth reading.
+        if: ${{ !cancelled() }}
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: test-results
+          path: |
+            coverage.xml
+            junit.xml
+          retention-days: 14
+          if-no-files-found: warn
+
+  # ==========================================================================
+  # accuracy-gate — scores the detector against the State Farm dataset and
+  # fails on a real accuracy regression.
+  #
+  # IT WILL SKIP ON EVERY HOSTED RUN, BY DESIGN. data/state_farm is ~6GB and
+  # gitignored, so a GitHub-hosted runner checking out this repo simply does not
+  # have it. The job detects that and exits green with a note in the summary. It
+  # becomes a live gate only on a self-hosted runner that has the dataset on
+  # disk, or once a caching/download step is added.
+  #
+  # TWO MECHANISMS, COVERING DIFFERENT THINGS. Do not remove either as redundant.
+  #
+  # benchmarks/accuracy_state_farm.py now has three distinct exit codes (verified
+  # by running it):
+  #     0  clean run, no regression
+  #     1  a metric regressed past --tolerance   -> the job SHOULD go red
+  #     2  could not run at all                  -> the job should NOT go red
+  # Code 2 covers a missing dataset AND a missing --compare baseline, and it is
+  # raised by a DatasetMissing(SystemExit) subclass that prints to stderr.
+  # (Before that fix the idiom was `raise SystemExit("string")`, and Python exits
+  # 1 for any non-integer argument — so "cannot run" and "regressed" were the
+  # same code and `continue-on-error` would have swallowed real regressions.)
+  #
+  # 1. The pre-flight dataset check below is a COST optimisation, not the
+  #    correctness mechanism. Hosted runners never have data/state_farm, so
+  #    without it every push would apt-get, build a venv and download ~800MB of
+  #    torch (via ultralytics) purely to discover the dataset is absent and stop.
+  #    The check short-circuits all of that.
+  #
+  # 2. The exit-code branch on the gate step is the CORRECTNESS mechanism, and it
+  #    catches what the pre-flight check cannot see: the pre-flight only tests for
+  #    val_manifest.csv, so if benchmarks/results/baseline_phase1.json were ever
+  #    deleted or renamed, the check would pass, the script would exit 2, and the
+  #    job would go red on a "cannot run" condition. Branching on the code is what
+  #    prevents that false red.
+  # ==========================================================================
+  accuracy-gate:
+    name: accuracy regression (skips without the dataset)
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+
+      - name: Look for the State Farm dataset
+        id: dataset
+        run: |
+          if [ -f data/state_farm/val_manifest.csv ]; then
+            echo "present=true" >> "$GITHUB_OUTPUT"
+            echo "State Farm dataset found — running the accuracy gate." \
+              >> "$GITHUB_STEP_SUMMARY"
+          else
+            echo "present=false" >> "$GITHUB_OUTPUT"
+            {
+              echo "## Accuracy gate skipped"
+              echo
+              echo "\`data/state_farm/val_manifest.csv\` is not present on this runner."
+              echo "The dataset is ~6GB and gitignored, so hosted runners never have it."
+              echo "This is expected and is NOT a failure."
+              echo
+              echo "To make this gate live, run it on a runner with the dataset prepared:"
+              echo
+              echo '    .venv/bin/python scripts/prepare_state_farm.py'
+              echo '    make accuracy-gate'
+            } >> "$GITHUB_STEP_SUMMARY"
+            echo "Dataset absent — skipping the accuracy gate (not a failure)."
+          fi
+
+      - uses: astral-sh/setup-uv@d0cc045d04ccac9d8b7881df0226f9e82c39688e # v6
+        if: steps.dataset.outputs.present == 'true'
+        with:
+          enable-cache: true
+          cache-dependency-glob: requirements.txt
+
+      # cv2 links against libGL even on code paths that never open a window.
+      - name: Install headless OpenCV system libraries
+        if: steps.dataset.outputs.present == 'true'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends libgl1 libglib2.0-0
+
+      - name: Create .venv and install dependencies
+        if: steps.dataset.outputs.present == 'true'
+        run: |
+          uv venv --python ${{ env.PYTHON_VERSION }} .venv
+          uv pip install --python .venv/bin/python -r requirements.txt
+
+      # Scores against benchmarks/results/baseline_phase1.json, the one file
+      # under benchmarks/results/ that is deliberately NOT gitignored. Exits
+      # nonzero when a metric drops by more than --tolerance (default 0.03).
+      # Note: yolo11n.pt is gitignored, so ultralytics downloads it here on
+      # first use.
+      - name: make accuracy-gate
+        if: steps.dataset.outputs.present == 'true'
+        env:
+          QT_QPA_PLATFORM: offscreen
+          MPLBACKEND: Agg
+        run: |
+          set +e
+          make accuracy-gate
+          code=$?
+          set -e
+          case "$code" in
+            0)
+              echo "Accuracy gate passed: no metric regressed." >> "$GITHUB_STEP_SUMMARY"
+              ;;
+            1)
+              echo "## Accuracy REGRESSION" >> "$GITHUB_STEP_SUMMARY"
+              echo "A metric dropped past the tolerance. See the log above." >> "$GITHUB_STEP_SUMMARY"
+              exit 1
+              ;;
+            2)
+              {
+                echo "## Accuracy gate could not run"
+                echo
+                echo "Exit code 2 means the harness could not run at all — a missing"
+                echo "dataset, or a missing \`--compare\` baseline. It is NOT a regression,"
+                echo "so this job is not failed. See the stderr message above."
+              } >> "$GITHUB_STEP_SUMMARY"
+              echo "Exit 2 (cannot run) — not treated as a failure."
+              ;;
+            *)
+              echo "Unexpected exit code $code from the accuracy harness." >> "$GITHUB_STEP_SUMMARY"
+              exit "$code"
+              ;;
+          esac
+
+      - name: Upload the accuracy run
+        if: ${{ steps.dataset.outputs.present == 'true' && !cancelled() }}
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: accuracy-results
+          path: benchmarks/results/accuracy_state_farm_*.json
+          retention-days: 14
+          if-no-files-found: warn
+
+  # ==========================================================================
+  # audit — NON-BLOCKING by design (see the header)
+  # ==========================================================================
+  audit:
+    name: pip-audit (non-blocking)
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    # Reports; never fails the build.
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+
+      - uses: astral-sh/setup-uv@d0cc045d04ccac9d8b7881df0226f9e82c39688e # v6
+        with:
+          enable-cache: true
+
+      # pip-audit resolves the requirements files, transitive dependencies
+      # included. That matters here: cloud/requirements.txt pins fastapi, and
+      # most of the current findings are in starlette, which fastapi pulls in
+      # and which nothing in this repo names directly.
+      #
+      # --python 3.12 is required, not cosmetic: mediapipe 0.10.14 publishes no
+      # 3.13 wheel, and uvx would otherwise default to the newest interpreter
+      # and fail to resolve before it audits anything.
+      #
+      # KNOWN STATE as of 2026-08-29 — 16 advisories in 4 packages:
+      #   starlette 0.46.2   9  (transitive, via fastapi 0.115.*)
+      #   zeroconf  0.132.2  5  (cloud/requirements.txt pins the 0.132.* series,
+      #                          which locks in every one of these; the fixes
+      #                          are all in 0.149.x)
+      #   protobuf  4.25.9   1  (transitive, via mediapipe)
+      #   pytest    8.3.3    1  (test-only; fix is in 9.0.3)
+      # Bumping any of these means changing requirements.txt or
+      # cloud/requirements.txt, which are production pins — that is a deliberate
+      # change with a test run behind it, not something CI should force.
+      - name: pip-audit
+        run: |
+          {
+            echo "## Dependency advisories"
+            echo
+            echo '```'
+            uvx --python 3.12 pip-audit@${{ env.PIP_AUDIT_VERSION }} \
+              --progress-spinner=off \
+              -r requirements.txt \
+              -r cloud/requirements.txt \
+              -r requirements-dev.txt 2>&1 || true
+            echo '```'
+          } | tee -a "$GITHUB_STEP_SUMMARY"

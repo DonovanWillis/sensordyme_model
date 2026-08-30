@@ -14,6 +14,12 @@ from __future__ import annotations
 import re
 import shutil
 import subprocess
+# Module-level so the string annotations on watch() resolve. It was imported only
+# INSIDE watch(), so `threading` was undefined at module scope and anything calling
+# typing.get_type_hints() on this class raised NameError -- benign today because the
+# annotations are strings and nothing introspects them, but a trap for any future
+# schema/DI tooling that does.
+import threading
 from typing import Optional
 
 from core.logging_setup import get_logger

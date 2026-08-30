@@ -1,0 +1,73 @@
+# SensorDyme development toolchain.
+#
+# NOT installed on the Raspberry Pi. requirements.txt is what ships to the
+# device; everything here is for a developer machine and for CI. Keeping them
+# separate matters on a Pi Zero-class board — `pip install ruff pyright` pulls a
+# Rust binary and a Node runtime onto a device that only needs to run inference.
+#
+# Install:
+#   uv pip install --python .venv/bin/python -r requirements-dev.txt
+#
+# (The project venv has no `pip` module, so `python -m pip` will not work here;
+# use uv, which is what CI does too.)
+#
+# Pins are exact. A lint gate that reports different findings on your machine
+# than in CI is worse than no lint gate, and every one of these tools changes
+# its findings between minor versions.
+
+# --- Tests --------------------------------------------------------------------
+# pytest is ALSO pinned in requirements.txt (the production file) at the same
+# version, because a handful of runtime modules are exercised on the device.
+# Keep the two in step; if they drift, the device and CI stop agreeing.
+pytest==8.3.3
+
+# Coverage. `make test-cov` reports on the modules that make decisions
+# (core/, modules/, services/, cloud/) — see the Makefile for the exact scope.
+pytest-cov==7.1.0
+coverage==7.16.0
+
+# A hung test is the failure mode that costs the most: the suite runs in ~18s,
+# so anything past 60s is a deadlock (a thread that never joins, a socket that
+# never times out), not slowness. Without this, CI burns its whole job timeout.
+pytest-timeout==2.4.0
+
+# --- Lint / format ------------------------------------------------------------
+# Rule set is pinned in ruff.toml. Ruff adds and reclassifies rules in every
+# minor release, so the version pin is part of the rule-set pin.
+ruff==0.16.4
+
+# --- Types --------------------------------------------------------------------
+# Config in pyrightconfig.json. The pip package bundles its own Node runtime, so
+# no separate `npm install -g pyright` is needed.
+#
+# NOTE ON THE VERSION: Homebrew currently ships pyright 1.1.413, which is AHEAD
+# of the newest release on PyPI (1.1.411). The two disagree — 1.1.413 reports a
+# few more errors on this codebase than 1.1.411 does. 1.1.411 is pinned because
+# it is the version CI can actually install; if you have the Homebrew binary on
+# PATH, `make typecheck` will use it and may show extra findings that CI does
+# not. Run `uvx pyright@1.1.411` to reproduce CI exactly.
+pyright==1.1.411
+
+# --- Dependency CVEs ----------------------------------------------------------
+# Resolves the requirements files (including transitive dependencies) against
+# the PyPI advisory database. Transitive matters here: cloud/ pins fastapi, and
+# the majority of the current advisories are in starlette, which fastapi pulls
+# in and nothing in this repo names directly.
+#
+# `make audit` must run on Python 3.12, not 3.13: mediapipe 0.10.14 (pinned in
+# requirements.txt) publishes no 3.13 wheel, so resolution fails outright there.
+pip-audit==2.10.1
+
+# --- Mutation testing ---------------------------------------------------------
+# The 1090+ tests pass, but a prior manual audit mutated 18 safety thresholds
+# (fall-detection stillness windows, drowsiness PERCLOS cutoffs, ...) and only 2
+# of the mutants were killed — an 11% kill rate on exactly the constants where
+# being wrong means missing a fall. mutmut makes that measurement repeatable
+# instead of a one-off. It is SLOW (minutes to hours); it belongs in `make
+# mutants`, run deliberately, never in the per-push CI gate.
+mutmut==3.7.0
+
+# --- Git hooks ----------------------------------------------------------------
+# Config in .pre-commit-config.yaml. Installed here so `pre-commit` is on PATH
+# inside the venv; the hooks themselves run in pre-commit's own isolated envs.
+pre-commit==4.6.2

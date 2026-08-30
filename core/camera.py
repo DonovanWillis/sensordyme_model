@@ -13,6 +13,10 @@ from typing import Iterator, Optional
 import cv2
 import numpy as np
 
+from core.logging_setup import get_logger
+
+log = get_logger("camera")
+
 
 def detect_pi() -> bool:
     """Return True if Picamera2 is importable, i.e. this is a Raspberry Pi.
@@ -162,10 +166,31 @@ class Camera:
         return self._fps
 
     def release(self) -> None:
-        """Release the underlying camera device."""
+        """Release the underlying camera device.
+
+        `stop()` halts the stream; `close()` releases the media device itself. Only
+        calling stop() leaves the /dev/video node held by the old Picamera2 object,
+        so `reopen()` -- step 1 of the recovery ladder in ARCHITECTURE.md -- then
+        constructs a fresh Picamera2 against a device the previous instance has not
+        let go of, leaking the object and its file descriptors on every attempt.
+        Dropping the reference alone is not enough: CPython may collect it later,
+        but "later" is not a guarantee the recovery path can be built on.
+
+        close() is called defensively -- some Picamera2 versions close on stop, and
+        closing twice must not turn a recoverable camera fault into a crash inside
+        the health monitor's restart path.
+        """
         if self._picam is not None:
-            self._picam.stop()
-            self._picam = None
+            picam, self._picam = self._picam, None
+            try:
+                picam.stop()
+            finally:
+                close = getattr(picam, "close", None)
+                if close is not None:
+                    try:
+                        close()
+                    except Exception as exc:  # noqa: BLE001 - see docstring
+                        log.warning("camera close() failed during release: %s", exc)
         if self._cap is not None:
             self._cap.release()
             self._cap = None
