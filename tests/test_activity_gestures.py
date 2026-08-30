@@ -18,12 +18,12 @@ from __future__ import annotations
 from dataclasses import dataclass
 
 from core.activity import (
-    ActivityRecognizer,
     FLAIL_MIN_REVERSALS,
     HAND_RAISED_MARGIN,
     MIN_SAMPLES,
     POSE_LOST_GRACE_S,
     WAVE_MIN_SWINGS,
+    ActivityRecognizer,
 )
 
 

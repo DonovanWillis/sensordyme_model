@@ -28,11 +28,11 @@ from __future__ import annotations
 
 import statistics
 import time
+from collections.abc import Callable
 from dataclasses import dataclass, field
-from typing import Callable, Optional
+from typing import Optional
 
 from core.capabilities import registry
-
 from jupiter.eval.synth import Example
 from jupiter.interpret import interpret
 from jupiter.providers import Provider

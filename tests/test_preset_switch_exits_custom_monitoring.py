@@ -12,7 +12,6 @@ running before it, immediately and durably.
 """
 
 import numpy as np
-import pytest
 
 from core.alerts import AlertManager
 from core.events import Event

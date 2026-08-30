@@ -28,8 +28,9 @@ from __future__ import annotations
 import math
 import time
 from collections import deque
+from collections.abc import Sequence
 from dataclasses import dataclass, field
-from typing import Optional, Sequence
+from typing import Optional
 
 from core import posture
 

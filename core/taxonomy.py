@@ -26,7 +26,7 @@ Honesty rules encoded in the entries:
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 
 SUPPORTED = "supported"
 PARTIAL = "partial"
@@ -160,9 +160,12 @@ TAXONOMY: dict[str, list[Detection]] = {
                   "face-model reasoning as face_covered below); does not and cannot NAME the "
                   "object — a coin and an unclassified UNKNOWN_OBJECT of the same relative size "
                   "score identically, honestly, rather than guessing a class the detector doesn't "
-                  "have (see objects.small_personal); when more than one person is in frame, the "
-                  "smallest detected box stands in for 'the baby', which can misattribute risk if "
-                  "that heuristic guesses wrong"),
+                  "have (see objects.small_personal); when more than one person is in frame the infant "
+                  "is positively identified from crib-zone containment, temporal identity, "
+                  "size/position stability and relative scale (modules/baby_monitoring.py's "
+                  "InfantIdentifier); when no person earns that identification the module "
+                  "DECLINES to score and raises infant_unidentified rather than scoring an "
+                  "adult. Identification is weakest with no safe zone drawn, and says so"),
         _d("medical", "Medical conditions / diagnoses", UNSUPPORTED,
            requires="out of scope by policy — the system reports observable safety conditions only"),
     ],

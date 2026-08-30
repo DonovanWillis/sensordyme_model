@@ -13,7 +13,7 @@ import sys
 import pytest
 
 pytest.importorskip("fastapi")
-from fastapi.testclient import TestClient  # noqa: E402
+from fastapi.testclient import TestClient
 
 DEVICE_HEADERS = {"X-Device-Key": "dk_test"}
 

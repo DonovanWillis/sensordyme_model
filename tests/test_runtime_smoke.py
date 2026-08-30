@@ -14,7 +14,6 @@ import numpy as np
 
 import services.runtime as runtime_module
 from core.alerts import AlertManager
-from core.camera import CameraError
 from core.events import Event
 from modules.base import VisionModule
 from services.runtime import DeviceRuntime

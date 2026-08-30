@@ -179,6 +179,51 @@ def status() -> tuple[bool, str]:
     return True, info.detail  # no HAT at all: CPU-only is the intended mode
 
 
+def live_status() -> tuple[bool, str]:
+    """(healthy, detail) for /api/health — grounded in COMPLETED INFERENCES.
+
+    `status()` above answers a config question: "is the configured intent being
+    met". That is the right answer at boot, and the wrong one for anyone reading
+    /api/health to find out what is actually computing — a seated HAT plus a .hef
+    path makes it say "Hailo in use" whether or not a single frame ever reached
+    the NPU. On real hardware the two can diverge: a caller pinning `device=`, a
+    per-frame inference failure inside a broad handler, or a model loaded before
+    configure() all leave the config intact while the work happens on CPU.
+
+    So this reports what RAN. `core/device_health.py::_accelerator` already made
+    this distinction for the payload the app sees; this applies the same evidence
+    to the device's own endpoint, which had only the config answer.
+
+    The three states an operator needs are worded so they can never be confused:
+        "Hailo NPU in use"  -- inference completed on-device, recently
+        "running on CPU"    -- nothing has executed on the accelerator
+        "<failure reason>"  -- configured but unusable
+    """
+    healthy, detail = status()
+    stats = inference_stats()
+    info = _accel_info or detect()
+
+    if stats["live"]:
+        return True, f"Hailo NPU in use — {stats['count']} inferences, last {stats['age_s']}s ago"
+    if stats["count"] > 0:
+        # It worked and then stopped. Not a config problem, and not healthy
+        # either: something upstream stopped feeding it.
+        return False, (
+            f"Hailo NPU idle — {stats['count']} inferences but none for "
+            f"{stats['age_s']}s (pipeline stalled or fell back to CPU)"
+        )
+    if info.present and not healthy:
+        return False, detail
+    if _accel_cfg.get("yolo_hef") and info.usable:
+        # The dangerous case this exists for: fully configured, HAT seated,
+        # runtime fine -- and nothing has ever executed on it.
+        return False, (
+            "running on CPU — accelerator is configured "
+            f"({_accel_cfg['yolo_hef']}) but no inference has executed on it"
+        )
+    return healthy, f"running on CPU — {detail}"
+
+
 def maybe_hailo_yolo(weights: str):
     """The Hailo-backed model for `weights`, or None to fall back to ultralytics/CPU.
 
@@ -244,6 +289,39 @@ def letterbox_transform(frame_w: int, frame_h: int, input_w: int, input_h: int) 
     return scale, pad_w // 2, pad_h // 2
 
 
+def _nms(boxes: np.ndarray, scores: np.ndarray, iou_threshold: float) -> list[int]:
+    """Greedy non-max suppression over xyxy boxes. Returns indices INTO `boxes`.
+
+    Written out rather than pulled from torchvision/ultralytics: this runs on the
+    Pi inside the no-NMS decode path, where the whole point is not to depend on a
+    heavyweight (and AGPL) inference stack just to suppress overlapping boxes.
+    """
+    if len(boxes) == 0:
+        return []
+    x1, y1, x2, y2 = boxes[:, 0], boxes[:, 1], boxes[:, 2], boxes[:, 3]
+    areas = np.maximum(0.0, x2 - x1) * np.maximum(0.0, y2 - y1)
+    order = scores.argsort()[::-1]
+
+    keep: list[int] = []
+    while order.size:
+        i = order[0]
+        keep.append(int(i))
+        if order.size == 1:
+            break
+        rest = order[1:]
+        xx1 = np.maximum(x1[i], x1[rest])
+        yy1 = np.maximum(y1[i], y1[rest])
+        xx2 = np.minimum(x2[i], x2[rest])
+        yy2 = np.minimum(y2[i], y2[rest])
+        inter = np.maximum(0.0, xx2 - xx1) * np.maximum(0.0, yy2 - yy1)
+        union = areas[i] + areas[rest] - inter
+        # A zero-area box would divide by zero; treat it as non-overlapping rather
+        # than letting a NaN silently keep or drop a detection.
+        iou = np.where(union > 0, inter / np.maximum(union, 1e-9), 0.0)
+        order = rest[iou <= iou_threshold]
+    return keep
+
+
 class HailoYOLO:
     """Runs a Model-Zoo YOLO .hef on the AI HAT+ behind the ultralytics call surface.
 
@@ -252,7 +330,33 @@ class HailoYOLO:
     [ymin, xmin, ymax, xmax, score] rows normalized to [0, 1].
     """
 
-    def __init__(self, hef_path: str) -> None:
+    #: Number of DFL bins per box side. A head emitting 4*(reg_max+1) channels is
+    #: doing distribution-based regression (GFocal/DFL): each side's distance is a
+    #: softmax over `_DFL_BINS` bins, and the distance is that distribution's
+    #: expectation. 68 channels = 4 sides x 17 bins. Verified against the real
+    #: damoyolo_tinynasL20_T.hef, whose 68-channel outputs carry raw logits
+    #: (range -3.3..9.6, mean ~0) while its 81-channel outputs are already
+    #: sigmoid'd probabilities (range 0..1).
+    _DFL_BINS = 17
+
+    #: IoU above which two same-class boxes are treated as one detection in the
+    #: off-chip NMS. 0.50 rather than the 0.70 the Model Zoo's on-chip yolov8/
+    #: yolo11 builds use, from a measured sweep on 200 real driver frames:
+    #:
+    #:     IoU   0.70   0.60   0.50   0.45   0.40
+    #:     multi 55.0%  53.5%  51.5%  50.0%  48.0%   (single-person images with >1 box)
+    #:
+    #: Note what that sweep says: tightening IoU barely helps, because the extra
+    #: boxes are NOT overlapping duplicates — they are spatially separate
+    #: low-confidence false positives, which NMS cannot touch. The lever that
+    #: actually works is the CONFIDENCE threshold (0.5% multi-person at conf
+    #: 0.60, still 100% person availability). 0.50 is taken here for the small
+    #: free improvement; the real control lives in each module's configured
+    #: confidence, and this comment exists so the next person does not spend a
+    #: day tuning IoU expecting it to fix duplicate boxes.
+    _DEFAULT_NMS_IOU = 0.50
+
+    def __init__(self, hef_path: str, nms_iou: Optional[float] = None) -> None:
         from hailo_platform import (  # imported here: only exists on the Pi
             HEF,
             ConfigureParams,
@@ -263,6 +367,9 @@ class HailoYOLO:
             OutputVStreamParams,
             VDevice,
         )
+
+        self._hef_path = hef_path  # kept so model_name() can name what actually ran
+        self._nms_iou = self._DEFAULT_NMS_IOU if nms_iou is None else float(nms_iou)
 
         self.names = dict(COCO_NAMES)
         self._hef = HEF(hef_path)
@@ -286,6 +393,70 @@ class HailoYOLO:
         # Model Zoo YOLO inputs are NHWC uint8, e.g. (640, 640, 3).
         self._input_h, self._input_w = input_info.shape[0], input_info.shape[1]
 
+        # Which decode path this .hef needs, decided from the HEF itself rather
+        # than from the filename or config. Two kinds ship in the Model Zoo:
+        #
+        #   NMS-on-chip  one output, already decoded and non-max-suppressed. The
+        #                score threshold and IoU are COMPILED IN and cannot be
+        #                changed at runtime -- measured on yolov11n.hef, whose
+        #                0.200 floor caps phone recall at 25.4% against CPU's
+        #                63.3% because `conf` below that is silently ignored.
+        #   raw tensors  several outputs per FPN scale, no NMS. Decoding is ours
+        #                to do, which costs CPU -- and buys back full control of
+        #                the threshold, which is the thing the on-chip builds
+        #                take away.
+        #
+        # The distinction is load-bearing for accuracy, not a detail: it is the
+        # difference between a detector that can see a phone and one that cannot.
+        out_infos = self._hef.get_output_vstream_infos()
+        self._raw_outputs = len(out_infos) > 1
+        self._nms_score_threshold = None
+        if self._raw_outputs:
+            # Group the per-scale heads. Each FPN level emits a box head
+            # (4*_DFL_BINS channels) and a class head (num_classes, possibly
+            # padded), at a grid whose stride is input_size / grid_size.
+            self._scales = self._group_raw_outputs(out_infos)
+            log.info(
+                "accel: %s has %d raw output tensors and NO on-chip NMS — decoding "
+                "off-chip at strides %s (the confidence threshold is fully ours)",
+                os.path.basename(hef_path), len(out_infos),
+                [s["stride"] for s in self._scales],
+            )
+        else:
+            log.info(
+                "accel: %s has on-chip NMS — its compiled-in score threshold bounds "
+                "recall regardless of the `conf` passed to predict()",
+                os.path.basename(hef_path),
+            )
+
+    def _group_raw_outputs(self, out_infos) -> list[dict]:
+        """Pair each scale's box head with its class head, by grid size.
+
+        Output names are model-specific (`conv53`/`conv54` on damoyolo), so the
+        pairing is done on SHAPE, which is a property of the architecture rather
+        than of one vendor's layer naming: at each grid size exactly one head has
+        4*_DFL_BINS channels (boxes) and one has the rest (classes).
+        """
+        by_grid: dict[int, dict] = {}
+        box_channels = 4 * self._DFL_BINS
+        for info in out_infos:
+            h, w, c = info.shape
+            if h != w:
+                raise RuntimeError(f"non-square detection grid {info.shape} on {info.name}")
+            entry = by_grid.setdefault(h, {"grid": h, "stride": self._input_h // h})
+            entry["box" if c == box_channels else "cls"] = info.name
+            if c != box_channels:
+                entry["num_classes"] = c
+        scales = [by_grid[g] for g in sorted(by_grid, reverse=True)]
+        for s in scales:
+            if "box" not in s or "cls" not in s:
+                raise RuntimeError(
+                    f"grid {s['grid']} is missing a box or class head: {s}. This .hef's "
+                    "head layout is not the 4*(reg_max+1) + classes shape this decoder "
+                    "understands, and guessing would silently produce wrong boxes."
+                )
+        return scales
+
     def predict(self, frame: np.ndarray, verbose: bool = False, classes=None, conf: float = 0.25):
         """Ultralytics-shaped predict: BGR frame in, [Result] out, boxes in pixel xyxy."""
         import cv2
@@ -308,6 +479,10 @@ class HailoYOLO:
         # Recorded only after the device returned a result, so the health report
         # reflects work the Hailo actually completed.
         record_inference()
+
+        if self._raw_outputs:
+            return self._decode_raw(raw, scale, left, top, w, h, classes, conf)
+
         # One output tensor (NMS postprocess): per image, a list per class of Nx5 rows.
         per_class = raw[next(iter(raw))][0]
 
@@ -328,6 +503,110 @@ class HailoYOLO:
                 y2 = min(max((ymax * self._input_h - top) / scale, 0.0), h)
                 boxes.append(_ShimBox(np.asarray([x1, y1, x2, y2]), cls_id, score))
         return [_ShimResult(boxes)]
+
+    # -------------------------------------------------------------- raw decode
+    def _decode_raw(self, raw, scale, left, top, w, h, classes, conf):
+        """Decode DFL box logits + class scores from a no-NMS .hef, then suppress.
+
+        Everything the on-chip NMS would have done, done here instead: distance
+        decoding, anchor placement, thresholding and non-max suppression. The
+        reason to want this is the threshold — an on-chip build bakes one in at
+        compile time (0.200 on the Model Zoo YOLO builds), and below it `conf` is
+        silently a no-op. Here `conf` is the only gate there is.
+
+        Layout was established empirically against damoyolo_tinynasL20_T.hef
+        rather than assumed from the architecture paper:
+          * box head, 4*17 channels, RAW LOGITS -> softmax over 17 bins per side,
+            expectation = distance from the anchor point in stride units;
+          * class head, already sigmoid'd probabilities in [0,1] — verified by
+            feeding a real driver image and finding channel 0 (COCO `person`)
+            at 0.85, channel 56 (`chair`) and 67 (`cell phone`) plausibly lit.
+            Channels beyond the COCO 80 are padding and are dropped.
+        """
+        wanted = set(int(c) for c in classes) if classes is not None else None
+        all_boxes: list[np.ndarray] = []
+        all_scores: list[np.ndarray] = []
+        all_classes: list[np.ndarray] = []
+
+        for spec in self._scales:
+            box_raw = np.asarray(raw[spec["box"]])[0]   # (G, G, 4*bins)
+            cls_raw = np.asarray(raw[spec["cls"]])[0]   # (G, G, C)
+            grid, stride = spec["grid"], spec["stride"]
+
+            # Only the real COCO classes; anything past 80 is padding, and letting
+            # it through would invent detections for classes that do not exist.
+            scores = cls_raw.reshape(-1, cls_raw.shape[-1])[:, : len(COCO_NAMES)]
+
+            best_cls = scores.argmax(axis=1)
+            best_score = scores.max(axis=1)
+            keep = best_score >= conf
+            if wanted is not None:
+                keep &= np.isin(best_cls, list(wanted))
+            if not keep.any():
+                continue
+
+            # DFL: softmax over the bins of each side, then take the expectation.
+            dfl = box_raw.reshape(-1, 4, self._DFL_BINS)[keep]
+            dfl = dfl - dfl.max(axis=2, keepdims=True)          # stabilise the exp
+            prob = np.exp(dfl)
+            prob /= prob.sum(axis=2, keepdims=True)
+            dist = (prob * np.arange(self._DFL_BINS, dtype=np.float32)).sum(axis=2)  # (N,4) l,t,r,b
+
+            # Anchor points at cell centres, in letterboxed-input pixels.
+            ys, xs = np.divmod(np.nonzero(keep)[0], grid)
+            cx = (xs + 0.5) * stride
+            cy = (ys + 0.5) * stride
+
+            all_boxes.append(np.stack([
+                cx - dist[:, 0] * stride, cy - dist[:, 1] * stride,
+                cx + dist[:, 2] * stride, cy + dist[:, 3] * stride,
+            ], axis=1))
+            all_scores.append(best_score[keep])
+            all_classes.append(best_cls[keep])
+
+        if not all_boxes:
+            return [_ShimResult([])]
+
+        boxes_xyxy = np.concatenate(all_boxes)
+        scores = np.concatenate(all_scores)
+        class_ids = np.concatenate(all_classes)
+
+        # Class-wise NMS, matching the on-chip builds' "cross classes: false" —
+        # a phone overlapping the hand holding it must not suppress either one.
+        keep_idx = []
+        for cls_id in np.unique(class_ids):
+            sel = np.nonzero(class_ids == cls_id)[0]
+            keep_idx.extend(sel[_nms(boxes_xyxy[sel], scores[sel], self._nms_iou)])
+
+        shim: list[_ShimBox] = []
+        for i in sorted(keep_idx, key=lambda j: -scores[j]):
+            x1, y1, x2, y2 = boxes_xyxy[i]
+            # Undo the letterbox: remove padding, then rescale to original pixels.
+            shim.append(_ShimBox(
+                np.asarray([
+                    min(max((x1 - left) / scale, 0.0), w),
+                    min(max((y1 - top) / scale, 0.0), h),
+                    min(max((x2 - left) / scale, 0.0), w),
+                    min(max((y2 - top) / scale, 0.0), h),
+                ]),
+                int(class_ids[i]), float(scores[i]),
+            ))
+        return [_ShimResult(shim)]
+
+    @property
+    def model_name(self) -> str:
+        """The .hef this instance actually loaded, for logs and captured samples.
+
+        Exists so callers can name the running detector without caring which
+        backend they hold: ultralytics' YOLO sets `model_name` to its weights
+        string, so `getattr(model, "model_name", weights)` now returns something
+        TRUE on both paths. Before this property it returned the ultralytics
+        weights name on the Hailo path too -- the driver_attention banner
+        announced "yolo11n.pt" while a DAMO-YOLO .hef was doing the work, which
+        is precisely the confidently-wrong log line that property was added to
+        stop printing.
+        """
+        return os.path.basename(self._hef_path)
 
     def close(self) -> None:
         """Release the Hailo device."""

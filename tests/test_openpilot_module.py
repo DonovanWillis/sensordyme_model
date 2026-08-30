@@ -17,7 +17,6 @@ from modules.driver_attention_openpilot import (
     OUTPUT_SIZE,
     DMonitoringModelResult,
     DriverMonitoring,
-    DriverStateResult,
     EventName,
     parse_driverstate,
 )

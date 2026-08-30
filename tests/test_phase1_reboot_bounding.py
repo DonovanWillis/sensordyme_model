@@ -23,7 +23,6 @@ WOULD have been issued.
 from __future__ import annotations
 
 import json
-from pathlib import Path
 
 import pytest
 
@@ -38,7 +37,7 @@ class _Recorder:
 
     def __call__(self, args, **_kwargs):
         self.calls.append(list(args))
-        return None
+        return
 
 
 @pytest.fixture()

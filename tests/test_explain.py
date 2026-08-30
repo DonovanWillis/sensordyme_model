@@ -16,7 +16,6 @@ from jupiter.explain import (
     CRITICAL,
     INFO,
     WARNING,
-    Explanation,
     explain,
     facts_from_event,
     humanise,
@@ -24,7 +23,7 @@ from jupiter.explain import (
     rule_summary,
     severity_for,
 )
-from jupiter.providers import ProviderResult, ScriptedProvider
+from jupiter.providers import ScriptedProvider
 
 FALL = {
     "type": "fall", "severity": "loud", "confidence": 0.94,

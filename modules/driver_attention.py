@@ -847,15 +847,49 @@ class DriverAttentionModule(VisionModule):
         self._yolo_weights = config.get("yolo_weights", "yolo11n.pt")
         self._yolo_every_n_frames = max(1, int(config.get("yolo_every_n_frames", 3)))
         # Kept in step with config.yaml's shipped value, so a config-less run
-        # behaves like the product. 0.35 (the previous default) measured 10.8%
-        # phone recall at 100% precision on held-out in-car imagery -- it
-        # missed close to nine phones in ten. 0.10 measures 51.7% / 95.8%.
-        # Not lower: 0.05 buys another 16 points of recall for 2.3 of
-        # precision, and the precision loss is NOT fully absorbed downstream --
-        # phone_use is protected by its 2.0s sustain gate, but "phone_detected"
-        # fires on the rising edge with no sustain at all and phone_risk feeds
-        # RiskFusion on mere visibility.
-        self._yolo_confidence_threshold = float(config.get("yolo_confidence_threshold", 0.10))
+        # behaves like the product.
+        #
+        # The number has moved twice, for different reasons. 0.35 measured 10.8%
+        # phone recall at 100% precision on held-out in-car imagery -- it missed
+        # close to nine phones in ten. Phase 1 lowered it to 0.10 (51.7% / 95.8%)
+        # on CPU YOLO11n. Phase 4 raises it to 0.20 on two findings the CPU
+        # measurement could not see:
+        #
+        #   1. An NMS-on-chip .hef has its score threshold COMPILED IN and
+        #      silently ignores anything lower (measured: a 0.200 floor on
+        #      yolov11n.hef). So 0.10 meant 0.10 on the raw-decode build and 0.20
+        #      on the on-chip build -- one config file describing two different
+        #      detectors. 0.20 is the lowest value that means itself on both.
+        #   2. On DAMO-YOLO 0.20 is the F1 optimum: 0.848 at 93.8% recall, against
+        #      66.2% recall at 0.35. Below it the raw-decode path turns noisy --
+        #      14 phone boxes on a single image at 0.10.
+        #
+        # Precision at 0.20 is ~77%, BELOW CPU YOLO11n's 95.8% at 0.10, and
+        # "phone_detected" still fires on the rising edge with no sustain gate.
+        # That is accepted deliberately rather than overlooked: a bare
+        # phone_detected is log-only by design (phone_alone_confidence 0.3 -- a
+        # dash-mounted GPS is legitimate), while the loud tier needs phone + hand
+        # overlap + eyes off road SUSTAINED. A false phone costs a log line; a
+        # missed phone costs the whole distraction chain. FN is the worse error.
+        self._yolo_confidence_threshold = float(config.get("yolo_confidence_threshold", 0.20))
+        # Person rides the same predict() pass but CANNOT share its threshold.
+        # One predict() takes one `conf`, and phone and person want opposite ends
+        # of it: DAMO-YOLO puts a spurious second person box on 51.5% of
+        # single-person images at 0.25, falling to 4.5% at 0.50 with person
+        # availability still 100%. Left on the phone threshold those phantom boxes
+        # reach _eating_boxes_near_face -- which picks the LARGEST person box as
+        # "the driver" -- and stretch face-loss patience from 2.5s out to
+        # face_lost_with_body_seconds (8.0s). So the pass runs at the low value
+        # and person is filtered up to its own threshold afterwards.
+        #
+        # Capped at 0.50, not DAMO's apparently free 0.60: config ships
+        # accelerator.required false, so any Hailo failure falls back to CPU
+        # YOLO11n, whose person availability at 0.60 is 86% -- one person in seven
+        # unseen. 0.50 is the last value acceptable on BOTH backends, and the
+        # threshold must stay correct on the fallback, not just the happy path.
+        self._person_confidence_threshold = float(
+            config.get("person_confidence_threshold", 0.50)
+        )
         self._yolo_class_map: dict[str, str] = dict(config.get("yolo_classes", {}))
         self._enable_hands = bool(config.get("enable_hands", True))
         self._hand_phone_iou_threshold = float(config.get("hand_phone_iou_threshold", 0.2))
@@ -971,9 +1005,16 @@ class DriverAttentionModule(VisionModule):
         if not self._object_detection_ready:
             self._object_detection_ready = True
             print(
+                # Names the model actually loaded, not a hardcoded one. This
+                # line said "YOLO11-nano" through the entire switch to DAMO-YOLO
+                # on the Hailo, which is exactly the sort of confidently wrong
+                # startup banner that makes a log worse than no log.
                 f"driver_attention: object detection ready "
-                f"(YOLO11-nano classes={list(self._yolo_class_map)}, hands={self._enable_hands}, "
-                f"conf>={self._yolo_confidence_threshold}, every {self._yolo_every_n_frames} frames)"
+                f"({getattr(self._yolo_model, 'model_name', self._yolo_weights)} "
+                f"classes={list(self._yolo_class_map)}, hands={self._enable_hands}, "
+                f"conf>={self._yolo_confidence_threshold} "
+                f"(person>={self._person_confidence_threshold}), "
+                f"every {self._yolo_every_n_frames} frames)"
             )
 
     def _update_object_detections(self, frame: np.ndarray) -> None:
@@ -1068,7 +1109,10 @@ class DriverAttentionModule(VisionModule):
             for box in result.boxes:
                 class_id = int(box.cls[0])
                 if class_id == _PERSON_CLASS:
-                    person_boxes.append(tuple(int(v) for v in box.xyxy[0].tolist()))
+                    # Filtered to person's OWN threshold, not the pass's -- see
+                    # _person_confidence_threshold for why they must differ.
+                    if float(box.conf[0]) >= self._person_confidence_threshold:
+                        person_boxes.append(tuple(int(v) for v in box.xyxy[0].tolist()))
                 event_type = self._yolo_class_ids.get(class_id)
                 if event_type is None:
                     continue

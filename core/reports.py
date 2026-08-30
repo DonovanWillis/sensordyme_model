@@ -11,10 +11,10 @@ from typing import Union
 import matplotlib
 
 matplotlib.use("Agg")
-import matplotlib.pyplot as plt  # noqa: E402
-from reportlab.lib.pagesizes import letter  # noqa: E402
-from reportlab.lib.units import inch  # noqa: E402
-from reportlab.pdfgen import canvas  # noqa: E402
+import matplotlib.pyplot as plt
+from reportlab.lib.pagesizes import letter
+from reportlab.lib.units import inch
+from reportlab.pdfgen import canvas
 
 
 def load_events(csv_path: Union[str, Path]) -> list[dict]:

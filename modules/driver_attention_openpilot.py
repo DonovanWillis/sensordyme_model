@@ -681,7 +681,7 @@ class _OnnxDMModel:
     from pathlib import Path
     path = Path(model_path)
     if not path.exists():
-      print(f"driver_attention_openpilot: downloading dmonitoring_model.onnx (~16MB, one-time)")
+      print("driver_attention_openpilot: downloading dmonitoring_model.onnx (~16MB, one-time)")
       import urllib.request
       urllib.request.urlretrieve(_MODEL_URL, path)
     # Provider list comes from the environment so deployments can opt into other

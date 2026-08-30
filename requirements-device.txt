@@ -1,0 +1,54 @@
+# SensorDyme SHIPPING dependencies — this is the set installed on a device we
+# convey to a customer (setup_pi.sh, and `make deploy` on every update after).
+# Python 3.11+ required (mediapipe does not yet support 3.13+).
+#
+# WHY THIS FILE IS SEPARATE FROM requirements.txt.
+# `ultralytics` is AGPL-3.0. SensorDyme both conveys the software on hardware and
+# serves inference over a network from it (the MJPEG dashboard in
+# core/dashboard.py), so AGPL §13 and the §4/§6 conveying obligations both apply
+# — which makes shipping it a commercial-release blocker, not a style question.
+# See docs/LICENSING.md for the full analysis.
+#
+# So the split is by DESTINATION, not by role: everything here reaches customer
+# hardware; requirements.txt adds what only a developer machine and CI need.
+# Nothing AGPL- or GPL-licensed may be added to this file without a licence
+# review. tests/test_phase4_no_agpl_runtime.py enforces the ultralytics/torch
+# exclusion mechanically.
+#
+# The device detects on the AI HAT+ (core/accel.py's HailoYOLO, which does its
+# own letterboxing, DFL decode and NMS against a compiled .hef and needs no
+# inference framework). With no accelerator AND no ultralytics there is no
+# detector at all, and core.detectors.get_yolo_model raises a message saying so
+# rather than degrading silently.
+
+mediapipe==0.10.14
+opencv-python==4.10.0.84
+numpy==1.26.4
+pyyaml==6.0.2
+matplotlib==3.9.2
+reportlab==4.2.5
+simpleaudio==1.0.4
+pytest==8.3.3
+anthropic==0.116.0 # mac_max VLM judge (provider: anthropic); harmless (unused) on the Pi
+
+# Direct pin, not incidental. requirements.txt used to note this was "already a
+# transitive dep of ultralytics" — with ultralytics gone from the device that
+# free ride is over, and core/uplink.py + the VLM judge still need it.
+requests==2.34.2
+
+# openpilot driver-monitoring module (modules/driver_attention_openpilot.py).
+# Installs on both Mac (dev) and Pi (aarch64 wheels) — on the Pi with the NoIR
+# camera at dash height, the openpilot DM model runs close to its native
+# training conditions (IR driver-facing dash cam), unlike a laptop webcam.
+# onnxruntime is MIT: it is an inference runtime, not a model, and carries none
+# of ultralytics' copyleft.
+onnxruntime==1.27.0
+
+# --- Raspberry Pi only extras ---
+# These are installed separately by setup_pi.sh. picamera2 ships as an apt
+# package on Pi OS (python3-picamera2) and is NOT pip-installable on Mac;
+# gpiozero is likewise Pi-only. Do not add them above this line.
+#
+#   picamera2   (apt: python3-picamera2)
+#   gpiozero==2.0.1
+#   lgpio==0.2.2.0

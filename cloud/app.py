@@ -33,12 +33,14 @@ from pathlib import Path
 from typing import Optional
 
 import jwt
-from cloud import mdns
-from cloud.notify import COOLDOWN_S as NOTIFY_COOLDOWN_S, gate
-from cloud.ratelimit import CLAIM_LIMITER, LOGIN_LIMITER, SIGNUP_LIMITER
-from core.presets import load_presets, resolve_preset, same_preset
 from fastapi import BackgroundTasks, Depends, FastAPI, Header, HTTPException, Request
 from pydantic import BaseModel
+
+from cloud import mdns
+from cloud.notify import COOLDOWN_S as NOTIFY_COOLDOWN_S
+from cloud.notify import gate
+from cloud.ratelimit import CLAIM_LIMITER, LOGIN_LIMITER, SIGNUP_LIMITER
+from core.presets import load_presets, resolve_preset, same_preset
 
 DB_PATH = os.environ.get("SENSORDYME_DB", str(Path(__file__).parent / "sensordyme.db"))
 JWT_TTL_S = 30 * 24 * 3600
@@ -350,7 +352,7 @@ def current_user(payload: dict = Depends(current_token)) -> int:
     uid = payload["uid"]
     # Not `isinstance(uid, int)` alone: bool is a subclass of int, and
     # `True` would otherwise authenticate as user 1.
-    if type(uid) is not int:  # noqa: E721 - bool must not pass as an int here
+    if type(uid) is not int:
         raise HTTPException(401, "invalid token: uid claim is not a user id")
     return uid
 

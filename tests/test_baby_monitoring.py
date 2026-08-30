@@ -4,7 +4,7 @@ import numpy as np
 import pytest
 
 from core.activity import ActivityState, Attribute
-from core.hand_perception import HandPerceptionResult, UNKNOWN_OBJECT
+from core.hand_perception import UNKNOWN_OBJECT, HandPerceptionResult
 from core.tracking import TrackedBox
 from modules.baby_monitoring import BabyMonitoringModule
 

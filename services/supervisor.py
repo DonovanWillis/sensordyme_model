@@ -15,7 +15,6 @@ requires bouncing the rest.
 from __future__ import annotations
 
 import threading
-import time
 from typing import Optional
 
 from core.health import HealthMonitor
@@ -89,7 +88,7 @@ class Service:
             try:
                 self.run(stop)
                 return  # clean exit
-            except Exception as exc:  # noqa: BLE001 - a service crash must never kill the device
+            except Exception as exc:
                 log.error("service %s crashed: %s", self.name, exc, exc_info=True)
                 if self._health is not None:
                     self._health.report_failure(self.name, f"crashed: {exc}")

@@ -18,6 +18,21 @@ core/taxonomy.py under `baby_monitoring`. The short version:
   landmark: this module still does not claim to see an actual mouth, on the
   same infant-face-model grounds as the DELIBERATELY NOT CLAIMED list below.
 
+  WHICH PERSON IS THE BABY: choking-hazard scoring is the one thing here that
+  reasons about the CHILD's own geometry rather than "the person in frame", so
+  it needs a target, and it now has to EARN one — see InfantIdentifier below.
+  Crib/safe-zone containment, temporal identity, size/position stability and
+  relative scale are combined into an explicit decision with a confidence, and
+  when no person in frame earns the label the module DECLINES TO SCORE and
+  says so (an `infant_unidentified` event, a telemetry column, a
+  get_debug_state() breakdown, an on-screen banner) rather than scoring an
+  adult. It replaces a "the smallest box is the baby" heuristic that always
+  returned something, and therefore silently scored the caregiver whenever the
+  infant's box dropped out. Identification is strongest when the user has drawn
+  a crib safe zone; with none configured (config.yaml's shipped default) it
+  falls back to temporal identity alone, caps its reported confidence, and
+  says which it is doing.
+
   DELIBERATELY NOT CLAIMED: face-covered / face-down detection (adult face
   models are not reliable enough on infants for a safety-critical claim),
   sleeping vs awake, crying (no microphone), or NAMING which small object is
@@ -50,18 +65,24 @@ import numpy as np
 
 from core.accel import COCO_NAMES
 from core.activity import (
-    ActivityRecognizer,
-    ActivityState,
     FLAIL_MIN_PEAK_ACCEL,
     FLAIL_MIN_PEAK_SPEED,
     FLAIL_MIN_REVERSAL_AMPLITUDE,
     FLAIL_MIN_REVERSALS,
+    ActivityRecognizer,
+    ActivityState,
 )
 from core.detections import Detection, DetectionFrame
 from core.detectors import get_yolo_model, iou, upper_region
 from core.event_engine import CONFIRMED, RESOLVED, EventEngine, RuleSpec
 from core.events import Event
-from core.hand_perception import HandPerceptionEngine, HandPerceptionResult, UNKNOWN_OBJECT, association_score
+from core.hand_perception import (
+    UNKNOWN_OBJECT,
+    HandPerceptionEngine,
+    HandPerceptionResult,
+    association_score,
+)
+from core.logging_setup import get_logger
 from core.tracking import BoxTracker
 from core.zones import Zone, load_zones
 from modules.base import VisionModule, register_module
@@ -166,31 +187,480 @@ class ChokingHazardAssessment:
     reason: str = "nothing held"
 
 
-def _infer_baby_box(
-    boxes: list[tuple[int, int, int, int]],
-) -> Optional[tuple[int, int, int, int]]:
-    """Which detected person box is (most likely) the baby's, when more than
-    one person is in frame.
+# --- positive infant identification -----------------------------------------
+# REPLACES the original `_infer_baby_box`, which returned the SMALLEST person
+# box as "the baby". That was a guess dressed as an answer: it always returned
+# something, so when a marginal-confidence infant box fell below the detector
+# threshold while a caregiver was in frame, the CAREGIVER became "the baby" and
+# choking-hazard risk was scored against an adult's mouth region and body
+# diagonal. Measured: one byte-identical real hazard (a small object held at
+# the infant's mouth, association 0.38) either fired or was missed purely
+# according to where the adult happened to be standing --
+#
+#     caregiver leaning over the crib .......... 0.380  FIRES
+#     caregiver close to camera, filling frame . 0.345  FIRES
+#     caregiver standing beside the crib ....... 0.314  FIRES
+#     caregiver across the room, left .......... 0.238  MISSED
+#     caregiver across the room, seated ........ 0.198  MISSED
+#     caregiver in the far corner, small ....... 0.000  MISSED ENTIRELY
+#
+# -- a safety decision that was non-deterministic with respect to the hazard
+# itself. It gets worse, not better, on the NPU: the Hailo backend produces
+# more spurious multi-person boxes than CPU (12.7% vs 7.2% on single-person
+# images, measured on hardware), so the wrong-target path triggers MORE often
+# there.
+#
+# What replaces it is positive identification: a candidate has to earn the
+# label "infant" from evidence, and when no candidate earns it the module says
+# so and DECLINES TO SCORE rather than scoring an adult. Declining is not the
+# rejected `if len(boxes) == 1: return None` one-liner -- that trades a
+# wrong-target score for a silent no-score, and person_absent does not cover it
+# (a caregiver in frame means the frame is emphatically not person-absent).
+# This decline is a reasoned outcome with a stated reason, a confidence, a
+# per-signal breakdown in get_debug_state(), a telemetry column, an on-screen
+# banner, AND its own `infant_unidentified` event, so an operator can see that
+# monitoring is degraded instead of mistaking silence for safety.
 
-    This module has never distinguished a caregiver from the child by
-    detection alone (unusual_stillness, zone checks, "holding" — all already
-    apply to "the person in frame" generically; core/taxonomy.py's own
-    `unattended` entry discloses this exact limitation). For mouth-proximity
-    risk specifically the choice matters, so: the SMALLEST box is treated as
-    the baby's, since an infant occupies a much smaller fraction of frame
-    than an adult at any camera distance/mounting this product ships with.
-    An honest geometric approximation, not a classifier — if it guesses
-    wrong (e.g. a caregiver crouched far from camera reads smaller than a
-    baby close to it), risk scoring is computed against the wrong box for
-    that frame rather than failing safe silently; disclosed in
-    core/taxonomy.py alongside every other box-only heuristic here.
+#: How much of a candidate's box must lie inside a user-drawn SAFE zone (the
+#: crib/play area) before it can be the infant at all. Deliberately near-total
+#: containment rather than "the feet point is inside": an infant in a crib is
+#: ENTIRELY within the crib region, while an adult leaning into it is not --
+#: measured on the sweep placements above, the leaning caregiver sits at 0.80
+#: containment and every other placement well below that, so 0.85 separates
+#: "in the crib" from "reaching into the crib" with margin on both sides. The
+#: 0.15 slack absorbs a box that overhangs a hand-drawn polygon slightly.
+INFANT_ZONE_MIN_CONTAINMENT = 0.85
+#: Track age at which the persistence signal saturates. The infant is the
+#: subject that has been there continuously; a caregiver arrives and leaves.
+INFANT_PERSISTENCE_FULL_S = 5.0
+#: How much recent history the size/position stability signal looks at.
+INFANT_STABILITY_WINDOW_S = 2.0
+#: Box-diagonal drift (as a fraction of the mean diagonal) and centroid drift
+#: (in diagonals) at which the stability signal reaches zero. An infant's box
+#: is small AND holds its size and place; an adult's changes fast as they move.
+INFANT_SIZE_DRIFT_FULL = 0.4
+INFANT_POSITION_DRIFT_FULL = 0.75
+#: Frame fraction at which the "small subject" prior reaches zero. Weakest of
+#: the signals ON PURPOSE and weighted accordingly -- a caregiver across the
+#: room is genuinely smaller in frame than an infant close to the lens, which
+#: is exactly how the old smallest-box heuristic failed. It informs, it never
+#: decides.
+INFANT_FRAME_FRACTION_FULL = 0.25
+#: Relative weights of the identification signals, in the task's own order of
+#: expected value. A signal that cannot be computed this frame (no safe zone
+#: configured, too little history for stability, only one person in frame for
+#: relative scale) is DROPPED and the remaining weights renormalized, rather
+#: than being scored as zero -- "not measurable" and "measured badly" are
+#: different facts, and conflating them is how the old heuristic got confident
+#: about a guess.
+INFANT_ID_WEIGHTS = {"zone": 0.50, "persistence": 0.20, "stability": 0.20, "scale": 0.10}
+#: How fast a track's box may change size (fraction of its own diagonal per
+#: second) and move (its own diagonals per second) and still be believed to be
+#: the SAME subject. Beyond either, the identity claim is broken and the track
+#: has to earn the infant label again from scratch.
+#:
+#: This is not belt-and-braces, it is load-bearing. core/tracking.py's matcher
+#: is nearest-centroid within 1.2 box diagonals and is read-only from here --
+#: measured, it happily re-matches EVERY one of the six caregiver placements
+#: onto the infant's own track the frame the infant's box drops out (the far
+#: corner caregiver, 500px away, still lands at 1.01 diagonals). Without this
+#: check the caregiver silently INHERITS the infant's track id and its
+#: accumulated age, and temporal identity -- the strongest signal available
+#: with no crib zone drawn -- hands the wrong-target bug straight back. The
+#: documented failure mode of a centroid matcher ("two ids swap when people
+#: cross") is merely visible and bounded elsewhere in this product; here it is
+#: a safety decision, so it gets checked rather than tolerated.
+#:
+#: Generous on purpose: a squirming infant, a rolling one (rolling changes a
+#: box's aspect, not its diagonal), and ordinary detector wobble all sit far
+#: below these, while the measured swaps sit far above (slowest: 1.85/s size,
+#: 8.8/s movement). A false break costs one re-qualification, which with a
+#: crib zone configured completes on the very next frame.
+INFANT_IDENTITY_MAX_SIZE_RATE = 2.0
+INFANT_IDENTITY_MAX_MOVE_RATE = 1.5
+#: Bonus for the track already established as the infant. This is temporal
+#: identity, the strongest signal available with no safe zone configured (and
+#: config.yaml ships `zones: {}`): once a subject has been identified as the
+#: infant, it stays the infant for as long as its track lives, and every OTHER
+#: person seen in frame ALONGSIDE it is recorded as definitively not-the-infant
+#: -- so when the infant's box drops out, the caregiver standing there cannot
+#: inherit the label no matter how small or still they are.
+INFANT_INCUMBENCY_BONUS = 0.35
+#: A candidate must reach this to be called the infant...
+INFANT_ID_MIN_CONFIDENCE = 0.5
+#: ...and must beat the runner-up by this much. Two candidates equally
+#: consistent with an infant means the module does not know which is which,
+#: and saying so is the entire point of this rewrite.
+INFANT_ID_MIN_MARGIN = 0.12
+#: With NO safe zone configured, a candidate that is not already the incumbent
+#: must be observed at least this long before it can be identified at all --
+#: there is no geometry to appeal to, so persistence has to be earned rather
+#: than assumed. Costs a short warm-up at startup; buys not labelling whichever
+#: person happens to be in the first frame "the baby".
+INFANT_NO_ZONE_MIN_OBSERVATION_S = 3.0
+#: How long a track that had the infant's identity BROKEN on it (see
+#: _identity_broken) is barred from being called the infant again on temporal
+#: evidence alone. A continuity break means "the box on this track is not the
+#: subject that was on it a moment ago", so the survivor is a different person
+#: until proven otherwise -- but a permanent bar is unsafe in the other
+#: direction (a genuine infant whose own box jumps past the rate limits would
+#: be disqualified forever), so it expires.
+#:
+#: Deliberately LONGER than infant_unidentified_warn_s (20s): with no crib zone
+#: there is no geometry to appeal to, and a lone stationary adult really is
+#: indistinguishable from a baby by box shape alone -- that is an information
+#: limit, not a bug to code around. So the operator is TOLD monitoring is
+#: degraded before the module resumes scoring at capped confidence, rather than
+#: after. Zone-qualified candidates bypass the quarantine entirely: crib
+#: containment is independent positive evidence, not an assumption.
+log = get_logger("baby_monitoring")
+
+INFANT_REACQUIRE_S = 30.0
+
+#: How much earlier than `infant_reacquire_s` the `infant_unidentified` warning
+#: must land. Not cosmetic: if the warning arrives after the quarantine expires,
+#: scoring resumes against a person the module was not confident about while the
+#: operator has still heard nothing. A margin rather than a bare `<` so the two
+#: cannot land in the same frame and race.
+_WARN_BEFORE_REACQUIRE_MARGIN_S = 5.0
+#: ...and identification confidence is capped, because without a crib zone
+#: this is persistence and stability only. Above INFANT_ID_MIN_CONFIDENCE (so
+#: the module still works out of the box) but visibly short of certain, and
+#: the reason string says why.
+INFANT_NO_ZONE_MAX_CONFIDENCE = 0.6
+
+
+@dataclass(frozen=True)
+class InfantIdentification:
+    """Which person box is the infant's, how sure the module is, and why.
+
+    `identified=False` with `box=None` is a first-class, REPORTED outcome, not
+    an error path: it means people are in frame but none of them earned the
+    label, so nothing infant-specific (choking-hazard risk above all) may be
+    scored this frame. Everything the decision was made from travels with it,
+    for get_debug_state() and the operator-facing event.
     """
-    if not boxes:
+
+    box: Optional[tuple[int, int, int, int]]
+    identified: bool
+    confidence: float
+    reason: str
+    signals: dict
+    people_in_frame: int = 0
+    eligible: int = 0
+    track_id: Optional[int] = None
+    rejected: tuple[str, ...] = ()
+
+
+def _zone_containment(
+    box: tuple[float, float, float, float], zones: list[Zone],
+    frame_w: int, frame_h: int, samples: int = 5,
+) -> float:
+    """Fraction of `box` lying inside the union of `zones`, by grid sampling.
+
+    Deliberately an AREA fraction rather than core/zones.py's own
+    `contains_box` feet-point test. The feet point answers "is this person
+    standing in the area", which is the right question for a restricted zone
+    and the wrong one here: an adult leaning over a crib has their feet on the
+    floor beside it (feet-point outside, so the test would say "not in the
+    crib") while an adult crouched at the crib side may put their feet inside
+    it. How much of the SUBJECT is in the crib is the question that actually
+    separates "the infant lying in the crib" from "the caregiver reaching into
+    it", and it degrades gracefully instead of flipping on one pixel.
+    """
+    x1, y1, x2, y2 = box
+    if not zones or x2 <= x1 or y2 <= y1:
+        return 0.0
+    fw, fh = max(frame_w, 1), max(frame_h, 1)
+    inside = 0
+    for i in range(samples):
+        px = (x1 + (x2 - x1) * (i + 0.5) / samples) / fw
+        for j in range(samples):
+            py = (y1 + (y2 - y1) * (j + 0.5) / samples) / fh
+            if any(zone.contains(px, py) for zone in zones):
+                inside += 1
+    return inside / float(samples * samples)
+
+
+def _shape_stability(history: "deque[tuple[float, float, float, float]]") -> Optional[float]:
+    """[0, 1] from recent (t, cx, cy, diagonal) samples: how little this box has
+    changed size or moved, in its own diagonal units so it means the same thing
+    near or far from the camera. None when there is too little history to say --
+    an honestly unavailable signal, not a zero one.
+    """
+    if len(history) < 3:
         return None
-    def _area(box: tuple[int, int, int, int]) -> int:
-        x1, y1, x2, y2 = box
-        return max(0, x2 - x1) * max(0, y2 - y1)
-    return min(boxes, key=_area)
+    diagonals = [sample[3] for sample in history]
+    mean_diagonal = sum(diagonals) / len(diagonals)
+    if mean_diagonal <= 1e-6:
+        return None
+    size_drift = (max(diagonals) - min(diagonals)) / mean_diagonal
+    _, x0, y0, _ = history[0]
+    position_drift = max(
+        math.hypot(sample[1] - x0, sample[2] - y0) for sample in history
+    ) / mean_diagonal
+    return max(0.0, 1.0 - 0.5 * (
+        min(1.0, size_drift / INFANT_SIZE_DRIFT_FULL)
+        + min(1.0, position_drift / INFANT_POSITION_DRIFT_FULL)
+    ))
+
+
+def _scale_score(area: float, frame_area: float, largest_area: float) -> float:
+    """[0, 1] "reads like a small subject": part frame fraction, part size
+    relative to the largest person in frame. The relative half is unavailable
+    (and omitted) when this IS the largest box, which is the single-person
+    case the old heuristic silently got wrong."""
+    frame_score = max(0.0, 1.0 - (area / max(frame_area, 1.0)) / INFANT_FRAME_FRACTION_FULL)
+    if largest_area <= area or largest_area <= 0:
+        return frame_score
+    return (frame_score + (largest_area - area) / largest_area) / 2.0
+
+
+class InfantIdentifier:
+    """Decides, each frame, which person box is the infant's -- or that none is.
+
+    Stateful on purpose: the two strongest signals available here are temporal
+    (how long has this subject been there; is this the same subject as last
+    frame), and neither exists in a single frame's list of boxes. Person boxes
+    go through core/tracking.py's BoxTracker (read-only, shared with the rest of
+    the product) so "the same subject" is a real, id-bearing claim rather than
+    a coincidence of ordering.
+    """
+
+    def __init__(
+        self, safe_zones: list[Zone], *,
+        min_containment: float = INFANT_ZONE_MIN_CONTAINMENT,
+        min_confidence: float = INFANT_ID_MIN_CONFIDENCE,
+        min_margin: float = INFANT_ID_MIN_MARGIN,
+        min_observation_s: float = INFANT_NO_ZONE_MIN_OBSERVATION_S,
+        reacquire_s: float = INFANT_REACQUIRE_S,
+    ) -> None:
+        self.safe_zones = list(safe_zones)
+        self.min_containment = min_containment
+        self.min_confidence = min_confidence
+        self.min_margin = min_margin
+        self.min_observation_s = min_observation_s
+        self.reacquire_s = reacquire_s
+        self._tracker = BoxTracker()
+        self._history: dict[int, deque] = {}
+        #: When each track's identity last (re)started -- normally its
+        #: first_seen, but reset by a continuity break so a track that has had
+        #: somebody else's box grafted onto it cannot spend the previous
+        #: subject's accumulated age. See _identity_broken.
+        self._identity_since: dict[int, float] = {}
+        #: The track currently believed to be the infant, or None.
+        self._infant_track_id: Optional[int] = None
+        #: Track id -> time until which it may not be called the infant on
+        #: temporal evidence, after the infant's identity broke on it. See
+        #: INFANT_REACQUIRE_S.
+        self._quarantine: dict[int, float] = {}
+        #: Tracks seen in frame AT THE SAME TIME as an identified infant, and
+        #: therefore known to be somebody else. This is what stops a caregiver
+        #: inheriting the label the moment the infant's box drops out.
+        self._not_the_infant: set[int] = set()
+
+    @staticmethod
+    def _identity_broken(
+        previous: tuple[float, float, float, float],
+        cx: float, cy: float, diagonal: float, now: float,
+    ) -> bool:
+        """Has this track's box changed too fast to still be the same subject?
+
+        Rates, not per-frame deltas, so the answer does not depend on the frame
+        interval (this module already runs detection every Nth frame, and
+        `now` is caller-supplied). See INFANT_IDENTITY_MAX_SIZE_RATE.
+        """
+        prev_t, px, py, prev_diagonal = previous
+        dt = now - prev_t
+        if dt <= 0 or prev_diagonal <= 1e-6:
+            return False
+        size_rate = abs(diagonal - prev_diagonal) / prev_diagonal / dt
+        move_rate = math.hypot(cx - px, cy - py) / prev_diagonal / dt
+        return size_rate > INFANT_IDENTITY_MAX_SIZE_RATE or move_rate > INFANT_IDENTITY_MAX_MOVE_RATE
+
+    def update(
+        self, boxes: list[tuple[int, int, int, int]], confidences: list[float],
+        w: int, h: int, now: float,
+    ) -> InfantIdentification:
+        aspect = w / max(h, 1)
+        detections = [
+            ("person", tuple(box), confidences[i] if i < len(confidences) else 1.0)
+            for i, box in enumerate(boxes)
+        ]
+        matched = self._tracker.update(detections, now, aspect)
+        live = {track.track_id for track in self._tracker.tracks}
+        self._not_the_infant &= live
+        self._history = {tid: hist for tid, hist in self._history.items() if tid in live}
+        self._identity_since = {tid: t for tid, t in self._identity_since.items() if tid in live}
+        self._quarantine = {tid: t for tid, t in self._quarantine.items() if tid in live}
+        if self._infant_track_id is not None and self._infant_track_id not in live:
+            # The tracker has given up on it (past its own lost_grace_s), so the
+            # infant must be positively re-identified rather than assumed.
+            self._infant_track_id = None
+
+        for track in matched:
+            history = self._history.setdefault(track.track_id, deque())
+            cx, cy = track.centroid
+            if history and self._identity_broken(history[-1], cx, cy, track.diagonal, now):
+                # Somebody else's box has almost certainly been grafted onto
+                # this track. Forget everything the track had accumulated: it
+                # is an unknown subject again, and must re-qualify.
+                history.clear()
+                self._identity_since[track.track_id] = now
+                if self._infant_track_id == track.track_id:
+                    self._infant_track_id = None
+                    self._quarantine[track.track_id] = now + self.reacquire_s
+            self._identity_since.setdefault(track.track_id, track.first_seen)
+            history.append((now, cx, cy, track.diagonal))
+            while history and now - history[0][0] > INFANT_STABILITY_WINDOW_S:
+                history.popleft()
+
+        if not matched:
+            return InfantIdentification(
+                box=None, identified=False, confidence=0.0,
+                reason="no person detected in frame", signals={}, people_in_frame=0,
+            )
+
+        # Only tracks matched THIS frame are candidates. A track kept alive
+        # through a miss has its last box FROZEN in place, and scoring a
+        # safety decision against a position that has not actually been
+        # re-observed is precisely the stale-state failure this whole change
+        # exists to remove (the module already applies the same rule to its
+        # item tracker, see `matched_this_frame` in _reason).
+        frame_area = float(max(w, 1) * max(h, 1))
+        areas = {
+            track.track_id: float(max(0, track.box[2] - track.box[0]) * max(0, track.box[3] - track.box[1]))
+            for track in matched
+        }
+        largest_area = max(areas.values())
+
+        scored: list[tuple[float, object, dict]] = []
+        rejected: list[str] = []
+        every_candidate: list[dict] = []
+        for track in matched:
+            # NOT track.age_s: a track whose identity was broken above spends
+            # its own time, not the previous subject's. See _identity_broken.
+            age_s = max(0.0, now - self._identity_since.get(track.track_id, track.first_seen))
+            signals: dict = {
+                "track_id": track.track_id,
+                "age_s": round(age_s, 2),
+                "detection_confidence": round(track.confidence, 3),
+            }
+            available: dict[str, float] = {}
+            reject: Optional[str] = None
+
+            if track.track_id in self._not_the_infant:
+                reject = "seen in frame alongside the infant, so this is somebody else"
+
+            zone_qualified = False
+            if self.safe_zones:
+                containment = _zone_containment(track.box, self.safe_zones, w, h)
+                signals["zone_containment"] = round(containment, 3)
+                available["zone"] = containment
+                zone_qualified = containment >= self.min_containment
+                if reject is None and not zone_qualified:
+                    reject = f"only {containment:.0%} inside the safe zone (needs {self.min_containment:.0%})"
+
+            # Crib containment is independent positive evidence, so it clears a
+            # quarantine; temporal evidence alone does not, because temporal
+            # evidence is exactly what the continuity break invalidated.
+            quarantined_until = self._quarantine.get(track.track_id, 0.0)
+            if reject is None and not zone_qualified and quarantined_until > now:
+                reject = (
+                    "the infant's identity broke on this track, so it is a different subject "
+                    f"until re-established ({quarantined_until - now:.0f}s left)"
+                )
+
+            persistence = min(1.0, age_s / INFANT_PERSISTENCE_FULL_S)
+            signals["persistence"] = round(persistence, 3)
+            available["persistence"] = persistence
+
+            stability = _shape_stability(self._history.get(track.track_id, deque()))
+            signals["stability"] = None if stability is None else round(stability, 3)
+            if stability is not None:
+                available["stability"] = stability
+
+            scale = _scale_score(areas[track.track_id], frame_area, largest_area)
+            signals["scale"] = round(scale, 3)
+            available["scale"] = scale
+
+            incumbent = track.track_id == self._infant_track_id
+            signals["incumbent"] = incumbent
+            if (
+                reject is None and not self.safe_zones and not incumbent
+                and age_s < self.min_observation_s
+            ):
+                reject = (
+                    f"no safe zone configured and only observed for {age_s:.1f}s "
+                    f"(needs {self.min_observation_s:.1f}s to identify positively)"
+                )
+
+            weight_total = sum(INFANT_ID_WEIGHTS[name] for name in available)
+            base = (
+                sum(INFANT_ID_WEIGHTS[name] * value for name, value in available.items()) / weight_total
+                if weight_total > 0 else 0.0
+            )
+            score = min(1.0, base + (INFANT_INCUMBENCY_BONUS if incumbent else 0.0))
+            signals["score"] = round(score, 3)
+            every_candidate.append(signals)
+            if reject is not None:
+                signals["rejected"] = reject
+                rejected.append(f"#{track.track_id}: {reject}")
+            else:
+                scored.append((score, track, signals))
+
+        all_signals = {"candidates": every_candidate}
+        if not scored:
+            return InfantIdentification(
+                box=None, identified=False, confidence=0.0,
+                reason="no person in frame could be positively identified as the infant",
+                signals=all_signals, people_in_frame=len(matched), eligible=0,
+                rejected=tuple(rejected),
+            )
+
+        scored.sort(key=lambda item: item[0], reverse=True)
+        best_score, best_track, _ = scored[0]
+        cap = 1.0 if self.safe_zones else INFANT_NO_ZONE_MAX_CONFIDENCE
+        confidence = min(best_score, cap)
+
+        if best_score < self.min_confidence:
+            return InfantIdentification(
+                box=None, identified=False, confidence=round(confidence, 3),
+                reason=(
+                    f"best candidate scored {best_score:.2f}, below the "
+                    f"{self.min_confidence:.2f} needed to call it the infant"
+                ),
+                signals=all_signals, people_in_frame=len(matched), eligible=len(scored),
+                rejected=tuple(rejected),
+            )
+        if len(scored) > 1 and best_score - scored[1][0] < self.min_margin:
+            return InfantIdentification(
+                box=None, identified=False, confidence=round(confidence, 3),
+                reason=(
+                    f"{len(scored)} people are equally consistent with being the infant "
+                    f"({best_score:.2f} vs {scored[1][0]:.2f}) -- cannot tell them apart"
+                ),
+                signals=all_signals, people_in_frame=len(matched), eligible=len(scored),
+                rejected=tuple(rejected),
+            )
+
+        self._infant_track_id = best_track.track_id
+        for track in matched:
+            if track.track_id != best_track.track_id:
+                self._not_the_infant.add(track.track_id)
+        reason = (
+            f"identified (track #{best_track.track_id}, score {best_score:.2f})"
+            if self.safe_zones else
+            f"identified (track #{best_track.track_id}, score {best_score:.2f}); no safe zone "
+            f"configured, so this rests on persistence and stability alone -- draw a crib "
+            f"safe zone for a stronger identification"
+        )
+        return InfantIdentification(
+            box=tuple(int(v) for v in best_track.box), identified=True,
+            confidence=round(confidence, 3), reason=reason, signals=all_signals,
+            people_in_frame=len(matched), eligible=len(scored), track_id=best_track.track_id,
+            rejected=tuple(rejected),
+        )
 
 
 def _size_factor(object_diagonal: float, hand_diagonal: float) -> float:
@@ -237,6 +707,7 @@ def _assess_choking_hazard(
     hand_track,
     baby_box: Optional[tuple[int, int, int, int]],
     aspect: float,
+    no_baby_reason: str = "no baby detected in frame this frame",
 ) -> ChokingHazardAssessment:
     """Everything about one hand's held object that matters for choking-hazard
     risk, computed from signals this module already has (hand-object
@@ -249,6 +720,12 @@ def _assess_choking_hazard(
     able to paper over a weak one on another. A large, stationary,
     far-from-the-mouth object must not score high just because it happens to
     be confidently tracked.
+
+    `baby_box=None` means the caller (InfantIdentifier) could not positively
+    identify the infant, and `no_baby_reason` carries WHY -- "nobody in frame"
+    and "people in frame but none of them is identifiably the infant" are very
+    different situations for an operator, and the second one used to be scored
+    against an adult instead of reported.
     """
     if assoc is None:
         return ChokingHazardAssessment(side=side, held=False, reason="nothing held")
@@ -256,7 +733,7 @@ def _assess_choking_hazard(
     if baby_box is None:
         return ChokingHazardAssessment(
             side=side, held=True, object_label=object_track.label, object_track_id=object_track.track_id,
-            association_confidence=association_confidence, reason="no baby detected in frame this frame",
+            association_confidence=association_confidence, reason=no_baby_reason,
         )
     x1, y1, x2, y2 = baby_box
     baby_diagonal = math.hypot((x2 - x1) * aspect, y2 - y1)
@@ -592,6 +1069,60 @@ class BabyMonitoringModule(VisionModule):
         # ChokingHazardAssessment for why the full breakdown is kept, not just
         # a pass/fail bit.
         self._last_choking_assessments: dict[str, ChokingHazardAssessment] = {}
+
+        # --- who is the baby? See InfantIdentifier. Everything infant-specific
+        # (currently choking-hazard risk scoring, the only thing that reasons
+        # about the child's own geometry rather than "the person in frame")
+        # goes through this, and it is allowed to answer "I don't know".
+        self._infant_identifier = InfantIdentifier(
+            [z for z in self._zones if z.kind == "safe"],
+            min_containment=float(config.get("infant_zone_min_containment", INFANT_ZONE_MIN_CONTAINMENT)),
+            min_confidence=float(config.get("infant_identification_min_confidence", INFANT_ID_MIN_CONFIDENCE)),
+            min_margin=float(config.get("infant_identification_min_margin", INFANT_ID_MIN_MARGIN)),
+            min_observation_s=float(
+                config.get("infant_min_observation_s", INFANT_NO_ZONE_MIN_OBSERVATION_S)
+            ),
+            reacquire_s=float(config.get("infant_reacquire_s", INFANT_REACQUIRE_S)),
+        )
+        self._last_infant_identification = InfantIdentification(
+            box=None, identified=False, confidence=0.0,
+            reason="no frame processed yet", signals={},
+        )
+        # Declining to score has to be VISIBLE or it is just a quieter version
+        # of the bug it replaces. People in frame with none of them identifiable
+        # as the infant means choking-hazard scoring is paused, which the
+        # operator needs told -- and person_absent explicitly does NOT cover it,
+        # because the frame is not person-absent. Long persist_s and a long
+        # cooldown on purpose: a caregiver lifting the baby out of the crib for
+        # a nappy change is a normal minute of not-knowing, not an alert.
+        #
+        # The warning MUST arrive before scoring can silently resume. Both this
+        # and infant_reacquire_s are independently settable from config, and
+        # nothing else compares them -- so a deployment could set the warning
+        # longer than the quarantine and get a window in which the module has
+        # started scoring choking hazards against a person it was not confident
+        # about, while still reporting nothing. That is the exact silent
+        # degradation this alert exists to prevent, reintroduced through a YAML
+        # file. Clamped rather than accepted, and said out loud: a config that
+        # cannot do what it asks for should not fail quietly either.
+        reacquire_s = self._infant_identifier.reacquire_s
+        warn_s = float(config.get("infant_unidentified_warn_s", 20.0))
+        if warn_s >= reacquire_s - _WARN_BEFORE_REACQUIRE_MARGIN_S:
+            clamped = max(1.0, reacquire_s - _WARN_BEFORE_REACQUIRE_MARGIN_S)
+            log.warning(
+                "infant_unidentified_warn_s=%.1fs is not comfortably shorter than "
+                "infant_reacquire_s=%.1fs; clamping the warning to %.1fs so the operator "
+                "is told scoring is paused before it can resume",
+                warn_s, reacquire_s, clamped,
+            )
+            warn_s = clamped
+
+        self._engine.add_rule(RuleSpec(
+            detection="infant_unidentified", severity="warning",
+            persist_s=warn_s,
+            min_frames=10, occlusion_grace_s=2.0, resolve_after_s=5.0,
+            cooldown_s=float(config.get("infant_unidentified_cooldown_s", 60.0)),
+        ))
 
         # Per-hand memory the engine itself doesn't keep (it's stateless about
         # "events" on purpose -- see its module docstring): what's currently
@@ -936,10 +1467,23 @@ class BabyMonitoringModule(VisionModule):
             track_id: v for track_id, v in self._recent_release.items()
             if now - v[1] <= self._transfer_window_s
         }
-        # Computed ONCE per frame, shared by both hands below -- see
-        # _infer_baby_box for why the smallest box stands in for the baby's
-        # when more than one person is in frame.
-        baby_box = _infer_baby_box(boxes)
+        # WHO IS THE BABY. Computed ONCE per frame and shared by both hands
+        # below. See InfantIdentifier: positive identification from crib-zone
+        # geometry, temporal persistence, size/position stability and relative
+        # scale -- and an explicit, reported "I do not know" when no person in
+        # frame earns the label, in place of the old smallest-box guess that
+        # silently scored an adult.
+        identification = self._infant_identifier.update(boxes, self._last_confidences, w, h, now)
+        self._last_infant_identification = identification
+        baby_box = identification.box
+        no_baby_reason = (
+            "no baby detected in frame this frame" if not present
+            else f"declined to score: {identification.reason}"
+        )
+        # Visible degradation, not silence -- see the rule's registration.
+        transitions += self._engine.update(
+            "infant_unidentified", present and not identification.identified, 0.9, now,
+        )
         choking_assessments: dict[str, ChokingHazardAssessment] = {}
         for side in ("left", "right"):
             assoc = hand_result.associations.get(f"{side}_hand") if hand_result is not None else None
@@ -968,7 +1512,9 @@ class BabyMonitoringModule(VisionModule):
             hand_track = None
             if held and hand_result is not None:
                 hand_track = next((h for h in hand_result.hands if h.label == f"{side}_hand"), None)
-            assessment = _assess_choking_hazard(side, assoc, hand_track, baby_box, aspect)
+            assessment = _assess_choking_hazard(
+                side, assoc, hand_track, baby_box, aspect, no_baby_reason=no_baby_reason,
+            )
             choking_assessments[side] = assessment
             transitions += self._engine.update(
                 f"choking_hazard:{side}",
@@ -1046,6 +1592,21 @@ class BabyMonitoringModule(VisionModule):
                         f"object={label} hand={side}",
                     ))
                 continue
+            if base == "infant_unidentified":
+                # Deliberately worded for the person reading a notification,
+                # not a log: what has stopped working and what they can do.
+                if tr.state == CONFIRMED:
+                    events.append(Event.now(
+                        "infant_unidentified", tr.duration_s, tr.confidence, self.name,
+                        "Cannot tell which person in view is the baby -- choking-hazard "
+                        f"scoring is paused ({self._last_infant_identification.reason})",
+                    ))
+                elif tr.state == RESOLVED:
+                    events.append(Event.now(
+                        "infant_unidentified_resolved", tr.duration_s, tr.confidence, self.name,
+                        "the baby is identifiable again",
+                    ))
+                continue
             if base == "choking_hazard":
                 side = detail_suffix
                 assessment = self._last_choking_assessments.get(side)
@@ -1100,8 +1661,21 @@ class BabyMonitoringModule(VisionModule):
             color = (0, 0, 220) if zone.kind == "restricted" else (0, 200, 0)
             cv2.polylines(frame, [pts], isClosed=True, color=color, thickness=2)
             cv2.putText(frame, zone.name, tuple(pts[0]), cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 1)
+        identification = self._last_infant_identification
         for (x1, y1, x2, y2) in self._last_boxes:
             cv2.rectangle(frame, (x1, y1), (x2, y2), (255, 180, 0), 2)
+        # WHICH box the module believes is the baby, drawn distinctly -- the
+        # single most important thing to be able to check by eye, and the thing
+        # nobody could see back when the smallest box silently won.
+        if identification.identified and identification.box is not None:
+            bx1, by1, bx2, by2 = identification.box
+            cv2.rectangle(frame, (bx1, by1), (bx2, by2), (0, 255, 0), 3)
+            cv2.putText(frame, f"BABY {identification.confidence:.2f}", (bx1, max(12, by1 - 8)),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.55, (0, 255, 0), 2)
+        elif self._last_boxes:
+            cv2.putText(frame, "BABY NOT IDENTIFIED - choking scoring paused",
+                        (10, min(frame.shape[0] - 10, 55)),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.55, (0, 165, 255), 2)
         cv2.putText(frame, self._status, (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 180, 0), 2)
         return frame
 
@@ -1214,6 +1788,14 @@ class BabyMonitoringModule(VisionModule):
             "choking_hazard_active": any(
                 d.startswith("choking_hazard:") for d in self._engine.active_detections()
             ),
+            # Logged every interval so "the alert never fired" can be told
+            # apart from "the module could not tell which box was the baby, so
+            # it never scored anything" -- the exact ambiguity that let the
+            # wrong-target defect live in the field. See InfantIdentifier.
+            "infant_identified": bool(self._last_infant_identification.identified),
+            "infant_identification_confidence": round(
+                self._last_infant_identification.confidence, 3
+            ),
         }
 
     def get_debug_state(self) -> Optional[dict]:
@@ -1258,4 +1840,24 @@ class BabyMonitoringModule(VisionModule):
                 "alert_triggered": triggered,
                 "reason": assessment.reason if not triggered else "risk >= threshold, sustained",
             }
-        return {"choking_hazard": per_hand, "active_alerts": sorted(active)}
+        identification = self._last_infant_identification
+        return {
+            "choking_hazard": per_hand,
+            # WHO the risk above was (or was not) scored against, and why --
+            # without this the risk numbers are unreadable, because a 0.0 could
+            # mean "no hazard" or "scored against the wrong person" (it used to
+            # mean the latter far more often than anyone could see).
+            "infant_identification": {
+                "identified": identification.identified,
+                "box": identification.box,
+                "track_id": identification.track_id,
+                "confidence": identification.confidence,
+                "reason": identification.reason,
+                "people_in_frame": identification.people_in_frame,
+                "eligible_candidates": identification.eligible,
+                "rejected": list(identification.rejected),
+                "safe_zones_configured": len(self._infant_identifier.safe_zones),
+                "candidates": identification.signals.get("candidates", []),
+            },
+            "active_alerts": sorted(active),
+        }

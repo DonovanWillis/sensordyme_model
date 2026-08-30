@@ -27,10 +27,10 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-from core.capabilities import registry  # noqa: E402
-from jupiter.eval import compare, format_report, generate, run, validate_dataset  # noqa: E402
-from jupiter.grammar import grammar_stats  # noqa: E402
-from jupiter.providers import JupiterUnavailable, get_provider  # noqa: E402
+from core.capabilities import registry
+from jupiter.eval import compare, format_report, generate, run, validate_dataset
+from jupiter.grammar import grammar_stats
+from jupiter.providers import JupiterUnavailable, get_provider
 
 
 def check(provider_names: list[str]) -> int:

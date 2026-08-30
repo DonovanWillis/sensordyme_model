@@ -11,7 +11,6 @@ scripts/install_backend_mac.sh and scripts/diagnose_backend_mac.py.
 
 from __future__ import annotations
 
-import json
 import plistlib
 import subprocess
 from pathlib import Path

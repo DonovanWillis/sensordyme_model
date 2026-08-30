@@ -64,7 +64,7 @@ class _RecordingRequests:
         response = types.SimpleNamespace(
             status_code=200,
             raise_for_status=lambda: None,
-            json=lambda: {},
+            json=dict,
         )
         return response
 

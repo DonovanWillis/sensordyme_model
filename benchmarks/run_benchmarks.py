@@ -26,8 +26,9 @@ import json
 import statistics
 import subprocess
 import time
+from collections.abc import Iterator
 from pathlib import Path
-from typing import Iterator, Optional
+from typing import Optional
 
 import cv2
 import numpy as np

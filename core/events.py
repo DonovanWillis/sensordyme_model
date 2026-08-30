@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 
 
 @dataclass(frozen=True)
@@ -34,7 +34,7 @@ class Event:
     ) -> "Event":
         """Build an Event stamped with the current UTC time."""
         return Event(
-            timestamp=datetime.now(timezone.utc),
+            timestamp=datetime.now(UTC),
             type=type,
             duration=duration,
             confidence=confidence,

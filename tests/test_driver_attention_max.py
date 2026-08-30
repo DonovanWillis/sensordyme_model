@@ -11,10 +11,10 @@ this suite still runs on a Mac with no camera, no GPU, and no network.
 import json
 from pathlib import Path
 
+import test_driver_attention_scenarios as das
 import yaml
 
 import main as main_module
-import test_driver_attention_scenarios as das
 from modules.base import SustainedConditionTracker
 from modules.driver_attention import GlanceCounter, angle_delta_deg, estimate_head_pose_deg
 from modules.driver_attention_max import (

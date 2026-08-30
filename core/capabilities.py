@@ -31,9 +31,10 @@ derived from what is registered, never from the wording of the request.
 from __future__ import annotations
 
 import difflib
-from dataclasses import dataclass, field
+from collections.abc import Iterable
+from dataclasses import dataclass
 from enum import Enum
-from typing import Iterable, Optional
+from typing import Optional
 
 
 class Support(str, Enum):

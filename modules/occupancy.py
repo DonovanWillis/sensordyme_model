@@ -81,8 +81,15 @@ class OccupancyModule(VisionModule):
         super().__init__(config)
         self._confidence_threshold = float(config["confidence_threshold"])
         self._confirm_frames = int(config["confirm_frames"])
-        weights = config.get("model_weights", "yolo11n.pt")
-        self._model = get_yolo_model(weights)
+        # Loaded on first use, not here. Every other module in this repo already
+        # defers its detector load; occupancy was the lone eager one, and that
+        # inconsistency had teeth: a detector failure inside __init__ happens
+        # before DeviceRuntime exists, so it bypasses the degraded-mode handling
+        # entirely and becomes an un-degradable startup crash. Loading lazily
+        # puts occupancy on the same path as the rest, where a missing backend is
+        # reported as "monitoring NOT active" instead of restart-looping.
+        self._weights = config.get("model_weights", "yolo11n.pt")
+        self._model = None
 
         self._last_emitted_count = -1
         self._pending_count: int | None = None
@@ -212,6 +219,8 @@ class OccupancyModule(VisionModule):
     def process(self, frame: np.ndarray) -> list[Event]:
         """Detect people in `frame`; emit occupancy_change once a new count is confirmed."""
         events: list[Event] = []
+        if self._model is None:
+            self._model = get_yolo_model(self._weights)
         results = self._model.predict(
             frame, verbose=False, classes=self._requested_class_ids, conf=self._confidence_threshold
         )

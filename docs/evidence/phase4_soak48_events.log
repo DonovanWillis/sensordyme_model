@@ -1,0 +1,1 @@
+Aug 29 22:30:44 sensordyme python[1994608]: 2026-08-29T22:30:44-0400 WARNING sensordyme.health: accelerator failing: running on CPU — accelerator is configured (/home/pi/sensordyme/models/damoyolo_tinynasL20_T.hef) but no inference has executed on it

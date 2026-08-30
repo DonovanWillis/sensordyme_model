@@ -25,7 +25,8 @@ from __future__ import annotations
 
 import json
 import threading
-from typing import Callable, Optional
+from collections.abc import Callable
+from typing import Optional
 
 from core.logging_setup import get_logger
 
@@ -133,7 +134,7 @@ class BLEProvisioningServer:
     def start(self) -> None:
         """Bring the GATT server + advertisement up. Raises BLEUnavailable off-Pi."""
         try:
-            import dbus  # noqa: F401
+            import dbus
             import dbus.mainloop.glib  # noqa: F401
             from gi.repository import GLib  # noqa: F401
         except ImportError as exc:

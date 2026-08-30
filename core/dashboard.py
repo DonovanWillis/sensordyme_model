@@ -24,7 +24,7 @@ import json
 import threading
 import time
 from collections import Counter, deque
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Optional
 
@@ -120,7 +120,7 @@ class DashboardServer:
                 self.end_headers()
                 self.wfile.write(body)
 
-            def do_POST(self) -> None:  # noqa: N802 (stdlib naming)
+            def do_POST(self) -> None:
                 try:
                     if not self._authorized():
                         self._json({"error": "invalid or missing device token"}, 401)
@@ -154,7 +154,7 @@ class DashboardServer:
                 except (BrokenPipeError, ConnectionResetError):
                     pass
 
-            def do_GET(self) -> None:  # noqa: N802 (stdlib naming)
+            def do_GET(self) -> None:
                 try:
                     if (self.path.startswith("/api") or self.path.startswith("/stream")) and not self._authorized():
                         self._json({"error": "invalid or missing device token"}, 401)
@@ -219,6 +219,7 @@ class DashboardServer:
         self._httpd = ThreadingHTTPServer((self._host, self._port), _Handler)
         self._port = self._httpd.server_address[1]  # resolve port 0 -> actual
         thread = threading.Thread(target=self._httpd.serve_forever, daemon=True, name="dashboard")
+        self._thread = thread  # is_alive() checks this, not merely that _httpd exists
         thread.start()
         return self.url
 
@@ -230,10 +231,25 @@ class DashboardServer:
     def close(self) -> None:
         if self._httpd is not None:
             self._httpd.shutdown()
+            # Release the socket and forget the server. Without this, `_httpd`
+            # stayed set after close() and is_alive() below reported True
+            # forever -- so the registered health check was a constant True and
+            # its restart path was unreachable.
+            self._httpd.server_close()
+            self._httpd = None
 
     def is_alive(self) -> bool:
-        """Whether the HTTP server is up (health monitor check)."""
-        return self._httpd is not None
+        """Whether the HTTP server is actually serving (health monitor check).
+
+        Tests the SERVE THREAD, not merely that an object exists. The previous
+        version returned `self._httpd is not None`, which close() never falsified
+        and which stayed true if the serving thread died -- the live feed would
+        go dark while /api/health reported the dashboard healthy.
+        """
+        if self._httpd is None:
+            return False
+        thread = getattr(self, "_thread", None)
+        return thread is None or thread.is_alive()
 
     def restart(self) -> None:
         """Tear the HTTP server down and bring it back on the same host/port."""
@@ -434,7 +450,7 @@ class DashboardServer:
                 "counts": [{"type": t, "n": n} for t, n in top_counts],
                 "total_events": sum(self._counts.values()),
                 "risk": [round(r, 3) for _, r in self._risk_series],
-                "generated_at": datetime.now(timezone.utc).isoformat(),
+                "generated_at": datetime.now(UTC).isoformat(),
             }
 
 

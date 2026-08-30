@@ -7,19 +7,26 @@ A modular edge computer-vision platform. One codebase, two targets:
 
 The platform auto-detects which one it's on at startup (by trying to import `picamera2`) — no flags, no branching config.
 
-> **⚠️ Licensing: resolve before any commercial release.**
-> The object detector runs on **Ultralytics, which is AGPL-3.0** — confirmed from the
-> installed package metadata (`License: AGPL-3.0`), and imported in the shipping
-> inference path at `core/detectors.py`. The AGPL's network clause is triggered by
-> conveying a program's output over a network, and this device serves annotated
-> inference over `/stream` and pushes events to a backend. YOLO11 weights inherit the
-> same license. Ultralytics sells an Enterprise License for exactly this situation.
+> **Detector: DAMO-YOLO on the Hailo-8L. No copyleft in the device image.**
+> The device runs `damoyolo_tinynasL20_T` (Apache-2.0) as a checksum-pinned Hailo
+> `.hef` — Model Zoo v2.15.0, sha256 `e69136d3…`, verified at install by
+> `setup_pi.sh`, which refuses to install a mismatch. `requirements-device.txt`
+> ships neither `ultralytics` nor `torch`, and `make deploy` excludes `*.pt` and
+> `*.hef` so a model can only arrive through pinned provisioning.
 >
-> This is a factual observation about a dependency's stated license, not legal advice
-> — get counsel. Two paths exist: buy the commercial license, or migrate to an
-> Apache-2.0 detector. `docs/HUGGINGFACE.md` evaluates the second option, including a
-> candidate (`damoyolo_tinynasL20_T`) that is Apache-2.0, scores higher than the
-> current model, **and** has a prebuilt Hailo-8L binary.
+> **This replaced an AGPL-3.0 dependency.** Until Phase 4 the detector was
+> Ultralytics YOLO11n, whose AGPL network clause is triggered by conveying
+> inference over a network — which this device does, via `/stream` and its event
+> uplink. That migration is complete: `core/detectors.py` reaches `ultralytics`
+> only as an optional *developer-machine* fallback, inside a `try`, and it is
+> absent from the device entirely. `docs/LICENSING.md` carries the full analysis
+> and the remaining open items; `docs/PHASE5_DEMO_READINESS.md` §8 records what
+> was actually verified on the hardware; `docs/THIRD_PARTY_NOTICES.md` is the
+> attribution file for what the device image contains — **it is incomplete, and
+> the Apache-2.0 §4(d) attribution obligation is not yet satisfied.**
+>
+> This is a factual account of dependency licences, not legal advice — get counsel
+> before a commercial release.
 
 ## Quickstart: Mac (30 seconds)
 
@@ -223,10 +230,10 @@ sensordyme/
 ├── modules/
 │   ├── base.py              # VisionModule ABC + registry + SustainedConditionTracker
 │   ├── driver_attention.py  # calibrated EAR + PERCLOS (drowsiness), yaw/pitch (distraction),
-│   │                        #   YOLO11-nano + MediaPipe Hands (phone/food) -- see below
+│   │                        #   DAMO-YOLO on Hailo + MediaPipe Hands (phone/food) -- see below
 │   ├── driver_attention_max.py # mac_max profile ONLY: gaze fusion, tiered drowsiness,
 │   │                        #   confidence-stacked phone fusion -- see "mac_max profile" below
-│   ├── occupancy.py         # YOLO11-nano person counting -> occupancy_change events
+│   ├── occupancy.py         # DAMO-YOLO person counting -> occupancy_change events
 │   └── fall_detection.py    # MediaPipe Pose: drop-then-stillness -> fall events
 ├── benchmarks/
 │   ├── run_benchmarks.py    # per-module latency/FPS/thermal -> JSON + summary CSV
@@ -277,7 +284,7 @@ Real testing surfaced three failure modes with a naive "raw threshold" approach:
   Both are persisted together to `data/calibration.json`; delete that file or pass `--recalibrate` to redo it (e.g. after a different person, or a different mounting position, starts using the same install).
 - **Distraction (glance-tolerant).** The same sustained-condition mechanism, applied to the *calibrated* yaw, means a normal 1–2s mirror or blindspot check resets cleanly and never fires `distraction` (default sustain: `distraction_seconds` = **3.0s**, `yaw_threshold_deg` = 35°). A separate `GlanceCounter` watches for the pattern single-glance logic misses: `glance_min_count` (default 5) short off-center glances within `glance_window_s` (default 45s) fires `frequent_glancing` — texting while still looking up periodically.
 - **Eyes down (separate from sideways).** Looking down at a lap is more dangerous and less often legitimate than a sideways glance, so calibrated pitch gets its own, more sensitive check: `pitch_threshold_deg` (default -20°) sustained for `eyes_down_seconds` (default 2.5s) fires `eyes_down`, independent of the yaw-based `distraction` event.
-- **Full-frame object scanning, with a visible bounding box.** YOLO11-nano (shared via `core/detectors.py` so `occupancy.py` doesn't load a second copy) scans the *entire* frame — not just near the face — on every `yolo_every_n_frames`-th frame (default 3) so Face Mesh keeps full frame rate. It covers everything a driver's hands might realistically hold: `cell phone`, plus 17 food/drink classes (`cup`, `bottle`, `wine glass`, `bowl`, `banana`, `apple`, `orange`, `broccoli`, `carrot`, `hot dog`, `pizza`, `donut`, `cake`, `sandwich`, `fork`, `knife`, `spoon`) via the `yolo_classes` config block. Boxes are drawn live in the **default** window (not just `--debug`) — orange while just visible, red once it's driving a `phone_use` alert. A phone alone is not an alert — a dashboard-mounted phone/GPS is legitimate and only logs `phone_detected`. It becomes the loud `phone_use` alert only when the phone is visible **and** the eyes are off the road (`distraction` or `eyes_down` condition) for `phone_use_seconds` (default 2.0s). If MediaPipe Hands (`enable_hands`, default on) finds a hand overlapping the phone box (IoU > `hand_phone_iou_threshold`), confidence is raised — someone visibly holding it is more certain than a phone merely in frame. Hands are drawn in the default view too. Any failure loading YOLO/Hands is caught, printed once to the terminal, and disables that subsystem gracefully instead of crashing the video loop or failing silently — check the terminal for `driver_attention: object detection ready (...)` to confirm it's active.
+- **Full-frame object scanning, with a visible bounding box.** The detector (DAMO-YOLO on the Hailo-8L; shared via `core/detectors.py` so `occupancy.py` doesn't load a second copy) scans the *entire* frame — not just near the face — on every `yolo_every_n_frames`-th frame (default 3) so Face Mesh keeps full frame rate. It covers everything a driver's hands might realistically hold: `cell phone`, plus 17 food/drink classes (`cup`, `bottle`, `wine glass`, `bowl`, `banana`, `apple`, `orange`, `broccoli`, `carrot`, `hot dog`, `pizza`, `donut`, `cake`, `sandwich`, `fork`, `knife`, `spoon`) via the `yolo_classes` config block. Boxes are drawn live in the **default** window (not just `--debug`) — orange while just visible, red once it's driving a `phone_use` alert. A phone alone is not an alert — a dashboard-mounted phone/GPS is legitimate and only logs `phone_detected`. It becomes the loud `phone_use` alert only when the phone is visible **and** the eyes are off the road (`distraction` or `eyes_down` condition) for `phone_use_seconds` (default 2.0s). If MediaPipe Hands (`enable_hands`, default on) finds a hand overlapping the phone box (IoU > `hand_phone_iou_threshold`), confidence is raised — someone visibly holding it is more certain than a phone merely in frame. Hands are drawn in the default view too. Any failure loading YOLO/Hands is caught, printed once to the terminal, and disables that subsystem gracefully instead of crashing the video loop or failing silently — check the terminal for `driver_attention: object detection ready (...)` to confirm it's active.
 - **Face lost.** If the camera can't find a face at all (turned fully away, slumped over, obstructed) for `face_lost_seconds` (default 2.5s), that's treated as a risk signal in its own right — `attention_lost` fires (loud) — rather than silently reported as "nothing going on," which is what naive per-signal logic does by default.
 - **Risk fusion — reasoning across signals, not just within each one.** `RiskFusion` combines every signal above into one continuous, smoothed 0–100% score, shown as a live bar in both the default and debug windows. This is the part that actually reasons about the driver holistically: independent thresholds each catch their own failure mode but miss *compound* danger — a driver who's a little drowsy AND glancing away is more dangerous than either fact alone (a microsleep is worse if attention is already split), so eye-risk and gaze-risk being simultaneously elevated adds a corroboration bonus on top of their weighted sum. The composite score fires its own `elevated_risk` (soft) / `high_risk` (loud) events for combinations that never cross any single signal's own bar. See `RiskFusion`'s docstring in `modules/driver_attention.py` for the full weighting rationale (`risk_ema_alpha`, `risk_elevated_threshold`, `risk_high_threshold`, `risk_confirm_seconds` in config).
 - **Patient alerting.** The alert cooldown (`alerts.cooldown_s`, default 15s) keeps any single event type from re-alerting too soon, on top of each signal's own sustained-duration/rolling-window debounce above.
@@ -305,11 +312,15 @@ Real testing surfaced three failure modes with a naive "raw threshold" approach:
 | `high_risk`/`elevated_risk` never fire even when things feel clearly compounding | Lower the thresholds, or increase `risk_ema_alpha` so the score reacts faster to fresh signal |
 | `attention_lost` fires during normal driving (e.g. looking far to check a mirror/blindspot) | Increase `face_lost_seconds` — Face Mesh naturally loses tracking briefly on extreme turns |
 | Want to know if object detection is actually running | Check the terminal for `driver_attention: object detection ready (...)` on startup and `driver_attention: phone detected in frame` when one appears; the video window also shows "object detection: OFF (see terminal)" if it failed to load |
-| Missed a food/drink item entirely | Confirm it's a COCO class SensorDyme lists (`yolo_classes` in config.yaml) — YOLO11-nano only knows COCO's 80 classes, so novel objects (a specific snack brand, a thermos) won't be recognized by name, only as the closest COCO class if at all |
+| Missed a food/drink item entirely | Confirm it's a COCO class SensorDyme lists (`yolo_classes` in config.yaml) — the detector only knows COCO's 80 classes, so novel objects (a specific snack brand, a thermos) won't be recognized by name, only as the closest COCO class if at all |
 
 ## Occupancy module: first-run note
 
-`occupancy` uses YOLO11-nano (`ultralytics`), loaded through the same shared cache in `core/detectors.py` that `driver_attention` uses. The first time either module runs, `yolo11n.pt` isn't cached yet — ultralytics will auto-download it (one-time, needs internet). A one-line notice prints when this happens; subsequent runs use the cached weights with no network access.
+`occupancy` shares one detector with `driver_attention` through the cache in `core/detectors.py`, so only one model is ever loaded.
+
+**On the device** that detector is the pinned DAMO-YOLO `.hef` on the Hailo-8L, provisioned and checksum-verified by `setup_pi.sh`. Nothing is downloaded at run time, and there is no CPU fallback: `ultralytics` is not installed. If the accelerator or the model is unavailable the service boots into a **degraded** state — it serves health and the dashboard and reports `monitoring_active: false` with the reason — rather than silently detecting nothing.
+
+**On a developer machine** the same call resolves to ultralytics, which auto-downloads `yolo11n.pt` on first use. That path is dev-only; see `docs/LICENSING.md`.
 
 ## Benchmarking
 
@@ -321,7 +332,7 @@ python benchmarks/plot_results.py           # renders charts from the latest res
 
 Results land in `benchmarks/results/{module}_{timestamp}.json`, a `summary_{timestamp}.csv`, and three 300dpi PNGs (FPS bar chart with a real-time threshold line, latency box plots, and — on a Pi — a CPU-temperature-over-time line chart via `vcgencmd`).
 
-Each module is benchmarked under its exact `config.yaml` settings (each result JSON embeds that config under `module_config`), so `driver_attention`'s numbers include its real YOLO11-nano + MediaPipe Hands stride — not a Face-Mesh-only fast path. If you want the isolated Face Mesh cost, temporarily set `yolo_every_n_frames` very high (e.g. `1000000`) before benchmarking.
+Each module is benchmarked under its exact `config.yaml` settings (each result JSON embeds that config under `module_config`), so `driver_attention`'s numbers include its real detector + MediaPipe Hands stride — not a Face-Mesh-only fast path. If you want the isolated Face Mesh cost, temporarily set `yolo_every_n_frames` very high (e.g. `1000000`) before benchmarking.
 
 ## Weekly reports
 

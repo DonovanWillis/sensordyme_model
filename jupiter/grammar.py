@@ -23,7 +23,6 @@ Two things this deliberately does NOT do:
 from __future__ import annotations
 
 from core.capabilities import registry
-
 from jupiter.schema import NOTIFY_KINDS, SEVERITIES
 
 

@@ -83,3 +83,16 @@ cloud/.jwt_secret
 
 # launchd's log for the always-running backend (scripts/install_backend_mac.sh).
 cloud/backend.log
+
+# Event/telemetry data written by a dev run into the repo root. These are
+# DEVICE data, not source: `make deploy` excludes them (Phase 6 found the rsync
+# was shipping them to customer hardware), and they must not be committed either
+# -- a repo carrying a developer's event history is the same privacy problem in
+# a different place. The paths are the defaults from config.yaml's logging block
+# plus the short-form ones the benchmarks write.
+e.csv
+t.csv
+events.csv
+telemetry.csv
+cloud/*.db
+*.sqlite3

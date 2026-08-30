@@ -1,28 +1,35 @@
-# SensorDyme core dependencies — installed on BOTH Mac (dev) and Raspberry Pi.
-# Python 3.11+ required (mediapipe does not yet support 3.13+).
-mediapipe==0.10.14
-ultralytics==8.3.28
-opencv-python==4.10.0.84
-numpy==1.26.4
-pyyaml==6.0.2
-matplotlib==3.9.2
-reportlab==4.2.5
-simpleaudio==1.0.4
-pytest==8.3.3
-anthropic==0.116.0 # mac_max VLM judge (provider: anthropic); harmless (unused) on the Pi
-requests==2.34.2 # mac_max VLM judge (providers: ollama / openai_compatible); already a transitive dep of ultralytics
-
-# --- Raspberry Pi only extras ---
-# These are installed separately by setup_pi.sh. picamera2 ships as an apt
-# package on Pi OS (python3-picamera2) and is NOT pip-installable on Mac;
-# gpiozero is likewise Pi-only. Do not add them above this line.
+# SensorDyme DEVELOPER + CI runtime dependencies.
 #
-#   picamera2   (apt: python3-picamera2)
-#   gpiozero==2.0.1
-#   lgpio==0.2.2.0
+# This is the Mac dev install (setup_mac.sh) and what CI installs. It is NOT what
+# ships: `requirements-device.txt` is the set that reaches customer hardware, and
+# it is included below so the shared pins live in exactly one place. Two
+# hand-maintained copies of the same packages drift, and the way that shows up is
+# a device running a different opencv than CI tested against.
+#
+#   device  →  requirements-device.txt        (setup_pi.sh, make deploy)
+#   dev/CI  →  requirements.txt               (setup_mac.sh, CI) — this file
+#   tooling →  requirements-dev.txt           (ruff, pyright, pytest-cov, ...)
+#
+# Python 3.11+ required (mediapipe does not yet support 3.13+).
+-r requirements-device.txt
 
-# openpilot driver-monitoring module (modules/driver_attention_openpilot.py).
-# Installs on both Mac (dev) and Pi (aarch64 wheels) — on the Pi with the NoIR camera at
-# dash height, the openpilot DM model runs close to its native training conditions
-# (IR driver-facing dash cam), unlike a laptop webcam.
-onnxruntime==1.27.0
+# --- Developer machines and CI ONLY. NOT installed on a device. --------------
+# ultralytics is AGPL-3.0 (confirmed in the installed dist-info METADATA), and
+# SensorDyme both conveys software on hardware and serves inference over a
+# network from it — so putting this on a shipped device triggers AGPL §13 and the
+# §4/§6 conveying obligations. See docs/LICENSING.md.
+#
+# It stays here because it is legitimately useful OFF the device, where nothing
+# is conveyed to anyone:
+#   * the mac_max profile (modules/driver_attention_max.py) detects on MPS,
+#   * benchmarks/accuracy_state_farm.py measures the CPU baseline the Hailo
+#     accuracy numbers are compared against,
+#   * scripts/prepare_state_farm.py produces an ultralytics-native training
+#     layout, and training happens on a workstation.
+#
+# It also pulls torch + torchvision (~800MB), which is a second, independent
+# reason not to put it on a Pi.
+#
+# Removing this line is NOT the remaining licence work — the device install no
+# longer references it. Keeping it is what preserves the dev path.
+ultralytics==8.3.28

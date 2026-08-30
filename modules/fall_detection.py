@@ -77,6 +77,19 @@ _MIN_TORSO_LANDMARK_VISIBILITY = 0.5
 #: Minimum of the 4 hip/shoulder landmarks that must be visible for a
 #: frame's average to be trusted for velocity at all.
 _MIN_TORSO_LANDMARKS_FOR_VELOCITY = 2
+#: Confidence reported for the "person" entry this module contributes to
+#: DetectionFrame. It is a PLACEHOLDER, not a measurement, and is named here so
+#: that it stops reading as one. MediaPipe Pose either returns landmarks or does
+#: not (gated at min_detection_confidence=0.5); it produces no per-detection
+#: score comparable to the one a YOLO box carries -- yet AI-configured rules
+#: compare against this number exactly as though it were one.
+#:
+#: The honest replacement is the mean visibility of the torso landmarks this
+#: module already computes, which IS a measured quantity. Deliberately not
+#: changed here: user-authored rules compare against this value, so moving it
+#: silently changes when their alerts fire. Measure the visibility distribution
+#: on real footage first, then move it on purpose.
+_PERSON_PRESENCE_CONFIDENCE = 0.9
 #: Posture confidence a STANDING reading must EXCEED before it is allowed to
 #: cancel a pending fall. Deliberately above core/posture.py's 0.5 partial-
 #: observation sentinel: classify() returns exactly Posture(STANDING, 0.5,
@@ -619,7 +632,9 @@ class FallDetectionModule(VisionModule):
         width, height = self._last_frame_size
         detections: list[Detection] = []
         if self._last_posture is not None:
-            detections.append(Detection(label="person", confidence=0.9))
+            detections.append(
+                Detection(label="person", confidence=_PERSON_PRESENCE_CONFIDENCE)
+            )
             if self._last_posture.label != posture.UNKNOWN:
                 detections.append(
                     Detection(label=self._last_posture.label, confidence=self._last_posture.confidence)

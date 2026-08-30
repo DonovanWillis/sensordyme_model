@@ -15,7 +15,6 @@ and GracedConditionTracker instances, RiskFusion, event firing -- is the
 real, unmodified module code.
 """
 
-import time
 
 import cv2
 import numpy as np

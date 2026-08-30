@@ -10,7 +10,6 @@ import json
 import pytest
 
 from core.capabilities import Capability, CapabilityRegistry, default_registry
-from jupiter import interpret as interpret_module
 from jupiter import security
 from jupiter.eval import generate, run, validate_dataset
 from jupiter.grammar import build_grammar, grammar_stats

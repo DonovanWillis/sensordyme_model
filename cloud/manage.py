@@ -15,7 +15,7 @@ import time
 
 sys.path.insert(0, __file__.rsplit("/", 2)[0])
 
-from cloud.app import db, init_db  # noqa: E402
+from cloud.app import db, init_db
 
 
 def create_device(name: str) -> None:

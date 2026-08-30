@@ -120,7 +120,7 @@ lint: ## Lint with ruff (rule set pinned in ruff.toml)
 
 lint-fix: ## Apply ruff's SAFE autofixes, then show what is left
 	@echo '>>> Applying SAFE fixes only. Review the diff before committing: git diff'
-	@echo '>>> --unsafe-fixes is deliberately not used; it can change behaviour.' 
+	@echo '>>> --unsafe-fixes is deliberately not used; it can change behaviour.'
 	$(RUFF) check . --fix
 
 fmt-check: ## Show what `ruff format` WOULD change (informational — not a gate)
@@ -141,8 +141,13 @@ audit: ## Audit the pinned dependencies for known CVEs
 	@echo ">>> what actually ships to the Pi and to the cloud host, and they give the"
 	@echo ">>> same answer on every machine. As of 2026-08-29 this reports 16"
 	@echo ">>> advisories, concentrated in starlette (via fastapi) and zeroconf."
+	@echo ">>> requirements-device.txt is listed EXPLICITLY, not left to the"
+	@echo ">>> '-r requirements-device.txt' include inside requirements.txt: if"
+	@echo ">>> pip-audit ever stops following includes, the pins that actually"
+	@echo ">>> ship would be the ones silently going unaudited."
 	uvx --python 3.12 pip-audit@2.10.1 --progress-spinner=off \
-		-r requirements.txt -r cloud/requirements.txt -r requirements-dev.txt
+		-r requirements-device.txt -r requirements.txt \
+		-r cloud/requirements.txt -r requirements-dev.txt
 
 check: lint typecheck test ## Run every CI gate locally (lint + typecheck + tests)
 	@echo
@@ -195,10 +200,15 @@ clean: ## Remove caches and coverage artifacts (never touches data/ or .venv)
 # rsync'd code and restarted the service but never installed anything — so the
 # first deploy that added a line to requirements.txt bricked the device with an
 # ImportError at ExecStartPre and the only symptom was "it stopped coming back
-# after a restart". `.venv/bin/pip install -r requirements.txt` is exactly what
-# setup_pi.sh line 35 does, inside the same venv the systemd unit runs from
+# after a restart". `.venv/bin/pip install -r requirements-device.txt` is exactly
+# what setup_pi.sh does, inside the same venv the systemd unit runs from
 # (sensordyme.service: ExecStart=.../.venv/bin/python), and it is a no-op when
 # nothing changed.
+#
+# CHANGED (Phase 4): requirements.txt -> requirements-device.txt. requirements.txt
+# pins ultralytics (AGPL-3.0), and this line is how packages land on hardware we
+# convey — so deploying the developer set would put the AGPL package back on the
+# device on the next update even with setup_pi.sh fixed. See docs/LICENSING.md.
 #
 # NOT changed: the host (pi@sensordyme.local) and the rsync flags. rsync still
 # runs WITHOUT --delete, so a file deleted from the repo stays on the device
@@ -206,10 +216,48 @@ clean: ## Remove caches and coverage artifacts (never touches data/ or .venv)
 # config.yaml still names. Adding --delete would also be the fastest way to
 # destroy data/ on a device if an exclude were ever mistyped, so it is flagged
 # here rather than changed unilaterally.
+#
+# `--exclude='*.pt'` is a LICENCE control, not a size one. A .pt checkpoint is
+# gitignored but still sits in the working tree after any dev run (ultralytics
+# auto-downloads yolo11n.pt on first use), and rsync copies the working tree, not
+# the index — so a plain `make deploy` from a developer's Mac was putting an
+# AGPL-3.0 model weight onto the device even with the pip install fixed. The
+# weights carry the same licence as the code that produced them; see
+# docs/LICENSING.md §"Model weights". Deliberately NOT excluding *.onnx:
+# dmonitoring_model.onnx is openpilot's driver-monitoring model, which the device
+# genuinely runs and which is not AGPL.
+#
+# `--exclude='*.hef'` closes the SAME hole for the format that actually matters.
+# A .hef is the only thing the Pi can execute, models/ is gitignored, and
+# docs/ACCELERATOR.md used to tell readers to download yolov11n.hef /
+# yolov8s_h8l.hef into it -- Ultralytics-derived, so AGPL weights in a different
+# wrapper. Excluding .pt while shipping .hef would have been a licence control
+# aimed at the one format the device cannot run.
+#
+# `*.db` / `*.sqlite3` / `*.csv` are a DATA control, the third kind. `--exclude='data'`
+# only covers the data/ DIRECTORY, so a dry run of this rsync was carrying
+# cloud/sensordyme.db -- the backend's own database, 639KB -- plus e.csv,
+# events.csv, t.csv and telemetry.csv from the repo root onto every device.
+# Shipping a developer's event history and a backend DB to a customer is a
+# privacy problem before it is a tidiness one, and nothing about it is visible
+# in `make deploy`'s output.
+#
+# It also makes deployment DETERMINISTIC rather than merely legal: the device's
+# model now comes only from setup_pi.sh, which pins a URL and verifies sha256 and
+# refuses to install a mismatch. A model must never arrive on a device because it
+# happened to be in someone's working tree.
+demo-check: ## run the demo preflight on the device (DEMO READY / NOT READY)
+	ssh pi@sensordyme.local 'cd ~/sensordyme && .venv/bin/python scripts/demo_preflight.py'
+
+demo-cycle: ## rehearse every demo mode on the device, with restarts
+	ssh pi@sensordyme.local 'cd ~/sensordyme && bash scripts/demo_cycle.sh'
+
 deploy: ## rsync to pi@sensordyme.local, install deps, migrate config, restart
 	rsync -av --exclude='.venv' --exclude='data' --exclude='.git' --exclude='__pycache__' \
-		--exclude='config.yaml' --exclude='*.log' --exclude='.secrets' \
+		--exclude='config.yaml' --exclude='*.log' --exclude='.secrets' --exclude='*.pt' \
+		--exclude='*.hef' --exclude='*.db' --exclude='*.sqlite3' --exclude='*.csv' \
+		--exclude='.pytest_cache' --exclude='.ruff_cache' --exclude='.claude*' \
 		./ pi@sensordyme.local:~/sensordyme/
-	ssh pi@sensordyme.local 'cd ~/sensordyme && .venv/bin/pip install -q -r requirements.txt'
+	ssh pi@sensordyme.local 'cd ~/sensordyme && .venv/bin/pip install -q -r requirements-device.txt'
 	ssh pi@sensordyme.local 'cd ~/sensordyme && python3 scripts/migrate_config.py config.yaml'
 	ssh pi@sensordyme.local 'cd ~/sensordyme && sudo systemctl restart sensordyme.service'

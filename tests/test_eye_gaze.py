@@ -17,8 +17,8 @@ and test_head_pose_geometry.py -- not hand-picked numbers):
 """
 
 import pytest
-
 import test_driver_attention_scenarios as das
+
 from core.eye_signal import eye_gaze_offset_deg
 from modules.driver_attention import estimate_head_pose_deg
 

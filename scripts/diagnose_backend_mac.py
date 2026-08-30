@@ -76,7 +76,7 @@ def launchd_status() -> tuple[bool, str]:
 
 def mdns_advertising(timeout: float = 3.0) -> tuple[bool, str]:
     try:
-        from zeroconf import Zeroconf, ServiceBrowser
+        from zeroconf import ServiceBrowser, Zeroconf
     except ImportError:
         return False, "zeroconf not installed -- can't check (pip install zeroconf)"
 

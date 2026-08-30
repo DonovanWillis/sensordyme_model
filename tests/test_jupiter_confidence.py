@@ -12,8 +12,6 @@ from __future__ import annotations
 
 import json
 
-import pytest
-
 from jupiter.confidence import ConfidenceReport, _rule_field_fidelity, score
 from jupiter.interpret import _extract_json_verbose, extract_json, interpret
 from jupiter.providers import ScriptedProvider

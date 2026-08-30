@@ -4,7 +4,7 @@ where no pose skeleton exists to supply a torso-length scale reference."""
 
 import pytest
 
-from core.tracking import BoxTracker, TrackedBox
+from core.tracking import BoxTracker
 
 
 def test_a_new_detection_becomes_a_new_track():

@@ -16,7 +16,7 @@ from core.logger import EventLogger, repair
 
 def an_event(kind: str = "fall") -> Event:
     return Event(
-        timestamp=datetime.datetime.now(datetime.timezone.utc),
+        timestamp=datetime.datetime.now(datetime.UTC),
         type=kind, duration=1.0, confidence=0.9,
         module_name="test", contributing_signals="",
     )

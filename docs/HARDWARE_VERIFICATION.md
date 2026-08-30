@@ -1,8 +1,16 @@
 # Hardware verification checklist
 
-Everything in this file is **UNVERIFIED**. It is the set of claims that cannot be
-established from a development Mac, with the exact command or procedure that would
-establish each one on real hardware.
+> **Status update (Phase 5, 2026-08-29).** This file was written before anything
+> here had run on a device. Several items have since been executed on the real
+> Pi 5 + AI HAT+ — the accelerator path in particular. `core/accel.py`'s
+> `HailoYOLO` **has now run on real Hailo hardware**; the statements below that
+> say otherwise are the pre-Phase-3 text and are marked where they appear.
+> `docs/PHASE5_DEMO_READINESS.md` is the record of what was actually observed.
+> Items not named there are still genuinely unverified.
+
+Everything in this file marked UNVERIFIED is exactly that. It is the set of claims
+that cannot be established from a development Mac, with the exact command or
+procedure that would establish each one on real hardware.
 
 Why it exists: a large fraction of this codebase's most important paths — the
 camera, the accelerator, BLE provisioning, GPIO, thermal behaviour, and sustained
@@ -27,9 +35,9 @@ Result column and commit it. A tick with no pasted output is not a verification.
 | 1 | Camera opens and produces a real frame | UNVERIFIED | |
 | 2 | `release()` genuinely frees the device; `reopen()` succeeds repeatedly | UNVERIFIED | |
 | 3 | Recovery ladder step 1 (retry → reopen) works under a real read failure | UNVERIFIED | |
-| 4 | Hailo device present and HailoRT usable | UNVERIFIED | |
-| 5 | A downloaded `.hef` actually runs and returns boxes | UNVERIFIED | |
-| 6 | Hailo vs CPU detection parity | UNVERIFIED | |
+| 4 | Hailo device present and HailoRT usable | **VERIFIED** (Phase 3) | see `docs/PHASE5_DEMO_READINESS.md` |
+| 5 | The provisioned `.hef` actually runs and returns boxes | **VERIFIED** (Phase 3/4) | `damoyolo_tinynasL20_T.hef`, raw-tensor decode |
+| 6 | Hailo vs CPU detection parity | **NO LONGER RUNNABLE ON A DEVICE** | the device has no CPU detector to compare against — see §4–6 |
 | 7 | Sustained FPS under real load, per module | UNVERIFIED | |
 | 8 | Thermal / undervoltage reporting is real | UNVERIFIED | |
 | 9 | BLE advertises and accepts provisioning | UNVERIFIED | |
@@ -78,12 +86,13 @@ reopen throws "Device or resource busy".
 
 ## 4–6. Hailo / AI HAT+
 
-`core/accel.py`'s `HailoYOLO` has **never executed on hardware** — the project's own
-`docs/ACCELERATOR.md` says so. Treat first contact as a debugging session, not a
-verification. Known-suspicious spots found by review, worth watching:
+`core/accel.py`'s `HailoYOLO` **has now executed on hardware** (Phase 3/4) — the
+"never executed" warning that used to head this section, and the matching line in
+`docs/ACCELERATOR.md`, both predate that run. Spots found by review that are still
+worth watching on a fresh board:
 
 - `predict()` re-enters the `InferVStreams` context and re-activates the network
-  group on **every frame**. This may be slow, or may not be valid at all.
+  group on **every frame**. It works; whether it is *fast* is the open question.
 - `HailoYOLO.predict()` takes no `device` kwarg, but some callers pass one.
 - The class-name table is hardcoded COCO regardless of what the `.hef` contains.
 
@@ -92,42 +101,74 @@ verification. Known-suspicious spots found by review, worth watching:
 hailortcli fw-control identify
 ls -l /dev/hailo0
 
-# 5. get a prebuilt model and run it (no Dataflow Compiler needed -- see ACCELERATOR.md)
-mkdir -p models
-curl -fL -o models/yolov11n.hef \
-  https://hailo-model-zoo.s3.eu-west-2.amazonaws.com/ModelZoo/Compiled/v2.19.0/hailo8l/yolov11n.hef
-# point config.yaml at it: accelerator.yolo_hef: /home/pi/sensordyme/models/yolov11n.hef
+# 5. confirm the SHIPPED model runs. Do NOT download a model by hand: setup_pi.sh
+#    provisions models/damoyolo_tinynasL20_T.hef from a pinned URL, verifies its
+#    sha256, and refuses to install a mismatch. config.yaml already points at it.
+sha256sum models/damoyolo_tinynasL20_T.hef
+#    must equal accelerator.yolo_hef_sha256 in config.yaml:
+#    e69136d3ebf3cc8ebaf3da5417a59962b139f3d3d67d715e9a9b1ae10963960e
+hailortcli parse-hef models/damoyolo_tinynasL20_T.hef | grep -iE 'Output|Score threshold'
+#    must show SIX outputs and NO score threshold -- this is a raw-tensor build.
 sudo systemctl restart sensordyme
 journalctl -u sensordyme -n 200 | grep -i 'accel\|hailo'
 curl -s localhost:8899/api/health | python3 -m json.tool | grep -A3 accelerator
 ```
 
+> **Do not `curl` an Ultralytics-derived `.hef` (`yolov11n`, `yolov8n`,
+> `yolov8s_h8l`) onto a device.** An earlier version of this step told you to,
+> and it was wrong twice over: those weights are **AGPL-3.0** (`docs/LICENSING.md`
+> §3–4) on hardware that is conveyed to a customer, and they are **NMS-on-chip**,
+> which compiles a 0.200 score-threshold floor into the model and silently ignores
+> any lower `conf` — measured as phone recall capped at 25.4%. Nothing errors;
+> `config.yaml` simply stops describing the running detector.
+
 **Pass:** health reports "Hailo in use for object detection", and the overlay boxes
-look right. **Any init failure falls back to CPU** and is reported — so a silent
-"still on CPU" is a fail, not a pass.
+look right. **There is no CPU fallback on a device** — `ultralytics` is not
+installed there — so an accelerator failure is not a quiet downgrade: the service
+boots **degraded**, serving health and the dashboard with
+`monitoring_active: false` and a reason. A `monitoring_active: false` reading is a
+fail, not a pass.
 
 ```bash
-# 6. parity -- the number that decides whether the NPU can be trusted.
-#    Same frames through both backends, compare detections.
+# 6. parity. NOT RUNNABLE AS ORIGINALLY WRITTEN: this step used to say "set
+#    accelerator.yolo_hef: null, restart" to get a CPU baseline. On a device that
+#    now yields no detector at all (get_yolo_model raises; the service degrades) --
+#    it does not produce a comparison, it produces an outage mid-check.
+#
+#    Run the CPU baseline on a DEVELOPER MACHINE, which has ultralytics, and
+#    compare it against the device's Hailo run:
+#
+#  on the Pi:
 python benchmarks/accuracy_state_farm.py --per-class 100 \
     --baseline benchmarks/results/hailo_on.json
-# then set accelerator.yolo_hef: null, restart, and:
+#  on a Mac/CI box with `requirements.txt` installed (accelerator.yolo_hef unset there):
 python benchmarks/accuracy_state_farm.py --per-class 100 \
     --compare benchmarks/results/hailo_on.json
 ```
 
 **Pass:** headline metrics within the default 0.03 tolerance. A larger gap means
-quantisation or the differing letterbox/NMS path is changing real detections, and
-the two backends are not interchangeable.
+quantisation or the differing letterbox/NMS path is changing real detections.
+
+**Read the gap carefully, though.** The two sides are no longer the same model:
+the device runs DAMO-YOLO and the developer baseline runs Ultralytics YOLO11n.
+Their confidence curves differ in both directions (`docs/DETECTION_THRESHOLDS.md`
+§2), so a difference here is evidence about *calibration*, not proof that the NPU
+is wrong.
 
 ---
 
 ## 7. Sustained FPS
 
-No FPS number for this product exists on real hardware. Latency measured on the dev
-Mac (YOLO11n ~19 ms, dmonitoring ~10 ms) is a floor, not a prediction — a Pi 5 CPU
-is roughly 3–6× slower, and the MediaPipe figures measured here were taken on blank
-frames where the landmark stage short-circuits.
+No *sustained FPS* number for this product exists on real hardware. A per-inference
+latency number now does: `damoyolo_tinynasL20_T` on the Hailo-8L measured **23.6 ms**
+on the device (`docs/ACCELERATOR.md`, 2026-08-29). That is one stage, not a frame
+budget — it excludes capture, MediaPipe, the rule engine and encode, which is
+exactly what this step is for.
+
+The dev-Mac latencies (YOLO11n ~19 ms, dmonitoring ~10 ms) are a floor for the
+*Mac*, not a prediction for the Pi, and they describe a **different detector** from
+the shipped one. The MediaPipe figures measured there were taken on blank frames
+where the landmark stage short-circuits.
 
 ```bash
 python benchmarks/run_benchmarks.py --minutes 5            # live camera

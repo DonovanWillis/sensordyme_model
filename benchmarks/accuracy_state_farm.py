@@ -18,7 +18,8 @@ What it measures
                        scored on the four phone classes (c1-c4) as positives and
                        c0/c9 (safe driving, talking to passenger) as negatives.
   * person recall   -- YOLO 'person' availability. Gates presence, zones, stillness,
-                       occupancy and baby_monitoring's smallest-box heuristic.
+                       occupancy, and the candidate set baby_monitoring's InfantIdentifier
+                       chooses the infant from (a spurious box is a candidate too).
   * face  recall    -- MediaPipe FaceMesh availability. Gates EVERY drowsiness (EAR,
                        PERCLOS) and gaze (yaw/pitch) detection in the product; when
                        the face is not found those detections cannot run at all.
@@ -102,6 +103,14 @@ class DatasetMissing(SystemExit):
         super().__init__(EXIT_CANNOT_RUN)
 
 
+class BackendUnavailable(SystemExit):
+    """Requested backend did not answer. Also EXIT_CANNOT_RUN — not a regression."""
+
+    def __init__(self, message: str) -> None:
+        print(message, file=sys.stderr)
+        super().__init__(EXIT_CANNOT_RUN)
+
+
 def load_sample(per_class: int, seed: int, split: str = "val") -> list[dict]:
     """Deterministic per-class sample from the subject-disjoint manifest.
 
@@ -133,17 +142,65 @@ def _image_path(row: dict) -> Path:
     return DATA_ROOT / "train" / row["classname"] / row["img"]
 
 
-def score_sample(sample: list[dict], sweep: tuple[float, ...], quiet: bool = False) -> dict:
+def _load_detector(backend: str = "auto") -> tuple[object, str]:
+    """The detector the PRODUCT would load, plus the backend that actually answered.
+
+    This deliberately goes through `core.detectors.get_yolo_model()` rather than
+    constructing `ultralytics.YOLO` directly. Constructing YOLO directly is what
+    the first version of this harness did, and it silently made the harness
+    incapable of measuring the Hailo backend at all -- it would happily report
+    "accuracy" for a CPU model on a device whose whole pipeline was running on
+    the NPU. A benchmark that cannot see the accelerator is worse than no
+    benchmark, because the number looks authoritative.
+
+    backend="auto"  -- honour config.yaml's `accelerator:` block (Hailo if a .hef
+                       is configured and the runtime is up; CPU otherwise)
+    backend="cpu"   -- force CPU by not configuring the accelerator at all, which
+                       is exactly how a HAT-less device behaves
+
+    Returns (model, backend_actually_used) where the backend string is derived
+    from the returned object, never from what was requested.
+    """
+    import yaml
+
+    from core import accel
+    from core.detectors import get_yolo_model
+
+    repo = Path(__file__).resolve().parent.parent
+    config = yaml.safe_load((repo / "config.yaml").read_text())
+    weights = (
+        config.get("modules", {}).get("driver_attention", {}).get("yolo_weights", "yolo11n.pt")
+    )
+
+    if backend == "cpu":
+        accel.configure({"enabled": False})
+    else:
+        accel.configure(config.get("accelerator", {}))
+
+    model = get_yolo_model(weights)
+    actual = "hailo" if type(model).__name__ == "HailoYOLO" else "cpu"
+    if backend == "hailo" and actual != "hailo":
+        # Refuse rather than silently mislabel. Publishing CPU numbers under a
+        # Hailo heading is the specific dishonesty this harness exists to prevent.
+        raise BackendUnavailable(
+            "--backend hailo was requested but the accelerator did not answer.\n"
+            f"  accel.status(): {accel.status()[1]}\n"
+            "Refusing to report CPU numbers under a Hailo label."
+        )
+    return model, actual
+
+
+def score_sample(sample: list[dict], sweep: tuple[float, ...], quiet: bool = False,
+                 backend: str = "auto") -> dict:
     """Run the product's real models over `sample`, recording per-image raw scores.
 
     Scores are recorded ONCE at a floor confidence and thresholded afterwards, so a
     full sweep costs the same as a single threshold -- which is what makes the PR
     curve cheap enough to run in CI.
     """
-    from ultralytics import YOLO
     import mediapipe as mp
 
-    yolo = YOLO("yolo11n.pt")
+    yolo, backend_used = _load_detector(backend)
     names = yolo.names
     phone_id = next(k for k, v in names.items() if v == "cell phone")
     person_id = next(k for k, v in names.items() if v == "person")
@@ -190,6 +247,7 @@ def score_sample(sample: list[dict], sweep: tuple[float, ...], quiet: bool = Fal
             print(f"  ...{index + 1}/{len(sample)}", file=sys.stderr)
 
     return {
+        "backend": backend_used,
         "per_class": per_class,
         "skipped": skipped,
         "elapsed_s": round(time.perf_counter() - started, 1),
@@ -272,6 +330,7 @@ def print_report(summary: dict, shipped_conf: float) -> None:
     print("=" * 74)
     print("SensorDyme accuracy baseline -- State Farm val split (subject-disjoint)")
     print("=" * 74)
+    print(f"detector backend: {summary.get('backend', '?').upper()}")
     print(
         f"{summary['images_scored']} images scored in {summary['elapsed_s']}s"
         + (f" ({summary['images_skipped']} unreadable)" if summary["images_skipped"] else "")
@@ -286,7 +345,7 @@ def print_report(summary: dict, shipped_conf: float) -> None:
           + (f"   (mean conf {summary['person_mean_conf']:.2f})" if summary["person_mean_conf"] else ""))
     print("      gates presence, zones, stillness, occupancy, baby-box heuristic")
     print(f"  >1 person box on a 1-person img : {100 * summary['multi_person_rate']:5.1f}%")
-    print("      baby_monitoring uses 'smallest box == the baby' when >1 person")
+    print("      spurious boxes feed baby_monitoring's infant identification")
     print()
 
     print("PER CLASS")
@@ -371,6 +430,9 @@ def main(argv: Optional[list[str]] = None) -> int:
     parser.add_argument("--compare", type=Path, help="compare against a baseline and exit nonzero on regression")
     parser.add_argument("--tolerance", type=float, default=0.03,
                         help="allowed metric drop before --compare fails (default 0.03)")
+    parser.add_argument("--backend", default="auto", choices=["auto", "cpu", "hailo"],
+                        help="auto = honour config.yaml accelerator block; cpu = force CPU; "
+                             "hailo = require the accelerator and refuse to fall back")
     parser.add_argument("--quiet", action="store_true")
     args = parser.parse_args(argv)
 
@@ -392,8 +454,9 @@ def main(argv: Optional[list[str]] = None) -> int:
         print(f"sampling {len(sample)} images ({args.per_class}/class) from the "
               f"{args.split} split; subjects: {', '.join(subjects)}")
 
-    scored = score_sample(sample, sweep, quiet=args.quiet)
+    scored = score_sample(sample, sweep, quiet=args.quiet, backend=args.backend)
     summary = summarise(scored, sweep, shipped_conf)
+    summary["backend"] = scored["backend"]
     print_report(summary, shipped_conf)
 
     payload = {
@@ -403,6 +466,7 @@ def main(argv: Optional[list[str]] = None) -> int:
         "per_class": args.per_class,
         "seed": args.seed,
         "shipped_conf": shipped_conf,
+        "backend": scored["backend"],
         "models": {"detector": "yolo11n.pt", "face": "mediapipe face_mesh (refine_landmarks)"},
         "summary": summary,
     }

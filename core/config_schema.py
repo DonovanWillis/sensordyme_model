@@ -117,7 +117,7 @@ def validate(config: dict) -> tuple[list[str], list[str]]:
         if "enabled" in cloud:
             _check(errors, isinstance(cloud["enabled"], bool),
                    f"`cloud.enabled:` must be true or false, got {cloud['enabled']!r}")
-        if "base_url" in cloud and cloud["base_url"]:
+        if cloud.get("base_url"):
             _check(errors, isinstance(cloud["base_url"], str),
                    f"`cloud.base_url:` must be a string, got {cloud['base_url']!r}")
         if "device_key" in cloud:

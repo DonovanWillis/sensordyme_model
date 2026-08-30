@@ -4,6 +4,27 @@
 **Scope:** Should Hugging Face become part of the SensorDyme AI development ecosystem?
 **Verdict: PARTIALLY — see [Recommendation](#recommendation).**
 
+> **SUPERSEDED IN PART — read this first.** This document is a snapshot of an
+> evaluation made *before* the detector migration, and it is kept as the record of
+> how that decision was reached. Its present-tense claims about what SensorDyme
+> ships are no longer true:
+>
+> * **"You are shipping AGPL-3.0 in a commercial product right now" (§0.3, §4.5)
+>   describes the pre-Phase-4 state.** The device now runs
+>   `damoyolo_tinynasL20_T.hef` (Apache-2.0) on the Hailo-8L, and
+>   `requirements-device.txt` ships neither `ultralytics` nor `torch`. Ultralytics
+>   remains pinned in `requirements.txt` for developer machines and CI only.
+> * **"Code never executed on hardware"** — it has since. See
+>   `docs/PHASE5_DEMO_READINESS.md`.
+> * **Ranked action #5 was carried out**, and it is what chose the shipping
+>   detector.
+>
+> **Do not follow any step here that installs an Ultralytics-derived `.hef`
+> (`yolov11n`, `yolov8n`, `yolov8s_pose`, `yolov8s_h8l`) onto a device** — those
+> weights are AGPL-3.0 on hardware that is conveyed to a customer. The
+> Hailo-8L/mAP research below is still accurate and still useful; the licence
+> *status* of the product is not. `docs/LICENSING.md` governs what may ship.
+
 Every metric below is either a live API response or a document fetched during this
 evaluation; URLs are given inline. Where I could not verify something, it is marked
 **UNVERIFIED**.
@@ -482,7 +503,7 @@ downloadable today, and your NPU is idle.**
 | # | Action | Validating experiment | Why |
 |---|---|---|---|
 | 1 | **Resolve the Ultralytics AGPL question** | Legal/business decision, not an experiment | Blocks launch. Everything else is moot if the detector must be replaced. |
-| 2 | Download `yolov11n.hef` + run one frame on the Hailo | Any output at all from the NPU | Converts "code never executed on hardware" into a working path. Lowest-risk possible first win. |
+| 2 | ~~Download `yolov11n.hef` + run one frame on the Hailo~~ **DONE, but with `damoyolo_tinynasL20_T.hef` instead — do not do this as written** | Any output at all from the NPU | Converts "code never executed on hardware" into a working path. **`yolov11n.hef` is AGPL-3.0-derived and NMS-on-chip (0.200 floor, 25.4% phone recall); it is the wrong first win on both counts.** |
 | 3 | `scrfd_2.5g.hef` → `face_landmarks_lite.hef` | Face-detection availability on **driver-facing** frames vs MediaPipe's measured 38.4% | Directly attacks the worst measured number in the audit, and frees the CPU. |
 | 4 | `tddfa_mobilenet_v1.hef` for head pose | Compare yaw/pitch against current FaceMesh-derived pose | 6914 FPS, better-posed geometry, NME 4.04 after quantization. |
 | 5 | `damoyolo_tinynasL20_T.hef` vs YOLO11n on your State Farm split | **Phone recall at conf 0.35** — the metric that is currently 12–17% | Apache-2.0 *and* +4.7 mAP int8. Could fix the license and the phone problem at once. |

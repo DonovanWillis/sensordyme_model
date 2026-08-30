@@ -33,7 +33,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-from core.dataset import LABEL_UNREVIEWED, Sample, split_by_session  # noqa: E402
+from core.dataset import LABEL_UNREVIEWED, Sample, split_by_session
 
 
 def load_samples(source: Path) -> list[Sample]:

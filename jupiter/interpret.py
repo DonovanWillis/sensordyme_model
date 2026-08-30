@@ -20,7 +20,6 @@ from dataclasses import dataclass, field
 from typing import Optional
 
 from core.capabilities import registry
-
 from jupiter import confidence as confidence_module
 from jupiter import prompt as prompt_module
 from jupiter import security

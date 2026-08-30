@@ -8,7 +8,8 @@ built-in webcam. Callers only ever see :meth:`Camera.frames`.
 from __future__ import annotations
 
 import time
-from typing import Iterator, Optional
+from collections.abc import Iterator
+from typing import Optional
 
 import cv2
 import numpy as np
@@ -125,7 +126,7 @@ class Camera:
             return frame
         except CameraError:
             raise
-        except Exception as exc:  # noqa: BLE001 - normalize backend-specific errors
+        except Exception as exc:
             raise CameraError(f"camera read failed: {exc}") from exc
 
     def reopen(self) -> None:

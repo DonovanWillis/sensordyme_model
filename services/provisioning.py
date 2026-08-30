@@ -30,8 +30,8 @@ import socket
 import threading
 from typing import Optional
 
-from core.logging_setup import get_logger
 from core.identity import device_id, display_name
+from core.logging_setup import get_logger
 from core.network import WifiManager, nmcli_available
 
 log = get_logger("provisioning")
@@ -105,7 +105,7 @@ class ProvisioningService:
         self._health = None
 
     # ------------------------------------------------------------------ Service lifecycle
-    def start(self, health=None) -> None:  # noqa: ANN001 - supervisor duck-type
+    def start(self, health=None) -> None:
         # Same three guarantees services/capture.py and services/supervisor.py both
         # make, and which this class -- which duck-types Service rather than
         # subclassing it -- was missing entirely:
@@ -137,7 +137,7 @@ class ProvisioningService:
         """Crash containment: a provisioning crash must be visible, not silent."""
         try:
             self.run(stop)
-        except Exception as exc:  # noqa: BLE001 - see start()'s note 3
+        except Exception as exc:
             log.error("provisioning service crashed: %s", exc, exc_info=True)
             self._crashed = f"crashed: {exc}"
             health = getattr(self, "_health", None)

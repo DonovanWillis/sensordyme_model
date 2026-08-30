@@ -21,8 +21,8 @@ definition never touches estimate_head_pose_deg -- only cv2.projectPoints and
 plain vector rotation -- so it cannot be circular.
 """
 
-import numpy as np
 import cv2
+import numpy as np
 
 from modules.driver_attention import (
     _MODEL_POINTS_3D,

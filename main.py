@@ -116,6 +116,14 @@ from core.presets import (  # noqa: E402
     same_preset,
 )
 
+# Deliberate re-exports. Nothing inside main.py calls the three names above
+# besides load_presets, so an "unused import" autofix will delete them and break
+# every caller that imports them from here -- which is exactly what happened
+# during Phase 7 when `pre-commit run --all-files` ran ruff's safe autofix over
+# the tree. __all__ makes the intent machine-readable so the next autofix keeps
+# them.
+__all__ = ["load_preset_aliases", "load_presets", "resolve_preset", "same_preset"]
+
 
 def alert_types_for(module_name: str, preset: Optional[dict] = None) -> set:
     """The alertable event types for a module, with optional per-preset override."""
@@ -242,6 +250,24 @@ def run(argv: Optional[list[str]] = None) -> None:
     active_preset = next((n for n, p in presets.items() if p.get("module") == module_name), None)
     if active_preset is not None:
         alert_event_types = alert_types_for(module_name, presets[active_preset])
+
+    # Install the accelerator config BEFORE constructing the module. This is an
+    # ordering requirement, not a tidiness one: core.accel.maybe_hailo_yolo reads
+    # the `accelerator:` block from module-level state that configure() installs,
+    # so any module that builds a detector in its __init__ (occupancy does) would
+    # otherwise ask for a model while `yolo_hef` is still unset, get None, and
+    # fall through to the CPU path.
+    #
+    # On a device that is the whole failure: ultralytics is deliberately absent
+    # (AGPL-3.0), so the fall-through raises, main.py exits non-zero, systemd's
+    # Restart=always retries, and StartLimitAction=reboot power-cycles the Pi.
+    # Measured in Phase 5 — occupancy alone put this device into a sustained
+    # reboot loop while the other three modules were fine, purely because they
+    # happen to load their detectors lazily, after DeviceRuntime calls
+    # configure(). DeviceRuntime still calls it; configure() is idempotent.
+    from core import accel as _accel
+
+    _accel.configure(config.get("accelerator", {}))
 
     module = module_cls(module_config)
     print(f"SensorDyme: profile '{profile}', running module '{module_name}' (available: {available_modules()})")

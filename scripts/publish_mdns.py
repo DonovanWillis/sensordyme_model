@@ -17,7 +17,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-from core.identity import device_id  # noqa: E402
+from core.identity import device_id
 
 DEFAULT_PATH = Path("/etc/avahi/services/sensordyme.service")
 

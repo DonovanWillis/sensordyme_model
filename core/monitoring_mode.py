@@ -23,8 +23,9 @@ and pose estimation answer questions nobody asked.
 
 from __future__ import annotations
 
+from collections.abc import Iterable
 from enum import Enum
-from typing import Iterable, Optional
+from typing import Optional
 
 
 class MonitoringMode(str, Enum):

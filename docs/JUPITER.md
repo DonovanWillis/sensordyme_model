@@ -6,7 +6,7 @@ here.
 
 ```
 JUPITER
-├── Vision        YOLO11 (Hailo/CPU) · MediaPipe FaceMesh/Hands/Pose ·
+├── Vision        DAMO-YOLO on the Hailo-8L · MediaPipe FaceMesh/Hands/Pose ·
 │                 openpilot dmonitoring — unchanged, each still specialised
 ├── Reasoning     a small local instruct model, text only
 ├── Config        natural language → validated SensorDyme rules

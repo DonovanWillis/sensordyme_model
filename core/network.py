@@ -14,6 +14,7 @@ from __future__ import annotations
 import re
 import shutil
 import subprocess
+
 # Module-level so the string annotations on watch() resolve. It was imported only
 # INSIDE watch(), so `threading` was undefined at module scope and anything calling
 # typing.get_type_hints() on this class raised NameError -- benign today because the
@@ -52,7 +53,7 @@ def explain_connect_failure(raw: str, ssid: str) -> str:
     lowered = raw.lower()
     if "secrets were required" in lowered or "no secrets" in lowered:
         return f"That password was not accepted by '{ssid}'. Check it and try again."
-    if "property is invalid" in lowered or "invalid" in lowered and "key" in lowered:
+    if "property is invalid" in lowered or ("invalid" in lowered and "key" in lowered):
         return "That password is not a valid Wi-Fi key — most are at least 8 characters."
     if ("no network with ssid" in lowered or "not found" in lowered
             or "could not be found" in lowered or "network not found" in lowered):

@@ -10,7 +10,7 @@ from typing import Optional
 import matplotlib
 
 matplotlib.use("Agg")
-import matplotlib.pyplot as plt  # noqa: E402
+import matplotlib.pyplot as plt
 
 RESULTS_DIR = Path(__file__).parent / "results"
 REALTIME_FPS_THRESHOLD = 15.0  # below this, a module isn't considered real-time on this hardware

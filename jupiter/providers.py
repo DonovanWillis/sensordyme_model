@@ -21,8 +21,9 @@ from __future__ import annotations
 import json
 import os
 import time
+from collections.abc import Callable
 from dataclasses import dataclass, field
-from typing import Callable, Optional
+from typing import Optional
 
 
 class JupiterUnavailable(Exception):
@@ -144,7 +145,7 @@ class JupiterLocalProvider(Provider):
         started = time.monotonic()
         try:
             response = self._post(f"{self.base_url}/api/chat", json=body, timeout=self.timeout_s)
-        except Exception as exc:  # noqa: BLE001
+        except Exception as exc:
             raise JupiterUnavailable(
                 f"could not reach the local model at {self.base_url}: {exc}"
             ) from exc
@@ -214,7 +215,7 @@ class JupiterOpenAICompat(Provider):
             )
             response.raise_for_status()
             text = response.json()["choices"][0]["message"]["content"]
-        except Exception as exc:  # noqa: BLE001
+        except Exception as exc:
             raise JupiterUnavailable(f"the model endpoint failed: {exc}") from exc
         return ProviderResult(
             text=text, provider=self.name, model=self.model,
@@ -289,7 +290,7 @@ class AnthropicProvider(Provider):
         started = time.monotonic()
         try:
             response = client.messages.create(**request)
-        except Exception as exc:  # noqa: BLE001
+        except Exception as exc:
             raise JupiterUnavailable(f"the Anthropic API failed: {exc}") from exc
         if getattr(response, "stop_reason", None) == "refusal":
             raise JupiterUnavailable("the model declined to answer", retryable=False)

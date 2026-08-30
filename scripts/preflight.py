@@ -80,6 +80,57 @@ def main() -> int:
     if not accel_ok:
         fatal = True
 
+    # 3b. detection backend -----------------------------------------------------
+    # Since Phase 4 a device ships WITHOUT ultralytics (AGPL-3.0), so the Hailo
+    # path is not an optimisation any more — it is the only detector present. A
+    # missing .hef therefore stops object detection completely, and does it deep
+    # inside the inference loop where it reads as a warm-up warning and a restart
+    # loop rather than one clear sentence at boot. This says the sentence.
+    #
+    # PROBES, deliberately; it does not call core.detectors.require_backend.
+    # That would LOAD the model, which constructs a Hailo VDevice inside
+    # ExecStartPre — and the service starts microseconds after this process
+    # exits, so it would be racing its own preflight for the NPU on every boot.
+    # A weaker claim that cannot break startup beats a stronger one that can.
+    #
+    # Non-fatal by design, matching the camera and HAT checks above: a device
+    # that cannot detect should still boot so health, provisioning and the app
+    # come up and can SAY it cannot detect. Booting into a silent restart loop
+    # tells the owner nothing.
+    hef = accel_cfg.get("yolo_hef")
+    hef_exists = bool(hef) and Path(hef).exists()
+    try:
+        import importlib.util
+
+        cpu_fallback = importlib.util.find_spec("ultralytics") is not None
+    except (ImportError, ValueError):
+        cpu_fallback = False
+
+    if hef_exists and info.usable:
+        backend_detail = f"Hailo ({hef})"
+    elif cpu_fallback:
+        backend_detail = "CPU (ultralytics) — a dev machine, or a device that should not ship as-is"
+    elif hef and not hef_exists:
+        backend_detail = (
+            f"NONE — accelerator.yolo_hef points at a missing file ({hef}) and "
+            "ultralytics is not installed. Object detection will not run. "
+            "Re-run setup_pi.sh to provision the model."
+        )
+    elif not hef:
+        backend_detail = (
+            "NONE — accelerator.yolo_hef is unset and ultralytics is not installed. "
+            "Object detection will not run. Set accelerator.yolo_hef in config.yaml."
+        )
+    else:
+        backend_detail = (
+            f"NONE — the accelerator is unusable ({info.detail}) and there is no CPU "
+            "fallback installed. Object detection will not run. Reseat the AI HAT+."
+        )
+    results["checks"]["detection_backend"] = {
+        "ok": bool((hef_exists and info.usable) or cpu_fallback),
+        "detail": backend_detail,
+    }
+
     # 4. disk -------------------------------------------------------------------
     usage = shutil.disk_usage(".")
     free_mb = usage.free // (1024 * 1024)

@@ -134,7 +134,7 @@ async def cmd_networks(args) -> int:
         try:
             await asyncio.wait_for(scan_done.wait(), timeout=40)
             print("  device reported scan complete")
-        except asyncio.TimeoutError:
+        except TimeoutError:
             print("  no scan-complete push within 40s")
 
         networks = await _read_json(client, CHAR_NETWORKS, "networks")

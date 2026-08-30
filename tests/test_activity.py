@@ -5,15 +5,11 @@ everywhere is worse than none: every alert it raises trains the owner to ignore
 the next one, and the one that matters is always the next one.
 """
 
-import pytest
 
 from core import posture
 from core.activity import (
-    JUMP_ANKLE_RISE,
     MIN_SAMPLES,
-    RUN_SPEED,
     ActivityRecognizer,
-    ActivityState,
 )
 
 

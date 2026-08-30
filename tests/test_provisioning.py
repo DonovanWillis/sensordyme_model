@@ -25,7 +25,7 @@ class FakeWifi:
         # Mirrors WifiManager.watch. The real one wakes the loop on any
         # NetworkManager event; here the loop just falls back to its interval.
         self.watched = True
-        return None
+        return
 
     def connect(self, ssid, psk):
         self.connect_calls.append((ssid, psk))

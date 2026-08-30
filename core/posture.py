@@ -23,8 +23,9 @@ lying down deliberately and collapsing look identical in a single frame.
 from __future__ import annotations
 
 import math
+from collections.abc import Sequence
 from dataclasses import dataclass
-from typing import Optional, Sequence
+from typing import Optional
 
 # MediaPipe Pose landmark indices.
 LEFT_SHOULDER, RIGHT_SHOULDER = 11, 12

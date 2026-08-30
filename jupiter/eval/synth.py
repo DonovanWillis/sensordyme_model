@@ -22,8 +22,9 @@ Two limits worth stating plainly, because synthetic data flatters a model:
 from __future__ import annotations
 
 import itertools
+from collections.abc import Iterator
 from dataclasses import dataclass, field
-from typing import Iterator, Optional
+from typing import Optional
 
 from core.capabilities import registry
 

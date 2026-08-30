@@ -6,10 +6,21 @@ Description=SensorDyme edge vision service
 # stack never blocks the camera product.
 After=multi-user.target bluetooth.service
 Wants=bluetooth.service
-StartLimitIntervalSec=600
+StartLimitIntervalSec=120
 StartLimitBurst=5
 # Absolute last resort, behind in-process recovery AND Restart=always: if the
-# service fails 5 times in 10 minutes, reboot the Pi.
+# service fails 5 times inside the window above, reboot the Pi.
+#
+# The WINDOW was 600s until Phase 5, which made this fire on healthy devices.
+# RestartSec is 3s, so a genuine crash loop burns all 5 attempts in about
+# fifteen seconds — it never needed ten minutes to be detected. What ten minutes
+# DID do was accumulate unrelated, successful, manually-spaced restarts until
+# the fifth one rebooted the Pi. Measured, not theorised: eight `systemctl
+# restart` calls spread over six minutes of Phase 5 mode-switching rebooted this
+# device three times in a row, and each reboot re-entered the loop.
+#
+# 120s still catches every real crash loop with 8x margin, and stops ordinary
+# operator restarts from escalating into a device reboot mid-demo.
 StartLimitAction=reboot
 
 [Service]

@@ -47,12 +47,56 @@ dashboard:
   stream_fps: 12 # frames/sec pushed to a viewer; detection still runs at full camera fps
 
 # AI accelerator (Raspberry Pi AI HAT+ / Hailo). Detected at startup and verified
-# before inference; falls back to CPU automatically (visible in /api/health) unless
-# `required` is set. `yolo_hef` must point to a model compiled for Hailo with the
+# before inference. On a DEVICE there is no CPU fallback -- ultralytics (AGPL-3.0)
+# is not installed -- so an unusable accelerator means monitoring_active: false and
+# a stated reason, not a slower mode. On a developer Mac the same code does fall
+# back to ultralytics. This line used to promise a fallback on both, which stopped
+# being true when ultralytics left the device image.
+#
+# `required: true` refuses to start without a usable accelerator; with false the
+# device boots degraded instead, which is the more useful failure because health,
+# the dashboard and provisioning all stay up to report it.
+# `yolo_hef` must point to a model compiled for Hailo with the
 # Dataflow Compiler (see docs/ACCELERATOR.md) — a .pt/.onnx cannot run on the HAT.
 accelerator:
   enabled: true
-  yolo_hef: null # e.g. /home/pi/sensordyme/models/yolov8s_h8l.hef (NMS-on-chip Model Zoo build)
+  yolo_hef: models/damoyolo_tinynasL20_T.hef # provisioned by setup_pi.sh, checksum-pinned there
+  # Relative to the service WorkingDirectory (/home/pi/sensordyme). Was `null`
+  # until Phase 4, which was wrong in a way nothing surfaced: with no .hef the
+  # device fell back to CPU ultralytics, and ultralytics is AGPL-3.0. The shipped
+  # default therefore selected the one detection path a conveyed device must not
+  # use. It read as a safe, neutral default and was neither.
+  #
+  # DAMO-YOLO is a raw-tensor build (6 outputs, no on-chip NMS), which is what
+  # lets confidence thresholds mean what config.yaml says -- an NMS-on-chip .hef
+  # compiles its score threshold in and silently ignores anything lower. See the
+  # 0.20 floor documented on driver_attention's yolo_confidence_threshold.
+  #
+  # On a machine with no Hailo (a dev Mac) this is ignored and the CPU path is
+  # used, so this default is safe to carry in the shared config.
+  yolo_hef_sha256: e69136d3ebf3cc8ebaf3da5417a59962b139f3d3d67d715e9a9b1ae10963960e
+  # THE authoritative answer to "what detector binary is SensorDyme running?".
+  # Advisory here (not enforced at runtime); enforced at install time by
+  # setup_pi.sh, which refuses to install a model whose hash does not match.
+  #
+  #   model      damoyolo_tinynasL20_T  (DAMO-YOLO tinynasL20_T, COCO-80)
+  #   build      Hailo Model Zoo v2.15.0, hailo8l
+  #   source     https://hailo-model-zoo.s3.eu-west-2.amazonaws.com/ModelZoo/
+  #              Compiled/v2.15.0/hailo8l/damoyolo_tinynasL20_T.hef
+  #   sha256     e69136d3ebf3cc8ebaf3da5417a59962b139f3d3d67d715e9a9b1ae10963960e
+  #   bytes      18,554,430
+  #   structure  6 raw output tensors, NO on-chip NMS -> the confidence
+  #              threshold is fully ours (see the note on yolo_confidence_threshold)
+  #   licence    DAMO-YOLO is Apache-2.0; the Model Zoo build carries no
+  #              copyleft. This is the whole reason the detector moved off
+  #              ultralytics -- see docs/LICENSING.md.
+  #
+  # SUPERSEDES an earlier build (sha256 4c71eab8...) that Phases 3 and 4
+  # measured. That one's provenance could never be established -- it matched no
+  # Model Zoo release -- so it was retired rather than shipped, and every
+  # accuracy number was re-measured against THIS binary in Phase 5. The old file
+  # is kept only under models/_archive_unreproducible/ so the historic numbers
+  # stay traceable to an artifact; it must never be deployed.
   required: false # true = refuse to start without a usable accelerator
 
 # Networking workflow (Pi only; ignored on a dev Mac):
@@ -301,16 +345,19 @@ modules:
 
     # --- object detection: scans the ENTIRE frame (not just near the face) for anything
     # the driver could be holding, via YOLO11-nano run every Nth frame ---
-    yolo_weights: yolo11n.pt # shared with occupancy.py via core/detectors.py (loaded once, cached)
+    yolo_weights: yolo11n.pt # shared with occupancy.py via core/detectors.py (loaded once, cached).
+    # A cache key when accelerator.yolo_hef is set — the real weights are the
+    # .hef. Only a dev Mac resolves this to an actual ultralytics checkpoint;
+    # devices do not ship ultralytics (AGPL-3.0, see docs/LICENSING.md).
     yolo_every_n_frames: 3 # run YOLO (+ hands) on 1 out of every N frames; Face Mesh still runs every frame
-    yolo_confidence_threshold: 0.10 # minimum YOLO detection confidence to count.
+    yolo_confidence_threshold: 0.20 # minimum YOLO detection confidence to count.
     # LOWERED from 0.35 (2026-08-29), from measurement rather than intuition. Scored on
     # the State Farm val split (subject-disjoint, 400 phone-present / 200 phone-absent
     # frames) with `python benchmarks/accuracy_state_farm.py`:
     #     conf   phone recall   precision
     #     0.35        10.8%       100.0%   <- the old value: missed ~9 phones in 10
-    #     0.10        51.7%        95.8%   <- here
-    #     0.05        67.8%        93.5%   (best F1, but see below)
+    #     0.10        51.7%        95.8%   <- Phase 1 set this
+    #     0.05        67.8%        93.5%   (best F1 on CPU, but see below)
     # Re-run that command after ANY change here; it writes a JSON baseline and has a
     # --compare mode that fails on regression.
     #
@@ -321,11 +368,70 @@ modules:
     # visibility. Both scale directly with per-frame FPs, so the extra 16 points of
     # recall at 0.05 is not free.
     #
-    # NOTE this threshold gates EVERY class in the same YOLO pass, not just phones --
-    # including the COCO person class used to corroborate face-loss (more detections =
-    # more patience before attention_lost, the safer direction) and the food/drink
-    # classes (whose false positives are now spatially gated to the driver's upper
-    # region in modules/driver_attention.py, so a bottle in a footwell fires nothing).
+    # RAISED to 0.20 (2026-08-29, Phase 4). The table above was measured on CPU
+    # YOLO11n; the device now runs DAMO-YOLO on the Hailo-8L, and two things that
+    # measurement could not see decide the value:
+    #
+    #   1. THE CONFIG DID NOT MEAN WHAT IT SAID. An NMS-on-chip .hef has its score
+    #      threshold COMPILED IN and silently ignores any lower `conf` -- measured
+    #      as a 0.200 floor on yolov11n.hef. So 0.10 meant 0.10 on a raw-decode
+    #      build and 0.20 on an on-chip build: one line describing two different
+    #      detectors, with no error and no log line to say so. 0.20 is the lowest
+    #      value that means itself on both, which is why it is the floor and not
+    #      merely a preference.
+    #   2. On DAMO-YOLO 0.20 is the F1 optimum -- 0.848 at 93.8% phone recall,
+    #      against 66.2% recall at 0.35 -- and below it the raw-decode path turns
+    #      noisy, emitting 14 phone boxes on a single image at 0.10.
+    #
+    # Precision at 0.20 is ~77%, BELOW the 95.8% this table records for CPU at
+    # 0.10, and phone_detected still fires on the rising edge with no sustain
+    # gate. Taken deliberately: a bare phone_detected is log-only by design (see
+    # phone_alone_confidence 0.3 -- a dash-mounted GPS is legitimate), while the
+    # loud tier needs phone + hand overlap + eyes off road SUSTAINED. A false
+    # phone costs a log line; a missed phone costs the whole distraction chain.
+    #
+    # NOTE this threshold gates EVERY class in the same YOLO pass. It NO LONGER
+    # gates person -- see person_confidence_threshold below. The previous note
+    # here argued that letting person ride the low threshold was "the safer
+    # direction" because more detections buy more patience before attention_lost.
+    # That was true of YOLO11n and is false of DAMO-YOLO, which puts a SPURIOUS
+    # second person box on 51.5% of single-person images at 0.25. Extra patience
+    # earned from a box that is not a person is not safety. The food/drink classes
+    # still ride this threshold; their false positives are spatially gated to the
+    # driver's upper region in modules/driver_attention.py, so a bottle in a
+    # footwell fires nothing.
+    person_confidence_threshold: 0.50 # separate gate for the COCO person class.
+    # Person and phone want OPPOSITE ends of the same predict() call, which takes
+    # only one `conf` -- so the pass runs at the phone value and person is filtered
+    # up to this one afterwards. Measured on DAMO-YOLO, 600 subject-disjoint
+    # State Farm images (spurious second box on a single-person image / person
+    # availability):
+    #     0.25    51.5% spurious   100% availability
+    #     0.40    16.0%            100%
+    #     0.50     4.5%            100%   <- here
+    #     0.60     0.5%            100%
+    # WHY 0.50 AND NOT 0.60 -- the reason CHANGED in Phase 5, so read this rather
+    # than the old one. The original argument was "a Hailo failure falls back to
+    # CPU YOLO11n, whose availability at 0.60 is 86%, so cap at 0.50 to stay
+    # correct on the fallback". That argument is now VOID: Phase 5 removed
+    # ultralytics from the device entirely (AGPL-3.0), so there is no CPU
+    # fallback to be correct on. A Hailo failure is total detection loss, handled
+    # by degrading loudly (monitoring_active: false), not by a quieter detector.
+    #
+    # 0.50 survives on its own measured merits, on the actual demo binary:
+    #     0.50  ->  100.0% availability,  4.0% spurious second box
+    #     0.60  ->   99.8% availability,  0.8% spurious
+    # 0.60 is NOT free here -- it costs availability, and on this module a missed
+    # person is the worse error: it feeds presence, zones, stillness and the
+    # face-loss corroboration that decides how long attention_lost waits. Trading
+    # 0.2% of "did we see the person at all" for 3.2% fewer duplicate boxes is the
+    # wrong direction on a safety path, even though it would make a demo tidier.
+    #
+    # Why spurious person boxes matter here specifically: _eating_boxes_near_face
+    # picks the LARGEST person box as "the driver", so a phantom box can move who
+    # the module thinks it is watching; and a visible body stretches face-loss
+    # patience from face_lost_seconds (2.5s) out to face_lost_with_body_seconds
+    # (8.0s).
     yolo_classes: # COCO class name -> event type this module emits when that class appears
       cell phone: phone_detected
       cup: eating_drinking
@@ -420,7 +526,11 @@ modules:
   occupancy:
     confidence_threshold: 0.5 # YOLO person-detection confidence threshold
     confirm_frames: 3 # frames a new count must persist before it's emitted
-    model_weights: yolo11n.pt # auto-downloaded by ultralytics on first run
+    model_weights: yolo11n.pt # CPU/dev checkpoint only — see the note below
+    # NOT auto-downloaded on a device any more, and not present there: ultralytics
+    # is AGPL-3.0 and is excluded from requirements-device.txt (docs/LICENSING.md).
+    # When accelerator.yolo_hef is set this name is only a cache key; the actual
+    # weights are the .hef. It still selects the real checkpoint on a dev Mac.
     # Optional security zones (normalized 0..1 coords; see core/zones.py).
     # A person's feet inside a `restricted` zone -> zone_violation (sustained);
     # staying past linger_s -> person_lingering. Example:
@@ -444,6 +554,40 @@ modules:
 
   baby_monitoring:
     confidence_threshold: 0.4 # YOLO person-detection confidence (children are smaller/lower-conf)
+    # HELD at 0.4 in Phase 4 against a recommendation to raise it to 0.50.
+    # The DAMO-YOLO evidence for 0.50 is real -- spurious second person box on
+    # 16.0% of images at 0.40 vs 4.5% at 0.50, availability 100% at both -- but it
+    # was measured on ADULTS AT CLOSE RANGE (State Farm in-car). Infant
+    # availability at 0.50 is UNMEASURED, and the two error directions here are
+    # not symmetric:
+    #   FP (a spurious person box) is already well defended -- InfantIdentifier
+    #      requires crib-zone containment, size stability and temporal identity,
+    #      so a phantom or adult box is rejected structurally, not by threshold.
+    #   FN (the infant's own box drops below the gate) is NOT defended. It
+    #      surfaces as infant_unidentified / person_absent, i.e. a monitoring gap
+    #      on a sleeping baby -- the exact silence expect_presence exists to end.
+    # Raising a threshold whose FPs are already handled, at the cost of FNs that
+    # are not, is the wrong trade on this module. Revisit ONLY with the measurement
+    # named in docs/DETECTION_THRESHOLDS.md: infant availability on real crib
+    # footage at 0.40 / 0.50 / 0.60.
+    #
+    # --- keys below were readable only from the source until Phase 4 ---
+    # Each was config.get()-able but appeared in no config file, so it was tunable
+    # only by someone who had read modules/baby_monitoring.py. Surfaced here at
+    # EXACTLY their existing code defaults: this block changes no behaviour, it
+    # only makes the behaviour visible.
+    hand_detection_confidence: 0.35 # MediaPipe Hands detection confidence
+    hand_unknown_object_floor: 0.15 # min confidence for an unrecognised held object
+    # NOT raised. Choking is the highest-severity alert this product emits and it
+    # has almost no headroom -- the measured association ceiling is ~0.38 against a
+    # 0.30 threshold. A missed choking hazard is plainly the worse error, so this
+    # floor stays low on purpose. Note it is silently clamped to 0.200 on an
+    # NMS-on-chip .hef build (see driver_attention's threshold note).
+    infant_zone_min_containment: 0.85 # fraction of the person box inside the crib zone
+    infant_identification_min_confidence: 0.5 # min score to accept a box AS the infant
+    infant_identification_min_margin: 0.12 # how far the best candidate must beat the runner-up
+    infant_min_observation_s: 3.0 # observation before identifying, when NO crib zone is drawn
+    infant_reacquire_s: 30.0 # how long identity survives losing the box
     detect_every_n_frames: 2 # run detection every Nth frame (motion runs every frame)
     model_weights: yolo11n.pt
     still_warning_s: 120 # unusually-still warning after this many seconds of low motion
@@ -463,6 +607,32 @@ modules:
     #   zones:
     #     crib:   { polygon: [[0.2,0.2],[0.8,0.2],[0.8,0.9],[0.2,0.9]], kind: safe }
     #     stairs: { polygon: [[0.0,0.5],[0.15,0.5],[0.15,1.0],[0.0,1.0]], kind: restricted }
+    #
+    # A `safe` crib zone now does MORE than gate safe_zone_exit: it is the strongest
+    # signal InfantIdentifier uses to decide WHICH person in frame is the baby (see
+    # modules/baby_monitoring.py). That matters because the module used to take the
+    # smallest person box, which returned the CAREGIVER whenever the infant's box
+    # dropped out — measured, three of six realistic caregiver placements then missed
+    # a real hazard outright.
+    #
+    # Deliberately still empty by default rather than shipping the example polygon:
+    # a crib rectangle is specific to one camera and one room, and a wrong zone is
+    # worse than none (it would positively identify the wrong region). The app's zone
+    # editor is how a real one gets drawn.
+    #
+    # WITHOUT a safe zone, identification falls back to temporal identity and size
+    # stability. Measured: still correct for the realistic sequence (infant
+    # established, caregiver walks in), but capped at 0.6 confidence, and in the
+    # adversarial case — infant box lost, a lone adult left in frame — it declines
+    # for INFANT_REACQUIRE_S (30 s) and may then re-identify that adult. That is an
+    # information limit, not a bug: a lone stationary adult is genuinely
+    # indistinguishable from a baby by box geometry alone. It is bounded so the
+    # `infant_unidentified` alert (20 s) always fires BEFORE re-acquisition (30 s) —
+    # the operator is told scoring is paused before it silently resumes.
+    #
+    # So: drawing a crib zone is the single highest-value setup step for baby
+    # monitoring, and the module reports reduced confidence and says why when there
+    # isn't one.
     zones: {}
     holding_bottle_confirm_s: 1.0 # sustained overlap with a detected bottle before "holding_bottle" fires
     holding_object_confirm_s: 1.0 # same, for object_classes below -> "holding_object"

@@ -21,9 +21,9 @@ The defects:
 
 import numpy as np
 import pytest
+import test_driver_attention_scenarios as das
 
 import modules.driver_attention as driver_attention_module
-import test_driver_attention_scenarios as das
 from core.zones import Zone
 from modules.driver_attention import PerclosTracker
 

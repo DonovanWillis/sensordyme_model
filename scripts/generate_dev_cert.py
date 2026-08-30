@@ -66,7 +66,7 @@ def main() -> int:
     print(f"wrote {cert_path} and {key_path}")
     print()
     print("Run the backend with it:")
-    print(f"  .venv/bin/uvicorn cloud.app:app --host 0.0.0.0 --port 8787 \\")
+    print("  .venv/bin/uvicorn cloud.app:app --host 0.0.0.0 --port 8787 \\")
     print(f"      --ssl-keyfile {key_path} --ssl-certfile {cert_path}")
     print()
     print("Then, on the device, point config.yaml's cloud.base_url at https:// and set:")

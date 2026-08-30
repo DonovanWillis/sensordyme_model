@@ -32,9 +32,10 @@ from __future__ import annotations
 
 import re
 import time
+from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import datetime
-from typing import Callable, Optional
+from typing import Optional
 
 from core.detections import DetectionFrame
 from core.detectors import iou

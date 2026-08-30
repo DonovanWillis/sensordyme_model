@@ -21,10 +21,16 @@ sudo apt-get install -y \
   alsa-utils
 
 # AI HAT+ (Hailo) support: driver + HailoRT runtime + tools. Available on
-# Pi OS Bookworm's repos; if this fails the device still runs on CPU and
-# /api/health explains why.
-echo "==> Installing Hailo support for the AI HAT+ (optional but recommended)"
-sudo apt-get install -y hailo-all || echo "WARNING: hailo-all not installed — AI HAT+ will be unused (CPU fallback)"
+# Pi OS Bookworm's repos. If this fails the device has NO detector at all --
+# there is no CPU fallback, because ultralytics (AGPL-3.0) is deliberately not
+# installed. The service still boots and serves health, the dashboard and BLE
+# provisioning, but reports monitoring_active: false and says why. That is
+# intended: a safety device that cannot see must say so rather than appear well.
+# (This comment used to promise a CPU fallback. That was true before Phase 4
+# removed ultralytics from the device image; leaving it would have told an
+# installer their failed install was harmless.)
+echo "==> Installing Hailo support for the AI HAT+ (REQUIRED — there is no CPU fallback)"
+sudo apt-get install -y hailo-all || echo "WARNING: hailo-all not installed — this device will have NO object detector and will boot degraded (monitoring_active: false)"
 
 echo "==> Creating virtualenv (with access to system site-packages for picamera2)"
 python3 -m venv --system-site-packages .venv
@@ -32,8 +38,76 @@ python3 -m venv --system-site-packages .venv
 source .venv/bin/activate
 
 pip install --upgrade pip
-pip install -r requirements.txt
+# requirements-device.txt, NOT requirements.txt: this is a device we convey, and
+# the developer set pins ultralytics, which is AGPL-3.0 (docs/LICENSING.md).
+# Detection here runs on the AI HAT+ via core/accel.py, which needs no inference
+# framework — just hailo-all, installed above. Dropping ultralytics also drops
+# torch + torchvision, ~800MB that never had a use on this board.
+pip install -r requirements-device.txt
 pip install gpiozero==2.0.1 lgpio==0.2.2.0
+
+# --- object-detection model -------------------------------------------------
+# This step exists because without it a fresh install produced a device that
+# could not detect anything. `models/` and `*.hef` are both gitignored and
+# nothing here fetched a model, so the detector only ever worked by falling back
+# to ultralytics, which auto-downloaded yolo11n.pt. Both are AGPL-3.0, so that
+# path is now deliberately closed (requirements-device.txt) -- which turns the
+# missing model from a silent licence problem into a loud startup failure. This
+# provisions the model properly instead.
+#
+# Pinned by CHECKSUM, not just URL: a model file is the one binary in this
+# product whose contents decide whether a fall is detected, and "whatever S3
+# served today" is not a supply chain. A mismatch fails the install.
+MODEL_DIR="models"
+MODEL_FILE="$MODEL_DIR/damoyolo_tinynasL20_T.hef"
+MODEL_URL="https://hailo-model-zoo.s3.eu-west-2.amazonaws.com/ModelZoo/Compiled/v2.15.0/hailo8l/damoyolo_tinynasL20_T.hef"
+MODEL_SHA256="e69136d3ebf3cc8ebaf3da5417a59962b139f3d3d67d715e9a9b1ae10963960e"
+# The build Phase 3/4 actually measured. Its provenance could NOT be established
+# -- it matches no Model Zoo release (v2.11-v2.15 all differ in size), and the
+# script that fetched it did not survive. It is structurally identical to the
+# pinned build above (same input, same 6 raw-tensor outputs, same shapes), so
+# integration is unaffected, but the WEIGHTS differ and the accuracy numbers in
+# docs/ were measured on this one. Re-run benchmarks/accuracy_state_farm.py
+# against the pinned build before treating those numbers as describing it.
+MODEL_SHA256_EVALUATED="4c71eab80976a2c9f1b134877890abce02871f6d4d92f53ac5a3f8bf2f24add2"
+
+mkdir -p "$MODEL_DIR"
+echo "==> Provisioning the object-detection model"
+if [ -f "$MODEL_FILE" ]; then
+  have="$(sha256sum "$MODEL_FILE" | cut -d' ' -f1)"
+  if [ "$have" = "$MODEL_SHA256" ]; then
+    echo "    already present and matches the pinned build"
+  elif [ "$have" = "$MODEL_SHA256_EVALUATED" ]; then
+    echo "    present: the Phase 3/4 EVALUATED build (provenance unverified, see above)."
+    echo "    Keeping it — it is the file the shipped accuracy numbers describe."
+  else
+    echo "ERROR: $MODEL_FILE is present but matches no known build." >&2
+    echo "  found:    $have" >&2
+    echo "  expected: $MODEL_SHA256 (pinned) or $MODEL_SHA256_EVALUATED (evaluated)" >&2
+    echo "  Refusing to guess. Delete the file to re-provision, or verify its origin." >&2
+    exit 1
+  fi
+else
+  echo "    downloading $(basename "$MODEL_FILE") from the Hailo Model Zoo"
+  if ! curl -fSL --retry 3 --connect-timeout 20 -o "$MODEL_FILE.part" "$MODEL_URL"; then
+    rm -f "$MODEL_FILE.part"
+    echo "ERROR: could not download the detection model from:" >&2
+    echo "  $MODEL_URL" >&2
+    echo "Without it this device cannot detect people or objects and the service" >&2
+    echo "will fail to start. Fetch it manually onto the device as $MODEL_FILE." >&2
+    exit 1
+  fi
+  got="$(sha256sum "$MODEL_FILE.part" | cut -d' ' -f1)"
+  if [ "$got" != "$MODEL_SHA256" ]; then
+    rm -f "$MODEL_FILE.part"
+    echo "ERROR: checksum mismatch on the downloaded model — NOT installing it." >&2
+    echo "  expected: $MODEL_SHA256" >&2
+    echo "  got:      $got" >&2
+    exit 1
+  fi
+  mv "$MODEL_FILE.part" "$MODEL_FILE"
+  echo "    installed and checksum-verified"
+fi
 
 mkdir -p data/reports
 

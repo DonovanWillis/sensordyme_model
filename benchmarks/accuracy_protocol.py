@@ -35,7 +35,7 @@ import json
 import sys
 import time
 from dataclasses import dataclass, field
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
@@ -108,7 +108,7 @@ PHASES = [
 
 
 def _utcnow() -> datetime:
-    return datetime.now(timezone.utc)
+    return datetime.now(UTC)
 
 
 def _countdown(seconds: float, label: str) -> None:
@@ -160,7 +160,7 @@ def _load_events(events_path: Path, t_min: datetime, t_max: datetime) -> list[di
             except (KeyError, ValueError):
                 continue
             if ts.tzinfo is None:
-                ts = ts.replace(tzinfo=timezone.utc)
+                ts = ts.replace(tzinfo=UTC)
             if t_min <= ts <= t_max:
                 events.append({"ts": ts, "type": row["type"], "signals": row.get("contributing_signals", "")})
     return events

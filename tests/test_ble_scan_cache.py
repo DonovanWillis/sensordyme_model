@@ -28,7 +28,7 @@ def test_the_server_accepts_a_scan_callback():
     """provisioning.py passes scan_networks=; a signature that omits it raises
     TypeError inside _open_ble_window and kills the provisioning thread, leaving
     no Bluetooth window at all."""
-    server = make_server(lambda: [])
+    server = make_server(list)
     assert server._scan_networks is not None
 
 

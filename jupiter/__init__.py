@@ -28,22 +28,22 @@ YOLO/MediaPipe -> structured observation -> deterministic rule engine, at
 30fps, with no LLM in it.
 """
 
-from jupiter.schema import RULE_SCHEMA, RuleDraft, schema_for_registry
 from jupiter.providers import (
     JupiterUnavailable,
     ProviderResult,
     available_providers,
     get_provider,
 )
+from jupiter.schema import RULE_SCHEMA, RuleDraft, schema_for_registry
 
 __all__ = [
     "RULE_SCHEMA",
-    "RuleDraft",
-    "schema_for_registry",
     "JupiterUnavailable",
     "ProviderResult",
+    "RuleDraft",
     "available_providers",
     "get_provider",
+    "schema_for_registry",
 ]
 
 VERSION = "0.1"

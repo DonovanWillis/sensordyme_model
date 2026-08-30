@@ -25,25 +25,23 @@ import signal
 import subprocess
 import threading
 import time
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import Optional
 
 import cv2
 
-from core import accel, sdnotify
+from core import accel, device_health, monitoring_mode, sdnotify
 from core.alerts import AlertManager
 from core.camera import Camera, CameraError
+from core.dataset import CaptureStore
 from core.events import Event
 from core.frame_bus import FrameBus
 from core.health import HealthMonitor
 from core.logger import EventLogger
 from core.logging_setup import get_logger, setup_logging
-from core import device_health
-from core.network import WifiManager, nmcli_available
-from core.dataset import CaptureStore
-from core import monitoring_mode
 from core.monitoring_config import load_or_empty
+from core.network import WifiManager, nmcli_available
 from core.rules import RuleEngine
 from core.telemetry import TelemetryLogger
 from core.zones import load_zones
@@ -170,6 +168,13 @@ class DeviceRuntime:
         self._last_stream_push = 0.0
         self._flash_until = 0.0  # monotonic time; see _FLASH_DURATION_S
         self._consecutive_process_failures = 0  # see _MAX_CONSECUTIVE_PROCESS_FAILURES
+        #: Why object detection is unavailable, or None when it is available.
+        #: Set at boot by _verify_detection_backend. When set, the device runs in
+        #: DEGRADED mode: it boots, serves health, the dashboard and provisioning,
+        #: and says plainly that monitoring is NOT active -- rather than either
+        #: crash-looping (telling the owner nothing) or running the module anyway
+        #: (claiming to watch something it cannot see).
+        self._detection_degraded: Optional[str] = None
         self._last_debug_print = 0.0
 
         self.camera: Optional[Camera] = None
@@ -215,6 +220,7 @@ class DeviceRuntime:
         info = accel.configure(accel_cfg)
         if accel_cfg.get("required", False) and not info.usable:
             raise RuntimeError(f"accelerator.required is set but: {info.detail}")
+        self._verify_detection_backend()
 
         logging_config = self.config.get("logging", {})
         self.logger = EventLogger(logging_config.get("csv_path", "data/events.csv"))
@@ -263,7 +269,20 @@ class DeviceRuntime:
                 events_csv_path=logging_config.get("csv_path", "data/events.csv"),
                 jpeg_quality=int(dash_cfg.get("jpeg_quality", 60)),
                 stream_fps=float(dash_cfg.get("stream_fps", 12)),
-                health_provider=lambda: self.health.snapshot(),
+                # Both halves of the picture. `health.snapshot()` answers "is each
+                # supervised component up"; `device_health.collect()` answers "what
+                # is the hardware actually doing" — frame-interval distribution,
+                # accelerator inference evidence, thermals. The second was already
+                # computed every tick for the app's status card and reached the
+                # backend over the uplink, but the DEVICE'S OWN endpoint could not
+                # see it. That mattered for the frame-interval percentiles: a mean
+                # fps cannot show a stall, and the stall is what loses evidence.
+                # caller="dashboard": fps sampling keeps a per-caller baseline,
+                # because this runs on the HTTP thread on every request while the
+                # inference loop samples on its own cadence. Sharing one baseline
+                # made each consume the other's window and report ~0 fps.
+                health_provider=lambda: {**self.health.snapshot(),
+                                         "device": self._collect_health("dashboard")},
             )
             print(
                 f"SensorDyme: dashboard live at {self.dashboard.start()} — annotated frames stream "
@@ -280,12 +299,28 @@ class DeviceRuntime:
             # new one arrives — otherwise a device that rebooted into a custom
             # configuration shows the base mode until the next change.
             self.uplink.set_monitoring(self.monitoring.describe())
-            self._apply_monitoring_mode()
             self.uplink.start()
             print(
                 f"SensorDyme: cloud uplink -> {cloud_cfg.get('base_url')} "
                 "(events + mode commands; never frames)"
             )
+
+        # Wire a RESTORED rule set into the running system. Both calls used to
+        # happen only in the inference loop, when a NEW rule set arrived over the
+        # uplink -- and `_apply_monitoring_mode()` additionally sat inside the
+        # `cloud.enabled` block above, so on a cloud-disabled device it never ran
+        # at all. A device that rebooted with rules already saved therefore came
+        # up in AI_CUSTOM mode, discarded every event its module produced (see
+        # the `self.monitoring.active` branch in the inference loop), never
+        # switched to the module the rules needed, never told any module which
+        # labels to request -- and reported itself healthy the whole time.
+        # Verified in Phase 6: 7 frames processed, 1 rule active, 0 events.
+        #
+        # Unconditional and before the loop starts, because "the device was
+        # restarted" must not be a different code path from "a rule arrived".
+        if self.monitoring.active:
+            self._apply_monitoring_mode()
+            self._apply_requested_labels()
 
         wifi = WifiManager()
         self.wifi = wifi  # also read by the health report the app displays
@@ -325,7 +360,24 @@ class DeviceRuntime:
             restart=self._restart_inference,
             check_interval_s=2.0,
         )
-        self.health.register("accelerator", check=accel.status, check_interval_s=60.0)
+        # live_status(), not status(): the endpoint must report what is actually
+        # computing, not what the config asked for. See core/accel.py:live_status.
+        # 10s, not 60s: inference_stats() calls a result "live" only within 10s, so
+        # a 60s interval would spend most of its time reporting a stale verdict.
+        # Gated on whether the ACTIVE module uses the accelerator, for the same
+        # reason device_health's monitoring_active is. `accel.live_status()` reads
+        # a process-global inference counter that does NOT reset on a module swap,
+        # so after switching into Elderly Monitoring (fall_detection is
+        # MediaPipe-Pose-only and never touches the NPU) the previous module's
+        # inferences age out and it reports "Hailo NPU idle — pipeline stalled or
+        # fell back to CPU". Three checks later the component is DEGRADED and the
+        # top-level `state` in /api/health follows -- for the whole Elderly
+        # segment of the demo, on a perfectly working fall detector.
+        self.health.register(
+            "accelerator",
+            check=self._accelerator_health,
+            check_interval_s=10.0,
+        )
         if self.dashboard is not None:
             self.health.register(
                 "dashboard",
@@ -406,13 +458,84 @@ class DeviceRuntime:
                     self.module_name, ", ".join(sorted(uncovered)),
                 )
 
+    #: Config keys through which a module names its detector weights. A module
+    #: declaring none (fall_detection is MediaPipe-Pose-only; dashsentinel loads
+    #: no detector) runs no object detection at all and must NOT be made to load
+    #: a model just to prove a backend it never uses exists.
+    _WEIGHTS_KEYS = ("yolo_weights", "model_weights", "phone_weights", "detector_weights")
+
+    def _verify_detection_backend(self) -> None:
+        """Resolve the object-detection backend at boot, or fail with one clear line.
+
+        WHY THIS EXISTS. Since ultralytics left the device image (AGPL-3.0, see
+        docs/LICENSING.md), the Hailo path is the ONLY detector present -- "no
+        backend" is now a total loss of object detection rather than a quiet
+        fallback to a slower one. occupancy.py already surfaces that at startup
+        because it loads its model in __init__, but driver_attention.py loads
+        lazily on its first stride tick, INSIDE the inference loop, where the
+        failure reads as a warm-up warning followed by a restart loop instead of
+        an explanation. This collapses both cases into the same message, at the
+        same moment, before the camera is even opened.
+
+        It LOADS the model rather than probing for one, deliberately: this runs in
+        the process that will use it, so the model lands in the shared cache and
+        the lazy caller gets it for free. scripts/preflight.py does the opposite
+        and only probes -- that is a separate process which exits moments before
+        this one starts, so loading there would race the service for the NPU.
+        """
+        # Re-decides from scratch, so a stale reason must not survive. Without
+        # this, a device that booted degraded and then switched to a module
+        # needing no detector (fall_detection is MediaPipe-Pose-only) would stay
+        # marked degraded while working perfectly -- the mirror of the bug this
+        # method exists to prevent.
+        self._detection_degraded = None
+
+        module_cfg = (self.config.get("modules", {}) or {}).get(self.module_name, {}) or {}
+        weights = next((module_cfg[k] for k in self._WEIGHTS_KEYS if module_cfg.get(k)), None)
+        if not weights:
+            log.info("object detection: %s uses no object detector", self.module_name)
+            return
+        from core import detectors
+
+        try:
+            backend = detectors.require_backend(str(weights), module_cfg.get("device"))
+        except Exception as exc:  # noqa: BLE001 - the reason is reported, not swallowed
+            # DEGRADED, not dead, and not pretending. Crash-looping here would
+            # take down health, the dashboard and BLE provisioning too, leaving
+            # an owner with a device that says nothing at all. Continuing as
+            # normal would be worse: the module would run against a detector
+            # that does not exist and the app would show "monitoring active".
+            # So: boot, refuse to analyse, and be loud about which one it is.
+            self._detection_degraded = str(exc)
+            log.error(
+                "DEGRADED: object detection unavailable for %s — monitoring is NOT "
+                "active. %s", self.module_name, exc,
+            )
+            return
+        log.info(
+            "object detection backend for %s: %s (%s)", self.module_name, backend, weights
+        )
+
     def _model_version(self) -> str:
         """Which model produced a sample — useless data without it, since you
         cannot tell an old model's mistakes from a new one's."""
-        weights = (self.config.get("modules", {}).get(self.module_name, {}) or {}).get(
-            "model_weights", "yolo11n.pt"
-        )
-        return str(weights)
+        module_cfg = (self.config.get("modules", {}) or {}).get(self.module_name, {}) or {}
+        # Every key a module might use, not just model_weights. driver_attention
+        # -- the flagship -- declares `yolo_weights`, so reading only
+        # `model_weights` stamped every one of its captured samples with the
+        # hardcoded "yolo11n.pt" default. A training sample labelled with a model
+        # that did not produce it is worse than an unlabelled one: you cannot tell
+        # an old model's mistakes from a new one's, which is this method's whole
+        # purpose. _WEIGHTS_KEYS is the same tuple _verify_detection_backend uses.
+        weights = next((module_cfg[k] for k in self._WEIGHTS_KEYS if module_cfg.get(k)), None)
+        # On-device the .pt name is only a cache key -- the real weights are the
+        # .hef -- so record the accelerator's model when one is in use.
+        hef = (self.config.get("accelerator", {}) or {}).get("yolo_hef")
+        if hef and accel.inference_stats()["count"] > 0:
+            import os
+
+            return f"{weights or 'unknown'}+{os.path.basename(hef)}"
+        return str(weights or "unknown")
 
     def _capture_training_sample(self, frame, alert, detection_frame) -> None:
         """Keep the frame that triggered a rule, if capture is switched on."""
@@ -433,7 +556,7 @@ class DeviceRuntime:
         )
 
     # ------------------------------------------------------------------ health reporting
-    def _collect_health(self) -> dict:
+    def _collect_health(self, caller: str = "loop") -> dict:
         """This device's real state, for the app's status indicators."""
         heartbeat_age = None if self._heartbeat == 0.0 else time.monotonic() - self._heartbeat
         return device_health.collect(
@@ -443,7 +566,28 @@ class DeviceRuntime:
             heartbeat_age_s=heartbeat_age,
             module_name=self.module_name,
             uplink_connected=self.uplink.connected if self.uplink is not None else None,
+            detection_degraded=self._detection_degraded,
+            caller=caller,
+            # Whether the ACTIVE module uses the accelerator at all. Recomputed
+            # per call because the active module changes at runtime when the
+            # operator switches preset mid-demo.
+            detector_required=self._module_uses_a_detector(),
         )
+
+    def _accelerator_health(self) -> tuple[bool, str]:
+        """Accelerator health, scoped to whether this mode actually uses it."""
+        if not self._module_uses_a_detector():
+            return True, f"not used by this mode ({self.module_name}) — {accel.status()[1]}"
+        return accel.live_status()
+
+    def _module_uses_a_detector(self) -> bool:
+        """Does the currently running module consume the object detector?
+
+        Same _WEIGHTS_KEYS signal `_verify_detection_backend` uses, so health and
+        the boot check can never disagree about which modules need a detector.
+        """
+        module_cfg = (self.config.get("modules", {}) or {}).get(self.module_name, {}) or {}
+        return any(module_cfg.get(key) for key in self._WEIGHTS_KEYS)
 
     # ------------------------------------------------------------------ AI-configured rules
     def _zones_for_module(self, module_name: str) -> list:
@@ -484,6 +628,13 @@ class DeviceRuntime:
 
         with self._module_lock:
             old_module, self.module, self.module_name = self.module, new_module, wanted
+        # The new module may need a detector the old one did not, or none at all.
+        # Verified once at boot was not enough: a device could boot on Elderly
+        # Monitoring (Pose-only, no detector required, so nothing was degraded),
+        # then be switched in the app to Security or Baby, whose modules load YOLO
+        # lazily inside process() -- raising every frame while monitoring_active
+        # stayed true and the banner said "active".
+        self._verify_detection_backend()
         # Release the old graphs explicitly. MediaPipe holds native resources
         # that a dropped reference does not free promptly, and a preset switch
         # used to leak one FaceMesh graph per swap.
@@ -494,7 +645,24 @@ class DeviceRuntime:
             except Exception:  # noqa: BLE001 - teardown must never raise
                 pass
 
-        self.rule_engine.set_zones(self._zones_for_module(wanted))
+        # Zones survive the swap when the swap is INTO AI-custom monitoring.
+        #
+        # The app sends zones and rules in a single poll: zones are applied
+        # first, then the rules, and the rules are what trigger this swap. Taking
+        # the new module's config.yaml zones here therefore replaced the polygon
+        # the user had just drawn -- with `{}` in the shipped config -- so the
+        # rule referencing it could never fire. The uplink had already acked
+        # zones_version, so the app never re-sent, and nothing recovered.
+        # Verified: 400 frames of a person inside the drawn polygon, zero alerts,
+        # with the video correct, people being detected, monitoring_active True
+        # and the app still listing the rule as active.
+        #
+        # Keyed on the MODE rather than on tracking the delivery, because in
+        # AI-custom the zones always come from the app by definition, however
+        # they arrived. Leaving AI-custom restores the module's own zones -- see
+        # _exit_custom_monitoring, which is the only place that happens.
+        if mode is not monitoring_mode.MonitoringMode.AI_CUSTOM:
+            self.rule_engine.set_zones(self._zones_for_module(wanted))
         self.mode = mode
         log.info(
             "[MONITORING] mode=%s module=%s base_monitoring=%s%s",
@@ -659,6 +827,10 @@ class DeviceRuntime:
     def _exit_custom_monitoring(self) -> None:
         """Someone explicitly picked a mode: that always wins over custom rules.
 
+        That includes the zones those rules were drawn for: once the custom
+        configuration is gone the module's own config.yaml zones are correct
+        again, and this is the only place that restoration happens.
+
         Before this, `_switch_preset` hot-swapped the running module but left
         `self.monitoring` (the saved rules + `overrides_mode`) untouched. That
         config drives `_apply_monitoring_mode()`, which runs on every rules/zones
@@ -676,6 +848,10 @@ class DeviceRuntime:
             return
         self.monitoring.clear()
         self.rule_engine.replace_rules([])
+        # Restore the module's own zones with the rules they replaced. Without
+        # this the app's polygons would outlive the custom configuration and
+        # quietly shadow every later preset.
+        self.rule_engine.set_zones(self._zones_for_module(self.module_name))
         if self.uplink is not None:
             self.uplink.set_monitoring(self.monitoring.describe())
         log.info("[MONITORING] custom monitoring exited: explicit mode switch")
@@ -737,6 +913,11 @@ class DeviceRuntime:
             old_module = self.module
             self.module, self.module_name, self.active_preset = new_module, new_module_name, name
             self.alert_event_types = self.alert_types_for(new_module_name, preset)
+        # Same reason as the AI-custom swap: a preset switch changes which module
+        # runs, and different modules need different backends. Verified once at
+        # boot leaves a device that switches into a detector-needing preset
+        # failing every frame while health still reports monitoring active.
+        self._verify_detection_backend()
         # What the preset wants, remembered separately from what is running:
         # AI_CUSTOM swaps the module out and must be able to hand it back.
         self._preset_module = new_module_name
@@ -774,6 +955,14 @@ class DeviceRuntime:
             self.dashboard.stream_interval if self.dashboard is not None else 0.0
         )
         while not (stop.is_set() or self.shutdown.is_set()):
+            if self._detection_degraded is not None:
+                # No detector, so there is nothing honest to compute. The
+                # heartbeat still ticks -- the loop IS alive, and health must be
+                # able to tell "degraded" from "hung", which are different
+                # failures with different fixes.
+                self._heartbeat = time.monotonic()
+                stop.wait(0.5)
+                continue
             frame, seq = self.bus.wait_for_fresh(last_seq, timeout=0.5)
             if seq == last_seq or frame is None:
                 # The heartbeat measures whether THIS LOOP is responsive; frame
@@ -874,7 +1063,7 @@ class DeviceRuntime:
             try:
                 events = module.process(frame)
                 self._consecutive_process_failures = 0
-            except Exception as exc:  # noqa: BLE001 - see comment above
+            except Exception as exc:
                 self._consecutive_process_failures += 1
                 log.error(
                     "module.process() failed (%d/%d consecutive): %s",
@@ -959,7 +1148,7 @@ class DeviceRuntime:
             snapshot = module.get_telemetry_snapshot()
             if snapshot is not None:
                 self.telemetry.log_if_due(
-                    time.monotonic(), datetime.now(timezone.utc).isoformat(), self.module_name, snapshot
+                    time.monotonic(), datetime.now(UTC).isoformat(), self.module_name, snapshot
                 )
 
             # Developer-only: "why did/didn't that alert" as a readable block,
@@ -1023,7 +1212,7 @@ class DeviceRuntime:
         try:
             self._evidence_dir.mkdir(parents=True, exist_ok=True)
             view = module.annotate(frame.copy())
-            stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S")
+            stamp = datetime.now(UTC).strftime("%Y%m%dT%H%M%S")
             types = "+".join(sorted({e.type for e in events}))[:60] or "alert"
             cv2.imwrite(str(self._evidence_dir / f"{stamp}_{types}.jpg"), view)
             # Bounded retention: newest N only.
@@ -1033,9 +1222,56 @@ class DeviceRuntime:
         except Exception as exc:  # noqa: BLE001 - evidence must never break detection
             log.warning("evidence snapshot failed: %s", exc)
 
+    def _shutdown_partial(self) -> None:
+        """Release whatever `_build()` managed to construct before it failed.
+
+        Mirrors run()'s finally block, but every step is independent and
+        best-effort: this runs on a half-built object where any attribute may be
+        None, and a second exception here would mask the real startup failure.
+
+        The step that actually matters is the camera. A held camera makes the
+        NEXT start fail too, which is how a single unplugged ribbon became a
+        reboot loop rather than one clear error repeated.
+        """
+        for label, attribute, method in (
+            ("health", "health", "stop"),
+            ("services", "supervisor", "stop_all"),
+            ("uplink", "uplink", "close"),
+            ("dashboard", "dashboard", "close"),
+            ("event log", "logger", "close"),
+            ("telemetry", "telemetry", "close"),
+            ("module", "module", "close"),
+            ("camera", "camera", "release"),
+        ):
+            target = getattr(self, attribute, None)
+            if target is None:
+                continue  # never built, nothing to release
+            try:
+                getattr(target, method)()
+            except Exception as exc:  # noqa: BLE001 - never mask the startup error
+                log.debug("partial shutdown: %s not released (%s)", label, exc)
+
     # ------------------------------------------------------------------ run
     def run(self) -> None:
-        self._build()
+        try:
+            self._build()
+        except Exception:
+            # _build() used to sit OUTSIDE this try, so anything it raised —
+            # a camera that will not open, a dashboard port still held by a
+            # stale manual run — escaped before the try/finally existed. The
+            # camera was left open, nothing was released, and systemd's
+            # Restart=always retried every 3s until StartLimitAction=reboot
+            # power-cycled the Pi. Verified in Phase 6: an unopenable camera
+            # raised after 10s, with `dashboard built? None  health built? None`.
+            #
+            # This does NOT convert a build failure into a running device — the
+            # exception still propagates and the service still exits non-zero.
+            # It guarantees the shutdown path runs, so the camera and sockets are
+            # released before the retry, which is what turns a reboot loop into
+            # an ordinary restart loop that systemd can report.
+            log.exception("startup failed; releasing whatever was already built")
+            self._shutdown_partial()
+            raise
 
         # systemd sends SIGTERM on stop; a clean release of the camera + flushed
         # logs must happen on that path too, not just Ctrl+C. (Handlers can only
@@ -1052,9 +1288,58 @@ class DeviceRuntime:
         self.health.start()
         sdnotify.notify_ready()
         log.info(
-            "runtime up: profile=%s module=%s display=%s accelerator=%s",
+            "runtime up: profile=%s module=%s display=%s accelerator=%s%s",
             self.profile, self.module_name, self.display, accel.status()[1],
+            "" if self._detection_degraded is None
+            else "  *** DEGRADED: monitoring NOT active ***",
         )
+        # One block naming everything that decides what this device is about to
+        # do. Before this, confirming a demo was set up correctly meant grepping
+        # several log lines written by different subsystems at different times,
+        # and the most important facts -- which model, which thresholds, whether
+        # anything is overriding the configured mode -- were the ones spread
+        # furthest apart. Phase 5 lost a driver-attention demo to a stale rule
+        # that nothing printed.
+        accel_cfg = self.config.get("accelerator", {}) or {}
+        module_cfg = (self.config.get("modules", {}) or {}).get(self.module_name, {}) or {}
+        hef = accel_cfg.get("yolo_hef")
+        pinned = str(accel_cfg.get("yolo_hef_sha256") or "")
+        lines = [
+            "----- demo configuration -----",
+            f"  mode              {self.module_name}"
+            + ("" if self.config.get("module") == self.module_name
+               else f"   (config.yaml says '{self.config.get('module')}')"),
+            f"  detector          {hef or 'CPU (no .hef configured)'}",
+            f"  model sha256      {pinned[:16] + '…' if pinned else '(not pinned)'}",
+            f"  phone conf        {module_cfg.get('yolo_confidence_threshold', '(n/a)')}",
+            f"  person conf       {module_cfg.get('person_confidence_threshold', '(n/a)')}",
+            f"  accelerator       {accel.status()[1]}",
+            f"  monitoring        {'NOT ACTIVE — DEGRADED' if self._detection_degraded else 'active'}",
+        ]
+        if self.monitoring.active:
+            lines.append("  override          AI-configured rule set IS overriding the mode")
+        log.info("\n".join(lines))
+
+        # Say WHY this module is running when it is not the configured one. An
+        # AI-configured rule set puts the device into AI-Custom mode, which is a
+        # feature -- but a rule saved weeks ago silently outranking config.yaml's
+        # `module:` is indistinguishable, from the logs, from the config simply
+        # being wrong. On this device a stale "watch for a bottle" rule from a
+        # fortnight earlier was quietly in charge of a driver-attention demo.
+        if self.monitoring.active:
+            configured = self.config.get("module")
+            age_h = (
+                (time.time() - self.monitoring.updated_at) / 3600.0
+                if self.monitoring.updated_at else None
+            )
+            log.warning(
+                "module '%s' is running because an AI-configured rule set is ACTIVE "
+                "and overrides config.yaml's module: '%s'. Instruction: %r. "
+                "Saved %s. Clear it from the app to return to the configured module.",
+                self.module_name, configured,
+                self.monitoring.instruction or "(none recorded)",
+                f"{age_h:.1f}h ago" if age_h is not None else "at an unknown time",
+            )
 
         try:
             if self.display:

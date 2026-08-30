@@ -22,9 +22,10 @@ guessing at. A missing part means "cannot say", never "not there".
 from __future__ import annotations
 
 import math
+from collections.abc import Iterable
 from dataclasses import dataclass, field
 from enum import Enum
-from typing import Iterable, Optional
+from typing import Optional
 
 
 class Part(str, Enum):

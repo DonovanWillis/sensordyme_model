@@ -42,9 +42,11 @@ def test_phone_use_fires_only_when_looking_at_it_and_once_per_episode():
 
 
 def test_every_skinnemoen_alert_type_is_audible():
-    import main as main_module
-    import yaml
     from pathlib import Path
+
+    import yaml
+
+    import main as main_module
 
     alert_set = main_module.ALERT_EVENT_TYPES_SKINNEMOEN
     for event_type in ("drowsiness", "skinnemoen_distracted", "skinnemoen_phone_use"):

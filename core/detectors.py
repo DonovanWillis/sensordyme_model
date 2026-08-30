@@ -27,9 +27,12 @@ def get_yolo_model(weights: str, device: Optional[str] = None):
     configured (see core/accel.py — services/runtime.py calls accel.configure at
     startup), this transparently returns a Hailo-backed model with the same call
     surface, so every module offloads to the accelerator without code changes.
-    Otherwise: any ultralytics-loadable checkpoint (YOLO or RT-DETR share the
-    same `YOLO(...)` loader, which dispatches on the checkpoint's own
-    architecture info).
+    Otherwise it falls back to the CPU backend, which needs `ultralytics` — an
+    AGPL-3.0 package that is DELIBERATELY NOT part of the device install (see
+    `require_backend` below and docs/LICENSING.md). On a developer machine that
+    installed requirements.txt it loads any ultralytics-loadable checkpoint (YOLO
+    or RT-DETR share the same `YOLO(...)` loader, which dispatches on the
+    checkpoint's own architecture info).
 
     Args:
         weights: Path or name of the weights file (e.g. "yolo11n.pt", "yolo11x.pt",
@@ -37,6 +40,11 @@ def get_yolo_model(weights: str, device: Optional[str] = None):
         device: Torch device string (e.g. "mps", "cuda", "cpu"). None (default)
             leaves ultralytics to pick automatically, matching prior behavior.
             An explicit device pin (mac_max's "mps") always bypasses the Hailo path.
+
+    Raises:
+        RuntimeError: when neither backend is available — no usable accelerator
+            and no `ultralytics` installed. Never returns a stub: a detector that
+            silently finds nothing is worse than one that refuses to start.
     """
     cache_key = (weights, device)
     if cache_key not in _model_cache:
@@ -47,7 +55,10 @@ def get_yolo_model(weights: str, device: Optional[str] = None):
             if hailo_model is not None:
                 _model_cache[cache_key] = hailo_model
                 return hailo_model
-        from ultralytics import YOLO
+        try:
+            from ultralytics import YOLO
+        except ImportError as exc:
+            raise RuntimeError(_no_backend_message(weights, device)) from exc
 
         print(
             f"core.detectors: loading YOLO weights '{weights}' "
@@ -59,6 +70,74 @@ def get_yolo_model(weights: str, device: Optional[str] = None):
             print(f"core.detectors: '{weights}' loaded on device={_model_device(model)}")
         _model_cache[cache_key] = model
     return _model_cache[cache_key]
+
+
+def _no_backend_message(weights: str, device: Optional[str]) -> str:
+    """The text a person sees when there is no detector at all.
+
+    Written out at length on purpose. The person hitting this is usually
+    installing a device, not reading this file, and the two fixes are completely
+    different depending on WHICH machine they are on — so a bare
+    "ModuleNotFoundError: No module named 'ultralytics'" is close to useless
+    here. It names the weights, both fixes, and why the AGPL package is not
+    simply installed for them.
+    """
+    if device is not None:
+        # An explicit device pin is the mac_max profile; it never consults the
+        # accelerator, so pointing at a Hailo HAT would be a wrong instruction.
+        return (
+            f"core.detectors: cannot load object-detection weights '{weights}' on "
+            f"device='{device}'. This profile runs detection on the CPU/GPU via the "
+            "`ultralytics` package, which is not installed.\n"
+            "  Fix: pip install -r requirements.txt (the developer set).\n"
+            "Note that `ultralytics` is AGPL-3.0 and is therefore NOT part of the "
+            "device install (requirements-device.txt) — see docs/LICENSING.md."
+        )
+    return (
+        f"core.detectors: no object-detection backend available for '{weights}'.\n"
+        "\n"
+        "The AI HAT+ accelerator is not usable (not seated, HailoRT missing, or "
+        "`accelerator.yolo_hef` unset/pointing at a missing file — /api/health "
+        "reports which), and the CPU fallback needs the `ultralytics` package, "
+        "which is not installed.\n"
+        "\n"
+        "`ultralytics` is AGPL-3.0, so it is deliberately excluded from the device "
+        "install (requirements-device.txt). See docs/LICENSING.md.\n"
+        "\n"
+        "Fix ONE of these:\n"
+        "  * Device (the shipping path): seat the AI HAT+, `sudo apt install "
+        "hailo-all`, and set `accelerator.yolo_hef` in config.yaml to a compiled "
+        ".hef.\n"
+        "  * Developer machine ONLY: pip install -r requirements.txt. Do not do "
+        "this on a shipped device — it puts an AGPL-3.0 package on hardware you "
+        "convey to a customer."
+    )
+
+
+def require_backend(weights: str, device: Optional[str] = None) -> str:
+    """Preflight: confirm a detector backend exists, or raise the same actionable error.
+
+    WHY A SEPARATE ENTRY POINT. `get_yolo_model` already fails correctly, but not
+    all callers reach it at the same time: occupancy.py loads its model in
+    `__init__` (so a missing backend surfaces during startup), while
+    driver_attention.py loads lazily on the first stride tick — inside the
+    inference loop, where services/runtime.py catches per-frame exceptions and
+    only escalates after several consecutive failures. That path still fails, but
+    it fails as a warm-up warning followed by a restart loop rather than as one
+    clear message at boot.
+
+    Call this once at startup, after `accel.configure`, to collapse both cases
+    into the same immediate, readable failure. Returns the backend name in use
+    ("hailo" or "ultralytics") so a caller can log it.
+
+    This LOADS the model (through `get_yolo_model`, so it lands in the shared
+    cache and the lazy caller gets it for free) rather than merely probing for
+    one. Probing separately would construct a second Hailo VDevice for the same
+    .hef just to throw it away, and "the import works" is a weaker claim than
+    "the weights actually loaded" anyway.
+    """
+    model = get_yolo_model(weights, device)
+    return "hailo" if type(model).__name__ == "HailoYOLO" else "ultralytics"
 
 
 def _model_device(model) -> str:

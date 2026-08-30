@@ -22,4 +22,4 @@ def _discover() -> None:
 
 _discover()
 
-__all__ = ["VisionModule", "register_module", "get_module_class", "available_modules"]
+__all__ = ["VisionModule", "available_modules", "get_module_class", "register_module"]

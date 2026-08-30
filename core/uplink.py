@@ -13,7 +13,6 @@ local alerts are never affected.
 from __future__ import annotations
 
 import threading
-import time
 import uuid
 from collections import deque
 from typing import Optional

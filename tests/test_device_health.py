@@ -54,7 +54,11 @@ def reset_accel_counters(monkeypatch):
     """Inference counters are module-level; isolate every test from the others."""
     monkeypatch.setattr(accel, "_inference_count", 0, raising=False)
     monkeypatch.setattr(accel, "_last_inference_monotonic", None, raising=False)
-    monkeypatch.setattr(device_health, "_last_fps_sample", None, raising=False)
+    # Reset the per-caller fps baselines. This was a single Optional[tuple]
+    # until fps sampling was keyed per caller (the dashboard thread and the
+    # inference loop were consuming each other's baseline and reporting 0 fps
+    # on a healthy camera); it is a dict now. Same reset, accurate type.
+    monkeypatch.setattr(device_health, "_last_fps_sample", {}, raising=False)
 
 
 # --------------------------------------------------------------------------- camera

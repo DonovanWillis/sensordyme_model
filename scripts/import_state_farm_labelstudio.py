@@ -28,8 +28,7 @@ import os
 from pathlib import Path
 
 import requests
-
-from prepare_state_farm import CLASS_NAMES  # noqa: E402 - same scripts/ dir
+from prepare_state_farm import CLASS_NAMES
 
 ROOT = Path(__file__).resolve().parent.parent
 DRIVER_CSV = ROOT / "data" / "state_farm" / "driver_imgs_list.csv"

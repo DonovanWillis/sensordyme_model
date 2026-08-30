@@ -18,8 +18,6 @@ from __future__ import annotations
 
 import csv
 
-import pytest
-
 from core.dashboard import DashboardServer
 
 

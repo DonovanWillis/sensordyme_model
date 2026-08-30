@@ -91,7 +91,7 @@ class CaptureService:
         inheritance."""
         try:
             self.run(stop)
-        except Exception as exc:  # noqa: BLE001 - a capture crash must never kill the device silently
+        except Exception as exc:
             log.error("capture service crashed: %s", exc, exc_info=True)
             if self._health is not None:
                 self._health.report_failure(self.name, f"crashed: {exc}")

@@ -85,10 +85,32 @@ hard-negative list — no images needed.
 
 ## Training and deploying (per model type)
 
-- **YOLO (objects)**: `yolo train model=yolo11n.pt data=<task>.yaml epochs=100` —
-  ultralytics is already a dependency. For the AI HAT, compile the trained
-  weights to `.hef` with Hailo's Dataflow Compiler (x86 machine + calibration
-  images), then point `accelerator.yolo_hef` at it. See docs/ACCELERATOR.md.
+- **Objects**: fine-tune the **shipped** architecture, then compile the trained
+  weights to `.hef` with Hailo's Dataflow Compiler (x86-64 Linux + calibration
+  images) and point `accelerator.yolo_hef` at the result. See
+  docs/ACCELERATOR.md.
+
+  > **Do not start from `yolo11n.pt`.** This section used to read
+  > `yolo train model=yolo11n.pt … — ultralytics is already a dependency`, and
+  > that is a licence trap: Ultralytics is **AGPL-3.0** and its stated position
+  > covers *"trained/fine-tuned models"*, so weights fine-tuned from `yolo11n.pt`
+  > inherit AGPL — and the last step of that recipe puts them on a device
+  > SensorDyme conveys to a customer. Removing `ultralytics` from the device does
+  > not help; the *weights* carry the licence. See docs/LICENSING.md §2, §4.
+  >
+  > `ultralytics` **is** still installed on developer machines
+  > (`requirements.txt`), so the command will run. That it runs is exactly the
+  > problem.
+  >
+  > Fine-tune **DAMO-YOLO** (`github.com/tinyvision/DAMO-YOLO`, Apache-2.0)
+  > instead — that is what ships, so a fine-tune stays on the same architecture
+  > *and* the same licence. YOLOX and NanoDet are the other Apache-2.0 options
+  > with Hailo-8L builds (docs/LICENSING.md §5). Never vendor DAMO-YOLO's
+  > `tools/onnx_inference.py` (CC BY-NC 4.0).
+  >
+  > Ultralytics training is fine for work that **never reaches a device** —
+  > `scripts/prepare_state_farm.py` produces an ultralytics-native layout for
+  > exactly that.
 - **Thresholds (EAR, PERCLOS, velocities)**: these are config, not weights.
   Sweep them offline against telemetry.csv + verdicts (see `benchmarks/`) and
   ship winners as preset variants.

@@ -20,7 +20,6 @@ from modules.baby_monitoring import (
     MOUTH_ZONE_FRACTION,
     BabyMonitoringModule,
     _assess_choking_hazard,
-    _infer_baby_box,
 )
 
 W, H = 1000, 1000
@@ -184,25 +183,34 @@ def test_unusual_stillness_still_fires_through_a_brief_detection_dropout():
     assert "unusual_stillness" in [e.type for e in events + events2 + events3]
 
 
-# ===================================================================== PHASE 2
-# PINNED KNOWN-WRONG BEHAVIOUR -- a red line for Phase 2, NOT a fix.
+# ============================================== PHASE 2 PINS, FIXED IN PHASE 3
+# These two tests were written in Phase 1 as CHARACTERIZATION PINS: they
+# asserted the then-current, known-WRONG behaviour of `_infer_baby_box`, which
+# returned the SMALLEST person box as "the baby" and therefore always returned
+# something. When a marginal-confidence infant box fell below the detector
+# threshold while a caregiver was in frame, it handed back the CAREGIVER's box
+# and choking-hazard risk was scored against an adult's mouth region and body
+# diagonal -- a silent wrong-target failure, materially worse than a missed
+# detection. They were pinned rather than fixed because the fix needed positive
+# identification, not a threshold guess.
 #
-# _infer_baby_box picks the SMALLEST person box as the baby's. When a
-# marginal-confidence infant box falls below the detector's threshold while a
-# caregiver is in frame, it does not return None -- it returns the CAREGIVER's
-# box, and choking-hazard risk is then scored against an adult's mouth region
-# and body diagonal. That is a silent WRONG-TARGET failure, materially worse
-# than a missed detection, and it is not covered anywhere else in the suite.
+# Phase 3 built that (modules/baby_monitoring.py's InfantIdentifier: crib-zone
+# containment, temporal identity, size/position stability, relative scale, and
+# an explicit reported "I do not know" that DECLINES to score). `_infer_baby_box`
+# no longer exists. So these two now assert the CORRECT behaviour instead,
+# keeping every measured number from the pinned version as the record of what
+# was actually wrong. The full Phase 3 coverage lives in
+# tests/test_phase3_baby_infant_identification.py; these two stay here as the
+# Phase 1 red line, closed.
 #
-# These two tests PASS today. They exist to pin the current behaviour with
-# real measured numbers so a Phase 2 fix has something to break, and so the
-# limitation cannot be quietly forgotten. Fixing it needs the infant-box
-# recall measurement (labelled crib-cam footage, confidence sweep) that has
-# not been done -- guessing at the detector threshold instead of measuring it
-# is the exact failure this phase exists to correct, so it is deliberately
-# NOT fixed here.
+# Renamed from test_pins_infer_baby_box_returning_the_caregiver_when_the_infant_
+# box_is_lost and test_pins_choking_risk_outcome_depending_on_where_the_
+# caregiver_stands: a name beginning "test_pins_" that asserts the opposite of
+# what it pins would be worse than no name at all.
 INFANT_IN_CRIB = (500, 400, 700, 850)
-#: Realistic caregiver placements, all LARGER in area than the infant box.
+#: Realistic caregiver placements. NOT all larger in area than the infant box:
+#: the far-corner one is 42,000px to the infant's 90,000px, which is how
+#: "smallest box wins" targeted an adult with the baby plainly in the crib.
 CAREGIVER_LEANING_OVER_CRIB = (450, 250, 800, 980)
 CAREGIVER_ACROSS_THE_ROOM = (30, 500, 300, 950)
 CAREGIVER_FAR_CORNER = (40, 600, 190, 880)
@@ -222,41 +230,111 @@ def _risk_scored_against(baby_box, association=MEASURED_ASSOCIATION_CEILING):
     return _assess_choking_hazard("right", (obj, association), hand, baby_box, 1.0).risk_score
 
 
-def test_pins_infer_baby_box_returning_the_caregiver_when_the_infant_box_is_lost():
-    """PINS KNOWN-WRONG BEHAVIOUR. Correct behaviour would be to return None
-    (or otherwise refuse to score) rather than silently substitute an adult."""
-    both = _infer_baby_box([CAREGIVER_ACROSS_THE_ROOM, INFANT_IN_CRIB])
-    assert both == INFANT_IN_CRIB, "with both visible, the smallest box is the infant's -- correct"
+def _hazard_at_the_infants_mouth():
+    """The same fixed hazard as _risk_scored_against, but fed through the module
+    frame by frame so the identifier -- not the test -- chooses the target."""
+    mouth = upper_region(INFANT_IN_CRIB, MOUTH_ZONE_FRACTION)
+    end = ((mouth[0] + mouth[2]) / 2.0, (mouth[1] + mouth[3]) / 2.0)
+    return _converging(start=(end[0] + 250, end[1] + 250), end=end, duration=0.6)
 
-    only_adult = _infer_baby_box([CAREGIVER_ACROSS_THE_ROOM])
-    assert only_adult == CAREGIVER_ACROSS_THE_ROOM, (
-        "WRONG-TARGET: the infant box was lost, so the caregiver's box is now "
-        "'the baby'. Phase 2: this should not silently return an adult."
+
+def test_infant_identification_declines_instead_of_returning_the_caregiver_when_the_infant_box_is_lost():
+    """FIXED IN PHASE 3 (was a characterization pin).
+
+    With both visible the infant is identified, which the old smallest-box
+    heuristic also managed. The difference is the case it got wrong: with the
+    infant's box lost and only a caregiver in frame, identification must FAIL
+    and report that failure -- `identified=False`, `box=None`, a stated reason
+    -- rather than silently substituting an adult.
+
+    Note this is NOT the `if len(boxes) == 1: return None` shortcut the Phase 1
+    audit rejected. Two boxes where neither is the infant declines too, and one
+    box that IS the infant identifies fine; the count of boxes is not what
+    decides it.
+    """
+    module = _module()
+    _run(module, [CAREGIVER_ACROSS_THE_ROOM, INFANT_IN_CRIB], 0.05, 1.0)
+    both = module._last_infant_identification
+    assert both.identified is True
+    assert both.box == INFANT_IN_CRIB, "with both visible, the infant is identified"
+
+    lost = _module()
+    _run(lost, [CAREGIVER_ACROSS_THE_ROOM], 0.05, 1.0)
+    only_adult = lost._last_infant_identification
+    assert only_adult.identified is False, (
+        "the infant box was lost, so there is no infant to score against -- the "
+        "caregiver must NOT become 'the baby'"
     )
-    assert _infer_baby_box([]) is None  # no people at all is handled honestly
+    assert only_adult.box is None
+    assert only_adult.people_in_frame == 1, "and it is not being confused with an empty frame"
+    assert only_adult.reason
+
+    # Not a box-count rule: two non-infants decline as well.
+    neither = _module()
+    _run(neither, [CAREGIVER_ACROSS_THE_ROOM, CAREGIVER_FAR_CORNER], 0.05, 1.0)
+    assert neither._last_infant_identification.identified is False
+
+    empty = _module()
+    _run(empty, [], 0.0, 1.0)
+    assert empty._last_infant_identification.box is None
+    assert empty._last_infant_identification.people_in_frame == 0
 
 
-def test_pins_choking_risk_outcome_depending_on_where_the_caregiver_stands():
-    """PINS KNOWN-WRONG BEHAVIOUR, and the part that actually matters: with
-    the infant box lost, whether ONE fixed real hazard is caught depends on
-    where the CAREGIVER happens to be standing -- the detection becomes
-    non-deterministic with respect to the hazard itself. Measured values, gate
-    0.30."""
+def test_choking_risk_outcome_no_longer_depends_on_where_the_caregiver_stands():
+    """FIXED IN PHASE 3 (was a characterization pin), and the part that actually
+    mattered: with the infant's box lost, whether ONE fixed real hazard was
+    caught used to depend on where the CAREGIVER happened to be standing, which
+    made the detection non-deterministic with respect to the hazard itself.
+
+    The risk FUNCTION is still position-dependent, and cannot be otherwise --
+    it measures distance to a mouth region and normalizes by a body diagonal,
+    so pointing it at a different body genuinely does give a different number.
+    The measured spread below is kept exactly as pinned, because it is the
+    reason target selection is safety-critical rather than a detail. What
+    changed is that a non-infant box can no longer REACH the function: the
+    module declines instead, so the OUTCOME is invariant. Gate 0.30.
+    """
     gate = _module()._choking_hazard_risk_threshold
     assert gate == pytest.approx(0.30)
 
+    # --- unchanged, and unchangeable: the arithmetic of scoring the wrong body
     correct = _risk_scored_against(INFANT_IN_CRIB)
     assert correct == pytest.approx(0.380, abs=0.005)
     assert correct >= gate, "scored against the right target, the hazard is caught"
+    assert _risk_scored_against(CAREGIVER_LEANING_OVER_CRIB) == pytest.approx(0.380, abs=0.005)
+    assert _risk_scored_against(CAREGIVER_ACROSS_THE_ROOM) == pytest.approx(0.198, abs=0.005)
+    assert _risk_scored_against(CAREGIVER_FAR_CORNER) == pytest.approx(0.0, abs=0.005)
 
-    # Same hazard, same frame, only the caregiver's position differs.
-    leaning = _risk_scored_against(CAREGIVER_LEANING_OVER_CRIB)
-    across = _risk_scored_against(CAREGIVER_ACROSS_THE_ROOM)
-    corner = _risk_scored_against(CAREGIVER_FAR_CORNER)
+    # --- what changed: the same hazard, swept over the same caregiver
+    # placements, through the real module. One outcome, every time.
+    outcomes = {}
+    for name, caregiver in (
+        ("leaning", CAREGIVER_LEANING_OVER_CRIB),
+        ("across", CAREGIVER_ACROSS_THE_ROOM),
+        ("corner", CAREGIVER_FAR_CORNER),
+    ):
+        module = _module()
+        events, _ = _run(module, [caregiver], 0.05, 2.4,
+                         hand_result_fn=_hazard_at_the_infants_mouth())
+        outcomes[name] = (
+            "choking_hazard" in [e.type for e in events],
+            module._last_choking_assessments["right"].risk_score,
+            module._last_infant_identification.identified,
+        )
+    assert set(outcomes.values()) == {(False, 0.0, False)}, (
+        f"outcome still varies with where the adult stands: {outcomes}"
+    )
 
-    assert leaning == pytest.approx(0.380, abs=0.005)
-    assert leaning >= gate, "caught, but only by luck of geometry -- not because it was scored right"
-    assert across == pytest.approx(0.198, abs=0.005)
-    assert across < gate, "REAL HAZARD MISSED"
-    assert corner == pytest.approx(0.0, abs=0.005)
-    assert corner < gate, "REAL HAZARD MISSED ENTIRELY -- risk scores literally zero"
+    # ...and the true positive is intact: put the infant back in frame and the
+    # identical hazard fires, at the correctly-targeted 0.380, from every one
+    # of those caregiver positions.
+    for name, caregiver in (
+        ("leaning", CAREGIVER_LEANING_OVER_CRIB),
+        ("across", CAREGIVER_ACROSS_THE_ROOM),
+        ("corner", CAREGIVER_FAR_CORNER),
+    ):
+        module = _module()
+        events, _ = _run(module, [caregiver, INFANT_IN_CRIB], 0.05, 2.4,
+                         hand_result_fn=_hazard_at_the_infants_mouth())
+        assert "choking_hazard" in [e.type for e in events], f"real hazard missed ({name})"
+        assert module._last_infant_identification.box == INFANT_IN_CRIB

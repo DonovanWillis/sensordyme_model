@@ -28,6 +28,11 @@ echo "Using $($PYTHON_BIN --version) at $(command -v "$PYTHON_BIN")"
 source .venv/bin/activate
 
 pip install --upgrade pip
+# The DEVELOPER set: requirements-device.txt (what ships) plus ultralytics, which
+# the mac_max profile and benchmarks/ need. ultralytics is AGPL-3.0 and is
+# correct to have on a dev machine (nothing is conveyed from here) but must never
+# reach a device — setup_pi.sh installs requirements-device.txt for that reason.
+# See docs/LICENSING.md.
 pip install -r requirements.txt
 
 mkdir -p data/reports

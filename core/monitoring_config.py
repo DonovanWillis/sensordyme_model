@@ -26,7 +26,6 @@ import os
 import tempfile
 import time
 from pathlib import Path
-from typing import Optional
 
 from core.logging_setup import get_logger
 
@@ -85,7 +84,12 @@ class MonitoringConfig:
         self.rules = list(raw.get("rules") or [])
         self.version = str(raw.get("version") or "")
         self.updated_at = float(raw.get("updated_at") or 0.0)
-        self.overrides_mode = bool(raw.get("overrides_mode", True))
+        # Defaults FALSE. A file written by an older format, hand-edited, or
+        # produced by anything that omits the key used to activate AI-custom
+        # monitoring and silence the configured module -- the most disruptive
+        # possible reading of an absent field. The safe default is "keep running
+        # the module the operator configured"; overriding it is an explicit act.
+        self.overrides_mode = bool(raw.get("overrides_mode", False))
         if self.rules:
             log.info(
                 "restored custom monitoring: %d rule(s) — %r",

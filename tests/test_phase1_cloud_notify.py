@@ -34,7 +34,7 @@ class _CaptureHandler(BaseHTTPRequestHandler):
 
     received: list[bytes] = []
 
-    def do_POST(self):  # noqa: N802 - BaseHTTPRequestHandler's naming
+    def do_POST(self):
         length = int(self.headers.get("Content-Length") or 0)
         self.rfile.read(length)
         raw = self.headers.get("Title", "")

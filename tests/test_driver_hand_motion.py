@@ -21,8 +21,9 @@ the match gate being too tight for a fast hand was the second half of the same
 defect.
 """
 
-import modules.driver_attention as driver_attention_module
 import test_driver_attention_scenarios as das
+
+import modules.driver_attention as driver_attention_module
 
 W, H = das.W, das.H
 clock = das.clock

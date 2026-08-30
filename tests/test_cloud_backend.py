@@ -6,7 +6,7 @@ import sys
 import pytest
 
 pytest.importorskip("fastapi")  # backend deps are dev/cloud-only, not installed on the Pi
-from fastapi.testclient import TestClient  # noqa: E402
+from fastapi.testclient import TestClient
 
 
 @pytest.fixture()
