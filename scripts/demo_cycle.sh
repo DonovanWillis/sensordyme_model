@@ -17,6 +17,11 @@ cd "$(dirname "$0")/.." || exit 1
 
 MODES=${MODES:-"driver_attention baby_monitoring fall_detection occupancy"}
 PORT=$(.venv/bin/python -c "import yaml;print((yaml.safe_load(open('config.yaml')).get('dashboard') or {}).get('port',8899))")
+# Carry the dashboard token when one is configured. Without it every health poll
+# below 401s and the rehearsal reports every mode as failed on a device that is
+# working correctly -- which would make the security feature look like a bug.
+TOKEN=$(.venv/bin/python -c "import yaml;print((yaml.safe_load(open('config.yaml')).get('dashboard') or {}).get('token') or '')")
+AUTH=(); [ -n "$TOKEN" ] && AUTH=(-H "X-Device-Token: $TOKEN")
 ORIGINAL=$(grep -m1 '^module:' config.yaml | awk '{print $2}')
 FAILURES=0
 
@@ -36,13 +41,13 @@ for mode in $MODES; do
   sudo systemctl restart sensordyme
   boot="timeout"
   for _ in $(seq 1 90); do
-    if curl -sf --max-time 3 "localhost:$PORT/api/health" -o /tmp/cycle.json 2>/dev/null; then
+    if curl -sf "${AUTH[@]}" --max-time 3 "localhost:$PORT/api/health" -o /tmp/cycle.json 2>/dev/null; then
       boot=$(echo "$(date +%s.%N) - $t0" | bc); break
     fi
     sleep 1
   done
   sleep 12   # let inference actually run before judging it
-  curl -sf --max-time 5 "localhost:$PORT/api/health" -o /tmp/cycle.json 2>/dev/null
+  curl -sf "${AUTH[@]}" --max-time 5 "localhost:$PORT/api/health" -o /tmp/cycle.json 2>/dev/null
   if ! .venv/bin/python - "$mode" "$boot" "$(systemctl is-active sensordyme)" <<'PY'
 import json, sys
 mode, boot, active = sys.argv[1:4]

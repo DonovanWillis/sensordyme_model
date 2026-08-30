@@ -80,6 +80,10 @@ class Check:
 @dataclass
 class Report:
     checks: list[Check] = field(default_factory=list)
+    #: The exact URL an operator should open, token included when one is set. A
+    #: token someone has to assemble by hand, under pressure, in front of an
+    #: audience, is a token that gets removed.
+    operator_url: str = ""
 
     def add(self, name: str, ok: bool, detail: str, fix: str = "", warn_only: bool = False) -> None:
         state = PASS if ok else (WARN if warn_only else FAIL)
@@ -90,24 +94,32 @@ class Report:
         return not any(c.state == FAIL for c in self.checks)
 
 
-def _health(host: str, port: int, timeout: float = 8.0) -> dict | None:
-    url = f"http://{host}:{port}/api/health"
+def _get(url: str, token: str | None, timeout: float = 8.0) -> dict | None:
+    """GET a dashboard JSON endpoint, carrying the device token when set.
+
+    Without the token, a preflight run against a device that HAS configured one
+    would 401 and report "dashboard unreachable" -- turning the security feature
+    into a reason to switch it back off.
+    """
+    # S310: the URL is built by this module from a literal "http://" plus a host
+    # and port read out of config.yaml. No user-supplied scheme reaches it.
+    request = urllib.request.Request(url)  # noqa: S310
+    if token:
+        request.add_header("X-Device-Token", token)
     try:
-        with urllib.request.urlopen(url, timeout=timeout) as response:
+        with urllib.request.urlopen(request, timeout=timeout) as response:  # noqa: S310
             return json.loads(response.read())
     except (urllib.error.URLError, OSError, ValueError, TimeoutError):
         return None
 
 
-def _state(host: str, port: int, timeout: float = 8.0) -> dict | None:
+def _health(host: str, port: int, token: str | None = None, timeout: float = 8.0) -> dict | None:
+    return _get(f"http://{host}:{port}/api/health", token, timeout)
+
+
+def _state(host: str, port: int, token: str | None = None, timeout: float = 8.0) -> dict | None:
     """The dashboard's own view, fetched independently of /api/health."""
-    try:
-        with urllib.request.urlopen(
-            f"http://{host}:{port}/api/state", timeout=timeout
-        ) as response:
-            return json.loads(response.read())
-    except (urllib.error.URLError, OSError, ValueError, TimeoutError):
-        return None
+    return _get(f"http://{host}:{port}/api/state", token, timeout)
 
 
 def _device(health: dict) -> dict:
@@ -138,6 +150,11 @@ def run(host: str, port: int) -> Report:
     # ---- 11 / 12. the dashboard, and whether it claims to be monitoring ------
     dash = config.get("dashboard", {}) or {}
     port = port or int(dash.get("port", 8899))
+    token = dash.get("token") or None
+    report.operator_url = (
+        f"http://{host if host != 'localhost' else 'sensordyme.local'}:{port}/"
+        + (f"?token={token}" if token else "")
+    )
     # TWO reads, deliberately. fps and the frame-interval percentiles are both
     # WINDOW measurements keyed per caller: the first call from a new caller
     # registers a baseline and honestly reports nothing, because there is no
@@ -147,9 +164,9 @@ def run(host: str, port: int) -> Report:
     #
     # The priming read is discarded; the second is the measurement. The gap
     # between them IS the window, so it must be long enough to contain frames.
-    if _health(host, port) is not None:
+    if _health(host, port, token) is not None:
         time.sleep(2.0)
-    health = _health(host, port)
+    health = _health(host, port, token)
     if health is None:
         report.add(
             "dashboard reachable", False, f"no /api/health on {host}:{port}",
@@ -353,7 +370,7 @@ def run(host: str, port: int) -> Report:
     # disagree -- and a dashboard showing one module while health reports another
     # is precisely the "config and runtime disagree" failure, in the one place a
     # judge is looking. Cheap to check, and neither surface can self-detect it.
-    state = _state(host, port)
+    state = _state(host, port, token)
     if state is None:
         report.add(
             "dashboard state API", False, f"no /api/state on {host}:{port}",
@@ -374,6 +391,64 @@ def run(host: str, port: int) -> Report:
             f"{len(state.get('events') or [])} in the recent buffer",
             "the dashboard cannot report events, so nothing will appear on stage "
             "even if the pipeline produces them",
+        )
+
+    # ---- network exposure, stated plainly every single run -------------------
+    # The dashboard serves the live camera on 0.0.0.0 by default with no token,
+    # so anyone on the same Wi-Fi can watch it. That is a reasonable default for
+    # a bench and a poor one for a conference hall, and the difference is a
+    # judgement only the operator can make -- so this reports it rather than
+    # deciding. WARN, never FAIL: refusing to run would be wrong, and an
+    # operator who cannot proceed learns to skip the gate.
+    host_bind = str(dash.get("host", "127.0.0.1"))
+    # S104: this is a comparison against the bind address, not a bind.
+    exposed = host_bind in ("0.0.0.0", "::") and not token  # noqa: S104
+    report.add(
+        "dashboard exposure",
+        not exposed,
+        (f"bound to {host_bind}:{port} with NO token — the live camera stream is "
+         "viewable by anyone on this network")
+        if exposed else
+        (f"bound to {host_bind}:{port}"
+         + (" with a token" if token else " (loopback only)")),
+        "set dashboard.token in config.yaml and open the page as "
+        "http://<host>:PORT/?token=YOUR_TOKEN, or accept the exposure knowingly",
+        warn_only=True,
+    )
+
+    # ---- backend / cloud uplink: three states, never conflated ---------------
+    # "The backend is unreachable", "the cloud uplink is intentionally off" and
+    # "monitoring is not running" are three different conditions with three
+    # different fixes, and an app that renders them identically sends someone
+    # debugging a camera when the real fault is a hostname.
+    #
+    # Phase 8 opened with exactly that: the app reported "can't reach the
+    # backend" while the backend was healthy the whole time. `cloud.base_url`
+    # named `Donovans-MacBook-Pro.local`, but macOS had renamed the machine to
+    # `Donovans-MacBook-Pro-2` (it appends a suffix when the name is already
+    # claimed), so the device could not resolve it. DNS, not the backend.
+    #
+    # This check is deterministic in all three states rather than being made
+    # conditional on whether the demo "needs" cloud: a device configured to
+    # reach a backend and failing to is a fault; a device configured not to is
+    # not. The configuration decides, so the check can never be wrong about it.
+    cloud_cfg = config.get("cloud", {}) or {}
+    connected = device.get("cloud_connected", health.get("cloud_connected"))
+    if not cloud_cfg.get("enabled"):
+        report.add(
+            "backend uplink", True,
+            "cloud.enabled is false — uplink intentionally offline, local demo unaffected",
+        )
+    else:
+        report.add(
+            "backend uplink", connected is True,
+            f"cloud.enabled is true, base_url {cloud_cfg.get('base_url')} — "
+            + ("connected" if connected is True else f"NOT connected (cloud_connected={connected})"),
+            "the device is configured to reach a backend and cannot. Check, in "
+            "this order: does the hostname resolve from the device; is the "
+            "backend listening on a non-loopback address; is the device key "
+            "accepted. This is NOT a monitoring fault — camera and NPU are "
+            "reported separately above.",
         )
 
     # ---- 13. throttling that is happening NOW, not once, historically -------
@@ -484,6 +559,8 @@ def main() -> int:
     if report.ready:
         warned = [c for c in report.checks if c.state == WARN]
         print("DEMO READY" + (f"  ({len(warned)} warning(s) above)" if warned else ""))
+        if report.operator_url:
+            print(f"\n  Open the dashboard at:  {report.operator_url}")
         return 0
     print(f"DEMO NOT READY — {len(failed)} check(s) failed:")
     for check in failed:

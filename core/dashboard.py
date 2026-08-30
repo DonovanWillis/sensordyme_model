@@ -159,7 +159,12 @@ class DashboardServer:
                     if (self.path.startswith("/api") or self.path.startswith("/stream")) and not self._authorized():
                         self._json({"error": "invalid or missing device token"}, 401)
                         return
-                    if self.path == "/" or self.path.startswith("/index"):
+                    # Compare the PATH, not the raw request line. An operator
+                    # opens the page as `/?token=...` when a token is configured,
+                    # and an exact match on "/" 404s that -- so the one URL the
+                    # feature requires was the one URL that did not work.
+                    bare_path = self.path.split("?", 1)[0]
+                    if bare_path == "/" or bare_path.startswith("/index"):
                         body = _PAGE.encode()
                         self.send_response(200)
                         self.send_header("Content-Type", "text/html; charset=utf-8")
@@ -545,7 +550,7 @@ _PAGE = """<!DOCTYPE html>
 <div class="grid">
   <div>
     <div class="card video">
-      <img src="/stream" alt="live camera">
+      <img id="cam" src="/stream" alt="live camera">
       <div class="pill" id="pill">OK</div>
       <div class="flash-overlay" id="flashOverlay"></div>
     </div>
@@ -575,10 +580,30 @@ _PAGE = """<!DOCTYPE html>
   </div>
 </div></div>
 <script>
+// Carry the dashboard token, when there is one, on every request this page
+// makes. Without this, setting `dashboard.token` loaded the page and then 401'd
+// every /api call and the video stream -- the page came up blank and the
+// protection was unusable, so in practice nobody turned it on and the camera
+// stream stayed readable by anyone on the network.
+//
+// The token is read from this page's own URL (?token=...), which is how an
+// operator opens it. The MJPEG <img> gets it as a query parameter because an
+// <img> cannot set a header; every fetch gets it as a header, which keeps it
+// out of proxy logs and browser history for the calls that can manage it.
+const TOKEN = new URLSearchParams(location.search).get("token") || "";
+function authFetch(url, opts){
+  opts = opts || {};
+  if(TOKEN){ opts.headers = Object.assign({}, opts.headers, {"X-Device-Token": TOKEN}); }
+  return fetch(url, opts);
+}
+if(TOKEN){
+  const cam = document.getElementById("cam");
+  if(cam) cam.src = "/stream?token=" + encodeURIComponent(TOKEN);
+}
 function fmt(s){const m=Math.floor(s/60),h=Math.floor(m/60);return h?h+":"+String(m%60).padStart(2,"0")+":"+String(s%60).padStart(2,"0"):m+":"+String(s%60).padStart(2,"0");}
 async function tick(){
   try{
-    const s = await (await fetch("/api/state")).json();
+    const s = await (await authFetch("/api/state")).json();
     document.getElementById("sub").textContent = s.module + " · live";
     document.getElementById("uptime").textContent = fmt(s.uptime_s);
     document.getElementById("total").textContent = s.total_events;
@@ -605,7 +630,7 @@ async function tick(){
 }
 async function loadModes(){
   try{
-    const p = await (await fetch("/api/presets")).json();
+    const p = await (await authFetch("/api/presets")).json();
     if(!p.presets.length) return;
     const card = document.getElementById("modecard"); card.style.display = "block";
     document.getElementById("modes").innerHTML = p.presets.map(m=>
@@ -615,7 +640,7 @@ async function loadModes(){
   }catch(e){}
 }
 async function setMode(name){
-  await fetch("/api/preset", {method:"POST", headers:{"Content-Type":"application/json"},
+  await authFetch("/api/preset", {method:"POST", headers:{"Content-Type":"application/json"},
                               body:JSON.stringify({preset:name})});
   setTimeout(loadModes, 800);
 }

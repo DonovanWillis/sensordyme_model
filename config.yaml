@@ -34,7 +34,21 @@ dashboard:
   enabled: true
   host: 0.0.0.0
   port: 8899
-  token: null # set a secret string to require X-Device-Token on all /api and /stream requests
+  token: null # SET THIS on any device that is not on a network you control.
+  # null means the dashboard and the LIVE CAMERA STREAM are served to anyone who
+  # can reach this host. With `host: 0.0.0.0` below that is everyone on the Wi-Fi.
+  # Verified in Phase 7: /api/health and /stream both answered 200 to an
+  # unauthenticated request from a different machine on the LAN.
+  #
+  # Deliberately null in the repo rather than a shared value: a secret committed
+  # here would be the same on every unit, which is not a secret. Generate one per
+  # device -- `openssl rand -hex 16` -- and put it here on that device only.
+  #
+  # When set, /api and /stream both require it (constant-time compared), and the
+  # operator opens the page as  http://<host>:8899/?token=YOUR_TOKEN
+  # The page then carries it on its own requests and on the video stream.
+  # `make demo-check` and `scripts/demo_cycle.sh` read it from this file, and the
+  # preflight WARNS on every run while it is null and the bind is 0.0.0.0. # set a secret string to require X-Device-Token on all /api and /stream requests
   # (do this whenever host is not 127.0.0.1)
   # NOTE: the iOS app's live feed does NOT send this header yet -- setting a token here
   # makes /stream return 401 and the app shows an endless spinner. Leave null until the
