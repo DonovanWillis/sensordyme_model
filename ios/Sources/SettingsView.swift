@@ -43,30 +43,6 @@ struct SettingsView: View {
                         .foregroundStyle(SD.Colors.textSecondary)
                 }
 
-                Section("Cloud backend") {
-                    TextField("Found automatically", text: state.$baseURLString)
-                        .keyboardType(.URL)
-                        .autocapitalization(.none)
-                        .autocorrectionDisabled()
-                    Button {
-                        Task { await findBackend() }
-                    } label: {
-                        if state.isLocatingBackend {
-                            Label("Searching this network…", systemImage: "antenna.radiowaves.left.and.right")
-                        } else {
-                            Label("Find my server on this network", systemImage: "antenna.radiowaves.left.and.right")
-                        }
-                    }
-                    .disabled(state.isLocatingBackend)
-                    if let findMessage {
-                        Text(findMessage)
-                            .font(.footnote)
-                            .foregroundStyle(SD.Colors.textSecondary)
-                    }
-                    Text("Leave this empty and SensorDyme finds the server on your Wi-Fi by itself — and finds it again if its address changes. Fill it in only to point somewhere the app cannot discover, such as a deployed public URL; a typed-in address is then used exactly as written. (Not \"localhost\": on a phone that means the phone itself.)")
-                        .font(.footnote)
-                        .foregroundStyle(SD.Colors.textSecondary)
-                }
 
                 Section("Troubleshooting") {
                     NavigationLink {
@@ -79,36 +55,7 @@ struct SettingsView: View {
                         .foregroundStyle(SD.Colors.textSecondary)
                 }
 
-                Section("Live feed (local network)") {
-                    TextField("http://192.168.1.20:8899", text: state.$deviceLocalURL)
-                        .keyboardType(.URL)
-                        .autocapitalization(.none)
-                        .autocorrectionDisabled()
-                    Button {
-                        discovery.start()
-                    } label: {
-                        if discovery.isSearching {
-                            HStack { ProgressView(); Text("Looking for your device…") }
-                        } else {
-                            Label("Find my device", systemImage: "magnifyingglass")
-                        }
-                    }
-                    ForEach(discovery.found) { device in
-                        Button {
-                            state.deviceLocalURL = device.url
-                            discovery.stop()
-                        } label: {
-                            Label("\(device.name) — \(device.url)", systemImage: "sensor.tag.radiowaves.forward")
-                                .lineLimit(1)
-                        }
-                    }
-                    SecureField("Device token (only if configured)", text: state.$deviceToken)
-                        .autocapitalization(.none)
-                        .autocorrectionDisabled()
-                    Text("The device's dashboard address on your Wi-Fi. Frames stream directly device-to-phone — they never pass through the cloud. “Find my device” discovers it automatically (mDNS).")
-                        .font(.footnote)
-                        .foregroundStyle(SD.Colors.textSecondary)
-                }
+
 
                 Section("Device Wi-Fi setup") {
                     // Same flow as the home screen's Bluetooth button, not a
@@ -202,14 +149,31 @@ struct SettingsView: View {
         }
     }
 
+    /// Where the address in use came from, said plainly. The three sources
+    /// behave differently — only one of them can be replaced by discovery — so
+    /// which one is in play is the first thing worth knowing here.
+    private var backendSource: String {
+        if !state.configuredBaseURL.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+            return "entered here"
+        }
+        if !AppState.productionBaseURL.isEmpty { return "built into this app" }
+        return "found on this network"
+    }
+
     /// Search the network on demand, and say what happened either way.
     ///
     /// Ignores whatever is currently saved: the reason to press this button is
     /// that the saved address is wrong, so confirming it is not an answer.
+    ///
+    /// The result goes to the discovery cache, not to the field above. Pressing
+    /// "find my server" is a request to locate one now, not a decision to pin
+    /// the app to the address it happens to have today — and writing a found
+    /// LAN address into configuration is precisely the conflation that stranded
+    /// the app on an IP from a network it had left.
     private func findBackend() async {
         findMessage = nil
         if let found = await BackendLocator.shared.search() {
-            state.baseURLString = found
+            state.adoptDiscovered(found)
             findMessage = "Found your server at \(found)."
         } else {
             findMessage = BackendLocator.shared.problem

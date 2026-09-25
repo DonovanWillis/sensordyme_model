@@ -1,0 +1,39 @@
+# What must NEVER reach the image, first — the Dockerfile copies `cloud/` and
+# `core/` wholesale, and both directories hold live secrets and data on a
+# developer's machine. Without these four lines the built image would ship the
+# accounts database, the JWT signing key and the server log to whoever can pull
+# it. They are already gitignored; an image is a second way to leak them.
+.secrets/
+cloud/*.db
+cloud/*.db-wal
+cloud/*.db-shm
+cloud/.jwt_secret
+cloud/*.log
+data/
+
+# The rest is build speed. The repo carries ~22MB of model weights and a full
+# virtualenv that the API image has no use for; sending them to Fly's remote
+# builder on every deploy costs minutes and buys nothing.
+.venv/
+.git/
+.github/
+.pytest_cache/
+.ruff_cache/
+.claude/
+.claude-flow/
+**/__pycache__/
+*.pyc
+*.onnx
+*.pt
+benchmarks/
+docs/
+hardware/
+ios/
+jupiter/
+modules/
+services/
+site/
+tests/
+third_party/
+typings/
+*.csv

@@ -1,0 +1,79 @@
+# SensorDyme cloud backend on Fly.io.
+#
+# What this deployment has to be true of, and where each one is enforced:
+#
+#   HTTPS                 force_https below; Fly terminates TLS with a real
+#                         Let's Encrypt certificate for <app>.fly.dev, which is
+#                         what lets iOS trust it with no app changes and the
+#                         device keep `verify=True` (core/uplink.py).
+#   Reachable publicly    an http_service is published on the Fly anycast IP;
+#                         no DNS or certificate work is needed for .fly.dev.
+#   Outbound-only device  nothing here opens a port toward the device. The Pi
+#                         POSTs to /v1/ingest and reads its commands off the
+#                         response (core/uplink.py) — NAT-friendly, no port
+#                         forwarding, no inbound ports on the device.
+#   Durable state         the [mounts] volume; see the warning on it.
+#   No mDNS               SENSORDYME_MDNS = "0".
+#
+# `app` must be globally unique across Fly. If this name is taken, pick another
+# and remember that the hostname — and therefore SENSORDYME_API_BASE_URL and the
+# device's cloud.base_url — changes with it.
+app = "sensordyme-api"
+primary_region = "iad"
+
+[build]
+  dockerfile = "cloud/Dockerfile"
+
+[env]
+  # These repeat cloud/Dockerfile's ENV on purpose: this file is what an
+  # operator reads, and a deployment whose durability depends on a value only
+  # visible inside a Dockerfile is one nobody can review.
+  SENSORDYME_DB = "/data/sensordyme.db"
+  SENSORDYME_JWT_SECRET_FILE = "/data/.jwt_secret"
+  SENSORDYME_MDNS = "0"
+  # Rate limiting keys on the caller's address, and behind Fly's proxy the TCP
+  # peer is the proxy for EVERY request — so without this, all users worldwide
+  # share one 10-attempts-per-5-minutes bucket and any single caller can lock
+  # out login globally. Fly's proxy sets Fly-Client-IP itself and overwrites
+  # anything a client sends, which is what makes it safe to trust here and
+  # nowhere else; cloud/app.py trusts no header unless this names one.
+  SENSORDYME_CLIENT_IP_HEADER = "Fly-Client-IP"
+
+[http_service]
+  internal_port = 8080
+  # Plain HTTP is redirected, not served. The device and the app both reach
+  # this over TLS or not at all.
+  force_https = true
+  # SQLite on one volume means exactly ONE writer. Scaling this app past a
+  # single machine corrupts the database rather than sharing it — keep
+  # `fly scale count 1` and swap to Postgres before scaling out (cloud/app.py
+  # is one file for that reason).
+  auto_stop_machines = false
+  auto_start_machines = true
+  min_machines_running = 1
+
+  [[http_service.checks]]
+    # The app's own liveness route, the same one the iOS Connection doctor and
+    # BackendLocator probe. Checking "/" instead would report a healthy service
+    # as failing: there is no root route, by design.
+    method = "GET"
+    path = "/v1/health"
+    interval = "30s"
+    timeout = "5s"
+    grace_period = "15s"
+
+[[mounts]]
+  # WITHOUT THIS, EVERY ACCOUNT IS LOST ON THE NEXT DEPLOY. The database lives
+  # here, and so does the JWT signing key — cloud/app.py generates and persists
+  # one on first start, so on ephemeral storage each restart mints a new key and
+  # every existing session fails with "invalid token: Signature verification
+  # failed" on a token that was valid when it was issued.
+  source = "sensordyme_data"
+  destination = "/data"
+
+[[vm]]
+  # The workload is a couple of small JSON POSTs per device every 2 seconds and
+  # SQLite writes measured in single-digit milliseconds. This is sized for that,
+  # not for headroom nobody is using.
+  size = "shared-cpu-1x"
+  memory = "512mb"

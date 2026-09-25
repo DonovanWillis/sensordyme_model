@@ -706,17 +706,49 @@ def health():
     return {"ok": True, "service": "sensordyme-cloud", "time": time.time()}
 
 
+def _trusted_client_ip_header() -> str:
+    """The header carrying the real client IP, when something in front of this
+    process is known to set it. Empty — trust nothing — unless configured.
+
+    Read per call rather than captured at import so a deployment can be
+    reconfigured without a code change, and so this is testable.
+    """
+    return os.environ.get("SENSORDYME_CLIENT_IP_HEADER", "").strip()
+
+
 def _client_ip(request: Request) -> str:
     """The caller's address, for rate limiting only (never trust this for auth).
 
-    `request.client` is the direct TCP peer, not an `X-Forwarded-For` header —
+    By default this is the direct TCP peer, not an `X-Forwarded-For` header —
     deliberately: a header is client-supplied and trivially spoofed by
     whoever is being rate limited, unless a trusted proxy in front of this
-    process is known to overwrite it, which nothing here assumes. Falling
-    back to a fixed key when the peer is unknown (some ASGI transports in
-    testing) means every such caller shares one bucket rather than the check
-    silently never applying to them.
+    process is known to overwrite it. Falling back to a fixed key when the
+    peer is unknown (some ASGI transports in testing) means every such caller
+    shares one bucket rather than the check silently never applying to them.
+
+    Behind a proxy that assumption inverts, and the consequence is not a
+    softer limit but a much worse one: the TCP peer is the proxy for EVERY
+    request, so all callers share a single 10-attempts-per-5-minutes bucket
+    and any one of them can lock every account out of login with ten tries.
+    Deployed on Fly, `Fly-Client-IP` is set by Fly's own proxy and overwrites
+    whatever the client sent, which is exactly the "known to overwrite it"
+    condition the paragraph above reserves this for.
+
+    So it stays opt-in and names the specific header to believe. An
+    unconfigured deployment — anything on a LAN, and every test — behaves
+    exactly as before, and no header is ever trusted by accident.
     """
+    header = _trusted_client_ip_header()
+    if header:
+        # A proxy chain may append; the first entry is the original client.
+        forwarded = request.headers.get(header, "")
+        candidate = forwarded.split(",")[0].strip()
+        if candidate:
+            return candidate
+        # Configured but absent means the request did not come through the
+        # proxy it was promised to. Fall through to the peer rather than
+        # returning "" — one shared bucket is a limit, "" is also a limit, but
+        # neither should silently look like a distinct client.
     return request.client.host if request.client is not None else "unknown"
 
 

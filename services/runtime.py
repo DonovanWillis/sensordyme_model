@@ -63,6 +63,10 @@ _VERSION = "0.2"
 # restart headless, process exit under --display) can recover a genuinely
 # wedged module, rather than looping forever silently dropping every frame.
 _MAX_CONSECUTIVE_PROCESS_FAILURES = 10
+#: How often to re-log a persistently failing annotate(). It runs at stream
+#: cadence while a viewer is connected, so logging every failure would bury the
+#: rest of the log within seconds of opening the feed.
+_ANNOTATE_FAILURE_LOG_EVERY = 300
 # How long the video overlay (_apply_alert_overlay, below) stays on after a new
 # event reaches Recent Activity -- edge-triggered on push_event, not tied to
 # module.is_alert_active()'s continuous "still ongoing" state, so a persistent
@@ -168,6 +172,7 @@ class DeviceRuntime:
         self._last_stream_push = 0.0
         self._flash_until = 0.0  # monotonic time; see _FLASH_DURATION_S
         self._consecutive_process_failures = 0  # see _MAX_CONSECUTIVE_PROCESS_FAILURES
+        self._consecutive_annotate_failures = 0  # see _ANNOTATE_FAILURE_LOG_EVERY
         #: Why object detection is unavailable, or None when it is available.
         #: Set at boot by _verify_detection_backend. When set, the device runs in
         #: DEGRADED mode: it boots, serves health, the dashboard and provisioning,
@@ -1185,16 +1190,45 @@ class DeviceRuntime:
             )
             view = None
             if self.display or want_stream:
-                view = module.annotate_debug(frame.copy()) if self.debug else module.annotate(frame.copy())
-                # Event-driven, not level-driven: flashes once per new event
-                # (see push_event/_emit_rule_alert above), not continuously for
-                # as long as module.is_alert_active() stays true -- an object
-                # that remains visible must not keep the screen flashing.
-                if now < self._flash_until:
-                    view = _apply_alert_overlay(view)
-                if want_stream:
-                    self.dashboard.push_frame(view)
-                    self._last_stream_push = now
+                # Guarded exactly like module.process() above, and for a sharper
+                # reason: this call happens ONLY while someone is watching the
+                # live feed (see `want_stream`). Unguarded, a module that drew
+                # badly took the whole inference loop down at the precise moment
+                # the app opened the camera -- and at no other time. The device
+                # looked healthy right up until a user looked at it, and the
+                # supervisor's restart then rebuilt the module, zeroing every
+                # timer, PERCLOS window and risk EMA, so nothing needing
+                # sustained evidence could fire while the feed was open.
+                #
+                # Unlike process(), a persistent failure here is never escalated
+                # into a restart: annotation is presentation, detection is the
+                # product. Losing the picture must not cost the monitoring.
+                try:
+                    view = module.annotate_debug(frame.copy()) if self.debug else module.annotate(frame.copy())
+                    self._consecutive_annotate_failures = 0
+                except Exception as exc:
+                    self._consecutive_annotate_failures += 1
+                    # First failure loudly, then throttled: this runs at stream
+                    # cadence, so an unthrottled log would bury everything else.
+                    if self._consecutive_annotate_failures == 1 or (
+                        self._consecutive_annotate_failures % _ANNOTATE_FAILURE_LOG_EVERY == 0
+                    ):
+                        log.error(
+                            "module.annotate() failed (%d consecutive); the live feed will "
+                            "hold its last frame, detection is unaffected: %s",
+                            self._consecutive_annotate_failures, exc, exc_info=True,
+                        )
+                    view = None
+                if view is not None:
+                    # Event-driven, not level-driven: flashes once per new event
+                    # (see push_event/_emit_rule_alert above), not continuously for
+                    # as long as module.is_alert_active() stays true -- an object
+                    # that remains visible must not keep the screen flashing.
+                    if now < self._flash_until:
+                        view = _apply_alert_overlay(view)
+                    if want_stream:
+                        self.dashboard.push_frame(view)
+                        self._last_stream_push = now
             if self.display and view is not None:
                 cv2.imshow(self.window_name, view)
                 key = cv2.waitKey(1) & 0xFF

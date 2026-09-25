@@ -14,8 +14,16 @@ targets:
       path: Info.plist
       properties:
         UILaunchScreen: {}
+        # Where this build's backend lives. Empty by default: no domain is
+        # assumed, and an unset build setting expands to "" which the app reads
+        # as "not configured" and falls back to mDNS discovery on the LAN — the
+        # existing development behaviour, unchanged. Set SENSORDYME_API_BASE_URL
+        # (below, in an .xcconfig, or on the xcodebuild command line) to a
+        # deployed HTTPS URL and the app works from any network, with discovery
+        # demoted to a fallback it can never override. See BackendResolution.swift.
+        SDBackendBaseURL: $(SENSORDYME_API_BASE_URL)
         NSAppTransportSecurity:
-          NSAllowsArbitraryLoads: true # dev builds talk to http://localhost / LAN IPs; tighten before App Store
+          NSAllowsArbitraryLoads: true # dev builds talk to http://localhost / LAN IPs; tighten before App Store (P4, after the HTTPS backend is live)
         # Local-network + Bonjour: the device dashboard (_sensordyme._tcp, published by
         # scripts/publish_mdns.py) and the cloud backend (_sensordyme-api._tcp, published
         # by cloud/mdns.py) — the latter is how sign-in works without anyone typing an
@@ -31,4 +39,8 @@ targets:
         SWIFT_VERSION: "5.9"
         CODE_SIGN_STYLE: Automatic
         DEVELOPMENT_TEAM: D6ZR59ZR7Q # personal team set in Xcode; kept here so regeneration preserves it
+        # The one place the production backend hostname is configured. Empty
+        # until a backend is actually deployed — deliberately not a literal in
+        # Swift, and deliberately not a guessed domain.
+        SENSORDYME_API_BASE_URL: ""
         ASSETCATALOG_COMPILER_APPICON_NAME: AppIcon

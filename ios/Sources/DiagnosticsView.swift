@@ -78,7 +78,7 @@ struct DiagnosticsView: View {
         }
 
         // 1. cloud backend configured
-        let base = state.baseURLString
+        let base = state.effectiveBaseURL
         if base.isEmpty {
             results.append(.init(name: "Cloud backend configured", passed: false,
                                  detail: "No backend address set. Settings → Cloud backend."))
@@ -150,29 +150,68 @@ struct DiagnosticsView: View {
             results.append(.init(name: "Device reachable", passed: nil, detail: "skipped"))
         }
 
-        // 6. live stream produces bytes
-        if !device.isEmpty, let url = URL(string: device)?.appendingPathComponent("stream") {
-            var req = URLRequest(url: url); req.timeoutInterval = 6
+        // 6. live stream produces a decodable frame
+        //
+        // Built on the same URL validation and framing the live feed itself uses,
+        // so this check can never pass on something the feed would fail on. Two
+        // things it deliberately does NOT do any more: treat "any byte arrived" as
+        // success (the multipart boundary text arrives even when the camera is
+        // producing nothing, so the old check passed on a dead camera), and report
+        // a device that answered 200 and then went quiet as a transport failure.
+        if device.isEmpty {
+            results.append(.init(name: "Live stream", passed: nil, detail: "skipped"))
+        } else if let url = MJPEGStreamURL.streamURL(forBase: device) {
+            var req = URLRequest(url: url)
+            req.timeoutInterval = 6
+            req.cachePolicy = .reloadIgnoringLocalAndRemoteCacheData
             if !state.deviceToken.isEmpty { req.setValue(state.deviceToken, forHTTPHeaderField: "X-Device-Token") }
+            var connected = false
             do {
                 let (bytes, resp) = try await URLSession.shared.bytes(for: req)
                 let status = (resp as? HTTPURLResponse)?.statusCode ?? 0
-                if status == 401 {
+                if status == 401 || status == 403 {
                     results.append(.init(name: "Live stream", passed: false,
-                                         detail: "device rejected the token (401) — the device's dashboard.token and Settings → Device token must match"))
+                                         detail: "device rejected the token (\(status)) — the device's dashboard.token and Settings → Device token must match"))
                 } else if status == 200 {
-                    var got = 0
-                    for try await _ in bytes.prefix(2048) { got += 1 }  // proves frames flow
-                    results.append(.init(name: "Live stream", passed: got > 0,
-                                         detail: got > 0 ? "receiving video data" : "connected but no video bytes — is the camera running?"))
+                    connected = true
+                    var parser = MJPEGFrameParser()
+                    var chunk = Data()
+                    var frameBytes: Int?
+                    let deadline = Date().addingTimeInterval(5)
+                    for try await byte in bytes {
+                        chunk.append(byte)
+                        if chunk.count >= 4096 {
+                            if let frame = parser.append(chunk).first { frameBytes = frame.count; break }
+                            chunk.removeAll(keepingCapacity: true)
+                        }
+                        if Date() >= deadline { break }
+                    }
+                    if frameBytes == nil, !chunk.isEmpty, let frame = parser.append(chunk).first {
+                        frameBytes = frame.count
+                    }
+                    if let frameBytes {
+                        results.append(.init(name: "Live stream", passed: true,
+                                             detail: "receiving video — decoded a \(frameBytes / 1024) KB frame"))
+                    } else {
+                        results.append(.init(name: "Live stream", passed: false,
+                                             detail: "connected to the device, but no complete video frame in 5s — the camera or the detector is not producing frames (check Device reachable, above, for the camera component)"))
+                    }
                 } else {
                     results.append(.init(name: "Live stream", passed: false, detail: "unexpected response (\(status))"))
                 }
             } catch {
-                results.append(.init(name: "Live stream", passed: false, detail: error.localizedDescription))
+                // A failure AFTER a 200 is the device going quiet, not an
+                // unreachable device -- saying "request timed out" there sends
+                // someone to check their Wi-Fi over a camera problem.
+                results.append(.init(
+                    name: "Live stream", passed: false,
+                    detail: connected
+                        ? "device accepted the connection then stopped sending — the camera is not producing frames (\(error.localizedDescription))"
+                        : error.localizedDescription))
             }
         } else {
-            results.append(.init(name: "Live stream", passed: nil, detail: "skipped"))
+            results.append(.init(name: "Live stream", passed: false,
+                                 detail: "the device address isn't a valid URL — it needs a scheme, e.g. http://192.168.1.20:8899"))
         }
     }
 }

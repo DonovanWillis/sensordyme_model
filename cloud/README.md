@@ -126,12 +126,83 @@ anything the app must reach.
 
 ## Deploy
 
-Anything that runs Python works (Fly.io, Railway, a small VPS).
+Anything that runs Python works (Fly.io, Railway, a small VPS). The repo ships a
+Fly.io deployment: `fly.toml` (root) and `cloud/Dockerfile`. Fly terminates TLS
+with a real certificate for `<app>.fly.dev`, which is the whole reason to prefer
+it here — iOS trusts it with no app changes, and the device keeps
+`verify=True`. `tests/test_deployment.py` pins the invariants below.
 
 ```bash
 export SENSORDYME_DB=/data/sensordyme.db
 uvicorn cloud.app:app --host 0.0.0.0 --port 8787
 ```
+
+### Fly.io, first time
+
+```bash
+brew install flyctl && fly auth login          # interactive; needs a payment method on file
+fly launch --no-deploy --copy-config --name sensordyme-api --region iad
+fly volumes create sensordyme_data --region iad --size 1   # see "the volume" below
+fly deploy --remote-only                       # builds on Fly; no local Docker needed
+fly scale count 1                              # SQLite has exactly one writer
+```
+
+`app` in `fly.toml` must be globally unique. If the name is taken, pick another
+— and remember the hostname travels with it, into both the app's
+`SENSORDYME_API_BASE_URL` and the device's `cloud.base_url`.
+
+### The volume is not optional
+
+`/data` holds the database **and** the JWT signing key. On ephemeral storage
+every deploy mints a new key, and every existing session then fails with
+`invalid token: Signature verification failed` on a token that was valid when it
+was issued — while the server itself looks perfectly healthy. That is the single
+most confusing way to get this wrong, so `fly.toml` mounts a volume and
+`tests/test_deployment.py` asserts both paths are on it.
+
+### Bringing an existing database with you
+
+Deploy first, import second, and point the device at it last: with no traffic
+yet there is nothing to race.
+
+```bash
+# 1. Back up locally. Use SQLite's own backup API -- a `cp` of a WAL-mode
+#    database that is being written to is not guaranteed to be consistent.
+python - <<'EOF'
+import sqlite3
+src, dst = sqlite3.connect("cloud/sensordyme.db"), sqlite3.connect(".secrets/backups/pre-fly.db")
+src.backup(dst); dst.close(); src.close()
+EOF
+
+# 2. Upload it (put it somewhere the backend is not serving from)
+fly ssh sftp shell
+  put .secrets/backups/pre-fly.db /data/import.db
+
+# 3. Check, then import. --dry-run reports what it found and writes nothing.
+fly ssh console -C "python /app/scripts/fly_import_db.py /data/import.db --dry-run"
+fly ssh console -C "python /app/scripts/fly_import_db.py /data/import.db"
+fly apps restart
+```
+
+`scripts/fly_import_db.py` refuses anything that is not a healthy SensorDyme
+database — the realistic mistake is uploading the freshly-created *empty* file
+and wiping the deployment with it — and backs up whatever it replaces on the
+volume before writing.
+
+The JWT secret is deliberately **not** migrated: a fresh key is generated on the
+volume, so everyone signs in once more. Accounts, devices, device keys and event
+history all come across; only sessions do not. Copy `cloud/.jwt_secret` to
+`/data/.jwt_secret` (mode 0600) if you would rather keep existing sessions alive.
+
+### Rate limiting behind the proxy
+
+`SENSORDYME_CLIENT_IP_HEADER = "Fly-Client-IP"` in `fly.toml` is load-bearing.
+Rate limiting keys on the caller's address, and behind a proxy the TCP peer is
+the proxy for *every* request — so without it all users share one
+10-attempts-per-5-minutes bucket and any single caller can lock everybody out of
+login with ten tries. `app.py` trusts no header unless this names one, because a
+header the proxy does not overwrite is spoofable by exactly the caller being
+limited.
 
 **Do not** generate the JWT secret inline on the command line
 (`export SENSORDYME_JWT_SECRET=$(openssl rand -hex 32)`, as this file used to

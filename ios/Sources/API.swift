@@ -101,6 +101,11 @@ struct APIClient {
     }
 
     /// Turn opaque networking failures into messages that say what to actually fix.
+    ///
+    /// The advice for a host that never answered comes from `BackendResolution`
+    /// rather than being written out here, because it is only true of some
+    /// hosts: telling someone to get on the same Wi-Fi as the server describes
+    /// a Mac on the LAN, and misdescribes a hosted backend.
     static func explain(_ error: URLError, host: String) -> String {
         #if !targetEnvironment(simulator)
         if host == "localhost" || host == "127.0.0.1" {
@@ -115,7 +120,7 @@ struct APIClient {
         case .notConnectedToInternet, .networkConnectionLost:
             return "No network connection. Check the phone's Wi-Fi."
         case .timedOut:
-            return "\(host) didn't answer in time. If it's a local address, make sure the phone is on the same Wi-Fi as the server."
+            return "\(host) didn't answer in time. \(BackendResolution.unreachableAdvice(host: host))"
         case .appTransportSecurityRequiresSecureConnection:
             return "iOS blocked the insecure connection to \(host)."
         default:
@@ -161,19 +166,41 @@ struct APIClient {
 /// App-wide session: backend URL, auth token, and a configured client.
 @MainActor
 final class AppState: ObservableObject {
-    // On the simulator, localhost genuinely is the dev Mac — keep the convenient
-    // default there. On a real phone localhost is the phone itself, which is a
-    // trap: start unconfigured and let BackendLocator find the server on the
-    // network, so nobody has to know an address to sign in.
-    #if targetEnvironment(simulator)
-    static let defaultBaseURL = "http://localhost:8787"
-    #else
-    static let defaultBaseURL = ""
-    #endif
+    /// The backend this build ships pointed at, from the `SENSORDYME_API_BASE_URL`
+    /// build setting via Info.plist's `SDBackendBaseURL`. Empty until a real
+    /// deployment exists — deliberately not a literal in Swift, so changing where
+    /// the app points is a build-configuration change and not a code change.
+    ///
+    /// On the simulator, localhost genuinely is the dev Mac, so it stands in when
+    /// no production URL is built in. On a real phone localhost is the phone
+    /// itself, which is a trap — there, an unconfigured build starts with nothing
+    /// and lets BackendLocator find the server on the network.
+    static let productionBaseURL: String = {
+        let fromBuild = BackendResolution.productionDefault(
+            fromInfoPlist: Bundle.main.object(forInfoDictionaryKey: "SDBackendBaseURL") as? String
+        )
+        #if targetEnvironment(simulator)
+        return fromBuild.isEmpty ? "http://localhost:8787" : fromBuild
+        #else
+        return fromBuild
+        #endif
+    }()
 
-    @AppStorage("baseURL") var baseURLString: String = AppState.defaultBaseURL
+    /// Typed by a person in Settings. Discovery never writes here — that
+    /// separation is the whole fix, and it is enforced by there being two keys
+    /// rather than by anyone remembering to check.
+    @AppStorage("configuredBaseURL")
+    var configuredBaseURL: String = "" {
+        didSet {
+            discoveredBaseURL = ""
+        }
+    }
+    /// Where mDNS last found a backend. A cache: useful, never authoritative,
+    /// and the only slot `relocateBackend()` is allowed to overwrite.
+    @AppStorage("discoveredBaseURL") private(set) var discoveredBaseURL: String = ""
+    /// Bumped when the storage layout changes, so the migration below runs once.
+    @AppStorage("backendStorageVersion") private var backendStorageVersion: Int = 0
     @AppStorage("deviceLocalURL") var deviceLocalURL: String = ""  // LAN feed, e.g. http://192.168.1.20:8899
-    @AppStorage("deviceToken") var deviceToken: String = ""  // dashboard.token; sent as X-Device-Token
     @AppStorage("accountEmail") var accountEmail: String = ""
     @AppStorage("demoMode") private var storedDemo: Bool = false
     /// Stored raw so the enum can gain cases without invalidating saved values.
@@ -203,47 +230,176 @@ final class AppState: ObservableObject {
         set { Keychain.set("authToken", newValue) }
     }
 
+    /// The device's own dashboard token (`dashboard.token` in its config.yaml),
+    /// sent as `X-Device-Token` on `/stream` and `/api`.
+    ///
+    /// In the Keychain for exactly the reason Keychain.swift gives for the
+    /// account token, which applies at least as strongly here: this is the
+    /// credential that gates a live camera feed, and UserDefaults is
+    /// unencrypted and included in unencrypted device backups. It was the one
+    /// secret in the app still stored in the clear.
+    ///
+    /// Mirrored in memory rather than read from the Keychain on every access:
+    /// the live feed watches this value (MJPEGView's `onChange`), and that
+    /// re-evaluates on every decoded frame — so a Keychain-backed getter would
+    /// mean a SecItemCopyMatching call a dozen times a second for the whole time
+    /// anyone is watching the camera. The Keychain stays the store of record;
+    /// this is a cache of it, written through on every change.
+    @Published private var deviceTokenCache: String = ""
+
+    var deviceToken: String {
+        get { deviceTokenCache }
+        set {
+            // Trimmed at the single point it is stored. A token is compared byte
+            // for byte with hmac.compare_digest on the device, so one trailing
+            // space or newline -- which is what pasting from a password manager
+            // or a terminal usually brings -- makes the CORRECT secret return
+            // 401. Verified against the real device: "secret123 " is rejected
+            // exactly like a wrong token, with nothing on screen to distinguish
+            // the two. No token legitimately has surrounding whitespace.
+            let cleaned = newValue.trimmingCharacters(in: .whitespacesAndNewlines)
+            guard cleaned != deviceTokenCache else { return }
+            deviceTokenCache = cleaned  // @Published publishes; no manual send needed
+            Keychain.set("deviceToken", cleaned)
+        }
+    }
+
     init() {
         // One-time migration: builds before the Keychain change kept the token
         // in UserDefaults under "authToken".
+        // The plaintext copy is removed ONLY once the Keychain write is confirmed.
+        // Deleting it on an unchecked write turns a failed write into a destroyed
+        // secret -- for the account token that is a forced re-login, and for the
+        // device token it is a live feed that reports a rejected token the user
+        // never got wrong.
         if let legacy = UserDefaults.standard.string(forKey: "authToken"), !legacy.isEmpty {
-            Keychain.set("authToken", legacy)
-            UserDefaults.standard.removeObject(forKey: "authToken")
+            if Keychain.set("authToken", legacy) {
+                UserDefaults.standard.removeObject(forKey: "authToken")
+            }
         }
+        // Same migration for the device token, so nobody has to re-type a token
+        // they already entered.
+        if let legacy = UserDefaults.standard.string(forKey: "deviceToken"), !legacy.isEmpty {
+            if Keychain.set("deviceToken", legacy.trimmingCharacters(in: .whitespacesAndNewlines)) {
+                UserDefaults.standard.removeObject(forKey: "deviceToken")
+            }
+        }
+        // AFTER the migration, so a token that has just been moved out of
+        // UserDefaults is the one loaded rather than an empty Keychain slot. The
+        // UserDefaults fallback covers the case where the Keychain is unavailable
+        // (locked, or an entitlement problem): the feed keeps working from the
+        // copy that is still there, instead of silently running with no token and
+        // blaming the device for rejecting it.
+        deviceTokenCache = Keychain.get("deviceToken")
+            ?? UserDefaults.standard.string(forKey: "deviceToken")
+            ?? ""
+        migrateBackendStorage()
         isDemo = storedDemo
         isSignedIn = !storedToken.isEmpty || storedDemo
     }
 
+    /// Split the old single `baseURL` slot into configuration and cache, once.
+    ///
+    /// Earlier builds stored one address that both a person and mDNS discovery
+    /// wrote to, so an address discovered on one Wi-Fi network outlived that
+    /// network and became the app's idea of where the backend permanently is.
+    /// On an installed app that value is already on disk, and no amount of
+    /// getting the new code right would clear it — which is why this runs rather
+    /// than only new installs benefiting: a bare IP there was written by
+    /// discovery, cannot be a backend anywhere else, and is dropped.
+    private func migrateBackendStorage() {
+        guard backendStorageVersion < 1 else { return }
+        backendStorageVersion = 1
+        let defaults = UserDefaults.standard
+        guard let legacy = defaults.string(forKey: "baseURL"), !legacy.isEmpty else { return }
+        // Removed either way: whatever it meant, it is not read again.
+        defaults.removeObject(forKey: "baseURL")
+        if case let .promoteToConfigured(url) = BackendResolution.migrate(legacy: legacy),
+           configuredBaseURL.isEmpty {
+            configuredBaseURL = url
+        }
+    }
+
+    /// The address requests actually go to: configured, else the build's
+    /// production URL, else whatever discovery last found.
+    var effectiveBaseURL: String {
+        if !configuredBaseURL.isEmpty {
+            return configuredBaseURL
+        }
+
+        if !discoveredBaseURL.isEmpty {
+            return discoveredBaseURL
+        }
+
+        return Self.productionBaseURL
+    }
+    /// Whether the app is allowed to go looking on the local network. False once
+    /// a public backend is pinned, so an internet blip can never divert sign-in
+    /// to a different server that happens to be on the same Wi-Fi.
+    private var mayDiscover: Bool {
+        true
+    }
+    
     var api: APIClient {
-        APIClient(
-            baseURL: baseURLString.isEmpty ? nil : URL(string: baseURLString),
+        let base = effectiveBaseURL
+        return APIClient(
+            baseURL: base.isEmpty ? nil : URL(string: base),
             token: storedToken.isEmpty ? nil : storedToken,
             relocate: { [weak self] in await self?.relocateBackend() ?? nil }
         )
     }
 
-    /// Point the app at a backend that is answering, without asking anyone.
+    /// Make sure there is a backend that answers, without asking anyone.
     ///
-    /// Runs before sign-in. A saved address wins whenever it still works, so a
-    /// deployed public backend entered once is never quietly swapped for whatever
-    /// happens to be on the local Wi-Fi.
+    /// Runs before sign-in. The pinned address — typed, or built in — is only
+    /// ever probed, never replaced: discovery writes to its own slot, so a
+    /// deployed backend cannot be swapped for whatever is on the local Wi-Fi.
     func ensureBackend() async {
         guard !isDemo else { return }
+
         isLocatingBackend = true
         defer { isLocatingBackend = false }
-        guard let found = await BackendLocator.shared.locate(saved: baseURLString) else { return }
-        if found != baseURLString { baseURLString = found }
+
+        // Always try to find a local SensorDyme backend first.
+        if let found = await BackendLocator.shared.search() {
+            discoveredBaseURL = found
+            return
+        }
+
+        // No local backend found, so use the configured/cloud backend.
+        let current = effectiveBaseURL
+
+        if !current.isEmpty, await BackendLocator.answers(current) {
+            return
+        }
     }
 
-    /// The saved address just failed. Search the network and remember where the
-    /// server moved to, so the next request goes straight there.
+    /// The address just failed. Search the network and remember where the server
+    /// moved to, so the next request goes straight there.
+    ///
+    /// Returns nil — declining to look — whenever a public backend is pinned.
+    /// A hosted backend that is briefly unreachable is unreachable; it has not
+    /// moved onto the local Wi-Fi, and treating "did not answer" as "look
+    /// elsewhere" is how an app ends up authenticating against a stranger's server.
     func relocateBackend() async -> URL? {
         guard !isDemo else { return nil }
+
         isLocatingBackend = true
         defer { isLocatingBackend = false }
-        guard let found = await BackendLocator.shared.search() else { return nil }
-        baseURLString = found
+
+        guard let found = await BackendLocator.shared.search() else {
+            return nil
+        }
+
+        discoveredBaseURL = found
         return URL(string: found)
+    }
+
+    /// Adopt an address the user picked from a discovery result in Settings.
+    /// It lands in the cache, not in configuration — the user asked to *find*
+    /// the server, not to pin it forever to the address it had today.
+    func adoptDiscovered(_ url: String) {
+        discoveredBaseURL = url
     }
 
     /// The single access point views use — the real cloud, or the built-in demo device.

@@ -123,6 +123,17 @@ struct MJPEGView: View {
     let url: URL
     @EnvironmentObject private var state: AppState
     @StateObject private var reader = MJPEGReader()
+    /// Used only to re-discover the device's current address when the stored one
+    /// stops answering. A second instance is safe and deliberate: DeviceLink's
+    /// state lives entirely in @AppStorage (the device's identity and its cached
+    /// address), so this shares that state with the one DevicesView owns rather
+    /// than competing with it — and `start()` is never called here, so this one
+    /// runs no network monitor of its own.
+    ///
+    /// Reusing DeviceLink rather than browsing Bonjour directly is the point: it
+    /// already refuses to adopt a different device when several answer, which is
+    /// what stops the feed silently binding to a neighbour's camera.
+    @StateObject private var link = DeviceLink()
 
     var body: some View {
         ZStack {
@@ -138,15 +149,26 @@ struct MJPEGView: View {
                     .frame(maxWidth: .infinity)
                     .aspectRatio(image.size.height > 0 ? image.size.width / image.size.height : 4 / 3,
                                  contentMode: .fit)
-            } else {
+            } else if reader.state.isRecoverableAutomatically {
                 ProgressView().tint(.white)
                     .frame(height: 230)
+            } else {
+                // A state that will never heal on its own gets an icon rather than
+                // a spinner. A spinner is a promise that something is still
+                // happening, and for a rejected token or a malformed address
+                // nothing is.
+                Image(systemName: "exclamationmark.triangle.fill")
+                    .font(.title)
+                    .foregroundStyle(SD.Colors.textSecondary)
+                    .frame(height: 230)
             }
-            if reader.isReconnecting {
+            if let message = reader.state.message {
                 VStack {
                     Spacer()
-                    Label("reconnecting…", systemImage: "wifi.exclamationmark")
+                    Label(message, systemImage: reader.state.isRecoverableAutomatically
+                          ? "wifi.exclamationmark" : "exclamationmark.triangle.fill")
                         .font(.caption2)
+                        .multilineTextAlignment(.center)
                         .padding(6)
                         .background(.black.opacity(0.6), in: Capsule())
                         .foregroundStyle(.white)
@@ -154,94 +176,254 @@ struct MJPEGView: View {
                 }
             }
         }
-        .onAppear { reader.start(url: url, token: state.deviceToken) }
+        .onAppear {
+            // Wired before start(), so the very first run of failures can trigger
+            // a re-resolve. Adopting the answer needs no code here: DeviceLink
+            // writes the device's current address to the same stored key the feed
+            // reads, so `onChange(of: url)` below picks it up and reconnects.
+            reader.onAddressLooksStale = { Task { await link.resolve(force: true) } }
+            reader.start(base: url.absoluteString, token: state.deviceToken)
+        }
         .onDisappear { reader.stop() }
+        // The address and the token are both editable in Settings while this view
+        // is on screen, and discovery can re-point the device at a new address at
+        // any moment. Without these the reader kept streaming from — or endlessly
+        // retrying — whatever it was given when it first appeared, and the only
+        // way to pick up a correction was to leave the screen and come back.
+        .onChange(of: url) { _, newURL in
+            reader.start(base: newURL.absoluteString, token: state.deviceToken)
+        }
+        .onChange(of: state.deviceToken) { _, newToken in
+            reader.start(base: url.absoluteString, token: newToken)
+        }
     }
 }
 
+/// Reads the device's MJPEG stream, and keeps reading it across drops.
+///
+/// The hard part is not parsing MJPEG, it is knowing which connection a callback
+/// belongs to. `URLSession` delivers `didCompleteWithError` for a task we
+/// deliberately cancelled just as it does for a stream that genuinely dropped,
+/// and it delivers it asynchronously — after `start()` has already opened a
+/// replacement. Treating those as the same event is what produced a black screen
+/// with a permanent "reconnecting…" badge in front of a perfectly healthy device:
+///
+///   1. `stop()` cancelled session A; its completion callback was queued.
+///   2. `start()` cleared the stopped flag and opened session B, which streamed.
+///   3. A's stale completion arrived, was read as "the stream dropped", and
+///      cancelled B — the healthy connection — to schedule a reconnect.
+///   4. B's cancellation then arrived and did the same to C, and so on.
+///
+/// Each turn of that cycle left a session behind that nothing held a reference to
+/// any more, so it could never be cancelled: measured, one appear/disappear pair
+/// turned one connection into four, left two permanently live, and doubled the
+/// bandwidth pulled from the device. Meanwhile the badge was only ever cleared
+/// inside the "a frame decoded" branch, so it stayed lit through the whole storm.
+///
+/// The fix is identity: every callback is checked against the session that is
+/// current *now*, and anything from a superseded session is dropped on the floor.
 @MainActor
 final class MJPEGReader: NSObject, ObservableObject, URLSessionDataDelegate {
-    @Published var image: UIImage?
-    @Published var isReconnecting = false
+    @Published private(set) var image: UIImage?
+    @Published private(set) var state: MJPEGStreamState = .idle
 
+    private let retryPolicy = MJPEGRetryPolicy()
+    private var parser = MJPEGFrameParser()
     private var session: URLSession?
-    private var buffer = Data()
-    private var url: URL?
+    private var base = ""
     private var token = ""
     private var stopped = true
     private var retryAttempt = 0
     private var retryTask: Task<Void, Never>?
+    private var lastFailureReason: String?
+    private var consecutiveTransportFailures = 0
+    private var lastAddressRecheck = Date.distantPast
 
-    func start(url: URL, token: String = "") {
-        stopSession()
-        self.url = url
+    /// Called when the address has failed enough times to be worth re-discovering.
+    /// A closure rather than a dependency so this class keeps knowing nothing
+    /// about Bonjour, and so the behaviour is testable without a network.
+    var onAddressLooksStale: (() -> Void)?
+
+    private static let failuresBeforeReresolving = 3
+    private static let addressRecheckInterval: TimeInterval = 20
+
+    // MARK: Lifecycle
+
+    /// Point the reader at a device and (re)start it. Safe to call repeatedly —
+    /// it is also how an address or token change is applied.
+    func start(base: String, token: String = "") {
+        // An unchanged target must not restart a healthy stream: `onChange` and
+        // `onAppear` can both fire for the same values, and tearing the
+        // connection down to rebuild it identically is a visible stutter.
+        if !stopped, base == self.base, token == self.token, state != .idle { return }
+        teardown()
+        self.base = base
         self.token = token
         stopped = false
         retryAttempt = 0
+        consecutiveTransportFailures = 0
+        lastFailureReason = nil
         connect()
     }
 
     func stop() {
         stopped = true
+        teardown()
+        state = .idle
+    }
+
+    /// Release the session and the pending retry, without deciding what happens next.
+    private func teardown() {
         retryTask?.cancel()
         retryTask = nil
-        stopSession()
-    }
-
-    private func stopSession() {
+        // invalidateAndCancel(), not finishTasksAndInvalidate(): a live stream has
+        // no natural end, so "finish" would never come. This also releases the
+        // session's strong reference to this delegate.
         session?.invalidateAndCancel()
         session = nil
-        buffer.removeAll()
+        // Bytes from a connection that is going away must never be spliced onto
+        // bytes from its replacement: the result would start inside one frame and
+        // end inside another, decode to nothing, and look like a broken camera.
+        parser.reset()
     }
 
+    // MARK: Connecting
+
     private func connect() {
-        guard let url, !stopped else { return }
-        var request = URLRequest(url: url.appendingPathComponent("stream"))
-        request.timeoutInterval = 15
-        if !token.isEmpty {
-            request.setValue(token, forHTTPHeaderField: "X-Device-Token")  // dashboard.token support
+        guard !stopped else { return }
+        // EVERY connection -- the first and every reconnect -- is built by the
+        // same function, so a retry cannot quietly become an unauthenticated
+        // request. The token is read from `self.token`, which start() set and
+        // nothing else mutates, so it survives session recreation.
+        //
+        // Header, not a query parameter: a token in a URL lands in proxy logs,
+        // browser history and Referer. The device accepts both (an <img> on its
+        // own web page cannot set a header); the app has no such excuse.
+        guard let request = MJPEGStreamRequest.make(
+            base: base, token: token, idleTimeout: Self.idleTimeout
+        ) else {
+            // Retrying cannot turn "192.168.1.20:8899" into a URL. Say so once.
+            image = nil
+            state = .unusableAddress
+            return
         }
-        let session = URLSession(configuration: .default, delegate: self, delegateQueue: nil)
+        teardown()
+
+        let configuration = URLSessionConfiguration.ephemeral
+        configuration.urlCache = nil                       // never cache a live video stream
+        configuration.requestCachePolicy = .reloadIgnoringLocalAndRemoteCacheData
+        configuration.timeoutIntervalForRequest = Self.idleTimeout
+        // Belt and braces against the failure this class exists to prevent: even
+        // if a session were ever leaked again, the app cannot hold more than one
+        // connection to the device at a time.
+        configuration.httpMaximumConnectionsPerHost = 1
+        configuration.networkServiceType = .video
+
+        let session = URLSession(configuration: configuration, delegate: self, delegateQueue: nil)
         self.session = session
+        state = image == nil ? .connecting : state
         session.dataTask(with: request).resume()
     }
 
+    /// How long without a single byte before the connection is considered dead.
+    /// The device pushes at `dashboard.stream_fps` (12/s by default), so silence
+    /// this long means the stream is not coming back on its own.
+    private static let idleTimeout: TimeInterval = 15
+
     /// Any drop (device rebooted, Wi-Fi blip, app came back from background)
     /// retries with capped exponential backoff instead of spinning forever.
-    private func scheduleReconnect() {
+    private func scheduleReconnect(reason: String? = nil) {
         guard !stopped else { return }
-        isReconnecting = true
-        stopSession()
-        let delay = min(8.0, 0.5 * pow(2.0, Double(retryAttempt)))
+        teardown()  // cancels any retry already pending, so retries cannot pile up
+        // Keep the last explanation while retrying rather than blanking it: the
+        // reason a reconnect is happening does not stop being true between
+        // attempts, and a badge that alternates between explaining itself and
+        // saying nothing is worse than one that keeps saying it.
+        lastFailureReason = reason ?? lastFailureReason
+        state = .reconnecting(attempt: retryAttempt + 1, reason: lastFailureReason)
+        consecutiveTransportFailures += 1
+        // A device that answered yesterday and refuses every connection today has
+        // usually taken a new DHCP address -- the stored one is a cache, not
+        // configuration (see DeviceLink). Ask for a fresh address rather than
+        // retrying a dead one until someone opens Settings. Rate-limited so a
+        // genuinely absent device cannot turn the retry loop into a discovery loop.
+        let now = Date()
+        if consecutiveTransportFailures >= Self.failuresBeforeReresolving,
+           now.timeIntervalSince(lastAddressRecheck) >= Self.addressRecheckInterval {
+            lastAddressRecheck = now
+            onAddressLooksStale?()
+        }
+        let delay = retryPolicy.delay(forAttempt: retryAttempt)
         retryAttempt += 1
         retryTask = Task { [weak self] in
             try? await Task.sleep(nanoseconds: UInt64(delay * 1_000_000_000))
-            guard let self, !Task.isCancelled else { return }
-            await MainActor.run { self.connect() }
+            guard !Task.isCancelled else { return }
+            await MainActor.run { self?.connect() }
+        }
+    }
+
+    /// Whether a callback belongs to the connection that is current *now*.
+    /// Everything in this class turns on this question — see the type's docs.
+    private func isCurrent(_ session: URLSession) -> Bool {
+        self.session === session
+    }
+
+    // MARK: URLSessionDataDelegate
+
+    nonisolated func urlSession(
+        _ session: URLSession,
+        dataTask: URLSessionDataTask,
+        didReceive response: URLResponse,
+        completionHandler: @escaping @Sendable (URLSession.ResponseDisposition) -> Void
+    ) {
+        let status = (response as? HTTPURLResponse)?.statusCode ?? 0
+        // Reading the body of a response we cannot use only wastes the radio; the
+        // status is recovered from `task.response` in didCompleteWithError below,
+        // which is where the decision about retrying is made.
+        completionHandler(status == 200 ? .allow : .cancel)
+        guard status == 200 else { return }
+        Task { @MainActor [weak self] in
+            guard let self, self.isCurrent(session) else { return }
+            // The device answered. Anything still wrong from here is the camera's
+            // end, not the network's, and the badge should stop blaming Wi-Fi.
+            if self.state != .streaming { self.state = .waitingForFrames }
         }
     }
 
     nonisolated func urlSession(_ session: URLSession, dataTask: URLSessionDataTask, didReceive data: Data) {
-        Task { @MainActor in
-            self.buffer.append(data)
-            // JPEG frames are delimited by SOI (FFD8) ... EOI (FFD9)
-            while let start = self.buffer.range(of: Data([0xFF, 0xD8])),
-                  let end = self.buffer.range(of: Data([0xFF, 0xD9]), in: start.lowerBound..<self.buffer.endIndex) {
-                let frame = self.buffer.subdata(in: start.lowerBound..<end.upperBound)
-                self.buffer.removeSubrange(..<end.upperBound)
-                if let image = UIImage(data: frame) {
-                    self.image = image
-                    self.isReconnecting = false
-                    self.retryAttempt = 0  // healthy again: future drops start with a short retry
-                }
+        Task { @MainActor [weak self] in
+            guard let self, self.isCurrent(session) else { return }  // bytes from a superseded connection
+            for frame in self.parser.append(data) {
+                guard let decoded = UIImage(data: frame) else { continue }
+                self.image = decoded
+                self.state = .streaming
+                self.retryAttempt = 0  // healthy again: future drops start with a short retry
+                self.consecutiveTransportFailures = 0
+                self.lastFailureReason = nil
             }
-            if self.buffer.count > 4_000_000 { self.buffer.removeAll() }  // corrupt stream guard
         }
     }
 
     nonisolated func urlSession(_ session: URLSession, task: URLSessionTask, didCompleteWithError error: Error?) {
-        Task { @MainActor in
-            self.scheduleReconnect()
+        let status = (task.response as? HTTPURLResponse)?.statusCode
+        Task { @MainActor [weak self] in
+            guard let self, self.isCurrent(session) else { return }
+            // THE fix. Without this guard, the completion for a session this class
+            // cancelled itself was read as "the live stream dropped" and tore down
+            // the healthy session that had already replaced it.
+
+            if status == 401 || status == 403 {
+                // No amount of retrying supplies a token. Looping here is what
+                // turned a one-line settings mistake into a permanent spinner.
+                // The device DID answer, so this is not a transport failure and
+                // must not count toward re-resolving the address.
+                self.consecutiveTransportFailures = 0
+                self.image = nil
+                self.state = .unauthorized(hasToken: !self.token.isEmpty)
+                self.teardown()
+                return
+            }
+            self.scheduleReconnect(reason: MJPEGStreamDiagnosis.describe(error))
         }
     }
 }

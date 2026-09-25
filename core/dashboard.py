@@ -21,6 +21,8 @@ from __future__ import annotations
 
 import hmac
 import json
+import select
+import socket
 import threading
 import time
 from collections import Counter, deque
@@ -111,6 +113,43 @@ class DashboardServer:
                 # first differing byte, which leaks the token's prefix to anyone who
                 # can time responses. Cheap to get right, awkward to retrofit later.
                 return hmac.compare_digest(sent, dashboard._token)
+
+            def _peer_gone(self) -> bool:
+                """True once the client has closed its end of the connection.
+
+                Costs one non-blocking peek and writes nothing, so it works during
+                the windows a write-based check cannot see: a stalled camera, a
+                degraded detector, or the moment between a viewer connecting and
+                the main loop encoding its first frame.
+
+                Why it matters beyond tidiness: `has_viewers()` is the gate the
+                inference loop uses to decide whether to annotate and JPEG-encode at
+                all, and on the Pi that work competes with the detector for the same
+                cores. A viewer slot that is never returned does not merely
+                mis-report a number -- it spends inference CPU forever, and parks
+                one handler thread per abandoned connection. An app that retries a
+                dropped stream (see the iOS MJPEG reader) produces exactly those
+                abandoned connections, so this is the device's half of that bug.
+
+                Conservative on purpose: anything unreadable is reported as still
+                connected, so a transient condition can never hang up on a healthy
+                viewer. Only a genuine EOF or a dead socket ends the stream.
+                """
+                sock = self.connection
+                try:
+                    readable = select.select([sock], [], [], 0)[0]
+                except (OSError, ValueError):
+                    return True  # socket already closed underneath us
+                if not readable:
+                    return False
+                try:
+                    # Readable on a request whose body is complete means EOF. Peek
+                    # rather than read: nothing may be consumed from the stream.
+                    return sock.recv(1, socket.MSG_PEEK) == b""
+                except (BlockingIOError, InterruptedError):
+                    return False
+                except OSError:
+                    return True
 
             def _json(self, obj: dict, status: int = 200) -> None:
                 body = json.dumps(obj).encode()
@@ -204,7 +243,13 @@ class DashboardServer:
                         dashboard.viewer_joined()
                         try:
                             last_seq = -1
-                            while True:
+                            # `not self._peer_gone()`, not `while True`: the loop used
+                            # to learn that a client had left ONLY by having a write
+                            # fail, and during any window with no fresh frames -- a
+                            # camera stall, a degraded detector, or simply the gap
+                            # before the first frame is encoded for a newly connected
+                            # viewer -- there is no write to fail. See _peer_gone().
+                            while not self._peer_gone():
                                 jpeg, seq = dashboard.latest_jpeg()
                                 if jpeg is not None and seq != last_seq:
                                     last_seq = seq

@@ -48,11 +48,17 @@ dashboard:
   # operator opens the page as  http://<host>:8899/?token=YOUR_TOKEN
   # The page then carries it on its own requests and on the video stream.
   # `make demo-check` and `scripts/demo_cycle.sh` read it from this file, and the
-  # preflight WARNS on every run while it is null and the bind is 0.0.0.0. # set a secret string to require X-Device-Token on all /api and /stream requests
-  # (do this whenever host is not 127.0.0.1)
-  # NOTE: the iOS app's live feed does NOT send this header yet -- setting a token here
-  # makes /stream return 401 and the app shows an endless spinner. Leave null until the
-  # app sends X-Device-Token.
+  # preflight WARNS on every run while it is null and the bind is 0.0.0.0.
+  #
+  # The iOS app supports this: it sends the value as X-Device-Token on /stream
+  # and on every /api call. Enter the same string under Settings -> Live feed ->
+  # Device token, where it is kept in the Keychain. A token the device rejects is
+  # now reported as a rejected token, with the setting to fix it named, rather
+  # than as an endless "reconnecting..." spinner.
+  #
+  # (An earlier note here said the app did not send the header and advised
+  # leaving this null. That was already out of date, and following it left the
+  # live camera stream readable by anyone on the Wi-Fi.)
   #
   # Live-feed cost controls. Annotating + JPEG-encoding competes with the detector for
   # CPU on the Pi, so frames are only encoded while someone is actually watching /stream.

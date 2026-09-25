@@ -22,8 +22,17 @@ enum Keychain {
         return String(data: data, encoding: .utf8)
     }
 
-    static func set(_ key: String, _ value: String) {
-        if value.isEmpty { delete(key); return }
+    /// Store a value, reporting whether it was actually stored.
+    ///
+    /// The result used to be discarded entirely, which is fine right up until a
+    /// caller *deletes its only other copy* on the strength of this having
+    /// worked — which is what the UserDefaults→Keychain migrations do. A silent
+    /// failure there does not degrade anything, it destroys the secret, and for
+    /// the device token that surfaces much later as the device rejecting a token
+    /// the user is certain they entered.
+    @discardableResult
+    static func set(_ key: String, _ value: String) -> Bool {
+        if value.isEmpty { delete(key); return true }
         let base: [String: Any] = [
             kSecClass as String: kSecClassGenericPassword,
             kSecAttrService as String: service,
@@ -37,8 +46,9 @@ enum Keychain {
             var add = base
             add[kSecValueData as String] = data
             add[kSecAttrAccessible as String] = kSecAttrAccessibleAfterFirstUnlock
-            SecItemAdd(add as CFDictionary, nil)
+            return SecItemAdd(add as CFDictionary, nil) == errSecSuccess
         }
+        return status == errSecSuccess
     }
 
     static func delete(_ key: String) {

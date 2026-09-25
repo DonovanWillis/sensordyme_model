@@ -9,6 +9,19 @@ requests==2.*
 # if it is missing, and a deployment with a real public address does not need it.
 zeroconf==0.132.*
 
+# app.py imports core.presets at module scope, which reads presets.yaml. PyYAML
+# arrives transitively via uvicorn[standard] today, so this has always worked --
+# by luck rather than by decision. A clean container built from this file alone
+# is exactly where that luck runs out, and the failure is an ImportError at
+# startup rather than anything the tests would catch.
+pyyaml>=5.1
+# core.capabilities builds the capability sheet from the object detector's COCO
+# label list in core.accel, whose only import-time dependency is numpy. Without
+# it the sheet lists no objects at all -- and because the AI-configure prompt
+# instructs the model to decline anything not on the sheet, every request comes
+# back "unsupported" rather than the feature merely degrading.
+numpy
+
 # Jupiter (local model) needs no extra package here — it speaks HTTP to a model
 # server, which keeps the API process light and restartable.
 #
