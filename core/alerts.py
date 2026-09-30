@@ -76,6 +76,11 @@ class SoundSink:
         """
         if level == AlertLevel.SUPPRESSED:
             return
+        # simpleaudio can segfault on macOS during native audio cleanup.
+        # SensorDyme runs audio alerts through the Pi buzzer in production;
+        # on Mac/dev mode, skip audio entirely so the backend stays stable.
+        if sys.platform == "darwin":
+            return
         duration_s = 0.15 if level == AlertLevel.SOFT else 0.6
         threading.Thread(target=self._play_tone_safe, args=(duration_s,), daemon=True).start()
 

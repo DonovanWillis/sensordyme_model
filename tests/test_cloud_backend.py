@@ -1016,3 +1016,263 @@ def test_a_fall_event_with_no_signals_produces_evidence_based_notification_text(
 
     stored = client.get(f"/v1/devices/{device_id}/events", headers=auth).json()["events"]
     assert stored[0]["duration"] == 34.0, "duration must reach the timeline, not just the notification"
+
+
+# --------------------------------------------------- stored state as untrusted input
+class TestMalformedStoredStateDoesNotBreakTheDeviceList:
+    """`GET /v1/devices` must survive an unreadable `monitoring` column.
+
+    Every JSON-column read in cloud/app.py is wrapped except one, and the one was
+    on the endpoint the app polls continuously. A single unreadable value — a
+    legacy row, a partially-written record, a hand-edited database — made the
+    device list a hard 500 for that account, permanently, with no route back
+    except editing the database. The app's whole home screen is that endpoint.
+
+    The value comes out of our own table rather than off the wire, which is
+    exactly why it read as trustworthy and was not guarded.
+    """
+
+    def _claimed_device(self, client):
+        client.post("/v1/signup", json={"email": "stored@example.com", "password": "supersecret1"})
+        token = client.post(
+            "/v1/login", json={"email": "stored@example.com", "password": "supersecret1"}
+        ).json()["token"]
+        return token
+
+    def test_unreadable_monitoring_reports_none_rather_than_500(self, backend):
+        app_module, client = backend
+        token = self._claimed_device(client)
+        with app_module.db() as conn:
+            conn.execute(
+                "INSERT INTO devices (name, claim_code, device_key, owner_id, created_at, monitoring)"
+                " VALUES ('cam', 'C1', 'dk_1', 1, 0, ?)",
+                ("{this is not json",),
+            )
+
+        resp = client.get("/v1/devices", headers={"Authorization": f"Bearer {token}"})
+
+        assert resp.status_code == 200, resp.text
+        assert resp.json()["devices"][0]["monitoring"] is None
+
+    def test_monitoring_that_is_valid_json_but_not_an_object_is_also_none(self, backend):
+        """`json.loads` succeeds on `"[]"` and `"7"`. The app expects an object,
+        so passing either through would move the failure into the client."""
+        app_module, client = backend
+        token = self._claimed_device(client)
+        with app_module.db() as conn:
+            conn.execute(
+                "INSERT INTO devices (name, claim_code, device_key, owner_id, created_at, monitoring)"
+                " VALUES ('cam', 'C2', 'dk_2', 1, 0, ?)",
+                ("[1, 2, 3]",),
+            )
+
+        resp = client.get("/v1/devices", headers={"Authorization": f"Bearer {token}"})
+
+        assert resp.status_code == 200
+        assert resp.json()["devices"][0]["monitoring"] is None
+
+    def test_a_good_monitoring_config_still_comes_through(self, backend):
+        """The guard must not quietly swallow valid config."""
+        app_module, client = backend
+        token = self._claimed_device(client)
+        with app_module.db() as conn:
+            conn.execute(
+                "INSERT INTO devices (name, claim_code, device_key, owner_id, created_at, monitoring)"
+                " VALUES ('cam', 'C3', 'dk_3', 1, 0, ?)",
+                ('{"mode": "baby_monitoring"}',),
+            )
+
+        resp = client.get("/v1/devices", headers={"Authorization": f"Bearer {token}"})
+
+        assert resp.json()["devices"][0]["monitoring"] == {"mode": "baby_monitoring"}
+
+    def test_one_bad_row_does_not_hide_the_other_devices(self, backend):
+        """The failure mode that mattered: one unreadable row took the whole
+        account's device list with it."""
+        app_module, client = backend
+        token = self._claimed_device(client)
+        with app_module.db() as conn:
+            conn.execute(
+                "INSERT INTO devices (name, claim_code, device_key, owner_id, created_at, monitoring)"
+                " VALUES ('broken', 'C4', 'dk_4', 1, 0, ?)", ("{nope",),
+            )
+            conn.execute(
+                "INSERT INTO devices (name, claim_code, device_key, owner_id, created_at, monitoring)"
+                " VALUES ('fine', 'C5', 'dk_5', 1, 0, ?)", ('{"mode": "security_monitoring"}',),
+            )
+
+        resp = client.get("/v1/devices", headers={"Authorization": f"Bearer {token}"})
+
+        assert resp.status_code == 200
+        names = {d["name"]: d["monitoring"] for d in resp.json()["devices"]}
+        assert names["broken"] is None
+        assert names["fine"] == {"mode": "security_monitoring"}
+
+
+class TestWriteContentionWaitsRatherThanFailing:
+    """A blocked writer must wait, not 500.
+
+    WAL serialises writes, and `/v1/ingest` writes on every device poll. If a
+    write gives up, the uncaught `sqlite3.OperationalError: database is locked`
+    becomes a 500 — and core/uplink.py treats any non-200 as a failed send and
+    re-queues the identical batch, so the endpoint most likely to meet contention
+    is the one whose client retries hardest.
+    """
+
+    def test_a_busy_timeout_is_configured_on_every_connection(self, backend):
+        app_module, _ = backend
+        with app_module.db() as conn:
+            busy_ms = conn.execute("PRAGMA busy_timeout").fetchone()[0]
+        assert busy_ms > 0, "a zero busy timeout fails immediately on any contention"
+        assert busy_ms == int(app_module.BUSY_TIMEOUT_S * 1000)
+
+    def test_the_timeout_is_long_enough_to_outlast_a_device_poll(self, backend):
+        """The device polls every ~2s; a budget shorter than that turns routine
+        overlap into a failed batch."""
+        app_module, _ = backend
+        assert app_module.BUSY_TIMEOUT_S >= 5.0
+
+    def test_a_write_held_open_elsewhere_does_not_raise_immediately(self, backend):
+        """With a busy timeout the second writer blocks and then succeeds once the
+        first commits, instead of raising at once."""
+        import threading
+
+        app_module, _ = backend
+        holder_has_lock = threading.Event()
+        release_holder = threading.Event()
+
+        def hold_the_write_lock():
+            conn = app_module._connect()
+            try:
+                conn.execute("BEGIN IMMEDIATE")
+                conn.execute(
+                    "INSERT INTO devices (name, claim_code, device_key, created_at)"
+                    " VALUES ('holder', 'H1', 'dk_h1', 0)"
+                )
+                holder_has_lock.set()
+                release_holder.wait(10)
+                conn.commit()
+            finally:
+                conn.close()
+
+        holder = threading.Thread(target=hold_the_write_lock)
+        holder.start()
+        try:
+            assert holder_has_lock.wait(5), "could not acquire the first write lock"
+            # Let the holder go shortly; the point is that this write waits for it
+            # rather than failing the instant it finds the database busy.
+            threading.Timer(0.3, release_holder.set).start()
+            with app_module.db() as conn:
+                conn.execute(
+                    "INSERT INTO devices (name, claim_code, device_key, created_at)"
+                    " VALUES ('waiter', 'W1', 'dk_w1', 0)"
+                )
+        finally:
+            release_holder.set()
+            holder.join(10)
+
+        with app_module.db() as conn:
+            names = {r["name"] for r in conn.execute("SELECT name FROM devices")}
+        assert {"holder", "waiter"} <= names
+
+
+class TestAIConfigureWritesOnlyToADeviceYouOwn:
+    """The draft write must be scoped to the owner, not just to the device id.
+
+    `/v1/ai/configure` checks ownership, then makes a model call that takes
+    seconds, then writes. Those were three separate steps with the ownership fact
+    only established before the slow one, and the write said `WHERE id = ?`. A
+    device re-claimed during the model call therefore received a draft from its
+    previous owner. It is the only write in cloud/app.py that was not gated in the
+    same statement or transaction as its ownership check.
+    """
+
+    def _signup(self, client, email):
+        client.post("/v1/signup", json={"email": email, "password": "supersecret1"})
+        return client.post(
+            "/v1/login", json={"email": email, "password": "supersecret1"}
+        ).json()["token"]
+
+    def test_a_device_owned_by_someone_else_is_not_written_to(self, backend):
+        app_module, client = backend
+        mine = self._signup(client, "owner-a@example.com")
+        theirs = self._signup(client, "owner-b@example.com")
+        del theirs
+        with app_module.db() as conn:
+            conn.execute(
+                "INSERT INTO devices (name, claim_code, device_key, owner_id, created_at)"
+                " VALUES ('theirs', 'X1', 'dk_x1', 2, 0)"
+            )
+            device_id = conn.execute("SELECT id FROM devices WHERE claim_code = 'X1'").fetchone()["id"]
+
+        resp = client.post(
+            "/v1/ai/configure",
+            json={"device_id": device_id, "prompt": "tell me when someone falls"},
+            headers={"Authorization": f"Bearer {mine}"},
+        )
+
+        assert resp.status_code == 404
+        with app_module.db() as conn:
+            draft = conn.execute(
+                "SELECT ai_rules_draft FROM devices WHERE id = ?", (device_id,)
+            ).fetchone()["ai_rules_draft"]
+        assert draft is None, "a draft was written to a device the caller does not own"
+
+    def test_losing_the_device_during_the_model_call_does_not_write(self, backend, monkeypatch):
+        """The race itself: ownership is real when checked and gone by the write."""
+        app_module, client = backend
+        mine = self._signup(client, "racer@example.com")
+        with app_module.db() as conn:
+            conn.execute(
+                "INSERT INTO devices (name, claim_code, device_key, owner_id, created_at)"
+                " VALUES ('mine', 'X2', 'dk_x2', 1, 0)"
+            )
+            device_id = conn.execute("SELECT id FROM devices WHERE claim_code = 'X2'").fetchone()["id"]
+
+        real_fallback = app_module._ai_fallback
+
+        def reclaim_midway(prompt):
+            # Stands in for the multi-second model call: the device changes hands
+            # while this is running, exactly as a concurrent claim would do.
+            with app_module.db() as conn:
+                conn.execute("UPDATE devices SET owner_id = 99 WHERE id = ?", (device_id,))
+            return real_fallback(prompt)
+
+        monkeypatch.setattr(app_module, "_ai_fallback", reclaim_midway)
+
+        resp = client.post(
+            "/v1/ai/configure",
+            json={"device_id": device_id, "prompt": "tell me when someone falls"},
+            headers={"Authorization": f"Bearer {mine}"},
+        )
+
+        assert resp.status_code == 404
+        with app_module.db() as conn:
+            draft = conn.execute(
+                "SELECT ai_rules_draft FROM devices WHERE id = ?", (device_id,)
+            ).fetchone()["ai_rules_draft"]
+        assert draft is None, "the draft landed on a device the caller had lost"
+
+    def test_the_normal_path_still_writes_a_draft(self, backend):
+        """The scoping must not break the feature it protects."""
+        app_module, client = backend
+        mine = self._signup(client, "normal@example.com")
+        with app_module.db() as conn:
+            conn.execute(
+                "INSERT INTO devices (name, claim_code, device_key, owner_id, created_at)"
+                " VALUES ('mine', 'X3', 'dk_x3', 1, 0)"
+            )
+            device_id = conn.execute("SELECT id FROM devices WHERE claim_code = 'X3'").fetchone()["id"]
+
+        resp = client.post(
+            "/v1/ai/configure",
+            json={"device_id": device_id, "prompt": "tell me when someone falls"},
+            headers={"Authorization": f"Bearer {mine}"},
+        )
+
+        assert resp.status_code == 200, resp.text
+        with app_module.db() as conn:
+            draft = conn.execute(
+                "SELECT ai_rules_draft FROM devices WHERE id = ?", (device_id,)
+            ).fetchone()["ai_rules_draft"]
+        assert draft is not None and "rules" in draft

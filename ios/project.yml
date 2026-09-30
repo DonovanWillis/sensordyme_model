@@ -42,5 +42,13 @@ targets:
         # The one place the production backend hostname is configured. Empty
         # until a backend is actually deployed — deliberately not a literal in
         # Swift, and deliberately not a guessed domain.
+        #
+        # Leave it EMPTY for Mac development. A LAN IP here is the one thing that
+        # reliably breaks this app: it was set to http://11.22.7.64:8787, which
+        # names a network this Mac has since left, and because a build-time URL
+        # outranks discovery the app went on trying that dead address and could
+        # not be pointed anywhere else without editing this file and rebuilding.
+        # Empty means "find the Mac on the network", which is the behaviour that
+        # survives a DHCP move. Set this only to a real deployed HTTPS URL.
         SENSORDYME_API_BASE_URL: ""
         ASSETCATALOG_COMPILER_APPICON_NAME: AppIcon

@@ -121,10 +121,33 @@ app = FastAPI(title="SensorDyme Cloud", version="0.1", lifespan=_lifespan)
 
 
 # ------------------------------------------------------------------------- storage
+#: How long a statement waits for a write lock before giving up.
+#:
+#: WAL allows readers and one writer, so writes serialise. `/v1/ingest` writes on
+#: every device poll (a device UPDATE, one INSERT per event, sometimes a
+#: compare-and-swap on desired_preset) and every authenticated request reads
+#: `revoked_tokens`, so brief contention is normal rather than exceptional.
+#:
+#: Python's default is 5 seconds, which is not obviously wrong — but the cost of
+#: exceeding it is badly asymmetric here. An exceeded timeout raises
+#: `sqlite3.OperationalError: database is locked`, which nothing catches, so it
+#: becomes a 500 — and `core/uplink.py` treats any non-200 as a failed send and
+#: re-queues the identical batch, so the one endpoint most likely to hit
+#: contention is also the one whose client retries forever. Waiting longer is
+#: strictly better than failing: the device is polling every couple of seconds
+#: and has nothing else to do.
+BUSY_TIMEOUT_S = 15.0
+
+
 def _connect() -> sqlite3.Connection:
-    conn = sqlite3.connect(DB_PATH)
+    conn = sqlite3.connect(DB_PATH, timeout=BUSY_TIMEOUT_S)
     conn.row_factory = sqlite3.Row
     conn.execute("PRAGMA journal_mode=WAL")
+    # `timeout=` above covers the implicit transaction Python manages; the pragma
+    # applies the same budget to every statement on this connection, including
+    # ones inside an explicit transaction. Setting one without the other leaves a
+    # path that still fails immediately.
+    conn.execute(f"PRAGMA busy_timeout={int(BUSY_TIMEOUT_S * 1000)}")
     return conn
 
 
@@ -390,6 +413,31 @@ def _zones_version(zones_json: Optional[str]) -> str:
     if not zones_json or zones_json == "[]":
         return ""
     return hashlib.sha256(zones_json.encode()).hexdigest()[:16]
+
+
+def _monitoring_payload(monitoring_json: Optional[str]) -> Optional[dict]:
+    """A device's stored monitoring config, or None if it cannot be read.
+
+    Wrapped for the same reason every other JSON-column read in this file is,
+    and it was the one that was not. `GET /v1/devices` is the app's busiest
+    endpoint — it polls it continuously — so a single unreadable `monitoring`
+    value (a legacy row, a partial write, a hand-edited database) turned the
+    whole device list into a hard 500 for that account, with no way back short
+    of editing the database. The stored value is input like any other; that it
+    arrives from our own table rather than from a request body is exactly why
+    it was easy to miss.
+
+    Returning None is the same thing an absent value already means, so the app
+    needs no new case: it renders as "no monitoring config", not as an error.
+    """
+    if not monitoring_json:
+        return None
+    try:
+        config = json.loads(monitoring_json)
+    except (ValueError, TypeError):
+        log.warning("device has an unreadable monitoring config; reporting none")
+        return None
+    return config if isinstance(config, dict) else None
 
 
 def _rules_payload(ai_rules_json: Optional[str]) -> list[dict]:
@@ -906,7 +954,7 @@ def list_devices(uid: int = Depends(current_user)):
                 "name": r["name"],
                 "active_preset": r["active_preset"],
                 "desired_preset": r["desired_preset"],
-                "monitoring": json.loads(r["monitoring"]) if r["monitoring"] else None,
+                "monitoring": _monitoring_payload(r["monitoring"]),
                 "online": bool(r["last_seen"] and now - r["last_seen"] < 30),
                 "last_seen": r["last_seen"],
                 # Whatever the device last said about itself. Withheld once the
@@ -1533,11 +1581,24 @@ def ai_configure(body: AIConfigureBody, uid: int = Depends(current_user)):
     # and committed a configuration the user was still reading, and the device
     # hot-swapped its detection module to match. Writing a draft leaves the
     # running configuration exactly where it is until someone accepts this one.
-    import json as _json
-
+    # Scoped to the owner, not just to the id. Ownership was checked before the
+    # model call above, and that call takes seconds — long enough for the device
+    # to be re-claimed in the gap. Every other write in this file is gated by
+    # `_owned_device` or a device-key lookup inside the same transaction; this was
+    # the one that was not, so a claim landing mid-request wrote a draft onto a
+    # device the caller no longer owned. Putting `owner_id` in the WHERE clause
+    # makes the check and the write one atomic statement rather than two facts
+    # that have to still agree.
     with db() as conn:
-        conn.execute("UPDATE devices SET ai_rules_draft = ? WHERE id = ?",
-                     (_json.dumps(result), body.device_id))
+        updated = conn.execute(
+            "UPDATE devices SET ai_rules_draft = ? WHERE id = ? AND owner_id = ?",
+            (json.dumps(result), body.device_id, uid),
+        ).rowcount
+    if not updated:
+        # Same 404 and same wording as `_owned_device`, so losing the device
+        # mid-request is indistinguishable from never having had it — there is
+        # nothing here worth telling an attacker apart.
+        raise HTTPException(404, "no such device on this account")
     return result
 
 
@@ -1573,9 +1634,22 @@ def explain_event(device_id: int, event_id: int, uid: int = Depends(current_user
             from jupiter.router import get_role_provider
 
             candidate = get_role_provider("explain")
-            ok, _ = candidate.available()
+            ok, why = candidate.available()
             provider = candidate if ok else None
-        except Exception:  # noqa: BLE001 - the facts path never needs a model
+            if not ok:
+                # Degrading to the facts-only explanation is correct and must not
+                # fail the request — but it has to be *visible*. Reported at INFO
+                # because a model being unavailable is an expected state, not a
+                # fault, and it says which one so the reason is actionable.
+                log.info("explain: model unavailable (%s); using the facts-only path", why)
+        except Exception as exc:  # noqa: BLE001 - the facts path never needs a model
+            # Previously silent, which made a permanently misconfigured provider
+            # indistinguishable from one deliberately switched off: every explain
+            # quietly took the facts path for ever and no log line ever said so.
+            log.warning(
+                "explain: could not reach the model provider (%s); using the "
+                "facts-only path", repr(exc),
+            )
             provider = None
 
     return explain(event, rule, provider=provider).as_dict()

@@ -59,6 +59,110 @@ enum BackendResolution {
         return isLANScoped(target)
     }
 
+    // MARK: - What to try, in what order
+
+    /// Every address worth trying right now, best first, with the ones that
+    /// cannot work from a phone removed.
+    ///
+    /// `effective` answers "which address is in force"; this answers "what should
+    /// the app actually attempt". They differ, and collapsing them is what made
+    /// the app unusable: precedence alone means a pinned address that has stopped
+    /// existing is tried forever, because being first in the list is a fact about
+    /// configuration and says nothing about whether anything answers there. A
+    /// build-time `http://11.22.7.64:8787` outranked discovery, so the app kept
+    /// dialling a network it had left, and the healthy Mac that discovery had
+    /// already found — and written to the discovered slot — was never tried.
+    ///
+    /// Returning an ordered list instead lets the caller health-check down it and
+    /// use the first address that actually answers. That resolves the tension
+    /// between the two things this app needs at once: a deployed HTTPS backend is
+    /// never abandoned for whatever is on the local Wi-Fi (it answers, so it wins
+    /// on the first probe), while a stale LAN address yields immediately to a
+    /// server that is really there (it does not answer, so the next candidate is
+    /// tried). Neither behaviour has to be configured.
+    static func candidates(
+        configured: String,
+        productionDefault: String,
+        discovered: String,
+        allowingLoopback: Bool = loopbackIsUsable
+    ) -> [String] {
+        var ordered: [String] = []
+        for candidate in [configured, productionDefault, discovered] {
+            let trimmed = candidate.trimmingCharacters(in: .whitespacesAndNewlines)
+            guard !trimmed.isEmpty,
+                  isUsableFromPhone(trimmed, allowingLoopback: allowingLoopback),
+                  !ordered.contains(trimmed)
+            else { continue }
+            ordered.append(trimmed)
+        }
+        return ordered
+    }
+
+    /// Whether loopback counts as a real backend here.
+    ///
+    /// On a phone it does not: `localhost` is the phone. On the simulator it does
+    /// — the simulator shares the Mac's network stack, so loopback genuinely is
+    /// the development backend, and filtering it out would break the one setup
+    /// where it is correct.
+    static let loopbackIsUsable: Bool = {
+        #if targetEnvironment(simulator)
+        return true
+        #else
+        return false
+        #endif
+    }()
+
+    /// Can this app reach this address at all, whatever is configured?
+    ///
+    /// Loopback is the case that matters and it is not hypothetical. macOS
+    /// publishes `127.0.0.1` alongside the real address in the A record for its
+    /// own `.local` hostname, so resolving the backend's Bonjour record on a
+    /// phone can genuinely yield loopback. On a device that means the phone
+    /// itself: trying it wastes a full connection timeout to learn nothing, and
+    /// if it is the only candidate the app reports the server as down while the
+    /// server is fine.
+    ///
+    /// `allowingLoopback` is a parameter rather than a compile-time branch inside
+    /// the function so both behaviours are testable from one build.
+    static func isUsableFromPhone(_ urlString: String, allowingLoopback: Bool = loopbackIsUsable) -> Bool {
+        guard let host = host(of: urlString) else { return false }
+        if allowingLoopback { return true }
+        return !isLoopbackName(host)
+    }
+
+    // MARK: - How hard to keep trying
+
+    /// The smallest and largest gap between reconnection attempts.
+    ///
+    /// A floor because a phone that retries a missing server as fast as it can
+    /// is a phone with a flat battery; a ceiling because a backend that comes
+    /// back should be noticed in under a minute, not in an hour.
+    static let minimumRetryDelay: TimeInterval = 2
+    static let maximumRetryDelay: TimeInterval = 60
+
+    /// How long to wait before attempt number `attempt` (0-based).
+    ///
+    /// Exponential so a server that is genuinely gone is not hammered, capped so
+    /// a server that comes back is found again promptly, and jittered so several
+    /// phones — or several views in one app — that lost the backend at the same
+    /// instant do not retry in lockstep for ever.
+    ///
+    /// `jitter` is injected rather than drawn here so the schedule is testable;
+    /// pass a fresh `Double.random(in: 0...1)` in real use.
+    static func retryDelay(attempt: Int, jitter: Double) -> TimeInterval {
+        let exponent = max(0, attempt)
+        // Cap the exponent before shifting: `1 << 64` is undefined, and an app
+        // left disconnected overnight reaches large attempt counts honestly.
+        let scale = pow(2.0, Double(min(exponent, 16)))
+        let uncapped = minimumRetryDelay * scale
+        let base = min(uncapped, maximumRetryDelay)
+        // ±25%, clamped so a jitter argument outside 0...1 cannot produce a
+        // negative delay (which would busy-loop).
+        let spread = 0.25
+        let factor = 1 + spread * (2 * min(max(jitter, 0), 1) - 1)
+        return max(minimumRetryDelay * (1 - spread), base * factor)
+    }
+
     // MARK: - The build-time production URL
 
     /// The production backend URL from Info.plist (`SDBackendBaseURL`, fed by

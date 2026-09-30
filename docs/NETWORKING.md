@@ -26,6 +26,70 @@ wifi/cloud_uplink health in one report — so you don't have to reason about whi
 side is actually broken. If it is not running: `./scripts/install_backend_mac.sh`
 starts it and keeps it running from then on.
 
+### Two ways the backend can be "running" and still unreachable
+
+Both of these were live on the development Mac and neither shows up as a network
+problem, so `diagnose_backend_mac.py` checks for them explicitly.
+
+**The LaunchAgent starts the wrong program.** `launchctl print` reporting
+`state = running` answers "is the job alive", not "is the job the backend". The
+installed plist had been hand-edited to run `main.py` — the camera/detector
+entrypoint — while a `uvicorn` started before that edit was still answering on
+:8787. So the port was open, `/v1/health` answered, launchd said running, and the
+next login would have started a detector and left the API server simply absent.
+The diagnostic now compares what is installed against the shipped template:
+
+```
+✗ Agent starts the backend: the installed agent does NOT start the backend --
+  it runs `/…/.venv/bin/python /…/main.py`. Reinstall it: ./scripts/install_backend_mac.sh
+```
+
+Reinstalling keeps a timestamped copy of whatever was there before, so a
+deliberate edit is recoverable rather than lost.
+
+**The mDNS record has gone stale.** The address and hostname were read once, at
+startup, and repeated for the life of the process. A laptop is the worst possible
+host for that assumption: it changes Wi-Fi, tethers to a phone, gets a new DHCP
+lease, and macOS renames it (`…-MacBook-Pro-2` → `-4`) on any name collision.
+Because the LaunchAgent keeps the backend up for weeks, the process that survives
+all of those changes is exactly the one still advertising where it used to be —
+found in practice announcing `172.20.10.2` (a hotspot address from days earlier)
+while the Mac had long since moved to a different address on a different network.
+
+That is worse than not advertising at all: a phone that finds nothing keeps
+looking, while a phone handed a dead address stops and reports the server down.
+`cloud/mdns.py` now re-checks its own address and hostname every
+`REFRESH_INTERVAL_S` (15s) and corrects the record — in place for an address
+change, by re-registering for a rename — and withdraws it entirely when the
+machine has no LAN address, rather than repeating the last one it had. The
+diagnostic verifies the record still matches this machine:
+
+```
+✗ mDNS advertising is current: STALE: advertised at ['172.20.10.2'] but this
+  machine is at 11.33.7.x -- the app is being sent to an address that no
+  longer exists.
+```
+
+A backend started before this fix landed will still be advertising staleness
+until it is restarted:
+
+```bash
+launchctl kickstart -k gui/$(id -u)/com.sensordyme.backend
+```
+
+### The app no longer depends on any of this being right
+
+The phone health-checks every address before it believes it, and tries them in
+order rather than committing to the first. A build-time URL used to outrank
+discovery outright, so `SENSORDYME_API_BASE_URL=http://11.22.7.64:8787` in
+`ios/project.yml` meant every request went to a dead address forever and could
+not be repointed without a rebuild. Now a candidate that does not answer
+`/v1/health` with `{"service": "sensordyme-cloud"}` is skipped and the next one
+is tried, so a stale pinned address yields to a server that is really there while
+a healthy deployed URL is never abandoned for whatever is on the local Wi-Fi.
+`ios/project.yml` ships that setting empty, and a test enforces that it is never
+a LAN address again.
+
 ## Second: is `cloud.base_url` a fixed IP address?
 
 The next most likely reason a working device appears to break is that

@@ -10,10 +10,13 @@ files that cannot see each other.
 from __future__ import annotations
 
 import plistlib
+import socket
+import threading as _threading
 from pathlib import Path
 
 import pytest
 import yaml
+import zeroconf as _zeroconf
 
 from cloud import mdns
 
@@ -74,6 +77,149 @@ class TestServiceType:
         declared = spec["targets"]["SensorDyme"]["info"]["properties"]["NSBonjourServices"]
         generated = plistlib.loads(plist.read_bytes())["NSBonjourServices"]
         assert sorted(declared) == sorted(generated)
+
+
+class TestSwiftLiteralsAgreeWithThePublisher:
+    """The Swift constants that actually drive NWBrowser must match what the
+    backend and the device publish.
+
+    This is the gap that let a real regression through. The existing agreement
+    test checks `cloud/mdns.py` against `ios/project.yml`'s NSBonjourServices —
+    a *declaration* list containing BOTH service types. But the app browses for
+    whatever string is written in the Swift source, and nothing read that. So
+    when `DeviceDiscovery` was switched from `_sensordyme._tcp` (the device) to
+    `_sensordyme-api._tcp` (the backend), every test still passed: both types are
+    declared, so the plist check was satisfied either way. The app listed the Mac
+    backend as if it were a camera and the real camera never appeared.
+
+    Two different services, and confusing them is silent on both sides:
+      * `_sensordyme._tcp`     — the DEVICE dashboard, published by avahi on the
+                                 Pi (scripts/publish_mdns.py). Browsed by
+                                 `DeviceDiscovery`.
+      * `_sensordyme-api._tcp` — the BACKEND, published by cloud/mdns.py.
+                                 Browsed by `BackendLocator`.
+
+    Reading Swift from a Python test is not elegant. It is the only thing that
+    covers this at all: `ios/` is excluded from ruff and pyright, there is no
+    XCTest target, and nothing automated ran the Swift suite when this was added.
+    A regex against a `static let` is crude but it fails loudly on the one change
+    that matters, which is the whole job.
+    """
+
+    IOS_SOURCES = REPO / "ios" / "Sources"
+    #: The device's own service. Not derived from cloud/mdns.py — that publishes
+    #: the backend — so it is stated once, here, and asserted against both ends.
+    DEVICE_SERVICE_TYPE = "_sensordyme._tcp"
+
+    def _static_let(self, filename: str, name: str) -> str:
+        import re
+
+        source = (self.IOS_SOURCES / filename).read_text()
+        match = re.search(rf'static let {name}\s*=\s*"([^"]+)"', source)
+        assert match, f"{filename} no longer declares `static let {name}` as a literal"
+        return match.group(1)
+
+    def test_backend_locator_browses_what_the_backend_publishes(self):
+        browsed = self._static_let("BackendLocator.swift", "serviceType")
+        published = mdns.SERVICE_TYPE.removesuffix(".local.")
+        assert browsed == published, (
+            f"BackendLocator browses {browsed!r} but cloud/mdns.py publishes "
+            f"{published!r}; the app would find no backend and say nothing about why"
+        )
+
+    def test_device_discovery_browses_the_device_not_the_backend(self):
+        browsed = self._static_let("Discovery.swift", "serviceType")
+        assert browsed == self.DEVICE_SERVICE_TYPE, (
+            f"DeviceDiscovery browses {browsed!r}, not {self.DEVICE_SERVICE_TYPE!r}"
+        )
+
+    def test_the_two_browsers_do_not_look_for_the_same_service(self):
+        """The regression itself: one class pointed at the other's service."""
+        device = self._static_let("Discovery.swift", "serviceType")
+        backend = self._static_let("BackendLocator.swift", "serviceType")
+        assert device != backend, (
+            "DeviceDiscovery and BackendLocator browse the same Bonjour type, so "
+            "one of them is looking for the wrong thing: the device dashboard and "
+            "the cloud backend are separate services"
+        )
+
+    def test_both_browsed_types_are_declared_to_ios(self):
+        """A type the app has not declared returns nothing, with no error."""
+        spec = yaml.safe_load((REPO / "ios" / "project.yml").read_text())
+        declared = spec["targets"]["SensorDyme"]["info"]["properties"]["NSBonjourServices"]
+        for filename in ("BackendLocator.swift", "Discovery.swift"):
+            browsed = self._static_let(filename, "serviceType")
+            assert browsed in declared, (
+                f"{filename} browses {browsed!r}, which ios/project.yml does not "
+                f"declare in NSBonjourServices ({declared}); iOS returns nothing"
+            )
+
+    def test_the_health_identity_check_matches_what_health_returns(self):
+        """The app refuses a server whose /v1/health `service` is not this string,
+        so a change to the payload silently makes every backend unrecognisable."""
+        expected = self._static_let("BackendLocator.swift", "expectedService")
+        fastapi = pytest.importorskip("fastapi")
+        del fastapi
+        from fastapi.testclient import TestClient
+
+        from cloud.app import app
+
+        payload = TestClient(app).get("/v1/health").json()
+        assert payload["service"] == expected, (
+            f"/v1/health reports service={payload['service']!r} but the app only "
+            f"accepts {expected!r}, so it would reject the real backend"
+        )
+
+
+class TestBuildTimeBackendURL:
+    """The build must not ship pointed at somebody's LAN address.
+
+    This is the regression that took the app off the air, and it is worth a test
+    because nothing else catches it: `SENSORDYME_API_BASE_URL` was set to
+    `http://11.22.7.64:8787`, a build-time URL outranks mDNS discovery, and the
+    network that address named was one the Mac had already left. So every request
+    went to an address that could not answer, discovery was never consulted even
+    though it had already found the healthy Mac, and the address could not be
+    changed without editing this file and rebuilding.
+
+    An empty value is the correct default: the app reads it as "not configured"
+    and finds the Mac on the network, which is the behaviour that survives DHCP.
+    A real deployed HTTPS URL is also fine — it is a name, valid from anywhere.
+    What is never fine is a bare IP or a `.local` name, both of which are true on
+    exactly one network.
+    """
+
+    def _configured(self) -> str:
+        spec = yaml.safe_load((REPO / "ios" / "project.yml").read_text())
+        return str(spec["targets"]["SensorDyme"]["settings"]["base"]["SENSORDYME_API_BASE_URL"])
+
+    def test_is_not_a_lan_address(self):
+        import re
+
+        value = self._configured().strip()
+        if not value:
+            return  # empty is the intended default
+        host = re.sub(r"^[a-zA-Z]+://", "", value).split("/")[0].split(":")[0]
+        is_ip_literal = re.fullmatch(r"\d{1,3}(\.\d{1,3}){3}", host) is not None
+        assert not is_ip_literal, (
+            f"ios/project.yml ships SENSORDYME_API_BASE_URL={value!r}. A build-time URL "
+            f"outranks mDNS discovery, so a LAN IP here strands every build on one "
+            f"network and cannot be changed without a rebuild. Leave it empty for "
+            f"development, or set a real deployed hostname."
+        )
+        assert not host.endswith(".local"), (
+            f"ios/project.yml ships SENSORDYME_API_BASE_URL={value!r}; a .local name is "
+            f"only meaningful on one network and outranks discovery."
+        )
+
+    def test_a_non_empty_value_is_a_complete_url(self):
+        """An unparseable value still becomes the app's top-priority candidate."""
+        value = self._configured().strip()
+        if not value:
+            return
+        assert value.startswith(("http://", "https://")), (
+            f"SENSORDYME_API_BASE_URL={value!r} has no scheme, so it is not a usable base URL"
+        )
 
 
 class TestAdvertisedPort:
@@ -157,3 +303,211 @@ class TestAdvertiser:
         that is not the one anybody meant to publish."""
         monkeypatch.setattr(mdns.socket, "gethostname", lambda: "some-mac.local")
         assert "." not in mdns.Advertiser(8787).name
+
+
+class _FakeZeroconf:
+    """Records what went on the wire, so a test can assert the record is true
+    without needing a second machine to browse from."""
+
+    def __init__(self) -> None:
+        self.registered: list = []
+        self.updated: list = []
+        self.unregistered: list = []
+        self.closed = False
+        self.update_error: Exception | None = None
+
+    def register_service(self, info) -> None:
+        self.registered.append(info)
+
+    def update_service(self, info) -> None:
+        if self.update_error is not None:
+            raise self.update_error
+        self.updated.append(info)
+
+    def unregister_service(self, info) -> None:
+        self.unregistered.append(info)
+
+    def close(self) -> None:
+        self.closed = True
+
+
+def _advertised_address(info) -> str:
+    return socket.inet_ntoa(info.addresses[0])
+
+
+@pytest.fixture
+def fake_mdns(monkeypatch):
+    """An Advertiser wired to a fake Zeroconf, with the machine's identity under
+    the test's control and the refresh timer off so ticks are explicit."""
+    fake = _FakeZeroconf()
+    monkeypatch.setattr(_zeroconf, "Zeroconf", lambda *a, **k: fake)
+
+    identity = {"address": "10.0.0.5", "host": "mac-one"}
+    monkeypatch.setattr(mdns, "lan_ip", lambda: identity["address"])
+    monkeypatch.setattr(mdns.socket, "gethostname", lambda: identity["host"])
+
+    advertiser = mdns.Advertiser(8787, refresh_interval_s=0)
+    assert advertiser.start() is True
+    assert len(fake.registered) == 1
+    try:
+        yield advertiser, fake, identity
+    finally:
+        advertiser.stop()
+
+
+class TestAdvertisementStaysTrue:
+    """The record must keep naming the address this machine actually has.
+
+    The bug: address and hostname were read once, at startup, and repeated for
+    the life of the process. A LaunchAgent keeps this backend up for weeks, so
+    the process that survives a Wi-Fi change, a tether, a DHCP move or a macOS
+    rename is exactly the one still advertising where it used to be. That is
+    worse than not advertising: a phone that finds nothing keeps looking, while a
+    phone handed a dead address connects to nothing and reports the server down.
+    """
+
+    def test_a_quiet_tick_changes_nothing(self, fake_mdns):
+        advertiser, fake, _ = fake_mdns
+        assert advertiser.refresh() is False
+        assert fake.updated == []
+        assert fake.unregistered == []
+
+    def test_a_new_dhcp_lease_is_corrected_in_place(self, fake_mdns):
+        advertiser, fake, identity = fake_mdns
+        identity["address"] = "192.168.4.22"
+
+        assert advertiser.refresh() is True
+
+        assert len(fake.updated) == 1
+        assert _advertised_address(fake.updated[-1]) == "192.168.4.22"
+        # In place: browsing clients see one service correcting itself, not one
+        # leaving and another arriving.
+        assert fake.unregistered == []
+
+    def test_the_instance_name_does_not_churn(self, fake_mdns):
+        """What a client keys on must stay put, or one server looks like several
+        appearing and disappearing."""
+        advertiser, fake, identity = fake_mdns
+        original = fake.registered[0].name
+
+        identity["address"] = "192.168.4.22"
+        advertiser.refresh()
+        identity["host"] = "mac-one-4"
+        advertiser.refresh()
+
+        for info in fake.registered + fake.updated:
+            assert info.name == original
+
+    def test_a_macos_rename_re_registers_so_the_hostname_resolves(self, fake_mdns):
+        """macOS renames a machine on a name collision (`-2` becomes `-4`). The
+        `server` field carries that name, and update_service does not revise it,
+        so this case has to be a clean re-registration or `.local` stops
+        resolving while the record still claims it works."""
+        advertiser, fake, identity = fake_mdns
+        identity["host"] = "mac-one-4"
+
+        assert advertiser.refresh() is True
+
+        assert len(fake.unregistered) == 1
+        assert len(fake.registered) == 2
+        assert fake.registered[-1].server == "mac-one-4.local."
+
+    def test_losing_the_network_withdraws_rather_than_lying(self, fake_mdns):
+        advertiser, fake, identity = fake_mdns
+        identity["address"] = None
+
+        assert advertiser.refresh() is True
+
+        assert len(fake.unregistered) == 1
+        # Nothing new went out in its place: silence, not a dead address.
+        assert len(fake.registered) == 1
+
+    def test_the_announcement_comes_back_when_the_network_does(self, fake_mdns):
+        advertiser, fake, identity = fake_mdns
+        identity["address"] = None
+        advertiser.refresh()
+
+        identity["address"] = "172.20.10.2"
+        assert advertiser.refresh() is True
+
+        assert len(fake.registered) == 2
+        assert _advertised_address(fake.registered[-1]) == "172.20.10.2"
+
+    def test_a_withdrawn_record_stays_withdrawn_on_a_quiet_tick(self, fake_mdns):
+        advertiser, fake, identity = fake_mdns
+        identity["address"] = None
+        advertiser.refresh()
+        assert advertiser.refresh() is False
+        assert len(fake.unregistered) == 1
+
+    def test_a_failed_update_keeps_the_previous_record(self, fake_mdns):
+        """Better to go on announcing the old address than to announce nothing at
+        all by accident — and the log has to say which happened."""
+        advertiser, fake, identity = fake_mdns
+        fake.update_error = OSError("network down mid-update")
+        identity["address"] = "192.168.4.22"
+
+        assert advertiser.refresh() is False
+        assert advertiser._address == "10.0.0.5"
+
+    def test_refresh_before_start_is_a_no_op(self):
+        assert mdns.Advertiser(8787).refresh() is False
+
+    def test_refresh_after_stop_is_a_no_op(self, fake_mdns):
+        advertiser, _, identity = fake_mdns
+        advertiser.stop()
+        identity["address"] = "192.168.4.22"
+        assert advertiser.refresh() is False
+
+
+class TestRefreshTimer:
+    def test_the_watcher_runs_refresh_without_being_asked(self, monkeypatch):
+        """The correction is worthless if something has to remember to trigger it."""
+        monkeypatch.setattr(_zeroconf, "Zeroconf", lambda *a, **k: _FakeZeroconf())
+        monkeypatch.setattr(mdns, "lan_ip", lambda: "10.0.0.5")
+        monkeypatch.setattr(mdns.socket, "gethostname", lambda: "mac-one")
+
+        ticked = _threading.Event()
+        advertiser = mdns.Advertiser(8787, refresh_interval_s=0.01)
+        monkeypatch.setattr(advertiser, "refresh", ticked.set)
+        try:
+            assert advertiser.start() is True
+            assert ticked.wait(5), "the refresh timer never fired"
+        finally:
+            advertiser.stop()
+
+    def test_stop_joins_the_watcher(self, monkeypatch):
+        """A thread still polling after shutdown keeps a Zeroconf instance alive
+        and re-registers a service the server no longer backs."""
+        monkeypatch.setattr(_zeroconf, "Zeroconf", lambda *a, **k: _FakeZeroconf())
+        monkeypatch.setattr(mdns, "lan_ip", lambda: "10.0.0.5")
+        monkeypatch.setattr(mdns.socket, "gethostname", lambda: "mac-one")
+
+        advertiser = mdns.Advertiser(8787, refresh_interval_s=0.01)
+        advertiser.start()
+        watcher = advertiser._watcher
+        assert watcher is not None
+        advertiser.stop()
+        assert not watcher.is_alive()
+
+    def test_a_refresh_that_raises_does_not_kill_the_timer(self, monkeypatch):
+        monkeypatch.setattr(_zeroconf, "Zeroconf", lambda *a, **k: _FakeZeroconf())
+        monkeypatch.setattr(mdns, "lan_ip", lambda: "10.0.0.5")
+        monkeypatch.setattr(mdns.socket, "gethostname", lambda: "mac-one")
+
+        calls = []
+        twice = _threading.Event()
+
+        def exploding_refresh():
+            calls.append(1)
+            if len(calls) >= 2:
+                twice.set()
+            raise RuntimeError("boom")
+
+        advertiser = mdns.Advertiser(8787, refresh_interval_s=0.01)
+        monkeypatch.setattr(advertiser, "refresh", exploding_refresh)
+        try:
+            advertiser.start()
+            assert twice.wait(5), "the timer stopped after the first failure"
+        finally:
+            advertiser.stop()

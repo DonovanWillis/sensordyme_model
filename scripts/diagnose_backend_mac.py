@@ -74,13 +74,77 @@ def launchd_status() -> tuple[bool, str]:
     return running, "running" if running else "installed but not running"
 
 
+PLIST_TEMPLATE = REPO_DIR / "deploy" / "launchd" / "com.sensordyme.backend.plist.template"
+INSTALLED_PLIST = Path.home() / "Library" / "LaunchAgents" / "com.sensordyme.backend.plist"
+
+
+def launchd_runs_the_backend() -> tuple[bool, str]:
+    """Is the installed agent configured to start the BACKEND?
+
+    `launchd_status` above answers "is the job running", which is not the same
+    question and was reported as if it were. The installed plist had been
+    hand-edited to run `main.py` -- the camera/detector entrypoint, not the API
+    server -- while the process still running was a `uvicorn` started before that
+    edit. So launchd said "running", the port was open, health answered, every
+    check passed, and the next login would have started the detector and left the
+    backend simply absent. Comparing what is installed against the template is
+    the only check that sees it.
+    """
+    if not INSTALLED_PLIST.exists():
+        return False, f"{INSTALLED_PLIST.name} not installed -- run scripts/install_backend_mac.sh"
+    try:
+        import plistlib
+
+        installed = plistlib.loads(INSTALLED_PLIST.read_bytes())
+    except Exception as exc:  # noqa: BLE001 - a corrupt plist is a finding, not a crash
+        return False, f"could not read the installed agent ({exc!r})"
+
+    args = installed.get("ProgramArguments") or []
+    joined = " ".join(args)
+    if not any(arg.endswith("uvicorn") for arg in args):
+        return False, (
+            f"the installed agent does NOT start the backend -- it runs `{joined}`. "
+            f"Reinstall it: ./scripts/install_backend_mac.sh"
+        )
+    if "cloud.app:app" not in args:
+        return False, (
+            f"the installed agent runs uvicorn but not the backend app -- `{joined}`. "
+            f"Reinstall it: ./scripts/install_backend_mac.sh"
+        )
+
+    # A port mismatch between what uvicorn binds and what the agent announces
+    # sends the app somewhere definite and wrong, which is worse than silence.
+    announced = (installed.get("EnvironmentVariables") or {}).get("SENSORDYME_PORT")
+    if "--port" in args:
+        bound = args[args.index("--port") + 1]
+        if announced is not None and announced != bound:
+            return False, (
+                f"the agent binds port {bound} but announces {announced} over mDNS -- "
+                f"the app would be sent to a port nothing is on"
+            )
+    return True, f"runs `{joined}`"
+
+
 def mdns_advertising(timeout: float = 3.0) -> tuple[bool, str]:
+    """Is the backend announcing itself, and is what it announces still TRUE?
+
+    The second half is the part that matters and was missing. This used to report
+    success on the strength of a record existing, which is exactly the state that
+    breaks the app: the address and hostname were captured once at startup, and a
+    LaunchAgent keeps the process alive across every Wi-Fi change, tether and DHCP
+    move, so a long-running backend sat there advertising an address that had not
+    existed for days. From the phone that is indistinguishable from the server
+    being switched off -- worse, in fact, because a confident wrong address stops
+    the app looking any further.
+    """
     try:
         from zeroconf import ServiceBrowser, Zeroconf
     except ImportError:
         return False, "zeroconf not installed -- can't check (pip install zeroconf)"
 
-    from cloud.mdns import SERVICE_TYPE
+    import socket
+
+    from cloud.mdns import SERVICE_TYPE, lan_ip
 
     found: list[str] = []
 
@@ -98,16 +162,37 @@ def mdns_advertising(timeout: float = 3.0) -> tuple[bool, str]:
     try:
         ServiceBrowser(zc, SERVICE_TYPE, _Listener())
         time.sleep(timeout)
+        if not found:
+            return False, "not seen -- SENSORDYME_MDNS may be off, or the network blocks multicast"
+        info = zc.get_service_info(SERVICE_TYPE, found[0], timeout=int(timeout * 1000))
     finally:
         zc.close()
 
-    if found:
-        return True, f"visible on the network ({found[0]})"
-    return False, "not seen -- SENSORDYME_MDNS may be off, or the network blocks multicast"
+    if info is None:
+        return False, f"advertised as {found[0]!r} but it would not resolve"
+
+    advertised = [socket.inet_ntoa(a) for a in (info.addresses or []) if len(a) == 4]
+    actual = lan_ip()
+    if actual is None:
+        return False, f"advertised at {advertised} but this machine has no LAN address"
+    if actual not in advertised:
+        return False, (
+            f"STALE: advertised at {advertised or 'no address'} but this machine is at "
+            f"{actual} -- the app is being sent to an address that no longer exists. "
+            f"Restart the backend so it re-announces: "
+            f"launchctl kickstart -k gui/$(id -u)/com.sensordyme.backend"
+        )
+    return True, f"visible and current ({found[0]} at {actual}:{info.port})"
 
 
 def main() -> int:
-    port = 8787
+    # Read the port the same way the advertiser does, rather than assuming the
+    # default. A diagnostic whose whole job is "is the backend up" reporting a
+    # perfectly healthy backend as down — because it is on a port this script
+    # hardcoded — is worse than having no diagnostic.
+    from cloud.mdns import advertised_port
+
+    port = advertised_port()
     all_ok = True
 
     print("SensorDyme backend diagnostic\n")
@@ -130,6 +215,10 @@ def main() -> int:
     running, detail = launchd_status()
     check("Persists across reboot/crash (launchd)", running, detail)  # advisory, not fatal
 
+    # Fatal, unlike the line above: an agent that starts the wrong program means
+    # the backend is gone at the next login, and nothing else here would say so.
+    all_ok &= check("Agent starts the backend", *launchd_runs_the_backend())
+
     secret_path = REPO_DIR / "cloud" / ".jwt_secret"
     all_ok &= check(
         "JWT secret persisted", secret_path.exists(),
@@ -138,7 +227,9 @@ def main() -> int:
              f"until the backend has run once and created it",
     )
 
-    check(*(("mDNS advertising",) + mdns_advertising()))  # advisory: Settings entry is a valid fallback
+    # Fatal too. A stale record is not a degraded version of discovery working —
+    # it actively stops the app looking anywhere else.
+    all_ok &= check("mDNS advertising is current", *mdns_advertising())
 
     if len(sys.argv) > 1:
         host = sys.argv[1]

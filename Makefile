@@ -1,6 +1,6 @@
 .PHONY: help dev dev-debug dev-max dev-openpilot dev-skinnemoen dev-dashsentinel \
         bench accuracy accuracy-dataset accuracy-gate report deploy \
-        test test-cov lint lint-fix fmt-check typecheck audit check mutants \
+        test test-cov test-ios lint lint-fix fmt-check typecheck audit check mutants \
         setup-dev hooks clean
 
 VENV := .venv/bin
@@ -149,7 +149,14 @@ audit: ## Audit the pinned dependencies for known CVEs
 		-r requirements-device.txt -r requirements.txt \
 		-r cloud/requirements.txt -r requirements-dev.txt
 
-check: lint typecheck test ## Run every CI gate locally (lint + typecheck + tests)
+test-ios: ## Run the Swift logic tests (ios/Tests). Needs a Mac with Swift.
+	@if command -v swift >/dev/null 2>&1; then \
+		bash ios/Tests/run.sh; \
+	else \
+		echo "swift not found — skipping the iOS logic tests (not a Mac?)"; \
+	fi
+
+check: lint typecheck test test-ios ## Run every CI gate locally (lint + typecheck + tests)
 	@echo
 	@echo 'All gates passed. "make audit" is deliberately NOT part of this: it'
 	@echo 'queries the PyPI advisory database, so it can start failing on a day'

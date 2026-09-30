@@ -11,6 +11,11 @@ struct SensorDymeApp: App {
                 // Applied at the root so every screen, sheet and alert inherits
                 // it — a theme applied per-screen leaves modals in the old one.
                 .preferredColorScheme(state.appearance.colorScheme)
+                // At the root, and not per-screen, because losing the backend is
+                // not something one screen recovers from: the app has to keep
+                // looking whether the user is on the sign-in screen, the device
+                // list or Settings.
+                .task { state.startBackendMonitoring() }
         }
     }
 }
@@ -21,6 +26,25 @@ struct RootView: View {
     @Environment(\.scenePhase) private var scenePhase
 
     var body: some View {
+        content
+            .onChange(of: scenePhase) { _, phase in
+                // Coming back from suspension is the case that used to need a
+                // force-quit: iOS freezes the app's tasks, the Mac's address may
+                // have moved while it was away, and nothing re-checked on return.
+                guard phase == .active else { return }
+                if case .connected = state.backendStatus {
+                    // Confirm it is still there rather than assuming; a backend
+                    // restart while suspended leaves a connection that only looks
+                    // live until the next request fails.
+                    Task { await state.revalidateBackend() }
+                } else {
+                    state.reconnect()
+                }
+            }
+    }
+
+    @ViewBuilder
+    private var content: some View {
         if state.isSignedIn {
             TabView {
                 DevicesView()

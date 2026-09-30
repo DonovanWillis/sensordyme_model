@@ -4,6 +4,13 @@ import Network
 /// Finds SensorDyme devices on the local network via Bonjour (_sensordyme._tcp,
 /// advertised by avahi on the device) and resolves them to an http base URL —
 /// so nobody ever types an IP address into Settings.
+///
+/// This browses for the DEVICE (a Pi running the camera and its own dashboard),
+/// which is a different service from the backend: the backend publishes
+/// `_sensordyme-api._tcp` from cloud/mdns.py and is found by `BackendLocator`.
+/// Pointing this type at `-api` makes the Mac backend show up in the device list
+/// — it has no `id` TXT record, so it lands there under its service name — while
+/// the actual camera never appears at all.
 @MainActor
 final class DeviceDiscovery: ObservableObject {
     /// One device on the network.
@@ -27,15 +34,23 @@ final class DeviceDiscovery: ObservableObject {
     /// looking harder.
     @Published private(set) var problem: String?
 
+    /// The device's own Bonjour service — NOT the backend's. Named here rather
+    /// than written inline so the two can't quietly become the same string.
+    static let serviceType = "_sensordyme._tcp"
+
     private var browser: NWBrowser?
     private var resolvers: [NWConnection] = []
+    /// The pending auto-stop. Held so a second `start()` cancels the first one's
+    /// timer: without this, each start queues its own sleeping task, and the one
+    /// from an abandoned search stops a newer search 10 seconds into it.
+    private var autoStop: Task<Void, Never>?
 
     func start() {
         stop()
         isSearching = true
         found = []
         let browser = NWBrowser(
-            for: .bonjour(type: "_sensordyme._tcp", domain: nil),
+            for: .bonjour(type: DeviceDiscovery.serviceType, domain: nil),
             using: NWParameters()
         )
         self.browser = browser
@@ -79,13 +94,16 @@ final class DeviceDiscovery: ObservableObject {
         }
         browser.start(queue: .main)
         // Auto-stop after a while; discovery is a burst, not a background drain.
-        Task { [weak self] in
+        autoStop = Task { [weak self] in
             try? await Task.sleep(nanoseconds: 10_000_000_000)
+            guard !Task.isCancelled else { return }
             self?.stop()
         }
     }
 
     func stop() {
+        autoStop?.cancel()
+        autoStop = nil
         browser?.cancel()
         browser = nil
         resolvers.forEach { $0.cancel() }

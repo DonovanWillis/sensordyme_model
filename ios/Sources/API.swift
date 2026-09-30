@@ -1,5 +1,7 @@
 import Foundation
+import Network
 import SwiftUI
+import os
 
 struct APIError: LocalizedError {
     let message: String
@@ -30,7 +32,7 @@ struct APIClient {
         }
         guard let base = resolved else {
             throw APIError(
-                message: "Couldn't find a SensorDyme server on this network. Make sure the server is running, or enter its address in Settings → Cloud backend.",
+                message: "Couldn't find a SensorDyme server on this network. Make sure the backend is running on your Mac and this phone is on the same Wi-Fi. You can also enter the address yourself in Settings → Manual server address.",
                 isUnreachable: true
             )
         }
@@ -109,14 +111,14 @@ struct APIClient {
     static func explain(_ error: URLError, host: String) -> String {
         #if !targetEnvironment(simulator)
         if host == "localhost" || host == "127.0.0.1" {
-            return "This app is pointed at \(host) — on a phone that means the phone itself, not your server. Open Settings → Cloud backend and enter your server's real address (e.g. http://192.168.1.x:8787 while developing)."
+            return "This app is pointed at \(host) — on a phone that means the phone itself, not your server. Open Settings → Manual server address and enter your server's real address (e.g. http://192.168.1.x:8787 while developing)."
         }
         #endif
         switch error.code {
         case .cannotConnectToHost:
-            return "Nothing is answering at \(host). Is the backend running, and is this the right address? (Settings → Cloud backend)"
+            return "Nothing is answering at \(host). Is the backend running on your Mac? SensorDyme will keep looking; you can also check Settings → Server."
         case .cannotFindHost, .dnsLookupFailed:
-            return "Can't find \(host) — check the address in Settings → Cloud backend."
+            return "Can't find \(host) — check Settings → Server, or set the address yourself in Settings → Manual server address."
         case .notConnectedToInternet, .networkConnectionLost:
             return "No network connection. Check the phone's Wi-Fi."
         case .timedOut:
@@ -219,6 +221,45 @@ final class AppState: ObservableObject {
     /// True while the app is looking for the backend on the network, so the
     /// sign-in screen can say what it is doing instead of appearing to hang.
     @Published var isLocatingBackend = false
+
+    /// How far the app has actually got with the backend.
+    ///
+    /// Four distinct states because the app used to collapse them and report a
+    /// connection for a service it had merely seen advertised on the network. An
+    /// mDNS record outlives the process that published it, so "discovered" and
+    /// "healthy" are genuinely different facts and only the second one means the
+    /// app can do anything.
+    enum BackendStatus: Equatable {
+        /// Nothing tried yet this launch.
+        case unknown
+        /// Looking: probing known addresses, then browsing the network.
+        case searching
+        /// An address answered `/v1/health` and identified itself as ours.
+        case connected(String)
+        /// Nothing answered. Carries something the user can act on.
+        case unreachable(String)
+    }
+
+    @Published private(set) var backendStatus: BackendStatus = .unknown
+
+    /// The last address that actually answered as the backend. Not persisted: it
+    /// is a statement about the network as it is right now, and restoring it
+    /// across launches is how a stale address gets treated as configuration.
+    @Published private(set) var confirmedBaseURL: String = ""
+
+    /// The single in-flight resolve. Concurrent callers join it rather than
+    /// starting competing searches — several views ask at once on launch, and a
+    /// request failing over triggers another.
+    private var resolveTask: Task<String?, Never>?
+    /// The pending automatic retry, held so there is never more than one timer.
+    private var retryTask: Task<Void, Never>?
+    /// The while-connected health re-check, held for the same reason.
+    private var heartbeatTask: Task<Void, Never>?
+    /// How many consecutive resolves have failed, for the backoff schedule.
+    private var failedAttempts = 0
+    /// Watches for the phone changing network, so a move is noticed rather than
+    /// waited out.
+    private var pathMonitor: NWPathMonitor?
     /// Explains an involuntary sign-out on the auth screen, so a rotated server
     /// secret or an expired token doesn't just silently dump the user to login.
     @Published var signOutNotice: String?
@@ -320,26 +361,42 @@ final class AppState: ObservableObject {
         }
     }
 
-    /// The address requests actually go to: configured, else the build's
-    /// production URL, else whatever discovery last found.
+    /// The address requests actually go to.
+    ///
+    /// A *confirmed* address — one that answered `/v1/health` as the SensorDyme
+    /// backend — outranks the configured order, which is the difference between
+    /// this and `BackendResolution.effective`. Precedence describes what is
+    /// configured; it says nothing about what exists. When a build-time
+    /// `http://11.22.7.64:8787` was top of the order, every request went there
+    /// and kept going there, so the healthy Mac that discovery had already found
+    /// was never used and the app could not be pointed anywhere else without a
+    /// rebuild.
+    ///
+    /// Before anything has been confirmed this still falls back to the configured
+    /// order, so the very first request on a cold launch has somewhere to go.
     var effectiveBaseURL: String {
-        if !configuredBaseURL.isEmpty {
-            return configuredBaseURL
-        }
-
-        if !discoveredBaseURL.isEmpty {
-            return discoveredBaseURL
-        }
-
-        return Self.productionBaseURL
+        if !confirmedBaseURL.isEmpty { return confirmedBaseURL }
+        return BackendResolution.effective(
+            configured: configuredBaseURL,
+            productionDefault: Self.productionBaseURL,
+            discovered: discoveredBaseURL
+        )
     }
-    /// Whether the app is allowed to go looking on the local network. False once
-    /// a public backend is pinned, so an internet blip can never divert sign-in
-    /// to a different server that happens to be on the same Wi-Fi.
+
+    /// Whether the app is allowed to go looking on the local network.
+    ///
+    /// False once a *public* backend is pinned, so an internet blip can never
+    /// divert sign-in to a different server that happens to be on the same
+    /// Wi-Fi. A pinned LAN address is a developer pointing at a Mac, and that
+    /// one stays discoverable — otherwise a stale dev URL is unrecoverable
+    /// without a rebuild, which is exactly the hole this app fell into.
     private var mayDiscover: Bool {
-        true
+        BackendResolution.mayFallBackToDiscovery(
+            configured: configuredBaseURL,
+            productionDefault: Self.productionBaseURL
+        )
     }
-    
+
     var api: APIClient {
         let base = effectiveBaseURL
         return APIClient(
@@ -349,49 +406,254 @@ final class AppState: ObservableObject {
         )
     }
 
-    /// Make sure there is a backend that answers, without asking anyone.
+    // MARK: - Finding and keeping the backend
+
+    private static let log = Logger(subsystem: "com.sensordyme.app", category: "backend")
+
+    /// Find a backend that actually answers, and remember it.
     ///
-    /// Runs before sign-in. The pinned address — typed, or built in — is only
-    /// ever probed, never replaced: discovery writes to its own slot, so a
-    /// deployed backend cannot be swapped for whatever is on the local Wi-Fi.
-    func ensureBackend() async {
-        guard !isDemo else { return }
-
-        isLocatingBackend = true
-        defer { isLocatingBackend = false }
-
-        // Always try to find a local SensorDyme backend first.
-        if let found = await BackendLocator.shared.search() {
-            discoveredBaseURL = found
-            return
-        }
-
-        // No local backend found, so use the configured/cloud backend.
-        let current = effectiveBaseURL
-
-        if !current.isEmpty, await BackendLocator.answers(current) {
-            return
-        }
-    }
-
-    /// The address just failed. Search the network and remember where the server
-    /// moved to, so the next request goes straight there.
+    /// One resolver for the whole app. It walks the configured order — typed
+    /// address, then the build's URL, then the last discovered one — health
+    /// checking each, and only then browses the network. That ordering gives both
+    /// behaviours the app needs at once, without a mode switch: a deployed HTTPS
+    /// backend answers on the first probe and is never abandoned for whatever is
+    /// on the local Wi-Fi, while an address that has stopped existing fails its
+    /// probe in a few seconds and the Mac that is really there gets used.
     ///
-    /// Returns nil — declining to look — whenever a public backend is pinned.
-    /// A hosted backend that is briefly unreachable is unreachable; it has not
-    /// moved onto the local Wi-Fi, and treating "did not answer" as "look
-    /// elsewhere" is how an app ends up authenticating against a stranger's server.
-    func relocateBackend() async -> URL? {
+    /// Returns the confirmed address, or nil. Never throws, and never reports a
+    /// connection it did not verify.
+    @discardableResult
+    func resolveBackend() async -> String? {
         guard !isDemo else { return nil }
 
-        isLocatingBackend = true
-        defer { isLocatingBackend = false }
+        // Join an existing search rather than starting a second browse. Without
+        // this, launch alone starts several: the sign-in screen, the alert
+        // watcher, and every request that fails over.
+        if let existing = resolveTask {
+            return await existing.value
+        }
 
-        guard let found = await BackendLocator.shared.search() else {
+        let task = Task { @MainActor [weak self] () -> String? in
+            guard let self else { return nil }
+
+            self.backendStatus = .searching
+            self.isLocatingBackend = true
+            defer { self.isLocatingBackend = false }
+
+            let known = BackendResolution.candidates(
+                configured: self.configuredBaseURL,
+                productionDefault: Self.productionBaseURL,
+                discovered: self.discoveredBaseURL
+            )
+            for candidate in known {
+                if Task.isCancelled { return nil }
+                if await BackendLocator.answers(candidate) {
+                    self.confirm(candidate)
+                    return candidate
+                }
+                Self.log.info("no backend at the known address \(candidate, privacy: .public)")
+            }
+
+            if Task.isCancelled { return nil }
+
+            if self.mayDiscover, let found = await BackendLocator.shared.search() {
+                // The result goes to the discovery cache, never to configuration:
+                // an address found on one network must not outlive it as if
+                // somebody had chosen it.
+                self.discoveredBaseURL = found
+                self.confirm(found)
+                return found
+            }
+
+            self.reportUnreachable(triedKnown: known)
             return nil
         }
 
-        discoveredBaseURL = found
+        resolveTask = task
+        let found = await task.value
+        resolveTask = nil
+        return found
+    }
+
+    /// Record a verified address and stop the retry clock.
+    private func confirm(_ url: String) {
+        confirmedBaseURL = url
+        backendStatus = .connected(url)
+        failedAttempts = 0
+        retryTask?.cancel()
+        retryTask = nil
+        Self.log.info("backend connected at \(url, privacy: .public)")
+        startHeartbeat()
+    }
+
+    /// How often to re-check a backend we believe we are connected to.
+    ///
+    /// One GET of `/v1/health` at this interval, and only while the app is
+    /// running and believes it is connected.
+    private static let heartbeatInterval: TimeInterval = 20
+
+    /// Keep checking that the server we are connected to is still there.
+    ///
+    /// Without this the app is only as honest as its last request. Signed out, on
+    /// the sign-in screen, nothing makes requests at all — so stopping the backend
+    /// left the app displaying "connected" indefinitely, which is the exact claim
+    /// it must never make about a server that is not answering. It also meant
+    /// reconnection was really request-triggered rather than automatic: the retry
+    /// schedule could not start, because nothing had noticed anything was wrong.
+    ///
+    /// Cheap enough to be unconditional: one small request every 20 seconds, and
+    /// iOS suspends the task outright once the app is backgrounded.
+    private func startHeartbeat() {
+        heartbeatTask?.cancel()
+        heartbeatTask = Task { @MainActor [weak self] in
+            while !Task.isCancelled {
+                try? await Task.sleep(nanoseconds: UInt64(Self.heartbeatInterval * 1_000_000_000))
+                guard !Task.isCancelled, let self else { return }
+                // Only meaningful while we claim to be connected; any other state
+                // already has the resolver or the retry schedule working on it.
+                guard case .connected(let url) = self.backendStatus else { return }
+                if await BackendLocator.answers(url) { continue }
+                Self.log.info("heartbeat: \(url, privacy: .public) stopped answering")
+                self.confirmedBaseURL = ""
+                self.reportUnreachable(triedKnown: [url])
+                return
+            }
+        }
+    }
+
+    /// Say why there is no connection, in terms of what was actually tried, and
+    /// schedule another attempt.
+    private func reportUnreachable(triedKnown: [String]) {
+        heartbeatTask?.cancel()
+        heartbeatTask = nil
+        confirmedBaseURL = ""
+        let reason: String
+        if let permission = BackendLocator.shared.problem {
+            // A denied Local Network permission is invisible in the results and
+            // is the one cause the user can fix immediately.
+            reason = permission
+        } else if triedKnown.isEmpty {
+            reason = "No SensorDyme server answered on this Wi-Fi. Check that the backend is running on your Mac and that this phone is on the same network."
+        } else if let host = URL(string: triedKnown[0])?.host {
+            reason = "Nothing answered at \(host), and no server was found on this Wi-Fi. \(BackendResolution.unreachableAdvice(host: host))"
+        } else {
+            reason = "No SensorDyme server answered on this Wi-Fi."
+        }
+        backendStatus = .unreachable(reason)
+        Self.log.info("backend unreachable: \(reason, privacy: .public)")
+        scheduleRetry()
+    }
+
+    /// Try again later, once, with a growing and jittered delay.
+    ///
+    /// One task at a time, cancelled the moment a connection is confirmed. The
+    /// delay is capped (see `BackendResolution.maximumRetryDelay`) so a backend
+    /// that comes back is noticed within a minute, and floored so a phone that
+    /// cannot find it does not retry itself flat.
+    private func scheduleRetry() {
+        guard retryTask == nil else { return }
+        let attempt = failedAttempts
+        failedAttempts += 1
+        let delay = BackendResolution.retryDelay(attempt: attempt, jitter: Double.random(in: 0...1))
+        Self.log.info("retrying in \(delay, format: .fixed(precision: 1), privacy: .public)s")
+        retryTask = Task { @MainActor [weak self] in
+            try? await Task.sleep(nanoseconds: UInt64(delay * 1_000_000_000))
+            guard !Task.isCancelled, let self else { return }
+            self.retryTask = nil
+            await self.resolveBackend()
+        }
+    }
+
+    /// Confirm the address we think we are connected to is still answering, and
+    /// fall back to a full re-resolve if it is not.
+    ///
+    /// Cheaper than `reconnect()` — one health check rather than a browse — which
+    /// is what makes it safe to run every time the app comes to the foreground.
+    func revalidateBackend() async {
+        guard !isDemo, !confirmedBaseURL.isEmpty else {
+            reconnect()
+            return
+        }
+        if await BackendLocator.answers(confirmedBaseURL) {
+            backendStatus = .connected(confirmedBaseURL)
+            return
+        }
+        Self.log.info("the confirmed backend stopped answering; re-resolving")
+        reconnect()
+    }
+
+    /// Re-check from scratch: forget what was confirmed and resolve again.
+    ///
+    /// For a network change, a return to the foreground, and the Settings button.
+    func reconnect() {
+        guard !isDemo else { return }
+        confirmedBaseURL = ""
+        failedAttempts = 0
+        heartbeatTask?.cancel()
+        heartbeatTask = nil
+        retryTask?.cancel()
+        retryTask = nil
+        resolveTask?.cancel()
+        resolveTask = nil
+        BackendLocator.shared.cancelSearch()
+        Task { await resolveBackend() }
+    }
+
+    /// Start watching for the things that invalidate a connection.
+    ///
+    /// Reconnection has to be automatic to be worth anything: the failures this
+    /// handles — the Mac restarting, the phone being suspended and resumed, Wi-Fi
+    /// dropping, the Mac's DHCP lease moving — all used to require force-quitting
+    /// the app, because nothing re-ran discovery after the sign-in screen.
+    func startBackendMonitoring() {
+        guard pathMonitor == nil, !isDemo else { return }
+        let monitor = NWPathMonitor()
+        pathMonitor = monitor
+        monitor.pathUpdateHandler = { [weak self] path in
+            Task { @MainActor in
+                guard let self else { return }
+                // Only when there is a network to look on. Reconnecting while the
+                // phone has no route just burns the backoff schedule.
+                guard path.status == .satisfied else {
+                    self.backendStatus = .unreachable("No network connection. Check the phone's Wi-Fi.")
+                    return
+                }
+                // The interface changed, so an address confirmed on the previous
+                // one says nothing about this one.
+                Self.log.info("network path changed; re-resolving the backend")
+                self.reconnect()
+            }
+        }
+        monitor.start(queue: .main)
+        Task { await resolveBackend() }
+    }
+
+    func stopBackendMonitoring() {
+        pathMonitor?.cancel()
+        pathMonitor = nil
+        heartbeatTask?.cancel()
+        heartbeatTask = nil
+        retryTask?.cancel()
+        retryTask = nil
+        resolveTask?.cancel()
+        resolveTask = nil
+        BackendLocator.shared.cancelSearch()
+    }
+
+    /// Kept as the name the sign-in screen calls; the work is `resolveBackend`.
+    func ensureBackend() async {
+        await resolveBackend()
+    }
+
+    /// A request just failed against `effectiveBaseURL`. Resolve again and hand
+    /// back somewhere new to try, so a server that moved heals itself instead of
+    /// sending the user to Settings to fix an address they never set.
+    func relocateBackend() async -> URL? {
+        guard !isDemo else { return nil }
+        // Forget the confirmation: it is what just failed, and leaving it in
+        // place makes the resolver hand back the same dead address.
+        confirmedBaseURL = ""
+        guard let found = await resolveBackend() else { return nil }
         return URL(string: found)
     }
 
@@ -400,6 +662,7 @@ final class AppState: ObservableObject {
     /// the server, not to pin it forever to the address it had today.
     func adoptDiscovered(_ url: String) {
         discoveredBaseURL = url
+        confirm(url)
     }
 
     /// The single access point views use — the real cloud, or the built-in demo device.

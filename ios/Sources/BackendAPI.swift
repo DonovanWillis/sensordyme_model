@@ -237,7 +237,7 @@ extension APIClient: BackendAPI {
 
     func orders() async throws -> [Order] {
         guard let baseURL else {
-            throw APIError(message: "No cloud backend configured. Open Settings → Cloud backend and enter your server's address.")
+            throw APIError(message: "No SensorDyme server found yet. Check Settings → Server, or enter the address in Settings → Manual server address.")
         }
         var req = URLRequest(url: baseURL.appendingPathComponent("v1/orders"))
         if let token { req.setValue("Bearer \(token)", forHTTPHeaderField: "Authorization") }
@@ -535,7 +535,7 @@ final class MockAPI: BackendAPI {
 extension APIClient {
     func getJSON<T: Decodable>(_ path: String) async throws -> T {
         guard let baseURL else {
-            throw APIError(message: "No cloud backend configured. Open Settings → Cloud backend and enter your server's address.")
+            throw APIError(message: "No SensorDyme server found yet. Check Settings → Server, or enter the address in Settings → Manual server address.")
         }
         var req = URLRequest(url: baseURL.appendingPathComponent(path))
         req.httpMethod = "GET"
@@ -555,7 +555,7 @@ extension APIClient {
 
     func postJSON<T: Decodable>(_ path: String, body: [String: Any]) async throws -> T {
         guard let baseURL else {
-            throw APIError(message: "No cloud backend configured. Open Settings → Cloud backend and enter your server's address.")
+            throw APIError(message: "No SensorDyme server found yet. Check Settings → Server, or enter the address in Settings → Manual server address.")
         }
         var req = URLRequest(url: baseURL.appendingPathComponent(path))
         req.httpMethod = "POST"

@@ -77,11 +77,31 @@ struct DiagnosticsView: View {
                                  detail: "You're in demo mode — everything is simulated. Sign out and log into a real account to test the real chain."))
         }
 
+        // 0. What the app currently believes, stated before anything is re-tested.
+        //
+        // Worth its own line because "discovered" and "healthy" are different
+        // facts and the app used to report them as one — so this is the check that
+        // says whether the address below is one that actually answered, or merely
+        // one that is configured.
+        switch state.backendStatus {
+        case .connected(let url):
+            results.append(.init(name: "Server connection", passed: true,
+                                 detail: "verified at \(url)"))
+        case .searching:
+            results.append(.init(name: "Server connection", passed: nil,
+                                 detail: "still looking for the server on this network"))
+        case .unreachable(let reason):
+            results.append(.init(name: "Server connection", passed: false, detail: reason))
+        case .unknown:
+            results.append(.init(name: "Server connection", passed: nil,
+                                 detail: "not checked yet this launch"))
+        }
+
         // 1. cloud backend configured
         let base = state.effectiveBaseURL
         if base.isEmpty {
             results.append(.init(name: "Cloud backend configured", passed: false,
-                                 detail: "No backend address set. Settings → Cloud backend."))
+                                 detail: "No backend address set, and none found on this Wi-Fi. Settings → Server → Find my server."))
         } else if base.contains("localhost") || base.contains("127.0.0.1") {
             #if targetEnvironment(simulator)
             results.append(.init(name: "Cloud backend configured", passed: true, detail: base))

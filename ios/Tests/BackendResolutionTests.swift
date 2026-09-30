@@ -107,5 +107,73 @@ check(BackendResolution.unreachableAdvice(host: "api.example-placeholder.invalid
 // unconditionally, which for a hosted backend describes a requirement the
 // product does not have and sends people to fix a working network.
 
+// ------------------------------------------------- what to actually try, in order
+print("\nthe candidate list is ordered by preference but gated by reachability:")
+check(BackendResolution.candidates(configured: "", productionDefault: "", discovered: "", allowingLoopback: false)
+      == [],
+      "nothing known produces nothing to try, not a bogus address")
+check(BackendResolution.candidates(configured: "", productionDefault: staleLAN, discovered: devMac, allowingLoopback: false)
+      == [staleLAN, devMac],
+      "a stale build-time LAN address is tried first but the discovered one is still THERE to fall through to")
+// This is the specific regression: with only precedence, the build-time
+// http://11.22.7.64:8787 was the answer and the healthy discovered Mac was never
+// reached, so the app could not connect and could not be pointed anywhere else.
+check(BackendResolution.candidates(configured: "", productionDefault: staleLAN, discovered: devMac, allowingLoopback: false).count == 2,
+      "a pinned address that has stopped existing does not hide the one that works")
+check(BackendResolution.candidates(configured: production, productionDefault: "", discovered: devMac, allowingLoopback: false)
+      == [production, devMac],
+      "a typed backend is tried before the local network, not instead of it")
+check(BackendResolution.candidates(configured: devMac, productionDefault: "", discovered: devMac, allowingLoopback: false)
+      == [devMac],
+      "the same address discovered and configured is one candidate, not two timeouts")
+check(BackendResolution.candidates(configured: "  ", productionDefault: "", discovered: devMac, allowingLoopback: false)
+      == [devMac],
+      "whitespace is not a candidate")
+
+print("\naddresses a phone cannot use are dropped before they cost a timeout:")
+check(BackendResolution.isUsableFromPhone("http://127.0.0.1:8787", allowingLoopback: false) == false,
+      "loopback is not a server a phone can reach")
+check(BackendResolution.isUsableFromPhone("http://localhost:8787", allowingLoopback: false) == false,
+      "nor is localhost by name")
+// ...but the simulator shares the Mac's network stack, so there loopback IS the
+// development backend. Filtering it out unconditionally broke the one setup
+// where pointing at localhost is the correct thing to do.
+check(BackendResolution.isUsableFromPhone("http://localhost:8787", allowingLoopback: true),
+      "on the simulator, localhost is the dev Mac and is allowed")
+check(BackendResolution.candidates(configured: "", productionDefault: "http://localhost:8787", discovered: "",
+                                   allowingLoopback: true)
+      == ["http://localhost:8787"],
+      "so a simulator build still has its default backend to try")
+check(BackendResolution.isUsableFromPhone(devMac, allowingLoopback: false),
+      "a .local name is fine — that is how the Mac is meant to be found")
+check(BackendResolution.isUsableFromPhone(staleLAN, allowingLoopback: false),
+      "so is a bare LAN address")
+check(BackendResolution.candidates(configured: "", productionDefault: "http://127.0.0.1:8787", discovered: devMac,
+                                   allowingLoopback: false)
+      == [devMac],
+      "on a device, loopback is filtered out rather than tried and timed out")
+// macOS publishes 127.0.0.1 in the A record for its own .local hostname
+// alongside the real address, so resolving the backend's Bonjour record on a
+// phone really can hand back loopback.
+
+// ----------------------------------------------------------------- retry schedule
+print("\nreconnection backs off, but stays bounded:")
+check(BackendResolution.retryDelay(attempt: 0, jitter: 0.5) == BackendResolution.minimumRetryDelay,
+      "the first retry waits the floor, with neutral jitter")
+check(BackendResolution.retryDelay(attempt: 3, jitter: 0.5) > BackendResolution.retryDelay(attempt: 1, jitter: 0.5),
+      "later attempts wait longer")
+check(BackendResolution.retryDelay(attempt: 40, jitter: 0.5) <= BackendResolution.maximumRetryDelay,
+      "a phone left disconnected overnight still rechecks within the ceiling")
+check(BackendResolution.retryDelay(attempt: 40, jitter: 1.0) <= BackendResolution.maximumRetryDelay * 1.25,
+      "jitter cannot push it far past the ceiling")
+check(BackendResolution.retryDelay(attempt: 0, jitter: 0) > 0,
+      "no jitter value produces a zero delay — that would be a busy loop")
+check(BackendResolution.retryDelay(attempt: 5, jitter: -5) > 0,
+      "nor does a jitter argument out of range")
+check(BackendResolution.retryDelay(attempt: 5, jitter: 0.0) != BackendResolution.retryDelay(attempt: 5, jitter: 1.0),
+      "jitter actually varies the delay, so phones do not retry in lockstep")
+check(BackendResolution.retryDelay(attempt: -1, jitter: 0.5) == BackendResolution.minimumRetryDelay,
+      "a negative attempt count is treated as the first attempt, not as an error")
+
 print("\n\(failures == 0 ? "PASSED" : "\(failures) FAILED")")
 exit(failures == 0 ? 0 : 1)

@@ -25,6 +25,10 @@ REPO = Path(__file__).resolve().parents[1]
 PLIST_TEMPLATE = REPO / "deploy" / "launchd" / "com.sensordyme.backend.plist.template"
 INSTALL_SCRIPT = REPO / "scripts" / "install_backend_mac.sh"
 
+#: What the agent binds so the phone can reach it; named to keep the linter from
+#: reading a test fixture as a real bind-to-the-world.
+_ANY_INTERFACE = "0.0.0.0"  # noqa: S104
+
 
 class TestLaunchdPlist:
     def _load(self) -> dict:
@@ -121,3 +125,106 @@ class TestDiagnoseBackend:
         assert diag.check("thing", False, "detail") is False
         out = capsys.readouterr().out
         assert "✓" in out and "✗" in out
+
+
+class TestAgentActuallyStartsTheBackend:
+    """`launchd_status` answers "is the job running", which is a different
+    question from "is the job the backend" — and the two were reported as if they
+    were the same.
+
+    What happened: the installed plist was hand-edited to run `main.py`, the
+    camera/detector entrypoint, instead of `uvicorn cloud.app:app`. The uvicorn
+    process started before that edit was still alive, so the port was open,
+    `/v1/health` answered, launchd said "running", and every check passed — while
+    the agent was configured to start the wrong program at the next login. The
+    class of bug is "the file on disk disagrees with the file in the repo", and
+    only comparing them catches it.
+    """
+
+    def _write(self, tmp_path, monkeypatch, program_args, env=None):
+        plist = tmp_path / "com.sensordyme.backend.plist"
+        payload: dict = {"ProgramArguments": program_args}
+        if env is not None:
+            payload["EnvironmentVariables"] = env
+        plist.write_bytes(plistlib.dumps(payload))
+        monkeypatch.setattr(diag, "INSTALLED_PLIST", plist)
+        return plist
+
+    def test_missing_agent_is_reported_as_missing(self, tmp_path, monkeypatch):
+        monkeypatch.setattr(diag, "INSTALLED_PLIST", tmp_path / "absent.plist")
+        ok, detail = diag.launchd_runs_the_backend()
+        assert ok is False
+        assert "install_backend_mac.sh" in detail
+
+    def test_an_agent_running_uvicorn_against_the_app_passes(self, tmp_path, monkeypatch):
+        self._write(tmp_path, monkeypatch, [
+            "/repo/.venv/bin/uvicorn", "cloud.app:app", "--host", _ANY_INTERFACE, "--port", "8787",
+        ], env={"SENSORDYME_PORT": "8787"})
+        ok, _ = diag.launchd_runs_the_backend()
+        assert ok is True
+
+    def test_an_agent_running_the_detector_is_caught(self, tmp_path, monkeypatch):
+        """The exact drift that was live on the dev Mac."""
+        self._write(tmp_path, monkeypatch, ["/repo/.venv/bin/python", "/repo/main.py"])
+        ok, detail = diag.launchd_runs_the_backend()
+        assert ok is False
+        assert "does NOT start the backend" in detail
+        assert "main.py" in detail, "the detail must name what it actually runs"
+
+    def test_uvicorn_against_the_wrong_app_is_caught(self, tmp_path, monkeypatch):
+        self._write(tmp_path, monkeypatch, [
+            "/repo/.venv/bin/uvicorn", "some.other:app", "--port", "8787",
+        ])
+        ok, detail = diag.launchd_runs_the_backend()
+        assert ok is False
+        assert "not the backend app" in detail
+
+    def test_a_port_it_binds_but_does_not_announce_is_caught(self, tmp_path, monkeypatch):
+        """Announcing a port uvicorn is not on sends the app somewhere definite
+        and wrong, which is worse than not announcing at all."""
+        self._write(tmp_path, monkeypatch, [
+            "/repo/.venv/bin/uvicorn", "cloud.app:app", "--port", "9999",
+        ], env={"SENSORDYME_PORT": "8787"})
+        ok, detail = diag.launchd_runs_the_backend()
+        assert ok is False
+        assert "9999" in detail and "8787" in detail
+
+    def test_a_corrupt_plist_is_a_finding_not_a_crash(self, tmp_path, monkeypatch):
+        plist = tmp_path / "com.sensordyme.backend.plist"
+        plist.write_bytes(b"this is not a plist")
+        monkeypatch.setattr(diag, "INSTALLED_PLIST", plist)
+        ok, detail = diag.launchd_runs_the_backend()
+        assert ok is False
+        assert "could not read" in detail
+
+    def test_the_shipped_template_passes_its_own_check(self, tmp_path, monkeypatch):
+        """Whatever the check demands, the template this repo installs must satisfy
+        — otherwise a correct install reports itself as broken."""
+        filled = PLIST_TEMPLATE.read_text().replace("__REPO_DIR__", "/tmp/sensordyme-test")
+        plist = tmp_path / "com.sensordyme.backend.plist"
+        plist.write_bytes(plistlib.dumps(plistlib.loads(filled.encode())))
+        monkeypatch.setattr(diag, "INSTALLED_PLIST", plist)
+        ok, detail = diag.launchd_runs_the_backend()
+        assert ok is True, detail
+
+
+class TestInstallScriptVerifiesWhatItWrote:
+    def _text(self) -> str:
+        return INSTALL_SCRIPT.read_text()
+
+    def test_it_checks_the_plist_it_wrote_starts_the_backend(self):
+        assert "cloud.app:app" in self._text()
+
+    def test_it_backs_up_an_existing_agent_before_replacing_it(self):
+        """This script is the documented repair for a hand-edited plist, so the
+        edit it replaces should be recoverable rather than simply gone."""
+        assert "replaced-" in self._text()
+
+    def test_it_refuses_when_another_process_holds_the_port(self):
+        text = self._text()
+        assert "lsof" in text and "8787" in text
+
+    def test_it_offers_a_restart_command(self):
+        """Restarting is how a moved backend re-announces itself, so the command
+        for it belongs where someone will find it."""
+        assert "kickstart" in self._text()

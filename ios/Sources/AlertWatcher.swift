@@ -51,6 +51,15 @@ final class AlertWatcher: ObservableObject {
         await notifier.refreshAuthorization()
         guard notifier.authorized, state.isSignedIn else { return }
 
+        // Don't poll into a backend that is known not to be there. Each attempt
+        // otherwise costs a 15-second request timeout plus a Bonjour search, so a
+        // 15-second loop against an absent server never stops working — it just
+        // runs continuously, draining the battery to rediscover the same absence.
+        //
+        // Nothing is lost by waiting: AppState is already retrying on its own
+        // schedule, and the moment it reconnects this resumes on the next tick.
+        guard case .connected = state.backendStatus else { return }
+
         // A failed poll is silent on purpose. The backend being briefly
         // unreachable is normal — the phone changes network, the Mac sleeps —
         // and surfacing it here would put an error in front of someone who did
