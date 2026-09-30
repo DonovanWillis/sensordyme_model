@@ -9,6 +9,12 @@ import SwiftUI
 /// whether their camera works, not how networking does.
 struct DeviceLinkBanner: View {
     @ObservedObject var link: DeviceLink
+    /// What the backend says about this device, when the device list has loaded.
+    ///
+    /// Nil means the backend could not be asked — which is itself worth saying,
+    /// rather than guessing at the device's state from Bonjour alone.
+    var backendDevice: Device?
+    var backendReachable: Bool = true
 
     var body: some View {
         switch link.state {
@@ -18,10 +24,12 @@ struct DeviceLinkBanner: View {
             row(icon: "antenna.radiowaves.left.and.right", tint: SD.Colors.textSecondary,
                 title: "Looking for your device…", detail: nil, action: nil)
         case .notFound:
-            row(icon: "wifi.exclamationmark", tint: SD.Colors.warning,
-                title: "Can't find your device",
-                detail: "It may be switched off, on a different Wi-Fi network, or somewhere else. SensorDyme finds it automatically once you're both on the same network.",
-                action: "Search again")
+            // Bonjour found nothing, which on its own says only "not reachable
+            // from this phone". It used to be reported as "Can't find your
+            // device" with advice about Wi-Fi — true of the phone, and the wrong
+            // fact for a camera that had been switched off for nine days, which
+            // the backend knew all along. `DevicePresence` combines the two.
+            notFoundRow
         case .needsProvisioning:
             // Only shown when the device has been SEEN and reports no network —
             // never as a guess. Bluetooth setup needs you within a few metres of
@@ -32,6 +40,29 @@ struct DeviceLinkBanner: View {
                 detail: "Stand near your SensorDyme and set it up over Bluetooth.",
                 action: "Search again")
         }
+    }
+
+    @ViewBuilder
+    private var notFoundRow: some View {
+        let verdict = DevicePresence.verdict(
+            foundOnNetwork: false,
+            backend: backendDevice.map {
+                DevicePresence.BackendView(
+                    lastSeen: $0.lastSeen.map { Date(timeIntervalSince1970: $0) }
+                )
+            },
+            backendReachable: backendReachable,
+            now: Date()
+        )
+        row(
+            // A running device that this phone simply cannot see is not a
+            // warning about the camera, so it does not get the alarming icon.
+            icon: DevicePresence.offersLocalRetry(verdict) ? "wifi.exclamationmark" : "bolt.slash",
+            tint: SD.Colors.warning,
+            title: DevicePresence.title(verdict),
+            detail: DevicePresence.detail(verdict),
+            action: DevicePresence.offersLocalRetry(verdict) ? "Search again" : nil
+        )
     }
 
     @ViewBuilder

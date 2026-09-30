@@ -47,7 +47,14 @@ struct DevicesView: View {
                         SDSectionHeader(title: devices.count == 1 ? "Your device" : "Your devices")
                             .padding(.top, SD.Space.xxs)
                     }
-                    DeviceLinkBanner(link: link)
+                    // The backend's view of the same device, so the banner can
+                    // tell "switched off" from "not on this Wi-Fi" instead of
+                    // blaming the network for both.
+                    DeviceLinkBanner(
+                        link: link,
+                        backendDevice: devices.first,
+                        backendReachable: errorMessage == nil
+                    )
 
                     ForEach(devices) { device in
                         NavigationLink(value: device) {
