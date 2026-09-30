@@ -32,12 +32,22 @@ struct RootView: View {
                 // force-quit: iOS freezes the app's tasks, the Mac's address may
                 // have moved while it was away, and nothing re-checked on return.
                 guard phase == .active else { return }
-                if case .connected = state.backendStatus {
+                switch state.backendStatus {
+                case .connected:
                     // Confirm it is still there rather than assuming; a backend
                     // restart while suspended leaves a connection that only looks
                     // live until the next request fails.
                     Task { await state.revalidateBackend() }
-                } else {
+                case .searching:
+                    // Already looking — leave it alone. This fires on the
+                    // inactive→active transition at launch, when the root task's
+                    // resolve is only milliseconds old, and `reconnect()` cancels
+                    // whatever is in flight before starting again. So asking here
+                    // threw away the launch resolve and started a second one,
+                    // which is why a pinned address that does not answer got
+                    // probed twice before discovery ever ran.
+                    break
+                case .unreachable, .unknown:
                     state.reconnect()
                 }
             }

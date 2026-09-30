@@ -114,19 +114,22 @@ struct DiagnosticsView: View {
         }
 
         // 2. cloud reachable
-        if let url = URL(string: base)?.appendingPathComponent("v1/health") {
-            do {
-                var req = URLRequest(url: url); req.timeoutInterval = 6
-                let (_, resp) = try await URLSession.shared.data(for: req)
-                let ok = (resp as? HTTPURLResponse)?.statusCode == 200
-                results.append(.init(name: "Cloud backend reachable", passed: ok,
-                                     detail: ok ? "server answered" : "server answered with an error — is this really the SensorDyme backend?"))
-            } catch let error as URLError {
-                results.append(.init(name: "Cloud backend reachable", passed: false,
-                                     detail: APIClient.explain(error, host: URL(string: base)?.host ?? base)))
-            } catch {
-                results.append(.init(name: "Cloud backend reachable", passed: false, detail: error.localizedDescription))
-            }
+        //
+        // Through `BackendLocator.answers`, the same check the app itself uses to
+        // decide whether it is connected — not a second implementation. This used
+        // to make its own request and accept any HTTP 200, so a doctor that said
+        // "reachable" and an app that refused the same address could both be
+        // right, which is the one thing a diagnostic must never do. `answers`
+        // additionally requires the body to identify the service as ours.
+        if URL(string: base) != nil {
+            let ok = await BackendLocator.answers(base)
+            results.append(.init(
+                name: "Cloud backend reachable",
+                passed: ok,
+                detail: ok
+                    ? "answered /v1/health as the SensorDyme backend"
+                    : "nothing at \(URL(string: base)?.host ?? base) answered as the SensorDyme backend — is it running, and is this the right address?"
+            ))
         } else {
             results.append(.init(name: "Cloud backend reachable", passed: nil, detail: "skipped — no valid backend address"))
         }

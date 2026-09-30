@@ -260,6 +260,9 @@ final class AppState: ObservableObject {
     /// Watches for the phone changing network, so a move is noticed rather than
     /// waited out.
     private var pathMonitor: NWPathMonitor?
+    /// The network path last seen, so the monitor can tell a real change from its
+    /// own first report. Same approach as `DeviceLink.lastPathID`.
+    private var lastPathID: String?
     /// Explains an involuntary sign-out on the auth screen, so a rotated server
     /// secret or an expired token doesn't just silently dump the user to login.
     @Published var signOutNotice: String?
@@ -430,8 +433,10 @@ final class AppState: ObservableObject {
         // this, launch alone starts several: the sign-in screen, the alert
         // watcher, and every request that fails over.
         if let existing = resolveTask {
+            Self.log.debug("joining the in-flight resolve")
             return await existing.value
         }
+        Self.log.debug("starting a resolve")
 
         let task = Task { @MainActor [weak self] () -> String? in
             guard let self else { return nil }
@@ -574,8 +579,14 @@ final class AppState: ObservableObject {
             reconnect()
             return
         }
-        if await BackendLocator.answers(confirmedBaseURL) {
-            backendStatus = .connected(confirmedBaseURL)
+        let address = confirmedBaseURL
+        if await BackendLocator.answers(address) {
+            backendStatus = .connected(address)
+            // Logged even though nothing changed: a silent success is
+            // indistinguishable from this never having run, which made the
+            // return-from-background path impossible to verify — the only
+            // evidence was the heartbeat's next tick shifting.
+            Self.log.info("revalidated on foreground; still connected at \(address, privacy: .public)")
             return
         }
         Self.log.info("the confirmed backend stopped answering; re-resolving")
@@ -612,14 +623,22 @@ final class AppState: ObservableObject {
         monitor.pathUpdateHandler = { [weak self] path in
             Task { @MainActor in
                 guard let self else { return }
+                let current = Self.fingerprint(path)
+                defer { self.lastPathID = current }
                 // Only when there is a network to look on. Reconnecting while the
                 // phone has no route just burns the backoff schedule.
                 guard path.status == .satisfied else {
                     self.backendStatus = .unreachable("No network connection. Check the phone's Wi-Fi.")
                     return
                 }
-                // The interface changed, so an address confirmed on the previous
-                // one says nothing about this one.
+                // NWPathMonitor reports the CURRENT path as soon as it starts, and
+                // that first report is not a change. Acting on it made launch do
+                // the work twice: the resolve started just below was cancelled and
+                // restarted, so a dead pinned address was probed twice and launch
+                // paid an extra connection timeout for nothing.
+                guard let previous = self.lastPathID, previous != current else { return }
+                // The interface really did change, so an address confirmed on the
+                // previous one says nothing about this one.
                 Self.log.info("network path changed; re-resolving the backend")
                 self.reconnect()
             }
@@ -628,9 +647,21 @@ final class AppState: ObservableObject {
         Task { await resolveBackend() }
     }
 
+    /// What identifies a network path for "did it change" purposes.
+    ///
+    /// Status plus the available interfaces. Not the assigned address: a renewed
+    /// DHCP lease on the same Wi-Fi is handled by the health check failing and the
+    /// resolver running again, and treating every address change as an interface
+    /// change would re-browse on routine lease renewals.
+    private static func fingerprint(_ path: NWPath) -> String {
+        let interfaces = path.availableInterfaces.map(\.name).sorted().joined(separator: ",")
+        return "\(path.status)-\(interfaces)"
+    }
+
     func stopBackendMonitoring() {
         pathMonitor?.cancel()
         pathMonitor = nil
+        lastPathID = nil
         heartbeatTask?.cancel()
         heartbeatTask = nil
         retryTask?.cancel()

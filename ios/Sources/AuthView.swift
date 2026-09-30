@@ -108,9 +108,12 @@ struct AuthView: View {
             }
         }
         .tint(SD.Colors.accent)
-        // Look for the server while the user is still typing, so signing in is
-        // usually instant rather than paying for the search after the tap.
-        .task { await state.ensureBackend() }
+        // No search kicked off here any more. The server is already being looked
+        // for before this screen appears — `startBackendMonitoring()` runs on the
+        // root view and keeps resolving on its own schedule — so asking again from
+        // here was a second launch-time resolve that raced the first rather than
+        // joining it, and a pinned address that does not answer got probed twice
+        // before discovery ever ran.
     }
 
     private var credentialsCard: some View {
