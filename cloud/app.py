@@ -34,7 +34,7 @@ from typing import Optional
 
 import jwt
 from fastapi import BackgroundTasks, Depends, FastAPI, Header, HTTPException, Request
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 
 from cloud import mdns
 from cloud.notify import COOLDOWN_S as NOTIFY_COOLDOWN_S
@@ -721,9 +721,37 @@ def _notification_detail(e: dict) -> str:
 
 
 # ------------------------------------------------------------------------- schemas
+#
+# Upper bounds on the fields whose size costs the server real work. Not
+# decoration: each of these had a floor ("at least 8 characters", "must be
+# non-empty") and no ceiling, so the expensive direction was the unguarded one.
+#
+# Every limit here is far above any legitimate value, so no real request is
+# rejected — the point is to bound the worst case, not to police input. Pydantic
+# answers an over-long field with a 422 naming it, before the handler runs.
+#
+#: PBKDF2 runs 200_000 iterations synchronously on a threadpool worker, on both
+#: signup and login. The per-IP limiter bounds one source; nothing bounded the
+#: cost of a single attempt. No real password is near this.
+MAX_PASSWORD_LEN = 1024
+#: RFC 5321's maximum forward-path length.
+MAX_EMAIL_LEN = 320
+#: Goes straight to a language model, on an authenticated endpoint with no rate
+#: limit of its own, so length is token spend.
+MAX_AI_PROMPT_LEN = 4000
+#: The device's own outbound queue is bounded at 500 events, so this cannot
+#: reject a legitimate batch even when that queue is completely full. Set well
+#: above it deliberately: core/uplink.py re-queues any non-200 and retries the
+#: identical batch, so a cap a real device could hit would not shed load — it
+#: would produce a permanent retry loop.
+MAX_INGEST_EVENTS = 1000
+#: Zones are drawn by hand on a phone screen.
+MAX_ZONES = 64
+
+
 class Credentials(BaseModel):
-    email: str
-    password: str
+    email: str = Field(max_length=MAX_EMAIL_LEN)
+    password: str = Field(max_length=MAX_PASSWORD_LEN)
 
 
 class ClaimBody(BaseModel):
@@ -753,11 +781,11 @@ class RenameBody(BaseModel):
 
 
 class ZonesBody(BaseModel):
-    zones: list[dict] = []
+    zones: list[dict] = Field(default=[], max_length=MAX_ZONES)
 
 
 class IngestBody(BaseModel):
-    events: list[dict] = []
+    events: list[dict] = Field(default=[], max_length=MAX_INGEST_EVENTS)
     active_preset: Optional[str] = None
     # The device's own view of its camera, inference, accelerator and network.
     health: Optional[dict] = None
@@ -772,7 +800,7 @@ class IngestBody(BaseModel):
 
 class AIConfigureBody(BaseModel):
     device_id: int
-    prompt: str
+    prompt: str = Field(max_length=MAX_AI_PROMPT_LEN)
 
 
 # ------------------------------------------------------------------------- user API

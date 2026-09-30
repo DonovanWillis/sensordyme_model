@@ -2,11 +2,14 @@
 
 import importlib
 import sys
+from pathlib import Path
 
 import pytest
 
 pytest.importorskip("fastapi")  # backend deps are dev/cloud-only, not installed on the Pi
 from fastapi.testclient import TestClient
+
+REPO = Path(__file__).resolve().parents[1]
 
 
 @pytest.fixture()
@@ -1276,3 +1279,233 @@ class TestAIConfigureWritesOnlyToADeviceYouOwn:
                 "SELECT ai_rules_draft FROM devices WHERE id = ?", (device_id,)
             ).fetchone()["ai_rules_draft"]
         assert draft is not None and "rules" in draft
+
+
+class TestRequestSizeIsBounded:
+    """Every one of these fields had a floor and no ceiling.
+
+    "at least 8 characters", "must not be empty", "valid E.164" — the cheap
+    direction was checked and the expensive one was not. A password is 200_000
+    PBKDF2 iterations on a threadpool worker; a prompt is language-model tokens on
+    an authenticated endpoint with no rate limit of its own.
+
+    The limits are set far above any legitimate value, so the tests below assert
+    both halves: the cap rejects the absurd, and a realistic request still works.
+    """
+
+    def _token(self, client, email="caps@example.com"):
+        client.post("/v1/signup", json={"email": email, "password": "supersecret1"})
+        return client.post(
+            "/v1/login", json={"email": email, "password": "supersecret1"}
+        ).json()["token"]
+
+    # ------------------------------------------------------------------ passwords
+    def test_an_absurd_password_is_rejected_before_hashing(self, backend):
+        app_module, client = backend
+        resp = client.post("/v1/signup", json={
+            "email": "huge@example.com",
+            "password": "x" * (app_module.MAX_PASSWORD_LEN + 1),
+        })
+        assert resp.status_code == 422
+
+    def test_a_long_but_realistic_passphrase_still_works(self, backend):
+        """A cap that rejects a real password-manager passphrase would be a bug
+        of its own."""
+        _, client = backend
+        passphrase = "correct horse battery staple " * 4  # 116 chars
+        assert client.post("/v1/signup", json={
+            "email": "phrase@example.com", "password": passphrase,
+        }).status_code == 200
+        assert client.post("/v1/login", json={
+            "email": "phrase@example.com", "password": passphrase,
+        }).status_code == 200
+
+    def test_the_short_password_rule_is_unchanged(self, backend):
+        """The floor must still be a 400 with its own message, not a 422."""
+        _, client = backend
+        resp = client.post("/v1/signup", json={"email": "s@example.com", "password": "short"})
+        assert resp.status_code == 400
+        assert "8+" in resp.json()["detail"]
+
+    def test_an_absurd_email_is_rejected(self, backend):
+        app_module, client = backend
+        resp = client.post("/v1/signup", json={
+            "email": "a" * (app_module.MAX_EMAIL_LEN + 1) + "@example.com",
+            "password": "supersecret1",
+        })
+        assert resp.status_code == 422
+
+    # -------------------------------------------------------------------- prompts
+    def test_an_absurd_ai_prompt_is_rejected_before_the_model_is_called(self, backend):
+        app_module, client = backend
+        token = self._token(client, "prompt@example.com")
+        with app_module.db() as conn:
+            conn.execute(
+                "INSERT INTO devices (name, claim_code, device_key, owner_id, created_at)"
+                " VALUES ('cam', 'P1', 'dk_p1', 1, 0)"
+            )
+            device_id = conn.execute("SELECT id FROM devices WHERE claim_code='P1'").fetchone()["id"]
+
+        resp = client.post("/v1/ai/configure", json={
+            "device_id": device_id, "prompt": "x" * (app_module.MAX_AI_PROMPT_LEN + 1),
+        }, headers={"Authorization": f"Bearer {token}"})
+
+        assert resp.status_code == 422
+
+    def test_a_wordy_but_reasonable_prompt_still_works(self, backend):
+        app_module, client = backend
+        token = self._token(client, "wordy@example.com")
+        with app_module.db() as conn:
+            conn.execute(
+                "INSERT INTO devices (name, claim_code, device_key, owner_id, created_at)"
+                " VALUES ('cam', 'P2', 'dk_p2', 1, 0)"
+            )
+            device_id = conn.execute("SELECT id FROM devices WHERE claim_code='P2'").fetchone()["id"]
+
+        prompt = "Tell me when someone falls over in the living room. " * 20  # ~1040 chars
+        resp = client.post("/v1/ai/configure", json={"device_id": device_id, "prompt": prompt},
+                           headers={"Authorization": f"Bearer {token}"})
+        assert resp.status_code == 200, resp.text
+
+    # --------------------------------------------------------------------- ingest
+    def test_an_absurd_event_batch_is_rejected(self, backend):
+        app_module, client = backend
+        with app_module.db() as conn:
+            conn.execute(
+                "INSERT INTO devices (name, claim_code, device_key, created_at)"
+                " VALUES ('cam', 'I1', 'dk_i1', 0)"
+            )
+        events = [{"type": "fall", "timestamp": "2026-01-01T00:00:00"}] * (app_module.MAX_INGEST_EVENTS + 1)
+        resp = client.post("/v1/ingest", json={"events": events},
+                           headers={"X-Device-Key": "dk_i1"})
+        assert resp.status_code == 422
+
+    def test_a_completely_full_device_queue_is_still_accepted(self, backend):
+        """The cap must sit ABOVE what a real device can send. core/uplink.py
+        re-queues any non-200 and retries the identical batch, so a cap a real
+        device could reach would be a permanent retry loop rather than load
+        shedding — the device's own queue is bounded at 500."""
+        app_module, client = backend
+        assert app_module.MAX_INGEST_EVENTS > 500
+        with app_module.db() as conn:
+            conn.execute(
+                "INSERT INTO devices (name, claim_code, device_key, created_at)"
+                " VALUES ('cam', 'I2', 'dk_i2', 0)"
+            )
+        events = [
+            {"type": "fall", "timestamp": f"2026-01-01T00:00:{i % 60:02d}", "event_key": f"k{i}"}
+            for i in range(500)
+        ]
+        resp = client.post("/v1/ingest", json={"events": events},
+                           headers={"X-Device-Key": "dk_i2"})
+        assert resp.status_code == 200, resp.text
+
+    def test_an_absurd_zone_list_is_rejected(self, backend):
+        app_module, client = backend
+        token = self._token(client, "zones@example.com")
+        with app_module.db() as conn:
+            conn.execute(
+                "INSERT INTO devices (name, claim_code, device_key, owner_id, created_at)"
+                " VALUES ('cam', 'Z1', 'dk_z1', 1, 0)"
+            )
+            device_id = conn.execute("SELECT id FROM devices WHERE claim_code='Z1'").fetchone()["id"]
+        zones = [{"name": f"z{i}", "points": [[0, 0], [1, 0], [1, 1]]} for i in range(app_module.MAX_ZONES + 1)]
+        resp = client.post(f"/v1/devices/{device_id}/zones", json={"zones": zones},
+                           headers={"Authorization": f"Bearer {token}"})
+        assert resp.status_code == 422
+
+
+class TestAIProposalMatchesWhatTheAppCanDecode:
+    """`/v1/ai/configure`'s response must carry every field iOS declares
+    non-optional.
+
+    `AIProposal` in ios/Sources/BackendAPI.swift is a `Codable` with seven
+    non-optional properties. A missing one is not a degraded response — it is a
+    `DecodingError`, so the whole Configure-with-AI screen fails with a generic
+    message no matter how good the proposal was. Nothing else checks this: the
+    Python tests assert on the dict, the Swift tests never see the wire format,
+    and `ios/` is excluded from ruff and pyright.
+
+    Read out of the Swift source rather than restated here, so adding a
+    non-optional field on the iOS side fails this test instead of failing on a
+    phone.
+    """
+
+    IOS_BACKEND_API = REPO / "ios" / "Sources" / "BackendAPI.swift"
+
+    def _swift_required_fields(self) -> set[str]:
+        import re
+
+        source = self.IOS_BACKEND_API.read_text()
+        match = re.search(r"struct AIProposal[^{]*\{(.*?)\n\}", source, re.DOTALL)
+        assert match, "AIProposal is no longer declared as a struct in BackendAPI.swift"
+        body = match.group(1)
+        required: set[str] = set()
+        for raw in body.splitlines():
+            line = raw.split("//")[0].strip()
+            # A brace means a computed property (`var isCustom: Bool { ... }`).
+            # Those are derived on the client and never appear on the wire, so
+            # requiring them would make this test demand keys the API must not
+            # send — which is exactly what it did on the first run.
+            if "{" in line:
+                continue
+            # `let x: T` / `var x: T` — non-optional, no default, so decoding
+            # requires the key. `var x: T?` and `= default` are both fine to omit.
+            m = re.match(r"(?:let|var)\s+(\w+)\s*:\s*([^=]+)$", line)
+            if not m:
+                continue
+            name, swift_type = m.group(1), m.group(2).strip()
+            if swift_type.endswith("?"):
+                continue
+            required.add(name)
+        assert required, "parsed no required fields — has the struct's formatting changed?"
+        return required
+
+    def _proposal(self, backend, prompt: str) -> dict:
+        app_module, client = backend
+        client.post("/v1/signup", json={"email": "shape@example.com", "password": "supersecret1"})
+        token = client.post(
+            "/v1/login", json={"email": "shape@example.com", "password": "supersecret1"}
+        ).json()["token"]
+        with app_module.db() as conn:
+            conn.execute(
+                "INSERT INTO devices (name, claim_code, device_key, owner_id, created_at)"
+                " VALUES ('cam', 'S1', 'dk_s1', 1, 0)"
+            )
+            device_id = conn.execute("SELECT id FROM devices WHERE claim_code='S1'").fetchone()["id"]
+        resp = client.post("/v1/ai/configure", json={"device_id": device_id, "prompt": prompt},
+                           headers={"Authorization": f"Bearer {token}"})
+        assert resp.status_code == 200, resp.text
+        return resp.json()
+
+    @pytest.mark.parametrize("prompt", [
+        "tell me when someone falls",          # matches a preset
+        "asdfghjkl nonsense zzz",              # nothing interpretable
+        "count the giraffes in the room",      # interpretable but unsupported
+    ])
+    def test_every_field_the_app_requires_is_present(self, backend, prompt):
+        """All three outcomes, because they take different code paths and only
+        one of them was ever exercised by hand."""
+        body = self._proposal(backend, prompt)
+        missing = self._swift_required_fields() - set(body.keys())
+        assert not missing, (
+            f"/v1/ai/configure omitted {sorted(missing)}, which AIProposal declares "
+            f"non-optional — the app would fail to decode the whole response"
+        )
+
+    def test_the_fields_have_the_types_the_app_expects(self, backend):
+        """A String where the app wants a String. `null` decodes no better than a
+        missing key for a non-optional property."""
+        body = self._proposal(backend, "tell me when someone falls")
+        for key in ("preset", "variant", "explanation", "source"):
+            assert isinstance(body[key], str), f"{key} is {type(body[key]).__name__}, not a string"
+        assert isinstance(body["rules"], list)
+        assert isinstance(body["settings"], dict)
+        assert isinstance(body["unsupported"], list)
+
+    def test_the_only_source_value_the_app_branches_on_is_still_emitted(self, backend):
+        """AIConfigureView shows its "no model configured" state on
+        `source == "unavailable"` and nothing else, so that exact string is a
+        contract rather than a label."""
+        body = self._proposal(backend, "asdfghjkl nonsense zzz")
+        assert body["source"] == "unavailable"

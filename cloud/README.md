@@ -35,7 +35,9 @@ stops it.
 
 That binds loopback only, which is right for the simulator. A real phone needs the
 Mac's LAN address, so bind all interfaces — and once the port is reachable from the
-network, sign tokens with a real secret instead of the dev default in `app.py`:
+network, bind all interfaces. (Token signing needs nothing from you: there is no
+longer a dev default to replace — `_load_jwt_secret` generates a secret on first
+start and persists it beside the database, so sessions survive restarts.)
 
 ```bash
 mkdir -p .secrets && openssl rand -hex 32 > .secrets/jwt_secret   # once; gitignored
@@ -54,7 +56,7 @@ Two environment variables shape the announcement:
 
 | Variable | Default | Why you would set it |
 | --- | --- | --- |
-| `SENSORDYME_PORT` | `8787` | uvicorn owns the real port and does not tell the app which one it chose. **Run on a non-default port and you must set this too** — announcing the wrong port is worse than not announcing, because it sends the app somewhere definite and wrong. |
+| `SENSORDYME_PORT` | `8787` | uvicorn owns the real port and does not tell the app which one it chose. **Run on a non-default port and you must set this too** — announcing the wrong port is worse than not announcing, because it sends the app somewhere definite and wrong. The server now checks a couple of seconds after startup whether anything is listening on the port it announced, and logs a warning naming the mismatch if not, so this is no longer a silent failure. |
 | `SENSORDYME_MDNS` | `1` | Set to `0` on a deployed server, where announcing to the datacentre LAN is pointless. |
 
 Announcing is best-effort: if `zeroconf` is missing or the network refuses, the
@@ -134,8 +136,13 @@ it here — iOS trusts it with no app changes, and the device keeps
 
 ```bash
 export SENSORDYME_DB=/data/sensordyme.db
-uvicorn cloud.app:app --host 0.0.0.0 --port 8787
+uvicorn cloud.app:app --host 0.0.0.0 --port 8080
 ```
+
+Port 8080 here, not the 8787 used for local development: `cloud/Dockerfile` and
+`fly.toml`'s `internal_port` both use 8080, and `tests/test_deployment.py` pins
+them to agree. This snippet said 8787 and so contradicted the two files it is
+describing.
 
 ### Fly.io, first time
 

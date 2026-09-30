@@ -102,7 +102,17 @@ struct AIProposal: Codable, Equatable {
     var rules: [AIRule]
     let settings: [String: String]
     let unsupported: [AIUnsupported]
-    let source: String        // "claude" | "unavailable" | "demo" — shown so demos are honest
+    /// Where the proposal came from, so the UI never implies a model was
+    /// consulted when it was not. The values the backend actually emits are
+    /// `"jupiter"` (the local model interpreted the request), `"fallback"`
+    /// (keyword matching, because no model was reachable but the request still
+    /// matched a known preset), `"unavailable"` (nothing could be interpreted —
+    /// the only value the UI branches on) and `"demo"` from MockAPI.
+    ///
+    /// The list here previously said `"claude" | "unavailable" | "demo"`, which
+    /// predates the move to Jupiter and omitted `"fallback"` entirely — the value
+    /// most proposals carry on a backend with no model running.
+    let source: String
     var mode: String?         // "custom" | "preset"
     var jupiter: AIJupiterMeta? = nil
 
