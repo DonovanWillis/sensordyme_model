@@ -64,8 +64,12 @@ final class AlertNotifier: NSObject, ObservableObject {
     private var announced: Set<Int> {
         get { Set(UserDefaults.standard.array(forKey: "announcedEvents") as? [Int] ?? []) }
         set {
-            // Bounded: the tail is old enough that it can never re-arrive.
-            UserDefaults.standard.set(Array(newValue.suffix(500)), forKey: "announcedEvents")
+            // Bounded to the NEWEST ids. `newValue.suffix(500)` was the obvious
+            // spelling and the wrong one: a Set has no order, so it kept an
+            // arbitrary 500 and could drop an id announced seconds ago — which the
+            // next poll then re-announces as a duplicate. See
+            // NotificationPolicy.trimAnnounced.
+            UserDefaults.standard.set(NotificationPolicy.trimAnnounced(newValue), forKey: "announcedEvents")
         }
     }
 

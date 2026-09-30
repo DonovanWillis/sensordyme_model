@@ -76,5 +76,35 @@ if case .suppress(.withinCooldown) = decide(critical: false, configured: true, a
     print("  FAIL configured rules must not bypass the cooldown — one policy, no per-source exceptions"); failures += 1
 }
 
+// ------------------------------------------- bounding the announced-events list
+print("\nthe announced list keeps the NEWEST ids, so nothing is re-announced:")
+// The bug: this was `Set.suffix(500)`. A Set has no order, so that kept an
+// arbitrary 500 — and an evicted id is one the next poll no longer recognises,
+// so it gets announced a second time. Only shows up past a few hundred events.
+let many = Set(1...600)
+let kept = NotificationPolicy.trimAnnounced(many, limit: 500)
+check(kept.count == 500, "trims to the limit")
+check(kept.contains(600), "the newest id is kept")
+check(kept.contains(599) && kept.contains(560), "so are the ones just before it")
+check(!kept.contains(1) && !kept.contains(100), "the oldest ids are the ones dropped")
+check(kept.max() == 600 && kept.min() == 101, "exactly the newest 500, nothing arbitrary")
+check(kept == kept.sorted(), "stored in ascending order, so the next trim is stable")
+
+check(NotificationPolicy.trimAnnounced([], limit: 500) == [], "an empty set stays empty")
+check(NotificationPolicy.trimAnnounced([7, 3, 9], limit: 500).sorted() == [3, 7, 9],
+      "under the limit, everything is kept")
+check(NotificationPolicy.trimAnnounced(Set(1...10), limit: 3) == [8, 9, 10],
+      "a small limit still keeps the newest, not the first found")
+check(NotificationPolicy.trimAnnounced(Set(1...10), limit: 0) == [],
+      "a zero limit is not a crash")
+check(NotificationPolicy.trimAnnounced(Set(1...10), limit: -5) == [],
+      "nor is a negative one")
+// The property that actually matters: an id announced this instant survives.
+let justAnnounced = 100_000
+var big = Set(1...900)
+big.insert(justAnnounced)
+check(NotificationPolicy.trimAnnounced(big, limit: 500).contains(justAnnounced),
+      "an id announced a moment ago is never the one evicted")
+
 print("\n\(failures == 0 ? "PASSED" : "\(failures) FAILED")")
 exit(failures == 0 ? 0 : 1)

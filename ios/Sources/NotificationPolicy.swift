@@ -63,4 +63,32 @@ enum NotificationPolicy {
         }
         return .notify
     }
+
+    /// How many announced event ids to remember.
+    ///
+    /// The list exists only to stop the poller re-announcing what it already
+    /// announced, so it needs to cover the window an event can still be returned
+    /// in — the app asks for the newest 25-200 events — with a wide margin, not
+    /// the whole history.
+    static let announcedHistoryLimit = 500
+
+    /// The ids worth keeping out of everything announced so far.
+    ///
+    /// Keeps the NEWEST ids, and that is the whole point. This was
+    /// `Set.suffix(500)`, which looks like "keep the most recent 500" and is not:
+    /// `Set` has no order, so `suffix` returns 500 elements in whatever order the
+    /// hash table happens to iterate. Past 500 events the ids retained were
+    /// arbitrary, so a *just-announced* alert could be evicted while an ancient
+    /// one was kept — and an evicted id is one the next poll no longer recognises,
+    /// so it announces it again. That is a duplicate alert for an event the user
+    /// was already told about, appearing only on accounts with a few hundred
+    /// events, which is why it would not show up early.
+    ///
+    /// Event ids are monotonic (sqlite AUTOINCREMENT), so "newest" is "largest"
+    /// and no timestamp is needed.
+    static func trimAnnounced(_ ids: Set<Int>, limit: Int = announcedHistoryLimit) -> [Int] {
+        guard limit > 0 else { return [] }
+        guard ids.count > limit else { return ids.sorted() }
+        return ids.sorted().suffix(limit)
+    }
 }

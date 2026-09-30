@@ -123,6 +123,9 @@ struct MJPEGView: View {
     let url: URL
     @EnvironmentObject private var state: AppState
     @StateObject private var reader = MJPEGReader()
+    /// Backgrounding does not remove this view, so `onDisappear` never fires for
+    /// it — the stream has to be released here instead. See the handler below.
+    @Environment(\.scenePhase) private var scenePhase
     /// Used only to re-discover the device's current address when the stored one
     /// stops answering. A second instance is safe and deliberate: DeviceLink's
     /// state lives entirely in @AppStorage (the device's identity and its cached
@@ -185,6 +188,35 @@ struct MJPEGView: View {
             reader.start(base: url.absoluteString, token: state.deviceToken)
         }
         .onDisappear { reader.stop() }
+        // Backgrounding is not `onDisappear`. The view stays in the hierarchy when
+        // the app leaves the foreground, so the MJPEG connection stayed open for a
+        // feed nobody could see — and on the device that is not merely untidy:
+        // `has_viewers()` is what makes the inference loop annotate and JPEG-encode
+        // at all (see core/dashboard.py), so a held viewer slot spends Pi CPU that
+        // the detector needs, for as long as iOS leaves the socket alive. It also
+        // spends the phone's battery and data pulling frames at 12fps.
+        //
+        // Stopping on background and starting again on return costs one reconnect,
+        // which the reader already does routinely and shows as a brief spinner.
+        // Only `.background`, deliberately not `.inactive`: inactive is also the
+        // app switcher, Control Centre and an incoming-call banner, and tearing
+        // the stream down for a swipe the user immediately reverses would be a
+        // visible stutter for no saving.
+        .onChange(of: scenePhase) { _, phase in
+            switch phase {
+            case .background:
+                reader.stop()
+            case .active:
+                // start() is a no-op when the target is unchanged and the stream is
+                // already healthy, so returning from a brief `.inactive` does not
+                // restart anything.
+                reader.start(base: url.absoluteString, token: state.deviceToken)
+            case .inactive:
+                break
+            @unknown default:
+                break
+            }
+        }
         // The address and the token are both editable in Settings while this view
         // is on screen, and discovery can re-point the device at a new address at
         // any moment. Without these the reader kept streaming from — or endlessly

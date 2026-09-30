@@ -110,9 +110,38 @@ async def _lifespan(_app: FastAPI):
     # started but answering nothing, so it goes to a thread.
     if advertiser is not None:
         await asyncio.to_thread(advertiser.start)
+
+    # Confirm, shortly after startup, that the port being announced is the port
+    # the server is actually on. An advertised port nothing listens on sends the
+    # app somewhere definite and wrong, which is worse than not advertising at
+    # all. The usual cause: launching without `--port`, so uvicorn binds its own
+    # default 8000 while SENSORDYME_PORT still says 8787.
+    #
+    # Deferred rather than checked inline, because uvicorn binds the socket AFTER
+    # lifespan startup finishes — a check here would always find nothing and cry
+    # wolf on every boot. Warn only; the server itself is fine either way.
+    async def _warn_if_announcing_the_wrong_port(port: int) -> None:
+        await asyncio.sleep(2)
+        if not await asyncio.to_thread(mdns.verify_advertised_port, port):
+            log.warning(
+                "announcing port %d, but nothing is listening there — the app "
+                "will be sent to a port this server is not on. Pass --port %d, "
+                "or set SENSORDYME_PORT to the port uvicorn actually bound.",
+                port, port,
+            )
+
+    port_check = (
+        asyncio.create_task(_warn_if_announcing_the_wrong_port(advertiser.port))
+        if advertiser is not None
+        else None
+    )
     try:
         yield
     finally:
+        # Cancelled first: a shutdown inside the 2-second window must not leave a
+        # task probing a port the server has already released.
+        if port_check is not None:
+            port_check.cancel()
         if advertiser is not None:
             await asyncio.to_thread(advertiser.stop)
 

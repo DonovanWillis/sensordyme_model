@@ -345,6 +345,33 @@ def advertised_port() -> int:
         return DEFAULT_PORT
 
 
+def verify_advertised_port(port: int, timeout: float = 0.5) -> bool:
+    """Is anything actually listening on the port we just told the network about?
+
+    uvicorn owns the real port and never tells the application which one it chose,
+    so `advertised_port()` is a *claim* read from the environment. When the two
+    disagree the failure is silent and total: the phone gets a definite address,
+    connects to nothing, and reports the server as down — worse than never having
+    advertised, which is what the module docstring warns about but nothing checked.
+
+    The specific trap: `SENSORDYME_PORT` defaults to 8787, but uvicorn's own
+    default is 8000. Launch `uvicorn cloud.app:app` with no `--port` and the
+    server binds 8000 while this announces 8787, confidently.
+
+    A local TCP connect, not an HTTP request: this runs during startup, so the
+    app is not serving yet and a request would deadlock. All we need to know is
+    whether the port is bound.
+    """
+    probe = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    probe.settimeout(timeout)
+    try:
+        return probe.connect_ex(("127.0.0.1", port)) == 0
+    except OSError:
+        return False
+    finally:
+        probe.close()
+
+
 def enabled() -> bool:
     """Off switch for deployments where announcing is pointless or unwanted."""
     return os.environ.get("SENSORDYME_MDNS", "1").strip().lower() not in {"0", "false", "no", "off"}
