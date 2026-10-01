@@ -63,6 +63,39 @@ enum MJPEGStreamState: Equatable {
     /// True while a picture may still be on screen and correct.
     var isShowingLiveVideo: Bool { self == .streaming }
 
+    /// What to show while a connection attempt is actually in flight.
+    ///
+    /// This exists because "connecting…" was shown for every attempt, including
+    /// the twentieth, which made a fully diagnosed failure look like an
+    /// indefinite connect. The arithmetic is the whole problem: a stale device
+    /// address on a network that blackholes it takes the full request timeout
+    /// (~16s) to fail, while the `reconnecting` state that carries the REASON is
+    /// only on screen for the retry delay (0.5s at first, 8s at the cap). So the
+    /// badge read "connecting…" for 70-97% of the time and the one state that
+    /// said *why* flashed past. The app knew the answer -- "the device didn't
+    /// answer in time" -- and threw it away every 0.5 seconds.
+    ///
+    /// An attempt after a failure is a *reconnection* attempt, and the reason the
+    /// last one failed is still the best information available, so it stays on
+    /// screen for the duration rather than being replaced by a word that implies
+    /// nothing is known yet.
+    ///
+    /// `hasImage` keeps the previous behaviour where a picture already on screen
+    /// is never covered by a badge: a brief drop mid-stream should not blank the
+    /// last good frame or shout about it.
+    static func inFlight(
+        hasImage: Bool,
+        current: MJPEGStreamState,
+        attempt: Int,
+        reason: String?
+    ) -> MJPEGStreamState {
+        if hasImage { return current }
+        // A genuine first attempt, with nothing yet known, is the only case where
+        // "connecting…" is the honest word.
+        if attempt <= 0, reason == nil { return .connecting }
+        return .reconnecting(attempt: max(attempt, 1), reason: reason)
+    }
+
     /// What to put in front of the user. Nil means "say nothing" -- a healthy
     /// stream must not carry a status badge over the video.
     var message: String? {

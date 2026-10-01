@@ -40,7 +40,12 @@ struct FeedCard: View {
             SD.Colors.canvas
             VStack(spacing: 10) {
                 Image(systemName: "video.slash.fill").font(.title).foregroundStyle(SD.Colors.textSecondary)
-                Text("Live feed streams on your home/car network.\nSet the device address in Settings.")
+                // No longer "set the device address in Settings": nobody types an
+                // address any more — the device is found over Bonjour, and the
+                // only thing a person can actually do about an empty address is
+                // get the device powered on and onto this Wi-Fi. Naming a setting
+                // that fills itself in sends someone looking for a field to edit.
+                Text("The live picture comes straight from your SensorDyme, so it needs to be switched on and on this Wi-Fi.\nSensorDyme finds it by itself.")
                     .font(.caption)
                     .multilineTextAlignment(.center)
                     .foregroundStyle(SD.Colors.textSecondary)
@@ -353,7 +358,15 @@ final class MJPEGReader: NSObject, ObservableObject, URLSessionDataDelegate {
 
         let session = URLSession(configuration: configuration, delegate: self, delegateQueue: nil)
         self.session = session
-        state = image == nil ? .connecting : state
+        // Not a bare `.connecting`: this attempt may take the full request
+        // timeout to fail, and on attempt two onwards we already know why the
+        // last one did. See MJPEGStreamState.inFlight.
+        state = MJPEGStreamState.inFlight(
+            hasImage: image != nil,
+            current: state,
+            attempt: retryAttempt,
+            reason: lastFailureReason
+        )
         session.dataTask(with: request).resume()
     }
 

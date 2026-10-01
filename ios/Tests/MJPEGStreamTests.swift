@@ -254,5 +254,81 @@ do {
           "a cancellation we caused ourselves is not reported as a fault")
 }
 
+// ------------------------------- what the badge says while an attempt is open
+print("\nan attempt in flight keeps the reason it already knows:")
+do {
+    // The bug: `connect()` set a bare `.connecting` for EVERY attempt. A stale
+    // device address on a network that blackholes it takes the full ~16s request
+    // timeout to fail, while the `reconnecting` state carrying the reason is only
+    // up for the retry delay (0.5s at first). So the badge read "connecting…" for
+    // most of every cycle and the explanation flashed past — indistinguishable,
+    // to the person watching, from a connect that never finishes.
+    let reason = "the device didn't answer in time"
+
+    check(MJPEGStreamState.inFlight(hasImage: false, current: .idle, attempt: 0, reason: nil)
+          == .connecting,
+          "a genuine first attempt with nothing known says 'connecting…'")
+
+    check(MJPEGStreamState.inFlight(hasImage: false, current: .connecting, attempt: 1, reason: reason)
+          == .reconnecting(attempt: 1, reason: reason),
+          "the second attempt keeps the reason instead of reverting to 'connecting…'")
+    check(MJPEGStreamState.inFlight(hasImage: false, current: .connecting, attempt: 7, reason: reason)
+          == .reconnecting(attempt: 7, reason: reason),
+          "and so does the eighth")
+
+    // The symptom, stated as a property: after one failure the badge must never
+    // again be the bare word that implies nothing is known.
+    check(MJPEGStreamState.inFlight(hasImage: false, current: .connecting, attempt: 1, reason: reason)
+          != .connecting,
+          "after any failure the badge is never a bare 'connecting…' again")
+    check(MJPEGStreamState.inFlight(hasImage: false, current: .connecting, attempt: 1, reason: reason)
+          .message?.contains(reason) == true,
+          "the reason is actually in the text the user reads")
+
+    check(MJPEGStreamState.inFlight(hasImage: false, current: .idle, attempt: 3, reason: nil)
+          == .reconnecting(attempt: 3, reason: nil),
+          "a retry whose cause is genuinely unknown still reports itself as a retry")
+    check(MJPEGStreamState.inFlight(hasImage: false, current: .idle, attempt: 0, reason: reason)
+          == .reconnecting(attempt: 1, reason: reason),
+          "a known reason with attempt 0 is a retry, not a first connect")
+}
+
+print("\na picture already on screen is never covered by a badge:")
+do {
+    let reason = "the device didn't answer in time"
+    check(MJPEGStreamState.inFlight(hasImage: true, current: .streaming, attempt: 0, reason: nil)
+          == .streaming,
+          "a healthy stream reconnecting in the background keeps streaming")
+    check(MJPEGStreamState.inFlight(hasImage: true, current: .streaming, attempt: 4, reason: reason)
+          == .streaming,
+          "even on a late attempt, the last good frame is not blanked")
+}
+
+print("\nthe terminal states are never turned back into a retry:")
+do {
+    // These two need a human to change a setting. Re-entering a retry state
+    // would turn a one-line settings mistake back into a permanent spinner.
+    check(!MJPEGStreamState.unauthorized(hasToken: true).isRecoverableAutomatically,
+          "a rejected token is not retried")
+    check(!MJPEGStreamState.unusableAddress.isRecoverableAutomatically,
+          "nor is an address that cannot be a URL")
+    check(MJPEGStreamState.connecting.isRecoverableAutomatically, "but connecting is")
+    check(MJPEGStreamState.reconnecting(attempt: 9, reason: "x").isRecoverableAutomatically,
+          "and so is reconnecting, however many attempts in")
+}
+
+print("\nthe timing that made this invisible, as arithmetic:")
+do {
+    // Not a tautology: it pins the relationship that produced the symptom, so if
+    // the retry cap ever grows past the request timeout, this is the place that
+    // says the ratio has changed.
+    let requestTimeout = 15.0          // MJPEGReader.idleTimeout
+    let policy = MJPEGRetryPolicy()
+    check(policy.delay(forAttempt: 0) < requestTimeout,
+          "the first retry delay is far shorter than a connection timeout")
+    check(policy.maximumDelay <= requestTimeout,
+          "even the capped delay does not exceed it — so a bare 'connecting…' would always dominate")
+}
+
 print(failures == 0 ? "\nPASSED" : "\n\(failures) FAILURE(S)")
 exit(failures == 0 ? 0 : 1)
