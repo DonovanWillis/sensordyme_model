@@ -81,6 +81,13 @@ cloud/*.db
 # JWT signing key, generated and persisted by cloud/app.py on first run.
 cloud/.jwt_secret
 
+# This backend's stable identity, generated and persisted by cloud/mdns.py on
+# first run and advertised in the mDNS TXT record. Not a secret — it identifies
+# a backend, it does not authenticate one — but it is per-machine, so committing
+# it would hand every clone the same identity and defeat the one thing it is for:
+# telling two SensorDyme backends on a network apart.
+cloud/.backend_id
+
 # launchd's log for the always-running backend (scripts/install_backend_mac.sh).
 cloud/backend.log
 
