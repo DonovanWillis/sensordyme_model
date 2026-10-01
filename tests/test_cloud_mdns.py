@@ -398,19 +398,28 @@ class TestAdvertisementStaysTrue:
         for info in fake.registered + fake.updated:
             assert info.name == original
 
-    def test_a_macos_rename_re_registers_so_the_hostname_resolves(self, fake_mdns):
-        """macOS renames a machine on a name collision (`-2` becomes `-4`). The
-        `server` field carries that name, and update_service does not revise it,
-        so this case has to be a clean re-registration or `.local` stops
-        resolving while the record still claims it works."""
+    def test_a_macos_rename_changes_nothing_because_the_name_is_ours(self, fake_mdns):
+        """This used to require a full re-registration, and that was the bug.
+
+        macOS renames a Mac on any name collision — this one went from
+        `Donovans-MacBook-Pro-2` to `-4`. The record carried that hostname in
+        `server`, so every client holding the old name was pointed at a host that
+        no longer existed. It cost ten days of a device dialling `…-Pro-2.local`
+        and being reported offline while the backend was up the whole time.
+
+        `server` is now `STABLE_HOSTNAME`, a name this backend publishes for
+        itself, so a rename is not an event the record has to survive — it simply
+        does not appear in it. The strongest form of the fix is that this test
+        asserts *nothing happens*.
+        """
         advertiser, fake, identity = fake_mdns
         identity["host"] = "mac-one-4"
 
-        assert advertiser.refresh() is True
+        assert advertiser.refresh() is False, "a rename must not disturb the record"
 
-        assert len(fake.unregistered) == 1
-        assert len(fake.registered) == 2
-        assert fake.registered[-1].server == "mac-one-4.local."
+        assert fake.unregistered == []
+        assert len(fake.registered) == 1
+        assert fake.registered[0].server == f"{mdns.STABLE_HOSTNAME}.local."
 
     def test_losing_the_network_withdraws_rather_than_lying(self, fake_mdns):
         advertiser, fake, identity = fake_mdns
@@ -458,6 +467,90 @@ class TestAdvertisementStaysTrue:
         advertiser.stop()
         identity["address"] = "192.168.4.22"
         assert advertiser.refresh() is False
+
+
+class TestStableIdentity:
+    """The service identity must be stable while the endpoint is disposable.
+
+    That sentence is the whole requirement, and the old record got it backwards:
+    the endpoint (address) was refreshed but the identity (`server`) was the OS
+    hostname — the one part nobody controls. macOS renamed the Mac and every
+    client holding the old name was pointed at nothing.
+    """
+
+    def test_the_advertised_hostname_is_one_we_own(self, fake_mdns):
+        _, fake, _ = fake_mdns
+        assert fake.registered[0].server == f"{mdns.STABLE_HOSTNAME}.local."
+
+    def test_the_advertised_hostname_does_not_contain_the_machine_name(self, fake_mdns):
+        """The specific regression: `mac-one` must not appear in the record."""
+        _, fake, identity = fake_mdns
+        assert identity["host"] not in fake.registered[0].server
+
+    def test_a_new_address_still_moves_the_record(self, fake_mdns):
+        """A stable name must not mean a frozen address — the name resolves to
+        wherever the machine currently is, so the address must still track."""
+        advertiser, fake, identity = fake_mdns
+        identity["address"] = "192.168.9.9"
+        assert advertiser.refresh() is True
+        assert _advertised_address(fake.updated[-1]) == "192.168.9.9"
+        assert fake.updated[-1].server == f"{mdns.STABLE_HOSTNAME}.local."
+
+    def test_the_stable_name_is_short_and_dns_safe(self):
+        """It becomes a DNS label, so it cannot carry dots, spaces or capitals
+        without becoming a different name than the one clients are told to use."""
+        name = mdns.STABLE_HOSTNAME
+        assert name == name.lower()
+        assert "." not in name and " " not in name and "_" not in name
+        assert 0 < len(name.encode()) <= 63  # RFC 1035 label limit
+        assert name.replace("-", "").isalnum()
+
+
+class TestBackendIdentity:
+    """Two SensorDyme backends on one network have to be distinguishable.
+
+    Without an id the app takes whichever answers its health check first, which
+    on a shared or campus network can be somebody else's Mac. The device side has
+    had `id=SD-…` for a while and the app already refuses to silently adopt a
+    different device; this is the same guarantee for the backend.
+    """
+
+    def test_the_id_is_advertised_in_the_txt_record(self, fake_mdns):
+        advertiser, fake, _ = fake_mdns
+        txt = fake.registered[0].properties
+        assert txt[b"id"].decode() == advertiser.backend_id
+
+    def test_the_id_is_stable_across_calls(self, tmp_path, monkeypatch):
+        monkeypatch.setattr(mdns, "BACKEND_ID_FILE", str(tmp_path / ".backend_id"))
+        first = mdns.backend_id()
+        assert mdns.backend_id() == first, "an identity that changes is not one"
+
+    def test_the_id_is_persisted_so_it_survives_a_restart(self, tmp_path, monkeypatch):
+        path = tmp_path / ".backend_id"
+        monkeypatch.setattr(mdns, "BACKEND_ID_FILE", str(path))
+        minted = mdns.backend_id()
+        assert path.exists() and path.read_text().strip() == minted
+
+    def test_two_backends_get_different_ids(self, tmp_path, monkeypatch):
+        monkeypatch.setattr(mdns, "BACKEND_ID_FILE", str(tmp_path / "a"))
+        a = mdns.backend_id()
+        monkeypatch.setattr(mdns, "BACKEND_ID_FILE", str(tmp_path / "b"))
+        b = mdns.backend_id()
+        assert a != b
+
+    def test_an_unwritable_location_still_yields_an_id(self, monkeypatch):
+        """Better a temporary identity than none: the backend must still start."""
+        monkeypatch.setattr(mdns, "BACKEND_ID_FILE", "/proc/definitely/not/writable")
+        assert mdns.backend_id().startswith("bk_")
+
+    def test_the_id_is_not_derived_from_a_secret(self):
+        """It identifies a backend, it does not authenticate one. Deriving it from
+        the JWT secret would leak information about the secret into a record that
+        every device on the network can read."""
+        source = (REPO / "cloud" / "mdns.py").read_text()
+        block = source[source.index("def backend_id"):source.index("def backend_id") + 1400]
+        for forbidden in ("jwt", "JWT", "secret_file", "_load_jwt"):
+            assert forbidden not in block
 
 
 class TestRefreshTimer:

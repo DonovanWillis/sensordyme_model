@@ -175,5 +175,46 @@ check(BackendResolution.retryDelay(attempt: 5, jitter: 0.0) != BackendResolution
 check(BackendResolution.retryDelay(attempt: -1, jitter: 0.5) == BackendResolution.minimumRetryDelay,
       "a negative attempt count is treated as the first attempt, not as an error")
 
+// --------------------------------------- choosing between several backends
+print("\nwhich backend, when more than one answers:")
+// The health check proves a server is *a* SensorDyme backend, not that it is
+// YOURS. On a shared flat, an office or a campus network, taking whichever
+// answered first is a coin flip between your Mac and a colleague's.
+typealias Found = BackendResolution.FoundBackend
+let mine = Found(url: "http://sensordyme-backend.local:8787", id: "bk_mine")
+let theirs = Found(url: "http://10.0.0.9:8787", id: "bk_theirs")
+let anonymous = Found(url: "http://10.0.0.7:8787", id: nil)
+
+check(BackendResolution.chooseBackend(from: [], remembering: nil) == .none,
+      "nothing found is nothing to choose")
+check(BackendResolution.chooseBackend(from: [mine], remembering: nil) == .use(mine),
+      "one backend and no memory: adopt it — this is what makes first launch need no setup")
+check(BackendResolution.chooseBackend(from: [anonymous], remembering: nil) == .use(anonymous),
+      "a backend too old to publish an id is still usable when it is the only one")
+
+check(BackendResolution.chooseBackend(from: [theirs, mine], remembering: "bk_mine") == .use(mine),
+      "a remembered id wins however the list is ordered")
+check(BackendResolution.chooseBackend(from: [mine, theirs], remembering: "bk_theirs") == .use(theirs),
+      "and it is the id that decides, not the position")
+
+// The case that matters most.
+check(BackendResolution.chooseBackend(from: [mine, theirs], remembering: nil)
+      == .ambiguous([mine, theirs]),
+      "several backends and no memory: refuse, rather than silently pick a stranger's Mac")
+check(BackendResolution.chooseBackend(from: [anonymous, theirs], remembering: nil)
+      == .ambiguous([anonymous, theirs]),
+      "several that cannot even be told apart is still a refusal, not a free choice")
+
+// Deliberately NOT a rule: "mine is missing, so take another one". A remembered
+// backend that has gone quiet is usually a Mac asleep, not a Mac replaced.
+check(BackendResolution.chooseBackend(from: [mine, theirs], remembering: "bk_gone")
+      == .ambiguous([mine, theirs]),
+      "a remembered backend being absent does not license adopting a different one")
+check(BackendResolution.chooseBackend(from: [theirs], remembering: "bk_gone") == .use(theirs),
+      "...but with only one on the network there is no ambiguity to get wrong")
+
+check(BackendResolution.chooseBackend(from: [mine], remembering: "") == .use(mine),
+      "an empty remembered id is treated as no memory, not as an id to match")
+
 print("\n\(failures == 0 ? "PASSED" : "\(failures) FAILED")")
 exit(failures == 0 ? 0 : 1)

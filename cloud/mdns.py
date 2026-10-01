@@ -25,8 +25,10 @@ from __future__ import annotations
 import contextlib
 import logging
 import os
+import secrets
 import socket
 import threading
+from pathlib import Path
 from typing import Optional
 
 # "-api", not the more obvious "-cloud": RFC 6763 caps a service name at 15 bytes
@@ -36,6 +38,68 @@ from typing import Optional
 # service iOS will not let it see, and the failure is silent on both sides.
 SERVICE_TYPE = "_sensordyme-api._tcp.local."
 DEFAULT_PORT = 8787
+
+#: The `.local` name this backend publishes for itself, and the whole point of it
+#: is that the backend OWNS it.
+#:
+#: The record used to carry the machine's own hostname, which seems like the
+#: stable thing and is not. macOS renames a Mac the moment it sees a name
+#: collision — this one went from `Donovans-MacBook-Pro-2` to `-4` — and every
+#: client holding the old name is then pointed at a host that no longer exists.
+#: It cost ten days of a device dutifully dialling `…-Pro-2.local` and being
+#: reported as offline, while the backend was up the whole time and the config
+#: had followed the documented advice to "use a name, not an IP". The name was
+#: the problem: a name assigned by the OS is not ours to depend on.
+#:
+#: A name we publish ourselves changes only when this file does. mDNS resolves it
+#: to whatever address the machine currently has, so the identity is stable and
+#: the endpoint is disposable — which is the property every client needs and none
+#: of them could get from `LocalHostName`.
+#:
+#: If two machines on one network both run this backend, zeroconf's conflict
+#: detection appends a suffix to one of them; the `id` below is what tells them
+#: apart for a client that cares.
+STABLE_HOSTNAME = "sensordyme-backend"
+
+#: Where this backend's stable identity is kept. Same approach as the JWT secret:
+#: generated once, persisted, never shipped.
+BACKEND_ID_FILE = os.environ.get(
+    "SENSORDYME_BACKEND_ID_FILE", str(Path(__file__).resolve().parent / ".backend_id")
+)
+
+
+def backend_id() -> str:
+    """A stable identifier for THIS backend, advertised in the TXT record.
+
+    Two SensorDyme backends on one network are indistinguishable without it: the
+    app would take whichever answered its health check first, which on a shared
+    or campus network can be a colleague's Mac. The device side has had an
+    identity for a while (`id=SD-…`, see scripts/publish_mdns.py) and the app
+    already refuses to silently adopt a different device; this is the same
+    guarantee for the backend.
+
+    Not a secret and deliberately not derived from one — it identifies a backend,
+    it does not authenticate it. Generated on first use and persisted so it
+    survives restarts, because an identity that changes every boot is not one.
+    """
+    path = Path(BACKEND_ID_FILE)
+    try:
+        existing = path.read_text().strip()
+        if existing:
+            return existing
+    except OSError:
+        pass
+    minted = f"bk_{secrets.token_hex(6)}"
+    try:
+        path.write_text(minted + "\n")
+    except OSError as exc:
+        # Usable but not persisted: better to advertise an identity that changes
+        # on restart than none at all, and the log says which happened.
+        log.warning(
+            "could not persist the backend id to %s (%s); using a temporary one "
+            "that will change on restart", path, exc,
+        )
+    return minted
 
 #: How often to re-check whether the address and hostname we announced are still
 #: the ones this machine has.
@@ -124,19 +188,24 @@ class Advertiser:
         self.port = port
         self.name = name or f"SensorDyme Cloud on {socket.gethostname().split('.')[0]}"
         self.refresh_interval_s = refresh_interval_s
+        #: Read once: an identity that changes while the process runs is not one.
+        self.backend_id = backend_id()
         self._zeroconf = None
         self._info = None
-        #: The address/host currently on the wire, so a refresh can tell whether
+        #: The address currently on the wire, so a refresh can tell whether
         #: anything actually changed without re-deriving it from ServiceInfo.
+        #:
+        #: Only the address: the `server` field is now a name this backend owns
+        #: (STABLE_HOSTNAME), so a machine rename no longer changes the record and
+        #: there is nothing to track about the hostname any more.
         self._address: Optional[str] = None
-        self._host: Optional[str] = None
         self._lock = threading.Lock()
         self._stopping = threading.Event()
         self._watcher: Optional[threading.Thread] = None
 
     # ----------------------------------------------------------------- internals
 
-    def _build_info(self, address: str, host: str):
+    def _build_info(self, address: str):
         from zeroconf import ServiceInfo
 
         return ServiceInfo(
@@ -144,16 +213,19 @@ class Advertiser:
             f"{self.name}.{SERVICE_TYPE}",
             addresses=[socket.inet_aton(address)],
             port=self.port,
-            # The app reads `path` to build its base URL, so the API can move
-            # without every installed copy of the app needing to be told.
-            properties={"v": "1", "path": "/", "api": "v1"},
-            server=f"{host}.local.",
+            # `path` lets the API move without every installed app being told.
+            # `id` is what distinguishes this backend from another one on the same
+            # network — see `backend_id`.
+            properties={"v": "1", "path": "/", "api": "v1", "id": self.backend_id},
+            # A name this backend owns, NOT the machine's hostname. See
+            # STABLE_HOSTNAME for the ten-day outage that distinction cost.
+            server=f"{STABLE_HOSTNAME}.local.",
         )
 
-    def _register_locked(self, address: str, host: str) -> bool:
+    def _register_locked(self, address: str) -> bool:
         """Put the record on the wire. Caller holds the lock."""
         try:
-            info = self._build_info(address, host)
+            info = self._build_info(address)
             self._zeroconf.register_service(info)  # type: ignore[union-attr]
         except Exception as exc:  # noqa: BLE001 - advertising is never worth a crash
             log.warning(
@@ -164,11 +236,11 @@ class Advertiser:
             return False
         self._info = info
         self._address = address
-        self._host = host
         log.info(
-            "announcing this server as '%s' at http://%s:%d (and http://%s.local:%d) — "
-            "the app can find it without being given an address",
-            self.name, address, self.port, host, self.port,
+            "announcing this server as '%s' (id %s) at http://%s:%d — reachable as "
+            "http://%s.local:%d, a name that survives this machine being renamed "
+            "or moved to another network",
+            self.name, self.backend_id, address, self.port, STABLE_HOSTNAME, self.port,
         )
         return True
 
@@ -182,7 +254,6 @@ class Advertiser:
                 self._zeroconf.unregister_service(self._info)
         self._info = None
         self._address = None
-        self._host = None
 
     # -------------------------------------------------------------------- public
 
@@ -193,7 +264,7 @@ class Advertiser:
         tell a no-op tick from a real correction. Never raises: a refresh that
         fails leaves the previous record in place and says so in the log.
         """
-        address, host = machine_identity()
+        address = lan_ip()
         with self._lock:
             if self._zeroconf is None:
                 return False
@@ -213,29 +284,21 @@ class Advertiser:
 
             if self._info is None:
                 log.info("a LAN address is available again (%s); re-announcing", address)
-                return self._register_locked(address, host)
+                return self._register_locked(address)
 
-            if address == self._address and host == self._host:
+            if address == self._address:
                 return False
 
-            previous_address, previous_host = self._address, self._host
-            # A changed hostname means a changed `server` record, which
-            # update_service does not revise — so that case is a clean
-            # re-registration. An address-only change (the common one: a new DHCP
-            # lease) is an update in place, which browsing clients see as the same
-            # service correcting itself rather than one leaving and another
-            # arriving.
-            if host != self._host:
-                log.info(
-                    "this machine was renamed (%s -> %s); re-announcing so the "
-                    "hostname in the record resolves again",
-                    previous_host, host,
-                )
-                self._withdraw_locked()
-                return self._register_locked(address, host)
-
+            previous_address = self._address
+            # An update in place, which browsing clients see as the same service
+            # correcting itself rather than one leaving and another arriving.
+            #
+            # A machine rename used to need a full re-registration here, because
+            # the old record carried the OS hostname in `server`. It carries
+            # STABLE_HOSTNAME now, so a rename changes nothing that is on the wire
+            # and this is the only case left: a new address.
             try:
-                info = self._build_info(address, host)
+                info = self._build_info(address)
                 self._zeroconf.update_service(info)
             except Exception as exc:  # noqa: BLE001
                 log.warning(
@@ -265,7 +328,7 @@ class Advertiser:
             )
             return False
 
-        address, host = machine_identity()
+        address = lan_ip()
         if address is None:
             log.warning(
                 "no LAN address found, so this server will not announce itself; "
@@ -288,7 +351,7 @@ class Advertiser:
                 )
                 self._zeroconf = None
                 return False
-            registered = self._register_locked(address, host)
+            registered = self._register_locked(address)
 
         if not registered:
             self.stop()

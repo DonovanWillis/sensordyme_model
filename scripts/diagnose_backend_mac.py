@@ -25,12 +25,14 @@ answer "where in the chain is this actually broken" end to end.
 
 from __future__ import annotations
 
+import os
 import subprocess
 import sys
 import time
 from pathlib import Path
-from urllib.error import URLError
-from urllib.request import urlopen
+from typing import Optional
+from urllib.error import HTTPError, URLError
+from urllib.request import Request, urlopen
 
 REPO_DIR = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(REPO_DIR))
@@ -53,14 +55,14 @@ def port_listening(port: int) -> bool:
         return False
 
 
-def http_get_json(url: str, timeout: float = 5.0):
-    with urlopen(url, timeout=timeout) as resp:  # noqa: S310 - localhost/LAN diagnostic only
+def http_get_json(url: str, timeout: float = 5.0, headers: Optional[dict] = None):
+    request = Request(url, headers=headers or {})  # noqa: S310 - localhost/LAN diagnostic only
+    with urlopen(request, timeout=timeout) as resp:  # noqa: S310
         import json
         return resp.status, json.loads(resp.read().decode())
 
 
 def launchd_status() -> tuple[bool, str]:
-    import os
     domain = f"gui/{os.getuid()}/com.sensordyme.backend"
     try:
         out = subprocess.run(
@@ -234,13 +236,32 @@ def main() -> int:
     if len(sys.argv) > 1:
         host = sys.argv[1]
         print(f"\nDevice ({host}):")
+        # The device's dashboard requires X-Device-Token. Read it from the
+        # environment so this tool can report the component states; without it we
+        # can still tell "up" from "absent", which is the question that matters.
+        token = os.environ.get("SENSORDYME_DEVICE_TOKEN", "")
+        headers = {"X-Device-Token": token} if token else {}
         try:
-            status, payload = http_get_json(f"http://{host}:8899/api/health", timeout=5)
+            status, payload = http_get_json(
+                f"http://{host}:8899/api/health", timeout=5, headers=headers
+            )
             comps = payload.get("components", {})
-            for key in ("wifi", "cloud_uplink", "provisioning"):
+            for key in ("wifi", "cloud_uplink", "provisioning", "camera", "inference"):
                 c = comps.get(key, {})
                 ok = c.get("state") == "ok"
                 check(key, ok, c.get("detail", "unknown"))
+        except HTTPError as exc:
+            # A 401 is the device ANSWERING. Reporting that as unreachable is the
+            # same false negative this tool exists to avoid: it sends someone to
+            # debug a network while the device is up and simply wants its token.
+            if exc.code in (401, 403):
+                check(
+                    "device reachable", True,
+                    f"{host}:8899 answered {exc.code} — it is up; set "
+                    f"SENSORDYME_DEVICE_TOKEN to read its component health",
+                )
+            else:
+                check("device reachable", False, f"{host}:8899 -- HTTP {exc.code}")
         except (URLError, OSError, ValueError) as exc:
             check("device reachable", False, f"{host}:8899 -- {exc}")
 

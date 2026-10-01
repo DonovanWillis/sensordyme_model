@@ -200,6 +200,12 @@ final class AppState: ObservableObject {
     /// Where mDNS last found a backend. A cache: useful, never authoritative,
     /// and the only slot `relocateBackend()` is allowed to overwrite.
     @AppStorage("discoveredBaseURL") private(set) var discoveredBaseURL: String = ""
+    /// Which backend this app last connected to, from the service's TXT record.
+    ///
+    /// Persisted because its whole job is to be remembered across launches: it is
+    /// what stops the app silently adopting a different SensorDyme backend when
+    /// several are on one network. The address is a cache; this is the identity.
+    @AppStorage("knownBackendID") private(set) var knownBackendID: String = ""
     /// Bumped when the storage layout changes, so the migration below runs once.
     @AppStorage("backendStorageVersion") private var backendStorageVersion: Int = 0
     @AppStorage("deviceLocalURL") var deviceLocalURL: String = ""  // LAN feed, e.g. http://192.168.1.20:8899
@@ -461,13 +467,20 @@ final class AppState: ObservableObject {
 
             if Task.isCancelled { return nil }
 
-            if self.mayDiscover, let found = await BackendLocator.shared.search() {
-                // The result goes to the discovery cache, never to configuration:
+            if self.mayDiscover,
+               let found = await BackendLocator.shared.search(remembering: self.knownBackendID) {
+                // The address goes to the discovery cache, never to configuration:
                 // an address found on one network must not outlive it as if
-                // somebody had chosen it.
-                self.discoveredBaseURL = found
-                self.confirm(found)
-                return found
+                // somebody had chosen it. The id is the opposite — it IS worth
+                // remembering, because it is what identifies this backend on the
+                // next network it turns up on.
+                self.discoveredBaseURL = found.url
+                if let id = found.id, !id.isEmpty, id != self.knownBackendID {
+                    Self.log.info("remembering backend id \(id, privacy: .public)")
+                    self.knownBackendID = id
+                }
+                self.confirm(found.url)
+                return found.url
             }
 
             self.reportUnreachable(triedKnown: known)

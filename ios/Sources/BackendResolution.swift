@@ -59,6 +59,71 @@ enum BackendResolution {
         return isLANScoped(target)
     }
 
+    // MARK: - Which backend, when several answer
+
+    /// A backend found on the network: where it is, and which one it is.
+    ///
+    /// `id` comes from the service's TXT record (`cloud/mdns.py`'s `backend_id`)
+    /// and is nil for a backend published by a build that predates it.
+    struct FoundBackend: Equatable {
+        let url: String
+        let id: String?
+    }
+
+    /// What to do about the backends currently on the network.
+    enum BackendChoice: Equatable {
+        /// Use this one.
+        case use(FoundBackend)
+        /// Several answered, none of them the one we know. Picking for the user
+        /// would mean possibly connecting them to somebody else's Mac.
+        case ambiguous([FoundBackend])
+        /// Nothing usable found.
+        case none
+    }
+
+    /// Choose among the healthy backends on this network.
+    ///
+    /// The app used to take whichever answered its health check first. The health
+    /// check proves a server is *a* SensorDyme backend, not that it is *yours* —
+    /// so on a shared flat, an office or a campus network that is a coin flip
+    /// between your Mac and a colleague's. The device side solved this a while
+    /// ago (`id=SD-…`, and `DeviceLink` deliberately refuses to adopt a different
+    /// camera); this is the same guarantee for the backend.
+    ///
+    /// The rule, and the reasoning for each branch:
+    ///
+    ///   * **A remembered id that is present wins.** That is the whole point of
+    ///     having an identity.
+    ///   * **Exactly one backend, none remembered → adopt it.** A single
+    ///     SensorDyme backend on the network is overwhelmingly yours, and this is
+    ///     what makes first launch need no setup at all. There is no ambiguity to
+    ///     get wrong.
+    ///   * **Several, none remembered → refuse.** This is the only genuinely
+    ///     dangerous case, and guessing is what must not happen. Reported so the
+    ///     app can say which it found rather than silently binding to one.
+    ///
+    /// Note what is NOT a rule: "remembered one is missing, so take another".
+    /// A remembered backend that has gone quiet is usually a Mac that is asleep,
+    /// not a Mac that has been replaced — and silently moving someone onto a
+    /// different server is a worse failure than telling them theirs is not here.
+    static func chooseBackend(
+        from found: [FoundBackend],
+        remembering remembered: String?
+    ) -> BackendChoice {
+        guard !found.isEmpty else { return .none }
+
+        if let remembered, !remembered.isEmpty,
+           let mine = found.first(where: { $0.id == remembered }) {
+            return .use(mine)
+        }
+
+        if found.count == 1 { return .use(found[0]) }
+
+        // Several. If none carries an id at all we cannot distinguish them even
+        // in principle, so this is still ambiguous rather than a free choice.
+        return .ambiguous(found)
+    }
+
     // MARK: - What to try, in what order
 
     /// Every address worth trying right now, best first, with the ones that

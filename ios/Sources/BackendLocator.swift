@@ -41,7 +41,7 @@ final class BackendLocator: ObservableObject {
 
     private var browser: NWBrowser?
     private var resolvers: [NWConnection] = []
-    private var candidates: [String] = []
+    private var candidates: [BackendResolution.FoundBackend] = []
     /// Endpoints a resolver has already been started for. Bonjour reports the
     /// full result set on every change, so without this the same service gets a
     /// fresh NWConnection on every callback.
@@ -49,7 +49,7 @@ final class BackendLocator: ObservableObject {
 
     /// The search currently running, so concurrent callers join it instead of
     /// starting a second browse. Several views ask at once on launch.
-    private var inFlight: Task<String?, Never>?
+    private var inFlight: Task<BackendResolution.FoundBackend?, Never>?
 
     // MARK: - Public discovery
 
@@ -60,26 +60,55 @@ final class BackendLocator: ObservableObject {
     /// "don't ask again" window, which was a second, invisible backoff competing
     /// with the caller's — so a deliberate "find my server" tap could silently do
     /// nothing. Retrying is the caller's decision; see `BackendResolution.retryDelay`.
-    func search(timeout: TimeInterval = 5) async -> String? {
+    ///
+    /// Returns the backend to use, or nil if none is usable.
+    ///
+    /// `remembering` is the id of the backend this app last connected to. Passed
+    /// in rather than read here so this type stays free of storage: the policy
+    /// lives in `BackendResolution.chooseBackend`, which is testable without a
+    /// network.
+    func search(timeout: TimeInterval = 5, remembering remembered: String? = nil)
+        async -> BackendResolution.FoundBackend? {
         if let existing = inFlight {
             return await existing.value
         }
 
-        let task = Task { @MainActor [weak self] () -> String? in
+        let task = Task { @MainActor [weak self] () -> BackendResolution.FoundBackend? in
             guard let self else { return nil }
             let discovered = await self.discover(timeout: timeout)
             Self.log.info("Bonjour returned \(discovered.count, privacy: .public) candidate(s)")
+
+            // Health-check every candidate before choosing between them. A stale
+            // record from a network this machine has left still resolves, so
+            // "answered" is what makes a candidate real — and choosing first and
+            // validating afterwards would let one dead record hide a live backend.
+            var healthy: [BackendResolution.FoundBackend] = []
             for candidate in discovered {
                 if Task.isCancelled { return nil }
-                if await Self.answers(candidate) {
-                    Self.log.info("backend confirmed healthy at \(candidate, privacy: .public)")
-                    return candidate
+                if await Self.answers(candidate.url) {
+                    healthy.append(candidate)
+                } else {
+                    Self.log.info(
+                        "candidate did not answer as the backend: \(candidate.url, privacy: .public)")
                 }
-                // Expected, not exceptional: a stale record from a network this
-                // machine has left resolves and then answers nothing.
-                Self.log.info("candidate did not answer as the backend: \(candidate, privacy: .public)")
             }
-            return nil
+
+            switch BackendResolution.chooseBackend(from: healthy, remembering: remembered) {
+            case .use(let backend):
+                Self.log.info(
+                    "backend confirmed healthy at \(backend.url, privacy: .public) (id \(backend.id ?? "none", privacy: .public))")
+                self.problem = nil
+                return backend
+            case .ambiguous(let all):
+                // Deliberately not a guess. On a shared network the wrong choice
+                // means someone watching a stranger's camera.
+                Self.log.error(
+                    "\(all.count, privacy: .public) SensorDyme backends answered and none is the one this app knows; not choosing between them")
+                self.problem = "Found \(all.count) SensorDyme servers on this Wi-Fi and none is the one this app used before. Open Settings → Manual server address to pick the right one."
+                return nil
+            case .none:
+                return nil
+            }
         }
 
         inFlight = task
@@ -139,7 +168,7 @@ final class BackendLocator: ObservableObject {
     /// which meant a single stale record was the entire result: it failed its
     /// health check, there was nothing behind it, and discovery reported no
     /// backend on a network where the backend was present and healthy.
-    func discover(timeout: TimeInterval = 5) async -> [String] {
+    func discover(timeout: TimeInterval = 5) async -> [BackendResolution.FoundBackend] {
         startBrowsing()
         defer { stopBrowsing() }
 
@@ -170,7 +199,7 @@ final class BackendLocator: ObservableObject {
         // Prefer IPv4 over IPv6: the dev backend binds 0.0.0.0, so a v6 candidate
         // resolves and then refuses, costing a timeout before the v4 one is tried.
         return candidates.sorted { first, second in
-            !first.contains("[") && second.contains("[")
+            !first.url.contains("[") && second.url.contains("[")
         }
     }
 
@@ -193,7 +222,9 @@ final class BackendLocator: ObservableObject {
             Task { @MainActor in
                 guard let self else { return }
                 for result in results {
-                    self.resolve(result.endpoint)
+                    // The id travels with the browse result, not the resolved
+                    // connection, so it has to be read here and carried through.
+                    self.resolve(result.endpoint, id: Self.backendID(from: result))
                 }
             }
         }
@@ -240,7 +271,18 @@ final class BackendLocator: ObservableObject {
 
     /// Bonjour hands back a service endpoint; opening a throwaway connection to
     /// it is the supported way to learn the concrete ip:port behind it.
-    private func resolve(_ endpoint: NWEndpoint) {
+    /// This backend's id out of the service's TXT record, or nil for a backend
+    /// published by a version that predates it. Same shape as
+    /// `DeviceDiscovery.deviceID`, which reads `id=SD-…` for the camera.
+    nonisolated private static func backendID(from result: NWBrowser.Result) -> String? {
+        guard case let .bonjour(record) = result.metadata,
+              let identifier = record["id"],
+              !identifier.isEmpty
+        else { return nil }
+        return identifier
+    }
+
+    private func resolve(_ endpoint: NWEndpoint, id: String?) {
         let key = "\(endpoint)"
         guard !resolving.contains(key) else { return }
         resolving.insert(key)
@@ -271,9 +313,10 @@ final class BackendLocator: ObservableObject {
                         Self.log.info("ignoring unusable address \(url, privacy: .public)")
                         return
                     }
-                    guard !self.candidates.contains(url) else { return }
-                    self.candidates.append(url)
-                    Self.log.info("resolved a backend candidate at \(url, privacy: .public)")
+                    guard !self.candidates.contains(where: { $0.url == url }) else { return }
+                    self.candidates.append(.init(url: url, id: id))
+                    Self.log.info(
+                        "resolved a backend candidate at \(url, privacy: .public) (id \(id ?? "none", privacy: .public))")
                 }
             case .failed, .cancelled:
                 connection?.cancel()
