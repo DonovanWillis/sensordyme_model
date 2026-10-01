@@ -104,33 +104,51 @@ It is *especially* confusing because most home routers hand out `192.168.1.x`,
 so the old address and the new one look like the same network when they are two
 different LANs that happen to share a private range.
 
-## The fix: use a name, not an address
+## The fix: use the backend's OWN name, not the Mac's
 
-A name follows the machine between networks. An IP does not.
+A name follows the machine between networks. An IP does not. That much this
+document got right. What it got wrong, and what cost ten days of a device
+reporting itself healthy while the app showed it offline, is **which** name.
 
-On the Pi, in `~/sensordyme/config.yaml`:
+The advice used to be "find the Mac's mDNS name with `scutil --get
+LocalHostName` and append `.local`". The Pi was configured exactly that way,
+with `http://Donovans-MacBook-Pro-2.local:8787` — and then macOS renamed the
+Mac to `…-Pro-4` on a name collision, which it does without asking. From the
+Pi, afterwards:
+
+```
+Donovans-MacBook-Pro-2.local:8787/v1/health -> HTTP 000   (does not exist)
+Donovans-MacBook-Pro-4.local:8787/v1/health -> HTTP 200
+```
+
+A hostname assigned by the operating system is not ours to depend on. So the
+backend now publishes a name it owns — `cloud/mdns.py`'s `STABLE_HOSTNAME` —
+which changes only when that file does:
 
 ```yaml
 cloud:
   enabled: true
-  base_url: http://your-macbook.local:8787   # NOT http://192.168.1.251:8787
+  base_url: http://sensordyme-backend.local:8787   # the backend's own name
   device_key: "dk_..."
 ```
 
-Find the Mac's mDNS name with:
-
-```
-scutil --get LocalHostName
-```
-
-and append `.local`. Then restart the device:
+Then restart the device:
 
 ```
 sudo systemctl restart sensordyme
 ```
 
-That is the whole fix. Both machines can now join any network together and the
-link re-forms with no reconfiguration.
+That is the whole fix, and this time there is nothing left to go stale: mDNS
+resolves that name to whatever address the Mac currently has, on whatever
+network it currently has it. The identity is stable and the endpoint is
+disposable, which is the only arrangement that survives a laptop.
+
+The iOS app needs no address at all — it browses for the service rather than
+resolving a name (see "The app no longer depends on any of this being right"
+above). `base_url` exists because the device has no Bonjour browser of its own:
+`avahi-utils` is not installed on it and neither is python `zeroconf`, so it
+resolves a name instead of discovering a service. Giving the device real service
+discovery would remove its last piece of configuration, and is worth doing.
 
 ## Why this works
 
