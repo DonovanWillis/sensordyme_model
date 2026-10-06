@@ -41,6 +41,8 @@ final class BackendLocator: ObservableObject {
 
     private var browser: NWBrowser?
     private var resolvers: [NWConnection] = []
+    /// SRV resolvers, held because NetService does nothing once released.
+    private var srvResolvers: [SRVResolver] = []
     private var candidates: [BackendResolution.FoundBackend] = []
     /// Endpoints a resolver has already been started for. Bonjour reports the
     /// full result set on every change, so without this the same service gets a
@@ -196,10 +198,14 @@ final class BackendLocator: ObservableObject {
             Self.log.info("Bonjour found no backend on this network")
         }
 
-        // Prefer IPv4 over IPv6: the dev backend binds 0.0.0.0, so a v6 candidate
-        // resolves and then refuses, costing a timeout before the v4 one is tried.
-        return candidates.sorted { first, second in
-            !first.url.contains("[") && second.url.contains("[")
+        // A NAME first, then IPv4, then IPv6 — see
+        // BackendResolution.preferringStableHost for why the name is not merely
+        // one option among several.
+        let endpoints = candidates.compactMap { found in
+            BackendResolution.BackendEndpoint(url: found.url, backendID: found.id)
+        }
+        return BackendResolution.preferringStableHost(endpoints).map { endpoint in
+            BackendResolution.FoundBackend(url: endpoint.baseURL, id: endpoint.backendID)
         }
     }
 
@@ -224,7 +230,16 @@ final class BackendLocator: ObservableObject {
                 for result in results {
                     // The id travels with the browse result, not the resolved
                     // connection, so it has to be read here and carried through.
-                    self.resolve(result.endpoint, id: Self.backendID(from: result))
+                    let id = Self.backendID(from: result)
+                    // Two resolutions per service, and the order matters:
+                    // the SRV target is the backend's STABLE name and is what we
+                    // want to keep, while the connection only yields today's
+                    // address. Both are offered as candidates and
+                    // `BackendResolution.preferringStableHost` puts the name
+                    // first, so the address is a fallback for a service that
+                    // publishes no usable hostname rather than the normal answer.
+                    self.resolveServiceName(result.endpoint, id: id)
+                    self.resolve(result.endpoint, id: id)
                 }
             }
         }
@@ -263,6 +278,8 @@ final class BackendLocator: ObservableObject {
         browser = nil
         resolvers.forEach { $0.cancel() }
         resolvers.removeAll()
+        srvResolvers.forEach { $0.cancel() }
+        srvResolvers.removeAll()
         resolving.removeAll()
         isSearching = false
     }
@@ -280,6 +297,50 @@ final class BackendLocator: ObservableObject {
               !identifier.isEmpty
         else { return nil }
         return identifier
+    }
+
+    /// Recover the backend's STABLE HOSTNAME from the Bonjour service record.
+    ///
+    /// This is the half that was missing, and its absence was the whole bug.
+    /// `resolve` below opens a connection and reads `currentPath.remoteEndpoint`,
+    /// which is the address the name resolved to — so the app cached
+    /// `http://10.97.118.172:8787` and never learned that the backend calls
+    /// itself `sensordyme-backend.local`. cloud/mdns.py publishes that name in
+    /// the SRV record precisely so the address can change without the app caring
+    /// (see STABLE_HOSTNAME there, and the ten-day outage that motivated it).
+    ///
+    /// NWBrowser does not expose the SRV target, so this uses NetService, which
+    /// does: `hostName` after a successful resolve is exactly the SRV target.
+    /// Failure is not fatal — `resolve` still contributes the address.
+    private func resolveServiceName(_ endpoint: NWEndpoint, id: String?) {
+        guard case let .service(name, type, domain, _) = endpoint else { return }
+        let key = "srv:\(name).\(type).\(domain)"
+        guard !resolving.contains(key) else { return }
+        resolving.insert(key)
+
+        let resolver = SRVResolver(name: name, type: type, domain: domain) { [weak self] host, port in
+            Task { @MainActor in
+                guard let self, let host, let port else { return }
+                let endpoint = BackendResolution.BackendEndpoint(
+                    scheme: "http", host: host, port: port, backendID: id
+                )
+                // A service may publish a loopback or numeric target; neither is
+                // better than what `resolve` already provides.
+                guard endpoint.hostIsStable,
+                      BackendResolution.isUsableFromPhone(endpoint.baseURL)
+                else {
+                    Self.log.info(
+                        "service target is not a usable stable name: \(endpoint.baseURL, privacy: .public)")
+                    return
+                }
+                guard !self.candidates.contains(where: { $0.url == endpoint.baseURL }) else { return }
+                self.candidates.append(.init(url: endpoint.baseURL, id: id))
+                Self.log.info(
+                    "resolved the backend's stable name \(endpoint.baseURL, privacy: .public) (id \(id ?? "none", privacy: .public))")
+            }
+        }
+        srvResolvers.append(resolver)
+        resolver.start()
     }
 
     private func resolve(_ endpoint: NWEndpoint, id: String?) {
@@ -353,5 +414,56 @@ final class BackendLocator: ObservableObject {
             return "Couldn't search this network (DNS error \(code))."
         }
         return "Couldn't search this network: \(error.localizedDescription)"
+    }
+}
+
+/// Resolves one Bonjour service to its SRV target hostname and port.
+///
+/// A small NSObject wrapper because NetService is delegate-based and predates
+/// Network.framework — but it is the only API that hands back the SRV target,
+/// which is the backend's stable identity. NWBrowser/NWConnection only ever
+/// reveal the resolved address.
+final class SRVResolver: NSObject, NetServiceDelegate {
+    private let service: NetService
+    private var finish: ((String?, Int?) -> Void)?
+
+    init(name: String, type: String, domain: String,
+         onResolved: @escaping (String?, Int?) -> Void) {
+        // NetService wants a dotted, trailing-dot domain; Bonjour reports "local".
+        let resolvedDomain = domain.isEmpty ? "local." : domain
+        self.service = NetService(domain: resolvedDomain, type: type, name: name)
+        self.finish = onResolved
+        super.init()
+        self.service.delegate = self
+    }
+
+    func start() {
+        // Short on purpose: this races the address resolution in `resolve`, and a
+        // service whose name will not resolve must not delay discovery.
+        service.resolve(withTimeout: 3)
+    }
+
+    func cancel() {
+        finish = nil
+        service.delegate = nil
+        service.stop()
+    }
+
+    private func deliver(_ host: String?, _ port: Int?) {
+        let callback = finish
+        finish = nil  // exactly once, whichever delegate method fires
+        callback?(host, port)
+    }
+
+    func netServiceDidResolveAddress(_ sender: NetService) {
+        deliver(sender.hostName, sender.port > 0 ? sender.port : nil)
+    }
+
+    func netService(_ sender: NetService, didNotResolve errorDict: [String: NSNumber]) {
+        deliver(nil, nil)
+    }
+
+    func netServiceDidStop(_ sender: NetService) {
+        deliver(nil, nil)
     }
 }

@@ -216,5 +216,111 @@ check(BackendResolution.chooseBackend(from: [theirs], remembering: "bk_gone") ==
 check(BackendResolution.chooseBackend(from: [mine], remembering: "") == .use(mine),
       "an empty remembered id is treated as no memory, not as an id to match")
 
+
+// MARK: - BackendEndpoint: identity versus location
+//
+// The bug these cover: BackendLocator resolved the Bonjour service by opening a
+// connection and reading currentPath.remoteEndpoint -- the ADDRESS the name had
+// resolved to -- and persisted that. The backend publishes a stable name
+// (sensordyme-backend.local) and a stable id (bk_...) for exactly this reason,
+// and the phone was discarding the name and keeping the address.
+
+typealias Endpoint = BackendResolution.BackendEndpoint
+
+let named = Endpoint(host: "sensordyme-backend.local", port: 8787, backendID: "bk_0eb63f4fc338")
+let numeric = Endpoint(host: "10.97.118.172", port: 8787, backendID: "bk_0eb63f4fc338")
+
+check(named.baseURL == "http://sensordyme-backend.local:8787", "a name builds the URL it should")
+check(named.hostIsStable, "a .local name is resolvable again later, so it is stable")
+check(!numeric.hostIsStable, "an address is only true on the network it was read on")
+check(named.backendID == numeric.backendID,
+      "the same backend at a name and at an address is still ONE backend")
+
+check(Endpoint(host: "sensordyme-backend.local.", port: 8787).host == "sensordyme-backend.local",
+      "a trailing dot is valid DNS and breaks URL(string:), so it is stripped")
+check(Endpoint(host: "SensorDyme-Backend.LOCAL", port: 8787).host == "sensordyme-backend.local",
+      "hosts compare case-insensitively")
+
+check(Endpoint(url: "http://sensordyme-backend.local:8787")?.port == 8787, "the port is parsed")
+check(Endpoint(url: "https://api.example.com")?.port == 443, "https defaults to 443")
+check(Endpoint(url: "http://sensordyme-backend.local")?.port == 8787,
+      "a bare http backend URL defaults to the backend's own port, not 80")
+check(Endpoint(url: "not a url") == nil, "garbage is rejected rather than becoming a host")
+check(Endpoint(url: "ftp://sensordyme-backend.local:8787") == nil, "only http(s) is a backend")
+check(!Endpoint(host: "127.0.0.1", port: 8787).hostIsStable, "loopback is never a stable backend")
+check(!Endpoint(host: "localhost", port: 8787).hostIsStable, "...including by name")
+
+// MARK: - What may be written to storage
+
+check(BackendResolution.mayPersistAsLocation(named), "a name is worth remembering")
+check(!BackendResolution.mayPersistAsLocation(numeric),
+      "an address must never be persisted: that is what made a dead IP authoritative for ever")
+
+// MARK: - Invalidating a stale location, keeping the identity
+
+check(BackendResolution.discoveryCache(
+        after: "http://10.97.118.172:8787", keeping: "http://10.97.118.172:8787") == "",
+      "the address that just failed is dropped from the cache")
+check(BackendResolution.discoveryCache(
+        after: "http://10.97.118.172:8787", keeping: "http://sensordyme-backend.local:8787")
+      == "http://sensordyme-backend.local:8787",
+      "a NAME survives a failure -- a quiet backend is usually a sleeping Mac, not a wrong name")
+check(BackendResolution.discoveryCache(after: "", keeping: "http://10.97.118.172:8787") == "",
+      "an address with nothing to attribute the failure to is still not worth keeping")
+check(BackendResolution.discoveryCache(after: "http://x", keeping: "") == "",
+      "an empty cache stays empty")
+
+// MARK: - A name beats an address for the same backend
+
+let ordered = BackendResolution.preferringStableHost([
+    numeric,
+    Endpoint(host: "fe80::1", port: 8787, backendID: "bk_0eb63f4fc338"),
+    named,
+])
+check(ordered.first == named, "the stable name is tried first, always")
+check(ordered.count == 3, "the others are kept as fallbacks, not discarded")
+check(!ordered[1].host.contains(":"), "IPv4 before IPv6: a v6 candidate costs a timeout first")
+
+check(BackendResolution.preferringStableHost([]).isEmpty, "no candidates is not a crash")
+let twoNames = BackendResolution.preferringStableHost([
+    Endpoint(host: "a.local", port: 1), Endpoint(host: "b.local", port: 2),
+])
+check(twoNames.map(\.host) == ["a.local", "b.local"],
+      "equally stable candidates keep discovery order rather than being reshuffled")
+
+// MARK: - The slow-verification race
+//
+// Candidate A is found, its verification is slow; B is found, verified, and
+// becomes active; then A's verification finally returns. A must not win.
+
+check(BackendResolution.verificationIsCurrent(generation: 2, current: 2),
+      "a verification from the current generation is acted on")
+check(!BackendResolution.verificationIsCurrent(generation: 1, current: 2),
+      "a verification from a superseded generation is discarded, not applied")
+check(BackendResolution.verificationIsCurrent(generation: 3, current: 2),
+      "a newer generation is never rejected as stale")
+
+// MARK: - The scenario from the brief, end to end
+//
+// The Mac moves from 10.97.118.172 to 10.97.120.45. Identity is unchanged.
+
+do {
+    let before = Endpoint(host: "sensordyme-backend.local", port: 8787, backendID: "bk_0eb63f4fc338")
+    // Only the name was persisted, so there is no dead address to try.
+    check(BackendResolution.mayPersistAsLocation(before), "the name is what got stored")
+    let candidates = BackendResolution.candidates(
+        configured: "", productionDefault: "", discovered: before.baseURL
+    )
+    check(candidates == ["http://sensordyme-backend.local:8787"],
+          "after the move the app still has exactly one thing to try, and it is the name")
+    // mDNS resolves that same name to the new address; identity is unchanged.
+    let after = Endpoint(
+        host: "sensordyme-backend.local", port: 8787,
+        backendID: "bk_0eb63f4fc338", resolvedAddress: "10.97.120.45"
+    )
+    check(after.baseURL == before.baseURL, "the URL every consumer uses did not change at all")
+    check(after.backendID == before.backendID, "and it is recognisably the same backend")
+}
+
 print("\n\(failures == 0 ? "PASSED" : "\(failures) FAILED")")
 exit(failures == 0 ? 0 : 1)

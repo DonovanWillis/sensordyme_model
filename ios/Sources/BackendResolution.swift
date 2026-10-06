@@ -348,4 +348,133 @@ enum BackendResolution {
         }
         return "Check the phone's internet connection and try again."
     }
+
+    // MARK: - Where a backend is, versus which backend it is
+
+    /// One backend: which one it is, and where to reach it.
+    ///
+    /// This type exists because the app kept conflating the two, and the bug that
+    /// cost was structural rather than careless. `BackendLocator` resolved the
+    /// Bonjour service by opening a connection and reading
+    /// `currentPath.remoteEndpoint` — the address the name had *resolved to* —
+    /// and cached that. So the backend published a stable identity
+    /// (`sensordyme-backend.local`, plus `id=bk_…` in the TXT record,
+    /// deliberately, after a ten-day outage caused by a name that could go
+    /// stale), and the phone threw the name away and kept the IP. The moment the
+    /// Mac got a new address the cache pointed at nothing, and because the cache
+    /// was never cleared on failure it stayed the first thing tried for ever.
+    ///
+    /// `host` is therefore the ADVERTISED host — a name when Bonjour gave one.
+    /// An IP belongs in `resolvedAddress`, which is diagnostics and a
+    /// short-lived fallback, never the thing that gets written to storage.
+    struct BackendEndpoint: Equatable {
+        let scheme: String
+        let host: String
+        let port: Int
+        /// From the service TXT record. nil for a backend predating `backend_id`.
+        let backendID: String?
+        /// What the name resolved to when it was last reached. Never persisted.
+        let resolvedAddress: String?
+
+        init(scheme: String = "http", host: String, port: Int,
+             backendID: String? = nil, resolvedAddress: String? = nil) {
+            self.scheme = scheme.lowercased()
+            // A trailing dot is correct in DNS and breaks URL(string:).
+            var cleaned = host.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+            while cleaned.hasSuffix(".") { cleaned.removeLast() }
+            self.host = cleaned
+            self.port = port
+            self.backendID = backendID
+            self.resolvedAddress = resolvedAddress
+        }
+
+        /// Parse a stored or typed URL back into an endpoint.
+        init?(url: String, backendID: String? = nil) {
+            let trimmed = url.trimmingCharacters(in: .whitespacesAndNewlines)
+            guard let parsed = URL(string: trimmed),
+                  let scheme = parsed.scheme?.lowercased(),
+                  scheme == "http" || scheme == "https",
+                  let host = parsed.host, !host.isEmpty
+            else { return nil }
+            self.init(
+                scheme: scheme,
+                host: host,
+                port: parsed.port ?? (scheme == "https" ? 443 : 8787),
+                backendID: backendID
+            )
+        }
+
+        /// The base URL every consumer should build its requests from.
+        var baseURL: String {
+            let bracketed = host.contains(":") && !host.hasPrefix("[") ? "[\(host)]" : host
+            return "\(scheme)://\(bracketed):\(port)"
+        }
+
+        /// Whether `host` is a name that can be resolved again later.
+        ///
+        /// This is the whole distinction the type exists for. A name survives the
+        /// machine moving; an address is only true on the network it was read on.
+        var hostIsStable: Bool {
+            !BackendResolution.isIPLiteral(host) && !BackendResolution.isLoopbackName(host)
+        }
+    }
+
+    /// May this endpoint be written to storage as where the backend lives?
+    ///
+    /// Only a name. An address may be used immediately — it is the fastest way to
+    /// reach a backend that is right there — but persisting one is what turned a
+    /// transient location into a permanent claim about the world.
+    static func mayPersistAsLocation(_ endpoint: BackendEndpoint) -> Bool {
+        endpoint.hostIsStable
+    }
+
+    /// What the discovery cache should hold after an endpoint failed.
+    ///
+    /// `reportUnreachable` used to clear only the confirmed address, so a dead
+    /// numeric candidate stayed in the discovery slot — first in `candidates`,
+    /// and the host named in every error the user read. A name is kept: it is
+    /// the identity, and the reason it did not answer is usually that the Mac is
+    /// asleep, not that the name is wrong. An address is dropped: there is
+    /// nothing to re-resolve and no reason to try it again.
+    static func discoveryCache(after failed: String, keeping cached: String) -> String {
+        let cachedValue = cached.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !cachedValue.isEmpty else { return "" }
+        guard let endpoint = BackendEndpoint(url: cachedValue) else { return "" }
+        if endpoint.hostIsStable { return cachedValue }
+        // An address: drop it if it is the thing that just failed, or if the
+        // failure was at the same host by another spelling.
+        let failedHost = host(of: failed)
+        if failedHost == nil || failedHost == endpoint.host { return "" }
+        return cachedValue
+    }
+
+    /// Choose between endpoints that are the same backend in different spellings.
+    ///
+    /// Bonjour can report one service on several interfaces, and resolving it
+    /// yields both a name and one or more addresses. They are not alternatives to
+    /// weigh — the name is strictly better, because it is the only one that still
+    /// means something after the address changes.
+    static func preferringStableHost(_ endpoints: [BackendEndpoint]) -> [BackendEndpoint] {
+        endpoints.enumerated().sorted { left, right in
+            if left.element.hostIsStable != right.element.hostIsStable {
+                return left.element.hostIsStable
+            }
+            // IPv4 before IPv6: the dev backend binds 0.0.0.0, so a v6 candidate
+            // resolves and then refuses, costing a timeout.
+            let leftV6 = isIPv6Literal(left.element.host)
+            let rightV6 = isIPv6Literal(right.element.host)
+            if leftV6 != rightV6 { return rightV6 }
+            return left.offset < right.offset  // otherwise keep discovery order
+        }.map(\.element)
+    }
+
+    /// Whether a verification that has just finished is still worth acting on.
+    ///
+    /// The race this closes: candidate A is found, verification is slow, B is
+    /// found and verified and becomes active, then A's verification finally
+    /// returns and overwrites it. Generations make "newest verified wins" a
+    /// check rather than a hope.
+    static func verificationIsCurrent(generation: Int, current: Int) -> Bool {
+        generation >= current
+    }
 }

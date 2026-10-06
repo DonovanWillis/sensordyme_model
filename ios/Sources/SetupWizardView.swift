@@ -109,6 +109,22 @@ struct SetupWizardView: View {
         )
     }
 
+    /// The device's own address while it is serving its first-boot setup
+    /// hotspot — and ONLY then.
+    ///
+    /// Isolated behind a named constant because a bare `10.42.0.1` in a view was
+    /// indistinguishable from the hardcoded runtime addresses this app has spent
+    /// a long time removing. This one is legitimate and is not discovery: it is
+    /// the gateway NetworkManager assigns in shared mode, so while the phone is
+    /// joined to the device's own AP it is the device, by construction, and
+    /// there is no network to discover anything on yet.
+    ///
+    /// It must never be used as a backend or device address during normal
+    /// operation — see `DeviceDiscovery` for that. Belongs to the legacy
+    /// `provisioning.method: hotspot` path (scripts/provisioning_hotspot.sh);
+    /// the shipped default is BLE, which needs no address at all.
+    static let provisioningHotspotSetupURL = URL(string: "http://10.42.0.1:8899/setup")
+
     private var hotspotStep: some View {
         VStack(spacing: 14) {
             stepBody(
@@ -116,8 +132,8 @@ struct SetupWizardView: View {
                 title: "Join its setup network",
                 text: "In Settings → Wi-Fi on this phone, join the network named SensorDyme-XXXX. Your device broadcasts it on first boot."
             )
-            if !state.isDemo {
-                Link(destination: URL(string: "http://10.42.0.1:8899/setup")!) {
+            if !state.isDemo, let setup = Self.provisioningHotspotSetupURL {
+                Link(destination: setup) {
                     Label("Open device setup page", systemImage: "safari")
                         .font(.subheadline.bold())
                 }

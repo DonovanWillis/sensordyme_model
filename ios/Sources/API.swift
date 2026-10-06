@@ -474,7 +474,23 @@ final class AppState: ObservableObject {
                 // somebody had chosen it. The id is the opposite — it IS worth
                 // remembering, because it is what identifies this backend on the
                 // next network it turns up on.
+                // Cache whatever was found, name or address — but note which,
+                // because the two have different lifetimes. A name is durable
+                // and survives the Mac moving. An address is a performance
+                // shortcut only, and `reportUnreachable` drops it the first time
+                // it fails (see `BackendResolution.discoveryCache`). That
+                // invalidation is what makes caching an address safe now and is
+                // precisely what was missing before: the address was cached and
+                // never cleared, so it stayed first in `candidates` for ever.
                 self.discoveredBaseURL = found.url
+                // os.Logger takes an interpolation literal, not an expression.
+                if BackendResolution.BackendEndpoint(url: found.url)?.hostIsStable == true {
+                    Self.log.info(
+                        "cached the backend's stable name \(found.url, privacy: .public)")
+                } else {
+                    Self.log.info(
+                        "cached \(found.url, privacy: .public) as an address — dropped on first failure")
+                }
                 if let id = found.id, !id.isEmpty, id != self.knownBackendID {
                     Self.log.info("remembering backend id \(id, privacy: .public)")
                     self.knownBackendID = id
@@ -545,6 +561,22 @@ final class AppState: ObservableObject {
         heartbeatTask?.cancel()
         heartbeatTask = nil
         confirmedBaseURL = ""
+        // Drop a dead ADDRESS from the discovery cache, keep a NAME.
+        //
+        // This used to clear only `confirmedBaseURL`, so a numeric address from
+        // a network the Mac had left stayed in the discovery slot — first in
+        // `candidates`, tried before anything else on every launch, and the host
+        // named in every error the user read. A name is kept deliberately: it is
+        // the backend's identity, it can be resolved again, and the usual reason
+        // it went quiet is a sleeping Mac rather than a wrong name.
+        let keptCache = BackendResolution.discoveryCache(
+            after: triedKnown.first ?? "", keeping: discoveredBaseURL
+        )
+        if keptCache != discoveredBaseURL {
+            Self.log.info(
+                "dropping the stale discovered address \(self.discoveredBaseURL, privacy: .public)")
+            discoveredBaseURL = keptCache
+        }
         let reason: String
         if let permission = BackendLocator.shared.problem {
             // A denied Local Network permission is invisible in the results and
@@ -701,11 +733,31 @@ final class AppState: ObservableObject {
         return URL(string: found)
     }
 
+    /// Pin an address the user typed in Settings, without touching the cache.
+    ///
+    /// `configuredBaseURL`'s `didSet` clears the discovery cache on purpose, and
+    /// the save path then called `adoptDiscovered` with the same string, which
+    /// put it straight back. The cache therefore held a user-pinned value for
+    /// ever — surviving the configured field being cleared, which is exactly the
+    /// "go back to finding my Mac automatically" that clearing it promises.
+    /// Configuration already outranks discovery in `candidates`, so there is
+    /// nothing the cache write was achieving.
+    func pinConfigured(_ url: String) {
+        configuredBaseURL = url  // didSet clears the cache; leave it cleared
+        confirm(url)
+    }
+
     /// Adopt an address the user picked from a discovery result in Settings.
     /// It lands in the cache, not in configuration — the user asked to *find*
     /// the server, not to pin it forever to the address it had today.
     func adoptDiscovered(_ url: String) {
-        discoveredBaseURL = url
+        // Same rule as discovery itself: a name is worth keeping, an address is
+        // only good for this session. Picking a row in Settings is still a
+        // request to *find* the server, not to pin today's address for ever.
+        if let endpoint = BackendResolution.BackendEndpoint(url: url),
+           BackendResolution.mayPersistAsLocation(endpoint) {
+            discoveredBaseURL = url
+        }
         confirm(url)
     }
 

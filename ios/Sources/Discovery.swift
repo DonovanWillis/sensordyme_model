@@ -40,6 +40,8 @@ final class DeviceDiscovery: ObservableObject {
 
     private var browser: NWBrowser?
     private var resolvers: [NWConnection] = []
+    /// Held because NetService stops resolving once released.
+    private var srvResolvers: [SRVResolver] = []
     /// The pending auto-stop. Held so a second `start()` cancels the first one's
     /// timer: without this, each start queues its own sleeping task, and the one
     /// from an abandoned search stops a newer search 10 seconds into it.
@@ -59,11 +61,13 @@ final class DeviceDiscovery: ObservableObject {
                 guard let self else { return }
                 for result in results {
                     if case let .service(name, _, _, _) = result.endpoint {
-                        self.resolve(
-                            endpoint: result.endpoint,
-                            name: name,
-                            deviceID: Self.deviceID(from: result, fallback: name)
+                        let id = Self.deviceID(from: result, fallback: name)
+                        // Name first, address as the fallback — `record` keeps
+                        // whichever is more durable. See `resolveServiceName`.
+                        self.resolveServiceName(
+                            endpoint: result.endpoint, name: name, deviceID: id
                         )
+                        self.resolve(endpoint: result.endpoint, name: name, deviceID: id)
                     }
                 }
             }
@@ -108,6 +112,8 @@ final class DeviceDiscovery: ObservableObject {
         browser = nil
         resolvers.forEach { $0.cancel() }
         resolvers.removeAll()
+        srvResolvers.forEach { $0.cancel() }
+        srvResolvers.removeAll()
         isSearching = false
     }
 
@@ -142,6 +148,52 @@ final class DeviceDiscovery: ObservableObject {
         return identifier
     }
 
+    /// Resolve a device service to a URL, preferring its STABLE HOSTNAME.
+    ///
+    /// Same fix as `BackendLocator.resolveServiceName`, and for the same reason:
+    /// reading `currentPath.remoteEndpoint` yields the ADDRESS the service name
+    /// resolved to, so the cached `deviceLocalURL` was only true on the network
+    /// it was read on. When the Pi's DHCP lease changes the live feed points at
+    /// nothing. The SRV target survives that; the address does not.
+    ///
+    /// The address resolution below is kept as the fallback, because a device
+    /// running firmware whose hostname does not resolve must still be reachable.
+    private func resolveServiceName(endpoint: NWEndpoint, name: String, deviceID: String) {
+        guard case let .service(serviceName, type, domain, _) = endpoint else { return }
+        let resolver = SRVResolver(name: serviceName, type: type, domain: domain) { [weak self] host, port in
+            Task { @MainActor in
+                guard let self, let host, let port else { return }
+                var cleaned = host.lowercased()
+                while cleaned.hasSuffix(".") { cleaned.removeLast() }
+                guard !cleaned.isEmpty,
+                      !BackendResolution.isIPLiteral(cleaned),
+                      !BackendResolution.isLoopbackName(cleaned)
+                else { return }
+                self.record(Found(id: deviceID, name: name, url: "http://\(cleaned):\(port)"),
+                            preferStable: true)
+            }
+        }
+        srvResolvers.append(resolver)
+        resolver.start()
+    }
+
+    /// Store a resolution, keeping a stable hostname in preference to an address.
+    ///
+    /// Replace in place. Appending would move a device down the list every time
+    /// it re-resolved, and re-resolution is routine — Bonjour reports the same
+    /// service repeatedly, and a device with both IPv4 and IPv6 resolves twice.
+    private func record(_ item: Found, preferStable: Bool) {
+        if let index = found.firstIndex(where: { $0.id == item.id }) {
+            if !preferStable, let existing = BackendResolution.host(of: found[index].url),
+               !BackendResolution.isIPLiteral(existing) {
+                return  // already have a name for this device; an address is no improvement
+            }
+            found[index] = item
+        } else {
+            found.append(item)
+        }
+    }
+
     /// Bonjour gives a service endpoint; opening a throwaway connection to it is
     /// the supported way to learn the concrete ip:port for building a URL.
     private func resolve(endpoint: NWEndpoint, name: String, deviceID: String) {
@@ -163,16 +215,7 @@ final class DeviceDiscovery: ObservableObject {
             let url = "http://\(cleaned):\(port.rawValue)"
             Task { @MainActor in
                 guard let self else { return }
-                let item = Found(id: deviceID, name: name, url: url)
-                // Replace in place. Appending would move a device down the list
-                // every time it re-resolved, and re-resolution is routine —
-                // Bonjour reports the same service repeatedly, and a device with
-                // both IPv4 and IPv6 resolves twice in a row.
-                if let index = self.found.firstIndex(where: { $0.id == deviceID }) {
-                    self.found[index] = item
-                } else {
-                    self.found.append(item)
-                }
+                self.record(Found(id: deviceID, name: name, url: url), preferStable: false)
                 connection?.cancel()
             }
         }

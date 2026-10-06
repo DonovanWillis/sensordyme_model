@@ -13,6 +13,8 @@ struct SettingsView: View {
     @State private var health: DeviceHealth?
     @State private var healthError: String?
     @State private var findMessage: String?
+    /// Local draft so the field is editable without writing the Keychain on every keystroke.
+    @State private var tokenDraft = ""
 
     var body: some View {
         NavigationStack {
@@ -162,6 +164,23 @@ struct SettingsView: View {
                             .font(.footnote)
                             .foregroundStyle(SD.Colors.textSecondary)
                     }
+
+                    // The feed and /api on the device both require this token, and
+                    // AppState.deviceToken had no writer anywhere in the app -- so
+                    // the stream's own "add it in Settings -> Device token" message
+                    // named a field that did not exist. It does now.
+                    SecureField("Device token", text: $tokenDraft)
+                        .textInputAutocapitalization(.never)
+                        .autocorrectionDisabled()
+                        .onSubmit { state.deviceToken = tokenDraft }
+                    if tokenDraft != state.deviceToken {
+                        Button("Save token") { state.deviceToken = tokenDraft }
+                    }
+                    Text(state.deviceToken.isEmpty
+                         ? "Set dashboard.token in the device's config.yaml, then paste the same value here. Without it the device refuses the live feed rather than showing its camera to everyone on the Wi-Fi."
+                         : "Saved to the keychain. It must match dashboard.token in the device's config.yaml.")
+                        .font(.footnote)
+                        .foregroundStyle(SD.Colors.textSecondary)
                 }
 
                 Section("Device health") {
@@ -241,6 +260,7 @@ struct SettingsView: View {
             }
             .navigationTitle("Settings")
             .sheet(isPresented: $showSetup) { SetupFlowView() }
+            .onAppear { tokenDraft = state.deviceToken }
         }
     }
 
@@ -403,8 +423,7 @@ struct ManualBackendView: View {
             message = "Nothing answered as a SensorDyme server at that address. It was not saved."
             return
         }
-        state.configuredBaseURL = candidate
-        state.adoptDiscovered(candidate)
+        state.pinConfigured(candidate)
         message = "Saved — SensorDyme is using that address."
     }
 }
