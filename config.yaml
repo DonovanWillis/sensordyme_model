@@ -34,11 +34,20 @@ dashboard:
   enabled: true
   host: 0.0.0.0
   port: 8899
-  token: null # SET THIS on any device that is not on a network you control.
-  # null means the dashboard and the LIVE CAMERA STREAM are served to anyone who
-  # can reach this host. With `host: 0.0.0.0` below that is everyone on the Wi-Fi.
-  # Verified in Phase 7: /api/health and /stream both answered 200 to an
-  # unauthenticated request from a different machine on the LAN.
+  token: null # SET THIS to use the live feed. Without it there is no feed.
+  # This used to read: "null means the dashboard and the LIVE CAMERA STREAM are
+  # served to anyone who can reach this host" -- which with `host: 0.0.0.0` above
+  # meant everyone on the Wi-Fi, and Phase 7 confirmed /api/health and /stream
+  # both answering 200 to an unauthenticated request from another machine.
+  #
+  # That is no longer true. core/dashboard.py now FAILS CLOSED: with no token on
+  # a network-reachable bind, every /api and /stream request is refused (401) and
+  # the reason is logged once at startup. On loopback, no token still means no
+  # auth, which is a reasonable convenience there and nowhere else.
+  #
+  # The fix is deliberately not "bind 127.0.0.1": the phone fetches /stream from
+  # this dashboard directly, so refusing to listen on the LAN would delete the
+  # live feed rather than secure it.
   #
   # Deliberately null in the repo rather than a shared value: a secret committed
   # here would be the same on every unit, which is not a secret. Generate one per

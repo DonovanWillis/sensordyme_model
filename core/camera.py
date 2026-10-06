@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import time
 from collections.abc import Iterator
+from contextlib import suppress
 from typing import Optional
 
 import cv2
@@ -70,21 +71,55 @@ class Camera:
             self._start_cv2_capture()
 
     def _start_picamera(self) -> None:
-        """Configure and start the Picamera2 sensor."""
-        from picamera2 import Picamera2
+        """Configure and start the Picamera2 sensor.
 
-        self._picam = Picamera2()
-        kwargs = {}
-        if self._rotate_180:
-            from libcamera import Transform  # Pi-only, like Picamera2 itself
+        Every failure here is raised as `CameraError`, the same as
+        `_start_cv2_capture` does. That symmetry is load-bearing rather than
+        tidiness: both `reopen()` call sites in services/capture.py catch
+        `CameraError` and nothing else, so a raw Picamera2 or libcamera exception
+        escaped them, propagated out of the pump loop, and killed the capture
+        thread permanently — on the Pi, which is the only platform that takes
+        this branch. The cv2 path was wrapped and this one was not, so the bug
+        was invisible on a Mac.
+        """
+        try:
+            from picamera2 import Picamera2
 
-            kwargs["transform"] = Transform(hflip=1, vflip=1)
-        video_config = self._picam.create_video_configuration(
-            main={"size": (self._width, self._height), "format": "RGB888"}, **kwargs
-        )
-        self._picam.configure(video_config)
-        self._picam.start()
+            self._picam = Picamera2()
+            kwargs = {}
+            if self._rotate_180:
+                from libcamera import Transform  # Pi-only, like Picamera2 itself
+
+                kwargs["transform"] = Transform(hflip=1, vflip=1)
+            video_config = self._picam.create_video_configuration(
+                main={"size": (self._width, self._height), "format": "RGB888"}, **kwargs
+            )
+            self._picam.configure(video_config)
+            self._picam.start()
+        except CameraError:
+            raise
+        except Exception as exc:  # picamera2/libcamera raise their own exception types
+            # Release whatever was half-built before reporting, so a retry does
+            # not contend with the fds this attempt already took.
+            self._release_picamera_quietly()
+            raise CameraError(f"could not start the Pi camera: {exc!r}") from exc
         time.sleep(1.0)  # let auto-exposure/white-balance settle
+
+    def _release_picamera_quietly(self) -> None:
+        """Drop a partially-constructed Picamera2 without raising.
+
+        Used on the failure path only: a half-open sensor still holds /dev/video*,
+        and leaving it held is what made each successive open attempt likelier to
+        fail than the last.
+        """
+        picam, self._picam = getattr(self, "_picam", None), None
+        if picam is None:
+            return
+        for step in ("stop", "close"):
+            # Teardown of a broken handle must not raise: this runs on the
+            # failure path, where the real error is the one already in flight.
+            with suppress(Exception):
+                getattr(picam, step)()
 
     def _start_cv2_capture(self) -> None:
         """Open the Mac webcam via OpenCV."""

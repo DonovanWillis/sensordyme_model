@@ -186,3 +186,56 @@ def test_taxonomy_integrity():
                 assert det.how, f"{mode}.{det.id} must say how it works"
     sheet = taxonomy.summary_for_llm()
     assert "baby_monitoring" in sheet and "UNSUPPORTED" in sheet
+
+
+def test_the_backend_rejects_an_area_rule_with_no_area_on_its_own(backend):
+    """The app must enforce "an area rule only fires in its area" WITHOUT jupiter.
+
+    This is the one safety property that was delegated to the AI layer. The
+    check lived only in jupiter/schema.py's RuleDraft.validate: this function
+    did not read `zone` at all, and neither does the device's
+    ConfiguredRule.from_dict. So replacing the interpreter -- the whole point
+    of making the model swappable -- silently removed the guard, and
+    core/rules.py skipped the zone check for a rule whose zone was empty,
+    firing on a person ANYWHERE in frame. jupiter/schema.py:140-144 records
+    that happening live: "alert if a vehicle enters the driveway" produced
+    target=person, predicate=in_zone, zone="".
+
+    So the fake model here is the point, not a convenience: it stands in for
+    any future interpreter that does not happen to carry the same check.
+    """
+    app_module, client, headers = backend
+
+    def rule(**overrides):
+        base = {"target": "person", "predicate": "present", "secondary": "", "description": "d",
+                "zone": "", "persist_s": 2, "min_count": 1, "confidence": 0.6,
+                "severity": "warning", "cooldown_s": 60, "schedule": "", "notify": "push"}
+        base.update(overrides)
+        return base
+
+    def fake_llm(prompt):
+        return {
+            "preset": "", "variant": "", "explanation": "test",
+            "settings": {}, "unsupported": [], "source": "fake",
+            "rules": [
+                rule(predicate="in_zone", zone="pool", description="someone in the pool area"),
+                rule(predicate="in_zone", zone="", description="someone enters the driveway"),
+                rule(predicate="near", secondary="", description="dog near the couch"),
+                rule(predicate="holding", secondary="", description="holding something"),
+            ],
+        }
+
+    app_module._ai_configure_llm = fake_llm
+    resp = client.post("/v1/ai/configure",
+                       json={"device_id": 1, "prompt": "watch the driveway"}, headers=headers)
+    data = resp.json()
+
+    kept = [(r["predicate"], r.get("zone", ""), r["secondary"]) for r in data["rules"]]
+    assert kept == [("in_zone", "pool", "")], f"an underspecified rule survived: {kept}"
+
+    reasons = " ".join(u["reason"] for u in data["unsupported"])
+    assert "needs a zone" in reasons
+    assert "needs a second object" in reasons
+    # The user has to learn what to add, or the rule just looks broken.
+    requires = " ".join(u["requires"] for u in data["unsupported"])
+    assert "zone the user draws" in requires

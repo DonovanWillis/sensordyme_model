@@ -28,7 +28,7 @@ import re
 import secrets
 import sqlite3
 import time
-from contextlib import asynccontextmanager, contextmanager
+from contextlib import asynccontextmanager, contextmanager, suppress
 from pathlib import Path
 from typing import Optional
 
@@ -146,7 +146,23 @@ async def _lifespan(_app: FastAPI):
             await asyncio.to_thread(advertiser.stop)
 
 
-app = FastAPI(title="SensorDyme Cloud", version="0.1", lifespan=_lifespan)
+#: Whether to publish the interactive API docs.
+#:
+#: Off by default. `/docs`, `/redoc` and `/openapi.json` were all answering 200
+#: to anyone who could reach the backend — and since the launchd template binds
+#: 0.0.0.0, that is everyone on the Wi-Fi. They describe every route, schema and
+#: field, which is a map for probing the rest. Useful while developing, so this
+#: is a switch rather than a deletion.
+_DOCS_ENABLED = os.environ.get("SENSORDYME_API_DOCS", "").strip().lower() in {"1", "true", "yes", "on"}
+
+app = FastAPI(
+    title="SensorDyme Cloud",
+    version="0.1",
+    lifespan=_lifespan,
+    docs_url="/docs" if _DOCS_ENABLED else None,
+    redoc_url="/redoc" if _DOCS_ENABLED else None,
+    openapi_url="/openapi.json" if _DOCS_ENABLED else None,
+)
 
 
 # ------------------------------------------------------------------------- storage
@@ -166,6 +182,27 @@ app = FastAPI(title="SensorDyme Cloud", version="0.1", lifespan=_lifespan)
 #: strictly better than failing: the device is polling every couple of seconds
 #: and has nothing else to do.
 BUSY_TIMEOUT_S = 15.0
+
+
+def _restrict_db_permissions() -> None:
+    """Make the database readable only by its owner.
+
+    It holds every account's email, password hash and salt, every device key,
+    every claim code, shipping addresses and the whole event history — and it was
+    created with the process umask, which on this machine meant `-rw-r--r--`.
+    Any local account could read all of it.
+
+    Contrast `_load_jwt_secret`, which opens its file 0o600 *before* writing so
+    the secret is never briefly exposed. The same care had not been applied one
+    file over. sqlite creates the database on first connect, so this runs after
+    `init_db` rather than before.
+
+    Best-effort: a database on a filesystem that cannot express these bits must
+    not stop the backend from serving.
+    """
+    for path in (DB_PATH, f"{DB_PATH}-wal", f"{DB_PATH}-shm"):
+        with suppress(OSError):
+            os.chmod(path, 0o600)
 
 
 def _connect() -> sqlite3.Connection:
@@ -314,6 +351,7 @@ def init_db() -> None:
 
 
 init_db()
+_restrict_db_permissions()
 
 
 # ------------------------------------------------------------------------- auth helpers
@@ -1559,6 +1597,37 @@ def _validate_proposal(data: dict) -> dict:
                 "requires": verdict.requires or "additional model or training data",
                 "support": verdict.support.value,
                 "alternatives": list(verdict.alternatives),
+            })
+            continue
+
+        # Predicates that are meaningless without their second half. The
+        # registry check above cannot see this -- it assessed "person" and
+        # "in_zone" independently and both pass on their own.
+        #
+        # This duplicates jupiter/schema.py:145-156 ON PURPOSE. Until now that
+        # was the ONLY place the check existed: this function did not look at
+        # `zone` at all, and neither does core/rules.py's ConfiguredRule
+        # .from_dict. So the property "an area rule only fires in its area" was
+        # enforced exclusively inside the AI layer -- swap the interpreter and
+        # it leaves with it, silently. An application safety rule may not be
+        # delegated to the thing it is checking.
+        zone = str(rule.get("zone") or "").strip()
+        if predicate == "in_zone" and not zone:
+            unsupported.append({
+                "request": described,
+                "reason": "'in_zone' needs a zone to watch, and none was named",
+                "requires": "a zone the user draws in the app",
+                "support": "unsupported",
+                "alternatives": [],
+            })
+            continue
+        if predicate in ("near", "holding", "near_mouth") and not secondary:
+            unsupported.append({
+                "request": described,
+                "reason": f"'{predicate}' needs a second object, and none was named",
+                "requires": "a second object for the relation",
+                "support": "unsupported",
+                "alternatives": [],
             })
             continue
 

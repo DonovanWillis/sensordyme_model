@@ -25,6 +25,7 @@ import signal
 import subprocess
 import threading
 import time
+from contextlib import suppress
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Optional
@@ -201,6 +202,7 @@ class DeviceRuntime:
         burn a whole systemd restart cycle (and model reload) per attempt."""
         last_exc: Optional[Exception] = None
         for attempt in range(1, _CAMERA_OPEN_RETRIES + 1):
+            camera: Optional[Camera] = None
             try:
                 camera = Camera(self.config.get("camera", {}))
                 # Prove it produces frames before declaring victory (the "verify
@@ -211,6 +213,16 @@ class DeviceRuntime:
                 return camera
             except (CameraError, RuntimeError) as exc:
                 last_exc = exc
+                # Release before retrying. `Camera()` can succeed (the sensor is
+                # started) and the verifying `read()` then fail, which left a live
+                # handle on /dev/video* behind on every attempt — so attempts 2-5
+                # were contending with the fds attempt 1 still owned, making each
+                # one likelier to fail than the last. Five failures inside
+                # StartLimitIntervalSec then reach StartLimitAction=reboot, so a
+                # transient glitch could become a reboot cycle.
+                if camera is not None:
+                    with suppress(Exception):  # nothing to do if even this fails
+                        camera.release()
                 log.warning(
                     "camera open attempt %d/%d failed: %s", attempt, _CAMERA_OPEN_RETRIES, exc
                 )

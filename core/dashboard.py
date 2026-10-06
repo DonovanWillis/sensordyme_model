@@ -33,6 +33,12 @@ from typing import Optional
 import cv2
 import numpy as np
 
+from core.logging_setup import get_logger
+
+#: This module had no logger at all. It needs exactly one — the open-dashboard
+#: warning below is the only thing here worth saying out loud.
+log = get_logger("dashboard")
+
 _JPEG_QUALITY = 60  # phone-screen quality; every point costs CPU on the Pi's encode path
 _STREAM_FPS = 12  # cap on frames pushed to a connected viewer (detection still runs at camera fps)
 _MAX_EVENTS = 200
@@ -66,6 +72,15 @@ class DashboardServer:
     ) -> None:
         self._host = host
         self._port = port
+        #: Whether this bind is reachable from anything but this machine.
+        #:
+        #: The distinction matters because the auth gate below used to treat "no
+        #: token configured" as "no auth required", which is a safe default on
+        #: loopback and the opposite of safe on 0.0.0.0 — and 0.0.0.0 is what
+        #: config.yaml ships. The result was the live camera feed, the event
+        #: history, the preset control and the Wi-Fi reprovisioning endpoint all
+        #: answering unauthenticated to anyone on the Wi-Fi.
+        self._network_reachable = host not in ("127.0.0.1", "::1", "localhost")
         self._module_name = module_name
         self._presets = presets or {}
         self._active_preset = active_preset
@@ -101,7 +116,17 @@ class DashboardServer:
             def _authorized(self) -> bool:
                 """When a device token is configured, require it on every /api and /stream path."""
                 if dashboard._token is None:
-                    return True
+                    # No token configured. On loopback that is a reasonable
+                    # convenience; on a network-reachable bind it is an open
+                    # camera, so refuse instead.
+                    #
+                    # Deliberately NOT solved by binding loopback: the phone
+                    # fetches /stream from this dashboard directly, so refusing
+                    # to listen on the LAN would delete the live feed rather
+                    # than secure it. Failing closed keeps the feature available
+                    # to anyone who sets a token and shuts the door for anyone
+                    # who has not.
+                    return not dashboard._network_reachable
                 sent = self.headers.get("X-Device-Token", "")
                 if not sent and "token=" in self.path:
                     # Kept for the MJPEG <img> case, which cannot set a header. It is
@@ -265,6 +290,18 @@ class DashboardServer:
                         self.end_headers()
                 except (BrokenPipeError, ConnectionResetError):
                     pass  # browser tab closed mid-stream
+
+        if self._network_reachable and self._token is None:
+            # Said once, loudly, at the only moment anyone is reading the log.
+            # The dashboard still starts — it will simply refuse every /api and
+            # /stream request — because a device that fails to boot is worse than
+            # one that boots and declines to show a stranger the camera.
+            log.error(
+                "dashboard is bound to %s with no token configured: every /api and "
+                "/stream request will be refused. Set dashboard.token in config.yaml "
+                "to use the live feed, or bind 127.0.0.1 if you do not need it.",
+                self._host,
+            )
 
         self._httpd = ThreadingHTTPServer((self._host, self._port), _Handler)
         self._port = self._httpd.server_address[1]  # resolve port 0 -> actual

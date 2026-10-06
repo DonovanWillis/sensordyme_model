@@ -358,7 +358,15 @@ class RuleEngine:
             active = present and count >= rule.min_count
             if active and not _in_window(rule.schedule, minute_of_day):
                 active = False  # outside its hours the rule observes nothing at all
-            if active and rule.zone:
+            if active and (rule.zone or rule.predicate == "in_zone"):
+                # `or rule.predicate == "in_zone"` is the whole point: a rule
+                # whose predicate is in_zone but whose zone is EMPTY used to
+                # skip this check and stay active on bare presence, firing
+                # frame-wide. _in_zone("") resolves no zone and returns False,
+                # so routing through it makes such a rule inert -- the same
+                # direction _in_zone already chose for a zone that is named but
+                # never drawn. Until now the only thing standing between a
+                # model and a frame-wide alert was jupiter/schema.py:145.
                 active = self._in_zone(rule.zone, boxes, frame_size)
 
             for transition in self._engine.update(rule.rule_id, active, confidence, now=now):
@@ -424,8 +432,8 @@ class RuleEngine:
 
             if active and not _in_window(rule.schedule, minute_of_day):
                 active = False  # outside its hours the rule observes nothing at all
-            if active and rule.zone:
-                active = self._in_zone(rule.zone, boxes, frame.size)
+            if active and (rule.zone or rule.predicate == "in_zone"):
+                active = self._in_zone(rule.zone, boxes, frame.size)  # see update()
 
             confidence = frame.mean_confidence(rule.detection) if seen else 0.0
             # An absence rule is a confident observation of nothing, so it cannot

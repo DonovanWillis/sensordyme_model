@@ -155,3 +155,34 @@ def test_absence_rule_fires_when_the_room_empties():
 def test_absence_rule_does_not_fire_while_someone_is_there():
     engine = RuleEngine([rule(detection="person", predicate="absent")])
     assert drive_frames(engine, frame(person())) == []
+
+
+def test_an_in_zone_rule_with_no_zone_is_inert_rather_than_frame_wide():
+    """A zone rule that names no zone must not degrade into "anywhere in frame".
+
+    `if active and rule.zone` skipped the zone check entirely when the zone was
+    empty, so an `in_zone` rule fell back to bare presence and alerted on a
+    person anywhere -- the opposite of what was asked, and much broader. The
+    adjacent decision in `_in_zone` had already chosen the other direction for a
+    zone that is named but never drawn ("firing everywhere is worse than not
+    firing"); these two now agree.
+
+    Checked here, on the device, and not only at the backend: the only thing
+    previously preventing this was a validator inside the AI layer
+    (jupiter/schema.py), and the device must not depend on that.
+    """
+    anywhere = rule(predicate="in_zone", zone="", description="someone enters the driveway")
+    engine = RuleEngine([anywhere], zones=[POOL])
+    assert drive_frames(engine, frame(person(OUT_OF_POOL))) == []
+    assert drive_frames(engine, frame(person(IN_POOL)), start=9000.0) == []
+
+    # The ordinary zone rule is unaffected -- this must fail closed, not fail.
+    proper = rule(predicate="in_zone", zone="pool", description="someone in the pool")
+    engine = RuleEngine([proper], zones=[POOL])
+    assert drive_frames(engine, frame(person(OUT_OF_POOL))) == []
+    alerts = drive_frames(engine, frame(person(IN_POOL)), start=9000.0)
+    assert len(alerts) == 1 and alerts[0].zone == "pool"
+
+    # And a rule that never claimed to be zone-bound still fires everywhere.
+    plain = rule(description="someone is here")
+    assert len(drive_frames(RuleEngine([plain]), frame(person(OUT_OF_POOL)))) == 1

@@ -5,6 +5,7 @@ import time
 import urllib.request
 
 import numpy as np
+import pytest
 
 from core.dashboard import FLASH_DURATION_S, DashboardServer
 from core.events import Event
@@ -137,6 +138,46 @@ def test_device_token_gates_api_when_set():
         assert status == 202
     finally:
         server.close()
+
+
+def test_untokened_dashboard_fails_closed_on_a_network_bind():
+    """A LAN-reachable dashboard with no token must refuse, not serve the camera.
+
+    This is the regression guard for the open-camera default. `token: null` used
+    to mean "no authentication", which on the Pi's `host: 0.0.0.0` meant the live
+    feed and the whole /api surface were served to every stranger on the Wi-Fi --
+    verified at the time by two unauthenticated 200s from another machine.
+
+    The fix is deliberately NOT "bind 127.0.0.1": the phone fetches /stream from
+    this dashboard directly, so refusing to listen on the LAN would delete the
+    live feed rather than secure it. So the two halves are asserted together --
+    loopback still serves without a token (a real convenience), a network bind
+    without a token refuses everything (/api AND /stream, which is the one that
+    actually shows a picture).
+    """
+    loopback = DashboardServer(host="127.0.0.1", port=0)
+    url = loopback.start()
+    try:
+        status, _, _ = _get(url + "/api/state")
+        assert status == 200, "loopback with no token should still be a convenience"
+    finally:
+        loopback.close()
+
+    exposed = DashboardServer(host="0.0.0.0", port=0)  # noqa: S104 - that IS the case under test
+    url = exposed.start()
+    try:
+        for path in ("/api/state", "/api/health", "/stream"):
+            with pytest.raises(urllib.error.HTTPError) as caught:
+                urllib.request.urlopen(url + path, timeout=5)  # noqa: S310 - fixed http:// URL
+            code = caught.value.code
+            assert code == 401, f"{path} answered {code} to an unauthenticated caller"
+        # The page itself is harmless and stays reachable, so the operator can
+        # see *why* -- a blank refusal with no explanation is how this gets
+        # debugged as "the feed is broken" instead of "set a token".
+        status, _, _ = _get(url + "/")
+        assert status == 200
+    finally:
+        exposed.close()
 
 
 def test_history_reads_events_csv(tmp_path):

@@ -1509,3 +1509,53 @@ class TestAIProposalMatchesWhatTheAppCanDecode:
         contract rather than a label."""
         body = self._proposal(backend, "asdfghjkl nonsense zzz")
         assert body["source"] == "unavailable"
+
+
+def test_interactive_api_docs_are_off_unless_explicitly_enabled(backend, tmp_path, monkeypatch):
+    """/docs, /redoc and /openapi.json must not be served by default.
+
+    FastAPI serves all three automatically, so the backend was publishing a
+    complete, browsable map of its own attack surface -- every path, every
+    parameter, every schema -- to anybody who could reach the port, including a
+    "Try it out" button. That is a reconnaissance gift, not a feature, on a box
+    whose whole job is to sit on a home LAN.
+
+    They stay available for development behind an explicit opt-in, because a
+    debugging aid that cannot be turned on gets replaced by something worse.
+    """
+    _, client = backend
+    for path in ("/docs", "/redoc", "/openapi.json"):
+        assert client.get(path).status_code == 404, f"{path} is being served"
+
+    monkeypatch.setenv("SENSORDYME_API_DOCS", "1")
+    monkeypatch.setenv("SENSORDYME_DB", str(tmp_path / "docs-on.db"))
+    for mod in ("cloud.app", "cloud", "cloud.ratelimit"):
+        sys.modules.pop(mod, None)
+    opted_in = importlib.import_module("cloud.app")
+    try:
+        with TestClient(opted_in.app) as dev_client:
+            assert dev_client.get("/openapi.json").status_code == 200
+            assert dev_client.get("/docs").status_code == 200
+    finally:
+        for mod in ("cloud.app", "cloud", "cloud.ratelimit"):
+            sys.modules.pop(mod, None)
+
+
+def test_the_database_is_not_readable_by_other_accounts(backend):
+    """The DB holds password hashes and JWT revocations; 0600 or it is pointless.
+
+    The JWT secret one file over was already written with 0600 via a careful
+    open(..., 0o600) dance; the database it protects was left at whatever the
+    process umask happened to be, which on a shared or multi-user box means
+    world-readable password hashes. sqlite creates the file on first connect, so
+    this is asserted after the app module has initialised it -- and the -wal and
+    -shm sidecars matter just as much, since in WAL mode recent rows live there.
+    """
+    app_module, _ = backend
+    db = Path(app_module.DB_PATH)
+    assert db.exists(), "the backend should have created the database on import"
+    for path in (db, Path(f"{db}-wal"), Path(f"{db}-shm")):
+        if not path.exists():
+            continue  # -wal/-shm only exist once WAL has been written to
+        mode = path.stat().st_mode & 0o777
+        assert mode == 0o600, f"{path.name} is {oct(mode)}, expected 0o600"
