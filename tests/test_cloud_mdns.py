@@ -315,8 +315,11 @@ class _FakeZeroconf:
         self.unregistered: list = []
         self.closed = False
         self.update_error: Exception | None = None
+        self.register_error: Exception | None = None
 
     def register_service(self, info) -> None:
+        if self.register_error is not None:
+            raise self.register_error
         self.registered.append(info)
 
     def update_service(self, info) -> None:
@@ -331,6 +334,18 @@ class _FakeZeroconf:
         self.closed = True
 
 
+class _Built(list):
+    """Every Zeroconf the Advertiser constructed, newest last, plus a way to make
+    the NEXT construction fail -- which is what a rebind under a flapping
+    interface actually looks like."""
+
+    arm: dict
+
+
+def _zeroconf_failing(built: _Built, *, register_error: Exception) -> None:
+    built.arm["register_error"] = register_error
+
+
 def _advertised_address(info) -> str:
     return socket.inet_ntoa(info.addresses[0])
 
@@ -339,8 +354,21 @@ def _advertised_address(info) -> str:
 def fake_mdns(monkeypatch):
     """An Advertiser wired to a fake Zeroconf, with the machine's identity under
     the test's control and the refresh timer off so ticks are explicit."""
-    fake = _FakeZeroconf()
-    monkeypatch.setattr(_zeroconf, "Zeroconf", lambda *a, **k: fake)
+    built: _Built = _Built()
+
+    arm: dict = {"register_error": None}
+
+    def _new_zeroconf(*_a, **_k):
+        # A FRESH instance per construction, which is the whole point: the bug
+        # was reusing one whose sockets were bound to an address that had gone.
+        instance = _FakeZeroconf()
+        instance.register_error = arm["register_error"]
+        built.append(instance)
+        return instance
+
+    built.arm = arm
+
+    monkeypatch.setattr(_zeroconf, "Zeroconf", _new_zeroconf)
 
     identity = {"address": "10.0.0.5", "host": "mac-one"}
     monkeypatch.setattr(mdns, "lan_ip", lambda: identity["address"])
@@ -348,9 +376,11 @@ def fake_mdns(monkeypatch):
 
     advertiser = mdns.Advertiser(8787, refresh_interval_s=0)
     assert advertiser.start() is True
+    assert len(built) == 1, "start() builds exactly one Zeroconf"
+    fake = built[0]
     assert len(fake.registered) == 1
     try:
-        yield advertiser, fake, identity
+        yield advertiser, fake, identity, built
     finally:
         advertiser.stop()
 
@@ -367,27 +397,47 @@ class TestAdvertisementStaysTrue:
     """
 
     def test_a_quiet_tick_changes_nothing(self, fake_mdns):
-        advertiser, fake, _ = fake_mdns
+        advertiser, fake, _, _built = fake_mdns
         assert advertiser.refresh() is False
         assert fake.updated == []
         assert fake.unregistered == []
 
-    def test_a_new_dhcp_lease_is_corrected_in_place(self, fake_mdns):
-        advertiser, fake, identity = fake_mdns
+    def test_a_new_dhcp_lease_REBINDS_rather_than_updating_in_place(self, fake_mdns):
+        """This test used to assert `update_service`, and that was the bug.
+
+        python-zeroconf binds its multicast sockets to the interface addresses
+        present when the instance is constructed, and never rebinds them. So
+        updating the record in place on an instance that has outlived a DHCP move
+        re-announces over sockets bound to an address that is gone.
+
+        What that looked like in the field, measured on a campus network that
+        moved this Mac 38 times across 12 subnets: the SERVICE record kept being
+        found -- macOS's own responder relays it -- while the STABLE_HOSTNAME A
+        record inside it was answered on loopback only. A phone therefore found
+        the service, failed to resolve the hostname in it, and said "Couldn't
+        find a SensorDyme on this network". A Zeroconf instance built fresh at the
+        same instant published the same name on en0 correctly, which is what
+        identified the instance's age as the variable rather than the network.
+
+        So a move now rebuilds. Clients see the service leave and come back
+        instead of correcting itself, which is the right trade: a brief
+        re-announcement is recoverable and an unresolvable hostname is not.
+        """
+        advertiser, fake, identity, built = fake_mdns
         identity["address"] = "192.168.4.22"
 
         assert advertiser.refresh() is True
 
-        assert len(fake.updated) == 1
-        assert _advertised_address(fake.updated[-1]) == "192.168.4.22"
-        # In place: browsing clients see one service correcting itself, not one
-        # leaving and another arriving.
-        assert fake.unregistered == []
+        assert len(built) == 2, "the move must build a NEW Zeroconf, not reuse the old one"
+        assert fake.closed, "and the old instance's dead sockets must be closed"
+        assert fake.updated == [], "update_service on a stale instance is the bug itself"
+        assert _advertised_address(built[-1].registered[-1]) == "192.168.4.22"
+        assert built[-1].registered[-1].server == f"{mdns.STABLE_HOSTNAME}.local."
 
     def test_the_instance_name_does_not_churn(self, fake_mdns):
         """What a client keys on must stay put, or one server looks like several
         appearing and disappearing."""
-        advertiser, fake, identity = fake_mdns
+        advertiser, fake, identity, _built = fake_mdns
         original = fake.registered[0].name
 
         identity["address"] = "192.168.4.22"
@@ -412,7 +462,7 @@ class TestAdvertisementStaysTrue:
         does not appear in it. The strongest form of the fix is that this test
         asserts *nothing happens*.
         """
-        advertiser, fake, identity = fake_mdns
+        advertiser, fake, identity, _built = fake_mdns
         identity["host"] = "mac-one-4"
 
         assert advertiser.refresh() is False, "a rename must not disturb the record"
@@ -422,7 +472,7 @@ class TestAdvertisementStaysTrue:
         assert fake.registered[0].server == f"{mdns.STABLE_HOSTNAME}.local."
 
     def test_losing_the_network_withdraws_rather_than_lying(self, fake_mdns):
-        advertiser, fake, identity = fake_mdns
+        advertiser, fake, identity, _built = fake_mdns
         identity["address"] = None
 
         assert advertiser.refresh() is True
@@ -432,41 +482,110 @@ class TestAdvertisementStaysTrue:
         assert len(fake.registered) == 1
 
     def test_the_announcement_comes_back_when_the_network_does(self, fake_mdns):
-        advertiser, fake, identity = fake_mdns
+        advertiser, _fake, identity, built = fake_mdns
         identity["address"] = None
         advertiser.refresh()
 
         identity["address"] = "172.20.10.2"
         assert advertiser.refresh() is True
 
-        assert len(fake.registered) == 2
-        assert _advertised_address(fake.registered[-1]) == "172.20.10.2"
+        # A DIFFERENT address came back, so this rebinds: the fresh announcement
+        # lands on a new instance rather than the one bound to the old address.
+        # That shape -- interface down, then up on a new address -- is how most
+        # DHCP moves actually arrive, which is why this path has to rebind too.
+        assert len(built) == 2
+        assert len(built[-1].registered) == 1
+        assert _advertised_address(built[-1].registered[-1]) == "172.20.10.2"
 
     def test_a_withdrawn_record_stays_withdrawn_on_a_quiet_tick(self, fake_mdns):
-        advertiser, fake, identity = fake_mdns
+        advertiser, fake, identity, _built = fake_mdns
         identity["address"] = None
         advertiser.refresh()
         assert advertiser.refresh() is False
         assert len(fake.unregistered) == 1
 
-    def test_a_failed_update_keeps_the_previous_record(self, fake_mdns):
-        """Better to go on announcing the old address than to announce nothing at
-        all by accident — and the log has to say which happened."""
-        advertiser, fake, identity = fake_mdns
-        fake.update_error = OSError("network down mid-update")
+    def test_a_rebind_that_cannot_register_reports_failure(self, fake_mdns):
+        """A move that cannot be re-announced must say so rather than look fine.
+
+        The old version of this test asserted the PREVIOUS address survived a
+        failed update. That is no longer the right guarantee and keeping it would
+        have been wrong: once the interface has moved, the old address is not a
+        safer thing to keep advertising -- it is a dead address, and a phone
+        handed one stops looking, where a phone handed nothing keeps searching.
+        So the record is dropped and `refresh` returns False.
+        """
+        advertiser, _fake, identity, built = fake_mdns
         identity["address"] = "192.168.4.22"
+        _zeroconf_failing(built, register_error=OSError("network down mid-register"))
 
         assert advertiser.refresh() is False
-        assert advertiser._address == "10.0.0.5"
+        assert advertiser._info is None, "a move that failed must not claim a live record"
+
+    def test_a_rebind_that_cannot_open_mdns_at_all_reports_failure(self, fake_mdns, monkeypatch):
+        """Constructing the replacement can itself fail while the network moves."""
+        advertiser, _fake, identity, _built = fake_mdns
+        identity["address"] = "192.168.4.22"
+        monkeypatch.setattr(
+            _zeroconf, "Zeroconf", lambda *a, **k: (_ for _ in ()).throw(OSError("no interface"))
+        )
+
+        assert advertiser.refresh() is False
+        assert advertiser._info is None
 
     def test_refresh_before_start_is_a_no_op(self):
         assert mdns.Advertiser(8787).refresh() is False
 
     def test_refresh_after_stop_is_a_no_op(self, fake_mdns):
-        advertiser, _, identity = fake_mdns
+        advertiser, _, identity, _built = fake_mdns
         advertiser.stop()
         identity["address"] = "192.168.4.22"
         assert advertiser.refresh() is False
+
+
+class TestTheInstanceNameIsOursNotTheNetworksx:
+    """The service instance name must not be derived from the machine hostname.
+
+    Found live, and it is why the app said "Couldn't find a SensorDyme on this
+    network" even once discovery was otherwise working. This network is a
+    university ResNet that assigns the hostname over DHCP as
+    `dhcp-10-130-229-13.dyn.uncc.edu` -- the IP ADDRESS, inside the hostname. The
+    instance name was `f"SensorDyme Cloud on {socket.gethostname()...}"`, so it
+    became `SensorDyme Cloud on dhcp-10-130-229-13` and changed with every lease.
+
+    The instance name is the client-facing key for a Bonjour service. One that
+    moves means a browsing client watches its known server vanish and an
+    unfamiliar one arrive on every DHCP move -- which is the opposite of what an
+    instance name exists to provide, and the same class of bug already fixed once
+    for `server` via STABLE_HOSTNAME.
+    """
+
+    def test_the_name_survives_a_hostname_that_embeds_the_ip(self, monkeypatch):
+        monkeypatch.setattr(
+            mdns.socket, "gethostname", lambda: "dhcp-10-130-229-13.dyn.uncc.edu"
+        )
+        name = mdns.Advertiser(8787).name
+        assert "dhcp" not in name, "the DHCP hostname must not reach the instance name"
+        assert "10-130" not in name, "and neither must the address inside it"
+
+    def test_the_name_is_the_same_on_two_different_networks(self, monkeypatch):
+        monkeypatch.setattr(mdns.socket, "gethostname", lambda: "dhcp-10-130-229-13")
+        first = mdns.Advertiser(8787).name
+        monkeypatch.setattr(mdns.socket, "gethostname", lambda: "dhcp-11-33-6-25")
+        assert mdns.Advertiser(8787).name == first, \
+            "the same backend on two networks is one service, not two"
+
+    def test_the_name_still_distinguishes_two_backends(self, monkeypatch):
+        """A single shared product name would make two Macs indistinguishable in
+        the picker, which is the failure `chooseBackend` refuses to guess at."""
+        monkeypatch.setattr(mdns, "backend_id", lambda: "bk_aaaaaaaaaaaa")
+        mine = mdns.Advertiser(8787).name
+        monkeypatch.setattr(mdns, "backend_id", lambda: "bk_bbbbbbbbbbbb")
+        assert mdns.Advertiser(8787).name != mine
+
+    def test_the_name_is_a_legal_mdns_label(self):
+        name = mdns.Advertiser(8787).name
+        assert "." not in name, "a dot splits the label into a name nobody published"
+        assert 0 < len(name.encode()) <= 63  # RFC 6763 instance-name limit
 
 
 class TestStableIdentity:
@@ -479,22 +598,24 @@ class TestStableIdentity:
     """
 
     def test_the_advertised_hostname_is_one_we_own(self, fake_mdns):
-        _, fake, _ = fake_mdns
+        _, fake, _, _built = fake_mdns
         assert fake.registered[0].server == f"{mdns.STABLE_HOSTNAME}.local."
 
     def test_the_advertised_hostname_does_not_contain_the_machine_name(self, fake_mdns):
         """The specific regression: `mac-one` must not appear in the record."""
-        _, fake, identity = fake_mdns
+        _, fake, identity, _built = fake_mdns
         assert identity["host"] not in fake.registered[0].server
 
     def test_a_new_address_still_moves_the_record(self, fake_mdns):
         """A stable name must not mean a frozen address — the name resolves to
         wherever the machine currently is, so the address must still track."""
-        advertiser, fake, identity = fake_mdns
+        advertiser, _fake, identity, built = fake_mdns
         identity["address"] = "192.168.9.9"
         assert advertiser.refresh() is True
-        assert _advertised_address(fake.updated[-1]) == "192.168.9.9"
-        assert fake.updated[-1].server == f"{mdns.STABLE_HOSTNAME}.local."
+        latest = built[-1].registered[-1]
+        assert _advertised_address(latest) == "192.168.9.9"
+        assert latest.server == f"{mdns.STABLE_HOSTNAME}.local.", \
+            "the NAME is what clients keep; only the address it points at moves"
 
     def test_the_stable_name_is_short_and_dns_safe(self):
         """It becomes a DNS label, so it cannot carry dots, spaces or capitals
@@ -516,7 +637,7 @@ class TestBackendIdentity:
     """
 
     def test_the_id_is_advertised_in_the_txt_record(self, fake_mdns):
-        advertiser, fake, _ = fake_mdns
+        advertiser, fake, _, _built = fake_mdns
         txt = fake.registered[0].properties
         assert txt[b"id"].decode() == advertiser.backend_id
 

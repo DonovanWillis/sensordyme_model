@@ -186,10 +186,24 @@ class Advertiser:
         refresh_interval_s: float = REFRESH_INTERVAL_S,
     ) -> None:
         self.port = port
-        self.name = name or f"SensorDyme Cloud on {socket.gethostname().split('.')[0]}"
         self.refresh_interval_s = refresh_interval_s
         #: Read once: an identity that changes while the process runs is not one.
         self.backend_id = backend_id()
+        #: The service INSTANCE name — the client-facing key for this service.
+        #:
+        #: Derived from this backend's own id, not from the machine's hostname,
+        #: for the same reason `server` is STABLE_HOSTNAME rather than the OS
+        #: name. The hostname is not ours: this network (a university ResNet)
+        #: hands out `dhcp-10-130-229-13.dyn.uncc.edu` via DHCP, so
+        #: `socket.gethostname()` embeds the IP ADDRESS and the instance name
+        #: changed with every lease. A browsing client saw its known server
+        #: disappear and an unfamiliar one arrive on each move, which is the
+        #: opposite of what an instance name is for.
+        #:
+        #: Short id suffix rather than the bare product name so two backends on
+        #: one network stay distinguishable in the app's picker; the full id is
+        #: still in the TXT record, which is what clients actually match on.
+        self.name = name or f"SensorDyme Cloud ({self.backend_id.removeprefix('bk_')[:8]})"
         self._zeroconf = None
         self._info = None
         #: The address currently on the wire, so a refresh can tell whether
@@ -199,6 +213,20 @@ class Advertiser:
         #: (STABLE_HOSTNAME), so a machine rename no longer changes the record and
         #: there is nothing to track about the hostname any more.
         self._address: Optional[str] = None
+        #: The address the live Zeroconf instance was CONSTRUCTED against.
+        #:
+        #: python-zeroconf binds its multicast sockets to the interface addresses
+        #: that exist when the instance is created, and does not rebind them
+        #: afterwards. So an instance that outlives a DHCP move is listening and
+        #: answering on an address that is gone. Measured on a campus network that
+        #: moved this Mac 38 times across 12 subnets: the SERVICE record survived
+        #: (macOS's own responder relays it, so browsing still worked), but the
+        #: STABLE_HOSTNAME A record was answered on loopback only -- so a phone
+        #: found the service, could not resolve the name in it, and reported
+        #: "Couldn't find a SensorDyme on this network". A freshly built instance
+        #: published the same name on en0 correctly at the same instant, which is
+        #: what identified the instance's age as the variable.
+        self._bound_address: Optional[str] = None
         self._lock = threading.Lock()
         self._stopping = threading.Event()
         self._watcher: Optional[threading.Thread] = None
@@ -221,6 +249,37 @@ class Advertiser:
             # STABLE_HOSTNAME for the ten-day outage that distinction cost.
             server=f"{STABLE_HOSTNAME}.local.",
         )
+
+    def _rebind_locked(self, address: str) -> bool:
+        """Rebuild the Zeroconf instance so its sockets bind to `address`.
+
+        The only way to rebind python-zeroconf is to construct a new one: there
+        is no public API to re-bind an existing instance, and `update_service`
+        on a stale one silently keeps using the dead sockets.
+        """
+        from zeroconf import Zeroconf
+
+        previous = self._zeroconf
+        self._info = None
+        self._address = None
+        if previous is not None:
+            # Best effort: the old sockets are bound to an address that no longer
+            # exists, so closing them can fail, and that is not a reason to stop.
+            with contextlib.suppress(Exception):
+                previous.close()
+        try:
+            self._zeroconf = Zeroconf()
+        except Exception as exc:  # noqa: BLE001 - advertising is never worth a crash
+            log.warning(
+                "could not re-open mDNS for %s (%s); this server is not "
+                "announcing itself until the next refresh",
+                address, repr(exc),
+            )
+            self._zeroconf = None
+            self._bound_address = None
+            return False
+        self._bound_address = address
+        return True
 
     def _register_locked(self, address: str) -> bool:
         """Put the record on the wire. Caller holds the lock."""
@@ -284,32 +343,46 @@ class Advertiser:
 
             if self._info is None:
                 log.info("a LAN address is available again (%s); re-announcing", address)
+                # The usual shape of a DHCP move is interface-down then
+                # interface-up on a NEW address, so this path -- not the
+                # address-changed one below -- is where most moves land. It has to
+                # rebind too, or the re-announcement goes out on dead sockets.
+                if address != self._bound_address and not self._rebind_locked(address):
+                    return False
                 return self._register_locked(address)
 
             if address == self._address:
                 return False
 
             previous_address = self._address
-            # An update in place, which browsing clients see as the same service
-            # correcting itself rather than one leaving and another arriving.
+            # A new address means the sockets under this instance are bound to an
+            # address that is gone, so the instance is rebuilt rather than
+            # updated in place.
             #
-            # A machine rename used to need a full re-registration here, because
-            # the old record carried the OS hostname in `server`. It carries
-            # STABLE_HOSTNAME now, so a rename changes nothing that is on the wire
-            # and this is the only case left: a new address.
-            try:
-                info = self._build_info(address)
-                self._zeroconf.update_service(info)
-            except Exception as exc:  # noqa: BLE001
+            # `update_service` was what this did, and it is where the bug lived:
+            # it updates the record the instance holds and re-announces it over
+            # those dead sockets. Browsing kept working because macOS's own
+            # responder relays the service, which is exactly why this was so hard
+            # to see -- the service was found and only the hostname in it could
+            # not be resolved.
+            #
+            # The cost is that clients see the service leave and return instead of
+            # correcting itself. That is the right trade: a brief re-announcement
+            # is recoverable, and an unresolvable hostname is not.
+            if not self._rebind_locked(address):
                 log.warning(
-                    "this machine moved to %s but the announcement could not be "
-                    "updated (%s); it still says %s, which the app will read as "
-                    "the server being down",
-                    address, repr(exc), previous_address,
+                    "this machine moved to %s but mDNS could not be re-opened; it "
+                    "is no longer announcing (was %s)",
+                    address, previous_address,
                 )
                 return False
-            self._info = info
-            self._address = address
+            if not self._register_locked(address):
+                log.warning(
+                    "this machine moved to %s but the announcement could not be "
+                    "re-made; it is no longer announcing (was %s)",
+                    address, previous_address,
+                )
+                return False
             log.info(
                 "this machine moved (%s -> %s); the announcement now points at "
                 "http://%s:%d",
@@ -351,6 +424,7 @@ class Advertiser:
                 )
                 self._zeroconf = None
                 return False
+            self._bound_address = address
             registered = self._register_locked(address)
 
         if not registered:
