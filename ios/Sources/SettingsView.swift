@@ -279,6 +279,9 @@ struct SettingsView: View {
         case .searching:
             Label("Looking…", systemImage: "arrow.triangle.2.circlepath")
                 .foregroundStyle(SD.Colors.textSecondary)
+        case .reconnecting:
+            Label("Reconnecting…", systemImage: "arrow.triangle.2.circlepath")
+                .foregroundStyle(SD.Colors.textSecondary)
         case .unreachable:
             Label("Not connected", systemImage: "exclamationmark.triangle.fill")
                 .foregroundStyle(.orange)
@@ -332,6 +335,8 @@ struct SettingsView: View {
         if let found {
             findMessage = "Found your server at \(found)."
         } else if case let .unreachable(reason) = state.backendStatus {
+            findMessage = reason
+        } else if case let .reconnecting(_, reason) = state.backendStatus {
             findMessage = reason
         } else {
             findMessage = "No SensorDyme server answered on this Wi-Fi. Check that it is running and that this phone is on the same network."

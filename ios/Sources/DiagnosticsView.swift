@@ -90,6 +90,12 @@ struct DiagnosticsView: View {
         case .searching:
             results.append(.init(name: "Server connection", passed: nil,
                                  detail: "still looking for the server on this network"))
+        case .reconnecting(let attempt, let reason):
+            // `passed: nil`, not false: automatic recovery is still running, and
+            // a doctor that reports a red cross mid-retry sends someone to debug
+            // a network that is about to work.
+            results.append(.init(name: "Server connection", passed: nil,
+                                 detail: "reconnecting (attempt \(attempt)) — \(reason)"))
         case .unreachable(let reason):
             results.append(.init(name: "Server connection", passed: false, detail: reason))
         case .unknown:

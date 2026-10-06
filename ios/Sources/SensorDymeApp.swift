@@ -47,6 +47,12 @@ struct RootView: View {
                     // which is why a pinned address that does not answer got
                     // probed twice before discovery ever ran.
                     break
+                case .reconnecting:
+                    // A backoff timer is already armed, but coming back to the
+                    // foreground is exactly the moment the network has usually
+                    // changed under us -- so try now rather than waiting out a
+                    // delay that was sized for a phone sitting in a pocket.
+                    state.reconnect()
                 case .unreachable, .unknown:
                     state.reconnect()
                 }

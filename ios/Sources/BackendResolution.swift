@@ -477,4 +477,71 @@ enum BackendResolution {
     static func verificationIsCurrent(generation: Int, current: Int) -> Bool {
         generation >= current
     }
+
+    // MARK: - Where the endpoint came from, and how hard we have tried
+
+    /// Which mechanism produced the endpoint in force.
+    ///
+    /// Worth carrying rather than inferring: "the cached address answered" and
+    /// "Bonjour found it just now" are the same URL and very different facts
+    /// about the network, and the logs were unable to tell them apart.
+    enum ResolutionSource: String, Equatable {
+        /// The last-known-good endpoint, reused for a fast start.
+        case cached
+        /// Found on the network this moment.
+        case bonjour
+        /// Typed by a person in Settings.
+        case manual
+    }
+
+    /// How many automatic attempts must fail before the app admits defeat and
+    /// points the user at Settings.
+    ///
+    /// The reason this constant exists: the app told the user to go and type an
+    /// IP address after the FIRST failed resolve, while exponential retry was
+    /// still running happily in the background and would usually succeed
+    /// seconds later. So the advice arrived before the recovery it was
+    /// pre-empting, and taught people that SensorDyme needs manual setup when
+    /// it does not. Three attempts is ~2s + ~4s + ~8s of jittered backoff,
+    /// which covers a backend still starting up or a Wi-Fi association that has
+    /// not settled.
+    static let attemptsBeforeSuggestingManualEntry = 3
+
+    /// What to say about a failed attempt, given how many have failed.
+    ///
+    /// `permissionProblem` short-circuits everything: a denied Local Network
+    /// permission is the one cause no amount of retrying can fix, so it is said
+    /// at once rather than after the backoff has run its course.
+    static func failureMessage(
+        attempts: Int,
+        triedHost: String?,
+        permissionProblem: String? = nil
+    ) -> String {
+        if let permissionProblem, !permissionProblem.isEmpty { return permissionProblem }
+
+        let stillTrying = attempts < attemptsBeforeSuggestingManualEntry
+        if stillTrying {
+            // Deliberately no mention of Settings. Recovery is in progress, and
+            // the honest thing to report is that it is in progress.
+            if let triedHost, !triedHost.isEmpty {
+                return "Reconnecting to SensorDyme — \(triedHost) didn't answer."
+            }
+            return "Looking for SensorDyme on this Wi-Fi…"
+        }
+
+        guard let triedHost, !triedHost.isEmpty else {
+            return "No SensorDyme server answered on this Wi-Fi. Check that the backend "
+                + "is running on your Mac and that this phone is on the same network. "
+                + "You can also enter the address yourself in Settings → Manual server address."
+        }
+        return "Nothing answered at \(triedHost), and no server was found on this Wi-Fi. "
+            + unreachableAdvice(host: triedHost)
+            + " You can also enter the address yourself in Settings → Manual server address."
+    }
+
+    /// Whether automatic recovery is still worth waiting for, which is what
+    /// decides between a "reconnecting" state and a terminal one.
+    static func isStillRecovering(attempts: Int) -> Bool {
+        attempts < attemptsBeforeSuggestingManualEntry
+    }
 }

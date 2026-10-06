@@ -21,6 +21,15 @@ struct APIClient {
     /// Finds the backend when the saved address is missing or has stopped
     /// answering. Supplied by AppState; see BackendLocator.
     var relocate: (@Sendable () async -> URL?)?
+    /// What to tell the user when there is no backend to talk to.
+    ///
+    /// Supplied by AppState rather than written here, because the right words
+    /// depend on how many attempts have failed — and this type has no way to
+    /// know that. The message it used to hardcode told the user to type an IP
+    /// address into Settings on the FIRST failed resolve, which is the symptom
+    /// that made automatic discovery look broken when it was merely still
+    /// working. See BackendResolution.failureMessage.
+    var noBackendMessage: String = "Looking for SensorDyme on this Wi-Fi…"
 
     private func request(_ method: String, _ path: String, query: [String: String]? = nil, body: [String: Any]? = nil) async throws -> Data {
         // A fresh install has no address saved, so ask the network for one rather
@@ -31,10 +40,7 @@ struct APIClient {
             resolved = await relocate()
         }
         guard let base = resolved else {
-            throw APIError(
-                message: "Couldn't find a SensorDyme server on this network. Make sure the backend is running on your Mac and this phone is on the same Wi-Fi. You can also enter the address yourself in Settings → Manual server address.",
-                isUnreachable: true
-            )
+            throw APIError(message: noBackendMessage, isUnreachable: true)
         }
         do {
             return try await send(method, path, query: query, body: body, base: base)
@@ -242,7 +248,16 @@ final class AppState: ObservableObject {
         case searching
         /// An address answered `/v1/health` and identified itself as ours.
         case connected(String)
-        /// Nothing answered. Carries something the user can act on.
+        /// Nothing answered yet, and automatic recovery is still running.
+        ///
+        /// Distinct from `unreachable` because the two deserve different words.
+        /// The app used to report the first failed resolve as unreachable and
+        /// tell the user to type an IP address into Settings, while exponential
+        /// retry was still running and would usually succeed a few seconds
+        /// later -- so the advice arrived ahead of the recovery it pre-empted.
+        case reconnecting(attempt: Int, reason: String)
+        /// Nothing answered and the app has stopped expecting it to. Carries
+        /// something the user can act on, including the manual-address escape.
         case unreachable(String)
     }
 
@@ -411,7 +426,14 @@ final class AppState: ObservableObject {
         return APIClient(
             baseURL: base.isEmpty ? nil : URL(string: base),
             token: storedToken.isEmpty ? nil : storedToken,
-            relocate: { [weak self] in await self?.relocateBackend() ?? nil }
+            relocate: { [weak self] in await self?.relocateBackend() ?? nil },
+            // Rebuilt on every access (this is a computed property), so the
+            // wording tracks how many attempts have actually failed.
+            noBackendMessage: BackendResolution.failureMessage(
+                attempts: failedAttempts,
+                triedHost: base.isEmpty ? nil : URL(string: base)?.host,
+                permissionProblem: BackendLocator.shared.problem
+            )
         )
     }
 
@@ -459,7 +481,7 @@ final class AppState: ObservableObject {
             for candidate in known {
                 if Task.isCancelled { return nil }
                 if await BackendLocator.answers(candidate) {
-                    self.confirm(candidate)
+                    self.confirm(candidate, source: .cached)
                     return candidate
                 }
                 Self.log.info("no backend at the known address \(candidate, privacy: .public)")
@@ -495,7 +517,7 @@ final class AppState: ObservableObject {
                     Self.log.info("remembering backend id \(id, privacy: .public)")
                     self.knownBackendID = id
                 }
-                self.confirm(found.url)
+                self.confirm(found.url, source: .bonjour)
                 return found.url
             }
 
@@ -510,7 +532,9 @@ final class AppState: ObservableObject {
     }
 
     /// Record a verified address and stop the retry clock.
-    private func confirm(_ url: String) {
+    private func confirm(_ url: String, source: BackendResolution.ResolutionSource = .cached) {
+        Self.log.info(
+            "connected to \(url, privacy: .public) via \(source.rawValue, privacy: .public)")
         confirmedBaseURL = url
         backendStatus = .connected(url)
         failedAttempts = 0
@@ -577,20 +601,23 @@ final class AppState: ObservableObject {
                 "dropping the stale discovered address \(self.discoveredBaseURL, privacy: .public)")
             discoveredBaseURL = keptCache
         }
-        let reason: String
-        if let permission = BackendLocator.shared.problem {
+        let reason = BackendResolution.failureMessage(
+            attempts: failedAttempts,
+            triedHost: triedKnown.first.flatMap { URL(string: $0)?.host },
             // A denied Local Network permission is invisible in the results and
-            // is the one cause the user can fix immediately.
-            reason = permission
-        } else if triedKnown.isEmpty {
-            reason = "No SensorDyme server answered on this Wi-Fi. Check that the backend is running on your Mac and that this phone is on the same network."
-        } else if let host = URL(string: triedKnown[0])?.host {
-            reason = "Nothing answered at \(host), and no server was found on this Wi-Fi. \(BackendResolution.unreachableAdvice(host: host))"
+            // is the one cause no amount of retrying can fix, so it is said at
+            // once rather than after the backoff has run its course.
+            permissionProblem: BackendLocator.shared.problem
+        )
+        if BackendResolution.isStillRecovering(attempts: failedAttempts),
+           BackendLocator.shared.problem == nil {
+            backendStatus = .reconnecting(attempt: failedAttempts + 1, reason: reason)
+            Self.log.info(
+                "attempt \(self.failedAttempts + 1, privacy: .public) failed; still recovering: \(reason, privacy: .public)")
         } else {
-            reason = "No SensorDyme server answered on this Wi-Fi."
+            backendStatus = .unreachable(reason)
+            Self.log.info("backend unreachable: \(reason, privacy: .public)")
         }
-        backendStatus = .unreachable(reason)
-        Self.log.info("backend unreachable: \(reason, privacy: .public)")
         scheduleRetry()
     }
 
@@ -744,7 +771,7 @@ final class AppState: ObservableObject {
     /// nothing the cache write was achieving.
     func pinConfigured(_ url: String) {
         configuredBaseURL = url  // didSet clears the cache; leave it cleared
-        confirm(url)
+        confirm(url, source: .manual)
     }
 
     /// Adopt an address the user picked from a discovery result in Settings.
@@ -758,7 +785,7 @@ final class AppState: ObservableObject {
            BackendResolution.mayPersistAsLocation(endpoint) {
             discoveredBaseURL = url
         }
-        confirm(url)
+        confirm(url, source: .bonjour)
     }
 
     /// The single access point views use — the real cloud, or the built-in demo device.

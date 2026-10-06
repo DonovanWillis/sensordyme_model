@@ -322,5 +322,69 @@ do {
     check(after.backendID == before.backendID, "and it is recognisably the same backend")
 }
 
+
+// MARK: - Not sending the user to Settings while recovery is still running
+//
+// The complaint this fixes, verbatim from the app: "Couldn't find a SensorDyme
+// server on this network. ... You can also enter the address yourself in
+// Settings -> Manual server address." That was shown after the FIRST failed
+// resolve, while exponential retry was still running in the background and
+// would usually succeed seconds later. The advice arrived ahead of the recovery
+// it pre-empted, and taught people SensorDyme needs manual setup when it does not.
+
+let firstFailure = BackendResolution.failureMessage(attempts: 0, triedHost: "10.0.0.5")
+check(!firstFailure.contains("Settings"),
+      "a first failure must not send the user to Settings -- retry is still running")
+check(firstFailure.lowercased().contains("reconnecting"),
+      "it should say what is actually happening instead")
+
+check(BackendResolution.isStillRecovering(attempts: 0), "attempt 1 is still recovering")
+check(BackendResolution.isStillRecovering(attempts: 1), "so is attempt 2")
+check(BackendResolution.isStillRecovering(attempts: 2), "and attempt 3")
+check(!BackendResolution.isStillRecovering(
+        attempts: BackendResolution.attemptsBeforeSuggestingManualEntry),
+      "after the budget is spent the app stops claiming it is about to work")
+
+let givenUp = BackendResolution.failureMessage(
+    attempts: BackendResolution.attemptsBeforeSuggestingManualEntry, triedHost: "10.0.0.5")
+check(givenUp.contains("Manual server address"),
+      "once automatic discovery has genuinely failed, the escape hatch IS the right advice")
+check(givenUp.contains("10.0.0.5"), "and it names what was tried")
+
+// A LAN address and a public one need different advice; that distinction already
+// existed and must survive being routed through the new message builder.
+check(BackendResolution.failureMessage(attempts: 9, triedHost: "10.0.0.5")
+        .contains("same Wi-Fi"),
+      "a local address means check the network")
+check(BackendResolution.failureMessage(attempts: 9, triedHost: "api.example.com")
+        .contains("internet connection"),
+      "a hosted backend does not: telling someone to check Wi-Fi sends them to fix what works")
+
+// Nothing was even tried -- no candidates at all.
+check(!BackendResolution.failureMessage(attempts: 0, triedHost: nil).contains("Settings"),
+      "still no Settings nag on the first attempt with nothing cached")
+check(BackendResolution.failureMessage(attempts: 0, triedHost: nil).contains("Looking for"),
+      "and it reads as a search in progress")
+check(BackendResolution.failureMessage(attempts: 9, triedHost: nil).contains("Manual server address"),
+      "but a sustained failure with nothing to try still offers the escape")
+
+// Local Network permission is the one cause retrying can never fix, so it is
+// said at once rather than after the backoff has run its course.
+let denied = "SensorDyme needs Local Network access."
+check(BackendResolution.failureMessage(attempts: 0, triedHost: "10.0.0.5",
+                                       permissionProblem: denied) == denied,
+      "a permission problem is reported immediately, not after three attempts")
+check(BackendResolution.failureMessage(attempts: 0, triedHost: "10.0.0.5",
+                                       permissionProblem: "") != denied,
+      "an empty problem string is not a problem")
+
+// MARK: - Where an endpoint came from is a fact worth carrying
+
+check(BackendResolution.ResolutionSource.cached.rawValue == "cached", "loggable")
+check(BackendResolution.ResolutionSource.bonjour.rawValue == "bonjour", "loggable")
+check(BackendResolution.ResolutionSource.manual.rawValue == "manual", "loggable")
+check(BackendResolution.ResolutionSource.cached != .bonjour,
+      "\"the cache answered\" and \"Bonjour just found it\" are the same URL and different facts")
+
 print("\n\(failures == 0 ? "PASSED" : "\(failures) FAILED")")
 exit(failures == 0 ? 0 : 1)
