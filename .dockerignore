@@ -8,6 +8,7 @@ cloud/*.db
 cloud/*.db-wal
 cloud/*.db-shm
 cloud/.jwt_secret
+cloud/.backend_id
 cloud/*.log
 data/
 
@@ -29,7 +30,7 @@ benchmarks/
 docs/
 hardware/
 ios/
-jupiter/
+jupiter/eval/
 modules/
 services/
 site/

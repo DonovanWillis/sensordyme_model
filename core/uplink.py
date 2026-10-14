@@ -12,10 +12,59 @@ local alerts are never affected.
 
 from __future__ import annotations
 
+import math
 import threading
 import uuid
 from collections import deque
 from typing import Optional
+
+#: Upper bound on the backlog. It must not exceed the backend's MAX_INGEST_EVENTS
+#: (cloud/app.py): the whole backlog goes up in one POST, so a queue larger than
+#: the backend accepts turns every flush after a long outage into a 422.
+MAX_QUEUE = 1000
+
+#: HTTP answers that say "try again later" or "fix the key", not "this body is
+#: wrong". Any OTHER 4xx means the backend will refuse the same batch every
+#: time, so re-queuing it would block every newer alert behind it forever.
+_RETRYABLE_4XX = frozenset({401, 403, 408, 409, 425, 429})
+
+#: Most events sent in one POST. A backlog after a long outage used to go up
+#: whole, and a large one exceeds the backend's body limit (413); sending it in
+#: slices also keeps each request short on a weak link. The rest stays queued
+#: and goes on the following polls.
+BATCH_MAX = 100
+
+
+def _json_safe(value):
+    """`value` with every non-finite float replaced by None.
+
+    `requests` encodes JSON with allow_nan=False and raises BEFORE sending, so a
+    single NaN anywhere in a batch made that batch unsendable -- and because a
+    failed batch is re-queued at the front, every later event and the heartbeat
+    with it.
+    """
+    if hasattr(value, "item") and not isinstance(value, (dict, list, tuple, str, bytes)):
+        # numpy scalars (float32 from a model, int64 from a count): requests
+        # cannot encode them, and a batch it cannot encode is stuck for ever.
+        try:
+            value = value.item() if getattr(value, "ndim", 0) == 0 else value.tolist()
+        except (AttributeError, ValueError, TypeError):
+            return str(value)
+    if isinstance(value, float):
+        return value if math.isfinite(value) else None
+    if isinstance(value, dict):
+        return {k: _json_safe(v) for k, v in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [_json_safe(v) for v in value]
+    return value
+
+
+def _finite(value, default: float = 0.0) -> float:
+    try:
+        number = float(value)
+    except (TypeError, ValueError):
+        return default
+    return number if math.isfinite(number) else default
 
 
 class CloudUplink:
@@ -29,7 +78,10 @@ class CloudUplink:
         # (measured under 5ms end to end) -- see config.yaml's comment on that
         # key for the full reasoning.
         self._poll_interval_s = float(config.get("poll_interval_s", 2.0))
-        self._queue: deque[dict] = deque(maxlen=int(config.get("queue_max", 500)))
+        self._queue: deque[dict] = deque(
+            maxlen=min(max(int(config.get("queue_max", 500)), 1), MAX_QUEUE)
+        )
+        self._batch_max = BATCH_MAX
         self._lock = threading.Lock()
         self._active_preset: Optional[str] = None
         self._monitoring: Optional[dict] = None
@@ -103,8 +155,8 @@ class CloudUplink:
                     "event_key": uuid.uuid4().hex,
                     "timestamp": event.timestamp.isoformat(),
                     "type": event.type,
-                    "confidence": round(event.confidence, 3),
-                    "signals": event.contributing_signals,
+                    "confidence": round(_finite(event.confidence), 3),
+                    "signals": _json_safe(event.contributing_signals),
                     # Seconds the condition was sustained before this fired --
                     # already computed by every module (Event.duration), but
                     # previously dropped here rather than sent, so a genuinely
@@ -112,7 +164,7 @@ class CloudUplink:
                     # a fallback when `signals` is empty (e.g. fall_detection's
                     # "fall" event carries no signals text today) rather than
                     # the bare, contextless "alert" that produced.
-                    "duration": round(event.duration, 3),
+                    "duration": round(_finite(event.duration), 3),
                     "severity": severity,
                     "source": source,
                 }
@@ -209,10 +261,11 @@ class CloudUplink:
             # locally while silently never reaching the backend again, which is the
             # worst failure shape available: no events, no error, no reconnect.
             batch: list = []
+            more_waiting = False
             try:
                 with self._lock:
-                    batch = list(self._queue)
-                    self._queue.clear()
+                    take = min(len(self._queue), self._batch_max)
+                    batch = [self._queue.popleft() for _ in range(take)]
                     active = self._active_preset
                     rules_version = self._rules_version
                     zones_version = self._zones_version
@@ -221,14 +274,14 @@ class CloudUplink:
                 # 1) push events (an empty batch doubles as the online heartbeat)
                 resp = self._requests.post(
                     f"{self._base_url}/v1/ingest",
-                    json={
+                    json=_json_safe({
                         "events": batch,
                         "active_preset": active,
                         "rules_version": rules_version,
                         "zones_version": zones_version,
                         "health": health,
                         "monitoring": monitoring,
-                    },
+                    }),
                     headers=headers,
                     timeout=10,
                     verify=self._verify,
@@ -253,6 +306,9 @@ class CloudUplink:
                     with self._lock:
                         self._pending_zones = zones if isinstance(zones, list) else []
                         self._zones_version = str(command.get("zones_version") or "")
+                # A full batch that went through means a backlog: send the next
+                # slice now rather than one per poll interval.
+                more_waiting = bool(batch) and len(batch) >= self._batch_max
                 if not self._connected:
                     self._connected = True
                     self._explained_failure = False
@@ -290,6 +346,28 @@ class CloudUplink:
                             "networks. See docs/NETWORKING.md."
                         )
                 self._connected = False
+                status = getattr(getattr(exc, "response", None), "status_code", None)
+                if status == 413 and len(batch) > 1:
+                    # Too big, not wrong: send less next time rather than lose it.
+                    self._batch_max = max(1, len(batch) // 2)
+                    print(
+                        f"cloud_uplink: batch of {len(batch)} too large for the backend; "
+                        f"retrying in batches of {self._batch_max}"
+                    )
+                elif (
+                    batch
+                    and isinstance(status, int)
+                    and 400 <= status < 500
+                    and status not in _RETRYABLE_4XX
+                ):
+                    # The backend read this batch and refused it; it will refuse
+                    # it again. Re-queuing it at the front is what used to block
+                    # every newer alert behind it forever.
+                    print(
+                        f"cloud_uplink: backend refused {len(batch)} event(s) with HTTP "
+                        f"{status}; dropping them so newer events are not blocked"
+                    )
+                    batch = []
                 with self._lock:
                     # Put the batch back in front of anything recorded since,
                     # but never at the cost of those newer events.
@@ -313,4 +391,4 @@ class CloudUplink:
                             f"cloud_uplink: backlog full — {dropped} older event(s) dropped; "
                             f"newer ones kept"
                         )
-            self._stop.wait(self._poll_interval_s)
+            self._stop.wait(0 if more_waiting else self._poll_interval_s)

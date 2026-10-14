@@ -111,6 +111,17 @@ def test_the_image_defaults_match_fly_toml(fly_config):
         assert f"{key}={fly_config['env'][key]}" in dockerfile, f"{key} disagrees with fly.toml"
 
 
+def test_the_image_ships_the_ai_the_backend_imports():
+    """cloud/app.py imports jupiter lazily and falls back without a word on
+    ImportError, so an image without it builds, deploys and passes health
+    checks -- with Configure-with-AI reduced to a keyword table and every
+    explanation a 503. Only a check on the image contents catches that."""
+    dockerfile = DOCKERFILE.read_text()
+    assert "COPY jupiter/ jupiter/" in dockerfile
+    ignored = [line.strip() for line in DOCKERIGNORE.read_text().splitlines()]
+    assert "jupiter/" not in ignored, ".dockerignore drops the jupiter/ the Dockerfile copies"
+
+
 # ------------------------------------------------------------------- no secrets
 
 def test_the_image_cannot_ship_the_database_or_the_signing_key():
@@ -119,7 +130,7 @@ def test_the_image_cannot_ship_the_database_or_the_signing_key():
     server log. .dockerignore is the only thing standing between those and
     anyone who can pull the image."""
     ignored = DOCKERIGNORE.read_text()
-    for pattern in ("cloud/*.db", "cloud/.jwt_secret", "cloud/*.log", ".secrets/"):
+    for pattern in ("cloud/*.db", "cloud/.jwt_secret", "cloud/.backend_id", "cloud/*.log", ".secrets/"):
         assert pattern in ignored, f".dockerignore does not exclude {pattern}"
 
 

@@ -95,3 +95,26 @@ def test_cloud_insecure_tls_over_https_warns():
 def test_cloud_must_be_a_mapping():
     errors, _ = validate({"module": "m", "modules": {"m": {}}, "cloud": "nope"})
     assert any("cloud:" in e for e in errors)
+
+
+def test_shapes_that_used_to_pass_validation_and_crash_boot_are_errors():
+    """Each of these validated clean and then crashed startup (AttributeError,
+    ValueError, TypeError in `{**None}`) or broke the uplink silently."""
+    base = {"module": "m", "modules": {"m": {}}}
+    cases = {
+        "logging:": {"logging": None},
+        "alerts:": {"alerts": None},
+        "alerts.cooldown_s": {"alerts": {"cooldown_s": "fifteen"}},
+        "modules.m": {"modules": {"m": None}},
+        "health.reboot_max_total": {"health": {"reboot_max_total": "five"}},
+        "cloud.queue_max": {"cloud": {"queue_max": 5000}},
+    }
+    for expected, patch in cases.items():
+        errors, _ = validate({**base, **patch})
+        assert any(expected in e for e in errors), f"{patch} was not reported: {errors}"
+
+
+def test_an_enabled_uplink_with_no_key_is_called_out():
+    _, warnings = validate({"module": "m", "modules": {"m": {}},
+                            "cloud": {"enabled": True, "base_url": "http://x", "device_key": ""}})
+    assert any("device_key" in w for w in warnings)

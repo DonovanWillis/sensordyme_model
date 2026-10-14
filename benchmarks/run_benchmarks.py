@@ -25,6 +25,7 @@ import csv
 import json
 import statistics
 import subprocess
+import sys
 import time
 from collections.abc import Iterator
 from pathlib import Path
@@ -33,6 +34,8 @@ from typing import Optional
 import cv2
 import numpy as np
 import yaml
+
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))  # repo root
 
 from core.camera import Camera
 from modules import available_modules, get_module_class

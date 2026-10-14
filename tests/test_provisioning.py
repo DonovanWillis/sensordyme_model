@@ -79,8 +79,8 @@ def _make_service(monkeypatch, wifi, grace_s=0.05, poll_s=0.02, reconfigure_wind
         "grace_s": grace_s,
         "poll_s": poll_s,
         "reconfigure_window_s": reconfigure_window_s,
-        # Off by default here so the window tests below still exercise the
-        # window. Production defaults to always-on; that is covered explicitly.
+        # Production defaults to off as well (see the test below); always-on
+        # is opted into explicitly where it is under test.
         "always_available": always_available,
     })
 
@@ -365,3 +365,20 @@ def test_a_failed_setup_is_not_overwritten_by_the_next_connectivity_push(monkeyp
     assert provisions, "no provisioning outcome was ever reported"
     assert provisions[-1]["state"] == "error", provisions[-1]
     assert "password" in provisions[-1]["error"].lower()
+
+
+def test_bluetooth_setup_is_not_left_open_by_default(monkeypatch):
+    """The credential write is unauthenticated BLE, so a device whose Wi-Fi is
+    working must not keep serving it for ever unless someone opts in. Online,
+    past the boot window, with no `always_available` in the config: closed."""
+    monkeypatch.setattr(provisioning_module, "nmcli_available", lambda: True)
+    import services.ble_gatt as ble_gatt
+
+    monkeypatch.setattr(ble_gatt, "BLEProvisioningServer", FakeBLEServer)
+    FakeBLEServer.instances = []
+    service = ProvisioningService(FakeWifi(online=True), {
+        "method": "ble", "grace_s": 0.05, "poll_s": 0.02, "reconfigure_window_s": 0.0,
+    })
+    _run_briefly(service, 0.2)
+    assert service.state != "reconfigurable"
+    assert all(not s.running for s in FakeBLEServer.instances)

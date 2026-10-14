@@ -561,12 +561,8 @@ extension APIClient {
         if let token { req.setValue("Bearer \(token)", forHTTPHeaderField: "Authorization") }
         let (data, response) = try await URLSession.shared.data(for: req)
         let status = (response as? HTTPURLResponse)?.statusCode ?? 0
-        guard status != 401 else {
-            throw APIError(message: "Your session has expired. Please sign in again.", isAuthFailure: true)
-        }
-        guard (200..<300).contains(status) else {
-            let detail = (try? JSONSerialization.jsonObject(with: data) as? [String: Any])?["detail"]
-            throw APIError(message: (detail as? String) ?? "request failed (\(status))")
+        if let error = Self.httpError(status: status, data: data, sentToken: token != nil) {
+            throw error
         }
         return try JSONDecoder().decode(T.self, from: data)
     }
@@ -587,12 +583,8 @@ extension APIClient {
         req.httpBody = try JSONSerialization.data(withJSONObject: body)
         let (data, response) = try await URLSession.shared.data(for: req)
         let status = (response as? HTTPURLResponse)?.statusCode ?? 0
-        guard status != 401 else {
-            throw APIError(message: "Your session has expired. Please sign in again.", isAuthFailure: true)
-        }
-        guard (200..<300).contains(status) else {
-            let detail = (try? JSONSerialization.jsonObject(with: data) as? [String: Any])?["detail"]
-            throw APIError(message: (detail as? String) ?? "request failed (\(status))")
+        if let error = Self.httpError(status: status, data: data, sentToken: token != nil) {
+            throw error
         }
         return try JSONDecoder().decode(T.self, from: data)
     }

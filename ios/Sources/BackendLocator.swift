@@ -38,6 +38,14 @@ final class BackendLocator: ObservableObject {
     /// look identical in the results, and only one of them can be fixed by
     /// looking harder.
     @Published private(set) var problem: String?
+    /// Set when several backends answered and none is the remembered one.
+    ///
+    /// Kept apart from `problem`, which AppState reads as "discovery itself
+    /// cannot work" (a denied Local Network permission) and which therefore
+    /// skips the reconnecting state. Stored there, this message outlived the
+    /// search that produced it and was shown as the cause of later, unrelated
+    /// outages -- a stopped server read as "Found 2 SensorDyme servers".
+    @Published private(set) var ambiguity: String?
 
     private var browser: NWBrowser?
     private var resolvers: [NWConnection] = []
@@ -106,7 +114,8 @@ final class BackendLocator: ObservableObject {
                 // means someone watching a stranger's camera.
                 Self.log.error(
                     "\(all.count, privacy: .public) SensorDyme backends answered and none is the one this app knows; not choosing between them")
-                self.problem = "Found \(all.count) SensorDyme servers on this Wi-Fi and none is the one this app used before. Open Settings → Manual server address to pick the right one."
+                let found = all.count == 1 ? "Found a SensorDyme server" : "Found \(all.count) SensorDyme servers"
+                self.ambiguity = "\(found) on this Wi-Fi, but not the one this app uses. Your server may be asleep or on another network; to use a different one, open Settings → Manual server address."
                 return nil
             case .none:
                 return nil
@@ -115,7 +124,9 @@ final class BackendLocator: ObservableObject {
 
         inFlight = task
         let found = await task.value
-        inFlight = nil
+        // Only clear the slot if it is still ours: after cancelSearch() a newer
+        // search may already occupy it.
+        if inFlight == task { inFlight = nil }
         return found
     }
 
@@ -205,7 +216,10 @@ final class BackendLocator: ObservableObject {
             BackendResolution.BackendEndpoint(url: found.url, backendID: found.id)
         }
         return BackendResolution.preferringStableHost(endpoints).map { endpoint in
-            BackendResolution.FoundBackend(url: endpoint.baseURL, id: endpoint.backendID)
+            BackendResolution.FoundBackend(
+                url: endpoint.baseURL, id: endpoint.backendID,
+                service: candidates.first { $0.url == endpoint.baseURL }?.service
+            )
         }
     }
 
@@ -216,10 +230,11 @@ final class BackendLocator: ObservableObject {
         candidates.removeAll()
         resolving.removeAll()
         problem = nil
+        ambiguity = nil
         isSearching = true
 
         let browser = NWBrowser(
-            for: .bonjour(type: Self.serviceType, domain: nil),
+            for: .bonjourWithTXTRecord(type: Self.serviceType, domain: nil),
             using: NWParameters()
         )
         self.browser = browser
@@ -334,13 +349,20 @@ final class BackendLocator: ObservableObject {
                     return
                 }
                 guard !self.candidates.contains(where: { $0.url == endpoint.baseURL }) else { return }
-                self.candidates.append(.init(url: endpoint.baseURL, id: id))
+                self.candidates.append(.init(url: endpoint.baseURL, id: id, service: key))
                 Self.log.info(
                     "resolved the backend's stable name \(endpoint.baseURL, privacy: .public) (id \(id ?? "none", privacy: .public))")
             }
         }
         srvResolvers.append(resolver)
         resolver.start()
+    }
+
+    /// Identifies the Bonjour service an endpoint belongs to, so the two
+    /// resolutions of one service can be recognised as one backend.
+    nonisolated private static func serviceKey(_ endpoint: NWEndpoint) -> String? {
+        guard case let .service(name, type, domain, _) = endpoint else { return nil }
+        return "srv:\(name).\(type).\(domain)"
     }
 
     private func resolve(_ endpoint: NWEndpoint, id: String?) {
@@ -375,7 +397,7 @@ final class BackendLocator: ObservableObject {
                         return
                     }
                     guard !self.candidates.contains(where: { $0.url == url }) else { return }
-                    self.candidates.append(.init(url: url, id: id))
+                    self.candidates.append(.init(url: url, id: id, service: Self.serviceKey(endpoint)))
                     Self.log.info(
                         "resolved a backend candidate at \(url, privacy: .public) (id \(id ?? "none", privacy: .public))")
                 }

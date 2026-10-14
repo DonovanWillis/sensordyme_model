@@ -117,14 +117,47 @@ def launchd_runs_the_backend() -> tuple[bool, str]:
     # A port mismatch between what uvicorn binds and what the agent announces
     # sends the app somewhere definite and wrong, which is worse than silence.
     announced = (installed.get("EnvironmentVariables") or {}).get("SENSORDYME_PORT")
-    if "--port" in args:
-        bound = args[args.index("--port") + 1]
+    port_at = args.index("--port") + 1 if "--port" in args else None
+    if port_at is not None and port_at < len(args):
+        bound = args[port_at]
         if announced is not None and announced != bound:
             return False, (
                 f"the agent binds port {bound} but announces {announced} over mDNS -- "
                 f"the app would be sent to a port nothing is on"
             )
     return True, f"runs `{joined}`"
+
+
+def jwt_secret_persisted() -> tuple[bool, str]:
+    """Will the backend sign with the same key after a restart?
+
+    Asked of the key the AGENT will use: cloud/app.py takes
+    SENSORDYME_JWT_SECRET, then SENSORDYME_JWT_SECRET_FILE, then a key it
+    generates beside the database. Checking only cloud/.jwt_secret reported a
+    missing key on a backend configured through either variable.
+    """
+    env: dict = {}
+    if INSTALLED_PLIST.exists():
+        try:
+            import plistlib
+
+            env = plistlib.loads(INSTALLED_PLIST.read_bytes()).get("EnvironmentVariables") or {}
+        except Exception:  # noqa: BLE001 - launchd_runs_the_backend reports a bad plist
+            env = {}
+    if env.get("SENSORDYME_JWT_SECRET"):
+        return True, "set in the agent's environment (SENSORDYME_JWT_SECRET)"
+    configured = env.get("SENSORDYME_JWT_SECRET_FILE")
+    db_path = env.get("SENSORDYME_DB")
+    secret_path = (
+        Path(configured) if configured
+        else (Path(db_path).parent if db_path else REPO_DIR / "cloud") / ".jwt_secret"
+    )
+    if secret_path.exists():
+        return True, str(secret_path)
+    return False, (
+        f"{secret_path} missing -- every restart will invalidate signed-in sessions "
+        f"until the backend has run once and created it"
+    )
 
 
 def mdns_advertising(timeout: float = 3.0) -> tuple[bool, str]:
@@ -221,13 +254,7 @@ def main() -> int:
     # the backend is gone at the next login, and nothing else here would say so.
     all_ok &= check("Agent starts the backend", *launchd_runs_the_backend())
 
-    secret_path = REPO_DIR / "cloud" / ".jwt_secret"
-    all_ok &= check(
-        "JWT secret persisted", secret_path.exists(),
-        str(secret_path) if secret_path.exists()
-        else f"{secret_path} missing -- every restart will invalidate signed-in sessions "
-             f"until the backend has run once and created it",
-    )
+    all_ok &= check("JWT secret persisted", *jwt_secret_persisted())
 
     # Fatal too. A stale record is not a degraded version of discovery working —
     # it actively stops the app looking anywhere else.

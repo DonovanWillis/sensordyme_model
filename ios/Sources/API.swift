@@ -85,15 +85,25 @@ struct APIClient {
             )
         }
         let status = (response as? HTTPURLResponse)?.statusCode ?? 0
-        guard status != 401 else {
-            throw APIError(message: "Your session has expired. Please sign in again.", isAuthFailure: true)
-        }
-        guard (200..<300).contains(status) else {
-            // FastAPI errors arrive as {"detail": "..."}
-            let detail = (try? JSONSerialization.jsonObject(with: data) as? [String: Any])?["detail"]
-            throw APIError(message: (detail as? String) ?? "request failed (\(status))")
+        if let error = Self.httpError(status: status, data: data, sentToken: token != nil) {
+            throw error
         }
         return data
+    }
+
+    /// The error for a non-2xx answer, or nil for success.
+    ///
+    /// A 401 means "your session expired" only when a session was sent. Sign-in
+    /// sends none, and its 401 is "wrong email or password" -- which every caller
+    /// used to report as an expired session, on the sign-in screen itself.
+    static func httpError(status: Int, data: Data, sentToken: Bool) -> APIError? {
+        if (200..<300).contains(status) { return nil }
+        // FastAPI errors arrive as {"detail": "..."}
+        let detail = (try? JSONSerialization.jsonObject(with: data) as? [String: Any])?["detail"] as? String
+        if status == 401 && sentToken {
+            return APIError(message: "Your session has expired. Please sign in again.", isAuthFailure: true)
+        }
+        return APIError(message: detail ?? "request failed (\(status))")
     }
 
     /// Did this fail to reach a server at all, rather than reach one that refused?
@@ -521,13 +531,23 @@ final class AppState: ObservableObject {
                 return found.url
             }
 
+            // A cancelled search returns nil too, and is not a failure: whoever
+            // cancelled it (reconnect, a network change) has already started the
+            // search that replaces it. Reporting it would overwrite that search's
+            // status, arm a second retry, count an attempt nobody made, and could
+            // drop a cached address that was never actually tested.
+            if Task.isCancelled { return nil }
+
             self.reportUnreachable(triedKnown: known)
             return nil
         }
 
         resolveTask = task
         let found = await task.value
-        resolveTask = nil
+        // Only clear the slot if it is still ours. After a cancel, a NEWER
+        // resolve may already be in it, and clearing that would let a third
+        // caller start a concurrent search beside it.
+        if resolveTask == task { resolveTask = nil }
         return found
     }
 
@@ -593,15 +613,22 @@ final class AppState: ObservableObject {
         // named in every error the user read. A name is kept deliberately: it is
         // the backend's identity, it can be resolved again, and the usual reason
         // it went quiet is a sleeping Mac rather than a wrong name.
-        let keptCache = BackendResolution.discoveryCache(
-            after: triedKnown.first ?? "", keeping: discoveredBaseURL
-        )
+        // Every candidate tried has failed by now, not just the first: with a
+        // configured URL (or the simulator's localhost) ahead of it, a dead
+        // discovered address was never matched and stayed cached for ever.
+        var keptCache = discoveredBaseURL
+        for tried in (triedKnown.isEmpty ? [""] : triedKnown) {
+            keptCache = BackendResolution.discoveryCache(after: tried, keeping: keptCache)
+        }
         if keptCache != discoveredBaseURL {
             Self.log.info(
                 "dropping the stale discovered address \(self.discoveredBaseURL, privacy: .public)")
             discoveredBaseURL = keptCache
         }
-        let reason = BackendResolution.failureMessage(
+        // Several backends and none of them ours is a fact about THIS search,
+        // and the one thing retrying cannot settle: say it as it is.
+        let ambiguity = BackendLocator.shared.ambiguity
+        let reason = ambiguity ?? BackendResolution.failureMessage(
             attempts: failedAttempts,
             triedHost: triedKnown.first.flatMap { URL(string: $0)?.host },
             // A denied Local Network permission is invisible in the results and
@@ -610,7 +637,7 @@ final class AppState: ObservableObject {
             permissionProblem: BackendLocator.shared.problem
         )
         if BackendResolution.isStillRecovering(attempts: failedAttempts),
-           BackendLocator.shared.problem == nil {
+           BackendLocator.shared.problem == nil, ambiguity == nil {
             backendStatus = .reconnecting(attempt: failedAttempts + 1, reason: reason)
             Self.log.info(
                 "attempt \(self.failedAttempts + 1, privacy: .public) failed; still recovering: \(reason, privacy: .public)")
@@ -772,6 +799,19 @@ final class AppState: ObservableObject {
     func pinConfigured(_ url: String) {
         configuredBaseURL = url  // didSet clears the cache; leave it cleared
         confirm(url, source: .manual)
+    }
+
+    /// Drop the typed address AND the remembered backend identity, and search.
+    ///
+    /// The identity is what stops discovery adopting a stranger's backend, so
+    /// it is normally never forgotten -- which also meant a backend whose id
+    /// had been regenerated (cloud/.backend_id deleted, a reinstalled Mac) was
+    /// refused for ever. Asking for "automatic" is the explicit moment to let
+    /// discovery choose again.
+    func useAutomaticBackend() {
+        configuredBaseURL = ""
+        knownBackendID = ""
+        reconnect()
     }
 
     /// Adopt an address the user picked from a discovery result in Settings.

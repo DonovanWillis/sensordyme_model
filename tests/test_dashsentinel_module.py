@@ -68,8 +68,10 @@ def test_vendored_scorer_escalation_behavior(tmp_path):
             "selected_face_index": 0,
         }
 
+    out = None
     for _ in range(10):
         out = scorer.score(features(closed=False))
+    assert out is not None
     assert out.status == "ALERT"
 
     # sustained eye closure alone: WARNING, and provably never DROWSY (score ceiling 0.56)

@@ -20,6 +20,9 @@ def backend(tmp_path, monkeypatch):
     # _ai_configure_llm falls through to the deterministic path.
     monkeypatch.setenv("SENSORDYME_AI_PROVIDER", "unavailable")
     monkeypatch.setenv("SENSORDYME_DB", str(tmp_path / "test.db"))
+    # Any test that enters the lifespan (`with TestClient(...)`) would otherwise
+    # announce a real backend on the developer's LAN, under the real backend id.
+    monkeypatch.setenv("SENSORDYME_MDNS", "0")
     for mod in ("cloud.app", "cloud", "cloud.ratelimit"):
         sys.modules.pop(mod, None)
     app_module = importlib.import_module("cloud.app")
@@ -1087,7 +1090,11 @@ class TestMalformedStoredStateDoesNotBreakTheDeviceList:
 
         resp = client.get("/v1/devices", headers={"Authorization": f"Bearer {token}"})
 
-        assert resp.json()["devices"][0]["monitoring"] == {"mode": "baby_monitoring"}
+        # Passed through, plus the three fields the app decodes as non-optional
+        # (a dict missing them failed the decode of the whole device list).
+        assert resp.json()["devices"][0]["monitoring"] == {
+            "mode": "baby_monitoring", "instruction": "", "rule_count": 0, "active": False,
+        }
 
     def test_one_bad_row_does_not_hide_the_other_devices(self, backend):
         """The failure mode that mattered: one unreadable row took the whole
@@ -1109,7 +1116,7 @@ class TestMalformedStoredStateDoesNotBreakTheDeviceList:
         assert resp.status_code == 200
         names = {d["name"]: d["monitoring"] for d in resp.json()["devices"]}
         assert names["broken"] is None
-        assert names["fine"] == {"mode": "security_monitoring"}
+        assert names["fine"]["mode"] == "security_monitoring"
 
 
 class TestWriteContentionWaitsRatherThanFailing:
@@ -1559,3 +1566,199 @@ def test_the_database_is_not_readable_by_other_accounts(backend):
             continue  # -wal/-shm only exist once WAL has been written to
         mode = path.stat().st_mode & 0o777
         assert mode == 0o600, f"{path.name} is {oct(mode)}, expected 0o600"
+
+
+def test_a_non_finite_confidence_cannot_break_the_event_history(backend):
+    """`float()` accepts "nan", "inf" and the JSON literals NaN / 1e999. Stored,
+    they made GET /events a permanent 500 for that device, because the response
+    encoder refuses non-finite floats. Coerce at the door instead."""
+    app_module, client = backend
+    auth, device, device_id = _claim_a_device(app_module, client)
+    raw = (
+        '{"events": ['
+        '{"type": "a", "confidence": 1e999, "duration": NaN, "event_key": "k1"},'
+        '{"type": "b", "confidence": "nan", "duration": "-inf", "event_key": "k2"}'
+        ']}'
+    )
+    resp = client.post(
+        "/v1/ingest", content=raw, headers={**device, "Content-Type": "application/json"}
+    )
+    assert resp.status_code == 200
+    events = client.get(f"/v1/devices/{device_id}/events", headers=auth)
+    assert events.status_code == 200
+    assert {e["type"]: e["confidence"] for e in events.json()["events"]} == {"a": 0.0, "b": 0.0}
+
+
+def test_an_oversized_body_is_refused_before_it_is_parsed(backend):
+    """FastAPI parses the body before any auth dependency runs, so one
+    unauthenticated request could make the server hold hundreds of MB --
+    more than the whole Fly VM has. Refused on the declared length..."""
+    app_module, client = backend
+    big = b'{"events": [], "pad": "' + b"x" * (app_module.MAX_BODY_BYTES + 1) + b'"}'
+    resp = client.post(
+        "/v1/ingest", content=big,
+        headers={"X-Device-Key": "wrong", "Content-Type": "application/json"},
+    )
+    assert resp.status_code == 413
+
+
+def test_an_oversized_chunked_body_is_refused_too(backend):
+    """...and on the bytes actually received, for a body with no length."""
+    app_module, client = backend
+    chunk = b"x" * 65536
+
+    def body():
+        yield b'{"email": "a@b.co", "password": "'
+        for _ in range(app_module.MAX_BODY_BYTES // len(chunk) + 2):
+            yield chunk
+        yield b'"}'
+
+    resp = client.post("/v1/login", content=body(), headers={"Content-Type": "application/json"})
+    assert resp.status_code == 413
+
+
+def test_a_normal_full_backlog_still_fits(backend):
+    """The cap must sit far above the largest legitimate request: a device
+    flushing its whole backlog at once."""
+    app_module, client = backend
+    _auth, device, _device_id = _claim_a_device(app_module, client)
+    events = [
+        {"event_key": f"k{i}", "type": "fall", "confidence": 0.91, "duration": 2.5,
+         "timestamp": "2026-10-14T00:00:00", "severity": "loud", "source": "module",
+         "signals": "zone=front_door confirmed after 12.4s; " * 8}
+        for i in range(app_module.MAX_INGEST_EVENTS)
+    ]
+    assert client.post("/v1/ingest", json={"events": events}, headers=device).status_code == 200
+
+
+def test_free_text_fields_are_bounded(backend):
+    app_module, client = backend
+    auth, _device, device_id = _claim_a_device(app_module, client)
+    huge = "x" * 100_000
+    assert client.post(f"/v1/devices/{device_id}/preset", json={"preset": huge}, headers=auth).status_code == 422
+    assert client.post("/v1/devices/claim", json={"claim_code": huge}, headers=auth).status_code == 422
+    zones = [{"name": huge, "kind": "restricted",
+              "polygon": [[0.1, 0.1], [0.2, 0.1], [0.2, 0.2]] * 1000}]
+    client.post(f"/v1/devices/{device_id}/zones", json={"zones": zones}, headers=auth)
+    stored = client.get(f"/v1/devices/{device_id}/zones", headers=auth).json()["zones"]
+    assert all(len(z["name"]) <= 60 and len(z["polygon"]) <= 256 for z in stored)
+
+
+def test_one_account_cannot_hold_the_server_with_slow_model_calls(backend, monkeypatch):
+    """Model calls are synchronous and slow, on a shared thread pool. Two in
+    flight per account; a third is refused at once rather than queued, and a
+    DIFFERENT account is unaffected."""
+    import threading
+
+    app_module, client = backend
+    auth, _device, device_id = _claim_a_device(app_module, client)
+    release = threading.Event()
+    started = threading.Semaphore(0)
+
+    def slow_model(prompt):
+        started.release()
+        release.wait(5)
+
+    monkeypatch.setattr(app_module, "_ai_configure_llm", slow_model)
+    body = {"device_id": device_id, "prompt": "tell me if a dog is on the couch"}
+    results: list[int] = []
+    workers = [
+        threading.Thread(target=lambda: results.append(
+            client.post("/v1/ai/configure", json=body, headers=auth).status_code))
+        for _ in range(2)
+    ]
+    for w in workers:
+        w.start()
+    assert started.acquire(timeout=5) and started.acquire(timeout=5)
+    try:
+        assert client.post("/v1/ai/configure", json=body, headers=auth).status_code == 429
+        with app_module.db() as conn:
+            conn.execute(
+                "INSERT INTO devices (name, claim_code, device_key, created_at) VALUES (?, ?, ?, ?)",
+                ("Other", "QQ-11-QQ", "dk_other", 0.0),
+            )
+        token = client.post("/v1/signup", json={"email": "other@example.com",
+                                                "password": "supersecret1"}).json()["token"]
+        other = {"Authorization": f"Bearer {token}"}
+        other_id = client.post("/v1/devices/claim", json={"claim_code": "QQ-11-QQ"},
+                               headers=other).json()["device_id"]
+        release.set()  # let the other account's call return promptly
+        assert client.post("/v1/ai/configure", json={**body, "device_id": other_id},
+                           headers=other).status_code == 200
+    finally:
+        release.set()
+        for w in workers:
+            w.join(5)
+    assert results == [200, 200]
+
+
+def test_an_unknown_mode_is_refused_rather_than_resent_for_ever(backend):
+    """The device ignores a preset it does not have and never reports it back,
+    so a stored unknown name was re-sent on every poll indefinitely."""
+    app_module, client = backend
+    auth, _device, device_id = _claim_a_device(app_module, client)
+    url = f"/v1/devices/{device_id}/preset"
+    assert client.post(url, json={"preset": "'; DROP TABLE devices;--"}, headers=auth).status_code == 400
+    assert client.post(url, json={"preset": "driver_safety:no_such_variant"}, headers=auth).status_code == 400
+    assert client.post(url, json={"preset": "elderly_monitoring"}, headers=auth).status_code == 200
+    assert client.post(url, json={"preset": ""}, headers=auth).status_code == 200
+    trailing = client.post(url, json={"preset": "driver_safety:"}, headers=auth)
+    assert trailing.status_code == 200 and trailing.json()["desired_preset"] == "driver_safety"
+
+
+def test_malformed_input_is_a_client_error_not_a_crash(backend):
+    app_module, client = backend
+    auth, _device, _device_id = _claim_a_device(app_module, client)
+    huge = "9" * 30
+    assert client.get(f"/v1/devices/{huge}/events", headers=auth).status_code in (400, 404)
+    resp = client.post("/v1/login", content='{"email": "a@b.co", "password": "\\ud800abcdefgh"}',
+                       headers={"Content-Type": "application/json"})
+    assert 400 <= resp.status_code < 500
+
+
+def test_a_validation_error_does_not_echo_the_password(backend):
+    _, client = backend
+    secret = "S3cret!" * 200
+    resp = client.post("/v1/login", json={"email": "a@b.co", "password": secret})
+    assert resp.status_code == 422
+    assert "S3cret!" not in resp.text
+
+
+def test_signup_requires_a_plausible_email(backend):
+    _, client = backend
+    for email in ("@", "a@", "@b.co", "a@b", "a@@x.io"):
+        assert client.post("/v1/signup", json={"email": email, "password": "supersecret1"}).status_code == 400
+
+
+def test_a_monitoring_report_of_the_wrong_shape_cannot_break_the_device_list(backend):
+    """The app decodes instruction/rule_count/active as non-optional; one device
+    reporting {"active": "yes"} would fail the decode of every device."""
+    app_module, client = backend
+    auth, device, _device_id = _claim_a_device(app_module, client)
+    client.post("/v1/ingest", json={"events": [], "monitoring": {"active": "yes", "rule_count": "x"}},
+                headers=device)
+    monitoring = client.get("/v1/devices", headers=auth).json()["devices"][0]["monitoring"]
+    assert monitoring["active"] is False and monitoring["rule_count"] == 0
+    assert monitoring["instruction"] == ""
+
+
+def test_a_rule_missing_fields_still_decodes_in_the_app(backend):
+    """AIRule's description/zone/schedule/notify are non-optional in the app. A
+    model that omitted one made the decode of the whole proposal fail."""
+    app_module, _client = backend
+    out = app_module._decodable_proposal({
+        "rules": [{"target": "dog", "predicate": "present"}],
+        "unsupported": [{"request": "x", "support": "needs_model"}],
+        "settings": {"sensitivity": 3},
+    })
+    rule = out["rules"][0]
+    assert {rule[k] for k in ("description", "zone", "schedule", "secondary")} == {""}
+    assert rule["notify"] == "push"
+    assert out["unsupported"][0] == {"request": "x", "reason": "", "requires": "", "support": "needs_model"}
+    assert out["settings"] == {"sensitivity": "3"}
+
+
+def test_a_device_event_type_cannot_inject_a_header(backend):
+    app_module, _client = backend
+    title = app_module._readable_title("evil\r\nX-Injected: 1")
+    assert "\r" not in title and "\n" not in title

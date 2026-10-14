@@ -11,6 +11,12 @@
 #                  prompt is grounded in — an empty sheet makes the model decline
 #                  every request as unsupported, so this is not optional weight
 #   presets.yaml   the mode registry core.presets reads
+#   jupiter/       the AI that /v1/ai/configure and event explanations call.
+#                  cloud/app.py imports it lazily and degrades silently on
+#                  ImportError, so leaving it out does not fail the build -- it
+#                  ships a backend whose "Configure with AI" is a keyword table
+#                  and whose explanations are always 503. Pure Python; its only
+#                  dependencies (requests, pyyaml) are already installed.
 #
 # NOT in it: the database and the JWT secret. Those live on the Fly volume at
 # /data so they survive deploys, and .dockerignore keeps the developer's copies
@@ -34,6 +40,7 @@ RUN pip install --no-cache-dir -r cloud/requirements.txt
 
 COPY cloud/ cloud/
 COPY core/ core/
+COPY jupiter/ jupiter/
 COPY presets.yaml presets.yaml
 COPY scripts/fly_import_db.py scripts/fly_import_db.py
 

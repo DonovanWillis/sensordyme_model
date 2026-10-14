@@ -139,7 +139,9 @@ class HealthMonitor:
             if comp is None:
                 return
             self._mark_failed(comp, error)
-            self._maybe_recover(comp)
+            action = self._maybe_recover(comp)
+        if action is not None:
+            action()
 
     # ------------------------------------------------------------------ monitor thread
     def start(self) -> None:
@@ -171,12 +173,19 @@ class HealthMonitor:
             healthy, detail = comp.check()  # type: ignore[misc]
         except Exception as exc:  # noqa: BLE001 - a broken check is itself a failure
             healthy, detail = False, f"check raised: {exc}"
+        action = None
         with self._lock:
             if healthy:
                 self._mark_ok(comp, detail)
             else:
                 self._mark_failed(comp, detail)
-                self._maybe_recover(comp)
+                action = self._maybe_recover(comp)
+        # Outside the lock. A restart can take seconds (joining a thread, reopening
+        # a camera); held under the lock it blocked /api/health, every component's
+        # own report_failure, and -- through _critical_component_down -- the
+        # systemd watchdog ping, for that whole time.
+        if action is not None:
+            action()
 
     # ------------------------------------------------------------------ state transitions
     def _mark_ok(self, comp: _Component, detail: str) -> None:
@@ -197,10 +206,14 @@ class HealthMonitor:
         threshold_passed = comp.consecutive_failures >= _FAILURES_BEFORE_RESTART
         comp.state = DOWN if (threshold_passed and comp.critical) else DEGRADED
 
-    def _maybe_recover(self, comp: _Component) -> None:
-        """Attempt a restart once the failure threshold is crossed; escalate when spent."""
+    def _maybe_recover(self, comp: _Component):
+        """Decide on a restart (or escalation) once the failure threshold is crossed.
+
+        Called under the lock, so the bookkeeping is consistent; returns the
+        action to run AFTER the lock is released, or None.
+        """
         if comp.consecutive_failures < _FAILURES_BEFORE_RESTART:
-            return
+            return None
 
         now = time.monotonic()
         recent = [t for t in comp.restart_times if now - t <= comp.restart_window_s]
@@ -211,21 +224,33 @@ class HealthMonitor:
                 "restarting %s (attempt %d/%d in window): %s",
                 comp.name, len(recent) + 1, comp.max_restarts, comp.detail,
             )
-            try:
-                comp.restart()
+            restart = comp.restart
+
+            def _restart() -> None:
+                try:
+                    restart()
+                except Exception as exc:  # noqa: BLE001
+                    log.error("restart of %s raised: %s", comp.name, exc)
+                    return
                 # Don't mark OK here — the next check passing is what proves recovery.
-                comp.consecutive_failures = _FAILURES_BEFORE_RESTART - 1
-            except Exception as exc:  # noqa: BLE001
-                log.error("restart of %s raised: %s", comp.name, exc)
-            return
+                with self._lock:
+                    comp.consecutive_failures = _FAILURES_BEFORE_RESTART - 1
+
+            return _restart
 
         if comp.critical and not comp.last_resort_fired and self._on_last_resort is not None:
             comp.last_resort_fired = True
             log.error("%s is down and its restart budget is spent — escalating to last resort", comp.name)
-            try:
-                self._on_last_resort(comp.name)
-            except Exception as exc:  # noqa: BLE001
-                log.error("last-resort handler raised: %s", exc)
+            on_last_resort = self._on_last_resort
+
+            def _escalate() -> None:
+                try:
+                    on_last_resort(comp.name)
+                except Exception as exc:  # noqa: BLE001
+                    log.error("last-resort handler raised: %s", exc)
+
+            return _escalate
+        return None
 
     def _critical_component_down(self) -> bool:
         with self._lock:

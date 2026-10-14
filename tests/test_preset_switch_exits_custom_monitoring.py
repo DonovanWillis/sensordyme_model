@@ -12,6 +12,7 @@ running before it, immediately and durably.
 """
 
 import numpy as np
+import pytest
 
 from core.alerts import AlertManager
 from core.events import Event
@@ -66,8 +67,16 @@ def _runtime(tmp_path) -> DeviceRuntime:
     return runtime
 
 
-def test_switching_preset_clears_active_custom_monitoring(tmp_path):
-    runtime = _runtime(tmp_path)
+@pytest.fixture
+def runtime(tmp_path):
+    rt = _runtime(tmp_path)
+    try:
+        yield rt
+    finally:
+        rt.logger.close()
+
+
+def test_switching_preset_clears_active_custom_monitoring(runtime):
     runtime.monitoring.save(
         [{"target": "cell phone", "predicate": "present"}],
         instruction="watch for phones",
@@ -84,11 +93,10 @@ def test_switching_preset_clears_active_custom_monitoring(tmp_path):
     assert runtime.active_preset == "mode_b"
 
 
-def test_switching_preset_does_not_revert_on_the_next_mode_apply(tmp_path):
+def test_switching_preset_does_not_revert_on_the_next_mode_apply(runtime):
     """The actual failure mode: a later _apply_monitoring_mode() call (which
     every rules/zones poll triggers) must not see monitoring.active still true
     and swap the device back to AI_CUSTOM."""
-    runtime = _runtime(tmp_path)
     runtime.monitoring.save([{"target": "cell phone", "predicate": "present"}], overrides_mode=True)
 
     runtime._switch_preset("mode_b")
@@ -98,10 +106,9 @@ def test_switching_preset_does_not_revert_on_the_next_mode_apply(tmp_path):
     assert runtime.module_name == "preset_switch_test_b", "mode reverted to AI_CUSTOM on the next poll"
 
 
-def test_switching_between_two_presets_with_no_custom_monitoring_is_unaffected(tmp_path):
+def test_switching_between_two_presets_with_no_custom_monitoring_is_unaffected(runtime):
     """The ordinary case, unchanged: plain preset-to-preset switching still works
     and does not touch (or write) the monitoring file when nothing was active."""
-    runtime = _runtime(tmp_path)
     assert runtime.monitoring.active is False
 
     runtime._switch_preset("mode_b")
@@ -111,8 +118,7 @@ def test_switching_between_two_presets_with_no_custom_monitoring_is_unaffected(t
     assert runtime.monitoring.active is False
 
 
-def test_exit_custom_monitoring_is_a_noop_when_nothing_is_active(tmp_path):
-    runtime = _runtime(tmp_path)
+def test_exit_custom_monitoring_is_a_noop_when_nothing_is_active(runtime):
     before = runtime.monitoring.updated_at
     runtime._exit_custom_monitoring()
     assert runtime.monitoring.updated_at == before  # no spurious write

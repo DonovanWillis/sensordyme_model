@@ -71,6 +71,9 @@ def validate(config: dict) -> tuple[list[str], list[str]]:
         stream_fps = dashboard.get("stream_fps", 12)
         _check(errors, _is_num(stream_fps) and 0 < stream_fps <= 60,
                f"`dashboard.stream_fps:` must be in (0, 60], got {stream_fps!r}")
+        host = dashboard.get("host", "127.0.0.1")
+        _check(errors, isinstance(host, str) and host != "",
+               f"`dashboard.host:` must be an IPv4 address or hostname, got {host!r}")
         if dashboard.get("token") and str(dashboard.get("host")) not in ("127.0.0.1", "localhost"):
             warnings.append(
                 "dashboard.token is set with a non-localhost host: make sure the app "
@@ -129,6 +132,18 @@ def validate(config: dict) -> tuple[list[str], list[str]]:
         skip_verify = cloud.get("tls_insecure_skip_verify", False)
         _check(errors, isinstance(skip_verify, bool),
                f"`cloud.tls_insecure_skip_verify:` must be true or false, got {skip_verify!r}")
+        if "queue_max" in cloud:
+            queue_max = cloud["queue_max"]
+            # Above the backend's MAX_INGEST_EVENTS (1000) every flush after an
+            # outage is refused; 0 silently discards every event.
+            _check(errors, isinstance(queue_max, int) and not isinstance(queue_max, bool)
+                   and 1 <= queue_max <= 1000,
+                   f"`cloud.queue_max:` must be an integer in 1-1000, got {queue_max!r}")
+        if cloud.get("enabled") is True and not cloud.get("device_key"):
+            warnings.append(
+                "cloud.enabled is true but cloud.device_key is empty: the uplink will not "
+                "start and this device will never reach the backend"
+            )
         if "poll_interval_s" in cloud:
             poll = cloud["poll_interval_s"]
             _check(errors, _is_num(poll) and poll > 0,
@@ -147,8 +162,31 @@ def validate(config: dict) -> tuple[list[str], list[str]]:
     else:
         errors.append("`cloud:` must be a mapping")
 
+    # Sections the runtime reads with `.get(...)` on the assumption they are
+    # mappings. `logging:` with nothing under it parses as null, which passed
+    # validation and then crashed boot with an AttributeError.
+    for section in ("logging", "alerts", "modules", "training", "hardware", "mac_max"):
+        if section in config and not isinstance(config[section], dict):
+            errors.append(f"`{section}:` must be a mapping, got {config[section]!r}")
+
+    alerts = config.get("alerts")
+    if isinstance(alerts, dict) and "cooldown_s" in alerts:
+        _check(errors, _is_num(alerts["cooldown_s"]) and alerts["cooldown_s"] >= 0,
+               f"`alerts.cooldown_s:` must be a non-negative number, got {alerts['cooldown_s']!r}")
+
+    if isinstance(health, dict):
+        for key in ("reboot_max_total",):
+            if key in health:
+                value = health[key]
+                _check(errors, isinstance(value, int) and not isinstance(value, bool) and value >= 0,
+                       f"`health.{key}:` must be a non-negative integer, got {value!r}")
+
     module_name = config.get("module")
     modules_cfg = config.get("modules", {})
+    if isinstance(modules_cfg, dict):
+        for name, section in modules_cfg.items():
+            if not isinstance(section, dict):
+                errors.append(f"`modules.{name}:` must be a mapping, got {section!r}")
     if profile != "mac_max" and isinstance(module_name, str) and isinstance(modules_cfg, dict):
         _check(errors, module_name in modules_cfg,
                f"`module: {module_name}` has no `modules.{module_name}:` config section")

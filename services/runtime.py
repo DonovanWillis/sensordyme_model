@@ -25,7 +25,7 @@ import signal
 import subprocess
 import threading
 import time
-from contextlib import suppress
+from contextlib import contextmanager, suppress
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Optional
@@ -78,6 +78,11 @@ _ANNOTATE_FAILURE_LOG_EVERY = 300
 # DashboardServer lazily and this constant governs a different renderer (the
 # baked-in frame overlay used by both the cv2 --display window and /stream).
 _FLASH_DURATION_S = 1.5
+#: Longest a module swap may run before the inference check treats it as hung.
+#: Model loading on a Pi CPU fallback has been measured in tens of seconds.
+_MAX_SWAP_S = 120.0
+#: Quiet time after which a run of last-resort reboots counts as over.
+_REBOOT_CAMPAIGN_RESET_S = 24 * 3600.0
 
 
 class _InferenceService(Service):
@@ -301,10 +306,25 @@ class DeviceRuntime:
                 health_provider=lambda: {**self.health.snapshot(),
                                          "device": self._collect_health("dashboard")},
             )
-            print(
-                f"SensorDyme: dashboard live at {self.dashboard.start()} — annotated frames stream "
-                "in-memory to connected browsers only (localhost by default); never written to disk"
-            )
+            try:
+                dashboard_url = self.dashboard.start()
+            except OSError as exc:
+                # The dashboard is the live feed and local API, not the detector.
+                # A port still held by a stale process, or a host this IPv4
+                # server cannot bind, used to abort the whole device -- and five
+                # aborts in two minutes make systemd reboot it. Detection and
+                # alerts carry on without it.
+                log.error(
+                    "dashboard could not start on %s:%s (%s); continuing without "
+                    "the live feed and local API",
+                    dash_cfg.get("host", "127.0.0.1"), dash_cfg.get("port", 8899), exc,
+                )
+                self.dashboard = None
+            else:
+                print(
+                    f"SensorDyme: dashboard live at {dashboard_url} — annotated frames stream "
+                    "in-memory to connected browsers only (localhost by default); never written to disk"
+                )
 
         cloud_cfg = self.config.get("cloud", {})
         if bool(cloud_cfg.get("enabled", False)) and cloud_cfg.get("device_key"):
@@ -614,6 +634,10 @@ class DeviceRuntime:
         return load_zones(module_cfg.get("zones", {}) if isinstance(module_cfg, dict) else {})
 
     def _apply_monitoring_mode(self) -> None:
+        with self._module_swap():
+            self._apply_monitoring_mode_now()
+
+    def _apply_monitoring_mode_now(self) -> None:
         """Run the detector the active mode calls for, and nothing else.
 
         This is what makes "AI custom monitoring" mean something. Suppressing a
@@ -717,7 +741,30 @@ class DeviceRuntime:
             self.uplink.push_event(event, severity, source="custom_rule")
 
     # ------------------------------------------------------------------ health hooks
+    @contextmanager
+    def _module_swap(self):
+        """Mark the inference thread as busy swapping modules, not hung.
+
+        A swap builds the new module, loads its models and closes the old one
+        on the inference thread; on a Pi that can take longer than the 10s the
+        heartbeat check allows. The check then "restarted" a loop that was
+        working, the restart was refused while the swap finished, and the
+        device lost ~40s of inference and two of its three restarts -- a second
+        slow swap within five minutes reached the last-resort reboot.
+        """
+        self._swap_started = time.monotonic()
+        try:
+            yield
+        finally:
+            self._swap_started = None
+            self._heartbeat = time.monotonic()
+
     def _inference_check(self) -> tuple[bool, str]:
+        swap_started = getattr(self, "_swap_started", None)
+        if swap_started is not None:
+            busy = time.monotonic() - swap_started
+            # Bounded: a swap that never finishes IS a hang.
+            return busy < _MAX_SWAP_S, f"switching module ({busy:.0f}s)"
         if self._heartbeat == 0.0:
             return True, "starting"
         age = time.monotonic() - self._heartbeat
@@ -768,6 +815,11 @@ class DeviceRuntime:
         max_total = int(health_cfg.get("reboot_max_total", 5))
         state = self._reboot_state()
         now = time.time()
+        # A campaign ends once the device has gone a day without needing one.
+        # Without this the total was a LIFETIME count: after `reboot_max_total`
+        # last resorts spread over months, auto-recovery was off for good.
+        if state["last_at"] and now - state["last_at"] > _REBOOT_CAMPAIGN_RESET_S:
+            state = {"count": 0, "last_at": state["last_at"]}
 
         if state["count"] >= max_total > 0:
             log.critical(
@@ -875,6 +927,10 @@ class DeviceRuntime:
 
     def _switch_preset(self, name: str) -> None:
         """Hot-swap the running module to a preset (optionally "preset:variant")."""
+        with self._module_swap():
+            self._switch_preset_now(name)
+
+    def _switch_preset_now(self, name: str) -> None:
         # Translate superseded names first. A `set_preset` command can have been
         # sitting in the backend since before a mode was renamed, and the old
         # code path simply returned on an unknown preset — so the device would
@@ -966,12 +1022,98 @@ class DeviceRuntime:
         print(f"SensorDyme: switched to preset '{name}' (module '{new_module_name}')")
 
     # ------------------------------------------------------------------ the inference loop
+    def _apply_pending_commands(self) -> None:
+        """Apply any mode, zone or rule change the app or dashboard has sent."""
+        # `is not None`, not `or`: dashboard's own "" is cloud/app.py's sentinel
+        # for "apply AI Custom" (see POST .../preset), a real, meaningful value
+        # distinct from "nothing pending" (None) — an `or` chain treats an
+        # empty-string result from the dashboard as falsy and silently falls
+        # through to whatever the uplink has instead, discarding the actual
+        # command.
+        dashboard_pending = self.dashboard.pop_pending_preset() if self.dashboard else None
+        pending = dashboard_pending if dashboard_pending is not None else (
+            self.uplink.pop_pending_preset() if self.uplink else None
+        )
+        # Resolve superseded names BEFORE the equality gate, not only inside
+        # _switch_preset. A stale "driver_distraction" command from an old
+        # backend or app never string-equals the device's "driver_safety",
+        # so the unresolved comparison passed every time and each delivery
+        # rebuilt the running module — closing FaceMesh and zeroing every
+        # timer, PERCLOS window and risk EMA mid-drive. With a backend old
+        # enough to re-send the alias on every poll, that was a full module
+        # teardown every few seconds: nothing needing sustained evidence
+        # could ever fire.
+        #
+        # `is not None`, not truthy: the same "" sentinel above must reach
+        # resolve_preset/_switch_preset rather than being silently dropped
+        # here — see _switch_preset's own handling of an empty name.
+        if pending is not None:
+            from main import resolve_preset
+
+            pending = resolve_preset(pending, self.presets)
+        # `pending == self.active_preset` is not "nothing to do" while custom
+        # monitoring is active: active_preset still names whichever preset was
+        # running before custom rules took over (entering custom monitoring
+        # never changes it), so a request to return to that exact preset has
+        # real work left — exiting custom monitoring — that this equality
+        # check would otherwise skip silently, with no error and no log line.
+        if pending is not None and (pending != self.active_preset or self.monitoring.active):
+            self._switch_preset(pending)
+
+        # A new AI-configured rule set from the app replaces the live one.
+        # `None` means no news; `[]` means the user deleted their rules and
+        # enforcement must actually stop.
+        if self.uplink is not None:
+            # Zones first: a rule that names an area is inert until the area
+            # exists, so applying rules before zones would leave a freshly
+            # activated rule silently doing nothing for one cycle.
+            new_zones = self.uplink.pop_pending_zones()
+            if new_zones is not None:
+                zones = load_zones({
+                    z["name"]: {"polygon": z.get("polygon"), "kind": z.get("kind", "restricted")}
+                    for z in new_zones if isinstance(z, dict) and z.get("name")
+                })
+                self.rule_engine.set_zones(zones)
+                print(f"zones: {len(zones)} area(s) active ({', '.join(z.name for z in zones) or 'none'})")
+
+            new_rules = self.uplink.pop_pending_rules()
+            if new_rules is not None:
+                self.rule_engine.replace_rules(new_rules)
+                # Written down as it arrives, so the next boot still has it.
+                self.monitoring.save(
+                    new_rules,
+                    instruction=self.uplink.pending_instruction(),
+                    version=self.uplink.rules_version(),
+                )
+                self.uplink.set_monitoring(self.monitoring.describe())
+                # A new configuration can change which detector is needed.
+                self._apply_monitoring_mode()
+                self._apply_requested_labels()
+                pending_zones = self.rule_engine.pending_zones()
+                print(
+                    f"rules: enforcing {len(self.rule_engine.rules)} AI-configured rule(s)"
+                    + (f"; awaiting zones: {', '.join(pending_zones)}" if pending_zones else "")
+                )
+
+    # ------------------------------------------------------------------ the inference loop
     def _inference_loop(self, stop: threading.Event) -> None:
         last_seq = 0
         stream_interval = (
             self.dashboard.stream_interval if self.dashboard is not None else 0.0
         )
         while not (stop.is_set() or self.shutdown.is_set()):
+            # Commands first, and on EVERY pass -- not only after a fresh frame.
+            # They used to be read further down, past the degraded short-circuit
+            # and the no-frame `continue`, so a device whose detector was missing
+            # (or whose camera was down) could not be switched to a mode that
+            # would work: the app's command sat pending for ever.
+            try:
+                self._apply_pending_commands()
+            except Exception:  # one bad command must not stop detection
+                # A switch that raised part-way (a module that would not build,
+                # a close() that threw) is logged and dropped; the loop -- and
+                # the module still installed -- carries on.
+                log.exception("applying a mode/rule/zone command failed; continuing")
             if self._detection_degraded is not None:
                 # No detector, so there is nothing honest to compute. The
                 # heartbeat still ticks -- the loop IS alive, and health must be
@@ -991,77 +1133,6 @@ class DeviceRuntime:
                 self._heartbeat = time.monotonic()
                 continue  # timeout: no fresh frame — health watches bus.age_s()
             last_seq = seq
-
-            # `is not None`, not `or`: dashboard's own "" is cloud/app.py's sentinel
-            # for "apply AI Custom" (see POST .../preset), a real, meaningful value
-            # distinct from "nothing pending" (None) — an `or` chain treats an
-            # empty-string result from the dashboard as falsy and silently falls
-            # through to whatever the uplink has instead, discarding the actual
-            # command.
-            dashboard_pending = self.dashboard.pop_pending_preset() if self.dashboard else None
-            pending = dashboard_pending if dashboard_pending is not None else (
-                self.uplink.pop_pending_preset() if self.uplink else None
-            )
-            # Resolve superseded names BEFORE the equality gate, not only inside
-            # _switch_preset. A stale "driver_distraction" command from an old
-            # backend or app never string-equals the device's "driver_safety",
-            # so the unresolved comparison passed every time and each delivery
-            # rebuilt the running module — closing FaceMesh and zeroing every
-            # timer, PERCLOS window and risk EMA mid-drive. With a backend old
-            # enough to re-send the alias on every poll, that was a full module
-            # teardown every few seconds: nothing needing sustained evidence
-            # could ever fire.
-            #
-            # `is not None`, not truthy: the same "" sentinel above must reach
-            # resolve_preset/_switch_preset rather than being silently dropped
-            # here — see _switch_preset's own handling of an empty name.
-            if pending is not None:
-                from main import resolve_preset
-
-                pending = resolve_preset(pending, self.presets)
-            # `pending == self.active_preset` is not "nothing to do" while custom
-            # monitoring is active: active_preset still names whichever preset was
-            # running before custom rules took over (entering custom monitoring
-            # never changes it), so a request to return to that exact preset has
-            # real work left — exiting custom monitoring — that this equality
-            # check would otherwise skip silently, with no error and no log line.
-            if pending is not None and (pending != self.active_preset or self.monitoring.active):
-                self._switch_preset(pending)
-
-            # A new AI-configured rule set from the app replaces the live one.
-            # `None` means no news; `[]` means the user deleted their rules and
-            # enforcement must actually stop.
-            if self.uplink is not None:
-                # Zones first: a rule that names an area is inert until the area
-                # exists, so applying rules before zones would leave a freshly
-                # activated rule silently doing nothing for one cycle.
-                new_zones = self.uplink.pop_pending_zones()
-                if new_zones is not None:
-                    zones = load_zones({
-                        z["name"]: {"polygon": z.get("polygon"), "kind": z.get("kind", "restricted")}
-                        for z in new_zones if isinstance(z, dict) and z.get("name")
-                    })
-                    self.rule_engine.set_zones(zones)
-                    print(f"zones: {len(zones)} area(s) active ({', '.join(z.name for z in zones) or 'none'})")
-
-                new_rules = self.uplink.pop_pending_rules()
-                if new_rules is not None:
-                    self.rule_engine.replace_rules(new_rules)
-                    # Written down as it arrives, so the next boot still has it.
-                    self.monitoring.save(
-                        new_rules,
-                        instruction=self.uplink.pending_instruction(),
-                        version=self.uplink.rules_version(),
-                    )
-                    self.uplink.set_monitoring(self.monitoring.describe())
-                    # A new configuration can change which detector is needed.
-                    self._apply_monitoring_mode()
-                    self._apply_requested_labels()
-                    pending_zones = self.rule_engine.pending_zones()
-                    print(
-                        f"rules: enforcing {len(self.rule_engine.rules)} AI-configured rule(s)"
-                        + (f"; awaiting zones: {', '.join(pending_zones)}" if pending_zones else "")
-                    )
 
             with self._module_lock:
                 module = self.module

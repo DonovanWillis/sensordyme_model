@@ -69,8 +69,8 @@ setup*.log
 *.local.yaml
 
 # --- Secrets ------------------------------------------------------------------
-# Real JWT signing key etc. app.py falls back to a committed dev default, which
-# is fine on loopback and not fine on a LAN-exposed port.
+# Real JWT signing key etc. cloud/app.py takes SENSORDYME_JWT_SECRET(_FILE), or
+# generates a key and persists it beside the database (cloud/.jwt_secret, below).
 .secrets/
 
 # Backend database: real accounts (email + pw_hash + salt), device_key, claim

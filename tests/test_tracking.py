@@ -90,11 +90,13 @@ def test_peak_speed_sees_oscillation_that_net_displacement_cannot():
     correct answers to different questions -- this pins that they differ."""
     tracker = BoxTracker(max_distance=5.0)
     t = 0.0
+    track = None
     for step in range(9):  # odd count -> ends one step from where it started
         x = 100 + 60 * (1 if step % 2 else -1)
         track = tracker.update([("hand", (x, 80, x + 40, 120), 0.9)], now=t)[0]
         t += 0.1
     # 120px of travel every 0.1s against a ~56.6px diagonal -> >20 diagonals/s.
+    assert track is not None
     assert track.peak_speed() > 20.0
     # ...while the net displacement over the whole 0.8s trail is one step.
     assert track.velocity() < 3.0

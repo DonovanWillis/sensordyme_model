@@ -147,16 +147,6 @@ def lan_ip() -> Optional[str]:
     return None if address.startswith("127.") else address
 
 
-def machine_identity() -> tuple[Optional[str], str]:
-    """The address and short hostname this machine has *right now*.
-
-    Read together and compared as a pair, because either one changing on its own
-    is enough to make an existing announcement wrong: a new DHCP lease changes
-    only the address, and a macOS name-collision rename changes only the host.
-    """
-    return lan_ip(), socket.gethostname().split(".")[0]
-
-
 class Advertiser:
     """Publishes the service while the server runs, keeps it true, and withdraws
     it on shutdown.
@@ -227,6 +217,12 @@ class Advertiser:
         #: published the same name on en0 correctly at the same instant, which is
         #: what identified the instance's age as the variable.
         self._bound_address: Optional[str] = None
+        #: True between a start() that found zeroconf installed and stop(). It,
+        #: not `_zeroconf`, is what decides whether refresh() does anything: a
+        #: Zeroconf that could not be built (no LAN at login, an interface
+        #: flapping mid-move) is a reason to try again on the next tick, not to
+        #: stop announcing for the rest of the process.
+        self._running = False
         self._lock = threading.Lock()
         self._stopping = threading.Event()
         self._watcher: Optional[threading.Thread] = None
@@ -325,8 +321,18 @@ class Advertiser:
         """
         address = lan_ip()
         with self._lock:
-            if self._zeroconf is None:
+            if not self._running:
                 return False
+
+            if self._zeroconf is None:
+                # Nothing on the wire because the instance could not be built
+                # (or the network was absent) last time. Try again now.
+                if address is None or not self._rebind_locked(address):
+                    return False
+                if not self._register_locked(address):
+                    return False
+                log.info("mDNS is available again; announcing at http://%s:%d", address, self.port)
+                return True
 
             # No LAN at all. Withdraw rather than keep repeating the last address
             # we had: a phone that finds nothing goes on looking, while a phone
@@ -401,11 +407,17 @@ class Advertiser:
             )
             return False
 
+        # From here on a failure is retried by the watcher rather than final: a
+        # LaunchAgent starts this at login, routinely before Wi-Fi has joined.
+        self._stopping.clear()
+        self._running = True
+        self._start_watcher()
+
         address = lan_ip()
         if address is None:
             log.warning(
-                "no LAN address found, so this server will not announce itself; "
-                "the app will need its address typed into Settings"
+                "no LAN address yet, so this server is not announcing itself; it "
+                "will as soon as this machine joins a network"
             )
             return False
 
@@ -419,20 +431,13 @@ class Advertiser:
                 # nothing after it is a log line that costs more time than it saves.
                 log.warning(
                     "could not announce this server on the network (%s); "
-                    "the app will need its address typed into Settings",
-                    repr(exc),
+                    "will retry every %.0fs",
+                    repr(exc), self.refresh_interval_s,
                 )
                 self._zeroconf = None
                 return False
             self._bound_address = address
-            registered = self._register_locked(address)
-
-        if not registered:
-            self.stop()
-            return False
-
-        self._start_watcher()
-        return True
+            return self._register_locked(address)
 
     def _start_watcher(self) -> None:
         if self.refresh_interval_s <= 0 or self._watcher is not None:
@@ -454,6 +459,7 @@ class Advertiser:
                 log.warning("mDNS refresh failed (%s); will try again", repr(exc))
 
     def stop(self) -> None:
+        self._running = False
         self._stopping.set()
         watcher, self._watcher = self._watcher, None
         if watcher is not None and watcher is not threading.current_thread():

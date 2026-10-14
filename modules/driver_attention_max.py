@@ -646,6 +646,22 @@ class DriverAttentionMaxModule(VisionModule):
 
         if not results.multi_face_landmarks:
             self._last_face_proto = None
+            # Reset the trackers, not just the flags. A tracker keeps its start
+            # time until it sees the condition go false, so clearing only the
+            # flags let the whole absence count toward the first reading after
+            # the face returned: one closed frame then fired drowsiness with a
+            # "duration" that was really time the face was not seen at all.
+            # driver_attention.py's face-lost path does the same.
+            for tracker in (
+                self._microsleep_tracker,
+                self._drowsy_tracker,
+                self._off_road_tracker,
+                self._eyes_down_tracker,
+                self._phone_use_distracted_tracker,
+            ):
+                tracker.update(False, now)
+            self._eyes_closed_prev = False
+            self._closure_start = None
             self._microsleep_active = False
             self._drowsy_active = False
             self._off_road_active = False

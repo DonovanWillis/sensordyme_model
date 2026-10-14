@@ -205,7 +205,11 @@ final class DeviceLink: ObservableObject {
         request.cachePolicy = .reloadIgnoringLocalCacheData
         do {
             let (_, response) = try await URLSession.shared.data(for: request)
-            return (response as? HTTPURLResponse).map { (200..<500).contains($0.statusCode) } ?? false
+            // 200, or 401/403 from a device that wants its token: that is a
+            // SensorDyme answering. Anything else (a 404 from whatever now holds
+            // this DHCP address) is not, and accepting it reported a stranger's
+            // box as the camera.
+            return (response as? HTTPURLResponse).map { [200, 401, 403].contains($0.statusCode) } ?? false
         } catch {
             return false
         }

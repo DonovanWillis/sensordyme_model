@@ -73,10 +73,18 @@ class ProvisioningService:
         # and its window closed six days ago. The only way to reconfigure it was
         # to break its Wi-Fi first — which is the problem, not the solution.
         #
-        # So it stays open, and what makes that safe is authentication rather
-        # than brevity: see core/pairing.py. A window that is merely short is
-        # not security, it is a smaller target.
-        self._always_available = bool(config.get("always_available", True))
+        # Keeping it open permanently was justified by authentication that was
+        # never built: the comment here cited a core/pairing.py that does not
+        # exist, and the credential characteristic is a plain BLE "write" with no
+        # pairing behind it. Left open, anyone within Bluetooth range could move
+        # a working camera onto a network of their choosing at any time.
+        #
+        # So the default is the window: open while offline, and for
+        # `reconfigure_window_s` after every boot. Moving a working device to a
+        # new house is a power-cycle away. `always_available: true` remains for
+        # someone who accepts that exposure, and is the setting to revisit once
+        # credential writes are actually authenticated.
+        self._always_available = bool(config.get("always_available", False))
         self._reconfigure_window_s = float(config.get("reconfigure_window_s", 300))
         self._version = version
         self._ble = None  # BLEProvisioningServer, created lazily

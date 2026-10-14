@@ -33,7 +33,11 @@ pip install --upgrade pip
 # correct to have on a dev machine (nothing is conveyed from here) but must never
 # reach a device — setup_pi.sh installs requirements-device.txt for that reason.
 # See docs/LICENSING.md.
-pip install -r requirements.txt
+# cloud/requirements.txt too: this Mac is also where the backend runs
+# (scripts/install_backend_mac.sh), and fastapi/uvicorn/pyjwt/zeroconf are in
+# neither of the files above -- a fresh setup could not start it. One resolve,
+# so the two files' pins are checked against each other.
+pip install -r requirements.txt -r cloud/requirements.txt
 
 mkdir -p data/reports
 

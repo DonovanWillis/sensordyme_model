@@ -16,11 +16,14 @@ from core.network import WifiManager
 class FakeNM:
     """A NetworkManager stand-in that tracks profiles and the active connection."""
 
-    def __init__(self, *, active="Hotspot", saved=("Hotspot",), joinable=()):
+    def __init__(self, *, active="Hotspot", saved=("Hotspot",), joinable=(), psks=None, correct=None):
         self.profiles = list(saved)
         self.active = active
         self.joinable = set(joinable)
         self.calls = []
+        #: Stored passphrase per profile, and the one each network accepts.
+        self.psks = dict(psks or {})
+        self.correct = dict(correct or {})
 
     def run(self, args, timeout=10):
         self.calls.append(args)
@@ -41,6 +44,12 @@ class FakeNM:
         if args[:2] == ["-t", "-f"] and "ACTIVE,SSID" in args[2]:
             return types.SimpleNamespace(
                 returncode=0, stderr="", stdout=f"yes:{self.active}\n" if self.active else "")
+        if args[:2] == ["-s", "-g"] and args[3:5] == ["connection", "show"]:
+            return types.SimpleNamespace(returncode=0, stderr="",
+                                         stdout=self.psks.get(args[5], "") + "\n")
+        if args[:2] == ["connection", "modify"] and "wifi-sec.psk" in args:
+            self.psks[args[2]] = args[args.index("wifi-sec.psk") + 1]
+            return ok
         if args[:2] == ["connection", "add"]:
             self.profiles.append(args[args.index("con-name") + 1])
             return ok
@@ -50,7 +59,8 @@ class FakeNM:
             return ok
         if args[:2] == ["connection", "up"]:
             target = args[2]
-            if target in self.joinable:
+            psk_ok = target not in self.correct or self.psks.get(target) == self.correct[target]
+            if target in self.joinable and psk_ok:
                 self.active = target
                 return ok
             return types.SimpleNamespace(
@@ -135,3 +145,49 @@ def test_activation_returning_zero_is_not_treated_as_connected(monkeypatch):
     ok, _ = wifi.provision("HomeWiFi", "correct")
     assert ok is False
     assert nm.active == "Hotspot"
+
+
+def test_a_wrong_password_for_the_CURRENT_network_does_not_destroy_it(monkeypatch):
+    """Re-entering the password of the network the device is already on used to
+    overwrite the stored passphrase BEFORE testing it. Rollback had nothing to
+    do (the previous network was the same one), so a typo left the device off
+    Wi-Fi with a broken profile -- across reboots."""
+    nm = FakeNM(active="HomeNet", saved=["HomeNet"], joinable={"HomeNet"},
+                psks={"HomeNet": "rightpass"}, correct={"HomeNet": "rightpass"})
+    wifi = install(monkeypatch, nm)
+
+    wifi.provision("HomeNet", "wrongpass1")
+
+    assert nm.psks["HomeNet"] == "rightpass", "the working passphrase was overwritten"
+    assert nm.active == "HomeNet", "the device was left off the network it was on"
+
+
+def test_a_failed_password_change_for_a_saved_network_restores_the_old_one(monkeypatch):
+    """Not the active network, so the change is attempted -- and undone on failure."""
+    nm = FakeNM(active="Hotspot", saved=["Hotspot", "HomeNet"], joinable={"Hotspot", "HomeNet"},
+                psks={"HomeNet": "oldpass1"}, correct={"HomeNet": "newpass1"})
+    wifi = install(monkeypatch, nm)
+
+    ok, _message = wifi.provision("HomeNet", "typo-pass")
+
+    assert ok is False
+    assert nm.psks["HomeNet"] == "oldpass1"
+    assert nm.active == "Hotspot"
+
+
+def test_a_corrected_password_for_a_saved_network_is_kept(monkeypatch):
+    nm = FakeNM(active="Hotspot", saved=["Hotspot", "HomeNet"], joinable={"Hotspot", "HomeNet"},
+                psks={"HomeNet": "oldpass"}, correct={"HomeNet": "newpass1"})
+    wifi = install(monkeypatch, nm)
+    assert wifi.provision("HomeNet", "newpass1")[0] is True
+    assert nm.psks["HomeNet"] == "newpass1"
+
+
+def test_re_sending_the_network_it_is_already_on_changes_nothing(monkeypatch):
+    nm = FakeNM(active="HomeNet", saved=["HomeNet"], joinable={"HomeNet"},
+                psks={"HomeNet": "rightpass"}, correct={"HomeNet": "rightpass"})
+    wifi = install(monkeypatch, nm)
+    ok, _ = wifi.provision("HomeNet", "anything")
+    assert ok is True
+    assert nm.psks["HomeNet"] == "rightpass"
+    assert not any(c[:2] == ["connection", "modify"] for c in nm.calls)

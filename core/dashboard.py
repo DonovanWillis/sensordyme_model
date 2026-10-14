@@ -29,6 +29,7 @@ from collections import Counter, deque
 from datetime import UTC, datetime
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Optional
+from urllib.parse import parse_qs, urlsplit
 
 import cv2
 import numpy as np
@@ -84,7 +85,9 @@ class DashboardServer:
         self._module_name = module_name
         self._presets = presets or {}
         self._active_preset = active_preset
-        self._token = token or None
+        # str(): YAML reads `token: 123456` as an int, and compare_digest(str, int)
+        # raises on every request -- an auth check that crashes is not one.
+        self._token = str(token) if token not in (None, "") else None
         self._events_csv_path = events_csv_path
         self._health_provider = health_provider  # () -> dict, from core/health.py
         self._jpeg_quality = max(1, min(100, int(jpeg_quality)))
@@ -110,6 +113,13 @@ class DashboardServer:
         dashboard = self
 
         class _Handler(BaseHTTPRequestHandler):
+            # Socket timeout for every read and write on a connection. Without
+            # it a client that opens a socket and sends half a request holds a
+            # thread for ever; a few hundred of them, unauthenticated, exhaust
+            # the process. Generous, because /stream writes to phones on weak
+            # Wi-Fi: only a client stalled this long is dropped.
+            timeout = 30
+
             def log_message(self, *args) -> None:  # silence per-request logging
                 pass
 
@@ -128,16 +138,26 @@ class DashboardServer:
                     # who has not.
                     return not dashboard._network_reachable
                 sent = self.headers.get("X-Device-Token", "")
-                if not sent and "token=" in self.path:
+                if not sent:
                     # Kept for the MJPEG <img> case, which cannot set a header. It is
                     # a real leak -- a token in a URL lands in proxy logs, browser
                     # history and Referer -- so it stays the fallback, never the
                     # documented path, and the app itself uses the header.
-                    sent = self.path.rsplit("token=", 1)[1].split("&")[0]
+                    #
+                    # Parsed, not split: the page sends encodeURIComponent(TOKEN),
+                    # so a token containing + / = & or a space only matches once
+                    # it is decoded.
+                    query = parse_qs(urlsplit(self.path).query)
+                    sent = (query.get("token") or [""])[0]
                 # compare_digest, not ==: a plain string compare short-circuits on the
                 # first differing byte, which leaks the token's prefix to anyone who
                 # can time responses. Cheap to get right, awkward to retrofit later.
-                return hmac.compare_digest(sent, dashboard._token)
+                # On bytes: compare_digest refuses non-ASCII str, and a header can
+                # carry anything -- that used to drop the connection with a traceback.
+                return hmac.compare_digest(
+                    sent.encode("utf-8", "surrogateescape"),
+                    dashboard._token.encode("utf-8", "surrogateescape"),
+                )
 
             def _peer_gone(self) -> bool:
                 """True once the client has closed its end of the connection.
@@ -184,28 +204,39 @@ class DashboardServer:
                 self.end_headers()
                 self.wfile.write(body)
 
+            def _read_json(self) -> dict:
+                """The request body as a JSON object; {} for anything else.
+
+                Bounded: these bodies are a preset name or a Wi-Fi password,
+                and an unbounded Content-Length is memory on the device's
+                terms. A malformed length used to raise into a traceback.
+                """
+                try:
+                    length = int(self.headers.get("Content-Length", 0))
+                except ValueError:
+                    return {}
+                if not 0 < length <= 64 * 1024:
+                    return {}
+                try:
+                    payload = json.loads(self.rfile.read(length))
+                except (ValueError, UnicodeDecodeError):
+                    return {}
+                return payload if isinstance(payload, dict) else {}
+
             def do_POST(self) -> None:
                 try:
                     if not self._authorized():
                         self._json({"error": "invalid or missing device token"}, 401)
                         return
                     if self.path.startswith("/setup/wifi"):
-                        length = int(self.headers.get("Content-Length", 0))
-                        try:
-                            payload = json.loads(self.rfile.read(length) or b"{}")
-                        except json.JSONDecodeError:
-                            payload = {}
+                        payload = self._read_json()
                         ok, message = dashboard.apply_wifi(
                             str(payload.get("ssid", "")), str(payload.get("password", ""))
                         )
                         self._json({"ok": ok, "message": message}, 200 if ok else 400)
                     elif self.path.startswith("/api/preset"):
-                        length = int(self.headers.get("Content-Length", 0))
-                        try:
-                            payload = json.loads(self.rfile.read(length) or b"{}")
-                        except json.JSONDecodeError:
-                            payload = {}
-                        name = payload.get("preset", "")
+                        payload = self._read_json()
+                        name = str(payload.get("preset", ""))
                         base = name.partition(":")[0]
                         if base not in dashboard._presets:
                             self._json({"error": f"unknown preset '{name}'"}, 400)

@@ -308,6 +308,16 @@ class WifiManager:
 
         previous = self.active_profile()
         existed = ssid in self.saved_networks()
+        if previous == ssid and existed and self.is_online():
+            # Already on this network with a password that demonstrably works.
+            # Re-writing it gains nothing and risks everything: a typo (or a
+            # stranger in Bluetooth range) used to replace the working
+            # passphrase, and when the old secret cannot be read back
+            # (agent-owned secrets) there is nothing to restore it from.
+            return True, f"already on '{ssid}'"
+        #: The passphrase a saved profile had before this attempt, so a failed
+        #: attempt can put it back. None when there is nothing to restore.
+        saved_psk: Optional[str] = None
 
         try:
             if not existed:
@@ -325,7 +335,12 @@ class WifiManager:
                     return False, explain_connect_failure(reason, ssid)
             elif password:
                 # Known network, new password: update in place rather than
-                # creating a duplicate profile for the same SSID.
+                # creating a duplicate profile for the same SSID -- but keep the
+                # old passphrase first. When `ssid` is the network the device is
+                # ON, rollback has nowhere else to go, so a mistyped password
+                # used to leave a working device off Wi-Fi with a broken
+                # profile, across reboots.
+                saved_psk = self._stored_psk(ssid)
                 _run(["connection", "modify", ssid,
                       "wifi-sec.key-mgmt", "wpa-psk", "wifi-sec.psk", password])
 
@@ -343,8 +358,18 @@ class WifiManager:
         except Exception as exc:  # noqa: BLE001
             reason = str(exc)
 
-        self._roll_back(ssid, created=not existed, previous=previous)
+        self._roll_back(ssid, created=not existed, previous=previous, restore_psk=saved_psk)
         return False, explain_connect_failure(reason, ssid)
+
+    @staticmethod
+    def _stored_psk(ssid: str) -> Optional[str]:
+        """The passphrase NetworkManager holds for profile `ssid`, or None."""
+        try:
+            result = _run(["-s", "-g", "802-11-wireless-security.psk", "connection", "show", ssid])
+        except Exception:  # noqa: BLE001 - absence means nothing to restore
+            return None
+        value = result.stdout.strip() if result.returncode == 0 else ""
+        return value or None
 
     def _settled_on(self, ssid: str) -> bool:
         """Whether the device is really on `ssid` with an address.
@@ -362,13 +387,19 @@ class WifiManager:
             time.sleep(0.5)
         return False
 
-    def _roll_back(self, ssid: str, created: bool, previous: Optional[str]) -> None:
+    def _roll_back(self, ssid: str, created: bool, previous: Optional[str],
+                   restore_psk: Optional[str] = None) -> None:
         """Undo a failed switch and get the device back on something."""
         try:
             if created:
                 # Leaving it saved means NetworkManager retries a network that
                 # rejected us on every future boot.
                 _run(["connection", "delete", ssid])
+            elif restore_psk is not None:
+                _run(["connection", "modify", ssid, "wifi-sec.psk", restore_psk])
+                if previous == ssid:
+                    log.info("switch failed — restoring '%s' with its previous password", ssid)
+                    _run(["connection", "up", ssid], timeout=_CONNECT_TIMEOUT_S)
             if previous and previous != ssid:
                 log.info("switch failed — returning to '%s'", previous)
                 _run(["connection", "up", previous], timeout=_CONNECT_TIMEOUT_S)

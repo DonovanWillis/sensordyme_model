@@ -300,3 +300,45 @@ def test_dashboard_unknown_path_is_404():
         assert raised
     finally:
         server.close()
+
+
+def _status(url, headers=None):
+    try:
+        with urllib.request.urlopen(urllib.request.Request(url, headers=headers or {}), timeout=5) as resp:  # noqa: S310
+            return resp.status
+    except urllib.error.HTTPError as exc:
+        return exc.code
+
+
+def test_a_numeric_token_from_yaml_still_authenticates():
+    """`token: 123456` loads as an int; compare_digest(str, int) used to raise on
+    every request, dropping the connection instead of answering."""
+    server = DashboardServer(host="127.0.0.1", port=0, token=123456)
+    url = server.start()
+    try:
+        assert _status(url + "/api/state", {"X-Device-Token": "123456"}) == 200
+        assert _status(url + "/api/state", {"X-Device-Token": "nope"}) == 401
+    finally:
+        server.close()
+
+
+def test_a_non_ascii_token_header_is_refused_not_crashed():
+    server = DashboardServer(host="127.0.0.1", port=0, token="s3cret")
+    url = server.start()
+    try:
+        assert _status(url + "/api/state", {"X-Device-Token": "café"}) == 401
+    finally:
+        server.close()
+
+
+def test_the_query_token_is_url_decoded():
+    """The page sends encodeURIComponent(TOKEN); a token with + / = must match."""
+    import urllib.parse
+
+    token = "ab+c/d= e"
+    server = DashboardServer(host="127.0.0.1", port=0, token=token)
+    url = server.start()
+    try:
+        assert _status(url + "/api/state?token=" + urllib.parse.quote(token, safe="")) == 200
+    finally:
+        server.close()

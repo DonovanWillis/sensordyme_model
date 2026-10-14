@@ -21,8 +21,10 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
+import hmac
 import json
 import logging
+import math
 import os
 import re
 import secrets
@@ -34,12 +36,20 @@ from typing import Optional
 
 import jwt
 from fastapi import BackgroundTasks, Depends, FastAPI, Header, HTTPException, Request
+from fastapi.exceptions import RequestValidationError
+from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field
 
 from cloud import mdns
 from cloud.notify import COOLDOWN_S as NOTIFY_COOLDOWN_S
 from cloud.notify import gate
-from cloud.ratelimit import CLAIM_LIMITER, LOGIN_LIMITER, SIGNUP_LIMITER
+from cloud.ratelimit import (
+    AI_CONCURRENCY,
+    AI_RATE_LIMITER,
+    CLAIM_LIMITER,
+    LOGIN_LIMITER,
+    SIGNUP_LIMITER,
+)
 from core.presets import load_presets, resolve_preset, same_preset
 
 DB_PATH = os.environ.get("SENSORDYME_DB", str(Path(__file__).parent / "sensordyme.db"))
@@ -75,6 +85,15 @@ def _load_jwt_secret() -> str:
     """
     env = os.environ.get("SENSORDYME_JWT_SECRET", "").strip()
     if env:
+        if len(env.encode()) < 32:
+            # Warned, not refused: refusing would take a running deployment
+            # down on upgrade. HS256 with a short key is brute-forceable
+            # offline from any one token, which is a forged session for anyone.
+            logging.getLogger("uvicorn.error").warning(
+                "SENSORDYME_JWT_SECRET is %d bytes; use at least 32 (e.g. "
+                "`openssl rand -hex 32`, set once and kept) or unset it to have one "
+                "generated and persisted", len(env.encode()),
+            )
         return env
 
     path = Path(os.environ.get("SENSORDYME_JWT_SECRET_FILE", Path(DB_PATH).parent / ".jwt_secret"))
@@ -163,6 +182,105 @@ app = FastAPI(
     redoc_url="/redoc" if _DOCS_ENABLED else None,
     openapi_url="/openapi.json" if _DOCS_ENABLED else None,
 )
+
+
+#: The largest request body accepted, on any route.
+#:
+#: FastAPI reads and parses a body BEFORE any auth dependency runs, so without
+#: this one unauthenticated POST could make the server hold as much as it cared
+#: to send -- measured at ~1 GB resident for a 300 MB body against a wrong
+#: device key, on a deployment whose whole VM has 512 MB. The largest legitimate
+#: request is a device flushing a full backlog (MAX_INGEST_EVENTS events), which
+#: is well under 1 MB; 4 MB leaves room without leaving a lever.
+MAX_BODY_BYTES = 4 * 1024 * 1024
+
+
+class _BodySizeLimit:
+    """Refuse oversized bodies with 413, by declared length and by bytes received.
+
+    Pure ASGI rather than BaseHTTPMiddleware so the body is never buffered here,
+    and so a chunked body with no Content-Length is counted as it arrives.
+    """
+
+    def __init__(self, app, limit: int) -> None:
+        self.app = app
+        self.limit = limit
+
+    async def __call__(self, scope, receive, send):
+        if scope["type"] != "http":
+            await self.app(scope, receive, send)
+            return
+        for name, value in scope.get("headers") or []:
+            if name == b"content-length":
+                try:
+                    declared = int(value)
+                except ValueError:
+                    declared = self.limit + 1
+                if declared > self.limit:
+                    await self._reject(send)
+                    return
+
+        received = 0
+
+        async def limited_receive():
+            nonlocal received
+            message = await receive()
+            if message["type"] == "http.request":
+                received += len(message.get("body", b""))
+                if received > self.limit:
+                    # FastAPI re-raises an HTTPException met while reading the
+                    # body (anything else becomes a 400), so this surfaces as 413.
+                    raise HTTPException(413, "request body too large")
+            return message
+
+        await self.app(scope, limited_receive, send)
+
+    @staticmethod
+    async def _reject(send) -> None:
+        body = b'{"detail":"request body too large"}'
+        await send({
+            "type": "http.response.start",
+            "status": 413,
+            "headers": [
+                (b"content-type", b"application/json"),
+                (b"content-length", str(len(body)).encode()),
+                (b"connection", b"close"),
+            ],
+        })
+        await send({"type": "http.response.body", "body": body})
+
+
+app.add_middleware(_BodySizeLimit, limit=MAX_BODY_BYTES)
+
+
+@app.exception_handler(RequestValidationError)
+async def _validation_error(_request: Request, exc: RequestValidationError) -> JSONResponse:
+    """FastAPI's default 422, minus the echo of what was sent.
+
+    The default includes each failing field's `input` -- so an over-long
+    password came straight back in the response body, into any proxy or client
+    log that records responses. `ctx` and `url` go too: `ctx` can hold
+    non-serialisable values, and neither tells a client anything `msg` does not.
+    """
+    errors = [
+        {key: value for key, value in error.items() if key not in ("input", "ctx", "url")}
+        for error in exc.errors()
+    ]
+    return JSONResponse(status_code=422, content={"detail": errors})
+
+
+@app.exception_handler(OverflowError)
+async def _overflow(_request: Request, _exc: OverflowError) -> JSONResponse:
+    """An integer too large for SQLite (a 30-digit device id or limit) is a bad
+    request, not a server fault."""
+    return JSONResponse(status_code=400, content={"detail": "number out of range"})
+
+
+@app.exception_handler(UnicodeEncodeError)
+async def _unencodable(_request: Request, _exc: UnicodeEncodeError) -> JSONResponse:
+    """JSON can carry a lone surrogate ("\\ud800") that UTF-8 cannot; hashing or
+    storing it raised and answered 500."""
+    return JSONResponse(status_code=400, content={"detail": "text is not valid Unicode"})
 
 
 # ------------------------------------------------------------------------- storage
@@ -359,6 +477,12 @@ def _hash_pw(password: str, salt: str) -> str:
     return hashlib.pbkdf2_hmac("sha256", password.encode(), salt.encode(), 200_000).hex()
 
 
+#: Hashed against when the email is unknown, so a login for an account that does
+#: not exist costs what one for an account that does costs. Skipping PBKDF2 for
+#: an unknown email answered ~20x faster, which says which emails have accounts.
+_NO_SUCH_USER_SALT = secrets.token_hex(16)
+
+
 def _issue_token(user_id: int) -> str:
     return jwt.encode(
         {"uid": user_id, "exp": int(time.time()) + JWT_TTL_S, "jti": secrets.token_hex(16)},
@@ -504,7 +628,21 @@ def _monitoring_payload(monitoring_json: Optional[str]) -> Optional[dict]:
     except (ValueError, TypeError):
         log.warning("device has an unreadable monitoring config; reporting none")
         return None
-    return config if isinstance(config, dict) else None
+    if not isinstance(config, dict):
+        return None
+    # The app decodes these three as non-optional (Models.swift CustomMonitoring),
+    # and one undecodable device fails the decode of the WHOLE device list. The
+    # dict arrives from the device verbatim, so its types are not ours to assume.
+    try:
+        rule_count = int(config.get("rule_count") or 0)
+    except (TypeError, ValueError):
+        rule_count = 0
+    return {
+        **config,
+        "instruction": str(config.get("instruction") or ""),
+        "rule_count": rule_count,
+        "active": config.get("active") is True,
+    }
 
 
 def _rules_payload(ai_rules_json: Optional[str]) -> list[dict]:
@@ -731,7 +869,10 @@ _EVENT_DETAIL_TEMPLATES = {
 
 
 def _readable_title(event_type: str) -> str:
-    return _EVENT_TITLES.get(event_type, f"SensorDyme: {event_type}")
+    # The title travels as an HTTP header to ntfy; a device-supplied type with a
+    # CR/LF in it raised InvalidHeader and tied up a worker through every retry.
+    printable = "".join(ch for ch in event_type if ch.isprintable())[:80]
+    return _EVENT_TITLES.get(event_type, f"SensorDyme: {printable}")
 
 
 def _notification_detail(e: dict) -> str:
@@ -748,6 +889,8 @@ def _notification_detail(e: dict) -> str:
     try:
         duration = float(duration) if duration is not None else 0.0
     except (TypeError, ValueError):
+        duration = 0.0
+    if not math.isfinite(duration):
         duration = 0.0
     if duration <= 0:
         return "alert"
@@ -785,6 +928,8 @@ MAX_AI_PROMPT_LEN = 4000
 MAX_INGEST_EVENTS = 1000
 #: Zones are drawn by hand on a phone screen.
 MAX_ZONES = 64
+MAX_ZONE_NAME_LEN = 60
+MAX_ZONE_POINTS = 256
 
 
 class Credentials(BaseModel):
@@ -793,29 +938,31 @@ class Credentials(BaseModel):
 
 
 class ClaimBody(BaseModel):
-    claim_code: str
+    claim_code: str = Field(max_length=64)
 
 
 class PresetBody(BaseModel):
-    preset: str
+    # Re-sent to the device on every poll until it converges, so its size is
+    # paid on every ingest response, not once.
+    preset: str = Field(max_length=128)
 
 
 class NtfyBody(BaseModel):
-    ntfy_topic: str
+    ntfy_topic: str = Field(max_length=256)
 
 
 class PhoneBody(BaseModel):
-    phone: str
+    phone: str = Field(max_length=32)
     sms_on_loud: bool = True
 
 
 class OrderBody(BaseModel):
     quantity: int
-    address: str
+    address: str = Field(max_length=1000)
 
 
 class RenameBody(BaseModel):
-    name: str
+    name: str = Field(max_length=100)
 
 
 class ZonesBody(BaseModel):
@@ -845,7 +992,22 @@ class AIConfigureBody(BaseModel):
 @app.get("/v1/health")
 def health():
     """Unauthenticated liveness probe — the app's Connection doctor hits this to
-    distinguish 'wrong address' from 'server down' from 'auth problem'."""
+    distinguish 'wrong address' from 'server down' from 'auth problem'.
+
+    Touches the database: a process that answers while its volume is missing or
+    its file unreadable can serve nothing, and reporting it healthy kept Fly
+    routing to it. One trivial query, on a connection that is opened anyway.
+    """
+    try:
+        with db() as conn:
+            conn.execute("SELECT 1").fetchone()
+    except sqlite3.Error as exc:
+        log.error("health: database unavailable (%s)", exc)
+        return JSONResponse(
+            status_code=503,
+            content={"ok": False, "service": "sensordyme-cloud", "time": time.time(),
+                     "detail": "database unavailable"},
+        )
     return {"ok": True, "service": "sensordyme-cloud", "time": time.time()}
 
 
@@ -900,7 +1062,8 @@ def signup(body: Credentials, request: Request):
     if not SIGNUP_LIMITER.allow(_client_ip(request)):
         raise HTTPException(429, "too many attempts — try again in a few minutes")
     email = body.email.strip().lower()
-    if not email or "@" not in email or len(body.password) < 8:
+    local, _, domain = email.rpartition("@")
+    if not local or "@" in local or "." not in domain.strip(".") or len(body.password) < 8:
         raise HTTPException(400, "valid email and a password of 8+ characters required")
     salt = secrets.token_hex(16)
     with db() as conn:
@@ -920,7 +1083,10 @@ def login(body: Credentials, request: Request):
         raise HTTPException(429, "too many attempts — try again in a few minutes")
     with db() as conn:
         row = conn.execute("SELECT * FROM users WHERE email = ?", (body.email.strip().lower(),)).fetchone()
-    if row is None or _hash_pw(body.password, row["salt"]) != row["pw_hash"]:
+    if row is None:
+        _hash_pw(body.password, _NO_SUCH_USER_SALT)
+        raise HTTPException(401, "wrong email or password")
+    if not hmac.compare_digest(_hash_pw(body.password, row["salt"]), row["pw_hash"]):
         raise HTTPException(401, "wrong email or password")
     return {"token": _issue_token(row["id"]), "email": row["email"]}
 
@@ -1084,7 +1250,18 @@ def set_preset(device_id: int, body: PresetBody, uid: int = Depends(current_user
         # Store the current name for a mode, never a superseded one. The device
         # will apply and report the current name, so a stored alias could never
         # match on convergence and would re-send on every poll for ever.
-        normalized = resolve_preset(body.preset)
+        normalized = resolve_preset(body.preset.strip().rstrip(":"))
+        # Only a mode that exists. The device ignores an unknown name ("ignoring
+        # unknown preset") and never reports it back, so storing one made ingest
+        # re-send it on every poll, for ever, with the app showing the switch as
+        # pending indefinitely.
+        if normalized:
+            presets = load_presets()
+            base, _, variant = normalized.partition(":")
+            if base not in presets or (
+                variant and variant not in (presets[base].get("variants") or {})
+            ):
+                raise HTTPException(400, f"unknown mode '{body.preset}'")
         # An empty preset IS the app's request for AI Custom (AIConfigureView's
         # Apply calls this with preset=""). Anything else is an explicit
         # request to leave custom monitoring in charge, whatever ai_rules
@@ -1142,10 +1319,14 @@ def _clean_zones(raw: list) -> list[dict]:
     for entry in raw or []:
         if not isinstance(entry, dict):
             continue
-        name = str(entry.get("name") or "").strip()
+        name = str(entry.get("name") or "").strip()[:MAX_ZONE_NAME_LEN]
         kind = str(entry.get("kind") or "restricted")
         points = entry.get("polygon") or []
         if not name or kind not in ("restricted", "safe", "boundary"):
+            continue
+        # Shipped to the device and point-in-polygon tested every frame; a
+        # hand-drawn zone has a handful of points.
+        if not isinstance(points, list) or len(points) > MAX_ZONE_POINTS:
             continue
         try:
             polygon = [(float(p[0]), float(p[1])) for p in points]
@@ -1328,66 +1509,6 @@ def _capabilities():
         return capabilities
     except ImportError:
         return None
-
-
-def _ai_system_prompt() -> str:
-    caps = _capabilities()
-    if caps is None:
-        return _legacy_system_prompt()
-    return (
-        "You turn a person's plain-language monitoring request into a configuration for "
-        "SensorDyme, a privacy-first camera device (video never leaves the device; only "
-        "events do).\n\n"
-        "SensorDyme is a GENERAL monitoring platform, not five fixed modes. Most requests "
-        "are custom configurations. Only set `preset` when the request genuinely matches one "
-        "of these whole-scenario modes: " + ", ".join(_MODES) + ". Otherwise leave `preset` "
-        "empty — a custom rule set is the normal, expected outcome, not a failure.\n\n"
-        "Express the request as rules of the form (target, predicate, secondary). Use ONLY "
-        "the exact labels and predicates from the capability sheet below.\n\n"
-        "Examples of the shape:\n"
-        "  'alert if my dog gets on the couch'  -> target=dog, predicate=near, secondary=couch\n"
-        "  'alert if someone enters the pool area' -> target=person, predicate=in_zone, zone=pool\n"
-        "  'tell me when the room is empty'     -> target=person, predicate=absent\n"
-        "  'alert if more than 3 people arrive' -> target=person, predicate=present, min_count=4\n\n"
-        "HONESTY RULES — these are the product's core promise:\n"
-        "- If a label is NOT in the sheet, do NOT substitute a preset or a loosely similar "
-        "object. Put the request in `unsupported`, say plainly that the vision model does not "
-        "recognise it, and state what would enable it (a model that includes that class, or "
-        "labelled examples to train one). Naming a close alternative from the sheet is helpful; "
-        "silently swapping to it is not.\n"
-        "- Predicates marked UNAVAILABLE cannot be used. Put those requests in `unsupported` "
-        "with the stated requirement.\n"
-        "- Never claim identity, intent, intoxication, emotion or medical conditions from "
-        "appearance. Report observable events only.\n"
-        "- Area rules need a zone the user draws in the app: name it and say so.\n"
-        "- Prefer conservative persistence (>=2s) and cooldowns (>=30s); a single ambiguous "
-        "frame must never alert.\n"
-        "- A request you cannot serve is fine to decline. An invented capability is not.\n\n"
-        "CAPABILITY SHEET:\n" + caps.registry().describe_for_llm()
-    )
-
-
-def _legacy_system_prompt() -> str:
-    tax = _taxonomy()
-    capability_sheet = tax.summary_for_llm() if tax else ""
-    return (
-        "You translate a user's plain-language monitoring request into a configuration for "
-        "SensorDyme, a privacy-first camera device (all video stays on the device; only events "
-        "leave it). Pick the best preset, then express the user's specific wishes as structured "
-        "rules using ONLY detection ids from the capability sheet below.\n\n"
-        "HONESTY RULES (these are the product's core promise):\n"
-        "- Only use detections marked SUPPORTED or PARTIAL. If part of the request needs an "
-        "UNSUPPORTED/PLANNED detection, put it in `unsupported` with the reason and what it "
-        "would require — never pretend the device can do it.\n"
-        "- Area rules ('near the pool', 'in the storage room') use a zone the user must draw in "
-        "the app: name the zone in the rule and mention drawing it in the explanation.\n"
-        "- Time rules ('after 11pm') go in `schedule`; note in the explanation that scheduled "
-        "enforcement is coming and the rule alerts at all hours until then.\n"
-        "- Never claim identity, intent, intoxication, or medical conditions from appearance.\n"
-        "- Prefer conservative persistence (>=2s) and sensible cooldowns (>=30s) so users are "
-        "not flooded; single ambiguous frames must never alert.\n\n"
-        "CAPABILITY SHEET:\n" + capability_sheet
-    )
 
 
 # Which model interprets custom requests. Jupiter (a local model) is the
@@ -1663,6 +1784,35 @@ def _validate_proposal(data: dict) -> dict:
     data["mode"] = "preset" if preset else "custom"
     data["rules"] = valid_rules
     data["unsupported"] = unsupported
+    return _decodable_proposal(data)
+
+
+def _decodable_proposal(data: dict) -> dict:
+    """Fill every field the app decodes as non-optional (BackendAPI.swift
+    AIRule / AIUnsupported / AIProposal.settings).
+
+    The rules come from a language model; one rule missing `zone` or `notify`
+    made the app's decode of the WHOLE proposal fail, so the person saw an
+    error instead of the rules that were fine.
+    """
+    rules = []
+    for rule in data.get("rules") or []:
+        if not isinstance(rule, dict):
+            continue
+        for key in ("secondary", "description", "zone", "schedule"):
+            rule[key] = str(rule.get(key) or "")
+        if rule.get("notify") not in ("push", "sms", "silent"):
+            rule["notify"] = "push"
+        rules.append(rule)
+    data["rules"] = rules
+    data["unsupported"] = [
+        {**item, **{key: str(item.get(key) or "") for key in ("request", "reason", "requires")}}
+        for item in (data.get("unsupported") or []) if isinstance(item, dict)
+    ]
+    settings = data.get("settings")
+    data["settings"] = (
+        {str(k): str(v) for k, v in settings.items()} if isinstance(settings, dict) else {}
+    )
     return data
 
 
@@ -1685,14 +1835,37 @@ def _legacy_validate_proposal(data: dict) -> dict:
     data["preset"] = preset
     data["rules"] = valid_rules
     data["unsupported"] = unsupported
-    return data
+    return _decodable_proposal(data)
+
+
+@contextmanager
+def _ai_slot(uid: int):
+    """Yield whether this account may make a model call right now.
+
+    Model calls are synchronous and can take up to a minute, on a shared thread
+    pool. Without a per-account bound one account could occupy every worker and
+    stall every other request on the server, devices' ingest included.
+    """
+    key = str(uid)
+    # Concurrency first: a call refused for being one too many at once must not
+    # also spend the per-minute budget, or a burst locks out the next real one.
+    if not AI_CONCURRENCY.acquire(key):
+        yield False
+        return
+    try:
+        yield AI_RATE_LIMITER.allow(key)
+    finally:
+        AI_CONCURRENCY.release(key)
 
 
 @app.post("/v1/ai/configure")
 def ai_configure(body: AIConfigureBody, uid: int = Depends(current_user)):
     with db() as conn:
         _owned_device(conn, body.device_id, uid)
-    result = _validate_proposal(_ai_configure_llm(body.prompt) or _ai_fallback(body.prompt))
+    with _ai_slot(uid) as allowed:
+        if not allowed:
+            raise HTTPException(429, "too many AI requests at once; try again in a moment")
+        result = _validate_proposal(_ai_configure_llm(body.prompt) or _ai_fallback(body.prompt))
     # Persist the validated proposal as a DRAFT, so the app's Activate
     # (set_preset) has it to promote.
     #
@@ -1749,36 +1922,41 @@ def explain_event(device_id: int, event_id: int, uid: int = Depends(current_user
     try:
         from jupiter.explain import explain, parse_rule_for_event
     except ImportError:
-        raise HTTPException(503, "explanations are unavailable on this backend")
+        raise HTTPException(503, "explanations are unavailable on this backend") from None
 
     event = dict(row)
     rule = parse_rule_for_event(device["ai_rules"], event.get("type", ""))
 
-    provider = None
-    if JUPITER_PROVIDER not in ("", "off"):
-        try:
-            from jupiter.router import get_role_provider
+    # Inside the per-account model budget, availability probe included: the
+    # probe alone can take seconds against an unreachable model. Over budget,
+    # explain from the facts alone -- this endpoint's contract is that it has no
+    # failure mode beyond the event not existing, so the limit costs phrasing,
+    # never an answer.
+    with _ai_slot(uid) as allowed:
+        provider = None
+        if allowed and JUPITER_PROVIDER not in ("", "off"):
+            try:
+                from jupiter.router import get_role_provider
 
-            candidate = get_role_provider("explain")
-            ok, why = candidate.available()
-            provider = candidate if ok else None
-            if not ok:
-                # Degrading to the facts-only explanation is correct and must not
-                # fail the request — but it has to be *visible*. Reported at INFO
-                # because a model being unavailable is an expected state, not a
-                # fault, and it says which one so the reason is actionable.
-                log.info("explain: model unavailable (%s); using the facts-only path", why)
-        except Exception as exc:  # noqa: BLE001 - the facts path never needs a model
-            # Previously silent, which made a permanently misconfigured provider
-            # indistinguishable from one deliberately switched off: every explain
-            # quietly took the facts path for ever and no log line ever said so.
-            log.warning(
-                "explain: could not reach the model provider (%s); using the "
-                "facts-only path", repr(exc),
-            )
-            provider = None
-
-    return explain(event, rule, provider=provider).as_dict()
+                candidate = get_role_provider("explain")
+                ok, why = candidate.available()
+                provider = candidate if ok else None
+                if not ok:
+                    # Degrading to the facts-only explanation is correct and must not
+                    # fail the request — but it has to be *visible*. Reported at INFO
+                    # because a model being unavailable is an expected state, not a
+                    # fault, and it says which one so the reason is actionable.
+                    log.info("explain: model unavailable (%s); using the facts-only path", why)
+            except Exception as exc:  # noqa: BLE001 - the facts path never needs a model
+                # Previously silent, which made a permanently misconfigured provider
+                # indistinguishable from one deliberately switched off: every explain
+                # quietly took the facts path for ever and no log line ever said so.
+                log.warning(
+                    "explain: could not reach the model provider (%s); using the "
+                    "facts-only path", repr(exc),
+                )
+                provider = None
+        return explain(event, rule, provider=provider).as_dict()
 
 
 # ------------------------------------------------------------------------- device API
@@ -1843,6 +2021,13 @@ def ingest(body: IngestBody, background_tasks: BackgroundTasks, device: sqlite3.
                 confidence = float(confidence_raw) if confidence_raw not in (None, "") else 0.0
                 duration_raw = e.get("duration")
                 duration = float(duration_raw) if duration_raw not in (None, "") else None
+                # float() accepts "nan", "inf" and JSON's NaN / 1e999. Stored,
+                # they make every later read of this device's events a 500:
+                # the response encoder refuses non-finite floats.
+                if not math.isfinite(confidence):
+                    confidence = 0.0
+                if duration is not None and not math.isfinite(duration):
+                    duration = None
                 cursor = conn.execute(
                     "INSERT OR IGNORE INTO events (device_id, timestamp, type, confidence, signals,"
                     " severity, source, received_at, event_key, duration) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
@@ -1855,7 +2040,7 @@ def ingest(body: IngestBody, background_tasks: BackgroundTasks, device: sqlite3.
                         str(e.get("severity", "log")),
                         str(e.get("source") or "module"),
                         now,
-                        str(event_key) if event_key else None,
+                        str(event_key) if event_key not in (None, "") else None,
                         duration,
                     ),
                 )
@@ -1873,8 +2058,10 @@ def ingest(body: IngestBody, background_tasks: BackgroundTasks, device: sqlite3.
                     newly_inserted_events.append(e)
             except (TypeError, ValueError, sqlite3.Error) as exc:
                 log.warning(
-                    "ingest: skipped one malformed event from device %s (%s): %r",
-                    device["id"], exc, e,
+                    "ingest: skipped one malformed event from device %s (%s): key=%r type=%r",
+                    device["id"], exc,
+                    str(e.get("event_key"))[:64] if isinstance(e, dict) else None,
+                    str(e.get("type"))[:64] if isinstance(e, dict) else None,
                 )
                 continue
         row = conn.execute(

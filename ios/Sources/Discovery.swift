@@ -52,7 +52,7 @@ final class DeviceDiscovery: ObservableObject {
         isSearching = true
         found = []
         let browser = NWBrowser(
-            for: .bonjour(type: DeviceDiscovery.serviceType, domain: nil),
+            for: .bonjourWithTXTRecord(type: DeviceDiscovery.serviceType, domain: nil),
             using: NWParameters()
         )
         self.browser = browser

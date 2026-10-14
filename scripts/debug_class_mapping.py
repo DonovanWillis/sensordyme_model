@@ -11,7 +11,12 @@ Run: .venv/bin/python scripts/debug_class_mapping.py
 """
 from __future__ import annotations
 
+import sys
+from pathlib import Path
+
 import yaml
+
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))  # repo root
 
 from core.accel import COCO_NAMES
 

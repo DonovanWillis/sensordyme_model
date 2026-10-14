@@ -68,6 +68,10 @@ enum BackendResolution {
     struct FoundBackend: Equatable {
         let url: String
         let id: String?
+        /// The Bonjour service this address was resolved from. One service is
+        /// resolved twice (its stable name and today's address), so this is what
+        /// says two URLs are the same backend when it publishes no `id`.
+        var service: String? = nil
     }
 
     /// What to do about the backends currently on the network.
@@ -112,9 +116,27 @@ enum BackendResolution {
     ) -> BackendChoice {
         guard !found.isEmpty else { return .none }
 
-        if let remembered, !remembered.isEmpty,
-           let mine = found.first(where: { $0.id == remembered }) {
-            return .use(mine)
+        // One backend is discovered as several URLs -- its stable name and the
+        // address it resolves to today. Counted as two, the "exactly one" rule
+        // below never applied, and a fresh install found its only backend
+        // "ambiguous" and refused to connect, forever. The first spelling is
+        // kept: discovery orders the stable name first.
+        var seen: Set<String> = []
+        let found = found.filter { backend in
+            seen.insert(backend.id ?? backend.service ?? backend.url).inserted
+        }
+
+        if let remembered, !remembered.isEmpty {
+            if let mine = found.first(where: { $0.id == remembered }) {
+                return .use(mine)
+            }
+            // Ours is not here. Whatever IS here is somebody else's: adopting it
+            // would send this account's bearer token to a stranger's server (a
+            // token they could replay against ours) and overwrite the id that
+            // lets the app find its own backend again when the Mac wakes. A
+            // backend reachable at a typed or deployed address never gets here --
+            // those are tried, by address, before discovery is consulted.
+            return .ambiguous(found)
         }
 
         if found.count == 1 { return .use(found[0]) }

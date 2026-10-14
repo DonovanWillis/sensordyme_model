@@ -296,7 +296,11 @@ class TestAdvertiser:
 
     def test_no_lan_address_degrades_instead_of_crashing(self, monkeypatch):
         monkeypatch.setattr(mdns, "lan_ip", lambda: None)
-        assert mdns.Advertiser(8787).start() is False
+        advertiser = mdns.Advertiser(8787, refresh_interval_s=0)
+        try:
+            assert advertiser.start() is False
+        finally:
+            advertiser.stop()
 
     def test_default_name_has_no_dots(self, monkeypatch):
         """A dot in the instance name splits the mDNS label and produces a name
@@ -540,6 +544,78 @@ class TestAdvertisementStaysTrue:
         advertiser.stop()
         identity["address"] = "192.168.4.22"
         assert advertiser.refresh() is False
+
+
+class TestAdvertisingRecoversOnItsOwn:
+    """A failure to announce must be temporary, never terminal.
+
+    The LaunchAgent starts this backend at login, which on a laptop is routinely
+    before Wi-Fi has joined; and a DHCP move can make building a fresh Zeroconf
+    fail for a moment. Either one used to leave `_zeroconf` as None, and every
+    later refresh returned early on exactly that -- so the backend served
+    happily for days while announcing nothing, and only a restart fixed it.
+    """
+
+    @pytest.fixture
+    def world(self, monkeypatch):
+        built: list = []
+        state: dict = {"address": None, "zeroconf_fails": False}
+
+        def _new_zeroconf(*_a, **_k):
+            if state["zeroconf_fails"]:
+                raise OSError("no multicast-capable interface")
+            instance = _FakeZeroconf()
+            built.append(instance)
+            return instance
+
+        monkeypatch.setattr(_zeroconf, "Zeroconf", _new_zeroconf)
+        monkeypatch.setattr(mdns, "lan_ip", lambda: state["address"])
+        advertiser = mdns.Advertiser(8787, refresh_interval_s=0)
+        try:
+            yield advertiser, state, built
+        finally:
+            advertiser.stop()
+
+    def test_started_before_the_network_it_announces_once_the_network_arrives(self, world):
+        advertiser, state, built = world
+        assert advertiser.start() is False, "nothing to announce yet"
+        assert advertiser.refresh() is False, "still no network: nothing to do"
+
+        state["address"] = "10.0.0.5"
+        assert advertiser.refresh() is True
+        assert len(built) == 1 and len(built[0].registered) == 1
+        assert _advertised_address(built[0].registered[0]) == "10.0.0.5"
+
+    def test_a_zeroconf_that_could_not_open_at_start_is_retried(self, world):
+        advertiser, state, built = world
+        state["address"] = "10.0.0.5"
+        state["zeroconf_fails"] = True
+        assert advertiser.start() is False
+
+        state["zeroconf_fails"] = False
+        assert advertiser.refresh() is True
+        assert _advertised_address(built[-1].registered[-1]) == "10.0.0.5"
+
+    def test_a_rebind_that_failed_mid_move_is_retried_on_the_next_tick(self, world):
+        advertiser, state, built = world
+        state["address"] = "10.0.0.5"
+        assert advertiser.start() is True
+
+        state["address"] = "192.168.4.22"
+        state["zeroconf_fails"] = True
+        assert advertiser.refresh() is False, "the move could not be announced"
+
+        state["zeroconf_fails"] = False
+        assert advertiser.refresh() is True, "...but it must not stay that way"
+        assert _advertised_address(built[-1].registered[-1]) == "192.168.4.22"
+
+    def test_stop_still_ends_retrying(self, world):
+        advertiser, state, built = world
+        assert advertiser.start() is False
+        advertiser.stop()
+        state["address"] = "10.0.0.5"
+        assert advertiser.refresh() is False
+        assert built == []
 
 
 class TestTheInstanceNameIsOursNotTheNetworksx:

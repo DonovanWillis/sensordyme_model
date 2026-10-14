@@ -201,7 +201,7 @@ def upper_region(box: Box, fraction: float = 0.35) -> Box:
     modules/baby_monitoring.py's module docstring on infant face models).
     """
     x1, y1, x2, y2 = box
-    return (x1, y1, x2, y1 + (y2 - y1) * fraction)
+    return (x1, y1, x2, int(y1 + (y2 - y1) * fraction))
 
 
 def iou(box_a: Box, box_b: Box) -> float:

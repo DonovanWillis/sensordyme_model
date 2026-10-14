@@ -1,11 +1,11 @@
 # SensorDyme CI
 #
 # ############################################################################
-# # UNVERIFIED. This workflow has NEVER RUN.                                 #
+# # UNVERIFIED. No run of this workflow has been confirmed.                  #
 # #                                                                          #
-# # As of 2026-08-29 this repository has no git remote at all (`git remote    #
-# # -v` is empty) — it exists only on one laptop. There is no GitHub Actions  #
-# # runner that has ever executed a line of this file, and `gh` is not        #
+# # The repository has had a GitHub remote since this was written, but no   #
+# # run of this workflow has been confirmed: no GitHub Actions result has   #
+# # been checked from this machine, and `gh` is not                          #
 # # installed locally either, so it could not even be linted against the real #
 # # schema. Every command below was run by hand on macOS and works there;     #
 # # what is unproven is the Ubuntu runner, the caching, and the YAML wiring.  #
@@ -135,6 +135,14 @@ jobs:
             cloud/requirements.txt
             requirements-dev.txt
 
+      # simpleaudio (requirements-device.txt) has no Linux wheel for 3.12 and
+      # builds from source against the ALSA headers; without them the install
+      # step fails before pyright ever runs.
+      - name: Install build headers for source-only wheels
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends libasound2-dev
+
       - name: Create .venv and install dependencies
         run: |
           uv venv --python ${{ env.PYTHON_VERSION }} .venv
@@ -173,7 +181,7 @@ jobs:
       - name: Install headless OpenCV system libraries
         run: |
           sudo apt-get update
-          sudo apt-get install -y --no-install-recommends libgl1 libglib2.0-0
+          sudo apt-get install -y --no-install-recommends libgl1 libglib2.0-0 libasound2-dev
 
       - name: Create .venv and install dependencies
         run: |
@@ -288,7 +296,7 @@ jobs:
         if: steps.dataset.outputs.present == 'true'
         run: |
           sudo apt-get update
-          sudo apt-get install -y --no-install-recommends libgl1 libglib2.0-0
+          sudo apt-get install -y --no-install-recommends libgl1 libglib2.0-0 libasound2-dev
 
       - name: Create .venv and install dependencies
         if: steps.dataset.outputs.present == 'true'

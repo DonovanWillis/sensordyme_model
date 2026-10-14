@@ -56,7 +56,8 @@ class Component:
 def _read_temperature_c() -> Optional[float]:
     """SoC temperature, from sysfs first (cheap) then vcgencmd."""
     try:
-        raw = open("/sys/class/thermal/thermal_zone0/temp").read().strip()
+        with open("/sys/class/thermal/thermal_zone0/temp") as f:
+            raw = f.read().strip()
         return round(int(raw) / 1000.0, 1)
     except (OSError, ValueError):
         pass
@@ -125,9 +126,10 @@ def _read_memory() -> tuple[Optional[int], Optional[int]]:
     """(used_mb, total_mb) from /proc/meminfo."""
     try:
         values = {}
-        for line in open("/proc/meminfo"):
-            key, _, rest = line.partition(":")
-            values[key] = int(rest.strip().split()[0])  # kB
+        with open("/proc/meminfo") as f:
+            for line in f:
+                key, _, rest = line.partition(":")
+                values[key] = int(rest.strip().split()[0])  # kB
         total = values.get("MemTotal")
         available = values.get("MemAvailable")
         if total is None or available is None:

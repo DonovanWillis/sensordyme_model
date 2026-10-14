@@ -253,6 +253,11 @@ clean: ## Remove caches and coverage artifacts (never touches data/ or .venv)
 # model now comes only from setup_pi.sh, which pins a URL and verifies sha256 and
 # refuses to install a mismatch. A model must never arrive on a device because it
 # happened to be in someone's working tree.
+# `cloud/.jwt_secret` is a SECRET control. It is the key every backend session
+# token is signed with; a device that holds it can mint a valid token for any
+# account. None of the patterns above matched it, so every deploy carried it to
+# the Pi. `cloud/.backend_id` goes with it: the device must not claim to be the
+# backend. `ios/` and `benchmarks/results` are simply not the device's business.
 demo-check: ## run the demo preflight on the device (DEMO READY / NOT READY)
 	ssh pi@sensordyme.local 'cd ~/sensordyme && .venv/bin/python scripts/demo_preflight.py'
 
@@ -264,6 +269,9 @@ deploy: ## rsync to pi@sensordyme.local, install deps, migrate config, restart
 		--exclude='config.yaml' --exclude='*.log' --exclude='.secrets' --exclude='*.pt' \
 		--exclude='*.hef' --exclude='*.db' --exclude='*.sqlite3' --exclude='*.csv' \
 		--exclude='.pytest_cache' --exclude='.ruff_cache' --exclude='.claude*' \
+		--exclude='cloud/.jwt_secret' --exclude='cloud/.backend_id' --exclude='.env' \
+		--exclude='.env.*' --exclude='*.pem' --exclude='*.key' --exclude='logs' \
+		--exclude='ios' --exclude='benchmarks/results' \
 		./ pi@sensordyme.local:~/sensordyme/
 	ssh pi@sensordyme.local 'cd ~/sensordyme && .venv/bin/pip install -q -r requirements-device.txt'
 	ssh pi@sensordyme.local 'cd ~/sensordyme && python3 scripts/migrate_config.py config.yaml'

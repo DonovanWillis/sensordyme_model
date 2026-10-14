@@ -220,6 +220,11 @@ class Camera:
             picam, self._picam = self._picam, None
             try:
                 picam.stop()
+            except Exception as exc:  # noqa: BLE001 - see docstring
+                # A stream that will not stop ("device busy") is exactly the
+                # fault reopen() exists to recover from; letting it escape
+                # killed the capture pump, which only expects CameraError.
+                log.warning("camera stop() failed during release: %s", exc)
             finally:
                 close = getattr(picam, "close", None)
                 if close is not None:

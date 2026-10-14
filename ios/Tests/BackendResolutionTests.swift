@@ -210,11 +210,28 @@ check(BackendResolution.chooseBackend(from: [anonymous, theirs], remembering: ni
 check(BackendResolution.chooseBackend(from: [mine, theirs], remembering: "bk_gone")
       == .ambiguous([mine, theirs]),
       "a remembered backend being absent does not license adopting a different one")
-check(BackendResolution.chooseBackend(from: [theirs], remembering: "bk_gone") == .use(theirs),
-      "...but with only one on the network there is no ambiguity to get wrong")
+check(BackendResolution.chooseBackend(from: [theirs], remembering: "bk_gone") == .ambiguous([theirs]),
+      "...nor does a lone stranger: adopting it would hand our token to their server")
 
 check(BackendResolution.chooseBackend(from: [mine], remembering: "") == .use(mine),
       "an empty remembered id is treated as no memory, not as an id to match")
+
+// One backend reaches discovery twice: its stable name and the address that name
+// resolves to today. Counting those as two made a fresh install call its only
+// backend "ambiguous" and never connect.
+let mineByName = Found(url: "http://sensordyme-backend.local:8787", id: "bk_mine")
+let mineByAddress = Found(url: "http://11.33.7.22:8787", id: "bk_mine")
+check(BackendResolution.chooseBackend(from: [mineByName, mineByAddress], remembering: nil)
+      == .use(mineByName),
+      "two spellings of one backend are one backend, and the stable name is kept")
+let oldByName = Found(url: "http://sensordyme-backend.local:8787", id: nil, service: "srv:A")
+let oldByAddress = Found(url: "http://11.33.7.22:8787", id: nil, service: "srv:A")
+check(BackendResolution.chooseBackend(from: [oldByName, oldByAddress], remembering: nil)
+      == .use(oldByName),
+      "without an id, the Bonjour service is what says two URLs are one backend")
+check(BackendResolution.chooseBackend(from: [mineByName, mineByAddress, theirs], remembering: nil)
+      == .ambiguous([mineByName, theirs]),
+      "deduplicating must not turn two real backends into one")
 
 
 // MARK: - BackendEndpoint: identity versus location

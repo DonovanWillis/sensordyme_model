@@ -101,3 +101,30 @@ def test_perclos_stays_low_for_occasional_blinks():
         perclos = tracker.update(False, now)
         now += 4.8
     assert perclos < 0.15
+
+
+def test_perclos_does_not_count_unobserved_time_as_closed():
+    """Nothing feeds the tracker while the face is lost, so the gap after the
+    last sample used to be charged to that sample's state. One closed blink
+    right before a 20s face loss read as 40% PERCLOS -- a fatigue alert with
+    no closure observed."""
+    tracker = PerclosTracker(window_s=60.0)
+    t = 0.0
+    for _ in range(300):  # 30s of open eyes at 10 Hz
+        tracker.update(False, t)
+        t += 0.1
+    tracker.update(True, t)  # one closed sample...
+    t += 20.0  # ...then the face is lost for 20s
+    perclos = tracker.update(False, t)
+    assert perclos < 0.1, f"unobserved time counted as eye closure: {perclos:.2f}"
+
+
+def test_perclos_still_counts_sustained_closure_at_a_low_frame_rate():
+    """The gap cap must not hide real closure on a slow device (2 fps)."""
+    tracker = PerclosTracker(window_s=60.0)
+    t = 0.0
+    perclos = 0.0
+    for _ in range(120):  # 60s, eyes closed throughout, a frame every 0.5s
+        perclos = tracker.update(True, t)
+        t += 0.5
+    assert perclos > 0.95

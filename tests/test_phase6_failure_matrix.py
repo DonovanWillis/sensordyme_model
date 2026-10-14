@@ -291,7 +291,8 @@ def test_every_module_swap_re_verifies_the_detection_backend():
     import ast
 
     tree = ast.parse((REPO / "services" / "runtime.py").read_text())
-    swaps = {"_apply_monitoring_mode", "_switch_preset"}
+    # The bodies; the public names wrap them in the swap-in-progress marker.
+    swaps = {"_apply_monitoring_mode_now", "_switch_preset_now"}
     for node in ast.walk(tree):
         if not (isinstance(node, ast.FunctionDef) and node.name in swaps):
             continue
@@ -411,7 +412,7 @@ def test_app_drawn_zones_survive_the_swap_their_own_rules_trigger():
     tree = ast.parse(source)
     fn = next(
         n for n in ast.walk(tree)
-        if isinstance(n, ast.FunctionDef) and n.name == "_apply_monitoring_mode"
+        if isinstance(n, ast.FunctionDef) and n.name == "_apply_monitoring_mode_now"
     )
     # The zone reset must be conditional, and conditional on the MODE — not on
     # tracking how the zones arrived, because in AI-custom they always come from

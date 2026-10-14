@@ -45,7 +45,9 @@ def _shift_iris(landmarks, dy_px: float = 0.0, dx_px: float = 0.0):
 # ------------------------------------------------------------------ sign convention
 def test_eye_gaze_offset_is_zero_for_a_centered_iris():
     points = [(lm.x * W, lm.y * H) for lm in make_fake_landmarks()]
-    yaw, pitch = eye_gaze_offset_deg(points)
+    offset = eye_gaze_offset_deg(points)
+    assert offset is not None
+    yaw, pitch = offset
     assert yaw == pytest.approx(0.0, abs=1e-6)
     assert pitch == pytest.approx(0.0, abs=1e-6)
 
@@ -65,7 +67,9 @@ def test_iris_toward_the_lower_lid_matches_head_pitchs_own_down_is_negative_conv
     assert head_delta_pitch < 0, "test setup: pitch_deg=10 should already be a verified 'looking down' rotation"
 
     points = [(lm.x * W, lm.y * H) for lm in _shift_iris(make_fake_landmarks(), dy_px=8.0)]
-    _, eye_pitch = eye_gaze_offset_deg(points)
+    offset = eye_gaze_offset_deg(points)
+    assert offset is not None
+    _, eye_pitch = offset
     assert eye_pitch < 0, (
         "iris shifted toward the lower lid must produce a NEGATIVE pitch component, "
         "matching estimate_head_pose_deg's own 'down = negative' convention"

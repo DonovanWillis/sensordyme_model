@@ -137,6 +137,14 @@ struct SetupFlowView: View {
                         .font(SD.Typography.caption)
                         .foregroundStyle(SD.Colors.textTertiary)
                         .fixedSize(horizontal: false, vertical: true)
+                    // A device already on Wi-Fi only accepts Bluetooth setup for
+                    // a few minutes after it starts (services/provisioning.py):
+                    // the credential write is unauthenticated, so it is not left
+                    // open for anyone in range. Moving it means a restart.
+                    Text("Already set up and moving it to a new network? Unplug your SensorDyme for a few seconds and plug it back in — it accepts Bluetooth setup for 5 minutes after it starts.")
+                        .font(SD.Typography.caption)
+                        .foregroundStyle(SD.Colors.textTertiary)
+                        .fixedSize(horizontal: false, vertical: true)
                     if flow.searchingSeconds > 20 {
                         Divider().overlay(SD.Colors.border)
                         Text("Still nothing after \(flow.searchingSeconds)s")

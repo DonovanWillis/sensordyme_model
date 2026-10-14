@@ -483,6 +483,14 @@ class AttentionCalibrator:
 #: second window -- once passed, the metric is the full configured window's.
 PERCLOS_MIN_WINDOW_S = 10.0
 
+#: The longest stretch after a CLOSED sample that is charged as closure when the
+#: next sample reads open. Nothing feeds the tracker while the face is lost, so
+#: without a cap the whole outage was charged to whatever the eyes were doing in
+#: the last frame before it: a blink just before a 20s face loss read as 40%
+#: PERCLOS. 1s is several frames even on a slow device, so a real closure that
+#: ends between frames is still counted in full.
+PERCLOS_MAX_SAMPLE_GAP_S = 1.0
+
 
 class PeakCorroboratedGraceTracker(CorroboratedGraceTracker):
     """A CorroboratedGraceTracker whose corroboration reflects the episode's
@@ -559,7 +567,10 @@ class PerclosTracker:
             dt = t - prev_t
             total_time += dt
             if prev_closed:
-                closed_time += dt
+                # Closed on both sides of a long gap is sustained closure (a
+                # sleeping driver can drop the face mesh); closed then open is
+                # a blink followed by unobserved time, charged only up to the cap.
+                closed_time += dt if closed_state else min(dt, PERCLOS_MAX_SAMPLE_GAP_S)
             prev_t, prev_closed = t, closed_state
 
         if total_time < self._min_window_s:
@@ -978,11 +989,18 @@ class DriverAttentionModule(VisionModule):
         self._last_fired_event_types: list[str] = []
 
     def close(self) -> None:
-        """Release the mediapipe FaceMesh graph (leaked per preset switch otherwise)."""
-        try:
-            self._face_mesh.close()
-        except Exception:  # noqa: BLE001 - closing twice must be harmless
-            pass
+        """Release the mediapipe graphs (leaked per preset switch otherwise).
+
+        Hands is created lazily, on the first object-detection tick, so it is
+        only closed when it exists.
+        """
+        for graph in (self._face_mesh, getattr(self, "_hands", None)):
+            if graph is None:
+                continue
+            try:
+                graph.close()
+            except Exception:  # noqa: BLE001 - closing twice must be harmless
+                pass
 
     def _ensure_object_detectors_loaded(self) -> None:
         """Lazily load YOLO (shared) and MediaPipe Hands on the first stride tick."""

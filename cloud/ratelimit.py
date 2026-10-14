@@ -58,9 +58,47 @@ class RateLimiter:
                 self._attempts.pop(key, None)
 
 
+class ConcurrencyLimiter:
+    """At most `max_in_flight` concurrent operations per key.
+
+    A sliding window bounds how OFTEN someone may start something; this bounds
+    how much of the server they can hold at once. The two differ for anything
+    slow: model calls block a worker thread for up to a minute each, so a
+    handful started together by one account occupies the whole thread pool and
+    every other account's requests -- including the devices' ingest -- wait.
+    """
+
+    def __init__(self, max_in_flight: int) -> None:
+        self._max = max_in_flight
+        self._in_flight: dict[str, int] = {}
+        self._lock = threading.Lock()
+
+    def acquire(self, key: str) -> bool:
+        with self._lock:
+            current = self._in_flight.get(key, 0)
+            if current >= self._max:
+                return False
+            self._in_flight[key] = current + 1
+            return True
+
+    def release(self, key: str) -> None:
+        with self._lock:
+            remaining = self._in_flight.get(key, 0) - 1
+            if remaining > 0:
+                self._in_flight[key] = remaining
+            else:
+                self._in_flight.pop(key, None)
+
+
 # 10 attempts per 5 minutes per IP. Generous enough that a real person
 # mistyping a password or a claim code a few times in a row is never
 # affected; tight enough that an online guessing script is not viable.
 LOGIN_LIMITER = RateLimiter(max_attempts=10, window_s=300.0)
 SIGNUP_LIMITER = RateLimiter(max_attempts=10, window_s=300.0)
 CLAIM_LIMITER = RateLimiter(max_attempts=10, window_s=300.0)
+
+# Model calls, per ACCOUNT (they are authenticated). The app asks for a preview
+# when someone stops typing, so a few a minute is normal use; 30 is far above
+# it. Two in flight lets a new preview start while the last is finishing.
+AI_RATE_LIMITER = RateLimiter(max_attempts=30, window_s=60.0)
+AI_CONCURRENCY = ConcurrencyLimiter(max_in_flight=2)

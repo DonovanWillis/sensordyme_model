@@ -333,7 +333,6 @@ class ActivityRecognizer:
         # A jump is the hips rising sharply while both ankles leave their
         # baseline. Requiring the ankles too is what separates a jump from
         # standing up quickly, which raises the hips just as fast.
-        rise = (max(heights) - heights[-1]) / torso  # y grows downward
         hip_rise = (heights[0] - min(heights)) / torso
         ankle_baseline = max(s.ankle_y for s in samples)
         ankle_rise = (ankle_baseline - min(s.ankle_y for s in samples)) / torso

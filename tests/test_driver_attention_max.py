@@ -340,3 +340,35 @@ def test_compute_gaze_components_is_zero_for_a_centered_iris():
     yaw, pitch = DriverAttentionMaxModule._compute_gaze_components(None, points)
     assert abs(yaw) < 1e-6
     assert abs(pitch) < 1e-6
+
+
+def test_face_loss_resets_the_trackers_not_just_the_flags():
+    """A tracker keeps its start time until it sees its condition go false, and
+    the face-lost path only cleared the `_*_active` flags. So eyes closed, then
+    20s with no face, then one closed frame fired drowsiness at once -- the
+    absence counted as closure."""
+    import types
+
+    import numpy as np
+
+    module = DriverAttentionMaxModule.__new__(DriverAttentionMaxModule)
+    for name in ("_microsleep_tracker", "_drowsy_tracker", "_off_road_tracker",
+                 "_eyes_down_tracker", "_phone_use_distracted_tracker"):
+        tracker = SustainedConditionTracker(1.5)
+        tracker.update(True, 0.0)  # condition in progress when the face went
+        setattr(module, name, tracker)
+    module._eyes_closed_prev = True
+    module._closure_start = 0.0
+    module._update_object_detections = lambda frame: None
+    module._vlm = None
+    module._poll_vlm = lambda events: None
+    module._face_mesh = types.SimpleNamespace(
+        process=lambda rgb: types.SimpleNamespace(multi_face_landmarks=None)
+    )
+
+    module.process(np.zeros((48, 64, 3), dtype=np.uint8))
+
+    for name in ("_microsleep_tracker", "_drowsy_tracker", "_off_road_tracker",
+                 "_eyes_down_tracker", "_phone_use_distracted_tracker"):
+        assert getattr(module, name)._start is None, f"{name} kept counting through face loss"
+    assert module._eyes_closed_prev is False and module._closure_start is None

@@ -92,3 +92,31 @@ def test_broken_check_counts_as_failure():
     monitor.register("hw_imu", check=exploding_check)
     _drive_checks(monitor, "hw_imu", 1)
     assert "check raised" in monitor.snapshot()["components"]["hw_imu"]["detail"]
+
+
+def test_a_slow_restart_does_not_block_health_reporting():
+    """Restarts used to run under the monitor's lock, so /api/health, every
+    component's report_failure and the watchdog gate all waited on them."""
+    import threading
+    import time
+
+    in_restart = threading.Event()
+    release = threading.Event()
+
+    def slow_restart():
+        in_restart.set()
+        release.wait(5)
+
+    monitor = HealthMonitor()
+    monitor.register("camera", critical=True, check=lambda: (False, "dead"), restart=slow_restart)
+    worker = threading.Thread(target=_drive_checks, args=(monitor, "camera", 5), daemon=True)
+    worker.start()
+    try:
+        assert in_restart.wait(5)
+        started = time.monotonic()
+        monitor.snapshot()
+        monitor.report_ok("camera")
+        assert time.monotonic() - started < 0.5, "health reporting waited on a restart"
+    finally:
+        release.set()
+        worker.join(5)

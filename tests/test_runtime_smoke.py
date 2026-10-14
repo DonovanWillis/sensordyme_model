@@ -223,3 +223,37 @@ def test_flash_active_is_edge_triggered_end_to_end(tmp_path, monkeypatch):
     finally:
         runtime.shutdown.set()
         thread.join(timeout=10)
+
+
+def test_a_dashboard_that_cannot_bind_does_not_take_the_device_down(tmp_path, monkeypatch):
+    """The dashboard is the live feed, not the detector. A port held by a stale
+    process used to abort the whole runtime -- and repeated aborts make systemd
+    reboot the device."""
+    import socket
+
+    monkeypatch.setattr(runtime_module, "Camera", FakeCamera)
+    squatter = socket.socket()
+    squatter.bind(("127.0.0.1", 0))
+    squatter.listen()
+    config = _config(tmp_path)
+    config["dashboard"]["port"] = squatter.getsockname()[1]
+    module = CountingModule({})
+    runtime = DeviceRuntime(
+        config=config, profile="pi", module=module, module_name="counting",
+        alert_manager=AlertManager(sinks=[]), alert_cfg={}, alert_event_types=set(),
+        alert_types_for=lambda name, preset=None: set(), presets={}, active_preset=None,
+        display=False, debug=False,
+    )
+    thread = threading.Thread(target=runtime.run)
+    thread.start()
+    try:
+        deadline = time.monotonic() + 10
+        while time.monotonic() < deadline and module.frames < 5:
+            time.sleep(0.05)
+        assert module.frames >= 5, "detection stopped because the dashboard could not bind"
+        assert runtime.dashboard is None
+    finally:
+        runtime.shutdown.set()
+        thread.join(timeout=10)
+        squatter.close()
+    assert not thread.is_alive()

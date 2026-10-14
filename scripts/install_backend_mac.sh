@@ -104,7 +104,9 @@ launchctl enable "$DOMAIN/$PLIST_LABEL"
 # people to debug a backend that came up fine a second later.
 answered=0
 for _ in $(seq 1 20); do
-    if curl -sS -m 2 -o /dev/null "http://localhost:${PORT}/v1/health" 2>/dev/null; then
+    # -f: an error status is not "answered". Without it any process on the port
+    # that speaks HTTP at all -- including one returning 404 or 500 -- passed.
+    if curl -fsS -m 2 -o /dev/null "http://localhost:${PORT}/v1/health" 2>/dev/null; then
         answered=1
         break
     fi

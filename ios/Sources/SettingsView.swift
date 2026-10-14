@@ -390,10 +390,9 @@ struct ManualBackendView: View {
 
                 if !state.configuredBaseURL.isEmpty {
                     Button("Clear and go back to automatic", role: .destructive) {
-                        state.configuredBaseURL = ""
                         draft = ""
                         message = "Cleared. SensorDyme will find your server on the network again."
-                        state.reconnect()
+                        state.useAutomaticBackend()
                     }
                 }
             } footer: {

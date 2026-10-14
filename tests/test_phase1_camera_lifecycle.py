@@ -17,8 +17,6 @@ docs/HARDWARE_VERIFICATION.md as a required on-device check.
 
 from __future__ import annotations
 
-import pytest
-
 from core.camera import Camera
 
 
@@ -89,7 +87,11 @@ def test_a_failing_close_does_not_propagate_out_of_release():
 
 
 def test_stop_failing_still_clears_the_reference():
-    """If stop() throws, release must not leave a half-released camera behind."""
+    """If stop() throws, release must not leave a half-released camera behind --
+    and must not raise either. reopen() calls release(), and the capture pump
+    only expects CameraError from it: a "device busy" from stop() used to escape
+    and kill the pump thread, so the one fault reopen() exists for stopped the
+    recovery instead."""
     class _StopFails(_FakePicam):
         def stop(self) -> None:
             self.calls.append("stop")
@@ -98,8 +100,7 @@ def test_stop_failing_still_clears_the_reference():
     picam = _StopFails()
     camera = _camera_with(picam)
 
-    with pytest.raises(RuntimeError):
-        camera.release()
+    camera.release()  # must not raise
 
     assert camera._picam is None, (
         "the reference survived a failing stop(), so a later reopen() would race it"

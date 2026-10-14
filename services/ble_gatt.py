@@ -16,9 +16,11 @@ Requires BlueZ with dbus-python + PyGObject (`apt install python3-dbus
 python3-gi`, installed by setup_pi.sh). All imports are performed at start()
 so this file is importable (and the rest of the codebase testable) on a Mac.
 
-Security posture (documented, deliberate): pairing is BLE "Just Works" — the
-credential write window only exists while the device is unprovisioned, which
-requires physical presence during setup, and closes the moment Wi-Fi connects.
+Security posture (documented, deliberate): pairing is BLE "Just Works", so the
+credential write is unauthenticated. What bounds the exposure is WHEN it is
+served: while the device is offline, and for a few minutes after each boot
+(services/provisioning.py, `reconfigure_window_s`). Setting
+`provisioning.always_available: true` keeps it open permanently.
 """
 
 from __future__ import annotations
@@ -167,8 +169,9 @@ class BLEProvisioningServer:
         threading.Thread(target=self._scan_worker, daemon=True, name="wifi-scan").start()
 
     def _scan_worker(self) -> None:
+        scan = self._scan_networks
         try:
-            networks = self._scan_networks() or []
+            networks = (scan() if scan is not None else None) or []
         except Exception as exc:  # noqa: BLE001 - a failed scan is an empty list
             log.warning("BLE: wifi scan failed: %s", exc)
             networks = []
@@ -505,6 +508,7 @@ class BLEProvisioningServer:
                 self._status_chrc = chrc
 
         # The adapter must be powered before anything can be registered on it.
+        adapter_props = None
         try:
             adapter_props = dbus.Interface(
                 bus.get_object(BLUEZ_SERVICE, adapter_path), DBUS_PROP_IFACE
@@ -522,6 +526,8 @@ class BLEProvisioningServer:
         # Show the device name in scan results: the kernel's scan-response
         # local-name comes from the adapter's Alias.
         try:
+            if adapter_props is None:
+                raise RuntimeError("no adapter properties interface")
             adapter_props.Set("org.bluez.Adapter1", "Alias", dbus.String(self._device_name))
         except Exception as exc:  # noqa: BLE001
             log.warning("could not set adapter alias: %s", exc)

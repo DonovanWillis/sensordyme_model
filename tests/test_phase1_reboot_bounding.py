@@ -162,3 +162,18 @@ def test_max_total_zero_means_unbounded_for_operators_who_want_that(runtime, reb
         clock[0] += 3600
 
     assert len(reboots.calls) == 6
+
+
+def test_the_total_bound_is_per_campaign_not_for_life(runtime, reboots, monkeypatch):
+    """A device that hit the bound and then ran fine for a day must be able to
+    recover by reboot again -- the count used to be a lifetime total."""
+    clock = [1_000_000.0]
+    monkeypatch.setattr("services.runtime.time.time", lambda: clock[0])
+    for _ in range(3):
+        runtime._last_resort("camera")
+        clock[0] += 3600
+    assert len(reboots.calls) == 3
+
+    clock[0] += 25 * 3600  # a quiet day later, a new fault
+    runtime._last_resort("camera")
+    assert len(reboots.calls) == 4
