@@ -1586,7 +1586,9 @@ def test_a_non_finite_confidence_cannot_break_the_event_history(backend):
     assert resp.status_code == 200
     events = client.get(f"/v1/devices/{device_id}/events", headers=auth)
     assert events.status_code == 200
-    assert {e["type"]: e["confidence"] for e in events.json()["events"]} == {"a": 0.0, "b": 0.0}
+    # Coerced to "unknown", not to 0.0: a non-finite value is a fault upstream,
+    # and 0.0 would read as "certain it did not happen" (core/confidence.py).
+    assert {e["type"]: e["confidence"] for e in events.json()["events"]} == {"a": None, "b": None}
 
 
 def test_an_oversized_body_is_refused_before_it_is_parsed(backend):

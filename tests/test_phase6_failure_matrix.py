@@ -15,6 +15,7 @@ from __future__ import annotations
 import json
 import types
 from pathlib import Path
+from typing import Any
 
 import pytest
 import yaml
@@ -55,13 +56,24 @@ def _no_intervals(caller: str = "default") -> dict:
     return {}
 
 
-def _runtime(module_name: str = "driver_attention", cfg: dict | None = None):
-    return types.SimpleNamespace(
+def _runtime(module_name: str = "driver_attention", cfg: dict | None = None) -> Any:
+    runtime = types.SimpleNamespace(
         config={"modules": {module_name: cfg if cfg is not None else {"yolo_weights": "yolo11n.pt"}}},
         module_name=module_name,
         _WEIGHTS_KEYS=DeviceRuntime._WEIGHTS_KEYS,
         _detection_degraded=None,
+        _model_identity=None,
+        # No separate boot config: the running module's config is the one in
+        # config["modules"], as on the pi profile.
+        module=None,
+        _boot_module=None,
+        _boot_module_config=None,
     )
+    # The real helpers, bound, so the method under test reads config exactly
+    # as it does in DeviceRuntime rather than through a stub.
+    runtime.__dict__["_active_module_config"] = types.MethodType(DeviceRuntime._active_module_config, runtime)
+    runtime.__dict__["_module_identity_name"] = types.MethodType(DeviceRuntime._module_identity_name, runtime)
+    return runtime
 
 
 # ----------------------------------------------------------------- accelerator

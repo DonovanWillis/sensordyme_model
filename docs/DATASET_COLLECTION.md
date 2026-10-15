@@ -126,7 +126,7 @@ one namespace.
 | `d02` | Phone in hand, near lap / low, driver looking down | `phone_use` (needs phone AND `eyes_down`), `pitch_threshold_deg` |
 | `d03` | Phone in hand, near the wheel / at wheel rim height | the hardest phone case: small, low-contrast, hand-occluded |
 | `d04` | Phone partially occluded — by hand, by wheel rim, by clothing | measures where the 51.7 % recall actually goes |
-| `d05` | Phone mounted in a cradle, not touched | **negative for `phone_use`, positive for `phone_detected`.** `mac_max`'s `phone_alone_confidence: 0.3` exists for exactly this case |
+| `d05` | Phone mounted in a cradle, not touched | **negative for `phone_use`, positive for `phone_detected`.** `phone_detected` is log-only (no alert tier) for exactly this case |
 | `d06` | Multiple occupants — passenger present, rear passengers | tests that the driver is the subject; `multi_person_rate` was 5.4 % on State Farm |
 | `d07` | Passenger holding a phone, driver attentive | the false-positive case `d06` sets up |
 | `d08` | Nighttime, ambient street/dash lighting only | face availability under low light |

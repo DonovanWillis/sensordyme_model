@@ -415,7 +415,7 @@ modules:
     # Precision at 0.20 is ~77%, BELOW the 95.8% this table records for CPU at
     # 0.10, and phone_detected still fires on the rising edge with no sustain
     # gate. Taken deliberately: a bare phone_detected is log-only by design (see
-    # phone_alone_confidence 0.3 -- a dash-mounted GPS is legitimate), while the
+    # the mac_max phone tiers -- a dash-mounted GPS is legitimate), while the
     # loud tier needs phone + hand overlap + eyes off road SUSTAINED. A false
     # phone costs a log line; a missed phone costs the whole distraction chain.
     #
@@ -841,8 +841,10 @@ mac_max:
     blink_rate_baseline_seconds: 300.0 # first 5 minutes of the session establish the user's own baseline rate
     blink_rate_low_per_min: 8.0 # normal awake blink rate is roughly 15-20/min; sustained rate below this is atypical
     blink_rate_high_per_min: 30.0 # sustained rate above this (rapid blinking) is also an atypical fatigue signal
+    blink_rate_baseline_deviation: 0.5 # AND at least 50% away from this person's own baseline, same direction
     fatigue_pattern_confirm_s: 30.0 # blink rate must stay out of [low, high] this long before "fatigue_pattern" fires
-    # (log-only -- feeds the FATIGUED state, does not alert on its own)
+    # (log-only -- feeds the FATIGUED state and corroborates "fatigue", does not alert on its own:
+    # blink rate also moves with reading, talking and dry air, so alone it is too confounded to interrupt)
 
     # --- glance / eyes-off-road (NHTSA-based, using the fused gaze vector, not just head yaw) ---
     gaze_off_road_seconds: 2.0 # NHTSA visual-manual distraction guideline: single glance > 2s -> "eyes_off_road"
@@ -868,11 +870,13 @@ mac_max:
       person: person_detected # log-only bookkeeping; not used by any alert logic
     enable_hands: true # MediaPipe Hands runs every frame in this profile (no stride -- Mac can afford it)
 
-    # --- phone / object fusion: confidence stacking, not single triggers ---
+    # --- phone / object fusion: evidence stacking, not single triggers ---
+    # Three tiers of increasing SEVERITY -- phone alone (log-only: a mounted GPS
+    # is legitimate), phone_in_hand (soft), phone_use_while_distracted (loud) --
+    # set by alerts.loud_types/soft_types below. Their confidence is evidence,
+    # not severity: the detector's score for the phone, joined with the gaze
+    # certainty where the tier requires eyes off road (core/confidence.py).
     hand_phone_iou_threshold: 0.2 # hand/phone box IoU above this counts as "holding it" (matches the pi profile)
-    phone_alone_confidence: 0.3 # phone visible, eyes forward, no hand overlap -> log-only (mounted GPS is legitimate)
-    phone_in_hand_confidence: 0.7 # phone + hand overlap -> "phone_in_hand" (soft)
-    phone_use_distracted_confidence: 0.95 # phone + hand overlap + (eyes_down OR off-road), sustained -> loudest tier
     phone_use_distracted_seconds: 1.5 # sustain duration required for the loudest phone_use_while_distracted tier
     hand_face_proximity_window_s: 30.0 # rolling window for repeated hand-to-face motion (eating pattern)
     hand_face_proximity_min_count: 2 # >= this many hand-approaches-face episodes in the window -> eating_drinking

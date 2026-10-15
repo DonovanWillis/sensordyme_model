@@ -16,6 +16,8 @@ real, unmodified module code.
 """
 
 
+from typing import Any
+
 import cv2
 import numpy as np
 import pytest
@@ -190,7 +192,7 @@ def _make_module(tmp_path, clock, **overrides):
     hands back control at t=0 equivalent for the scenario itself.
     """
     config = {**_CONFIG, "calibration_path": str(tmp_path / "calibration.json"), **overrides}
-    module = DriverAttentionModule(config)
+    module: Any = DriverAttentionModule(config)
     neutral = make_fake_landmarks(pitch_deg=0.0, yaw_deg=0.0)
     frame = np.zeros((H, W, 3), dtype=np.uint8)
     # A bit past calibration_duration_s, all neutral -> settles immediately.
@@ -316,9 +318,16 @@ def test_looking_down_at_a_phone_for_over_five_seconds_is_very_high_confidence(t
     assert module.is_alert_active() is True
 
 
-def test_phone_use_confidence_is_high_when_a_hand_is_on_it(tmp_path, clock):
+def test_phone_use_confidence_is_the_detectors_score_times_gaze_certainty(tmp_path, clock):
+    """phone_use means "a phone was there AND the eyes were off the road", so its
+    confidence is the joint certainty of both (core/confidence.py): the
+    detector's own score for the phone times the measurement's certainty that
+    the gaze was past its threshold. It used to be a fixed 0.95/0.6 tier keyed
+    on whether a hand overlapped the phone; the overlap is corroboration, now
+    stated in the detail, not a number."""
     module, frame = _make_module(tmp_path, clock)
     module._last_phone_boxes = [(280, 300, 360, 420)]
+    module._last_phone_score = 0.82
     module._hand_overlaps_phone = True
     landmarks = make_fake_landmarks(pitch_deg=30.0)
     module._face_mesh.process = lambda rgb, lm=landmarks: _FakeFaceMeshResult(lm)
@@ -328,7 +337,11 @@ def test_phone_use_confidence_is_high_when_a_hand_is_on_it(tmp_path, clock):
         clock["now"] += 0.05
     phone_events = [e for e in events if e.type == "phone_use"]
     assert phone_events, "phone_use should have fired"
-    assert phone_events[0].confidence >= 0.9
+    # Pitch 30 degrees down against a -20 threshold is ten noise floors past it,
+    # so the gaze term is ~1 and the joint is the detector's own score.
+    assert phone_events[0].confidence == pytest.approx(0.82, abs=0.01)
+    assert phone_events[0].confidence <= 0.82, "a joint can never exceed either of its parts"
+    assert "hand on phone" in phone_events[0].contributing_signals
 
 
 def test_face_temporarily_occluded_does_not_instantly_reset_progress(tmp_path, clock):
@@ -359,3 +372,69 @@ def test_debug_state_reports_gaze_and_duration_while_looking_down(tmp_path, cloc
     assert state["eyes_down_state"] == "CONFIRMED"
     assert state["eyes_down_duration_s"] >= 2.5
     assert state["alert_active"] is True
+
+
+# ------------------------------------------------------------------ confidence
+def _events(module, frame, clock, pitch_deg=0.0, yaw_deg=0.0, seconds=0.0, step=0.05):
+    landmarks = make_fake_landmarks(pitch_deg=pitch_deg, yaw_deg=yaw_deg)
+    module._face_mesh.process = lambda rgb, lm=landmarks: _FakeFaceMeshResult(lm)
+    events = []
+    for _ in range(max(1, int(seconds / step))):
+        events += module.process(frame)
+        clock["now"] += step
+    return events
+
+
+@pytest.mark.parametrize(
+    ("event_type", "pose"),
+    [("eyes_down", {"pitch_deg": 30.0}), ("eyes_up", {"pitch_deg": -35.0}), ("distraction", {"yaw_deg": 50.0})],
+)
+def test_a_confirmed_gaze_event_reports_certainty_not_the_angle(tmp_path, clock, event_type, pose):
+    """The measured angle, the threshold and the confidence are three different
+    numbers (core/confidence.py). Before, eyes_down at 30 degrees reported
+    |pitch|/90 = 0.33 — a confirmed alert reaching the phone as "33% confidence".
+    Ten degrees past a threshold on a steady face is near-certain."""
+    module, frame = _make_module(tmp_path, clock)
+    events = [e for e in _events(module, frame, clock, seconds=8.0, **pose) if e.type == event_type]
+    assert events, f"{event_type} should have fired"
+    confidence = events[0].confidence
+    assert confidence is not None and 0.5 <= confidence <= 1.0
+    assert confidence > 0.95
+    angle = abs(pose.get("pitch_deg", 0.0) or pose.get("yaw_deg", 0.0))
+    assert confidence != pytest.approx(angle / 90.0, abs=0.05), "the angle leaked into confidence"
+
+
+def test_a_condition_carried_across_a_lost_face_never_claims_more_than_a_coin_flip(tmp_path, clock):
+    """Face lost mid-glance with the body still visible: the event is inferred
+    from the last reading, not measured, so it is capped at 0.5 — "may or may
+    not still hold" — however far past the threshold that last reading was."""
+    module, frame = _make_module(tmp_path, clock)
+    _events(module, frame, clock, pitch_deg=30.0, seconds=1.0)  # building toward eyes_down
+    module._last_person_visible = True
+    module._update_object_detections = lambda frame: None  # keep the body "visible"
+    module._face_mesh.process = lambda rgb: _FakeFaceMeshResult(None)
+    events = []
+    for _ in range(80):
+        events += module.process(frame)
+        clock["now"] += 0.05
+    coasted = [e for e in events if e.type == "eyes_down"]
+    assert coasted, "the coasted eyes_down should have fired"
+    assert coasted[0].confidence is not None and coasted[0].confidence <= 0.5
+    assert "extrapolated" in coasted[0].contributing_signals
+
+
+def test_events_without_graded_evidence_say_so_instead_of_inventing_a_number(tmp_path, clock):
+    """attention_lost is "no face for N seconds": a duration rule. It used to
+    report 0.9 or 0.6 by a fixed table. Now it reports None, and the corroboration
+    that table encoded is stated in the detail."""
+    module, frame = _make_module(tmp_path, clock)
+    module._face_mesh.process = lambda rgb: _FakeFaceMeshResult(None)
+    events = []
+    for _ in range(400):
+        events += module.process(frame)
+        clock["now"] += 0.05
+    lost = [e for e in events if e.type == "attention_lost"]
+    assert lost, "attention_lost should have fired"
+    assert all(e.confidence is None for e in lost)
+    risk = [e for e in events if e.module_name == module.name and e.contributing_signals.startswith("risk score")]
+    assert all(e.confidence is None for e in risk), "a risk index is how bad, not how sure"

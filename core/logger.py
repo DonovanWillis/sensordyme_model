@@ -100,7 +100,7 @@ class EventLogger:
                 event.timestamp.isoformat(),
                 event.type,
                 f"{event.duration:.3f}",
-                f"{event.confidence:.3f}",
+                "" if event.confidence is None else f"{event.confidence:.3f}",
                 event.module_name,
                 event.contributing_signals,
             ]

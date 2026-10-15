@@ -13,14 +13,18 @@ before this was added -- the Pi profile's `device=None` path is unchanged.
 
 from __future__ import annotations
 
-from typing import Optional
+import os
+from typing import Any, Optional
 
 Box = tuple[int, int, int, int]
 
-_model_cache: dict[tuple[str, Optional[str]], object] = {}
+# Any: either an ultralytics YOLO or core.accel.HailoYOLO — one call surface, no shared base class.
+_model_cache: dict[tuple[str, Optional[str]], Any] = {}
+#: sha256 per resolved weights path, computed once per load (never per frame).
+_weights_sha256: dict[str, Optional[str]] = {}
 
 
-def get_yolo_model(weights: str, device: Optional[str] = None):
+def get_yolo_model(weights: str, device: Optional[str] = None) -> Any:
     """Return a shared detector instance for `weights`, loading it once.
 
     When the AI HAT+ is present, HailoRT works, and `accelerator.yolo_hef` is
@@ -58,7 +62,16 @@ def get_yolo_model(weights: str, device: Optional[str] = None):
         try:
             from ultralytics import YOLO
         except ImportError as exc:
-            raise RuntimeError(_no_backend_message(weights, device)) from exc
+            message = _no_backend_message(weights, device)
+            if device is None:
+                from core import accel
+
+                # Say WHY the accelerator was not used when it was refused —
+                # above all a failed integrity check, which must never read as a
+                # generic "install something" problem.
+                if accel.failure_reason():
+                    message = f"{message}\n\nAccelerator refused: {accel.failure_reason()}"
+            raise RuntimeError(message) from exc
 
         print(
             f"core.detectors: loading YOLO weights '{weights}' "
@@ -138,6 +151,58 @@ def require_backend(weights: str, device: Optional[str] = None) -> str:
     """
     model = get_yolo_model(weights, device)
     return "hailo" if type(model).__name__ == "HailoYOLO" else "ultralytics"
+
+
+def model_identity(weights: str, device: Optional[str] = None) -> Optional[dict]:
+    """Which exact model `get_yolo_model(weights, device)` loaded, or None if not loaded.
+
+    {"name", "sha256", "backend"}: the file actually executing (the .hef on the
+    accelerator, not the .pt name that was only a cache key), the sha256 of the
+    file as loaded, and which runtime ran it. A name alone cannot answer "which
+    exact model produced this event" — two different files can share one.
+    """
+    model = _model_cache.get((weights, device))
+    if model is None:
+        return None
+    identity = getattr(model, "identity", None)
+    if isinstance(identity, dict):
+        return dict(identity)
+    path = getattr(model, "ckpt_path", None) or weights
+    return {
+        "name": os.path.basename(str(path)),
+        "sha256": _sha256_once(str(path)),
+        "backend": "ultralytics",
+    }
+
+
+def _sha256_once(path: str) -> Optional[str]:
+    """sha256 of a local weights file, cached per path; None if it is not a file."""
+    if path not in _weights_sha256:
+        from core.accel import file_sha256
+
+        try:
+            _weights_sha256[path] = file_sha256(path) if os.path.isfile(path) else None
+        except OSError:
+            _weights_sha256[path] = None
+    return _weights_sha256[path]
+
+
+def release_all() -> None:
+    """Close every loaded detector and forget it. Called at shutdown.
+
+    The Hailo models hold the chip; process exit would free it too, but a clean
+    close is what lets a reload in the same process work — and every reload
+    passes through the integrity check again.
+    """
+    from core import accel
+
+    for model in list(_model_cache.values()):
+        close = getattr(model, "close", None)
+        if callable(close):
+            close()
+    _model_cache.clear()
+    _weights_sha256.clear()
+    accel.release_hailo_models()
 
 
 def _model_device(model) -> str:

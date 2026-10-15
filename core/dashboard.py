@@ -420,7 +420,7 @@ class DashboardServer:
                 {
                     "time": event.timestamp.astimezone().strftime("%H:%M:%S"),
                     "type": event.type,
-                    "confidence": round(event.confidence, 2),
+                    "confidence": None if event.confidence is None else round(event.confidence, 2),
                     "signals": event.contributing_signals,
                     "severity": severity,
                 }

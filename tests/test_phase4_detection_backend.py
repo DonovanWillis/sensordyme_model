@@ -10,20 +10,32 @@ stop a device from starting — had no coverage at all. That is the gap here.
 from __future__ import annotations
 
 import types
+from typing import Any
 
 import pytest
 
 from services.runtime import DeviceRuntime
 
 
-def _runtime(module_name: str, module_cfg: dict) -> types.SimpleNamespace:
+def _runtime(module_name: str, module_cfg: dict) -> Any:
     """The smallest object `_verify_detection_backend` actually reads from."""
-    return types.SimpleNamespace(
+    runtime = types.SimpleNamespace(
         config={"modules": {module_name: module_cfg}},
         module_name=module_name,
         _WEIGHTS_KEYS=DeviceRuntime._WEIGHTS_KEYS,
         _detection_degraded=None,
+        _model_identity=None,
+        # No separate boot config: the running module's config is the one in
+        # config["modules"], as on the pi profile.
+        module=None,
+        _boot_module=None,
+        _boot_module_config=None,
     )
+    # The real helpers, bound, so the method under test reads config exactly
+    # as it does in DeviceRuntime rather than through a stub.
+    runtime.__dict__["_active_module_config"] = types.MethodType(DeviceRuntime._active_module_config, runtime)
+    runtime.__dict__["_module_identity_name"] = types.MethodType(DeviceRuntime._module_identity_name, runtime)
+    return runtime
 
 
 def test_a_module_with_no_detector_does_not_load_one(monkeypatch):
@@ -178,3 +190,56 @@ def test_the_phone_detector_device_pin_is_passed_through(monkeypatch, module_nam
         _runtime(module_name, {"phone_weights": "yolo11n.pt", "phone_device": "mps"})
     )
     assert seen == {"weights": "yolo11n.pt", "device": "mps"}
+
+
+def test_mac_max_verifies_and_labels_the_detector_its_module_actually_runs(monkeypatch):
+    """mac_max hands the runtime module_name="driver_attention", whose
+    config["modules"] entry is the PI detector (yolo11n.pt, Hailo/CPU). The
+    module itself was built from config["mac_max"] (yolo11x.pt on MPS). Reading
+    config["modules"] verified — and stamped every event with — a model that
+    never ran. The runtime now uses the config the boot module was built from."""
+    from core import detectors
+
+    seen = {}
+    monkeypatch.setattr(
+        detectors, "require_backend",
+        lambda w, d=None: seen.update(weights=w, device=d) or "ultralytics",
+    )
+    monkeypatch.setattr(
+        detectors, "model_identity",
+        lambda w, d=None: {"name": w, "sha256": None, "backend": "ultralytics"},
+    )
+    boot_module = types.SimpleNamespace(name="driver_attention_max")
+    runtime = _runtime("driver_attention", {"yolo_weights": "yolo11n.pt"})
+    runtime.module = boot_module
+    runtime._boot_module = boot_module
+    runtime._boot_module_config = {"detector_weights": "yolo11x.pt", "device": "mps"}
+
+    DeviceRuntime._verify_detection_backend(runtime)
+
+    assert seen == {"weights": "yolo11x.pt", "device": "mps"}
+    assert runtime._model_identity == {
+        "module": "driver_attention_max",
+        "detector": {"name": "yolo11x.pt", "sha256": None, "backend": "ultralytics"},
+    }
+
+
+def test_events_never_see_a_half_built_or_previous_model_identity(monkeypatch):
+    """Verification can take seconds (a CPU load, hashing weights). During it
+    the identity is unknown (None) — never the previous module's model, and
+    never this module with detector=None — then assigned once, complete."""
+    from core import detectors
+
+    runtime = _runtime("driver_attention", {"yolo_weights": "yolo11n.pt"})
+    runtime._model_identity = {"module": "fall_detection", "detector": None}  # the previous module's
+    during = {}
+
+    def loading(w, d=None):
+        during["identity"] = runtime._model_identity
+        return "ultralytics"
+
+    monkeypatch.setattr(detectors, "require_backend", loading)
+    monkeypatch.setattr(detectors, "model_identity", lambda w, d=None: {"name": w, "sha256": None, "backend": "u"})
+    DeviceRuntime._verify_detection_backend(runtime)
+    assert during["identity"] is None
+    assert runtime._model_identity["detector"] == {"name": "yolo11n.pt", "sha256": None, "backend": "u"}

@@ -158,13 +158,19 @@ def test_phone_in_hand_and_phone_use_while_distracted_are_alert_worthy():
     assert "phone_use_while_distracted" in main_module.ALERT_EVENT_TYPES_MAC_MAX
 
 
-def test_confidence_stacking_matches_config():
-    """The three phone-fusion tiers must have strictly increasing confidence,
-    matching the 'confidence stacking, not single triggers' design."""
+def test_phone_tiers_escalate_by_severity_not_by_invented_confidence():
+    """The three phone tiers still escalate -- by ALERT TIER: phone alone is
+    log-only, phone_in_hand soft, phone_use_while_distracted loud. Confidence is
+    evidence, and the old fixed 0.3/0.7/0.95 constants (severity in a field
+    that means certainty) are gone from config."""
     config = yaml.safe_load((Path(__file__).resolve().parent.parent / "config.yaml").read_text())
     da_config = config["mac_max"]["driver_attention"]
-    assert da_config["phone_alone_confidence"] < da_config["phone_in_hand_confidence"]
-    assert da_config["phone_in_hand_confidence"] < da_config["phone_use_distracted_confidence"]
+    for dead in ("phone_alone_confidence", "phone_in_hand_confidence", "phone_use_distracted_confidence"):
+        assert dead not in da_config, f"{dead} would be read by nothing"
+    alerts = config["mac_max"]["alerts"]
+    assert "phone_use_while_distracted" in alerts["loud_types"]
+    assert "phone_in_hand" in alerts["soft_types"]
+    assert "phone_detected" not in alerts["loud_types"] + alerts["soft_types"]
 
 
 # --- GazeCalibrator ------------------------------------------------------------------
@@ -359,6 +365,9 @@ def test_face_loss_resets_the_trackers_not_just_the_flags():
         setattr(module, name, tracker)
     module._eyes_closed_prev = True
     module._closure_start = 0.0
+    from core.confidence import NoiseEstimator
+    for name in ("_ear_noise", "_gaze_yaw_noise", "_gaze_pitch_noise"):
+        setattr(module, name, NoiseEstimator(floor=1.0))
     module._update_object_detections = lambda frame: None
     module._vlm = None
     module._poll_vlm = lambda events: None

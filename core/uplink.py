@@ -129,7 +129,7 @@ class CloudUplink:
         self._stop.set()
 
     # ------------------------------------------------------------------ main-loop side
-    def push_event(self, event, severity: str, source: str = "module") -> None:
+    def push_event(self, event, severity: str, source: str = "module", model: Optional[dict] = None) -> None:
         """Queue one alert event for the next sync cycle.
 
         `source` distinguishes a preset's own detection from something the user
@@ -153,9 +153,19 @@ class CloudUplink:
             self._queue.append(
                 {
                     "event_key": uuid.uuid4().hex,
+                    # Which exact model produced this: module + detector name,
+                    # sha256 and backend (DeviceRuntime.model_identity). Taken
+                    # NOW, at queue time, so an event queued before a module
+                    # switch keeps the identity of the model that produced it.
+                    "model": _json_safe(dict(model)) if model else None,
                     "timestamp": event.timestamp.isoformat(),
                     "type": event.type,
-                    "confidence": round(_finite(event.confidence), 3),
+                    # None is a statement ("no graded evidence"), not a missing 0:
+                    # see core/confidence.py. Sent as null, stored as NULL.
+                    "confidence": (
+                        None if event.confidence is None
+                        else round(_finite(event.confidence), 3)
+                    ),
                     "signals": _json_safe(event.contributing_signals),
                     # Seconds the condition was sustained before this fired --
                     # already computed by every module (Event.duration), but

@@ -88,6 +88,37 @@ with the reason in `/api/health`. See docs/ACCELERATOR.md for compiling models
 — stock `.pt`/`.onnx` files cannot run on the HAT, and MediaPipe Face Mesh has
 no Hailo build (stays on CPU by design).
 
+The chip is one exclusive device and config names one `.hef`, so `core/accel.py`
+keeps **one** `HailoYOLO` per `.hef` (every weights name a module asks for is a
+cache key for it). Its vstreams are opened and the network group activated
+once, then held for every frame; a device fault tears them down and the next
+frame rebuilds them. Inference is serialised by a per-instance lock.
+`core.detectors.release_all()` closes it at shutdown.
+
+**Integrity.** The `.hef`'s sha256 is checked against
+`accelerator.yolo_hef_sha256` on every load (boot, a preset switch that needs a
+detector, a reload) — never per frame. A mismatch, truncation or replacement is
+refused: the model never reaches the chip, `/api/health` names the expected and
+actual hashes, and on a device (no CPU detector) the runtime goes DEGRADED
+rather than detecting with an unexpected file. Recovery: re-provision with
+`setup_pi.sh`, or update the pin if the change is intended.
+
+## Events: confidence and model identity
+
+`Event.confidence` is the certainty, in [0, 1], that the condition the event
+names really occurred — or `None` when there is no graded evidence (a count, a
+mode change). It is never a raw measurement or a threshold. Three sources,
+defined in `core/confidence.py`: a model's own score; for threshold rules,
+`Phi(margin / sigma)` with sigma measured live from the signal (0.5 = exactly on
+the threshold); or none. Severity (log/soft/loud) is separate and lives in the
+alert tiers. Nothing gates on confidence after an event exists.
+
+Every uplinked event carries `model`: the module plus the detector file that
+ran, its sha256 and backend (`DeviceRuntime.model_identity`, taken from what was
+actually loaded). The backend stores it per event (`events.model`, NULL for
+history) and returns it from `GET /v1/devices/{id}/events`; the app decodes it
+as `EventModel` and the explanation lists it as "Model".
+
 ## Adding hardware
 
 `hardware/hal.py` defines interfaces (IMU, GPS, IO expander, audio amp, LEDs,

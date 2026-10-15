@@ -430,6 +430,10 @@ def init_db() -> None:
             # text ("remained down for 34 seconds") instead of a bare type
             # name. NULL for events from firmware that predates this field.
             "ALTER TABLE events ADD COLUMN duration REAL",
+            # Which model produced the event: module + detector name, sha256
+            # and backend, as JSON (see _model_identity). NULL for history and
+            # for firmware that predates it — never back-filled with a guess.
+            "ALTER TABLE events ADD COLUMN model TEXT",
             # The proposal the user is LOOKING AT, which is not the same thing
             # as the proposal they asked to run. /v1/ai/configure is called by
             # AIConfigureView's `configure()` — the preview, before the person
@@ -1249,11 +1253,22 @@ def device_events(device_id: int, limit: int = 100, uid: int = Depends(current_u
         # `id` is included so the app can ask why a specific alert fired.
         # Without it an event is unaddressable and /explain is unreachable.
         rows = conn.execute(
-            "SELECT id, timestamp, type, confidence, signals, severity, source, duration FROM events "
+            "SELECT id, timestamp, type, confidence, signals, severity, source, duration, model FROM events "
             "WHERE device_id = ? ORDER BY id DESC LIMIT ?",
             (device_id, limit),
         ).fetchall()
-    return {"events": [dict(r) for r in rows]}
+    return {"events": [{**dict(r), "model": _stored_model(r["model"])} for r in rows]}
+
+
+def _stored_model(raw: Optional[str]) -> Optional[dict]:
+    """The stored identity, or None for history (and for anything unreadable)."""
+    if not raw:
+        return None
+    try:
+        value = json.loads(raw)
+    except ValueError:
+        return None
+    return value if isinstance(value, dict) else None
 
 
 @app.post("/v1/devices/{device_id}/preset")
@@ -1973,6 +1988,36 @@ def explain_event(device_id: int, event_id: int, uid: int = Depends(current_user
 
 
 # ------------------------------------------------------------------------- device API
+_SHA256 = re.compile(r"^[0-9a-f]{64}$")
+
+
+def _model_identity(raw) -> Optional[dict]:
+    """A device-reported model identity, validated at the boundary.
+
+    Answers "which exact model produced this event": the module, and the object
+    detector it ran — file name, sha256 of the file that was loaded, and the
+    backend that executed it. Only these keys survive, every string is bounded,
+    and a sha256 must look like one; anything else is dropped rather than
+    stored, because a malformed identity must not cost the event itself.
+    """
+    if not isinstance(raw, dict):
+        return None
+    module = raw.get("module")
+    out: dict = {"module": str(module)[:64] if isinstance(module, str) else None}
+    detector = raw.get("detector")
+    if isinstance(detector, dict) and isinstance(detector.get("name"), str):
+        sha = detector.get("sha256")
+        backend = detector.get("backend")
+        out["detector"] = {
+            "name": detector["name"][:128],
+            "sha256": sha if isinstance(sha, str) and _SHA256.match(sha) else None,
+            "backend": backend[:32] if isinstance(backend, str) else None,
+        }
+    else:
+        out["detector"] = None
+    return out if out["module"] or out["detector"] else None
+
+
 def _finite(value):
     """`value` with every non-finite float replaced by None.
 
@@ -2049,20 +2094,25 @@ def ingest(body: IngestBody, background_tasks: BackgroundTasks, device: sqlite3.
             # queue deadlock.
             try:
                 event_key = e.get("event_key")
-                confidence_raw = e.get("confidence", 0.0)
-                confidence = float(confidence_raw) if confidence_raw not in (None, "") else 0.0
+                # None is a statement — "no graded evidence" (core/confidence.py)
+                # — and is stored as NULL, never coerced to a 0 that would read
+                # as "certain it did not happen". Older firmware sends floats.
+                confidence_raw = e.get("confidence")
+                confidence = float(confidence_raw) if confidence_raw not in (None, "") else None
                 duration_raw = e.get("duration")
                 duration = float(duration_raw) if duration_raw not in (None, "") else None
                 # float() accepts "nan", "inf" and JSON's NaN / 1e999. Stored,
                 # they make every later read of this device's events a 500:
                 # the response encoder refuses non-finite floats.
-                if not math.isfinite(confidence):
-                    confidence = 0.0
+                if confidence is not None:
+                    confidence = min(1.0, max(0.0, confidence)) if math.isfinite(confidence) else None
+                model = _model_identity(e.get("model"))
                 if duration is not None and not math.isfinite(duration):
                     duration = None
                 cursor = conn.execute(
                     "INSERT OR IGNORE INTO events (device_id, timestamp, type, confidence, signals,"
-                    " severity, source, received_at, event_key, duration) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                    " severity, source, received_at, event_key, duration, model)"
+                    " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
                     (
                         device["id"],
                         str(e.get("timestamp", "")),
@@ -2074,6 +2124,7 @@ def ingest(body: IngestBody, background_tasks: BackgroundTasks, device: sqlite3.
                         now,
                         str(event_key) if event_key not in (None, "") else None,
                         duration,
+                        json.dumps(model, sort_keys=True) if model is not None else None,
                     ),
                 )
                 # rowcount is 0 when OR IGNORE silently dropped a retry of an

@@ -44,6 +44,14 @@ import cv2
 import mediapipe as mp
 import numpy as np
 
+from core.confidence import (
+    NoiseEstimator,
+    clamp_unit,
+    joint,
+    margin_confidence,
+    proportion_confidence,
+    rate_confidence,
+)
 from core.detectors import Box, get_yolo_model, iou
 from core.events import Event
 from core.vlm_judge import VLM_EVENT_BY_STATE, VLMConfirmTracker, VLMJudge, vlm_is_local
@@ -253,6 +261,15 @@ class BlinkRateTracker:
     A sustained drop or rise in blink rate relative to how the user normally
     blinks is itself a fatigue signal, independent of any single closure's
     duration. See config.yaml's citations for the specific rate thresholds.
+
+    The rate must be atypical on BOTH counts to qualify: outside the population
+    band [low, high] AND at least `baseline_deviation` away from this person's
+    own baseline, in the same direction. The baseline used to be measured and
+    then never read, so a person who naturally blinks 7 times a minute sat
+    permanently below the 8/min floor and "fatigue_pattern" was simply their
+    normal. Blink rate also moves with reading, talking and dry air, which is
+    why this stays a corroborating signal (it feeds the FATIGUED state) and is
+    deliberately not an alert on its own.
     """
 
     def __init__(
@@ -262,8 +279,10 @@ class BlinkRateTracker:
         low_per_min: float,
         high_per_min: float,
         confirm_s: float,
+        baseline_deviation: float = 0.5,
     ) -> None:
         self._window_s = window_s
+        self._baseline_deviation = baseline_deviation
         self._baseline_seconds = baseline_seconds
         self._low_per_min = low_per_min
         self._high_per_min = high_per_min
@@ -273,6 +292,7 @@ class BlinkRateTracker:
         self._baseline_rate: Optional[float] = None
         self._out_of_range_tracker = SustainedConditionTracker(confirm_s)
         self._last_rate = 0.0
+        self._last_confidence: Optional[float] = None
 
     def record_blink(self, now: float) -> None:
         """Call once per completed short (non-microsleep) eye closure."""
@@ -296,12 +316,38 @@ class BlinkRateTracker:
         while self._blink_times and self._blink_times[0] < cutoff:
             self._blink_times.popleft()
         window_minutes = min(self._window_s, now - self._session_start) / 60.0
-        rate = len(self._blink_times) / window_minutes if window_minutes > 0 else 0.0
+        count = len(self._blink_times)
+        rate = count / window_minutes if window_minutes > 0 else 0.0
         self._last_rate = rate
 
-        out_of_range = rate < self._low_per_min or rate > self._high_per_min
+        low, high = self.effective_band
+        out_of_range = rate < low or rate > high
         fired = self._out_of_range_tracker.update(out_of_range, now)
-        return "fatigue_pattern" if fired is not None else None
+        if fired is None:
+            return None
+        self._last_confidence = rate_confidence(count, window_minutes, low, high)
+        return "fatigue_pattern"
+
+    @property
+    def effective_band(self) -> tuple[float, float]:
+        """The normal range for THIS person: the population band, widened to
+        `baseline_deviation` either side of their own baseline where theirs is
+        already outside it."""
+        low, high = self._low_per_min, self._high_per_min
+        if self._baseline_rate is not None:
+            low = min(low, self._baseline_rate * (1.0 - self._baseline_deviation))
+            high = max(high, self._baseline_rate * (1.0 + self._baseline_deviation))
+        return low, high
+
+    @property
+    def is_active(self) -> bool:
+        """The anomaly has been sustained (confirmed) and has not yet cleared."""
+        return self._out_of_range_tracker.is_active
+
+    @property
+    def last_confidence(self) -> Optional[float]:
+        """Poisson certainty that the true rate was outside the band, at firing."""
+        return self._last_confidence
 
     @property
     def rate_per_min(self) -> float:
@@ -346,6 +392,7 @@ class DriverAttentionMaxModule(VisionModule):
             low_per_min=float(config.get("blink_rate_low_per_min", 8.0)),
             high_per_min=float(config.get("blink_rate_high_per_min", 30.0)),
             confirm_s=float(config.get("fatigue_pattern_confirm_s", 30.0)),
+            baseline_deviation=float(config.get("blink_rate_baseline_deviation", 0.5)),
         )
         self._fatigue_warned = False
         self._fatigue_critical_warned = False
@@ -382,9 +429,13 @@ class DriverAttentionMaxModule(VisionModule):
 
         # --- phone / object fusion (confidence stacking) ---
         self._hand_phone_iou_threshold = float(config.get("hand_phone_iou_threshold", 0.2))
-        self._phone_alone_confidence = float(config.get("phone_alone_confidence", 0.3))
-        self._phone_in_hand_confidence = float(config.get("phone_in_hand_confidence", 0.7))
-        self._phone_use_distracted_confidence = float(config.get("phone_use_distracted_confidence", 0.95))
+        # The three phone tiers differ in SEVERITY, which is the alert tier each
+        # maps to (log / soft / loud). Their confidence is evidence: the
+        # detector's own score for the phone, joined with whatever else the
+        # tier requires (core/confidence.py). These used to be fixed 0.3/0.7/
+        # 0.95 constants, which said "how bad" in the field meant "how sure".
+        self._last_phone_score: Optional[float] = None
+        self._last_eating_score: Optional[float] = None
         self._phone_use_distracted_tracker = SustainedConditionTracker(
             float(config.get("phone_use_distracted_seconds", 1.5))
         )
@@ -400,6 +451,10 @@ class DriverAttentionMaxModule(VisionModule):
         self._ear_filter = RollingMedianFilter(filter_size)
         self._gaze_yaw_filter = RollingMedianFilter(filter_size)
         self._gaze_pitch_filter = RollingMedianFilter(filter_size)
+        # Live noise of each decision signal; see core/confidence.py.
+        self._ear_noise = NoiseEstimator(floor=0.005, smoothing_window=filter_size)
+        self._gaze_yaw_noise = NoiseEstimator(floor=1.0, smoothing_window=filter_size)
+        self._gaze_pitch_noise = NoiseEstimator(floor=1.0, smoothing_window=filter_size)
         self._phone_visible_filter = RollingMedianFilter(filter_size)
         self._hand_overlap_filter = RollingMedianFilter(filter_size)
 
@@ -506,6 +561,8 @@ class DriverAttentionMaxModule(VisionModule):
         phone_boxes: list[Box] = []
         eating_boxes: list[Box] = []
         overlay_boxes: list[tuple[Box, str, float]] = []
+        phone_score: Optional[float] = None
+        eating_score: Optional[float] = None
         for result in results:
             for box in result.boxes:
                 class_id = int(box.cls[0])
@@ -517,8 +574,10 @@ class DriverAttentionMaxModule(VisionModule):
                 overlay_boxes.append((xyxy, self._detector_model.names[class_id], confidence))
                 if event_type == "phone_detected":
                     phone_boxes.append(xyxy)
+                    phone_score = max(phone_score or 0.0, confidence)
                 elif event_type == "eating_drinking":
                     eating_boxes.append(xyxy)
+                    eating_score = max(eating_score or 0.0, confidence)
 
         hand_boxes: list[Box] = []
         if self._hands is not None:
@@ -532,6 +591,8 @@ class DriverAttentionMaxModule(VisionModule):
 
         self._last_phone_boxes = phone_boxes
         self._last_eating_boxes = eating_boxes
+        self._last_phone_score = phone_score
+        self._last_eating_score = eating_score
         self._last_hand_boxes = hand_boxes
         self._last_overlay_boxes = overlay_boxes
 
@@ -662,6 +723,8 @@ class DriverAttentionMaxModule(VisionModule):
                 tracker.update(False, now)
             self._eyes_closed_prev = False
             self._closure_start = None
+            for noise in (self._ear_noise, self._gaze_yaw_noise, self._gaze_pitch_noise):
+                noise.observe(None)  # a gap is motion, not noise
             self._microsleep_active = False
             self._drowsy_active = False
             self._off_road_active = False
@@ -704,17 +767,25 @@ class DriverAttentionMaxModule(VisionModule):
             return events  # still calibrating -- annotate() shows the prompt
 
         # --- temporal smoothing ---
+        self._ear_noise.observe(raw_ear)
         ear = self._ear_filter.update(raw_ear)
         self._last_ear = ear
         if raw_gaze_yaw is not None:
-            gaze_yaw = self._gaze_yaw_filter.update(raw_gaze_yaw - self._calibrator.baseline_gaze_yaw)
-            gaze_pitch = self._gaze_pitch_filter.update(raw_gaze_pitch - self._calibrator.baseline_gaze_pitch)
+            yaw_delta = raw_gaze_yaw - self._calibrator.baseline_gaze_yaw
+            pitch_delta = raw_gaze_pitch - self._calibrator.baseline_gaze_pitch
+            self._gaze_yaw_noise.observe(yaw_delta)
+            self._gaze_pitch_noise.observe(pitch_delta)
+            gaze_yaw = self._gaze_yaw_filter.update(yaw_delta)
+            gaze_pitch = self._gaze_pitch_filter.update(pitch_delta)
             self._last_gaze_yaw, self._last_gaze_pitch = gaze_yaw, gaze_pitch
         else:
+            self._gaze_yaw_noise.observe(None)
+            self._gaze_pitch_noise.observe(None)
             gaze_yaw, gaze_pitch = self._last_gaze_yaw, self._last_gaze_pitch
 
         # --- drowsiness: blink vs. microsleep vs. drowsiness, PERCLOS, blink rate ---
         eyes_closed = ear < self._calibrator.ear_threshold
+        closure_confidence = margin_confidence(self._calibrator.ear_threshold - ear, self._ear_noise.sigma)
         if eyes_closed and not self._eyes_closed_prev:
             self._closure_start = now
         if not eyes_closed and self._eyes_closed_prev and self._closure_start is not None:
@@ -728,38 +799,57 @@ class DriverAttentionMaxModule(VisionModule):
         fired = self._microsleep_tracker.update(eyes_closed, now)
         self._microsleep_active = self._microsleep_tracker.is_active
         if fired is not None:
-            events.append(Event.now("microsleep_warning", fired, 0.6, self.name, "sustained_eye_closure_0.5-1.5s"))
+            events.append(Event.now(
+                "microsleep_warning", fired, closure_confidence, self.name, "sustained_eye_closure_0.5-1.5s"))
 
         fired = self._drowsy_tracker.update(eyes_closed, now)
         self._drowsy_active = self._drowsy_tracker.is_active
         if fired is not None:
-            events.append(Event.now("drowsiness", fired, 0.9, self.name, "sustained_eye_closure_gt_1.5s"))
+            events.append(Event.now(
+                "drowsiness", fired, closure_confidence, self.name, "sustained_eye_closure_gt_1.5s"))
 
         perclos = self._perclos_tracker.update(eyes_closed, now)
         self._last_perclos = perclos
         self._fatigue_active = perclos > self._perclos_fatigue_threshold
         self._fatigue_critical_active = perclos > self._perclos_escalate_threshold
         if self._fatigue_critical_active and not self._fatigue_critical_warned:
-            events.append(Event.now("fatigue_critical", 0.0, perclos, self.name, "perclos_gt_0.25"))
+            events.append(Event.now(
+                "fatigue_critical", 0.0,
+                proportion_confidence(perclos, self._perclos_escalate_threshold, self._perclos_tracker.episodes),
+                self.name, f"perclos {perclos:.2f} > {self._perclos_escalate_threshold:.2f}",
+            ))
             self._fatigue_critical_warned = True
         elif perclos <= self._perclos_escalate_threshold * 0.8:
             self._fatigue_critical_warned = False
         if self._fatigue_active and not self._fatigue_warned:
-            events.append(Event.now("fatigue", 0.0, perclos, self.name, "perclos_gt_0.15"))
+            corroborated = " + blink-rate anomaly" if self._blink_rate_tracker.is_active else ""
+            events.append(Event.now(
+                "fatigue", 0.0,
+                proportion_confidence(perclos, self._perclos_fatigue_threshold, self._perclos_tracker.episodes),
+                self.name, f"perclos {perclos:.2f} > {self._perclos_fatigue_threshold:.2f}{corroborated}",
+            ))
             self._fatigue_warned = True
         elif perclos <= self._perclos_fatigue_threshold * 0.8:
             self._fatigue_warned = False
 
         fatigue_pattern_event = self._blink_rate_tracker.update(now)
         if fatigue_pattern_event:
-            events.append(Event.now("fatigue_pattern", 0.0, 0.5, self.name, "blink_rate_anomaly"))
+            low, high = self._blink_rate_tracker.effective_band
+            events.append(Event.now(
+                "fatigue_pattern", 0.0, self._blink_rate_tracker.last_confidence, self.name,
+                f"blink rate {self._blink_rate_tracker.rate_per_min:.1f}/min outside {low:.1f}-{high:.1f}",
+            ))
 
         # --- gaze / eyes-off-road ---
         off_road_condition = abs(gaze_yaw) > self._gaze_yaw_threshold_deg
         fired = self._off_road_tracker.update(off_road_condition, now)
         self._off_road_active = self._off_road_tracker.is_active
         if fired is not None:
-            events.append(Event.now("eyes_off_road", fired, min(1.0, abs(gaze_yaw) / 90.0), self.name, "gaze_yaw"))
+            events.append(Event.now(
+                "eyes_off_road", fired,
+                margin_confidence(abs(gaze_yaw) - self._gaze_yaw_threshold_deg, self._gaze_yaw_noise.sigma),
+                self.name, "gaze_yaw",
+            ))
 
         cumulative_seconds = self._excessive_glance_tracker.update(off_road_condition, now)
         self._last_excessive_glance_seconds = cumulative_seconds
@@ -769,7 +859,7 @@ class DriverAttentionMaxModule(VisionModule):
                 Event.now(
                     "excessive_glancing",
                     0.0,
-                    min(1.0, cumulative_seconds / self._excessive_glance_window_s),
+                    None,  # accumulated time over a budget: no graded evidence
                     self.name,
                     "cumulative_gaze_off_12s_window",
                 )
@@ -783,10 +873,19 @@ class DriverAttentionMaxModule(VisionModule):
         self._eyes_down_active = self._eyes_down_tracker.is_active
         if fired is not None:
             events.append(
-                Event.now("eyes_down", fired, min(1.0, abs(gaze_pitch) / 90.0), self.name, "gaze_pitch_down")
+                Event.now(
+                    "eyes_down", fired,
+                    margin_confidence(self._gaze_pitch_down_threshold_deg - gaze_pitch, self._gaze_pitch_noise.sigma),
+                    self.name, "gaze_pitch_down",
+                )
             )
 
         eyes_off_road_now = off_road_condition or eyes_down_condition
+        eyes_off_road_confidence = max(
+            margin_confidence(abs(gaze_yaw) - self._gaze_yaw_threshold_deg, self._gaze_yaw_noise.sigma),
+            margin_confidence(self._gaze_pitch_down_threshold_deg - gaze_pitch, self._gaze_pitch_noise.sigma),
+        )
+        phone_confidence = clamp_unit(self._last_phone_score)
 
         # --- phone / object fusion: confidence stacking ---
         phone_visible = bool(self._last_phone_boxes)
@@ -800,7 +899,7 @@ class DriverAttentionMaxModule(VisionModule):
                 Event.now(
                     "phone_use_while_distracted",
                     fired,
-                    self._phone_use_distracted_confidence,
+                    joint(phone_confidence, eyes_off_road_confidence),
                     self.name,
                     "phone + hand_overlap + gaze_off",
                 )
@@ -809,12 +908,12 @@ class DriverAttentionMaxModule(VisionModule):
         if self._pending_phone_alone_edge:
             self._pending_phone_alone_edge = False
             events.append(
-                Event.now("phone_detected", 0.0, self._phone_alone_confidence, self.name, "phone_only_eyes_forward")
+                Event.now("phone_detected", 0.0, phone_confidence, self.name, "phone_only_eyes_forward")
             )
         if self._pending_phone_in_hand_edge:
             self._pending_phone_in_hand_edge = False
             events.append(
-                Event.now("phone_in_hand", 0.0, self._phone_in_hand_confidence, self.name, "phone + hand_overlap")
+                Event.now("phone_in_hand", 0.0, phone_confidence, self.name, "phone + hand_overlap")
             )
 
         # --- eating/drinking: food/drink class + hand overlap + repeated hand-to-face motion ---
@@ -828,7 +927,8 @@ class DriverAttentionMaxModule(VisionModule):
         if approach_fired and eating_visible and hand_overlaps_food:
             events.append(
                 Event.now(
-                    "eating_drinking", 0.0, 0.6, self.name, "food + hand_overlap + repeated_hand_to_face_motion"
+                    "eating_drinking", 0.0, clamp_unit(self._last_eating_score), self.name,
+                    "food + hand_overlap + repeated_hand_to_face_motion",
                 )
             )
 
@@ -844,7 +944,7 @@ class DriverAttentionMaxModule(VisionModule):
             return "PHONE_USE"
         if self._vlm_confirm.active_state is not None:
             return f"VLM:{self._vlm_confirm.active_state.upper()}"
-        if self._fatigue_critical_active or self._fatigue_active:
+        if self._fatigue_critical_active or self._fatigue_active or self._blink_rate_tracker.is_active:
             return "FATIGUED"
         if self._off_road_active or self._eyes_down_active or self._excessive_glancing_active:
             return "DISTRACTED"

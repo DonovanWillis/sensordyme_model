@@ -28,8 +28,11 @@ need offline compilation before it could run here.
 
 from __future__ import annotations
 
+import contextlib
+import hashlib
 import os
 import shutil
+import threading
 import time
 from dataclasses import dataclass
 from typing import Optional
@@ -143,6 +146,21 @@ def inference_stats() -> dict:
     }
 
 
+def file_sha256(path: str) -> str:
+    """sha256 of a file, streamed: a .hef is megabytes, read in 1 MiB chunks."""
+    digest = hashlib.sha256()
+    with open(path, "rb") as handle:
+        for chunk in iter(lambda: handle.read(1 << 20), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def failure_reason() -> Optional[str]:
+    """Why the accelerator was refused, if it was (missing file, bad checksum,
+    init failure) — for the error a person sees when nothing else can run."""
+    return _hailo_failed_reason
+
+
 def configure(accel_cfg: dict, info: Optional[AcceleratorInfo] = None) -> AcceleratorInfo:
     """Install the `accelerator:` config block; returns the detection result."""
     global _accel_cfg, _accel_info, _hailo_failed_reason
@@ -224,14 +242,41 @@ def live_status() -> tuple[bool, str]:
     return healthy, f"running on CPU — {detail}"
 
 
+def _refuse(reason: str, *, error: bool = False) -> None:
+    """Record why the accelerator is not being used (status() reports it) and log it."""
+    global _hailo_failed_reason
+    _hailo_failed_reason = reason
+    (log.error if error else log.warning)("%s", reason)
+
+
+#: One HailoYOLO per .hef file, by real path. The chip is one exclusive device
+#: (a second VDevice in the same process fails to open it), and config names
+#: exactly one .hef, so every weights name a module asks for — yolo11n.pt here,
+#: yolo11s.pt there — is a cache key for the SAME compiled model. Keying the
+#: device by weights name, as core.detectors does for the CPU path, made a second
+#: name try to open the chip a second time, fail, and fall back to a CPU backend
+#: the device does not have.
+_hailo_models: dict[str, "HailoYOLO"] = {}
+_hailo_models_lock = threading.Lock()
+
+
 def maybe_hailo_yolo(weights: str):
     """The Hailo-backed model for `weights`, or None to fall back to ultralytics/CPU.
 
     Called by core.detectors.get_yolo_model. Fallback is always safe and always
     logged; the reason is surfaced through status() so the app's health card
     shows *why* the accelerator isn't being used.
+
+    Integrity is checked HERE, on every load — boot, a preset switch that needs
+    a detector, a reload after release_hailo_models() — and never per frame.
+    The file's sha256 must equal `accelerator.yolo_hef_sha256` (the pin
+    setup_pi.sh verified at install). A mismatch refuses the model outright:
+    a .hef replaced or corrupted after install is exactly the file that must not
+    run, and on a device there is no CPU detector to fall back to, so the
+    runtime goes DEGRADED with this reason rather than detecting with it. An
+    unpinned config still loads, loudly, with the computed hash recorded as the
+    model's identity so every event it produces stays traceable.
     """
-    global _hailo_failed_reason
     if not _accel_cfg.get("enabled", True):
         return None
     hef_path = _accel_cfg.get("yolo_hef")
@@ -241,17 +286,61 @@ def maybe_hailo_yolo(weights: str):
     if not info.usable:
         return None
     if not os.path.exists(hef_path):
-        _hailo_failed_reason = f"accelerator.yolo_hef points to a missing file: {hef_path}"
-        log.warning("%s — falling back to CPU for '%s'", _hailo_failed_reason, weights)
+        _refuse(f"accelerator.yolo_hef points to a missing file: {hef_path} (wanted for '{weights}')")
         return None
-    try:
-        model = HailoYOLO(hef_path)
-        log.info("object detection '%s' -> Hailo (%s)", weights, hef_path)
+    key = os.path.realpath(hef_path)
+    with _hailo_models_lock:
+        shared = _hailo_models.get(key)
+        if shared is not None:
+            log.info("object detection '%s' -> Hailo (%s, shared)", weights, hef_path)
+            return shared
+        try:
+            actual = file_sha256(hef_path)
+        except OSError as exc:
+            _refuse(f"accelerator.yolo_hef could not be read ({exc}) — refusing to run it", error=True)
+            return None
+        pinned = str(_accel_cfg.get("yolo_hef_sha256") or "").strip().lower()
+        if pinned and actual != pinned:
+            _refuse(
+                f"model integrity check FAILED for {hef_path}: sha256 {actual} does not match the "
+                f"pinned accelerator.yolo_hef_sha256 {pinned}. Refusing to run it. Re-provision "
+                "the model (setup_pi.sh verifies it) or, if the change is intended, update the pin.",
+                error=True,
+            )
+            return None
+        if not pinned:
+            log.warning(
+                "accelerator.yolo_hef_sha256 is not set: running %s UNVERIFIED (sha256 %s). "
+                "Pin it so a replaced or corrupted model is refused.", hef_path, actual,
+            )
+        try:
+            model = HailoYOLO(hef_path, sha256=actual)
+        except Exception as exc:  # noqa: BLE001 - never let the accelerator kill startup
+            _refuse(f"Hailo init failed ({exc}) — running on CPU")
+            return None
+        # Re-hash after the load: the file was read twice (once to hash, once
+        # by HEF()), so a swap between the two reads would otherwise pass.
+        try:
+            reloaded = file_sha256(hef_path)
+        except OSError:
+            reloaded = None
+        if reloaded != actual:
+            model.close()
+            _refuse(f"model integrity check FAILED for {hef_path}: the file changed while it was being "
+                    "loaded. Refusing to run it.", error=True)
+            return None
+        _hailo_models[key] = model
+        log.info("object detection '%s' -> Hailo (%s, sha256 %s)", weights, hef_path, actual[:12])
         return model
-    except Exception as exc:  # noqa: BLE001 - never let the accelerator kill startup
-        _hailo_failed_reason = f"Hailo init failed ({exc}) — running on CPU"
-        log.warning("%s", _hailo_failed_reason)
-        return None
+
+
+def release_hailo_models() -> None:
+    """Close every Hailo model and free the chip. The next load re-verifies."""
+    with _hailo_models_lock:
+        models = list(_hailo_models.values())
+        _hailo_models.clear()
+    for model in models:
+        model.close()
 
 
 # ------------------------------------------------------------------ ultralytics-shaped shims
@@ -356,7 +445,7 @@ class HailoYOLO:
     #: day tuning IoU expecting it to fix duplicate boxes.
     _DEFAULT_NMS_IOU = 0.50
 
-    def __init__(self, hef_path: str, nms_iou: Optional[float] = None) -> None:
+    def __init__(self, hef_path: str, nms_iou: Optional[float] = None, sha256: Optional[str] = None) -> None:
         from hailo_platform import (  # imported here: only exists on the Pi
             HEF,
             ConfigureParams,
@@ -369,6 +458,15 @@ class HailoYOLO:
         )
 
         self._hef_path = hef_path  # kept so model_name() can name what actually ran
+        self.sha256 = sha256  # the verified hash of the file that was loaded
+        # Inference is serialised: one chip, one activated network group, and
+        # HailoRT vstreams are not safe to drive from two threads at once.
+        self._lock = threading.Lock()
+        # The pipeline's two contexts (vstreams open, network group active),
+        # entered ONCE and held — see _ensure_ready. None until the first frame.
+        self._session: Optional[contextlib.ExitStack] = None
+        self._pipeline = None
+        self._closed = False
         self._nms_iou = self._DEFAULT_NMS_IOU if nms_iou is None else float(nms_iou)
 
         self.names = dict(COCO_NAMES)
@@ -473,9 +571,17 @@ class HailoYOLO:
         rgb = cv2.cvtColor(letterboxed, cv2.COLOR_BGR2RGB)
         batch = np.expand_dims(rgb, axis=0)
 
-        with self._infer_pipeline as pipeline:
-            with self._network_group.activate(self._network_group_params):
+        with self._lock:
+            pipeline = self._ensure_ready()
+            try:
                 raw = pipeline.infer({self._input_name: batch})
+            except Exception:
+                # The device may have reset under us: drop the held contexts so
+                # the next frame rebuilds them instead of reusing dead streams.
+                # The exception still propagates — the runtime counts failures
+                # and escalates exactly as before.
+                self._teardown()
+                raise
         # Recorded only after the device returned a result, so the health report
         # reflects work the Hailo actually completed.
         record_inference()
@@ -608,9 +714,65 @@ class HailoYOLO:
         """
         return os.path.basename(self._hef_path)
 
+    def _ensure_ready(self):
+        """The open, activated pipeline — set up on first use, then reused.
+
+        Opening the vstreams and activating the network group used to happen
+        inside predict(), i.e. on EVERY frame: two context entries and two
+        exits around each inference. HailoRT's own usage is to enter both once
+        and infer in a loop; holding them is what this does. Caller holds _lock.
+        """
+        if self._closed:
+            raise RuntimeError("HailoYOLO used after close()")
+        if self._pipeline is None:
+            session = contextlib.ExitStack()
+            try:
+                pipeline = session.enter_context(self._infer_pipeline)
+                session.enter_context(self._network_group.activate(self._network_group_params))
+            except Exception:
+                session.close()
+                raise
+            self._session, self._pipeline = session, pipeline
+        return self._pipeline
+
+    def _teardown(self) -> None:
+        """Exit the held contexts. Safe to call when nothing is held."""
+        session, self._session, self._pipeline = self._session, None, None
+        if session is not None:
+            try:
+                session.close()
+            except Exception:  # releasing a dead device must not raise; logged with traceback
+                log.warning("accel: error while closing the Hailo pipeline", exc_info=True)
+
+    @property
+    def identity(self) -> dict:
+        """Which exact model this is — see core.detectors.model_identity."""
+        return {"name": self.model_name, "sha256": self.sha256, "backend": "hailo"}
+
+    #: How long close() waits for an in-flight inference before giving up.
+    _CLOSE_TIMEOUT_S = 2.0
+
     def close(self) -> None:
-        """Release the Hailo device."""
+        """Release the pipeline and the Hailo device. Idempotent, and bounded.
+
+        A wedged device can leave an inference thread inside infer() holding
+        the lock for ever; waiting on it unconditionally hung shutdown until
+        systemd killed the process. After the timeout the instance is marked
+        closed and left: process exit releases the chip.
+        """
+        if not self._lock.acquire(timeout=self._CLOSE_TIMEOUT_S):
+            self._closed = True
+            log.warning("accel: inference still in progress after %.1fs; not waiting to close the Hailo device",
+                        self._CLOSE_TIMEOUT_S)
+            return
         try:
-            self._vdevice.release()
-        except Exception:  # noqa: BLE001
-            pass
+            if self._closed:
+                return
+            self._closed = True
+            self._teardown()
+            try:
+                self._vdevice.release()
+            except Exception:  # noqa: BLE001
+                pass
+        finally:
+            self._lock.release()

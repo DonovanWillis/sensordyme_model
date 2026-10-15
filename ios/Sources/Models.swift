@@ -188,10 +188,13 @@ struct EventItem: Codable, Identifiable, Hashable {
     /// "custom_rule" when this is something the user explicitly configured.
     /// Optional so an older backend still decodes.
     let source: String?
+    /// Which exact model produced this event. Nil for events recorded before
+    /// model tracking, and from an older backend that does not send it.
+    var model: EventModel? = nil
 
     enum CodingKeys: String, CodingKey {
         case eventID = "id"
-        case timestamp, type, confidence, signals, severity, source
+        case timestamp, type, confidence, signals, severity, source, model
     }
 
     /// Whether the user asked to be told about this specifically.

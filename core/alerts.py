@@ -47,7 +47,8 @@ class ConsoleSink:
 
     def emit(self, event: Event, level: AlertLevel) -> None:
         """Print a one-line alert message."""
-        print(f"[ALERT:{level.value}] {event.module_name}: {event.type} (confidence={event.confidence:.2f})")
+        confidence = "n/a" if event.confidence is None else f"{event.confidence:.2f}"
+        print(f"[ALERT:{level.value}] {event.module_name}: {event.type} (confidence={confidence})")
 
 
 class SoundSink:

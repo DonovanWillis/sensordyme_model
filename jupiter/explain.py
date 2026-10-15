@@ -110,9 +110,13 @@ def facts_from_event(event: dict, rule: Optional[dict] = None) -> list[Fact]:
         for signal in [s.strip() for s in signals.replace("+", ",").split(",") if s.strip()]:
             facts.append(Fact(humanise(signal)))
 
+    # "Confidence", not "Detector confidence": it is the certainty that the
+    # event's condition held, which for a measured rule (head angle, eye
+    # closure) is not a detector's score at all — see core/confidence.py. Absent
+    # when the device had no graded evidence, rather than shown as 0%.
     confidence = event.get("confidence")
     if isinstance(confidence, (int, float)) and confidence > 0:
-        facts.append(Fact("Detector confidence", f"{round(float(confidence) * 100)}%"))
+        facts.append(Fact("Confidence", f"{round(float(confidence) * 100)}%"))
 
     duration = event.get("duration")
     if isinstance(duration, (int, float)) and duration > 0:
@@ -122,7 +126,31 @@ def facts_from_event(event: dict, rule: Optional[dict] = None) -> list[Fact]:
         zone = rule.get("zone")
         if zone:
             facts.append(Fact("Area", str(zone)))
+
+    model = _model_fact(event.get("model"))
+    if model:
+        facts.append(Fact("Model", model))
     return facts
+
+
+def _model_fact(raw) -> str:
+    """"damoyolo_tinynasL20_T.hef (sha256 e69136d3ebf3)" from a stored identity.
+
+    Which exact file produced the event — the question an investigation starts
+    with. Empty for events that predate model tracking.
+    """
+    if isinstance(raw, str):
+        try:
+            raw = json.loads(raw)
+        except ValueError:
+            return ""
+    if not isinstance(raw, dict):
+        return ""
+    detector = raw.get("detector")
+    if not isinstance(detector, dict) or not detector.get("name"):
+        return ""
+    sha = detector.get("sha256")
+    return f"{detector['name']} (sha256 {sha[:12]})" if isinstance(sha, str) and sha else str(detector["name"])
 
 
 def rule_summary(rule: Optional[dict]) -> str:

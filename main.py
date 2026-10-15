@@ -292,6 +292,7 @@ def run(argv: Optional[list[str]] = None) -> None:
         display=display,
         debug=debug,
         window_name=WINDOW_NAME,
+        module_config=module_config,
     ).run()
 
 

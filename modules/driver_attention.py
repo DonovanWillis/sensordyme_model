@@ -98,6 +98,13 @@ import cv2
 import mediapipe as mp
 import numpy as np
 
+from core.confidence import (
+    NoiseEstimator,
+    clamp_unit,
+    joint,
+    margin_confidence,
+    proportion_confidence,
+)
 from core.detections import Detection, DetectionFrame
 from core.detectors import Box, get_yolo_model, iou, upper_region
 from core.events import Event
@@ -207,6 +214,23 @@ def eye_aspect_ratio(p1: Point, p2: Point, p3: Point, p4: Point, p5: Point, p6: 
     if horizontal == 0:
         return 0.0
     return vertical / horizontal
+
+
+def _extrapolated(confidence: float) -> float:
+    """Confidence for a condition carried across a lost face, not measured.
+
+    The reading is the last one before landmarks were lost, so all it can say
+    is that the condition held THEN. Nothing measures it now, which is the
+    definition of the 0.5 boundary in core/confidence.py: it may or may not
+    still hold. Capped there, never raised.
+    """
+    return min(0.5, confidence)
+
+
+def _risk_event(event_type: str, score: float, module_name: str) -> Event:
+    """A fused-risk event. The fusion score is a weighted risk index (how bad),
+    not a certainty (how sure), so it travels in the signals, not as confidence."""
+    return Event.now(event_type, 0.0, None, module_name, f"risk score {score:.2f}")
 
 
 def _saturating_ratio(value: float, threshold: float) -> float:
@@ -546,6 +570,20 @@ class PerclosTracker:
         self._min_window_s = min(min_window_s, window_s)
         self._samples: deque[tuple[float, bool]] = deque()
 
+    @property
+    def episodes(self) -> int:
+        """Distinct closures in the window: the independent observations PERCLOS rests on.
+
+        Frames are not independent -- one closure spans many -- so this, not the
+        frame count, is the sample size behind the fraction's uncertainty.
+        """
+        count, prev = 0, False
+        for _t, closed in self._samples:
+            if closed and not prev:
+                count += 1
+            prev = closed
+        return count
+
     def update(self, closed: bool, now: float) -> float:
         """Record the current closed/open state and return the PERCLOS fraction in [0, 1].
 
@@ -771,6 +809,14 @@ class DriverAttentionModule(VisionModule):
         self._ear_smoother = SignalSmoother(smoothing_window)
         self._yaw_smoother = SignalSmoother(smoothing_window)
         self._pitch_smoother = SignalSmoother(smoothing_window)
+        # Each decision signal's own noise, measured live, so an event's
+        # confidence says how far past its threshold the reading was in units
+        # of that noise -- see core/confidence.py. Floors are the signals'
+        # resolution: a landmark-fit angle is not meaningful below ~1 degree, an
+        # eyelid-contour EAR below ~0.005.
+        self._ear_noise = NoiseEstimator(floor=0.005, smoothing_window=smoothing_window)
+        self._yaw_noise = NoiseEstimator(floor=1.0, smoothing_window=smoothing_window)
+        self._pitch_noise = NoiseEstimator(floor=1.0, smoothing_window=smoothing_window)
         # Session open-eye reference, so the effective closure threshold follows
         # the face in front of the camera today (glasses on or off) instead of
         # only the face that calibrated. Banded to the calibrated baseline so a
@@ -878,7 +924,7 @@ class DriverAttentionModule(VisionModule):
         # Precision at 0.20 is ~77%, BELOW CPU YOLO11n's 95.8% at 0.10, and
         # "phone_detected" still fires on the rising edge with no sustain gate.
         # That is accepted deliberately rather than overlooked: a bare
-        # phone_detected is log-only by design (phone_alone_confidence 0.3 -- a
+        # phone_detected is log-only by design (no alert tier -- a
         # dash-mounted GPS is legitimate), while the loud tier needs phone + hand
         # overlap + eyes off road SUSTAINED. A false phone costs a log line; a
         # missed phone costs the whole distraction chain. FN is the worse error.
@@ -949,6 +995,10 @@ class DriverAttentionModule(VisionModule):
         self._frame_index = 0
         self._last_phone_boxes: list[Box] = []
         self._last_eating_boxes: list[Box] = []
+        # The detector's own best score for each, this tick: the model
+        # confidence phone/eating events report (core/confidence.py, "model").
+        self._last_phone_score: Optional[float] = None
+        self._last_eating_score: Optional[float] = None
         self._last_hand_boxes: list[Box] = []
         self._last_overlay_boxes: list[tuple[Box, str]] = []
         # Parallel to _last_overlay_boxes. Kept separate rather than widening that
@@ -1056,6 +1106,8 @@ class DriverAttentionModule(VisionModule):
             # with no detector running to ever contradict it.
             self._last_phone_boxes = []
             self._last_eating_boxes = []
+            self._last_phone_score = None
+            self._last_eating_score = None
             self._last_hand_boxes = []
             self._last_overlay_boxes = []
             self._last_overlay_confidences = []
@@ -1123,6 +1175,7 @@ class DriverAttentionModule(VisionModule):
         overlay_boxes: list[tuple[Box, str]] = []
         overlay_confidences: list[float] = []
         person_boxes: list[Box] = []
+        box_scores: dict[tuple[int, ...], float] = {}
         for result in results:
             for box in result.boxes:
                 class_id = int(box.cls[0])
@@ -1137,6 +1190,7 @@ class DriverAttentionModule(VisionModule):
                 xyxy = tuple(int(v) for v in box.xyxy[0].tolist())
                 overlay_boxes.append((xyxy, self._yolo_model.names[class_id]))
                 overlay_confidences.append(float(box.conf[0]))
+                box_scores[xyxy] = max(box_scores.get(xyxy, 0.0), float(box.conf[0]))
                 if event_type == "phone_detected":
                     phone_boxes.append(xyxy)
                 else:
@@ -1156,6 +1210,8 @@ class DriverAttentionModule(VisionModule):
 
         self._last_phone_boxes = phone_boxes
         self._last_eating_boxes = eating_boxes
+        self._last_phone_score = max((box_scores[b] for b in phone_boxes), default=None)
+        self._last_eating_score = max((box_scores[b] for b in eating_boxes), default=None)
         self._last_hand_boxes = hand_boxes
         self._last_overlay_boxes = overlay_boxes
         self._last_overlay_confidences = overlay_confidences
@@ -1232,7 +1288,7 @@ class DriverAttentionModule(VisionModule):
         self._erratic_hands_active = self._erratic_hands_tracker.is_active
         if fired is not None:
             events.append(Event.now(
-                "erratic_hand_movement", fired, 0.7, self.name,
+                "erratic_hand_movement", fired, None, self.name,
                 "sustained rapid, chaotic hand motion",
             ))
 
@@ -1274,7 +1330,8 @@ class DriverAttentionModule(VisionModule):
             self._drowsy_active = self._drowsy_tracker.is_active
             self._distracted_active = self._distract_tracker.is_active
             if fired is not None:
-                confidence = min(1.0, abs(self._last_yaw) / 90.0)
+                confidence = _extrapolated(margin_confidence(
+                    abs(self._last_yaw) - self._yaw_threshold_deg, self._yaw_noise.sigma))
                 events.append(Event.now(
                     "distraction", fired, confidence, self.name,
                     "face lost mid-turn; extrapolated from last known gaze",
@@ -1283,15 +1340,19 @@ class DriverAttentionModule(VisionModule):
             self._eyes_down_active = self._eyes_down_tracker.is_active
             if fired is not None:
                 events.append(Event.now(
-                    "eyes_down", fired, min(1.0, abs(self._last_pitch) / 90.0), self.name,
-                    "face lost mid-glance; extrapolated from last known gaze",
+                    "eyes_down", fired,
+                    _extrapolated(margin_confidence(
+                        self._pitch_threshold_deg - self._last_pitch, self._pitch_noise.sigma)),
+                    self.name, "face lost mid-glance; extrapolated from last known gaze",
                 ))
             fired = self._eyes_up_tracker.update(coasted_eyes_up, now)
             self._eyes_up_active = self._eyes_up_tracker.is_active
             if fired is not None:
                 events.append(Event.now(
-                    "eyes_up", fired, min(1.0, abs(self._last_pitch) / 90.0), self.name,
-                    "face lost mid-glance; extrapolated from last known gaze",
+                    "eyes_up", fired,
+                    _extrapolated(margin_confidence(
+                        self._last_pitch - self._pitch_up_threshold_deg, self._pitch_noise.sigma)),
+                    self.name, "face lost mid-glance; extrapolated from last known gaze",
                 ))
 
             # A face the camera can't see at all is its own risk signal, not "nothing to
@@ -1302,9 +1363,11 @@ class DriverAttentionModule(VisionModule):
             fired = self._face_lost_tracker.update(True, corroborated=self._last_person_visible, now=now)
             self._face_lost_active = self._face_lost_tracker.is_active
             if fired is not None:
-                confidence = 0.9 if not self._face_lost_tracker.corroborated else 0.6
+                # No graded evidence: "no face found for N seconds" is a
+                # duration rule, and the corroboration difference is stated in
+                # the detail rather than encoded as an invented number.
                 detail = "" if not self._face_lost_tracker.corroborated else "person still in frame; face turned away"
-                events.append(Event.now("attention_lost", fired, confidence, self.name, detail))
+                events.append(Event.now("attention_lost", fired, None, self.name, detail))
 
             # Can't confirm eyes-off-road without a face reading, so a visible phone here
             # gets partial (not full) phone_risk credit -- it might just be sitting in a
@@ -1333,7 +1396,7 @@ class DriverAttentionModule(VisionModule):
             )
             self._last_risk_score = score
             if risk_event is not None:
-                events.append(Event.now(risk_event, 0.0, score, self.name))
+                events.append(_risk_event(risk_event, score, self.name))
             self._last_fired_event_types = [e.type for e in events]
             return events
 
@@ -1346,6 +1409,8 @@ class DriverAttentionModule(VisionModule):
             self._ear_smoother.reset()
             self._yaw_smoother.reset()
             self._pitch_smoother.reset()
+            for noise in (self._ear_noise, self._yaw_noise, self._pitch_noise):
+                noise.observe(None)  # a gap is motion, not noise
         self._face_lost_active = False
 
         face_proto = results.multi_face_landmarks[0]
@@ -1362,6 +1427,7 @@ class DriverAttentionModule(VisionModule):
         # as half-closed eyes; under the max the clean eye simply outvotes it.
         # (A wink also reads open, which is correct: a wink is not drowsiness.)
         raw_ear = max(left_ear, right_ear)
+        self._ear_noise.observe(raw_ear)
         # Median-smoothed: a single glare/glasses frame cannot move the value
         # past the recent majority, so no downstream boolean sees the spike.
         ear = self._ear_smoother.update(raw_ear)
@@ -1436,12 +1502,19 @@ class DriverAttentionModule(VisionModule):
         # becomes True once the closure has actually been sustained for drowsy_seconds.
         self._drowsy_active = self._drowsy_tracker.is_active
         if fired is not None:
-            events.append(Event.now("drowsiness", fired, max(0.0, 1.0 - ear), self.name))
+            events.append(Event.now(
+                "drowsiness", fired,
+                margin_confidence(effective_threshold - ear, self._ear_noise.sigma), self.name,
+            ))
 
         perclos = self._perclos_tracker.update(drowsy_condition, now)
         self._last_perclos = perclos
         if perclos > self._perclos_threshold and not self._fatigue_warned:
-            events.append(Event.now("fatigue_warning", 0.0, perclos, self.name))
+            events.append(Event.now(
+                "fatigue_warning", 0.0,
+                proportion_confidence(perclos, self._perclos_threshold, self._perclos_tracker.episodes),
+                self.name, f"PERCLOS {perclos:.2f} over {self._perclos_threshold:.2f}",
+            ))
             self._fatigue_warned = True
         elif perclos < self._perclos_threshold * 0.8:
             self._fatigue_warned = False
@@ -1450,6 +1523,10 @@ class DriverAttentionModule(VisionModule):
         # angle -- "0" here means the calibrated neutral pose, not raw yaw=0/pitch=0, so an
         # off-center-mounted camera doesn't misread ordinary forward driving as a head turn.
         eyes_off_road = False
+        eyes_off_road_confidence: Optional[float] = None
+        if pose is None:
+            self._yaw_noise.observe(None)
+            self._pitch_noise.observe(None)
         if pose is not None and not self._calibrator.is_calibrated:
             # Not calibrated yet: baseline_yaw/baseline_pitch are the 0.0
             # placeholder default, not a real reading. This face model's
@@ -1484,10 +1561,12 @@ class DriverAttentionModule(VisionModule):
             # exactly where spectacle frames sit) spikes by tens of degrees on
             # a single bad frame, and a spike was enough to seed a false
             # glance "episode" in the counter below.
-            yaw = self._yaw_smoother.update(angle_delta_deg(raw_gaze_yaw, self._calibrator.baseline_yaw))
-            pitch = self._pitch_smoother.update(
-                angle_delta_deg(raw_gaze_pitch, self._calibrator.baseline_pitch)
-            )
+            yaw_delta = angle_delta_deg(raw_gaze_yaw, self._calibrator.baseline_yaw)
+            pitch_delta = angle_delta_deg(raw_gaze_pitch, self._calibrator.baseline_pitch)
+            self._yaw_noise.observe(yaw_delta)
+            self._pitch_noise.observe(pitch_delta)
+            yaw = self._yaw_smoother.update(yaw_delta)
+            pitch = self._pitch_smoother.update(pitch_delta)
             # Plausibility floor UNDER the median filter, not instead of it —
             # see MAX_PLAUSIBLE_GAZE_DEG.
             yaw = max(-MAX_PLAUSIBLE_GAZE_DEG, min(MAX_PLAUSIBLE_GAZE_DEG, yaw))
@@ -1503,33 +1582,51 @@ class DriverAttentionModule(VisionModule):
             # turn the whole time, rearview_tolerance_seconds) -- not on every glance.
             self._distracted_active = self._distract_tracker.is_active
             if fired is not None:
-                confidence = min(1.0, abs(yaw) / 90.0)
+                confidence = margin_confidence(abs(yaw) - self._yaw_threshold_deg, self._yaw_noise.sigma)
                 detail = "" if not self._distract_tracker.corroborated else "sustained wide-angle turn (mirror/blind-spot check taking too long)"
                 events.append(Event.now("distraction", fired, confidence, self.name, detail))
 
             if self._glance_counter.update(distract_condition, now):
-                events.append(Event.now("frequent_glancing", 0.0, 1.0, self.name))
+                # A count crossing a limit: no graded evidence to report.
+                events.append(Event.now("frequent_glancing", 0.0, None, self.name))
 
             eyes_down_condition = pitch < self._pitch_threshold_deg
             fired = self._eyes_down_tracker.update(eyes_down_condition, now)
             self._eyes_down_active = self._eyes_down_tracker.is_active
             if fired is not None:
-                events.append(Event.now("eyes_down", fired, min(1.0, abs(pitch) / 90.0), self.name))
+                events.append(Event.now(
+                    "eyes_down", fired,
+                    margin_confidence(self._pitch_threshold_deg - pitch, self._pitch_noise.sigma), self.name,
+                ))
 
             eyes_up_condition = pitch > self._pitch_up_threshold_deg
             fired = self._eyes_up_tracker.update(eyes_up_condition, now)
             self._eyes_up_active = self._eyes_up_tracker.is_active
             if fired is not None:
-                events.append(Event.now("eyes_up", fired, min(1.0, abs(pitch) / 90.0), self.name))
+                events.append(Event.now(
+                    "eyes_up", fired,
+                    margin_confidence(pitch - self._pitch_up_threshold_deg, self._pitch_noise.sigma), self.name,
+                ))
 
             eyes_off_road = distract_condition or eyes_down_condition or eyes_up_condition
+            # Certainty of "off road" is that of whichever criterion holds most
+            # firmly -- the OR of the three, bounded below by its strongest term.
+            eyes_off_road_confidence = max(
+                margin_confidence(abs(yaw) - self._yaw_threshold_deg, self._yaw_noise.sigma),
+                margin_confidence(self._pitch_threshold_deg - pitch, self._pitch_noise.sigma),
+                margin_confidence(pitch - self._pitch_up_threshold_deg, self._pitch_noise.sigma),
+            )
 
         # --- object context: phone / eating, fused with where the eyes are ---
         phone_use_condition = phone_visible and eyes_off_road
         fired = self._phone_use_tracker.update(phone_use_condition, now)
         if fired is not None:
-            confidence = 0.95 if self._hand_overlaps_phone else 0.6
-            events.append(Event.now("phone_use", fired, confidence, self.name))
+            # Both conditions had to hold: the detector's certainty there is a
+            # phone, times the measurement's that the eyes were off the road.
+            # A hand on the phone is corroboration, stated, not a number.
+            confidence = joint(clamp_unit(self._last_phone_score), eyes_off_road_confidence)
+            detail = "hand on phone" if self._hand_overlaps_phone else ""
+            events.append(Event.now("phone_use", fired, confidence, self.name, detail))
             self._phone_use_active = True
         elif not phone_use_condition:
             self._phone_use_active = False
@@ -1539,11 +1636,11 @@ class DriverAttentionModule(VisionModule):
             if not phone_use_condition:
                 # Phone visible but eyes on the road: a mounted phone/GPS is legitimate.
                 # Log it for the record; do not alert.
-                events.append(Event.now("phone_detected", 0.0, 0.6, self.name))
+                events.append(Event.now("phone_detected", 0.0, clamp_unit(self._last_phone_score), self.name))
 
         if self._pending_eating_detected_edge:
             self._pending_eating_detected_edge = False
-            events.append(Event.now("eating_drinking", 0.0, 0.6, self.name))
+            events.append(Event.now("eating_drinking", 0.0, clamp_unit(self._last_eating_score), self.name))
 
         # --- risk fusion: reason about the signals above *together*, not just individually ---
         # Both of these turn a raw count into "how far along toward the
@@ -1583,7 +1680,7 @@ class DriverAttentionModule(VisionModule):
         )
         self._last_risk_score = score
         if risk_event is not None:
-            events.append(Event.now(risk_event, 0.0, score, self.name))
+            events.append(_risk_event(risk_event, score, self.name))
 
         self._last_fired_event_types = [e.type for e in events]
         return events

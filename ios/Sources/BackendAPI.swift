@@ -455,13 +455,13 @@ final class MockAPI: BackendAPI {
             facts: [
                 ExplanationFact(label: "Rapid drop", detail: ""),
                 ExplanationFact(label: "Stillness", detail: ""),
-                ExplanationFact(label: "Detector confidence", detail: "94%"),
+                ExplanationFact(label: "Confidence", detail: "94%"),
                 ExplanationFact(label: "Held for", detail: "8 seconds"),
                 ExplanationFact(label: "Area", detail: "living room"),
             ],
             rule: "You were alerted because your rule alerts after 5 seconds.",
             confidence: 0.94, source: "facts",
-            narrative: "Fall SensorDyme saw: Rapid drop; Stillness; Detector confidence — 94%; Held for — 8 seconds; Area — living room. You were alerted because your rule alerts after 5 seconds.")
+            narrative: "Fall SensorDyme saw: Rapid drop; Stillness; Confidence — 94%; Held for — 8 seconds; Area — living room. You were alerted because your rule alerts after 5 seconds.")
     }
 
     func aiConfigure(deviceID: Int, prompt: String) async throws -> AIProposal {

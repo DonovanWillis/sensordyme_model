@@ -117,8 +117,19 @@ class DeviceRuntime:
         display: bool,
         debug: bool,
         window_name: str = "SensorDyme",
+        module_config: Optional[dict] = None,
     ) -> None:
         self.config = config
+        # The config the boot module was ACTUALLY built from. For the pi profile
+        # that is config["modules"][module_name]; for mac_max it is
+        # config["mac_max"][...] with the device pin, while module_name still
+        # says "driver_attention" — so re-reading config["modules"] verified and
+        # labelled the pi detector while the module ran a different one on MPS.
+        self._boot_module = module
+        self._boot_module_config = module_config
+        # Which exact model events from this module come from; see
+        # _verify_detection_backend and core.detectors.model_identity.
+        self._model_identity: Optional[dict] = None
         self.profile = profile
         self.module = module
         self.module_name = module_name
@@ -526,11 +537,18 @@ class DeviceRuntime:
         # marked degraded while working perfectly -- the mirror of the bug this
         # method exists to prevent.
         self._detection_degraded = None
+        # Unknown while verifying, then assigned ONCE, complete. Filling it in
+        # piecemeal left a window (a CPU load can take seconds) in which events
+        # went out naming the module with detector=None — or, before the swap
+        # sites cleared it, naming the PREVIOUS module's model.
+        self._model_identity = None
+        identity: dict = {"module": self._module_identity_name(), "detector": None}
 
-        module_cfg = (self.config.get("modules", {}) or {}).get(self.module_name, {}) or {}
+        module_cfg = self._active_module_config()
         weights = next((module_cfg[k] for k in self._WEIGHTS_KEYS if module_cfg.get(k)), None)
         if not weights:
             log.info("object detection: %s uses no object detector", self.module_name)
+            self._model_identity = identity
             return
         from core import detectors
 
@@ -550,15 +568,41 @@ class DeviceRuntime:
                 "DEGRADED: object detection unavailable for %s — monitoring is NOT "
                 "active. %s", self.module_name, exc,
             )
+            self._model_identity = identity
             return
+        identity["detector"] = detectors.model_identity(str(weights), device)
+        self._model_identity = identity
         log.info(
-            "object detection backend for %s: %s (%s)", self.module_name, backend, weights
+            "object detection backend for %s: %s (%s) — model %s", self.module_name, backend, weights,
+            identity["detector"],
         )
+
+    def _active_module_config(self) -> dict:
+        """The config the RUNNING module was built from (see __init__)."""
+        if self._boot_module_config is not None and self.module is self._boot_module:
+            return self._boot_module_config
+        return (self.config.get("modules", {}) or {}).get(self.module_name, {}) or {}
+
+    def _module_identity_name(self) -> str:
+        """The module's own registered name: "driver_attention_max", not the
+        "driver_attention" the mac_max profile passes as module_name."""
+        return str(getattr(self.module, "name", None) or self.module_name)
+
+    @property
+    def model_identity(self) -> Optional[dict]:
+        """Which exact model this runtime's events come from, for the uplink."""
+        return self._model_identity
 
     def _model_version(self) -> str:
         """Which model produced a sample — useless data without it, since you
         cannot tell an old model's mistakes from a new one's."""
-        module_cfg = (self.config.get("modules", {}) or {}).get(self.module_name, {}) or {}
+        detector = (self._model_identity or {}).get("detector")
+        if detector:
+            sha = detector.get("sha256")
+            return f"{detector['name']}@{sha[:12]}" if sha else str(detector["name"])
+        # Before (or without) a verified load: the configured name, from every
+        # weights key a module can declare.
+        module_cfg = self._active_module_config()
         # Every key a module might use, not just model_weights. driver_attention
         # -- the flagship -- declares `yolo_weights`, so reading only
         # `model_weights` stamped every one of its captured samples with the
@@ -625,7 +669,7 @@ class DeviceRuntime:
         Same _WEIGHTS_KEYS signal `_verify_detection_backend` uses, so health and
         the boot check can never disagree about which modules need a detector.
         """
-        module_cfg = (self.config.get("modules", {}) or {}).get(self.module_name, {}) or {}
+        module_cfg = self._active_module_config()
         return any(module_cfg.get(key) for key in self._WEIGHTS_KEYS)
 
     # ------------------------------------------------------------------ AI-configured rules
@@ -671,6 +715,7 @@ class DeviceRuntime:
 
         with self._module_lock:
             old_module, self.module, self.module_name = self.module, new_module, wanted
+            self._model_identity = None  # unknown, not the old module's, until verified below
         # The new module may need a detector the old one did not, or none at all.
         # Verified once at boot was not enough: a device could boot on Elderly
         # Monitoring (Pose-only, no detector required, so nothing was degraded),
@@ -740,7 +785,7 @@ class DeviceRuntime:
             # Marked as configured. `notify: "push"` on a rule IS someone asking
             # to be told; the severity field is about how prominent it looks,
             # not about whether it is worth interrupting for.
-            self.uplink.push_event(event, severity, source="custom_rule")
+            self.uplink.push_event(event, severity, source="custom_rule", model=self._model_identity)
 
     # ------------------------------------------------------------------ health hooks
     @contextmanager
@@ -987,6 +1032,7 @@ class DeviceRuntime:
         with self._module_lock:
             old_module = self.module
             self.module, self.module_name, self.active_preset = new_module, new_module_name, name
+            self._model_identity = None  # unknown, not the old module's, until verified below
             self.alert_event_types = self.alert_types_for(new_module_name, preset)
         # Same reason as the AI-custom swap: a preset switch changes which module
         # runs, and different modules need different backends. Verified once at
@@ -1016,7 +1062,8 @@ class DeviceRuntime:
             self.dashboard.set_active_preset(name, new_module_name)
         if self.uplink is not None:
             self.uplink.set_active_preset(name)
-        switch_event = Event.now("preset_changed", 0.0, 1.0, "system", f"mode -> {name}")
+        # A mode change is not a detection: no confidence (core/confidence.py).
+        switch_event = Event.now("preset_changed", 0.0, None, "system", f"mode -> {name}")
         self.logger.log(switch_event)
         self._flash_until = time.monotonic() + _FLASH_DURATION_S
         if self.dashboard is not None:
@@ -1200,7 +1247,7 @@ class DeviceRuntime:
                 # see _apply_alert_overlay's caller below and _FLASH_DURATION_S.
                 self._flash_until = time.monotonic() + _FLASH_DURATION_S
                 if self.uplink is not None and event.type in self.alert_event_types:
-                    self.uplink.push_event(event, severity)
+                    self.uplink.push_event(event, severity, model=self._model_identity)
 
             # Evidence snapshots: OPT-IN (alerts.save_evidence), local-disk only,
             # bounded count — the single, deliberate exception to "frames are never
@@ -1484,6 +1531,9 @@ class DeviceRuntime:
                 self.module.close()
             if self.camera is not None:
                 self.camera.release()
+            from core import detectors
+
+            detectors.release_all()
             if self.display:
                 cv2.destroyAllWindows()
             log.info("shutdown complete")
