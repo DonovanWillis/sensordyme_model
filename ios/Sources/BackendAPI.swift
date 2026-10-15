@@ -549,6 +549,9 @@ extension APIClient {
             // it was still running. See BackendResolution.failureMessage.
             throw APIError(message: noBackendMessage, isUnreachable: true)
         }
+        guard BackendResolution.cleartextPermitted(baseURL.absoluteString) else {
+            throw APIError(message: BackendResolution.cleartextRefusal(host: baseURL.host ?? "that server"))
+        }
         var req = URLRequest(url: baseURL.appendingPathComponent(path))
         req.httpMethod = "GET"
         req.timeoutInterval = 30
@@ -568,6 +571,9 @@ extension APIClient {
             // first failure is what made automatic discovery look broken while
             // it was still running. See BackendResolution.failureMessage.
             throw APIError(message: noBackendMessage, isUnreachable: true)
+        }
+        guard BackendResolution.cleartextPermitted(baseURL.absoluteString) else {
+            throw APIError(message: BackendResolution.cleartextRefusal(host: baseURL.host ?? "that server"))
         }
         var req = URLRequest(url: baseURL.appendingPathComponent(path))
         req.httpMethod = "POST"

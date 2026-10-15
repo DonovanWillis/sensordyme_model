@@ -9,6 +9,11 @@ struct FeedCard: View {
 
     private var isLiveFeed: Bool {
         !state.isDemo && !state.deviceLocalURL.isEmpty && URL(string: state.deviceLocalURL) != nil
+            && FeedLink.showsLiveFeed(
+                deviceHardwareID: device.hardwareId,
+                linkedID: state.linkedDeviceID,
+                accountDeviceCount: state.accountDeviceCount
+            )
     }
 
     var body: some View {

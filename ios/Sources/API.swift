@@ -64,6 +64,10 @@ struct APIClient {
         guard let url = comps?.url else {
             throw APIError(message: "Couldn't build a request URL for \(path).")
         }
+        // Every request here may carry the password (sign-in) or the token.
+        guard BackendResolution.cleartextPermitted(url.absoluteString) else {
+            throw APIError(message: BackendResolution.cleartextRefusal(host: url.host ?? "that server"))
+        }
         var req = URLRequest(url: url)
         req.httpMethod = method
         req.timeoutInterval = 15
@@ -225,6 +229,11 @@ final class AppState: ObservableObject {
     /// Bumped when the storage layout changes, so the migration below runs once.
     @AppStorage("backendStorageVersion") private var backendStorageVersion: Int = 0
     @AppStorage("deviceLocalURL") var deviceLocalURL: String = ""  // LAN feed, e.g. http://192.168.1.20:8899
+    /// Which camera that feed is: its SD- id (DeviceLink writes the same key).
+    @AppStorage("deviceServiceName") var linkedDeviceID: String = ""
+    /// Devices on the signed-in account, as last loaded. FeedLink needs it to
+    /// know when "the linked camera" is unambiguous.
+    @Published var accountDeviceCount: Int = 0
     @AppStorage("accountEmail") var accountEmail: String = ""
     @AppStorage("demoMode") private var storedDemo: Bool = false
     /// Stored raw so the enum can gain cases without invalidating saved values.
@@ -899,6 +908,7 @@ final class AppState: ObservableObject {
         if !localStateOwner.isEmpty {
             Self.log.info("a different account signed in; clearing the previous account's local state")
             deviceLocalURL = ""
+            linkedDeviceID = ""
             deviceToken = ""
             UserDefaults.standard.removeObject(forKey: "alertPhone")
             UserDefaults.standard.removeObject(forKey: "smsOnLoud")

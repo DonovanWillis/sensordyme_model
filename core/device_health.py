@@ -22,6 +22,7 @@ worse than one that admits it doesn't know.
 
 from __future__ import annotations
 
+import functools
 import os
 import shutil
 import subprocess
@@ -29,7 +30,7 @@ import time
 from dataclasses import asdict, dataclass, field
 from typing import Optional
 
-from core import accel
+from core import accel, identity
 from core.thermal import SOFT_THROTTLE_C
 
 # States the app understands. Kept deliberately small so every surface can
@@ -246,6 +247,12 @@ def _network(wifi) -> Component:
     return Component(OK, f"connected to {ssid}", {"ssid": ssid})
 
 
+@functools.cache
+def _device_id() -> str:
+    """identity.device_id(), computed once: it reads /proc and hashes."""
+    return identity.device_id()
+
+
 def collect(
     *,
     bus=None,
@@ -359,6 +366,10 @@ def collect(
 
     report = {
         "reported_at": time.time(),
+        # Which camera this is: the same SD- id it advertises over Bonjour. The
+        # backend stores it so the app can show each device its OWN live feed
+        # rather than whichever camera the phone linked (ios FeedLink.swift).
+        "device_id": _device_id(),
         # The single field a consumer should trust for "is this thing watching?".
         # Everything else describes components; this describes the product.
         "monitoring_active": (

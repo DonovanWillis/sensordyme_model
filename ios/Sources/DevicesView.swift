@@ -179,6 +179,7 @@ struct DevicesView: View {
             let fetched = try await state.backend.devices()
             guard reloadGuard.isLatest(token) else { return }
             devices = fetched
+            state.accountDeviceCount = fetched.count
             errorMessage = nil
             refreshing.succeed()
         } catch let error as APIError where error.isAuthFailure {

@@ -403,6 +403,27 @@ check(BackendResolution.ResolutionSource.manual.rawValue == "manual", "loggable"
 check(BackendResolution.ResolutionSource.cached != .bonjour,
       "\"the cache answered\" and \"Bonjour just found it\" are the same URL and different facts")
 
+// MARK: - Where credentials may travel without encryption
+
+print("\ncleartext is for the local network only:")
+check(BackendResolution.cleartextPermitted("https://api.example.com"), "https anywhere")
+check(BackendResolution.cleartextPermitted("http://11.33.6.234:8787"),
+      "a LAN IP literal, even in public-range space (ResNet hands out 11/8)")
+check(BackendResolution.cleartextPermitted("http://192.168.1.50:8787"), "a private IP")
+check(BackendResolution.cleartextPermitted("http://[fe80::1%25en0]:8787"), "a link-local IPv6 literal")
+check(BackendResolution.cleartextPermitted("http://sensordyme-backend.local:8787"), "an mDNS name")
+check(BackendResolution.cleartextPermitted("http://localhost:8787"), "loopback")
+check(!BackendResolution.cleartextPermitted("http://raspberrypi:8899"),
+      "NOT a single-label name: a DNS search domain can resolve it to the internet")
+check(BackendResolution.cleartextPermitted("http://raspberrypi.local:8899"), "its .local name instead")
+check(!BackendResolution.cleartextPermitted("http://user@evil.com"), "NOT userinfo smuggling an internet host")
+check(!BackendResolution.cleartextPermitted("http://example.com."), "NOT a trailing-dot internet name")
+check(BackendResolution.cleartextPermitted("HTTP://11.33.6.234:8787"), "scheme case does not matter")
+check(!BackendResolution.cleartextPermitted("http://api.example.com"), "NOT an internet DNS name over http")
+check(!BackendResolution.cleartextPermitted("http://sensordyme.fly.dev:8787"), "NOT a deployed backend over http")
+check(!BackendResolution.cleartextPermitted("ftp://192.168.1.50"), "NOT another scheme")
+check(!BackendResolution.cleartextPermitted("not a url"), "NOT garbage")
+
 // MARK: - The health check confirms WHICH backend, not just that one answered
 
 print("\na cached name or address must lead back to the backend that was pinned:")

@@ -25,9 +25,13 @@ struct Device: Codable, Identifiable, Hashable {
     /// configuration ran meant someone who asked it to count people was told it
     /// was watching for driver distraction.
     let monitoring: CustomMonitoring?
+    /// The camera's own id (`SD-XXXXXXXX`, the same one it advertises over
+    /// Bonjour). Nil from firmware or a backend that predates it. See FeedLink.
+    var hardwareId: String? = nil
 
     enum CodingKeys: String, CodingKey {
         case id, name, online, health, monitoring
+        case hardwareId = "hardware_id"
         case activePreset = "active_preset"
         case desiredPreset = "desired_preset"
         case lastSeen = "last_seen"

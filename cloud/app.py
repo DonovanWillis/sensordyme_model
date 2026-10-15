@@ -434,6 +434,10 @@ def init_db() -> None:
             # and backend, as JSON (see _model_identity). NULL for history and
             # for firmware that predates it — never back-filled with a guess.
             "ALTER TABLE events ADD COLUMN model TEXT",
+            # The hardware's own id (SD-XXXXXXXX, the one it advertises over
+            # Bonjour), from its health report. The app's only way to know which
+            # camera on the LAN is which backend device. NULL until reported.
+            "ALTER TABLE devices ADD COLUMN hardware_id TEXT",
             # The proposal the user is LOOKING AT, which is not the same thing
             # as the proposal they asked to run. /v1/ai/configure is called by
             # AIConfigureView's `configure()` — the preview, before the person
@@ -1239,6 +1243,9 @@ def list_devices(uid: int = Depends(current_user)):
                 # device goes quiet: a stale report showing a healthy camera is
                 # worse than no report, because the app would render it as live.
                 "health": _health_payload(r, now),
+                # Kept even when health is withheld as stale: it identifies the
+                # camera, it does not claim it is healthy.
+                "hardware_id": r["hardware_id"],
             }
             for r in rows
         ]
@@ -2018,6 +2025,15 @@ def _model_identity(raw) -> Optional[dict]:
     return out if out["module"] or out["detector"] else None
 
 
+_HARDWARE_ID = re.compile(r"^SD-[0-9A-F]{8}$")
+
+
+def _hardware_id(health) -> Optional[str]:
+    """The device's SD- id from its health report, if well-formed (core/identity.py)."""
+    value = health.get("device_id") if isinstance(health, dict) else None
+    return value if isinstance(value, str) and _HARDWARE_ID.match(value) else None
+
+
 def _finite(value):
     """`value` with every non-finite float replaced by None.
 
@@ -2041,14 +2057,25 @@ def _finite(value):
 def ingest(body: IngestBody, background_tasks: BackgroundTasks, device: sqlite3.Row = Depends(current_device)):
     now = time.time()
     with db() as conn:
+        hardware_id = _hardware_id(body.health)
+        if hardware_id and device["owner_id"]:
+            # One camera, one row: a re-paired camera (a new device row for the
+            # same hardware) would otherwise leave its id on the old row too, and
+            # the app would show the live feed on the dead card as well.
+            conn.execute(
+                "UPDATE devices SET hardware_id = NULL WHERE owner_id = ? AND hardware_id = ? AND id != ?",
+                (device["owner_id"], hardware_id, device["id"]),
+            )
         conn.execute(
             "UPDATE devices SET last_seen = ?, active_preset = COALESCE(?, active_preset),"
-            " health = COALESCE(?, health), monitoring = COALESCE(?, monitoring) WHERE id = ?",
+            " health = COALESCE(?, health), monitoring = COALESCE(?, monitoring),"
+            " hardware_id = COALESCE(?, hardware_id) WHERE id = ?",
             (
                 now,
                 body.active_preset,
                 json.dumps(_finite(body.health)) if body.health is not None else None,
                 json.dumps(_finite(body.monitoring)) if body.monitoring is not None else None,
+                hardware_id,
                 device["id"],
             ),
         )

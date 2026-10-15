@@ -347,6 +347,33 @@ enum BackendResolution {
         return host == "local" || host.hasSuffix(".local") || host.hasSuffix(".local.")
     }
 
+    /// May this URL carry a password or a session token?
+    ///
+    /// HTTPS always. Plain HTTP only to a destination that exists on the local
+    /// network alone: an IP literal, a `.local` mDNS name, or loopback. Never to
+    /// a DNS name — that would send the account's credentials across the
+    /// internet in the clear. Not even a single-label name: with a DNS search
+    /// domain, `http://box` resolves as `box.<search-domain>`, which can be
+    /// anywhere.
+    ///
+    /// This is the rule ATS cannot express. NSAllowsLocalNetworking was measured
+    /// to block http://11.33.6.234, a real LAN address on ResNet-style networks
+    /// that hand out public-range space, so the Info.plist exemption stays broad
+    /// and this check is what actually holds the line.
+    static func cleartextPermitted(_ urlString: String) -> Bool {
+        guard let url = URL(string: urlString.trimmingCharacters(in: .whitespacesAndNewlines)),
+              let scheme = url.scheme?.lowercased(),
+              let host = url.host?.lowercased(), !host.isEmpty
+        else { return false }
+        if scheme == "https" { return true }
+        guard scheme == "http" else { return false }
+        return isLANScoped(host)
+    }
+
+    static func cleartextRefusal(host: String) -> String {
+        "Refusing to send your sign-in to \(host) without encryption. A server on the internet must use https://."
+    }
+
     static func isLoopbackName(_ host: String) -> Bool {
         let name = host.lowercased()
         return name == "localhost" || name.hasSuffix(".localhost") || name.hasPrefix("127.")

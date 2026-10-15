@@ -138,6 +138,9 @@ struct SettingsView: View {
                     ForEach(discovery.found) { device in
                         Button {
                             state.deviceLocalURL = device.url
+                            // The id too: the address alone left the stored id
+                            // naming a different camera than the one streaming.
+                            state.linkedDeviceID = device.id
                             discovery.stop()
                         } label: {
                             HStack {
@@ -425,6 +428,10 @@ struct ManualBackendView: View {
         }
         guard BackendResolution.isUsableFromPhone(candidate) else {
             message = "On a phone, localhost means the phone itself. Use your Mac's address on the network instead."
+            return
+        }
+        guard BackendResolution.cleartextPermitted(candidate) else {
+            message = BackendResolution.cleartextRefusal(host: BackendResolution.host(of: candidate) ?? "that server")
             return
         }
         checking = true

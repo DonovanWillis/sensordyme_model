@@ -22,8 +22,15 @@ targets:
         # deployed HTTPS URL and the app works from any network, with discovery
         # demoted to a fallback it can never override. See BackendResolution.swift.
         SDBackendBaseURL: $(SENSORDYME_API_BASE_URL)
+        # Plain HTTP must reach LAN IP literals, and ATS has no key for that:
+        # NSAllowsLocalNetworking covers .local and unqualified names only, and was
+        # MEASURED to block http://11.33.6.234 — this network's real addresses, which
+        # are not RFC 1918 (ResNet-style networks hand out public-range space). So the
+        # exemption stays, and the actual rule is enforced in the app where
+        # credentials leave it: BackendResolution.cleartextPermitted refuses plain
+        # HTTP to any internet DNS name (APIClient, Manual server address).
         NSAppTransportSecurity:
-          NSAllowsArbitraryLoads: true # dev builds talk to http://localhost / LAN IPs; tighten before App Store (P4, after the HTTPS backend is live)
+          NSAllowsArbitraryLoads: true
         # Local-network + Bonjour: the device dashboard (_sensordyme._tcp, published by
         # scripts/publish_mdns.py) and the cloud backend (_sensordyme-api._tcp, published
         # by cloud/mdns.py) — the latter is how sign-in works without anyone typing an

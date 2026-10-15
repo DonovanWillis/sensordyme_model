@@ -77,6 +77,27 @@ picture is served at `/api/health` → the app's Settings → Device health card
   "Find my device" (Discovery.swift) resolves it — no IP typing.
 - **Offline**: detection, local alerts, dashboard all keep working; cloud
   events queue in memory (bounded) until connectivity returns.
+- **Which camera is which**: each device reports its `SD-` id in its health
+  report; the backend keeps it as `devices.hardware_id`. The app shows a device
+  its live feed only when that id matches the camera the phone linked
+  (`ios/Sources/FeedLink.swift`); with an id unknown, only a one-device account
+  is unambiguous enough to stream.
+- **Cleartext**: plain HTTP is for the LAN only. ATS keeps
+  `NSAllowsArbitraryLoads` because `NSAllowsLocalNetworking` blocks IP literals in
+  public-range space (measured on a ResNet-style network), and the app enforces
+  the real rule itself: `BackendResolution.cleartextPermitted` refuses to send a
+  password or token over HTTP to any internet DNS name.
+
+### Known limitation: BLE provisioning is unauthenticated
+
+The Wi-Fi credential write is BLE "Just Works": anyone in radio range while the
+window is open (offline, or 5 minutes after boot) can point the device at their
+own network. Planned fix, which needs firmware + app + backend together and a
+test against real hardware: the backend gives a signed-in owner a
+provisioning proof derived from the device's `device_key` (which the device and
+backend already share); the app includes it, HMAC'd over a nonce read from the
+device-info characteristic, in the credential write; the device rejects writes
+without a valid proof. Unclaimed devices would need a printed setup code.
 
 ## AI acceleration (AI HAT+ / Hailo)
 

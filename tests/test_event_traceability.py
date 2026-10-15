@@ -155,3 +155,47 @@ def test_the_uplink_records_the_identity_at_queue_time():
     uplink.push_event(Event.now("eyes_down", 1.0, 0.9, "driver_attention"), "soft", model=identity)
     identity["detector"]["name"] = "something_else.hef"  # the runtime moves on
     assert uplink._queue[0]["model"]["detector"]["name"] == "damoyolo_tinynasL20_T.hef"
+
+
+def test_each_device_reports_and_returns_its_own_hardware_id(backend):
+    """The app shows a device its own live feed only if it can tell which camera
+    that device is (ios FeedLink.swift). The device reports its SD- id in health;
+    the backend keeps it — even once health goes stale — and returns it."""
+    from core import device_health, identity
+
+    app_module, client, auth, device_id = backend
+    report = device_health.collect()
+    assert identity.is_device_id(report["device_id"])
+    client.post("/v1/ingest", json={"events": [], "health": report}, headers={"X-Device-Key": "dk_trace"})
+    listed = client.get("/v1/devices", headers=auth).json()["devices"]
+    assert listed[0]["hardware_id"] == report["device_id"]
+
+    # A malformed id is not stored, and does not erase the good one.
+    client.post("/v1/ingest", json={"events": [], "health": {**report, "device_id": "x'; drop"}},
+                headers={"X-Device-Key": "dk_trace"})
+    # Health from firmware that predates the field leaves it alone too.
+    client.post("/v1/ingest", json={"events": [], "health": {"state": "ok"}}, headers={"X-Device-Key": "dk_trace"})
+    with app_module.db() as conn:
+        conn.execute("UPDATE devices SET last_seen = 0 WHERE id = ?", (device_id,))  # gone quiet: health withheld
+    listed = client.get("/v1/devices", headers=auth).json()["devices"]
+    assert listed[0]["health"] is None
+    assert listed[0]["hardware_id"] == report["device_id"], "the id identifies the camera even when health is stale"
+
+
+def test_a_re_paired_camera_belongs_to_one_device_row_only(backend):
+    """The same Pi claimed again (a new device row) must not leave its id on the
+    old row: the app would then show the live feed on the dead card too."""
+    import time as _time
+
+    app_module, client, auth, old_id = backend
+    with app_module.db() as conn:
+        conn.execute(
+            "INSERT INTO devices (name, claim_code, device_key, created_at) VALUES (?, ?, ?, ?)",
+            ("Re-paired", "RE-PA-IR", "dk_repaired", _time.time()),
+        )
+    new_id = client.post("/v1/devices/claim", json={"claim_code": "RE-PA-IR"}, headers=auth).json()["device_id"]
+    health = {"state": "ok", "device_id": "SD-3D248632"}
+    client.post("/v1/ingest", json={"events": [], "health": health}, headers={"X-Device-Key": "dk_trace"})
+    client.post("/v1/ingest", json={"events": [], "health": health}, headers={"X-Device-Key": "dk_repaired"})
+    ids = {d["id"]: d["hardware_id"] for d in client.get("/v1/devices", headers=auth).json()["devices"]}
+    assert ids == {old_id: None, new_id: "SD-3D248632"}
