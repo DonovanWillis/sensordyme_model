@@ -31,7 +31,7 @@ from __future__ import annotations
 import numpy as np
 import pytest
 
-from core.accel import COCO_NAMES, HailoYOLO, _ShimResult, _nms
+from core.accel import COCO_NAMES, HailoYOLO, _nms, _ShimResult
 
 
 # ----------------------------------------------------------------- NMS
@@ -148,7 +148,8 @@ def test_dfl_decode_places_the_box_where_the_arithmetic_says_it_should():
     """One scale, one object, hand-computed expected box."""
     grid, stride, bins, dist_bin = 20, 32, 17, 4
     row = col = 10
-    box, cls = _heads(grid, cls_id=0, cell=(row, col), distance_bin=dist_bin, score=0.9)
+    box, cls = _heads(grid, cls_id=0, cell=(row, col), distance_bin=dist_bin, score=0.9,
+                      bins=bins)
 
     model = _yolo(_raw_outputs=True,
                   _scales=[{"grid": grid, "stride": stride, "box": "b", "cls": "c"}])
@@ -175,7 +176,8 @@ def test_the_letterbox_is_undone_so_boxes_land_in_original_frame_pixels():
     """A detection must come back in the caller's coordinates, not the model's."""
     grid, stride, bins, dist_bin = 20, 32, 17, 2
     row = col = 10
-    box, cls = _heads(grid, cls_id=0, cell=(row, col), distance_bin=dist_bin, score=0.9)
+    box, cls = _heads(grid, cls_id=0, cell=(row, col), distance_bin=dist_bin, score=0.9,
+                      bins=bins)
 
     model = _yolo(_raw_outputs=True,
                   _scales=[{"grid": grid, "stride": stride, "box": "b", "cls": "c"}])

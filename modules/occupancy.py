@@ -45,6 +45,7 @@ against. See _pose_confirms_person.
 
 from __future__ import annotations
 
+import contextlib
 import time
 
 import cv2
@@ -58,7 +59,7 @@ from core.event_engine import CONFIRMED, RESOLVED, EventEngine, RuleSpec
 from core.events import Event
 from core.keypoints import from_detection_box
 from core.tracking import PersonTracker
-from core.zones import load_zones
+from core.zones import BoundaryCrossing, load_zones
 from modules.base import VisionModule, register_module
 
 _PERSON_CLASS = 0  # COCO
@@ -103,9 +104,22 @@ class OccupancyModule(VisionModule):
         self._last_person_boxes: list[tuple[int, int, int, int]] = []
         self._requested_class_ids: list[int] = [_PERSON_CLASS]
         self._extra_labels: set[str] = set()
+        # What the detector is asked for is three independent contributions,
+        # recombined by _refresh_requested_classes: people (always), the
+        # vehicle/animal classes the zone rules need (only while a zone exists),
+        # and whatever AI-configured rules asked for (set_requested_labels).
+        # set_requested_labels used to OVERWRITE the list with person + rule
+        # labels, which dropped the zone classes. After any AI-rule session on
+        # the Security preset (or a rules update to `[]`), vehicle_in_zone and
+        # animal_in_zone silently never fired again until a restart.
+        self._zone_class_ids: set[int] = set()
+        self._extra_class_ids: set[int] = set()
 
         # Optional security zones (feet-point membership; see core/zones.py).
-        self._zones = load_zones(config.get("zones", {}))
+        self._zones: list = []
+        self._watched_zones: list = []
+        self._boundary_watch: dict[str, BoundaryCrossing] = {}
+        self._label_to_zone_category: dict[str, str] = {}
         self._engine = EventEngine({})
         self._linger_s = float(config.get("linger_s", 30.0))
         self._zone_confirm_s = float(config.get("zone_confirm_s", 2.0))
@@ -120,38 +134,6 @@ class OccupancyModule(VisionModule):
             detection="crowd", severity="warning",
             persist_s=self._crowd_confirm_s, min_frames=3, resolve_after_s=5.0,
         ))
-        # The zones lingering/violation logic actually watches -- "safe" zones
-        # are someone else's business (modules/baby_monitoring.py).
-        self._watched_zones = [z for z in self._zones if z.kind in ("restricted", "boundary")]
-        for zone in self._watched_zones:
-            self._engine.add_rule(RuleSpec(
-                detection=f"zone_violation:{zone.name}", severity="critical",
-                persist_s=self._zone_confirm_s, min_frames=3, resolve_after_s=5.0,
-            ))
-
-        # Vehicle/animal-in-zone: same zone engine, a category word's real
-        # labels resolved from the live capability registry rather than a
-        # second hardcoded list (see module docstring). Only requested from
-        # the detector when there's a zone to test them against -- a bare
-        # person-counting config pays nothing for this.
-        self._label_to_zone_category: dict[str, str] = {}
-        if self._watched_zones:
-            reg = capability_registry()
-            for category in _ZONE_CATEGORIES:
-                for label in reg.expand(category):
-                    self._label_to_zone_category[label] = category
-            name_to_id = {name: class_id for class_id, name in COCO_NAMES.items()}
-            extra_ids = {
-                name_to_id[label] for label in self._label_to_zone_category if label in name_to_id
-            }
-            self._requested_class_ids = sorted({_PERSON_CLASS, *extra_ids})
-            for category in _ZONE_CATEGORIES:
-                for zone in self._watched_zones:
-                    self._engine.add_rule(RuleSpec(
-                        detection=f"{category}_in_zone:{zone.name}", severity="warning",
-                        persist_s=self._zone_confirm_s, min_frames=3, resolve_after_s=5.0,
-                    ))
-
         # Per-person lingering identity (see module docstring). Track ids are
         # only ever added; a retired id is pruned once every zone's lingering
         # rule for it has itself resolved or been dropped, so long-running
@@ -159,6 +141,15 @@ class OccupancyModule(VisionModule):
         self._tracker = PersonTracker()
         self._known_track_ids: set[int] = set()
         self._last_tracked_boxes: dict[int, tuple[int, int, int, int]] = {}
+
+        # Zone rules: restricted -> zone_violation / vehicle_in_zone /
+        # animal_in_zone / person_lingering; boundary -> a crossing watch
+        # (BoundaryCrossing, reported as zone_violation "crossed": a line
+        # alerts on CROSSING it, not on standing inside it -- it used to be
+        # treated as one more restricted zone). "safe" zones are someone
+        # else's business (modules/baby_monitoring.py). Installed here so
+        # set_zones() can replace them in place.
+        self._install_zones(load_zones(config.get("zones", {})))
 
         # Optional cross-model verification (off by default -- see
         # _pose_confirms_person). A brand-new track, the first time it's
@@ -171,6 +162,102 @@ class OccupancyModule(VisionModule):
         self._verify_new_tracks = bool(config.get("verify_new_tracks_with_pose", False))
         self._pose_verifier = None
         self._track_pose_confirmed: dict[int, bool] = {}
+
+    # ------------------------------------------------------------------ zones
+    def _install_zones(self, zones: list) -> None:
+        """Make `zones` this module's zones, replacing the previous set in place.
+
+        A restricted zone whose name, kind and polygon are unchanged keeps all
+        its rules and state. A removed or redrawn one has every rule under it
+        dropped from the engine, with tracks and cooldowns: zone_violation,
+        vehicle/animal_in_zone, and person_lingering for every known track.
+        Nothing stays latched. Counting, crowd and the person tracker are
+        untouched.
+        """
+        old_zones, new_zones = list(self._zones), list(zones)
+        old_watched = {z for z in old_zones if z.kind == "restricted"}
+        new_watched = {z for z in new_zones if z.kind == "restricted"}
+        for zone in old_watched - new_watched:
+            self._retire_zone_rule(f"zone_violation:{zone.name}")
+            for category in _ZONE_CATEGORIES:
+                self._retire_zone_rule(f"{category}_in_zone:{zone.name}")
+            for track_id in self._known_track_ids:
+                self._retire_zone_rule(f"person_lingering:{zone.name}:{track_id}")
+        for zone in new_watched - old_watched:
+            self._engine.add_rule(RuleSpec(
+                detection=f"zone_violation:{zone.name}", severity="critical",
+                persist_s=self._zone_confirm_s, min_frames=3, resolve_after_s=5.0,
+            ))
+            for category in _ZONE_CATEGORIES:
+                self._engine.add_rule(RuleSpec(
+                    detection=f"{category}_in_zone:{zone.name}", severity="warning",
+                    persist_s=self._zone_confirm_s, min_frames=3, resolve_after_s=5.0,
+                ))
+        self._boundary_watch = {
+            z.name: (
+                self._boundary_watch[z.name]
+                if z in old_zones and z.name in self._boundary_watch
+                else BoundaryCrossing(self._zone_confirm_s)
+            )
+            for z in new_zones if z.kind == "boundary"
+        }
+        self._zones = new_zones
+        self._watched_zones = [z for z in new_zones if z.kind == "restricted"]
+        if not self._watched_zones:
+            self._known_track_ids.clear()
+            self._last_tracked_boxes = {}
+
+        # Vehicle/animal-in-zone: same zone engine, a category word's real
+        # labels resolved from the live capability registry rather than a
+        # second hardcoded list (see module docstring). Only requested from
+        # the detector when there's a zone to test them against -- a bare
+        # person-counting config pays nothing for this.
+        self._label_to_zone_category = {}
+        self._zone_class_ids = set()
+        if self._watched_zones:
+            reg = capability_registry()
+            for category in _ZONE_CATEGORIES:
+                for label in reg.expand(category):
+                    self._label_to_zone_category[label] = category
+            name_to_id = {name: class_id for class_id, name in COCO_NAMES.items()}
+            self._zone_class_ids = {
+                name_to_id[label] for label in self._label_to_zone_category if label in name_to_id
+            }
+        self._refresh_requested_classes()
+
+    def _retire_zone_rule(self, detection: str) -> None:
+        """Withdraw a zone's rule. An alert confirmed under it is RESOLVED, not
+        silently dropped -- reported on the next frame by process() -- so a zone
+        redrawn in the app mid-violation does not leave the alert "active" in
+        the app and dashboard for good."""
+        transition = self._engine.retire_rule(detection)
+        if transition is not None:
+            self.__dict__.setdefault("_retired_zone_transitions", []).append(transition)
+
+    def _take_retired_zone_events(self) -> list[Event]:
+        """The resolutions queued by _retire_zone_rule, as events, once."""
+        transitions = self.__dict__.pop("_retired_zone_transitions", None) or []
+        events = []
+        for tr in transitions:
+            # "zone_violation:pool", "safe_zone_exit", "person_lingering:pool:7"
+            base, _, rest = tr.detection.partition(":")
+            zone = rest.split(":", 1)[0]
+            events.append(Event.now(
+                f"{base}_resolved", tr.duration_s, tr.confidence, self.name,
+                f"zone={zone}" if zone else "",
+            ))
+        return events
+
+    def _refresh_requested_classes(self) -> None:
+        # getattr: tolerant of an instance built without __init__ (tests do that
+        # to avoid loading a detector); absent means "nothing requested".
+        zone_ids = getattr(self, "_zone_class_ids", set())
+        extra_ids = getattr(self, "_extra_class_ids", set())
+        self._requested_class_ids = sorted({_PERSON_CLASS, *zone_ids, *extra_ids})
+
+    def set_zones(self, zones: list) -> None:
+        """Replace the configured zones with the app-drawn ones. See VisionModule.set_zones."""
+        self._install_zones(list(zones or []))
 
     def _ensure_pose_verifier(self) -> None:
         if self._pose_verifier is None:
@@ -218,6 +305,10 @@ class OccupancyModule(VisionModule):
 
     def process(self, frame: np.ndarray) -> list[Event]:
         """Detect people in `frame`; emit occupancy_change once a new count is confirmed."""
+        return self._take_retired_zone_events() + self._process_frame(frame)
+
+    def _process_frame(self, frame: np.ndarray) -> list[Event]:
+        """One frame's work; see process()."""
         events: list[Event] = []
         if self._model is None:
             self._model = get_yolo_model(self._weights)
@@ -283,8 +374,25 @@ class OccupancyModule(VisionModule):
             elif tr.state == RESOLVED:
                 events.append(Event.now("crowd_resolved", tr.duration_s, tr.confidence, self.name))
 
-        # Zone security events (only when a restricted/boundary zone is configured
-        # -- occupancy has nothing to do with a "safe" zone, see baby_monitoring.py).
+        # Boundary zones: a settled change of side, in either direction, by
+        # anyone's feet. Nobody in view is no observation, not a crossing.
+        if self._boundary_watch:
+            h, w = frame.shape[:2]
+            for zone in self._zones:
+                if zone.kind != "boundary":
+                    continue
+                inside = (
+                    any(zone.contains_box(b, w, h) for b in self._last_person_boxes)
+                    if self._last_person_boxes else None
+                )
+                crossing = self._boundary_watch[zone.name].update(inside, now)
+                if crossing is not None:
+                    events.append(Event.now(
+                        "zone_violation", 0.0, 0.85, self.name, f"zone={zone.name} crossed ({crossing})",
+                    ))
+
+        # Zone security events (only when a restricted zone is configured --
+        # occupancy has nothing to do with a "safe" zone, see baby_monitoring.py).
         if self._watched_zones:
             h, w = frame.shape[:2]
 
@@ -293,7 +401,9 @@ class OccupancyModule(VisionModule):
             # matching without paying for a pose model this module doesn't
             # otherwise run.
             skeletons = [from_detection_box(b) for b in self._last_person_boxes]
-            box_by_skeleton_id = {id(s): b for s, b in zip(skeletons, self._last_person_boxes)}
+            box_by_skeleton_id = {
+                id(s): b for s, b in zip(skeletons, self._last_person_boxes, strict=True)
+            }
             tracked = {t.track_id: t for t in self._tracker.update(skeletons, now)}
             newly_appeared_tracks = set(tracked) - self._known_track_ids
             self._known_track_ids |= set(tracked)
@@ -391,10 +501,8 @@ class OccupancyModule(VisionModule):
         _switch_preset hot-swap between, and both already call
         old_module.close(), but this override was missing."""
         if self._pose_verifier is not None:
-            try:
+            with contextlib.suppress(Exception):  # closing twice must be harmless
                 self._pose_verifier.close()
-            except Exception:  # noqa: BLE001 - closing twice must be harmless
-                pass
 
     def set_requested_labels(self, labels: set[str]) -> None:
         """Ask the detector for these classes too, on top of people.
@@ -404,9 +512,10 @@ class OccupancyModule(VisionModule):
         must not take the camera down.
         """
         name_to_id = {name: class_id for class_id, name in COCO_NAMES.items()}
-        extra = {name_to_id[label] for label in labels if label in name_to_id}
+        self._extra_class_ids = {name_to_id[label] for label in labels if label in name_to_id}
         self._extra_labels = {label for label in labels if label in name_to_id}
-        self._requested_class_ids = sorted({_PERSON_CLASS, *extra})
+        # Added to, never replacing, the zone rules' own vehicle/animal classes.
+        self._refresh_requested_classes()
 
     def get_detections(self) -> DetectionFrame:
         """This frame's detections, with boxes, so zone/count/relation rules can evaluate."""
@@ -418,7 +527,9 @@ class OccupancyModule(VisionModule):
                 Detection(label=label, confidence=conf, box=tuple(float(v) for v in box))
                 # zip truncates if a detector ever returns mismatched lists, which
                 # is the safe direction: a missing score must not fabricate a box.
-                for box, conf, label in zip(self._last_boxes, self._last_confidences, self._last_labels)
+                for box, conf, label in zip(
+                    self._last_boxes, self._last_confidences, self._last_labels, strict=False
+                )
             ),
         )
 
@@ -443,7 +554,7 @@ class OccupancyModule(VisionModule):
         # Per-person track id (only populated when zones are configured — see
         # process()), so "3 people entered" reads as Person 1/2/3 rather than
         # three identical, indistinguishable boxes.
-        for track_id, (x1, y1, x2, y2) in self._last_tracked_boxes.items():
+        for track_id, (x1, _y1, _x2, y2) in self._last_tracked_boxes.items():
             cv2.putText(frame, f"#{track_id}", (x1, min(h - 5, y2 + 18)),
                         cv2.FONT_HERSHEY_SIMPLEX, 0.55, (255, 255, 0), 2)
 

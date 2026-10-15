@@ -81,10 +81,10 @@ def test_the_new_key_lands_inside_its_own_section(tmp_path):
     path = write(tmp_path, DEVICE_CONFIG)
     migrate(path)
     lines = path.read_text().splitlines()
-    index = next(i for i, l in enumerate(lines) if "reconfigure_window_s" in l and not l.strip().startswith("#"))
+    index = next(i for i, line in enumerate(lines) if "reconfigure_window_s" in line and not line.strip().startswith("#"))
     assert lines[index].startswith("    ")
-    preceding = [l for l in lines[:index] if l.strip() and not l.strip().startswith("#")]
-    assert any(l.strip() == "provisioning:" for l in preceding)
+    preceding = [line for line in lines[:index] if line.strip() and not line.strip().startswith("#")]
+    assert any(line.strip() == "provisioning:" for line in preceding)
 
 
 def test_a_one_level_key_gets_its_comment_at_the_same_indent_as_the_key(tmp_path):
@@ -97,7 +97,7 @@ def test_a_one_level_key_gets_its_comment_at_the_same_indent_as_the_key(tmp_path
     path = write(tmp_path, DEVICE_CONFIG)
     migrate(path)
     lines = path.read_text().splitlines()
-    key_index = next(i for i, l in enumerate(lines) if l.strip().startswith("ca_cert_path:"))
+    key_index = next(i for i, line in enumerate(lines) if line.strip().startswith("ca_cert_path:"))
     comment_index = key_index - 1
     assert lines[comment_index].strip().startswith("#")
     key_indent = len(lines[key_index]) - len(lines[key_index].lstrip(" "))
@@ -165,8 +165,8 @@ def test_a_new_key_is_not_filed_under_the_next_section_s_comment(tmp_path):
     path.write_text(text)
     migrate(path)
     lines = path.read_text().splitlines()
-    key_line = next(i for i, l in enumerate(lines) if "reconfigure_window_s:" in l)
-    health_comment = next(i for i, l in enumerate(lines) if "Health monitoring" in l)
+    key_line = next(i for i, line in enumerate(lines) if "reconfigure_window_s:" in line)
+    health_comment = next(i for i, line in enumerate(lines) if "Health monitoring" in line)
     assert key_line < health_comment, "new key landed under the health section's comment"
 
 
@@ -220,6 +220,13 @@ def test_a_single_line_flow_sequence_is_handled_too(tmp_path):
     assert "alerts.loud_types+=unusual_stillness" in added
     result = path.read_text()
     assert "drowsiness" in result and "phone_use" in result and "unusual_stillness" in result
+    # Substrings were all this checked, and they were all there -- above the
+    # key, outside the list, in a file that no longer parsed. A device whose
+    # config does not parse does not boot.
+    parsed = __import__("yaml").safe_load(result)
+    assert parsed["alerts"]["loud_types"][:2] == ["drowsiness", "phone_use"]
+    assert "unusual_stillness" in parsed["alerts"]["loud_types"]
+    assert parsed["alerts"]["soft_types"] == ["fatigue_warning"]
 
 
 def test_list_migration_result_still_parses_as_yaml(tmp_path):

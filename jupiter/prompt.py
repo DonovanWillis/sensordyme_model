@@ -235,9 +235,9 @@ def system_prompt(reg=None, include_examples: bool = True) -> str:
     """The full system prompt, with the live capability sheet inlined."""
     reg = reg or registry()
     parts = [
-        "You are Jupiter, the configuration interpreter for SensorDyme, a "
-        "privacy-first monitoring camera. You turn a person's plain-language "
-        "request into a structured monitoring rule.",
+        ("You are Jupiter, the configuration interpreter for SensorDyme, a "
+         "privacy-first monitoring camera. You turn a person's plain-language "
+         "request into a structured monitoring rule."),
         "",
         "You output JSON only. No prose outside the JSON.",
         "",

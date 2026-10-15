@@ -37,7 +37,7 @@ from enum import Enum
 from typing import Optional
 
 
-class Support(str, Enum):
+class Support(str, Enum):  # noqa: UP042 - StrEnum would change str()/format() of members
     """How well the current system can serve a request.
 
     The gradations matter: a customer told "no" walks away, while a customer
@@ -373,7 +373,12 @@ def default_registry() -> CapabilityRegistry:
         Capability(
             id="temporal.persistence",
             kind="temporal",
-            summary="conditions confirmed over time rather than on one frame",
+            # `still` is evaluated, not assumed: core/rules.py's _StillnessWatcher
+            # compares the target's box with where it was a second earlier. It
+            # used to fall through to plain presence, so "still for 5 minutes"
+            # fired on someone who had been walking around the whole time.
+            summary="conditions confirmed over time rather than on one frame; 'still' means "
+                    "the detected subject's box has stopped moving",
             predicates=frozenset({"persists", "still", "lingering"}),
         ),
         Capability(
@@ -598,7 +603,7 @@ _REGISTRY: Optional[CapabilityRegistry] = None
 
 def registry() -> CapabilityRegistry:
     """Process-wide registry, built once."""
-    global _REGISTRY
+    global _REGISTRY  # noqa: PLW0603 - process-wide registry singleton
     if _REGISTRY is None:
         _REGISTRY = default_registry()
     return _REGISTRY
@@ -606,5 +611,5 @@ def registry() -> CapabilityRegistry:
 
 def set_registry(new_registry: CapabilityRegistry) -> None:
     """Replace the registry (tests, and devices with extra models installed)."""
-    global _REGISTRY
+    global _REGISTRY  # noqa: PLW0603 - process-wide registry singleton
     _REGISTRY = new_registry

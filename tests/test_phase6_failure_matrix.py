@@ -450,15 +450,20 @@ def test_app_drawn_zones_survive_the_swap_their_own_rules_trigger():
     )
 
 
-def test_leaving_custom_monitoring_restores_the_module_zones():
-    """The other direction: the app's polygons must not outlive the rules.
+def test_leaving_custom_monitoring_restores_the_zones_in_force():
+    """The other direction: dropping the custom rules re-points the rule engine
+    at the zones in force for the running module.
 
-    If they did, a drawn zone would silently shadow every later preset.
+    Those are the app's zones when it has sent any — they are the device's
+    zones, drawn in the app's editor for a crib or a keep-out area, and must
+    keep protecting the preset the owner returns to — otherwise the module's
+    own config.yaml zones. (tests/test_runtime_coordinator_fixes.py covers the
+    behaviour end to end.)
     """
     source = (REPO / "services" / "runtime.py").read_text()
     body = source[source.index("def _exit_custom_monitoring") :]
     body = body[: body.index("\n    def ", 1)]
-    assert "set_zones(self._zones_for_module" in body, (
-        "_exit_custom_monitoring must restore the module's own zones when it "
-        "drops the custom rules"
+    assert "set_zones(self._effective_zones(self.module_name))" in body, (
+        "_exit_custom_monitoring must reset the rule engine to the effective "
+        "zones when it drops the custom rules"
     )

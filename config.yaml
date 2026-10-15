@@ -212,6 +212,7 @@ logging:
   csv_path: data/events.csv
   telemetry_csv_path: data/telemetry.csv # raw per-frame signals (throttled) -- future model-training data
   telemetry_interval_s: 0.5 # minimum seconds between two telemetry rows
+  telemetry_max_mb: 25 # each telemetry CSV rotates to <name>.1.csv past this size (one old copy kept)
 
 alerts:
   sinks: [console, sound, gpio_buzzer] # gpio_buzzer drives the piezo on the Pi device; skipped with a notice on Mac
@@ -252,6 +253,9 @@ alerts:
                # push. unusual_stillness/person_absent have the identical gap. Baby Mode has no equivalent
                # of "the driver is in danger, interrupt them" signal in loud_types at all before this --
                # every one of its alert-worthy events, notification-wise, was unreachable by default.
+               infant_unidentified, # baby_monitoring: choking-hazard scoring is paused (no person in view is
+               # identifiably the baby). Now one of the preset's alert_types, and an alert type outside this list
+               # is tagged soft, which cloud/notify.py never pushes -- the operator would again not be told.
                person_lingering, vehicle_in_zone, animal_in_zone, crowd] # security_monitoring's own alert_types --
                # the SAME class of bug, found by generalizing the fix above into a regression test
                # (tests/test_config.py) that checks every preset, not just baby_monitoring's. (Security's
@@ -294,7 +298,16 @@ modules:
     # is detectable and not just head pose renamed. false = old head-pose-only behavior.
     eye_gaze_scale_deg: 40.0 # extreme iris deflection to the socket edge ~= this many
     # degrees of eye-in-head rotation (approximation, matches the value already
-    # validated on the mac_max profile's own gaze fusion)
+    # validated on the mac_max profile's own gaze fusion). The iris offset is measured
+    # from the eye CORNERS (not the eyelids), so blinking/squinting/closing does not
+    # move it; frames with a closed eye fall back to head pose only. Changing this or
+    # enable_gaze invalidates the stored calibration (the device recalibrates).
+    camera_hfov_deg: null # the lens's real horizontal field of view, for head-pose intrinsics.
+    # null = focal length equal to the image width (~53 deg HFOV), the historical
+    # assumption and still the default. Camera Module 3 Wide: 102; Camera Module 3
+    # (standard): 66. With the Wide lens and the face 20-30 deg off-axis, the default
+    # mis-reads a 35 deg turn as 29-38 deg depending on direction, and a 25 deg nod as
+    # up to 31. Changing it invalidates the stored calibration (the device recalibrates).
 
     # --- signal conditioning (glasses/glare robustness; see core/eye_signal.py) ---
     # Raw EAR and head-pose readings are noisy measurements, and glasses make
@@ -305,7 +318,14 @@ modules:
     signal_release_s: 0.4 # a condition must be FALSE this long before its timer resets or its
     # live alert clears -- bridges one-frame landmark dropouts without changing
     # how fast anything fires (detection latency is unchanged; see
-    # tests/test_driver_signal_conditioning.py)
+    # tests/test_driver_signal_conditioning.py). Also the glance counter's re-arm
+    # gap: a glance hovering around yaw_threshold_deg counts once, not per crossing.
+    # NOT used for eye closure -- see eye_closure_release_frames.
+    eye_closure_release_frames: 2 # the eye-closure (drowsiness) timer bridges at most this
+    # many consecutive "open" frames, and counts only CLOSED time toward drowsy_seconds.
+    # Unlike a head turn, an eye genuinely reopens between blinks: a 0.4 s grace bridged
+    # those reopenings, so a flurry of ordinary 0.25 s blinks read as one continuous
+    # 2 s closure and fired "drowsiness". 1-2 frames covers a landmark glitch at any fps.
     ear_baseline_window_s: 60.0 # session open-eye reference window: the effective closure
     # threshold follows the upper percentile of the last minute's EAR, so putting
     # glasses on (which shifts the whole EAR distribution) doesn't leave the
@@ -314,24 +334,38 @@ modules:
     ear_baseline_band_high: 1.4 # fraction of the calibrated baseline -- glasses shift a
     # baseline by tens of percent; genuinely closing eyes would need far more,
     # so pathology cannot drag the threshold down with it
-    iris_veto: true # when the eyelid EAR claims "closed" but the iris landmarks (already
-    # computed; FaceMesh runs with refine_landmarks=true) show a plainly visible
-    # iris, trust the iris: a visible iris and a closed eye cannot both be true.
-    # Only ever suppresses a false closure, never invents one.
+    iris_veto: true # when the eyelid EAR claims "closed" but the iris-normalised lid gap
+    # (iris landmarks, already computed; FaceMesh runs with refine_landmarks=true) says
+    # the eye is about as open as THIS face's eye usually is (>= ear_threshold_ratio
+    # + 0.15 of its own P90 over ear_baseline_window_s), trust the iris: the EAR was
+    # corrupted (glasses/glare on the eye corners). Relative, not a fixed number --
+    # both measures share the lid landmarks, so a fixed cutoff silently capped the
+    # personal threshold. Only ever suppresses a false closure, never invents one.
 
     # --- drowsiness (eye closure) ---
     ear_threshold_ratio: 0.75 # personal threshold = this * the calibrated open-eye baseline EAR
     ear_threshold_fallback: 0.20 # used only before calibration completes, or if calibration.json is unreadable
-    calibration_duration_s: 10.0 # seconds of startup sampling (look at the road) used to compute EAR + head-pose baselines
-    calibration_max_pose_spread_deg: 20 # if yaw/pitch samples during the window haven't settled within this many
-    # degrees of their own mean (still glancing around -- phone, mirror, getting seated), the window is extended
-    # rather than averaging a glance-at-the-phone into "neutral". Never SHORTENS calibration, only extends it.
+    calibration_duration_s: 10.0 # seconds of startup sampling (look at the road) used to compute EAR + head-pose baselines.
+    # The head-pose baseline is a ROTATION and every reading is the head's rotation relative to it, so a
+    # camera below/above the eye line or off to the side no longer turns a pure head turn into pitch.
+    # (Calibration file format 5: files from older builds are rejected and the device recalibrates once.)
+    calibration_max_pose_spread_deg: 20 # if the TRAILING calibration_duration_s of yaw/pitch samples hasn't settled
+    # within this many degrees of its own mean (still glancing around -- phone, mirror, getting seated), the window
+    # is extended rather than averaging a glance-at-the-phone into "neutral"; an early glance ages out of the
+    # trailing window instead of blocking calibration. Never SHORTENS calibration, only extends it.
     calibration_max_duration_s: 30 # hard ceiling on the extension above -- calibrates anyway past this point
     # (imperfectly calibrated is better than stuck uncalibrated forever)
     calibration_path: data/calibration.json # persisted baseline; delete or pass --recalibrate to redo it
     drowsy_seconds: 2.0 # continuous eye closure (EAR < threshold) required to fire "drowsiness" -- blinks are far shorter
     perclos_window_s: 60.0 # rolling window (seconds) for PERCLOS = % of time eyes were closed
     perclos_threshold: 0.15 # PERCLOS above this fires "fatigue_warning" even with no single long closure
+    perclos_closure_ratio: 0.4 # PERCLOS counts the eye closed when EAR < this * the open-eye reference --
+    # deeper than the drowsiness criterion (ear_threshold_ratio, ~25% closure), because the 0.15 cutoff
+    # comes from P80 research: the eyelid covering >= 80% of the pupil/open gap (Wierwille et al.,
+    # FHWA). MediaPipe's EAR never reaches 0 for a shut eye (the lid landmarks stay a few px apart:
+    # closed reads ~0.15-0.3 x open), so 80% of the MEASURABLE range is closed + 0.2*(open - closed)
+    # ~= 0.3-0.45 x open; 0.4 sits in that band. With 0.75, squints and downward glances (both
+    # lower EAR ~25%) were charged as closure against a threshold that never meant them.
 
     # --- distraction (head pose, corrected for camera mounting angle -- see calibration above) ---
     yaw_threshold_deg: 35 # |calibrated yaw| beyond this = looking away from the road (sideways)
@@ -496,7 +530,9 @@ modules:
     erratic_hands_seconds: 1.0 # continuous erratic state required before it confirms
 
     # --- risk fusion: reasons across signals together (see modules/driver_attention.py::RiskFusion) ---
-    risk_ema_alpha: 0.3 # smoothing for the composite score; higher = reacts faster but noisier
+    risk_ema_alpha: 0.3 # smoothing for the composite score; higher = reacts faster but noisier.
+    # Weight per 1/30 s (one frame at the device's measured 30 fps), applied by elapsed time, so the
+    # score reacts in the same wall-clock time at any frame rate
     risk_elevated_threshold: 0.4 # composite score above this fires the soft "elevated_risk" event
     risk_high_threshold: 0.75 # composite score above this, sustained, fires the loud "high_risk" event
     risk_confirm_seconds: 1.0 # composite score must stay above risk_high_threshold this long to fire "high_risk"
@@ -562,7 +598,8 @@ modules:
     # weights are the .hef. It still selects the real checkpoint on a dev Mac.
     # Optional security zones (normalized 0..1 coords; see core/zones.py).
     # A person's feet inside a `restricted` zone -> zone_violation (sustained);
-    # staying past linger_s -> person_lingering. Example:
+    # staying past linger_s -> person_lingering. A `boundary` zone (the app's
+    # "Line") alerts on a crossing, reported as zone_violation "crossed". Example:
     #   zones:
     #     front_door: { polygon: [[0.6,0.2],[0.95,0.2],[0.95,0.9],[0.6,0.9]], kind: restricted }
     zones: {}
@@ -633,6 +670,9 @@ modules:
     zone_confirm_s: 2.0
     # Safe zone = where the child should stay (crib/play area): leaving it alerts.
     # Restricted zones = user-drawn danger areas (stairs/pool/stove): entering alerts.
+    # Boundary zones (the app's "Line") = crossing alerts, as zone_violation "crossed".
+    # Zones drawn in the app replace these for every mode once the app sends any
+    # (services/runtime.py), and are remembered across restarts.
     #   zones:
     #     crib:   { polygon: [[0.2,0.2],[0.8,0.2],[0.8,0.9],[0.2,0.9]], kind: safe }
     #     stairs: { polygon: [[0.0,0.5],[0.15,0.5],[0.15,1.0],[0.0,1.0]], kind: restricted }
@@ -729,7 +769,9 @@ modules:
     flailing_cooldown_s: 8.0 # re-confirmation suppression after flailing resolves --
     # short on purpose: repeated episodes (calm, flail again) should each be reported
     # flail_min_peak_speed: 1.6 # torso-lengths/s, peak wrist speed -- uncomment to override
-    # flail_min_peak_accel: 6.0 # torso-lengths/s^2, peak wrist acceleration
+    # flail_min_peak_accel: 40.0 # torso-lengths/s^2, peak wrist acceleration from VELOCITY
+    #   VECTORS (a direction reversal counts); 6.0 was the old speed-difference scale and
+    #   would pass any reversal at all -- see core/activity.py FLAIL_MIN_PEAK_ACCEL
     # flail_min_reversals: 4 # direction reversals within the window
     # flail_min_reversal_amplitude: 0.10 # torso-lengths of travel per reversal leg
 
@@ -797,7 +839,9 @@ modules:
     # fake. Cooldowns remain appropriate for chattier detections (zone_violation etc).
     # Optional elderly-mode zones -- same shape as occupancy's/baby's, tested
     # against the ankle midpoint instead of a box (see core/zones.py).
-    #   restricted/boundary: feet inside -> zone_violation (sustained)
+    #   restricted: feet inside -> zone_violation (sustained)
+    #   boundary (the app's "Line"): crossing it either way -> zone_violation,
+    #     detail "zone=X crossed (entered|left)"; standing on one side never alerts
     #   safe (e.g. a "bed" zone): feet outside ALL safe zones -> safe_zone_exit
     #     -- bed monitoring: "getting out of bed", the same safe_zone_exit
     #     baby_monitoring.py uses for a crib

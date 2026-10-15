@@ -157,6 +157,11 @@ struct DeviceDetailView: View {
         // earlier than where the retry logic was looking.
         .onChange(of: notifier.pendingEventID, initial: true) { _, id in
             guard let id else { return }
+            // Only this device's alerts. With device X open, a tap on an alert
+            // for device Y used to be consumed here: X searched its own events,
+            // failed, showed "Couldn't open that alert" and cleared the id —
+            // racing the screen DevicesView was pushing for Y.
+            if let target = notifier.pendingDeviceID, target != device.id { return }
             if let match = events.first(where: { $0.eventID == id }) {
                 selectedEvent = match
                 notifier.pendingEventID = nil

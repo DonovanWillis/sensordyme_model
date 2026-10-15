@@ -83,7 +83,12 @@ presets:
     title: Baby Monitoring
     description: Presence, safe/danger zones, unusual-stillness, and frantic-movement alerts with staged confirmation.
     module: baby_monitoring
-    alert_types: [zone_violation, safe_zone_exit, unusual_stillness, person_absent, flailing, choking_hazard]
+    # infant_unidentified: choking-hazard scoring is paused because no person in
+    # view is identifiably the baby. It used to be log-only, absent here, so the
+    # "operator is told scoring is paused before it can resume" guarantee
+    # (config.yaml, infant_reacquire_s) reached only the local CSV.
+    alert_types: [zone_violation, safe_zone_exit, unusual_stillness, person_absent, flailing, choking_hazard,
+                  infant_unidentified]
     variants:
       standard: { title: Standard }
       nap_time:

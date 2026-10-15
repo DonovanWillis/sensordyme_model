@@ -314,6 +314,16 @@ class DriverAttentionSkinnemoenModule(VisionModule):
     self._drowsy_prev = self._drowsy
     return events
 
+  def close(self) -> None:
+    """Release the FaceMesh graph. Safe to call twice; the runtime calls it on
+    a module swap and at shutdown."""
+    face_mesh, self._face_mesh = getattr(self, "_face_mesh", None), None
+    if face_mesh is not None:
+      try:
+        face_mesh.close()
+      except Exception:  # noqa: BLE001, S110 - releasing a graph must never raise into shutdown
+        pass
+
   def get_telemetry_snapshot(self) -> Optional[dict]:
     return {
         "ear": self._last_ear,

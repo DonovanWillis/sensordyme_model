@@ -65,6 +65,8 @@ final class SetupFlow: ObservableObject {
         searchClock?.cancel()
         searchClock = nil
         ble.stop()
+        // Its path monitor would otherwise outlive the setup sheet.
+        link.stop()
     }
 
     func connect(to device: DiscoveredDevice) {
@@ -90,6 +92,9 @@ final class SetupFlow: ObservableObject {
     // MARK: Bridging the two radios
 
     private func observeBLE() {
+        // Once: start() can run again, and every extra sink re-ran the
+        // absorption below for each change.
+        guard observers.isEmpty else { return }
         // Mirror the Bluetooth state machine into setup phases, rather than
         // duplicating it. The one thing added here is what happens *after*
         // success, which Bluetooth has no opinion about.
@@ -171,6 +176,11 @@ final class SetupFlow: ObservableObject {
 
     private func beginRediscovery() {
         guard rediscoverTask == nil else { return }
+        // Which device was just provisioned, read off Bluetooth before the link
+        // is dropped. Without it this went looking for whatever camera was
+        // linked BEFORE (setting up a second camera "verified" the first one,
+        // at the first one's address) or adopted the first camera to answer.
+        let provisionedID = ble.deviceID
         // Bluetooth has done its job; holding the link open keeps the device's
         // radio busy and stops it settling on the network it just joined.
         ble.stop()
@@ -183,7 +193,9 @@ final class SetupFlow: ObservableObject {
                 if elapsed >= rediscoverBudget { break }
                 phase = .rediscovering(ssid: targetSSID, elapsed: elapsed)
 
-                await link.resolve(force: true)
+                // Firmware that reports no id falls back to the general rule
+                // (the linked camera, else one this account owns, else a lone one).
+                await link.resolve(force: true, expecting: provisionedID)
                 if case let .connected(url) = link.state {
                     phase = .ready(ssid: targetSSID, url: url)
                     rediscoverTask = nil

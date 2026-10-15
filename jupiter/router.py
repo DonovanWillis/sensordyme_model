@@ -88,11 +88,19 @@ def _load_yaml(path: Optional[Path]) -> dict:
         return {}
     try:
         with path.open() as f:
-            return yaml.safe_load(f) or {}
-    except (OSError, yaml.YAMLError):
+            data = yaml.safe_load(f)
+    except (OSError, UnicodeDecodeError, yaml.YAMLError):
         # A broken routing file must not take Configure-with-AI down; fall
         # back to the same built-in defaults a missing file would use.
         return {}
+    # Valid YAML of the wrong shape (a top-level list) is just as broken.
+    return data if isinstance(data, dict) else {}
+
+
+def _mapping(value) -> dict:
+    """`value` if it is a mapping, else {} — e.g. `roles: {configure: "qwen"}`
+    or `cloud_fallback: true`, which parse fine and are not blocks."""
+    return value if isinstance(value, dict) else {}
 
 
 def role_config(role: str, *, path: Optional[Path] = None) -> tuple[str, dict]:
@@ -105,8 +113,8 @@ def role_config(role: str, *, path: Optional[Path] = None) -> tuple[str, dict]:
     if role not in _ROLE_DEFAULTS:
         raise ValueError(f"unknown Jupiter role {role!r} (known: {sorted(_ROLE_DEFAULTS)})")
 
-    yaml_roles = (_load_yaml(path).get("roles") or {})
-    yaml_role = yaml_roles.get(role) or {}
+    yaml_roles = _mapping(_load_yaml(path).get("roles"))
+    yaml_role = _mapping(yaml_roles.get(role))
     default = _ROLE_DEFAULTS[role]
     env_prefix = _ROLE_ENV_PREFIX[role]
 
@@ -117,11 +125,15 @@ def role_config(role: str, *, path: Optional[Path] = None) -> tuple[str, dict]:
         or default["provider"]
     ).lower()
 
+    # The built-in model belongs to the built-in provider. Pairing it with any
+    # other one built e.g. AnthropicProvider(model="qwen2.5:7b-instruct") for a
+    # deployment that only set SENSORDYME_AI_PROVIDER=anthropic, so every call
+    # failed. Left empty, each provider applies its own default model.
     model = (
         os.environ.get(f"{env_prefix}_MODEL", "").strip()
         or str(yaml_role.get("model", "")).strip()
         or os.environ.get("JUPITER_MODEL", "").strip()
-        or default["model"]
+        or (default["model"] if provider_name == default["provider"] else "")
     )
 
     base_url = (
@@ -152,7 +164,7 @@ def cloud_fallback_config(*, path: Optional[Path] = None) -> dict:
     `cloud_fallback.enabled` is an alternative way to turn it on, not a second
     independent switch — either one enables it.
     """
-    yaml_cloud = _load_yaml(path).get("cloud_fallback") or {}
+    yaml_cloud = _mapping(_load_yaml(path).get("cloud_fallback"))
     enabled = bool(yaml_cloud.get("enabled", False)) or os.environ.get(
         "SENSORDYME_ALLOW_EXTERNAL_AI", ""
     ).strip().lower() in ("1", "true", "yes")

@@ -15,10 +15,18 @@ Results go to stdout (journalctl) and data/preflight.json so the dashboard and
 app can show what boot looked like. Philosophy: only an unusable *config* stops
 boot — a missing camera or HAT boots into degraded mode where health monitoring,
 provisioning, and the app all still work and can say what's wrong.
+
+The unit runs this as `ExecStartPre=-…`, so systemd IGNORES the exit status: a
+failing ExecStartPre under Restart=always was a restart every few seconds, and
+StartLimitAction=reboot turned that into a reboot loop. Preflight reports;
+main.py is what refuses a bad config, exiting 78, which the unit's
+RestartPreventExitStatus=78 stops systemd from retrying. The exit status here
+still means something to a person running it by hand.
 """
 
 from __future__ import annotations
 
+import contextlib
 import json
 import shutil
 import sys
@@ -26,6 +34,10 @@ import time
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))  # repo root
+
+#: Longest the camera check's verifying read may block. A driver hang used to
+#: hold ExecStartPre -- and so the whole service start -- until TimeoutStartSec.
+_CAMERA_READ_TIMEOUT_S = 10.0
 
 
 def main() -> int:
@@ -52,18 +64,27 @@ def main() -> int:
         fatal = True
 
     # 2. camera -----------------------------------------------------------------
+    camera = None
     try:
         from core.camera import Camera
 
         camera = Camera(config.get("camera", {}))
-        frame = camera.read()  # prove frames flow, not just that open succeeded
-        camera.release()
+        # Prove frames flow, not just that open succeeded -- bounded, so a hung
+        # driver is reported instead of stalling the boot.
+        frame = camera.read(timeout_s=_CAMERA_READ_TIMEOUT_S)
         results["checks"]["camera"] = {
             "ok": True,
             "detail": f"frame {frame.shape[1]}x{frame.shape[0]}",
         }
     except Exception as exc:  # noqa: BLE001
         results["checks"]["camera"] = {"ok": False, "detail": str(exc)}
+    finally:
+        # Released on the failure path too: the service opens the same device
+        # moments after this process exits.
+        if camera is not None:
+            # A teardown error must not mask the result already recorded.
+            with contextlib.suppress(Exception):
+                camera.release()
 
     # 3. accelerator ------------------------------------------------------------
     from core import accel
@@ -138,8 +159,14 @@ def main() -> int:
 
     results["fatal"] = fatal
     out = Path("data/preflight.json")
-    out.parent.mkdir(parents=True, exist_ok=True)
-    out.write_text(json.dumps(results, indent=2))
+    try:
+        out.parent.mkdir(parents=True, exist_ok=True)
+        out.write_text(json.dumps(results, indent=2))
+    except OSError as exc:
+        # A full or read-only data/ (a worn SD card) is a thing to REPORT, not
+        # a reason to fail: crashing here made the disk check -- documented as
+        # non-fatal -- fatal in exactly the case it exists for.
+        print(f"preflight FAIL results: could not write {out} ({exc}); continuing")
 
     for name, check in results["checks"].items():
         status = "OK " if check.get("ok") else "FAIL"

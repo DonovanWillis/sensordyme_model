@@ -7,7 +7,7 @@ import Foundation
 /// One monitoring rule: watch `target` for `predicate`, optionally in relation
 /// to `secondary`. Mutable so the review screen can edit before activation —
 /// the user approves a rule, not a black box.
-struct AIRule: Codable, Equatable, Identifiable {
+struct AIRule: Codable, Equatable, Identifiable, Sendable {
     var target: String        // "person", "dog", "lying_down"
     var predicate: String     // present | absent | in_zone | near | holding
     var secondary: String     // second object for relational rules, or ""
@@ -24,24 +24,138 @@ struct AIRule: Codable, Equatable, Identifiable {
     /// "with", not proof of interaction). Carried on the rule so the caveat
     /// survives to the review screen rather than living only in the reply.
     var caveat: String?
+    /// Every other key the backend sent with this rule (a timezone, anything a
+    /// newer schema adds), carried back unchanged when the edited rule is sent
+    /// for activation — so the app cannot drop what it does not know about.
+    var extra: [String: JSONValue] = [:]
 
     var id: String { "\(predicate):\(target):\(secondary)" }
 
-    /// The rule in the user's terms rather than the schema's.
+    /// The rule in the user's terms rather than the schema's. See RuleWording.
     var headline: String {
-        let verb: String
-        switch predicate {
-        case "absent": verb = "is gone"
-        case "in_zone": verb = "is in \(zone.isEmpty ? "the area" : zone)"
-        case "near", "holding": verb = "is with \(secondary)"
-        default: verb = min_count > 1 ? "appears (\(min_count)+)" : "appears"
+        RuleWording.headline(target: target, predicate: predicate, secondary: secondary,
+                             zone: zone, minCount: min_count)
+    }
+
+    /// The rule as a JSON object, for a request body.
+    func jsonObject() throws -> Any {
+        try JSONSerialization.jsonObject(with: JSONEncoder().encode(self))
+    }
+
+    /// The rule as it is sent for activation: stamped with the phone's IANA
+    /// time zone, which the device evaluates `schedule` ("23:00-06:00") in. The
+    /// Pi's own clock zone is whatever the image shipped with, so "11pm" meant
+    /// 11pm somewhere else. An older backend ignores the key.
+    func forActivation(timeZone: TimeZone = .current) -> AIRule {
+        var rule = self
+        rule.extra["timezone"] = .string(timeZone.identifier)
+        return rule
+    }
+}
+
+// In an extension so the memberwise initialiser MockAPI uses survives.
+extension AIRule {
+    private struct Key: CodingKey {
+        let stringValue: String
+        init(_ name: String) { stringValue = name }
+        init?(stringValue: String) { self.stringValue = stringValue }
+        var intValue: Int? { nil }
+        init?(intValue: Int) { nil }
+    }
+
+    private static let knownKeys: Set<String> = [
+        "target", "predicate", "secondary", "description", "zone", "persist_s", "min_count",
+        "confidence", "severity", "cooldown_s", "schedule", "notify", "caveat",
+    ]
+
+    init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: Key.self)
+        func text(_ name: String, _ fallback: String = "") throws -> String {
+            try c.decodeIfPresent(String.self, forKey: Key(name)) ?? fallback
         }
-        return "\(target.capitalized) \(verb)"
+        func number(_ name: String, _ fallback: Double) throws -> Double {
+            try c.decodeIfPresent(Double.self, forKey: Key(name)) ?? fallback
+        }
+        target = try c.decode(String.self, forKey: Key("target"))
+        predicate = try text("predicate", "present")
+        secondary = try text("secondary")
+        description = try text("description")
+        zone = try text("zone")
+        persist_s = try number("persist_s", 3)
+        // An integer field a Python backend may still render as 2.0.
+        if let count = try? c.decodeIfPresent(Int.self, forKey: Key("min_count")) {
+            min_count = count
+        } else {
+            min_count = Int(try number("min_count", 1))
+        }
+        confidence = try number("confidence", 0.6)
+        severity = try text("severity", "warning")
+        cooldown_s = try number("cooldown_s", 60)
+        schedule = try text("schedule")
+        notify = try text("notify", "push")
+        caveat = try c.decodeIfPresent(String.self, forKey: Key("caveat"))
+        var others: [String: JSONValue] = [:]
+        for key in c.allKeys where !Self.knownKeys.contains(key.stringValue) {
+            others[key.stringValue] = try c.decode(JSONValue.self, forKey: key)
+        }
+        extra = others
+    }
+
+    func encode(to encoder: Encoder) throws {
+        var c = encoder.container(keyedBy: Key.self)
+        for (name, value) in extra where !Self.knownKeys.contains(name) {
+            try c.encode(value, forKey: Key(name))
+        }
+        try c.encode(target, forKey: Key("target"))
+        try c.encode(predicate, forKey: Key("predicate"))
+        try c.encode(secondary, forKey: Key("secondary"))
+        try c.encode(description, forKey: Key("description"))
+        try c.encode(zone, forKey: Key("zone"))
+        try c.encode(persist_s, forKey: Key("persist_s"))
+        try c.encode(min_count, forKey: Key("min_count"))
+        try c.encode(confidence, forKey: Key("confidence"))
+        try c.encode(severity, forKey: Key("severity"))
+        try c.encode(cooldown_s, forKey: Key("cooldown_s"))
+        try c.encode(schedule, forKey: Key("schedule"))
+        try c.encode(notify, forKey: Key("notify"))
+        try c.encodeIfPresent(caveat, forKey: Key("caveat"))
+    }
+}
+
+/// Any JSON value, so a rule's unknown keys can be carried through untouched.
+enum JSONValue: Codable, Equatable, Sendable {
+    case string(String)
+    case number(Double)
+    case bool(Bool)
+    case array([JSONValue])
+    case object([String: JSONValue])
+    case null
+
+    init(from decoder: Decoder) throws {
+        let c = try decoder.singleValueContainer()
+        if c.decodeNil() { self = .null }
+        else if let value = try? c.decode(Bool.self) { self = .bool(value) }
+        else if let value = try? c.decode(Double.self) { self = .number(value) }
+        else if let value = try? c.decode(String.self) { self = .string(value) }
+        else if let value = try? c.decode([JSONValue].self) { self = .array(value) }
+        else { self = .object(try c.decode([String: JSONValue].self)) }
+    }
+
+    func encode(to encoder: Encoder) throws {
+        var c = encoder.singleValueContainer()
+        switch self {
+        case .string(let value): try c.encode(value)
+        case .number(let value): try c.encode(value)
+        case .bool(let value): try c.encode(value)
+        case .array(let value): try c.encode(value)
+        case .object(let value): try c.encode(value)
+        case .null: try c.encodeNil()
+        }
     }
 }
 
 /// A part of the request the device honestly cannot do, with why and what it'd take.
-struct AIUnsupported: Codable, Equatable, Identifiable {
+struct AIUnsupported: Codable, Equatable, Identifiable, Sendable {
     let request: String
     let reason: String
     let requires: String
@@ -72,7 +186,7 @@ struct AIUnsupported: Codable, Equatable, Identifiable {
 /// how cleanly its response parsed and how many of its fields arrived
 /// well-formed. A score below 1.0 always comes with `basis` explaining why —
 /// there is no bare number with nothing behind it.
-struct AIInterpretationConfidence: Codable, Equatable {
+struct AIInterpretationConfidence: Codable, Equatable, Sendable {
     let score: Double
     let basis: [String]
 
@@ -89,19 +203,19 @@ struct AIInterpretationConfidence: Codable, Equatable {
 /// how sure it was, how long it took. Optional because the demo backend and
 /// older server versions don't send it; nothing here is load-bearing for
 /// activating a rule.
-struct AIJupiterMeta: Codable, Equatable {
+struct AIJupiterMeta: Codable, Equatable, Sendable {
     let provider: String?
     let model: String?
     let interpretation_confidence: AIInterpretationConfidence?
 }
 
-struct AIProposal: Codable, Equatable {
+struct AIProposal: Codable, Equatable, Sendable {
     let preset: String        // "" for a custom configuration belonging to no preset
     let variant: String
     let explanation: String
     var rules: [AIRule]
     let settings: [String: String]
-    let unsupported: [AIUnsupported]
+    var unsupported: [AIUnsupported]
     /// Where the proposal came from, so the UI never implies a model was
     /// consulted when it was not. The values the backend actually emits are
     /// `"jupiter"` (the local model interpreted the request), `"fallback"`
@@ -115,12 +229,49 @@ struct AIProposal: Codable, Equatable {
     let source: String
     var mode: String?         // "custom" | "preset"
     var jupiter: AIJupiterMeta? = nil
+    /// Which stored draft this proposal is (POST /v1/ai/configure). Sent back
+    /// on activation so the backend can refuse — 409 — a draft that has been
+    /// replaced since this one was reviewed. Nil from an older backend.
+    var draft_version: String? = nil
 
     /// A custom configuration is the normal outcome, not a failure to match.
     var isCustom: Bool { preset.isEmpty }
 
-    /// Nothing was understood well enough to act on.
-    var isEmpty: Bool { rules.isEmpty }
+    /// Nothing was understood well enough to act on. A keyword-fallback
+    /// proposal carries a mode and no rules, and that is something to activate.
+    var isEmpty: Bool { rules.isEmpty && preset.isEmpty }
+}
+
+/// What `POST /v1/devices/{id}/preset` confirmed about an activation.
+///
+/// The backend answers `{ok, desired_preset, rules_active, rules_version,
+/// unsupported}`: how many of the sent rules will actually run, and every rule
+/// it could not run, with why. A rule never runs beside a NAMED monitoring mode —
+/// for a preset proposal the rules come back in `unsupported` with
+/// `rules_active: 0` while the mode switch itself still happens. An older backend
+/// omits `rules_active`: no confirmation, and the app then claims no more than
+/// it always did.
+struct ActivationResult: Decodable, Equatable, Sendable {
+    /// How many of the sent rules will run; nil when the backend did not say.
+    var rulesActive: Int?
+    /// Fingerprint of the running rule set ("" when none).
+    var rulesVersion: String?
+    /// Rules the backend could not run, with why.
+    var unsupported: [AIUnsupported]?
+
+    var confirmsRules: Bool { rulesActive != nil }
+
+    init(rulesActive: Int? = nil, rulesVersion: String? = nil, unsupported: [AIUnsupported]? = nil) {
+        self.rulesActive = rulesActive
+        self.rulesVersion = rulesVersion
+        self.unsupported = unsupported
+    }
+
+    enum CodingKeys: String, CodingKey {
+        case rulesActive = "rules_active"
+        case rulesVersion = "rules_version"
+        case unsupported
+    }
 }
 
 protocol BackendAPI {
@@ -137,6 +288,10 @@ protocol BackendAPI {
     func setPreset(deviceID: Int, preset: String) async throws
     func setNtfyTopic(_ topic: String) async throws
     func aiConfigure(deviceID: Int, prompt: String) async throws -> AIProposal
+    /// Activate a reviewed proposal: its preset, and the rules AS EDITED.
+    /// Throws an `APIError` with status 409 when the stored draft has changed
+    /// since this proposal was fetched.
+    func activate(deviceID: Int, proposal: AIProposal) async throws -> ActivationResult
     func setPhone(_ phone: String, smsOnLoud: Bool) async throws
     func renameDevice(deviceID: Int, name: String) async throws
     func zones(deviceID: Int) async throws -> [MonitorZone]
@@ -204,6 +359,19 @@ extension APIClient: BackendAPI {
 
     func aiConfigure(deviceID: Int, prompt: String) async throws -> AIProposal {
         try await postJSON("v1/ai/configure", body: ["device_id": deviceID, "prompt": prompt])
+    }
+
+    func activate(deviceID: Int, proposal: AIProposal) async throws -> ActivationResult {
+        // The edited rules, not just the preset. Sending only the preset is
+        // what made every control on the review screen decorative: the backend
+        // promoted the draft stored at preview time, unedited, and for a named
+        // preset promoted nothing at all — while the app said "Active".
+        var body: [String: Any] = ["preset": proposal.preset]
+        if !proposal.rules.isEmpty {
+            body["rules"] = try proposal.rules.map { try $0.forActivation().jsonObject() }
+            if let version = proposal.draft_version { body["draft_version"] = version }
+        }
+        return try await postJSON("v1/devices/\(deviceID)/preset", body: body)
     }
 
     func zones(deviceID: Int) async throws -> [MonitorZone] {
@@ -428,6 +596,24 @@ final class MockAPI: BackendAPI {
     func setPreset(deviceID: Int, preset: String) async throws {
         desiredPreset = preset
         switchRequestedAt = Date()
+    }
+
+    /// Mirrors the real backend: a custom proposal's rules all run (the demo has
+    /// no capability layer to refuse any), and a named mode switches while its
+    /// rules come back unsupported, because rules never run beside a mode.
+    func activate(deviceID: Int, proposal: AIProposal) async throws -> ActivationResult {
+        guard !proposal.preset.isEmpty else {
+            return ActivationResult(rulesActive: proposal.rules.count, rulesVersion: "demo", unsupported: [])
+        }
+        try await setPreset(deviceID: deviceID, preset: proposal.preset)
+        let moved = proposal.rules.map { rule in
+            AIUnsupported(
+                request: rule.description,
+                reason: "a rule can't run alongside a monitoring mode",
+                requires: "AI Custom monitoring",
+                support: "unsupported", alternatives: [])
+        }
+        return ActivationResult(rulesActive: 0, rulesVersion: "", unsupported: moved)
     }
 
     func setNtfyTopic(_ topic: String) async throws {}

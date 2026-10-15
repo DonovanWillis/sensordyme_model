@@ -38,6 +38,11 @@ DEGRADED = "degraded"    # failing, but not yet past the failure threshold (or n
 DOWN = "down"            # past the threshold; restarts exhausted or unavailable
 
 _FAILURES_BEFORE_RESTART = 3  # consecutive check failures before a restart is attempted
+#: How long stop() waits, beyond one check interval, for an in-flight check or
+#: recovery action to finish. A camera restart is a 5 s join plus a reopen; a
+#: short join let shutdown race ahead while the monitor was still restarting
+#: the very services shutdown was stopping.
+_STOP_JOIN_GRACE_S = 30.0
 
 
 @dataclass
@@ -87,6 +92,10 @@ class HealthMonitor:
         self._stop = threading.Event()
         self._thread: Optional[threading.Thread] = None
         self._started_at = time.monotonic()
+        #: Recovery actions decided by a push report, run by the monitor thread.
+        #: Never on the reporter's own thread: that thread may be the very one
+        #: the restart has to stop and join.
+        self._pending_actions: deque = deque()
 
     # ------------------------------------------------------------------ registration
     def register(
@@ -125,23 +134,50 @@ class HealthMonitor:
 
     # ------------------------------------------------------------------ push-style reporting
     def report_ok(self, name: str, detail: str = "") -> None:
-        """Mark a component healthy (for components without a check callable)."""
+        """Mark a component healthy.
+
+        For a component with a pull `check`, a push "ok" only clears a
+        push-reported degradation; it never overrules a check that is failing,
+        whose own next pass is what proves recovery.
+        """
         with self._lock:
             comp = self._components.get(name)
             if comp is None:
+                return
+            if comp.check is not None and comp.consecutive_failures > 0:
                 return
             self._mark_ok(comp, detail)
 
-    def report_failure(self, name: str, error: str) -> None:
-        """Record a failure observed by the component itself (e.g. a thread crash)."""
+    def report_failure(self, name: str, error: str, *, escalate: bool = True) -> None:
+        """Record a failure observed by the component itself (e.g. a thread crash).
+
+        Escalation (restart, last resort) happens only for push-only components
+        -- those registered without a `check` -- and only when `escalate` is
+        true. A component with a pull check is recovered by the monitor thread
+        on the strength of that check; a push report about it is informational
+        (detail, timestamp, OK -> DEGRADED). Two reasons:
+
+          * the reporter is often the component's own worker thread, and its
+            restart has to stop and join that thread. Run inline, the camera
+            pump joined itself, raised, and died with its stop event set.
+          * push reports arrive far faster than checks (every failed camera
+            read), so counting them toward the restart threshold turned ~100 ms
+            of bad reads into a component restart that pre-empted the pump's own
+            in-place reopen and spent two of three restarts per glitch.
+
+        Any action decided here is queued and run by the monitor thread.
+        """
         with self._lock:
             comp = self._components.get(name)
             if comp is None:
                 return
+            if not escalate or comp.check is not None:
+                self._note_failure(comp, error)
+                return
             self._mark_failed(comp, error)
             action = self._maybe_recover(comp)
-        if action is not None:
-            action()
+            if action is not None:
+                self._pending_actions.append(action)
 
     # ------------------------------------------------------------------ monitor thread
     def start(self) -> None:
@@ -149,9 +185,17 @@ class HealthMonitor:
         self._thread.start()
 
     def stop(self) -> None:
+        """Stop the monitor, waiting for an in-flight check or restart to finish.
+
+        After this returns no further recovery action runs: the loop checks
+        the stop flag before every check and every action. The join is bounded
+        (generously) so a hung action cannot hold shutdown for ever.
+        """
         self._stop.set()
-        if self._thread is not None:
-            self._thread.join(timeout=self._interval + 1)
+        if self._thread is not None and self._thread is not threading.current_thread():
+            self._thread.join(timeout=self._interval + _STOP_JOIN_GRACE_S)
+            if self._thread.is_alive():
+                log.warning("health monitor did not stop: a check or restart is still running")
 
     def _run(self) -> None:
         while not self._stop.is_set():
@@ -162,10 +206,24 @@ class HealthMonitor:
                     if c.check is not None and now - c.last_checked >= c.check_interval_s
                 ]
             for comp in due:
+                if self._stop.is_set():
+                    return
                 self._run_check(comp)
+            self._run_pending_actions()
+            if self._stop.is_set():
+                return
             if self._watchdog_ping is not None and not self._critical_component_down():
                 self._watchdog_ping()
             self._stop.wait(self._interval)
+
+    def _run_pending_actions(self) -> None:
+        """Run recovery actions queued by push reports, on this (monitor) thread."""
+        while not self._stop.is_set():
+            with self._lock:
+                if not self._pending_actions:
+                    return
+                action = self._pending_actions.popleft()
+            action()
 
     def _run_check(self, comp: _Component) -> None:
         comp.last_checked = time.monotonic()
@@ -184,7 +242,10 @@ class HealthMonitor:
         # a camera); held under the lock it blocked /api/health, every component's
         # own report_failure, and -- through _critical_component_down -- the
         # systemd watchdog ping, for that whole time.
-        if action is not None:
+        #
+        # Not once stop() has been called: a restart started during shutdown
+        # would bring back a service that shutdown is in the middle of stopping.
+        if action is not None and not self._stop.is_set():
             action()
 
     # ------------------------------------------------------------------ state transitions
@@ -196,6 +257,15 @@ class HealthMonitor:
         comp.last_ok = time.monotonic()
         comp.consecutive_failures = 0
         comp.last_resort_fired = False
+
+    def _note_failure(self, comp: _Component, error: str) -> None:
+        """Record an informational (push) failure without touching the
+        consecutive-failure count that drives restarts and DOWN."""
+        comp.last_failure = time.monotonic()
+        comp.detail = error
+        if comp.state == OK:
+            log.warning("%s reported a failure: %s", comp.name, error)
+            comp.state = DEGRADED
 
     def _mark_failed(self, comp: _Component, error: str) -> None:
         comp.consecutive_failures += 1

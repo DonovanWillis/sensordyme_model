@@ -4,6 +4,14 @@ import SwiftUI
 struct SensorDymeApp: App {
     @StateObject private var state = AppState()
 
+    init() {
+        // The notification-centre delegate has to be in place before launch
+        // finishes, or the tap that cold-launched the app is never delivered.
+        // AlertNotifier sets it in its initialiser; it used to be created lazily,
+        // when the root view's AlertWatcher was first installed — after launch.
+        _ = AlertNotifier.shared
+    }
+
     var body: some Scene {
         WindowGroup {
             RootView()

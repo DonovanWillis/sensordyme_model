@@ -59,6 +59,15 @@ class ProvisioningService:
     # faster than this meant it, and must not be slowed down by a floor.
     _UNSETTLED_POLL_CEILING_S = 1.0
 
+    # How long to wait before trying to open Bluetooth again after the GATT
+    # server failed to start or died (bluetoothd restarting, adapter rfkilled).
+    # A retry, not a give-up: the window is the device's only way back onto a
+    # network, so a transient BlueZ fault must not close it for the whole boot.
+    _BLE_RETRY_S = 30.0
+
+    # Methods whose in-process loop is dormant BY DESIGN (run() returns at once).
+    _DORMANT_METHODS = ("off", "hotspot")
+
     def __init__(self, wifi: WifiManager, config: dict, version: str = "dev") -> None:
         self._wifi = wifi
         self._method = str(config.get("method", "ble"))
@@ -86,6 +95,14 @@ class ProvisioningService:
         # credential writes are actually authenticated.
         self._always_available = bool(config.get("always_available", False))
         self._reconfigure_window_s = float(config.get("reconfigure_window_s", 300))
+        # How long Bluetooth stays up after a credential write has an outcome.
+        #
+        # The outcome travels over the very channel the success closes: a device
+        # that joined Wi-Fi past its reconfigure window used to tear Bluetooth
+        # down the moment NetworkManager said "connected" -- before the join
+        # worker had even pushed "ok" -- so the app saw the link vanish mid-join
+        # and reported a failure for a setup that had worked.
+        self._outcome_linger_s = float(config.get("outcome_linger_s", 10.0))
         self._version = version
         self._ble = None  # BLEProvisioningServer, created lazily
         self._ble_unavailable = False
@@ -106,6 +123,20 @@ class ProvisioningService:
         # app read that as the new network succeeding. A failed setup showed as
         # a successful one, which is the worst way for this to be wrong.
         self._provision: Optional[dict] = None
+        #: Incremented on every credential write and echoed in `provision`, so
+        #: the app can tell the answer to ITS write from a status describing an
+        #: earlier attempt that was still in flight when it pressed Send.
+        self._attempt = 0
+        #: monotonic() when the current `provision` reached ok/error (linger clock).
+        self._outcome_at: Optional[float] = None
+        #: When the BLE server last failed to start or died, and why.
+        self._ble_failed_at: Optional[float] = None
+        self._ble_failure: Optional[str] = None
+        #: Last values _describe() observed, so the credential write handler --
+        #: which runs on the GLib loop thread -- can answer without running nmcli.
+        self._last_described: dict = {}
+        #: Last status pushed, so an unchanged description is not re-sent.
+        self._last_pushed: Optional[dict] = None
         self.state = "starting"  # starting | online | waiting | provisioning | unavailable
         #: Set by _guarded_run when the thread dies of an unhandled exception, so
         #: status() can report the failure instead of the stale `state` string.
@@ -160,7 +191,13 @@ class ProvisioningService:
             wake.set()
         if self._thread is not None:
             self._thread.join(timeout=timeout)
-        self._thread = None
+            if self._thread.is_alive():
+                # Keep the handle. Dropping it here is what let start() launch a
+                # second thread beside a wedged one (BLE calls can block), both
+                # driving the same BlueZ objects; start() refuses while it lives.
+                log.warning("provisioning thread did not stop within %.0fs", timeout)
+            else:
+                self._thread = None
         self._teardown_ble()
 
     def restart(self) -> None:
@@ -193,7 +230,16 @@ class ProvisioningService:
 
         while not stop.is_set():
             now = time.monotonic()
+            self._reap_dead_ble(now)
             online = self._wifi.is_online()
+            joining = self._join_in_flight()
+            # A join that has an outcome keeps the channel open for a while, so
+            # the outcome is delivered (and re-readable) before Bluetooth closes.
+            lingering = (
+                self._outcome_at is not None
+                and now - self._outcome_at < self._outcome_linger_s
+            )
+            window_left: Optional[float] = None
 
             if online:
                 offline_since = None
@@ -205,22 +251,26 @@ class ProvisioningService:
                 if self._always_available:
                     reconfigurable = True
                 else:
-                    reconfigurable = (
-                        (now - started_at) < self._reconfigure_window_s
-                        and not self._provisioned_this_session
-                    )
+                    window_left = self._reconfigure_window_s - (now - started_at)
+                    reconfigurable = window_left > 0 and not self._provisioned_this_session
                 if reconfigurable:
-                    self.state = "reconfigurable"
-                    if self._ble is None and not self._ble_unavailable:
+                    if self._ble is None and self._may_open_ble(now):
                         self._open_ble_window()
-                    self._push_status(self._describe())
+                    # After opening, which sets "provisioning": the first status
+                    # pushed used to say reconfigurable=false for that reason.
+                    self.state = "reconfigurable"
+                    self._push_status(self._describe(online=True))
+                elif self._ble is not None and (joining or lingering):
+                    # Online -- quite possibly BECAUSE of the join in flight --
+                    # but the app is still waiting to hear how its write went.
+                    self.state = "online"
+                    self._push_status(self._describe(online=True))
                 else:
                     if self._ble is not None:
-                        ssid = self._wifi.current_ssid()
-                        self._push_status(self._describe())
+                        self._push_status(self._describe(online=True))
                         log.info(
                             "Wi-Fi is up (%s) and the setup window has elapsed — closing Bluetooth",
-                            ssid,
+                            self._last_described.get("ssid"),
                         )
                         self._teardown_ble()
                     self.state = "online"
@@ -238,34 +288,44 @@ class ProvisioningService:
                 # nothing: the window closes the instant Wi-Fi comes up, which
                 # on a known network is well before anyone could connect to it.
                 # Waiting costs the entire setup experience.
-                if now - offline_since >= self._grace_s and self._ble is None and not self._ble_unavailable:
+                if (now - offline_since >= self._grace_s and self._ble is None
+                        and self._may_open_ble(now)):
                     self._open_ble_window()
                 if self._ble is not None:
                     self.state = "provisioning"
-            # Poll quickly whenever something is expected to change, slowly when
-            # nothing is. A settled device on known Wi-Fi has no reason to be
-            # asked every second; a device that just lost its network is one
-            # somebody is probably standing over, and up to ten seconds of
-            # apparent nothing is exactly the pause that reads as broken.
-            settled = online and self._ble is None
-            interval = (
-                self._poll_s if settled
-                else min(self._poll_s, self._UNSETTLED_POLL_CEILING_S)
-            )
+            # Poll quickly only while something is expected to change: offline
+            # (someone is probably standing over it), a join in flight, or an
+            # outcome being delivered. A device that is online -- including one
+            # holding its reconfigure window open -- has no reason to be asked
+            # every second: nmcli monitor wakes this loop on any real change, and
+            # each tick costs several nmcli processes on a Pi running inference.
+            if not online or joining or lingering:
+                interval = min(self._poll_s, self._UNSETTLED_POLL_CEILING_S)
+            else:
+                interval = self._poll_s
+                if self._ble is not None and window_left is not None and window_left > 0:
+                    interval = min(interval, max(window_left, 0.05))  # close on time
+            if self._ble is None and self._ble_failed_at is not None:
+                interval = min(interval, self._BLE_RETRY_S)
             # The interval is now a backstop, not the mechanism: a state change
             # wakes this immediately, and the timeout only covers what nmcli
             # monitor might not report.
             changed.clear()
             changed.wait(timeout=interval)
 
-    def _describe(self) -> dict:
+    def _join_in_flight(self) -> bool:
+        thread = self._connect_thread
+        return thread is not None and thread.is_alive()
+
+    def _describe(self, online: Optional[bool] = None) -> dict:
         """The device's own account of where it is in setup.
 
         Sent over Bluetooth so the app can show real steps rather than a
         spinner. Every field here is observed, never assumed.
         """
-        online = self._wifi.is_online()
-        return {
+        if online is None:
+            online = self._wifi.is_online()
+        described = {
             "state": "online" if online else self.state,
             "ssid": self._wifi.current_ssid() if online else None,
             "ip": self._wifi.ip_address() if online else None,
@@ -276,6 +336,18 @@ class ProvisioningService:
             # answer to the first must not be mistaken for the second.
             "provision": self._provision,
         }
+        self._last_described = described
+        return described
+
+    def _describe_cached(self) -> dict:
+        """_describe() from the last observed values -- no nmcli, safe on the GLib loop."""
+        described = dict(self._last_described) if self._last_described else {
+            "state": self.state, "ssid": None, "ip": None,
+            "device_id": device_id(),
+            "reconfigurable": self.state == "reconfigurable",
+        }
+        described["provision"] = self._provision
+        return described
 
     def status(self) -> tuple[bool, str]:
         """(healthy, detail) for the health monitor (non-critical component).
@@ -290,10 +362,21 @@ class ProvisioningService:
         crashed = getattr(self, "_crashed", None)
         if crashed:
             return False, crashed
-        # `unavailable` is a legitimate terminal state (dev Mac, hotspot install):
-        # run() returns immediately by design, so a dead thread there is expected.
+        if self._method in self._DORMANT_METHODS:
+            # run() returns at once by design: provisioning is off, or handled by
+            # the legacy hotspot oneshot outside this process. Not a failure --
+            # reporting it as one kept /api/health "degraded" for ever.
+            if self._method == "off":
+                return True, "Wi-Fi provisioning disabled (network.provisioning.method: off)"
+            return True, "provisioning handled by the hotspot oneshot (method: hotspot)"
+        # `unavailable` is a legitimate terminal state (dev Mac): run() returns
+        # immediately by design, so a dead thread there is expected.
         if self.state != "unavailable" and self._thread is not None and not self._thread.is_alive():
             return False, f"provisioning thread is not running (last state: {self.state})"
+        if (self._ble is None and self._ble_failure
+                and self.state in ("waiting", "provisioning", "reconfigurable")):
+            # Observed, not assumed: the window is wanted and is NOT open.
+            return False, f"Bluetooth setup could not start ({self._ble_failure}); retrying"
         if self.state == "provisioning":
             return True, "offline — Bluetooth setup open so the app can hand it a network"
         if self.state == "reconfigurable":
@@ -303,12 +386,39 @@ class ProvisioningService:
         return True, f"state: {self.state}"
 
     # ------------------------------------------------------------------ BLE window
+    def _may_open_ble(self, now: float) -> bool:
+        if self._ble_unavailable:
+            return False
+        return self._ble_failed_at is None or now - self._ble_failed_at >= self._BLE_RETRY_S
+
+    def _reap_dead_ble(self, now: float) -> None:
+        """Notice a GATT server whose thread has died, instead of reporting it open.
+
+        start() returning is not the server serving: bluetoothd can restart under
+        it, or registration can fail after the fact. Left unchecked the service
+        kept a dead server, said "Bluetooth setup open", and never tried again.
+        """
+        ble = self._ble
+        if ble is None:
+            return
+        alive = getattr(ble, "is_alive", None)
+        if alive is None or alive():
+            return
+        reason = getattr(ble, "failure", None) or "the Bluetooth server stopped unexpectedly"
+        log.error("BLE provisioning is not serving (%s) — retrying in %.0fs", reason, self._BLE_RETRY_S)
+        self._teardown_ble()
+        self._ble_failed_at = now
+        self._ble_failure = reason
+
     def _open_ble_window(self) -> None:
-        from services.ble_gatt import BLEProvisioningServer, BLEUnavailable
+        import time
+
+        from services.ble_gatt import BLEProvisioningServer, BLEStartError, BLEUnavailable
 
         name = _ble_name()
+        ble = None
         try:
-            self._ble = BLEProvisioningServer(
+            ble = BLEProvisioningServer(
                 device_name=name,
                 device_info={
                     # The stable identity, so the app can recognise this device
@@ -320,10 +430,14 @@ class ProvisioningService:
                     "hostname": socket.gethostname(),
                 },
                 on_credentials=self._on_credentials,
-                scan_networks=lambda: self._wifi.scan(),
+                scan_networks=lambda: self._wifi.scan(),  # noqa: PLW0108 - late-binds self._wifi
                 on_command=self._on_command,
             )
-            self._ble.start()
+            self._ble = ble
+            self._last_pushed = None
+            ble.start()
+            self._ble_failed_at = None
+            self._ble_failure = None
             self.state = "provisioning"
             log.info("no Wi-Fi — Bluetooth setup open as '%s'; pair from the SensorDyme app", name)
         except BLEUnavailable as exc:
@@ -331,15 +445,34 @@ class ProvisioningService:
             self._ble_unavailable = True
             self.state = "unavailable"
             log.error("%s", exc)
+        except BLEStartError as exc:
+            # Transient until proven otherwise: retried after _BLE_RETRY_S.
+            self._ble = None
+            self._ble_failed_at = time.monotonic()
+            self._ble_failure = str(exc)
+            log.error("Bluetooth setup could not start: %s — retrying in %.0fs", exc, self._BLE_RETRY_S)
 
     def _teardown_ble(self) -> None:
-        if self._ble is not None:
-            self._ble.stop()
-            self._ble = None
+        ble, self._ble = self._ble, None
+        self._last_pushed = None
+        if ble is not None:
+            ble.stop()
 
-    def _push_status(self, status: dict) -> None:
-        if self._ble is not None:
-            self._ble.set_status(status)
+    def _push_status(self, status: dict, force: bool = False) -> None:
+        # One read of the attribute: the run loop can tear the window down (and
+        # set it to None) between a check and a use on a worker thread.
+        ble = self._ble
+        if ble is None:
+            return
+        if "provision" in status and status["provision"] is not self._provision:
+            # Described before a credential write replaced the outcome (the run
+            # loop and the BLE thread race): never re-publish the previous
+            # attempt's answer on top of this attempt's "connecting".
+            status = dict(status, provision=self._provision)
+        if not force and status == self._last_pushed:
+            return  # nothing new to say; a re-send is a notification for nothing
+        self._last_pushed = dict(status)
+        ble.set_status(status)
 
     # ------------------------------------------------------------------ app callbacks
     def _on_credentials(self, ssid: str, psk: str) -> None:
@@ -355,24 +488,37 @@ class ProvisioningService:
         "connecting" status was queued before the join and could not leave until
         after it finished. The user saw "Sending…" and total silence for the
         entire attempt, which reads as a broken device rather than a working one
-        doing something slow.
+        doing something slow. The "connecting" push is built from cached values
+        for the same reason: three nmcli calls here were three more stalls.
         """
-        if self._connect_thread is not None and self._connect_thread.is_alive():
+        if self._join_in_flight():
             # A second write while the first is still going would race two nmcli
             # invocations against the same radio.
             log.info("BLE: ignoring credentials for '%s' — a join is already running", ssid)
             return
 
-        self._provision = {"state": "connecting", "ssid": ssid}
-        self._push_status(self._describe())
+        self._attempt += 1
+        attempt = self._attempt
+        self._outcome_at = None
+        # Set (and pushed) before this handler returns, i.e. before the write
+        # response: by the time the app's write completes, "connecting" with this
+        # attempt number is what the status characteristic says.
+        self._provision = {"state": "connecting", "ssid": ssid, "attempt": attempt}
+        ble = self._ble
+        if ble is not None:
+            # No implicit Wi-Fi scans while the radio is associating.
+            ble.set_scans_paused(True)
+        self._push_status(self._describe_cached(), force=True)
         self._connect_thread = threading.Thread(
-            target=self._join_network, args=(ssid, psk),
+            target=self._join_network, args=(ssid, psk, attempt),
             daemon=True, name="wifi-join",
         )
         self._connect_thread.start()
 
-    def _join_network(self, ssid: str, psk: str) -> None:
+    def _join_network(self, ssid: str, psk: str, attempt: int = 0) -> None:
         """Join `ssid` off the event loop, reporting the outcome over BLE."""
+        import time
+
         try:
             # provision(), not connect(): the device may already be on a working
             # network that someone is standing a long way from. The new profile
@@ -381,18 +527,37 @@ class ProvisioningService:
             ok, message = self._wifi.provision(ssid, psk)
         except Exception as exc:  # noqa: BLE001 - the window must survive a failed join
             log.error("wifi join failed: %s", exc)
-            self._provision = {"state": "error", "ssid": ssid, "error": str(exc)}
-            self._push_status(self._describe())
-            return
+            ok, message = False, str(exc)
 
         if ok:
-            self._provisioned_this_session = True
-            self._provision = {
-                "state": "ok", "ssid": ssid, "ip": self._wifi.ip_address(), "message": message,
-            }
+            try:
+                ip = self._wifi.ip_address()
+            except Exception:  # noqa: BLE001
+                ip = None
+            outcome = {"state": "ok", "ssid": ssid, "ip": ip, "message": message, "attempt": attempt}
         else:
-            self._provision = {"state": "error", "ssid": ssid, "error": message}
-        self._push_status(self._describe())
+            outcome = {"state": "error", "ssid": ssid, "error": message, "attempt": attempt}
+        # Outcome first, linger clock second, "provisioned" last: the run loop
+        # must never see a finished setup without also seeing the reason to keep
+        # Bluetooth up long enough to report it.
+        self._provision = outcome
+        self._outcome_at = time.monotonic()
+        if ok:
+            self._provisioned_this_session = True
+        ble = self._ble
+        if ble is not None:
+            ble.set_scans_paused(False)
+        try:
+            described = self._describe()
+        except Exception:  # noqa: BLE001 - the outcome matters more than the rest
+            described = self._describe_cached()
+        self._push_status(described, force=True)
+        self._wake_loop()
+
+    def _wake_loop(self) -> None:
+        wake = getattr(self, "_wake", None)
+        if wake is not None:
+            wake.set()
 
     def _on_command(self, command: dict) -> None:
         """Handle an app command. Runs on the BLE event loop — never block here.
@@ -402,9 +567,14 @@ class ProvisioningService:
         the BLE server's own non-blocking refresh; the app learns the outcome
         from the status push and re-reads the list.
         """
+        if not isinstance(command, dict):
+            return
         action = command.get("action")
         if action == "rescan":
-            if self._ble is not None:
-                self._ble.refresh_networks()
+            ble = self._ble
+            if ble is not None:
+                # Explicitly asked for: bypasses the implicit-refresh rate limit
+                # (but still not while a join is using the radio).
+                ble.refresh_networks(force=True)
         elif action == "identify":
             log.info("BLE identify requested")  # future: blink the status LED via the HAL

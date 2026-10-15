@@ -26,7 +26,7 @@ from dataclasses import dataclass, field
 from typing import Optional
 
 
-class JupiterUnavailable(Exception):
+class JupiterUnavailable(Exception):  # noqa: N818 - established exception name
     """A provider could not answer. Carries a sentence fit to show a user."""
 
     def __init__(self, message: str, *, retryable: bool = True) -> None:
@@ -120,7 +120,14 @@ class JupiterLocalProvider(Provider):
                 {"role": "user", "content": user},
             ],
             "stream": False,
-            "options": {"temperature": self.temperature, "num_predict": self.max_tokens},
+            "options": {
+                "temperature": self.temperature,
+                "num_predict": self.max_tokens,
+                # The system prompt alone is ~3k tokens; with num_predict on top
+                # it overruns Ollama's default context, which silently truncates
+                # the prompt (the vocabulary goes first) or cuts the answer off.
+                "num_ctx": int(self.config.get("num_ctx", 8192)),
+            },
         }
 
         # Structured output goes through `format`, NOT `options.grammar`.
@@ -155,8 +162,18 @@ class JupiterLocalProvider(Provider):
                 f"run: ollama pull {self.model}",
                 retryable=False,
             )
-        response.raise_for_status()
-        text = (response.json().get("message") or {}).get("content", "")
+        # A 500 ("model runner has unexpectedly stopped"), an out-of-memory 400,
+        # or a body that is not JSON is the server being unavailable, not a bug
+        # in the caller. Raised raw, it escaped interpret() — which only expects
+        # JupiterUnavailable — and turned Configure-with-AI into an HTTP 500
+        # that also skipped the cloud and keyword fallbacks.
+        try:
+            response.raise_for_status()
+            text = (response.json().get("message") or {}).get("content") or ""
+        except Exception as exc:
+            raise JupiterUnavailable(
+                f"the local model server returned an error: {exc}"
+            ) from exc
         return ProviderResult(
             text=text, provider=self.name, model=self.model,
             latency_s=round(time.monotonic() - started, 3),
@@ -188,7 +205,7 @@ class JupiterOpenAICompat(Provider):
         )
         self._post = post or _default_post()
         self.local = any(
-            host in self.base_url.lower() for host in ("localhost", "127.0.0.1", "0.0.0.0")
+            host in self.base_url.lower() for host in ("localhost", "127.0.0.1", "0.0.0.0")  # noqa: S104 - a substring check, not a bind
         )
 
     def complete(self, system: str, user: str, *, schema=None, grammar=None) -> ProviderResult:
@@ -214,7 +231,9 @@ class JupiterOpenAICompat(Provider):
                 headers=headers, timeout=self.timeout_s,
             )
             response.raise_for_status()
-            text = response.json()["choices"][0]["message"]["content"]
+            # `content: null` is legal in this API (a refusal, a tool call);
+            # it must read as an empty answer, not crash len() below.
+            text = response.json()["choices"][0]["message"]["content"] or ""
         except Exception as exc:
             raise JupiterUnavailable(f"the model endpoint failed: {exc}") from exc
         return ProviderResult(
@@ -271,7 +290,13 @@ class AnthropicProvider(Provider):
                 raise JupiterUnavailable(
                     "the `anthropic` package is not installed", retryable=False
                 ) from exc
-            self._client = anthropic.Anthropic()
+            # The configured timeout, not the SDK's 10-minute default with two
+            # retries: this runs on an API request a person is waiting on.
+            self._client = anthropic.Anthropic(
+                api_key=self.config.get("api_key") or None,
+                timeout=self.timeout_s,
+                max_retries=1,
+            )
         return self._client
 
     def complete(self, system: str, user: str, *, schema=None, grammar=None) -> ProviderResult:
@@ -284,7 +309,7 @@ class AnthropicProvider(Provider):
         }
         if schema is not None:
             request["output_config"] = {
-                "format": {"type": "json_schema", "schema": schema},
+                "format": {"type": "json_schema", "schema": _anthropic_schema(schema)},
                 "effort": "low",
             }
         started = time.monotonic()
@@ -292,14 +317,33 @@ class AnthropicProvider(Provider):
             response = client.messages.create(**request)
         except Exception as exc:
             raise JupiterUnavailable(f"the Anthropic API failed: {exc}") from exc
-        if getattr(response, "stop_reason", None) == "refusal":
+        stop_reason = getattr(response, "stop_reason", None)
+        if stop_reason == "refusal":
             raise JupiterUnavailable("the model declined to answer", retryable=False)
+        if stop_reason == "max_tokens":
+            # Truncated JSON parses as nothing and would be scored as a refusal.
+            raise JupiterUnavailable("the model's answer was cut off (max_tokens)")
         text = next((b.text for b in response.content if getattr(b, "type", "") == "text"), "")
         return ProviderResult(
             text=text, provider=self.name, model=self.model,
             latency_s=round(time.monotonic() - started, 3),
             prompt_chars=len(system) + len(user), completion_chars=len(text),
+            meta={"constrained": schema is not None},
         )
+
+
+def _anthropic_schema(schema: dict) -> dict:
+    """The schema in the subset structured outputs accepts.
+
+    The API does not support numeric constraints (minimum/maximum); the SDK's
+    transform_schema moves them into descriptions. RuleDraft.validate clamps
+    the numbers afterwards either way.
+    """
+    try:
+        from anthropic import transform_schema
+    except ImportError:
+        return schema
+    return transform_schema(schema)
 
 
 class ScriptedProvider(Provider):

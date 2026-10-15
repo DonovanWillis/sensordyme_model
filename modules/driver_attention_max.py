@@ -32,6 +32,7 @@ here — this docstring only explains the mechanisms.
 
 from __future__ import annotations
 
+import contextlib
 import json
 import math
 import statistics
@@ -666,6 +667,12 @@ class DriverAttentionMaxModule(VisionModule):
         if self._vlm is None:
             return
         verdict = self._vlm.latest_verdict()
+        if verdict is None or not self._vlm.is_current(verdict):
+            # No current evidence: the judge disabled itself or stopped
+            # answering (network down, rate-limit backoff). A confirmed state is
+            # a claim about the driver NOW; left set it latched is_alert_active()
+            # and the VLM:<STATE> label for the rest of the session.
+            self._vlm_confirm.reset()
         if verdict is None or verdict.seq == self._vlm_last_seq:
             return
         self._vlm_last_seq = verdict.seq
@@ -1132,3 +1139,20 @@ class DriverAttentionMaxModule(VisionModule):
             or self._off_road_active
             or self._vlm_confirm.active_state is not None
         )
+
+    def close(self) -> None:
+        """Stop the VLM worker and release the MediaPipe graphs. Safe to call twice.
+
+        The runtime calls this on a module swap and at shutdown; without it every
+        swap leaked a FaceMesh + Hands graph and left a judge thread parked.
+        """
+        vlm = getattr(self, "_vlm", None)
+        if vlm is not None:
+            vlm.close()
+        for attr in ("_face_mesh", "_hands"):
+            graph = getattr(self, attr, None)
+            setattr(self, attr, None)
+            if graph is None:
+                continue
+            with contextlib.suppress(Exception):  # releasing a graph must never raise into shutdown
+                graph.close()

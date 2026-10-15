@@ -5,7 +5,7 @@ from main import load_config
 
 
 def test_repo_config_is_valid():
-    errors, warnings = validate(load_config("config.yaml"))
+    errors, _warnings = validate(load_config("config.yaml"))
     assert errors == []
 
 
@@ -44,7 +44,7 @@ def test_missing_module_section_errors():
 def test_token_with_lan_host_warns():
     _, warnings = validate(
         {"module": "m", "modules": {"m": {}},
-         "dashboard": {"host": "0.0.0.0", "token": "secret"}}
+         "dashboard": {"host": "0.0.0.0", "token": "secret"}}  # noqa: S104 - config value under test
     )
     assert any("token" in w for w in warnings)
 

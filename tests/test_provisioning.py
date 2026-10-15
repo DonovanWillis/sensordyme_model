@@ -2,6 +2,7 @@
 
 import threading
 import time
+from typing import ClassVar
 
 import services.provisioning as provisioning_module
 from services.provisioning import ProvisioningService
@@ -39,7 +40,7 @@ class FakeWifi:
 
 
 class FakeBLEServer:
-    instances = []
+    instances: ClassVar[list] = []
 
     def __init__(self, device_name, device_info, on_credentials, on_command=None,
                  scan_networks=None):
@@ -62,12 +63,15 @@ class FakeBLEServer:
     def set_status(self, status):
         self.statuses.append(status)
 
-    def refresh_networks(self):
+    def refresh_networks(self, force=False):
         self.refreshed = getattr(self, "refreshed", 0) + 1
+
+    def set_scans_paused(self, paused):
+        self.scans_paused = paused
 
 
 def _make_service(monkeypatch, wifi, grace_s=0.05, poll_s=0.02, reconfigure_window_s=0.0,
-                  always_available=False):
+                  always_available=False, outcome_linger_s=0.05):
     # Pretend we're on a Pi and swap the real GATT server for the fake.
     monkeypatch.setattr(provisioning_module, "nmcli_available", lambda: True)
     import services.ble_gatt as ble_gatt
@@ -82,6 +86,9 @@ def _make_service(monkeypatch, wifi, grace_s=0.05, poll_s=0.02, reconfigure_wind
         # Production defaults to off as well (see the test below); always-on
         # is opted into explicitly where it is under test.
         "always_available": always_available,
+        # Production keeps Bluetooth up ~10s after an outcome so the app hears
+        # it (tests/test_network_review_fixes.py); here, just long enough.
+        "outcome_linger_s": outcome_linger_s,
     })
 
 

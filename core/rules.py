@@ -16,13 +16,22 @@ What this layer owns, and the event engine deliberately does not:
   * **schedule gating** — "between 11pm and 5am" is enforced by refusing to
     accumulate observations outside the window, not by suppressing the alert at
     the end. Gating only the alert would let a rule confirm at 22:59 and fire the
-    instant the window opened, which is not what the user asked for.
+    instant the window opened, which is not what the user asked for. Every
+    predicate is gated, counting included. Hours are read in the rule's own
+    `timezone` (IANA name) when it carries one, else the engine's, else the
+    device's local time — the person who typed "after 11pm" meant their clock.
   * **count thresholds** — "more than three people" is a property of one frame's
     observation, not of the lifecycle, so `min_count` is checked before the
-    observation reaches the engine.
+    observation reaches the engine. With a zone, only subjects INSIDE the zone
+    count: "three people in the driveway" is not "one in the driveway and two
+    on the pavement".
   * **zone binding** — a rule names a zone the user draws in the app; if that
     zone does not exist yet the rule is inert rather than firing frame-wide,
     which is the difference between "alert near the pool" and "alert anywhere".
+    That holds for every predicate: an absence rule with a zone asks whether
+    the zone is empty, and a counting rule counts inside it.
+  * **stillness** — `still` asks whether the subject has stopped moving, which
+    no single frame can answer; see `_StillnessWatcher`.
 
 Everything temporal (persistence, occlusion grace, resolve, cooldown) stays in
 EventEngine, so custom rules get exactly the same debouncing as built-in ones.
@@ -30,12 +39,15 @@ EventEngine, so custom rules get exactly the same debouncing as built-in ones.
 
 from __future__ import annotations
 
+import math
 import re
 import time
+from collections import deque
 from collections.abc import Callable
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import datetime, tzinfo
 from typing import Optional
+from zoneinfo import ZoneInfo
 
 from core.detections import DetectionFrame
 from core.detectors import iou
@@ -108,13 +120,53 @@ def _plural(noun: str) -> str:
     return noun + "s"
 
 
-def _any_overlap(boxes_a: list, boxes_b: list) -> bool:
+def _any_overlap(boxes_a: list, boxes_b: list, *, upper: bool = False) -> bool:
     """Whether any pixel-space (x1, y1, x2, y2) box in `boxes_a` intersects
     any in `boxes_b` at all -- reuses core/detectors.py's iou() (the same
     overlap math driver_attention.py's hand/phone check and occupancy.py's
     tracker matching already use) rather than a second implementation of
-    box intersection."""
-    return any(iou(a, b) > 0 for a in boxes_a for b in boxes_b)
+    box intersection.
+
+    `upper` tests the upper (face) region of each `boxes_a` box instead of the
+    whole box. A box is never compared with itself: when both lists hold the
+    same label ("two people close together"), one person's box trivially
+    overlaps itself, which made a single person satisfy a two-person relation.
+    Identity, not equality, decides "itself" -- the lists hold the frame's own
+    box objects, and two detections at the same coordinates are two subjects.
+    """
+    for a in boxes_a:
+        region = _upper_region(a) if upper else a
+        for b in boxes_b:
+            if b is a:
+                continue
+            if iou(region, b) > 0:
+                return True
+    return False
+
+
+def _resolve_timezone(name: object) -> Optional[tzinfo]:
+    """An IANA timezone ("Europe/London"), or None when absent or unknown.
+
+    None means "use the engine default, else device local time" -- an unknown
+    name must not disable the rule or move its hours somewhere arbitrary.
+    """
+    if not isinstance(name, str) or not name.strip():
+        return None
+    try:
+        return ZoneInfo(name.strip())
+    except (ValueError, OSError, KeyError):  # ZoneInfoNotFoundError is a KeyError
+        return None
+
+
+def _minute_of_day(stamp: datetime, zone: Optional[tzinfo]) -> int:
+    """Minutes since local midnight of `stamp`, read in `zone` when given.
+
+    A naive `stamp` is device local time (what `datetime.now()` returns), and
+    `astimezone` converts it on that assumption.
+    """
+    if zone is not None:
+        stamp = stamp.astimezone(zone)
+    return stamp.hour * 60 + stamp.minute
 
 
 def _parse_schedule(text: str) -> Optional[tuple[int, int]]:
@@ -163,6 +215,8 @@ class ConfiguredRule:
     notify: str = "push"
     min_count: int = 1
     schedule: Optional[tuple[int, int]] = None
+    # IANA timezone the schedule is written in; None = engine default / device local.
+    timezone: Optional[tzinfo] = None
 
     @classmethod
     def from_dict(cls, index: int, raw: dict) -> Optional["ConfiguredRule"]:
@@ -195,6 +249,7 @@ class ConfiguredRule:
             notify=notify if notify in _NOTIFY_KINDS else "push",
             min_count=min_count,
             schedule=_parse_schedule(str(raw.get("schedule") or "")),
+            timezone=_resolve_timezone(raw.get("timezone")),
         )
 
     def spec(self, raw: dict) -> RuleSpec:
@@ -232,11 +287,21 @@ class _CountWatcher:
     the rule's persistence window before it counts as real.
     """
 
-    def __init__(self, persist_s: float) -> None:
+    def __init__(self, persist_s: float, threshold: int = 1) -> None:
         self._persist_s = persist_s
+        # min_count. Above 1 the rule is "tell me when there are N or more", so
+        # a number is news only at or above N -- or when it falls back below N
+        # from there, which is the all-clear. Changes entirely below N are not.
+        self._threshold = max(1, int(threshold))
         self._reported: Optional[int] = None
         self._candidate: Optional[int] = None
         self._candidate_since: float = 0.0
+
+    def interrupt(self) -> None:
+        """Forget a count that had not settled yet (outside the rule's hours, or
+        its zone is gone). Otherwise a value seen before the window opened would
+        be reported the instant it did, having "settled" while nobody asked."""
+        self._candidate = None
 
     def observe(self, count: int, now: float) -> Optional[tuple[int, Optional[int]]]:
         """Feed one frame's count. Returns (count, previous) when worth saying."""
@@ -255,7 +320,68 @@ class _CountWatcher:
             # baseline so a later arrival reads "2 people visible (was 0)", but
             # do not announce that nothing is there.
             return None
+        if self._threshold > 1 and count < self._threshold and (
+            previous is None or previous < self._threshold
+        ):
+            return None
         return count, previous
+
+
+#: Stillness: how far back a subject's position is compared, and how far its box
+#: centre may have moved in that time (in box diagonals) and still be "still".
+#: Measured in seconds, not frames, so the answer does not change with frame rate.
+_STILL_WINDOW_S = 1.0
+_STILL_MAX_SHIFT = 0.1
+#: A reference position older than this is from before a gap in view -- whoever
+#: is there now cannot be judged against it.
+_STILL_MAX_AGE_S = 3.0
+
+
+def _centre_and_diagonal(box) -> tuple[float, float, float]:
+    x1, y1, x2, y2 = box
+    return (x1 + x2) / 2.0, (y1 + y2) / 2.0, math.hypot(x2 - x1, y2 - y1)
+
+
+class _StillnessWatcher:
+    """Whether a subject's box has stayed put over the last second.
+
+    "Still" is a claim about motion, so it needs two moments: a box now, and a
+    box about `_STILL_WINDOW_S` ago at nearly the same place (centre shift under
+    `_STILL_MAX_SHIFT` of the box diagonal, so it scales with distance from the
+    camera). Detector jitter is a few percent of a diagonal; a person walking
+    covers about half a diagonal a second. The rule's own persist_s then asks
+    for that to hold continuously ("still for ten minutes"), and any real
+    movement breaks the run through the event engine's ordinary reset.
+
+    With several subjects, any one of them being still is enough -- there is no
+    identity tracking here, so each current box is matched to the nearest
+    reference box. Detections without boxes cannot be judged and read as not
+    still.
+    """
+
+    def __init__(self) -> None:
+        self._history: deque[tuple[float, list[tuple[float, float, float]]]] = deque()
+
+    def observe(self, boxes: list, now: float) -> bool:
+        while self._history and now - self._history[0][0] > _STILL_MAX_AGE_S:
+            self._history.popleft()
+        reference = None
+        for stamp, centres in reversed(self._history):
+            if now - stamp >= _STILL_WINDOW_S:
+                reference = centres
+                break
+        current = [_centre_and_diagonal(b) for b in boxes]
+        if current:
+            self._history.append((now, current))
+        if not current or not reference:
+            return False
+        for cx, cy, diagonal in current:
+            if diagonal <= 0:
+                continue
+            nearest = min(math.hypot(cx - rx, cy - ry) for rx, ry, _ in reference)
+            if nearest / diagonal <= _STILL_MAX_SHIFT:
+                return True
+        return False
 
 
 class RuleEngine:
@@ -266,12 +392,15 @@ class RuleEngine:
         raw_rules: Optional[list[dict]] = None,
         zones: Optional[list[Zone]] = None,
         clock: Optional[Callable[[], datetime]] = None,
+        timezone: Optional[str] = None,
     ) -> None:
         self._clock = clock or datetime.now
         self._zones = {_zone_key(z.name): z for z in (zones or [])}
+        self._timezone = _resolve_timezone(timezone)
         self._rules: dict[str, ConfiguredRule] = {}
         self._engine = EventEngine({})
         self._counters: dict[str, _CountWatcher] = {}
+        self._stillness: dict[str, _StillnessWatcher] = {}
         self._persist: dict[str, float] = {}
         self.replace_rules(raw_rules or [])
 
@@ -284,6 +413,7 @@ class RuleEngine:
         # brand-new rule report "5 bottles (was 3)" from a previous
         # configuration's history, which is a fact about nothing.
         self._counters = {}
+        self._stillness = {}
         self._persist = {}
         for index, raw in enumerate(raw_rules or []):
             if not isinstance(raw, dict):
@@ -307,6 +437,11 @@ class RuleEngine:
     def set_zones(self, zones: list[Zone]) -> None:
         self._zones = {_zone_key(z.name): z for z in (zones or [])}
 
+    def set_timezone(self, name: Optional[str]) -> None:
+        """Default IANA timezone for rules that do not name their own; None or
+        an unknown name means device local time."""
+        self._timezone = _resolve_timezone(name)
+
     @property
     def rules(self) -> list[ConfiguredRule]:
         return list(self._rules.values())
@@ -321,8 +456,14 @@ class RuleEngine:
         said "alert me when you see a bottle" asked for an alert, and it should
         look like one — the picture and the notification describing the same
         moment must not disagree about whether it is serious.
+
+        A `silent` rule is the opposite request — track it, do not alert — so it
+        never drives the alert state on its own.
         """
-        return bool(self._engine.active_detections())
+        return any(
+            rule is not None and rule.notify != "silent"
+            for rule in (self._rules.get(d) for d in self._engine.active_detections())
+        )
 
     def pending_zones(self) -> list[str]:
         """Zones rules reference that the user hasn't drawn yet.
@@ -351,12 +492,12 @@ class RuleEngine:
         reported without them satisfies a zone rule only if it has no zone.
         """
         now = time.monotonic() if now is None else now
-        minute_of_day = self._minute_of_day()
+        stamp = self._clock()
         alerts: list[Alert] = []
 
         for rule in self.rules_for(detection):
             active = present and count >= rule.min_count
-            if active and not _in_window(rule.schedule, minute_of_day):
+            if active and not _in_window(rule.schedule, self._rule_minute(rule, stamp)):
                 active = False  # outside its hours the rule observes nothing at all
             if active and (rule.zone or rule.predicate == "in_zone"):
                 # `or rule.predicate == "in_zone"` is the whole point: a rule
@@ -395,23 +536,40 @@ class RuleEngine:
         """
         now = time.monotonic() if now is None else now
         alerts: list[Alert] = []
-        minute_of_day = self._minute_of_day()
+        stamp = self._clock()
 
         for rule in self._rules.values():
             seen = rule.detection in frame.labels()
             boxes = frame.boxes(rule.detection)
+            in_hours = _in_window(rule.schedule, self._rule_minute(rule, stamp))
+            # A zone-bound rule sees only the subjects inside its zone; with the
+            # zone undrawn it sees nothing at all (inert, never frame-wide).
+            zone_bound = bool(rule.zone) or rule.predicate == "in_zone"
+            zone = self._zones.get(_zone_key(rule.zone)) if rule.zone else None
+            if zone_bound:
+                in_zone = (
+                    [b for b in boxes if zone.contains_box(b, frame.width, frame.height)]
+                    if zone is not None else []
+                )
+            else:
+                in_zone = boxes
 
             # Counting is a value, not a condition, so it does not go through
             # the event engine at all. "Is a person present" becomes true and
             # later false; "how many bottles are there" is a number that is
-            # worth mentioning when it changes.
+            # worth mentioning when it changes. It is still a rule: it keeps
+            # its hours and its zone like every other one.
             if rule.predicate == "count":
                 watcher = self._counters.get(rule.rule_id)
                 if watcher is None:
                     watcher = self._counters[rule.rule_id] = _CountWatcher(
-                        self._persist_for(rule)
+                        self._persist_for(rule), threshold=rule.min_count
                     )
-                settled = watcher.observe(frame.count(rule.detection), now)
+                if not in_hours or (zone_bound and zone is None):
+                    watcher.interrupt()
+                    continue
+                count = len(in_zone) if zone_bound else frame.count(rule.detection)
+                settled = watcher.observe(count, now)
                 if settled is not None and rule.notify != "silent":
                     count, previous = settled
                     alerts.append(Alert(
@@ -428,12 +586,9 @@ class RuleEngine:
                     ))
                 continue
 
-            active = self._evaluate(rule, frame, seen, boxes)
-
-            if active and not _in_window(rule.schedule, minute_of_day):
+            active = self._evaluate(rule, frame, seen, boxes, zone_bound, zone, in_zone, now)
+            if active and not in_hours:
                 active = False  # outside its hours the rule observes nothing at all
-            if active and (rule.zone or rule.predicate == "in_zone"):
-                active = self._in_zone(rule.zone, boxes, frame.size)  # see update()
 
             confidence = frame.mean_confidence(rule.detection) if seen else 0.0
             # An absence rule is a confident observation of nothing, so it cannot
@@ -456,26 +611,42 @@ class RuleEngine:
                 ))
         return alerts
 
-    def _evaluate(self, rule: ConfiguredRule, frame: "DetectionFrame",
-                  seen: bool, boxes: list) -> bool:
-        """Whether this rule's condition holds in this frame."""
+    def _evaluate(self, rule: ConfiguredRule, frame: "DetectionFrame", seen: bool,
+                  boxes: list, zone_bound: bool, zone: Optional[Zone], in_zone: list,
+                  now: float) -> bool:
+        """Whether this rule's condition holds in this frame.
+
+        `in_zone` is `boxes` narrowed to the rule's zone when it is zone-bound
+        (empty when that zone is not drawn), and `boxes` otherwise.
+        """
         if rule.predicate == "absent":
-            return not seen
-        if rule.predicate in ("near", "holding"):
+            if not zone_bound:
+                return not seen
+            # "Nobody at the pool": the zone must exist, hold none of the target,
+            # and every sighting must have a box -- a subject the module saw
+            # without a location could be standing in the zone.
+            located = len(boxes) == frame.count(rule.detection)
+            return zone is not None and not in_zone and located
+        if rule.predicate in ("near", "holding", "near_mouth"):
             # Proximity stands in for interaction: overlapping boxes are strong
             # evidence of "with", and no evidence at all of intent. The rule
-            # carries a caveat saying so.
-            if not seen or not rule.secondary:
+            # carries a caveat saying so. near_mouth tests the target's FACE
+            # region rather than the whole target — what separates "drinking
+            # from a bottle" evidence from "standing next to a bottle"; see
+            # _upper_region.
+            if not seen or not rule.secondary or not in_zone:
                 return False
-            return _any_overlap(boxes, frame.boxes(rule.secondary))
-        if rule.predicate == "near_mouth":
-            # The secondary must overlap the target's FACE region, not just the
-            # target. This is what separates "drinking from a bottle" evidence
-            # from "standing next to a bottle" — see _upper_region.
-            if not seen or not rule.secondary:
-                return False
-            return _any_overlap([_upper_region(b) for b in boxes], frame.boxes(rule.secondary))
-        # present / in_zone / count all start from "is it there, enough of it".
+            return _any_overlap(in_zone, frame.boxes(rule.secondary),
+                                upper=rule.predicate == "near_mouth")
+        if rule.predicate == "still":
+            watcher = self._stillness.get(rule.rule_id)
+            if watcher is None:
+                watcher = self._stillness[rule.rule_id] = _StillnessWatcher()
+            return watcher.observe(in_zone, now)
+        # present / in_zone / lingering / persists all start from "is it there,
+        # enough of it" -- inside the zone, when the rule has one.
+        if zone_bound:
+            return len(in_zone) >= rule.min_count
         return seen and frame.count(rule.detection) >= rule.min_count
 
     def active_alerts(self) -> list[str]:
@@ -483,9 +654,10 @@ class RuleEngine:
         return self._engine.active_detections()
 
     # ------------------------------------------------------------------ internals
-    def _minute_of_day(self) -> int:
-        stamp = self._clock()
-        return stamp.hour * 60 + stamp.minute
+    def _rule_minute(self, rule: ConfiguredRule, stamp: datetime) -> int:
+        """Minute of day for `rule`'s schedule: its own timezone, else the
+        engine's, else the device's local time."""
+        return _minute_of_day(stamp, rule.timezone or self._timezone)
 
     def _in_zone(
         self,

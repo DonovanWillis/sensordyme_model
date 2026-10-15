@@ -26,17 +26,27 @@ StartLimitAction=reboot
 [Service]
 Type=notify
 NotifyAccess=main
-User=pi
+# Replaced by setup_pi.sh with the installing user (Bookworm images have no
+# default `pi`); the sudoers rule is templated with the same name.
+User=__SENSORDYME_USER__
 WorkingDirectory=__SENSORDYME_DIR__
-# Preflight verifies config (fatal), camera, AI HAT, disk — results in
-# data/preflight.json and the journal.
-ExecStartPre=__SENSORDYME_DIR__/.venv/bin/python __SENSORDYME_DIR__/scripts/preflight.py
+# Preflight verifies config, camera, AI HAT, disk — results in
+# data/preflight.json and the journal. The leading "-" makes its exit status
+# advisory: Restart= applies to a failing ExecStartPre too, so a bad config (or a
+# preflight that could not write its results to a full/read-only card) restarted
+# every few seconds and StartLimitAction=reboot turned that into a reboot loop.
+ExecStartPre=-__SENSORDYME_DIR__/.venv/bin/python __SENSORDYME_DIR__/scripts/preflight.py
 ExecStart=__SENSORDYME_DIR__/.venv/bin/python __SENSORDYME_DIR__/main.py --no-display
 # The health monitor sends WATCHDOG=1 only while the capture+inference pipeline
 # is verifiably alive — a wedged loop (not just a dead process) triggers restart.
 WatchdogSec=45
 Restart=always
 RestartSec=3
+# main.py exits 78 (EX_CONFIG) on an invalid config.yaml. Retrying cannot fix a
+# config, and every retry counts toward StartLimitAction=reboot, so that status
+# stops the unit instead: `systemctl status sensordyme` / the journal show the
+# config errors, and `systemctl restart sensordyme` after fixing them resumes.
+RestartPreventExitStatus=78
 TimeoutStartSec=180
 
 [Install]

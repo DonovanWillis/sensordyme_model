@@ -44,7 +44,7 @@ class Detection:
     requires: str = ""   # what's missing (PLANNED/UNSUPPORTED)
 
 
-def _d(id: str, title: str, support: str, how: str = "", caveat: str = "", requires: str = "") -> Detection:
+def _d(id: str, title: str, support: str, how: str = "", caveat: str = "", requires: str = "") -> Detection:  # noqa: A002 - mirrors the Detection.id field
     return Detection(id=id, title=title, support=support, how=how, caveat=caveat, requires=requires)
 
 
@@ -176,7 +176,12 @@ TAXONOMY: dict[str, list[Detection]] = {
                "not single-frame; sitting/lying deliberately does NOT trigger it)"),
         _d("on_floor", "Person remaining on floor after fall", SUPPORTED,
            how="fall alert stays active until significant movement resumes"),
-        _d("presence", "Person present / absent", SUPPORTED, how="YOLO person + event lifecycle"),
+        _d("presence", "Person present / absent", PARTIAL,
+           how="MediaPipe Pose: a tracked skeleton reads as a person, a label AI-configured "
+               "present/absent rules can target (this mode runs no object detector)",
+           caveat="no built-in presence/absence alert in this mode, and pose tracking -- not a "
+                  "person detector -- decides presence, so someone the pose model loses (far away, "
+                  "heavily occluded) reads as absent"),
         _d("zone_events", "Restricted areas / stairs / wandering", SUPPORTED,
            how="user-drawn zones tested against the ankle midpoint + persistence"),
         _d("bed_exit", "Getting out of bed (a user-drawn 'bed' safe zone)", SUPPORTED,
@@ -187,14 +192,17 @@ TAXONOMY: dict[str, list[Detection]] = {
            how="hip/shoulder centroid movement over a long window (deliberately "
                "10 minutes by default, to not flag ordinary resting/reading)"),
         _d("posture", "Standing / sitting / lying classification", PARTIAL,
-           how="pose landmarks exist in the fall module",
-           caveat="explicit posture classification not implemented; falls are detected by "
-                  "trajectory, not posture, precisely to avoid lying-down false alarms"),
+           how="core/posture.py classifies standing / sitting / lying_down (plus on_floor) from "
+               "pose landmarks; each is a label AI-configured rules can target",
+           caveat="posture raises no built-in alert: falls are detected by trajectory, not "
+                  "posture, precisely to avoid lying-down false alarms"),
         _d("struggling", "Struggling to stand / loss of balance / stumble / gait analysis", UNSUPPORTED,
            requires="temporal gait models; current pose pipeline detects falls, not gait quality"),
-        _d("schedule", "Time-conditioned rules (nighttime activity, outside hours)", PLANNED,
-           requires="rule schedules — representable in AI-configure rules, enforcement lands "
-                    "with the scheduler"),
+        _d("schedule", "Time-conditioned rules (nighttime activity, outside hours)", PARTIAL,
+           how="AI-configured rules carry an HH:MM-HH:MM window, enforced on the device "
+               "(core/rules.py) in the rule's timezone when it names one, else device local time",
+           caveat="applies to AI-configured rules only; this mode's own alerts are not "
+                  "time-conditioned"),
         _d("smoke_fire_flood", "Smoke / fire / flooding visible", UNSUPPORTED,
            requires="dedicated smoke/fire segmentation models (COCO has no such classes); "
                     "a smoke/heat sensor is the honest hardware answer"),
@@ -233,9 +241,11 @@ TAXONOMY: dict[str, list[Detection]] = {
            requires="specialized models with serious false-positive stakes; we refuse to "
                     "approximate these with the current stack — actions like 'person entered "
                     "restricted area' are reported instead of labels like 'burglar'"),
-        _d("schedule", "Armed hours / motion during configured times", PLANNED,
-           requires="rule schedules — representable in AI-configure rules, enforcement lands "
-                    "with the scheduler"),
+        _d("schedule", "Armed hours / motion during configured times", PARTIAL,
+           how="AI-configured rules carry an HH:MM-HH:MM window, enforced on the device "
+               "(core/rules.py) in the rule's timezone when it names one, else device local time",
+           caveat="applies to AI-configured rules only; this mode's own zone/lingering/crowd "
+                  "alerts are not time-conditioned"),
     ],
 }
 

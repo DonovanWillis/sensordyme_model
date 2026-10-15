@@ -1,9 +1,18 @@
-# Installed by setup_pi.sh to /etc/sudoers.d/sensordyme-reboot (mode 0440).
-# Two narrowly-scoped privileged actions for the service user:
+# TEMPLATE. setup_pi.sh replaces __SENSORDYME_USER__ with the service user,
+# validates the result with `visudo -cf`, and installs it to
+# /etc/sudoers.d/sensordyme-reboot (mode 0440).
+#
+# Narrowly-scoped privileged actions for the service user -- exact command
+# lines, not whole programs. sudoers matches the arguments verbatim, so these
+# must stay identical to the argv services/ble_gatt.py builds (a test checks).
 #   * the health monitor's last-resort reboot (services/runtime.py, rate-limited
 #     and config-gated);
 #   * BLE advertising via the kernel mgmt API — bluetoothd's own advertising
 #     manager is broken on the Pi 5's controller, so services/ble_gatt.py falls
-#     back to btmgmt (see the comment there).
-pi ALL=(root) NOPASSWD: /usr/bin/systemctl reboot
-pi ALL=(root) NOPASSWD: /usr/bin/btmgmt
+#     back to btmgmt (see the comment there). It used to be `/usr/bin/btmgmt`
+#     with ANY arguments, i.e. the whole controller-management interface as root.
+__SENSORDYME_USER__ ALL=(root) NOPASSWD: /usr/bin/systemctl reboot
+__SENSORDYME_USER__ ALL=(root) NOPASSWD: /usr/bin/btmgmt connectable on
+__SENSORDYME_USER__ ALL=(root) NOPASSWD: /usr/bin/btmgmt rm-adv 1
+__SENSORDYME_USER__ ALL=(root) NOPASSWD: /usr/bin/btmgmt add-adv -u 5d1e0001-5344-4d45-b000-536e447a6d65 -c -g -n 1
+__SENSORDYME_USER__ ALL=(root) NOPASSWD: /usr/bin/btmgmt advinfo

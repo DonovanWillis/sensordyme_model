@@ -26,6 +26,7 @@ Nothing here estimates. Every number comes from a call that actually happened.
 
 from __future__ import annotations
 
+import math
 import statistics
 import time
 from collections.abc import Callable
@@ -36,6 +37,7 @@ from core.capabilities import registry
 from jupiter.eval.synth import Example
 from jupiter.interpret import interpret
 from jupiter.providers import Provider
+from jupiter.schema import NO_TARGET
 
 
 @dataclass
@@ -55,7 +57,10 @@ class CaseResult:
 
     @property
     def refusal_correct(self) -> bool:
-        return self.got_supported == self.expected_supported
+        # A call that failed or returned no usable JSON proposed no rule, but
+        # it did not REFUSE anything — counting it as a correct refusal let a
+        # dead or garbage-emitting provider score 100% on refusals.
+        return self.parsed and self.got_supported == self.expected_supported
 
     @property
     def hallucinated(self) -> bool:
@@ -92,8 +97,10 @@ class Report:
             "refusal_accuracy": self._rate(lambda c: c.refusal_correct),
             "hallucination_rate": self._rate(lambda c: c.hallucinated),
             "latency_mean_s": round(statistics.mean(latencies), 3) if latencies else None,
+            # Nearest-rank: the smallest value with at least 95% of samples at
+            # or below it. int() rounded the rank down and read low.
             "latency_p95_s": (
-                round(sorted(latencies)[max(0, int(len(latencies) * 0.95) - 1)], 3)
+                round(sorted(latencies)[max(0, math.ceil(len(latencies) * 0.95) - 1)], 3)
                 if latencies else None
             ),
             "wall_clock_s": round(self.wall_clock_s, 1),
@@ -155,9 +162,11 @@ def run(
             expected_supported=example.expect_supported,
             got_supported=got_supported,
             parsed=outcome.ok,
-            # Every returned rule already survived registry validation inside
-            # interpret(); a rule present here IS schema-valid by construction.
-            schema_ok=outcome.ok and all(r.target for r in interpretation.rules),
+            # Rules that fail validation never reach `interpretation.rules`, so
+            # checking those measured nothing (schema_rate == parse_rate). The
+            # question is whether every rule the MODEL proposed survived — the
+            # raw payload is what it actually wrote.
+            schema_ok=outcome.ok and _all_proposed_rules_valid(interpretation),
             target_match=target_match,
             predicate_match=predicate_match,
             latency_s=outcome.latency_s,
@@ -169,6 +178,17 @@ def run(
 
     report.wall_clock_s = time.monotonic() - started
     return report
+
+
+def _all_proposed_rules_valid(interpretation) -> bool:
+    """Every rule the model proposed — other than a deliberate target:"none"
+    refusal — was accepted by validation."""
+    raw_rules = (interpretation.raw or {}).get("rules") or []
+    proposed = sum(
+        1 for r in raw_rules
+        if isinstance(r, dict) and str(r.get("target", "")).strip().lower() != NO_TARGET
+    )
+    return len(interpretation.rules) == proposed
 
 
 def compare(reports: list[Report]) -> dict:

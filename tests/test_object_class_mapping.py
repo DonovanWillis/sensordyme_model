@@ -58,7 +58,7 @@ BOX = (100, 100, 200, 200)
 _CASES = {39: "bottle", 46: "banana", 0: "person", 67: "cell phone", 56: "chair", 2: "car"}
 
 
-@pytest.mark.parametrize("class_id,expected_label", sorted(_CASES.items()))
+@pytest.mark.parametrize(("class_id", "expected_label"), sorted(_CASES.items()))
 def test_class_id_resolves_to_the_correct_label(module, class_id, expected_label):
     """The exact table the product asked for: raw_class_id -> SensorDyme label."""
     module.set_requested_labels(set(_CASES.values()))
@@ -124,5 +124,5 @@ def test_a_detector_shim_with_no_cls_attribute_still_yields_people(module):
             return [_FakeResult([_NoClassBox(BOX)])]
 
     module._model = _ShimModel()
-    events = module.process(FRAME)  # must not raise AttributeError
+    module.process(FRAME)  # must not raise AttributeError
     assert module.get_detections().labels() == {"person"}

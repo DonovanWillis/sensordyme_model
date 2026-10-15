@@ -26,7 +26,7 @@ class FakeCamera:
     def __init__(self, config):
         self.released = False
 
-    def read(self):
+    def read(self, timeout_s=None):
         return np.zeros((48, 64, 3), dtype=np.uint8)
 
     def reopen(self):
@@ -117,14 +117,14 @@ def test_runtime_processes_frames_serves_health_and_shuts_down(tmp_path, monkeyp
         assert module.frames >= 5  # capture -> bus -> inference is flowing
 
         url = runtime.dashboard.url
-        with urllib.request.urlopen(url + "/api/health", timeout=5) as resp:
+        with urllib.request.urlopen(url + "/api/health", timeout=5) as resp:  # noqa: S310 - local test server URL
             health = json.loads(resp.read())
         assert health["state"] in ("ok", "degraded")  # degraded: wifi/accel details off-Pi
         assert health["components"]["camera"]["state"] == "ok"
         assert health["components"]["inference"]["state"] == "ok"
         assert "accelerator" in health["components"]
 
-        with urllib.request.urlopen(url + "/api/state", timeout=5) as resp:
+        with urllib.request.urlopen(url + "/api/state", timeout=5) as resp:  # noqa: S310 - local test server URL
             state = json.loads(resp.read())
         assert state["total_events"] >= 1  # the drowsiness event reached the dashboard
     finally:
@@ -208,7 +208,7 @@ def test_flash_active_is_edge_triggered_end_to_end(tmp_path, monkeypatch):
         url = runtime.dashboard.url
 
         def flash_active():
-            with urllib.request.urlopen(url + "/api/state", timeout=5) as resp:
+            with urllib.request.urlopen(url + "/api/state", timeout=5) as resp:  # noqa: S310 - local test server URL
                 return json.loads(resp.read())["flash_active"]
 
         deadline = time.monotonic() + 10

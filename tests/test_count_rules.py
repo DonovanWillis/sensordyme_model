@@ -128,11 +128,13 @@ def test_counting_does_not_disturb_the_other_predicates():
         detections=(Detection(label="person", confidence=0.9, box=(0, 0, 10, 10)),
                     Detection(label="bottle", confidence=0.9, box=(0, 0, 5, 5))),
     )
-    for t in (0.0, 0.5, 1.0, 1.5, 2.0, 2.5):
-        alerts = e.observe_frame(f, now=t)
-    kinds = {a.detection for a in e.observe_frame(f, now=3.0)}
-    # Both rule kinds coexist; the presence rule confirmed at some point.
-    assert isinstance(kinds, set)
+    fired: set[str] = set()
+    for t in (0.0, 0.5, 1.0, 1.5, 2.0, 2.5, 3.0):
+        fired |= {a.detection for a in e.observe_frame(f, now=t)}
+    # Both rule kinds coexist: the presence rule confirmed AND the count rule
+    # reported. (This used to assert only `isinstance(kinds, set)`, which no
+    # behaviour could fail.)
+    assert fired == {"person", "bottle"}
 
 
 def test_starting_up_pointed_at_an_empty_room_says_nothing():

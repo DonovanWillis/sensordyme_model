@@ -4,9 +4,9 @@ from core.event_engine import CONFIRMED, DEVELOPING, OBSERVED, RESOLVED, EventEn
 
 
 def _engine(**overrides):
-    spec = dict(detection="zone_violation:pool", severity="critical",
-                min_confidence=0.5, persist_s=2.0, min_frames=3,
-                occlusion_grace_s=1.0, resolve_after_s=5.0, cooldown_s=30.0)
+    spec = {"detection": "zone_violation:pool", "severity": "critical",
+            "min_confidence": 0.5, "persist_s": 2.0, "min_frames": 3,
+            "occlusion_grace_s": 1.0, "resolve_after_s": 5.0, "cooldown_s": 30.0}
     spec.update(overrides)
     return EventEngine({spec["detection"]: RuleSpec(**spec)}), spec["detection"]
 

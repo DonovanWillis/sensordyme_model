@@ -53,8 +53,9 @@ struct DevicesView: View {
                     // blaming the network for both.
                     DeviceLinkBanner(
                         link: link,
-                        backendDevice: devices.first,
-                        backendReachable: errorMessage == nil
+                        backendDevice: linkedBackendDevice,
+                        backendReachable: errorMessage == nil,
+                        accountHasDevices: !devices.isEmpty
                     )
 
                     ForEach(devices) { device in
@@ -155,6 +156,18 @@ struct DevicesView: View {
         .tint(SD.Colors.accent)
     }
 
+    /// The backend's record of the camera this phone links, for the banner.
+    ///
+    /// Was `devices.first`, which on a two-device account described the OTHER
+    /// device: "hasn't reported in 3 days… switched off" about a camera that was
+    /// running, using its neighbour's last_seen. Nil when it is ambiguous,
+    /// which the banner says plainly rather than guessing.
+    private var linkedBackendDevice: Device? {
+        FeedLink.linkedDeviceIndex(
+            hardwareIDs: devices.map(\.hardwareId), linkedID: state.linkedDeviceID
+        ).map { devices[$0] }
+    }
+
     /// Distinguishes "still loading" from "genuinely nothing here" — showing an
     /// empty state during the first fetch reads as "you have no devices", which
     /// is alarming when you do.
@@ -179,7 +192,7 @@ struct DevicesView: View {
             let fetched = try await state.backend.devices()
             guard reloadGuard.isLatest(token) else { return }
             devices = fetched
-            state.accountDeviceCount = fetched.count
+            state.recordAccountDevices(fetched)
             errorMessage = nil
             refreshing.succeed()
         } catch let error as APIError where error.isAuthFailure {

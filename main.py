@@ -97,6 +97,8 @@ ALERT_EVENT_TYPES_MAC_MAX = {
     "vlm_confirmed_eating",
 }
 WINDOW_NAME = "SensorDyme"
+#: Exit status for an invalid config (sysexits.h EX_CONFIG); see run().
+CONFIG_ERROR_EXIT = 78
 
 
 def load_config(path: Union[str, Path]) -> dict:
@@ -125,6 +127,33 @@ from core.presets import (  # noqa: E402
 __all__ = ["load_preset_aliases", "load_presets", "resolve_preset", "same_preset"]
 
 
+def restored_preset(config_module: Optional[str], modules_cfg: dict,
+                    presets: dict) -> Optional[tuple[str, dict, dict]]:
+    """The preset the owner last chose, if it still applies: (name, preset, overrides).
+
+    None when nothing was saved, when config.yaml's `module:` has changed since
+    (a newer, deliberate choice — see core/device_state.py), or when the saved
+    name no longer resolves to a preset and variant this build can run.
+    """
+    from core import device_state
+
+    name = device_state.saved_preset(config_module)
+    if not name:
+        return None
+    name = resolve_preset(name, presets)
+    base, _, variant_name = name.partition(":")
+    preset = presets.get(base)
+    if preset is None or preset.get("module") not in (modules_cfg or {}):
+        return None
+    overrides: dict = {}
+    if variant_name:
+        variant = (preset.get("variants") or {}).get(variant_name)
+        if variant is None:
+            return None
+        overrides = variant.get("overrides") or {}
+    return name, preset, overrides
+
+
 def alert_types_for(module_name: str, preset: Optional[dict] = None) -> set:
     """The alertable event types for a module, with optional per-preset override."""
     if preset and preset.get("alert_types"):
@@ -149,7 +178,15 @@ def build_alert_manager(alert_cfg: dict, is_pi: bool) -> AlertManager:
             if is_pi:
                 from core.alerts import GPIOBuzzerSink
 
-                sinks.append(GPIOBuzzerSink(int(alert_cfg.get("gpio_buzzer_pin", 17))))
+                # Losing the buzzer must not cost detection. gpiozero/lgpio come
+                # from setup_pi.sh, not requirements-device.txt, and a busy pin
+                # or a permissions problem raises here too — unguarded, that
+                # exited the process before the runtime existed, and systemd's
+                # StartLimitAction=reboot turned it into a reboot loop.
+                try:
+                    sinks.append(GPIOBuzzerSink(int(alert_cfg.get("gpio_buzzer_pin", 17))))
+                except Exception as exc:  # noqa: BLE001 - any failure means "no buzzer"
+                    print(f"SensorDyme: 'gpio_buzzer' sink unavailable ({exc}); continuing without it")
             else:
                 print("SensorDyme: 'gpio_buzzer' sink skipped (not running on a Pi)")
         else:
@@ -216,13 +253,30 @@ def run(argv: Optional[list[str]] = None) -> None:
     if errors:
         for error in errors:
             print(f"SensorDyme: config ERROR: {error}")
-        raise SystemExit(f"invalid config ({len(errors)} error(s) above) — refusing to start")
+        print(f"SensorDyme: invalid config ({len(errors)} error(s) above) — refusing to start")
+        # EX_CONFIG. sensordyme.service lists it in RestartPreventExitStatus, so
+        # a bad config stops the service with the reason in the journal instead
+        # of Restart=always + StartLimitAction=reboot power-cycling the Pi for
+        # ever over a file no reboot can fix.
+        raise SystemExit(CONFIG_ERROR_EXIT)
 
     profile = args.profile if args.profile is not None else config.get("profile", "pi")
 
     module_name = args.module if args.module is not None else config["module"]
     if args.module is not None:
         profile = "pi"  # --module runs through the standard module path
+
+    # Presets: app/dashboard-selectable modes (standard module path only — the
+    # mac_max profile keeps its own launch flow and is never hot-swapped).
+    presets = load_presets() if profile != "mac_max" else {}
+
+    # The mode the owner picked survives a restart. An explicit --module is a
+    # developer asking for something specific, so it wins.
+    restored = None
+    if profile != "mac_max" and args.module is None:
+        restored = restored_preset(config.get("module"), config.get("modules", {}), presets)
+    if restored is not None:
+        module_name = restored[1]["module"]
 
     if profile == "mac_max":
         from modules.driver_attention_max import require_mps
@@ -240,16 +294,23 @@ def run(argv: Optional[list[str]] = None) -> None:
         alert_event_types = ALERT_EVENT_TYPES_MAC_MAX
     else:
         module_cls = get_module_class(module_name)
-        module_config = {**config["modules"][module_name], "recalibrate": args.recalibrate}
+        overrides = restored[2] if restored is not None else {}
+        module_config = {
+            **config["modules"][module_name], **overrides, "recalibrate": args.recalibrate,
+        }
         alert_cfg = config.get("alerts", {})
         alert_event_types = ALERT_EVENT_TYPES_BY_MODULE.get(module_name, ALERT_EVENT_TYPES_PI)
 
-    # Presets: app/dashboard-selectable modes (standard module path only — the
-    # mac_max profile keeps its own launch flow and is never hot-swapped).
-    presets = load_presets() if profile != "mac_max" else {}
-    active_preset = next((n for n, p in presets.items() if p.get("module") == module_name), None)
-    if active_preset is not None:
-        alert_event_types = alert_types_for(module_name, presets[active_preset])
+    if restored is not None:
+        active_preset: Optional[str] = restored[0]
+        alert_event_types = alert_types_for(module_name, restored[1])
+        print(f"SensorDyme: restored the last selected mode '{active_preset}'")
+    else:
+        active_preset = next(
+            (n for n, p in presets.items() if p.get("module") == module_name), None
+        )
+        if active_preset is not None:
+            alert_event_types = alert_types_for(module_name, presets[active_preset])
 
     # Install the accelerator config BEFORE constructing the module. This is an
     # ordering requirement, not a tidiness one: core.accel.maybe_hailo_yolo reads

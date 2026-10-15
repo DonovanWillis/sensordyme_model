@@ -326,7 +326,7 @@ def test_openai_compatible_403_is_retryable_not_a_dead_key():
 
 
 def test_openai_compatible_requires_base_url():
-    with pytest.raises(ValueError):
+    with pytest.raises(ValueError, match=r"vlm\.base_url is required"):
         VLMJudge(
             {"provider": "openai_compatible", "model": "x", "interval_s": 0.0},
             post=_FakePost({}),
@@ -335,7 +335,7 @@ def test_openai_compatible_requires_base_url():
 
 
 def test_unknown_provider_raises():
-    with pytest.raises(ValueError):
+    with pytest.raises(ValueError, match=r"unknown vlm\.provider 'gemini'"):
         VLMJudge({"provider": "gemini", "interval_s": 0.0}, autostart=False)
 
 

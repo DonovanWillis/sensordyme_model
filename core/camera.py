@@ -7,6 +7,7 @@ built-in webcam. Callers only ever see :meth:`Camera.frames`.
 
 from __future__ import annotations
 
+import threading
 import time
 from collections.abc import Iterator
 from contextlib import suppress
@@ -18,6 +19,12 @@ import numpy as np
 from core.logging_setup import get_logger
 
 log = get_logger("camera")
+
+#: Device handles abandoned because a read on them never returned (see
+#: Camera.read's `timeout_s`). Held for the life of the process on purpose:
+#: releasing -- or letting the GC finalise -- a handle whose read is still
+#: blocked can block the caller in turn, and the caller is boot or recovery.
+_ABANDONED_HANDLES: list = []
 
 
 def detect_pi() -> bool:
@@ -45,11 +52,17 @@ class CameraError(RuntimeError):
 class Camera:
     """FPS-throttled frame source: Picamera2 on Pi, cv2 webcam on Mac/dev."""
 
-    def __init__(self, config: dict) -> None:
+    def __init__(self, config: dict, open_now: bool = True) -> None:
         """Open the platform-appropriate capture device.
 
         Args:
             config: The `camera` section of config.yaml (width, height, fps, device_index).
+            open_now: False builds the camera CLOSED: every attribute (fps,
+                is_pi) is set from config, read() raises CameraError, and
+                reopen() opens it. This is how the runtime boots when the
+                camera cannot be opened at startup -- the capture pump's own
+                read-failure -> reopen path then keeps trying, while health,
+                the dashboard and provisioning come up and can say so.
         """
         self._width = int(config.get("width", 640))
         self._height = int(config.get("height", 480))
@@ -63,6 +76,8 @@ class Camera:
         self._picam: Optional[object] = None
         self._cap: Optional[cv2.VideoCapture] = None
 
+        if not open_now:
+            return
         if self.is_pi:
             print("SensorDyme: detected Raspberry Pi -> using Picamera2 (Camera Module 3)")
             self._start_picamera()
@@ -132,13 +147,71 @@ class Camera:
                 "camera access in System Settings > Privacy & Security > Camera."
             )
 
-    def read(self) -> np.ndarray:
+    @property
+    def is_open(self) -> bool:
+        """Whether a device handle is held (False when built with open_now=False,
+        after release(), after a failed open, or after a read timed out)."""
+        if getattr(self, "is_pi", False):
+            return getattr(self, "_picam", None) is not None
+        return getattr(self, "_cap", None) is not None
+
+    def read(self, timeout_s: Optional[float] = None) -> np.ndarray:
         """Capture and return one BGR frame.
 
+        Args:
+            timeout_s: None (the capture pump's case) blocks for as long as the
+                driver does. A number bounds the wait -- for the one-shot
+                verifying reads at boot (runtime, preflight), where a driver
+                hang otherwise holds the whole service start until systemd's
+                TimeoutStartSec. On timeout the blocked handle is ABANDONED,
+                not released (releasing a handle mid-read can block in turn):
+                the camera reads as closed, and a later reopen() tries a fresh
+                one. Only use it where that trade is right.
+
         Raises:
-            CameraError: on a failed read, so the caller (services/capture.py)
-                can retry or :meth:`reopen` instead of the process dying.
+            CameraError: on a failed read (or a timeout, or a closed camera), so
+                the caller (services/capture.py) can retry or :meth:`reopen`
+                instead of the process dying.
         """
+        if timeout_s is not None:
+            return self._read_with_timeout(timeout_s)
+        return self._read()
+
+    def _read_with_timeout(self, timeout_s: float) -> np.ndarray:
+        outcome: dict = {}
+        done = threading.Event()
+
+        def _worker() -> None:
+            try:
+                outcome["frame"] = self._read()
+            except BaseException as exc:  # noqa: BLE001 - handed back to the caller
+                outcome["error"] = exc
+            finally:
+                done.set()
+
+        threading.Thread(target=_worker, daemon=True, name="camera-verify-read").start()
+        if not done.wait(timeout_s):
+            self._abandon_handle()
+            raise CameraError(
+                f"camera read did not return within {timeout_s:.1f}s (driver hang); "
+                "the handle was abandoned"
+            )
+        if "error" in outcome:
+            raise outcome["error"]
+        return outcome["frame"]
+
+    def _abandon_handle(self) -> None:
+        """Forget a handle whose read never returned, without touching it."""
+        for attribute in ("_picam", "_cap"):
+            handle = getattr(self, attribute, None)
+            if handle is not None:
+                _ABANDONED_HANDLES.append(handle)
+                setattr(self, attribute, None)
+        log.error("camera read hung; abandoned the device handle (a process restart frees it)")
+
+    def _read(self) -> np.ndarray:
+        if not self.is_open:
+            raise CameraError("camera is not open")
         try:
             if self.is_pi:
                 # No channel conversion: Picamera2's "RGB888" format delivers

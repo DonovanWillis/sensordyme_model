@@ -36,6 +36,8 @@ this class).
 from __future__ import annotations
 
 import base64
+import contextlib
+import ipaddress
 import json
 import os
 import re
@@ -44,6 +46,7 @@ import time
 from collections.abc import Callable
 from dataclasses import dataclass
 from typing import Optional
+from urllib.parse import urlsplit
 
 import cv2
 import numpy as np
@@ -111,7 +114,7 @@ class VLMBackendAuthError(RuntimeError):
     """Credentials are missing or rejected — disables the judge immediately with its message."""
 
 
-class VLMBackendRateLimited(RuntimeError):
+class VLMBackendRateLimited(RuntimeError):  # noqa: N818 - established exception name
     """The provider rate-limited us; carries how long to back off."""
 
     def __init__(self, message: str, retry_after: float) -> None:
@@ -119,14 +122,50 @@ class VLMBackendRateLimited(RuntimeError):
         self.retry_after = retry_after
 
 
+class VLMUnusableVerdict(RuntimeError):  # noqa: N818 - established exception name
+    """The backend answered, but not with a usable verdict (empty, not JSON, or a
+    state outside VLM_STATES). Counts toward max_consecutive_failures: a judge
+    that only ever returns this is broken, and must say so rather than sit on
+    "warming up" for ever."""
+
+
+#: Where the Ollama backend connects when vlm.base_url is not set.
+_OLLAMA_DEFAULT_BASE = "http://localhost:11434"
+
+
+def _is_loopback_url(url: str) -> bool:
+    """Whether `url`'s HOST is this machine. Parsed, not substring-matched:
+    "https://localhost.example.com" and "https://api.example.com/?via=localhost"
+    both contain "localhost" and both send frames off the machine."""
+    try:
+        host = urlsplit(url).hostname
+    except ValueError:
+        return False
+    if not host:
+        return False
+    if host == "localhost":
+        return True
+    try:
+        address = ipaddress.ip_address(host)
+    except ValueError:
+        return False  # any other name is resolved elsewhere: assume it leaves the machine
+    # 0.0.0.0 / :: as a destination reach this host on Linux and macOS.
+    return address.is_loopback or address.is_unspecified
+
+
 def vlm_is_local(config: dict) -> bool:
-    """Whether the configured provider keeps frames on this machine (no network egress)."""
+    """Whether the configured provider keeps frames on this machine (no network egress).
+
+    Decided from the host the backend will actually connect to. Ollama is local
+    only at its default address — it is commonly run on a separate GPU box, and
+    the Ollama backend honours vlm.base_url, so `provider: ollama` alone used to
+    print "frames stay ON-DEVICE" while they went over the network.
+    """
     provider = config.get("provider", "anthropic")
     if provider == "ollama":
-        return True
+        return _is_loopback_url(config.get("base_url") or _OLLAMA_DEFAULT_BASE)
     if provider == "openai_compatible":
-        base = (config.get("base_url") or "").lower()
-        return any(host in base for host in ("localhost", "127.0.0.1", "0.0.0.0"))
+        return _is_loopback_url(config.get("base_url") or "")
     return False
 
 
@@ -166,6 +205,10 @@ class _AnthropicBackend:
 
     def __init__(self, config: dict, client: Optional[object] = None) -> None:
         self._model = config.get("model", "claude-opus-4-8")
+        # Configurable for the same reason as the openai_compatible backend: a
+        # model that thinks before answering spends this budget first, and an
+        # exhausted budget yields no verdict text at all.
+        self._max_tokens = int(config.get("max_tokens", 300))
         self._client = client
         self._anthropic = None  # the imported module, for typed exception checks
 
@@ -197,7 +240,7 @@ class _AnthropicBackend:
         try:
             response = client.messages.create(
                 model=self._model,
-                max_tokens=300,  # deliberately short: the answer is a tiny JSON verdict
+                max_tokens=self._max_tokens,  # default 300: the answer is a tiny JSON verdict
                 system=_SYSTEM_PROMPT,
                 output_config={"format": {"type": "json_schema", "schema": _OUTPUT_SCHEMA}},
                 messages=[{"role": "user", "content": content}],
@@ -216,10 +259,8 @@ class _AnthropicBackend:
                 ) from exc
             if an is not None and isinstance(exc, an.RateLimitError):
                 retry_after = 30.0
-                try:
+                with contextlib.suppress(AttributeError, TypeError, ValueError):
                     retry_after = float(exc.response.headers.get("retry-after", "30"))
-                except (AttributeError, TypeError, ValueError):
-                    pass
                 raise VLMBackendRateLimited("Anthropic API rate limited", retry_after) from exc
             raise
         if getattr(response, "stop_reason", None) == "refusal":
@@ -232,7 +273,7 @@ class _OllamaBackend:
 
     def __init__(self, config: dict, post: Optional[Callable] = None) -> None:
         self._model = config.get("model", "qwen2.5vl:7b")
-        base = (config.get("base_url") or "http://localhost:11434").rstrip("/")
+        base = (config.get("base_url") or _OLLAMA_DEFAULT_BASE).rstrip("/")
         self._url = base + "/api/chat"
         self._conn_error_cls: Optional[type] = None
         if post is None:
@@ -338,13 +379,19 @@ class _OpenAICompatBackend:
             )
         if response.status_code == 429:
             retry_after = 30.0
-            try:
+            with contextlib.suppress(AttributeError, TypeError, ValueError):
                 retry_after = float(response.headers.get("retry-after", "30"))
-            except (AttributeError, TypeError, ValueError):
-                pass
             raise VLMBackendRateLimited("provider rate limited", retry_after)
         response.raise_for_status()
-        return response.json()["choices"][0]["message"]["content"]
+        message = response.json()["choices"][0]["message"]
+        content = message.get("content")
+        if content is None and message.get("refusal"):
+            return None  # an explicit refusal, like Anthropic's stop_reason "refusal"
+        if isinstance(content, list):  # some servers return content as typed parts
+            return "".join(part.get("text", "") for part in content if isinstance(part, dict))
+        # A null content with no refusal (e.g. hidden reasoning exhausted
+        # max_tokens) is an EMPTY answer, which _classify counts as a failure.
+        return content if isinstance(content, str) else ""
 
 
 _BACKENDS = {
@@ -406,11 +453,20 @@ class VLMConfirmTracker:
                     self._fired_state = verdict.state
                     return verdict.state
         else:
-            self._streak_state = None
-            self._streak = 0
-            self._fired_state = None
-            self.active_state = None
+            self.reset()
         return None
+
+    def reset(self) -> None:
+        """Forget the streak and any confirmed state.
+
+        Called by the module when there is no CURRENT verdict to stand on (the
+        judge disabled itself, or stopped answering): a confirmed state is a
+        claim about the driver now, and it must not outlive its evidence.
+        """
+        self._streak_state = None
+        self._streak = 0
+        self._fired_state = None
+        self.active_state = None
 
 
 # ---------------------------------------------------------------------------- judge
@@ -512,8 +568,25 @@ class VLMJudge:
         with self._lock:
             return self._verdict
 
+    def verdict_lifetime_s(self, verdict: VLMVerdict) -> float:
+        """How long `verdict` stays current: two full judgment cycles (interval,
+        burst capture and the call's own latency), so one slow or failed call
+        never expires a live verdict but a judge that has stopped answering —
+        network down, rate-limit backoff, or disabled — does."""
+        burst_span = (self._burst_frames - 1) * self._burst_spacing_s
+        return 2.0 * (self._interval_s + burst_span + max(verdict.latency_s, 1.0))
+
+    def is_current(self, verdict: VLMVerdict, now: Optional[float] = None) -> bool:
+        """Whether `verdict` still describes the driver: the judge is running and
+        the verdict is younger than verdict_lifetime_s()."""
+        if self._disabled_reason is not None or self._stop.is_set():
+            return False
+        now = time.monotonic() if now is None else now
+        return now - verdict.at <= self.verdict_lifetime_s(verdict)
+
     def close(self) -> None:
-        """Stop the worker thread."""
+        """Stop the worker thread. Idempotent; never blocks on an in-flight call
+        (the worker is a daemon and exits after it returns)."""
         self._stop.set()
         self._wake.set()
 
@@ -549,7 +622,14 @@ class VLMJudge:
             self._failures = 0
 
     def _classify(self, frames: list[np.ndarray]) -> Optional[VLMVerdict]:
-        """One synchronous judgment over a burst. Returns None on a refusal or unparseable answer."""
+        """One synchronous judgment over a burst.
+
+        Returns None on a refusal (not a failure: the judge declined, it is not
+        broken). Raises VLMUnusableVerdict when the backend answered with
+        nothing usable — empty text, no JSON, or a state outside VLM_STATES — so
+        it counts toward max_consecutive_failures instead of being dropped
+        silently for ever.
+        """
         images_b64: list[str] = []
         for frame in frames:
             ok, buf = cv2.imencode(".jpg", frame, [int(cv2.IMWRITE_JPEG_QUALITY), self._jpeg_quality])
@@ -561,13 +641,15 @@ class VLMJudge:
         t0 = time.perf_counter()
         text = self._backend.judge(images_b64)
         latency = time.perf_counter() - t0
+        if text is None:
+            return None  # a refusal
 
         data = _extract_json(text)
         if data is None:
-            return None
+            raise VLMUnusableVerdict(f"no JSON verdict in the answer: {str(text)[:80]!r}")
         state = data.get("state")
         if state not in VLM_STATES:
-            return None
+            raise VLMUnusableVerdict(f"state {state!r} is not one of {', '.join(VLM_STATES)}")
         try:
             confidence = max(0.0, min(1.0, float(data.get("confidence", 0.0))))
         except (TypeError, ValueError):

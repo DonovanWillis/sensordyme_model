@@ -49,7 +49,7 @@ _StrictUniqueKeyLoader.add_constructor(
 
 def _load_strict() -> dict:
     with PRESETS_PATH.open() as f:
-        return yaml.load(f, Loader=_StrictUniqueKeyLoader)
+        return yaml.load(f, Loader=_StrictUniqueKeyLoader)  # noqa: S506 - a yaml.SafeLoader subclass
 
 
 def test_file_exists():

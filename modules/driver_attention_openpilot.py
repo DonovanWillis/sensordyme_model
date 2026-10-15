@@ -671,6 +671,10 @@ _MODEL_URL = (
     "selfdrive/modeld/models/dmonitoring_model.onnx"
 )
 
+#: Most DriverMonitoring ticks (DT_DMON each) run for one camera frame: 2s of
+#: policy time. Backlog beyond this is dropped, not replayed (see process()).
+_MAX_TICKS_PER_FRAME = 40
+
 
 class _OnnxDMModel:
   """Runs openpilot's dmonitoring_model.onnx with their exact crop and parsing."""
@@ -881,12 +885,17 @@ class DriverAttentionOpenpilotModule(VisionModule):
     now = time.monotonic()
     if self._last_tick is None:
       self._last_tick = now
-    self._tick_accum += now - self._last_tick
+    # Catch up at most _MAX_TICKS_PER_FRAME ticks of policy time per frame and
+    # DROP any older backlog. Kept, a loop stall (a first-run YOLO download on
+    # the phone detector's first frame, GC, sleep) was replayed at 40 ticks per
+    # frame with the CURRENT driver state, so a glance away right after a 30s
+    # stall reached the terminal alert in ~0.2s of real time.
+    self._tick_accum = min(self._tick_accum + (now - self._last_tick), _MAX_TICKS_PER_FRAME * DT_DMON)
     self._last_tick = now
 
     fired: set[str] = set()
     ticks = 0
-    while self._tick_accum >= DT_DMON and ticks < 40:
+    while self._tick_accum >= DT_DMON and ticks < _MAX_TICKS_PER_FRAME:
       self._dm.run_step(self._build_sm())
       fired |= set(self._dm.current_events.events)
       self._tick_accum -= DT_DMON
@@ -967,6 +976,16 @@ class DriverAttentionOpenpilotModule(VisionModule):
 
   def get_telemetry_snapshot(self) -> Optional[dict]:
     return None  # this module's signals don't fit the shared telemetry schema
+
+  def close(self) -> None:
+    """Release the MediaPipe Hands graph (the ONNX session is freed with the
+    module). Safe to call twice; the runtime calls it on swap and shutdown."""
+    hands, self._hands = getattr(self, "_hands", None), None
+    if hands is not None:
+      try:
+        hands.close()
+      except Exception:  # noqa: BLE001, S110 - releasing a graph must never raise into shutdown
+        pass
 
   def annotate(self, frame: np.ndarray) -> np.ndarray:
     h, w = frame.shape[:2]

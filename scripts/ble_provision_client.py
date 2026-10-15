@@ -22,6 +22,7 @@ import asyncio
 import json
 import sys
 import time
+from typing import Optional
 
 from bleak import BleakClient, BleakScanner
 
@@ -31,6 +32,33 @@ CHAR_WIFI_CREDS = "5d1e0003-5344-4d45-b000-536e447a6d65"
 CHAR_STATUS = "5d1e0004-5344-4d45-b000-536e447a6d65"
 CHAR_COMMAND = "5d1e0005-5344-4d45-b000-536e447a6d65"
 CHAR_NETWORKS = "5d1e0006-5344-4d45-b000-536e447a6d65"
+
+
+def pick_outcome(updates: list[dict], baseline_attempt: Optional[int] = None) -> Optional[dict]:
+    """The ok/error answer to THIS write among `updates`, or None while there is none.
+
+    The device keeps its last outcome in every status it sends, so a status that
+    arrives after the write can still describe the PREVIOUS attempt. Taking the
+    newest ok/error in the list (which this did) reported a retry's result as
+    whatever the last attempt said. An outcome counts only when it is numbered
+    after `baseline_attempt` (the attempt the device reported before this write),
+    or -- for firmware that does not number attempts -- once this write's own
+    "connecting" has been seen.
+    """
+    seen_connecting = False
+    for update in updates:
+        provision = update.get("provision") or {}
+        state = provision.get("state")
+        attempt = provision.get("attempt")
+        numbered = isinstance(attempt, int)
+        if numbered and baseline_attempt is not None and attempt <= baseline_attempt:
+            continue  # an earlier attempt's status
+        if state == "connecting":
+            seen_connecting = True
+            continue
+        if state in ("ok", "error") and (seen_connecting or numbered):
+            return provision
+    return None
 
 
 async def find_device(timeout: float = 10.0):
@@ -80,7 +108,7 @@ async def _read_json(client, uuid, label):
     raw = await client.read_gatt_char(uuid)
     try:
         return json.loads(raw.decode())
-    except Exception:
+    except Exception:  # noqa: BLE001 - any undecodable payload is reported, never fatal
         print(f"  {label}: unparseable: {raw!r}")
         return None
 
@@ -112,7 +140,7 @@ async def cmd_networks(args) -> int:
     def on_status(_handle, data: bytearray):
         try:
             status = json.loads(data.decode())
-        except Exception:
+        except Exception:  # noqa: BLE001 - an undecodable push is skipped, never fatal
             return
         print(f"    status push: scanning={status.get('scanning')}")
         if status.get("scanning") is False:
@@ -153,20 +181,31 @@ async def cmd_provision(args) -> int:
     device, _ = devices[0]
 
     updates: list[dict] = []
+    # Assigned before any callback can run: a status pushed between
+    # start_notify() and the write used to hit an unassigned `t0`.
+    t0 = time.monotonic()
 
-    def on_status(_handle, data: bytearray):
-        try:
-            status = json.loads(data.decode())
-        except Exception:
+    def record(status, how: str) -> None:
+        if not isinstance(status, dict):
             return
         updates.append(status)
         stamp = time.monotonic() - t0
         provision = status.get("provision") or {}
-        print(f"  [{stamp:5.1f}s] connectivity={status.get('state')!r:15} "
-              f"provision={provision.get('state')!r} {provision.get('error') or ''}")
+        print(f"  [{stamp:5.1f}s] {how:6} connectivity={status.get('state')!r:15} "
+              f"provision={provision.get('state')!r} attempt={provision.get('attempt')!r} "
+              f"{provision.get('error') or ''}")
+
+    def on_status(_handle, data: bytearray):
+        try:
+            status = json.loads(data.decode())
+        except Exception:  # noqa: BLE001 - an undecodable push is skipped, never fatal
+            return  # e.g. a notification cut at the MTU; the reads below cover it
+        record(status, "notify")
 
     async with BleakClient(device) as client:
         print(f"connected to {device.address}")
+        before = await _read_json(client, CHAR_STATUS, "status")
+        baseline = ((before or {}).get("provision") or {}).get("attempt") if isinstance(before, dict) else None
         await client.start_notify(CHAR_STATUS, on_status)
 
         # Never log the passphrase. Whether one was supplied is enough to
@@ -182,23 +221,22 @@ async def cmd_provision(args) -> int:
         # device that refuses a network stays on its old one and keeps reporting
         # "online" — reading that as the result declares success for a setup
         # that failed, which is exactly what this client did at first.
-        def outcome():
-            for update in reversed(updates):
-                provision = update.get("provision") or {}
-                if provision.get("state") in ("ok", "error"):
-                    return provision
-            return None
-
+        # Read as well as listen, like the app: a notification longer than the
+        # MTU arrives truncated and unparseable, a read does not.
         deadline = time.monotonic() + args.wait
-        while time.monotonic() < deadline and outcome() is None:
-            await asyncio.sleep(0.5)
+        next_read = time.monotonic()
+        while time.monotonic() < deadline and pick_outcome(updates, baseline) is None:
+            if time.monotonic() >= next_read:
+                record(await _read_json(client, CHAR_STATUS, "status"), "read")
+                next_read = time.monotonic() + 2.0
+            await asyncio.sleep(0.25)
 
-    final = outcome()
+    final = pick_outcome(updates, baseline)
     if final is None:
         print(f"NO OUTCOME within {args.wait:.0f}s — this is the 'stuck on Sending' failure")
         return 2
     if final.get("state") == "ok":
-        print(f"OK: device joined {final.get('ssid')} at {final.get('ip')}")
+        print(f"OK: device joined {args.ssid} at {final.get('ip')}")
         return 0
     print(f"FAILED: {final.get('error')}")
     return 1

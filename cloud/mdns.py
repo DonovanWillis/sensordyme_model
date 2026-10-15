@@ -56,16 +56,39 @@ DEFAULT_PORT = 8787
 #: the endpoint is disposable — which is the property every client needs and none
 #: of them could get from `LocalHostName`.
 #:
-#: If two machines on one network both run this backend, zeroconf's conflict
-#: detection appends a suffix to one of them; the `id` below is what tells them
-#: apart for a client that cares.
+#: If two machines on one network both run this backend, they would BOTH answer
+#: for this name: python-zeroconf's conflict detection probes only the service
+#: INSTANCE name, never the `server` host name (zeroconf `async_check_service`),
+#: so nothing renamed either of them and a device configured with
+#: `sensordyme-backend.local` could reach -- and hand its device key to -- the
+#: other one. So the name is probed before it is claimed (`_choose_hostname`):
+#: if another machine already answers for it, this backend announces itself as
+#: `sensordyme-backend-<id>` instead and says so in the log. The common case --
+#: one backend on the LAN -- keeps the plain name, which is what devices are
+#: configured with (docs/NETWORKING.md).
 STABLE_HOSTNAME = "sensordyme-backend"
+
+#: How long to listen for another owner of STABLE_HOSTNAME before claiming it.
+#: Only paid once per process (the choice is then kept), on a thread.
+PROBE_TIMEOUT_MS = 1000
 
 #: Where this backend's stable identity is kept. Same approach as the JWT secret:
 #: generated once, persisted, never shipped.
 BACKEND_ID_FILE = os.environ.get(
     "SENSORDYME_BACKEND_ID_FILE", str(Path(__file__).resolve().parent / ".backend_id")
 )
+
+
+def read_backend_id() -> Optional[str]:
+    """This backend's persisted id, or None -- WITHOUT minting one.
+
+    For tools (scripts/diagnose_backend_mac.py) that must identify the running
+    backend's record but must not create an identity as a side effect.
+    """
+    try:
+        return Path(BACKEND_ID_FILE).read_text().strip() or None
+    except OSError:
+        return None
 
 
 def backend_id() -> str:
@@ -157,6 +180,78 @@ def lan_ip() -> Optional[str]:
     return None if address.startswith("127.") else address
 
 
+#: Interface-name prefixes that are never the LAN a phone is on: VPN tunnels,
+#: point-to-point links, container and VM bridges, loopback.
+_NOT_LAN_INTERFACES = (
+    "lo", "utun", "tun", "tap", "ppp", "ipsec", "wg", "tailscale", "zt",
+    "docker", "veth", "vmnet", "vboxnet", "gif", "stf",
+)
+
+
+def _ipv4_interfaces() -> dict[str, str]:
+    """{IPv4 address: interface name} for this machine; {} if unknown."""
+    try:
+        import ifaddr  # a dependency of zeroconf
+    except ImportError:
+        return {}
+    found: dict[str, str] = {}
+    try:
+        for adapter in ifaddr.get_adapters():
+            name = str(adapter.nice_name or adapter.name)
+            for ip in adapter.ips:
+                if isinstance(ip.ip, str):  # IPv6 entries are tuples
+                    found.setdefault(ip.ip, name)
+    except Exception:  # noqa: BLE001 - best effort, like everything here
+        return {}
+    return found
+
+
+def _is_lan(address: str, interface: str) -> bool:
+    if address.startswith(("127.", "169.254.")):
+        return False
+    return not interface.lower().startswith(_NOT_LAN_INTERFACES)
+
+
+def lan_addresses() -> list[str]:
+    """Every address a phone on this machine's LAN(s) could reach it at,
+    best first.
+
+    `lan_ip()` alone is the address of the DEFAULT ROUTE, and it used to be
+    the only address announced, on every interface. Two cases made that a
+    dead address: a full-tunnel VPN (the default route is the tunnel, so the
+    LAN was told a VPN address), and a machine on two networks at once
+    (Ethernet + Wi-Fi), whose second network was told the first one's address.
+    Now the routed address comes first when it is a real LAN address, followed
+    by every other LAN address, and tunnel interfaces are left out.
+
+    No default route at all still means "not on a network": empty, so the
+    record is withdrawn rather than guessed.
+    """
+    primary = lan_ip()
+    if primary is None:
+        return []
+    interfaces = _ipv4_interfaces()
+    ordered: list[str] = []
+    if primary not in interfaces or _is_lan(primary, interfaces[primary]):
+        ordered.append(primary)
+    ordered += [a for a, name in interfaces.items() if a not in ordered and _is_lan(a, name)]
+    return ordered
+
+
+def hostname_owners(zc, hostname: str, timeout_ms: int = PROBE_TIMEOUT_MS) -> list[str]:
+    """The IPv4 addresses some responder on the network gives for
+    `hostname`.local right now ([] if nobody answers)."""
+    # Public in zeroconf's __init__ but missing from its __all__ (0.151).
+    from zeroconf import AddressResolverIPv4, Zeroconf  # pyright: ignore[reportPrivateImportUsage]
+
+    if not isinstance(zc, Zeroconf):
+        return []
+    resolver = AddressResolverIPv4(f"{hostname}.local.")
+    if not resolver.request(zc, timeout_ms):
+        return []
+    return list(resolver.parsed_addresses())
+
+
 class Advertiser:
     """Publishes the service while the server runs, keeps it true, and withdraws
     it on shutdown.
@@ -206,13 +301,19 @@ class Advertiser:
         self.name = name or f"SensorDyme Cloud ({self.backend_id.removeprefix('bk_')[:8]})"
         self._zeroconf = None
         self._info = None
+        #: The host name actually claimed: STABLE_HOSTNAME, or the per-backend
+        #: fallback when another machine already answered for it. Chosen once,
+        #: on the first registration, and then kept -- flipping it would strand
+        #: whichever clients learned the first answer.
+        self.hostname: Optional[str] = None
         #: The address currently on the wire, so a refresh can tell whether
         #: anything actually changed without re-deriving it from ServiceInfo.
         #:
         #: Only the address: the `server` field is now a name this backend owns
         #: (STABLE_HOSTNAME), so a machine rename no longer changes the record and
         #: there is nothing to track about the hostname any more.
-        self._address: Optional[str] = None
+        #: A tuple of every address announced (see `lan_addresses`), primary first.
+        self._address: Optional[tuple] = None
         #: The address the live Zeroconf instance was CONSTRUCTED against.
         #:
         #: python-zeroconf binds its multicast sockets to the interface addresses
@@ -226,7 +327,7 @@ class Advertiser:
         #: "Couldn't find a SensorDyme on this network". A freshly built instance
         #: published the same name on en0 correctly at the same instant, which is
         #: what identified the instance's age as the variable.
-        self._bound_address: Optional[str] = None
+        self._bound_address: Optional[tuple] = None
         #: True between a start() that found zeroconf installed and stop(). It,
         #: not `_zeroconf`, is what decides whether refresh() does anything: a
         #: Zeroconf that could not be built (no LAN at login, an interface
@@ -239,13 +340,13 @@ class Advertiser:
 
     # ----------------------------------------------------------------- internals
 
-    def _build_info(self, address: str):
+    def _build_info(self, addresses):
         from zeroconf import ServiceInfo
 
         return ServiceInfo(
             SERVICE_TYPE,
             f"{self.name}.{SERVICE_TYPE}",
-            addresses=[socket.inet_aton(address)],
+            addresses=[socket.inet_aton(a) for a in addresses],
             port=self.port,
             # `path` lets the API move without every installed app being told.
             # `id` is what distinguishes this backend from another one on the same
@@ -253,10 +354,35 @@ class Advertiser:
             properties={"v": "1", "path": "/", "api": "v1", "id": self.backend_id},
             # A name this backend owns, NOT the machine's hostname. See
             # STABLE_HOSTNAME for the ten-day outage that distinction cost.
-            server=f"{STABLE_HOSTNAME}.local.",
+            server=f"{self.hostname or STABLE_HOSTNAME}.local.",
         )
 
-    def _rebind_locked(self, address: str) -> bool:
+    def _choose_hostname_locked(self, addresses) -> None:
+        """Claim STABLE_HOSTNAME unless another machine already answers for it.
+        Caller holds the lock; runs before the first registration only."""
+        if self.hostname is not None:
+            return
+        try:
+            answers = hostname_owners(self._zeroconf, STABLE_HOSTNAME)
+        except Exception as exc:  # noqa: BLE001 - a failed probe must not stop announcing
+            log.info("could not check whether %s.local is taken (%r); claiming it", STABLE_HOSTNAME, exc)
+            answers = []
+        ours = set(addresses) | set(_ipv4_interfaces())
+        foreign = sorted(a for a in answers if a not in ours)
+        if not foreign:
+            self.hostname = STABLE_HOSTNAME
+            return
+        self.hostname = f"{STABLE_HOSTNAME}-{self.backend_id.removeprefix('bk_')[:8]}"
+        log.warning(
+            "another machine (%s) already answers for %s.local -- probably a second "
+            "SensorDyme backend on this network. This one announces itself as %s.local "
+            "instead, so a device configured with %s.local reaches the OTHER backend. "
+            "Point this backend's devices at http://%s.local:%d",
+            ", ".join(foreign), STABLE_HOSTNAME, self.hostname, STABLE_HOSTNAME,
+            self.hostname, self.port,
+        )
+
+    def _rebind_locked(self, address: tuple) -> bool:
         """Rebuild the Zeroconf instance so its sockets bind to `address`.
 
         The only way to rebind python-zeroconf is to construct a new one: there
@@ -279,7 +405,7 @@ class Advertiser:
             log.warning(
                 "could not re-open mDNS for %s (%s); this server is not "
                 "announcing itself until the next refresh",
-                address, repr(exc),
+                _fmt(address), repr(exc),
             )
             self._zeroconf = None
             self._bound_address = None
@@ -287,9 +413,10 @@ class Advertiser:
         self._bound_address = address
         return True
 
-    def _register_locked(self, address: str) -> bool:
+    def _register_locked(self, address: tuple) -> bool:
         """Put the record on the wire. Caller holds the lock."""
         try:
+            self._choose_hostname_locked(address)
             info = self._build_info(address)
             self._zeroconf.register_service(info)  # type: ignore[union-attr]
         except Exception as exc:  # noqa: BLE001 - advertising is never worth a crash
@@ -302,10 +429,10 @@ class Advertiser:
         self._info = info
         self._address = address
         log.info(
-            "announcing this server as '%s' (id %s) at http://%s:%d — reachable as "
+            "announcing this server as '%s' (id %s) at %s port %d — reachable as "
             "http://%s.local:%d, a name that survives this machine being renamed "
             "or moved to another network",
-            self.name, self.backend_id, address, self.port, STABLE_HOSTNAME, self.port,
+            self.name, self.backend_id, _fmt(address), self.port, self.hostname, self.port,
         )
         return True
 
@@ -329,7 +456,7 @@ class Advertiser:
         tell a no-op tick from a real correction. Never raises: a refresh that
         fails leaves the previous record in place and says so in the log.
         """
-        address = lan_ip()
+        address = tuple(lan_addresses()) or None
         with self._lock:
             if not self._running:
                 return False
@@ -341,7 +468,7 @@ class Advertiser:
                     return False
                 if not self._register_locked(address):
                     return False
-                log.info("mDNS is available again; announcing at http://%s:%d", address, self.port)
+                log.info("mDNS is available again; announcing at %s port %d", _fmt(address), self.port)
                 return True
 
             # No LAN at all. Withdraw rather than keep repeating the last address
@@ -358,7 +485,7 @@ class Advertiser:
                 return True
 
             if self._info is None:
-                log.info("a LAN address is available again (%s); re-announcing", address)
+                log.info("a LAN address is available again (%s); re-announcing", _fmt(address))
                 # The usual shape of a DHCP move is interface-down then
                 # interface-up on a NEW address, so this path -- not the
                 # address-changed one below -- is where most moves land. It has to
@@ -389,20 +516,20 @@ class Advertiser:
                 log.warning(
                     "this machine moved to %s but mDNS could not be re-opened; it "
                     "is no longer announcing (was %s)",
-                    address, previous_address,
+                    _fmt(address), _fmt(previous_address),
                 )
                 return False
             if not self._register_locked(address):
                 log.warning(
                     "this machine moved to %s but the announcement could not be "
                     "re-made; it is no longer announcing (was %s)",
-                    address, previous_address,
+                    _fmt(address), _fmt(previous_address),
                 )
                 return False
             log.info(
                 "this machine moved (%s -> %s); the announcement now points at "
-                "http://%s:%d",
-                previous_address, address, address, self.port,
+                "%s port %d",
+                _fmt(previous_address), _fmt(address), _fmt(address), self.port,
             )
             return True
 
@@ -423,7 +550,7 @@ class Advertiser:
         self._running = True
         self._start_watcher()
 
-        address = lan_ip()
+        address = tuple(lan_addresses()) or None
         if address is None:
             log.warning(
                 "no LAN address yet, so this server is not announcing itself; it "
@@ -480,6 +607,13 @@ class Advertiser:
                 with contextlib.suppress(Exception):
                     self._zeroconf.close()
             self._zeroconf = None
+
+
+def _fmt(addresses) -> str:
+    """Addresses for a log line."""
+    if not addresses:
+        return "no address"
+    return ", ".join(addresses) if isinstance(addresses, (tuple, list)) else str(addresses)
 
 
 def advertised_port() -> int:

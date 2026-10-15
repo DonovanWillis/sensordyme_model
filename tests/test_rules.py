@@ -104,21 +104,21 @@ def test_zero_persistence_is_floored():
 
 # --------------------------------------------------------------------- schedules
 def test_rule_is_inert_outside_its_hours():
-    engine = RuleEngine([rule(schedule="23:00-05:00")], clock=lambda: datetime(2026, 8, 6, 14, 0))
+    engine = RuleEngine([rule(schedule="23:00-05:00")], clock=lambda: datetime(2026, 8, 6, 14, 0))  # noqa: DTZ001 - naive = device local time, as the engine expects
     assert drive(engine, "person_present", 6.0) == []
 
 
 def test_rule_fires_inside_its_hours():
-    engine = RuleEngine([rule(schedule="23:00-05:00")], clock=lambda: datetime(2026, 8, 6, 23, 30))
+    engine = RuleEngine([rule(schedule="23:00-05:00")], clock=lambda: datetime(2026, 8, 6, 23, 30))  # noqa: DTZ001 - naive = device local time
     assert len(drive(engine, "person_present", 6.0)) == 1
 
 
 def test_rule_does_not_bank_progress_before_its_window_opens():
     """Observing at 22:59 must not let the rule fire the instant 23:00 arrives."""
-    clock = {"now": datetime(2026, 8, 6, 22, 59)}
+    clock = {"now": datetime(2026, 8, 6, 22, 59)}  # noqa: DTZ001 - naive = device local time
     engine = RuleEngine([rule(schedule="23:00-05:00", persist_s=2.0)], clock=lambda: clock["now"])
     drive(engine, "person_present", 10.0)              # all before the window
-    clock["now"] = datetime(2026, 8, 6, 23, 0)
+    clock["now"] = datetime(2026, 8, 6, 23, 0)  # noqa: DTZ001 - naive = device local time
     assert engine.observe("person_present", True, now=2000.0) == [], "must restart inside the window"
 
 

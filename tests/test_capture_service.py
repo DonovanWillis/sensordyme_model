@@ -134,12 +134,17 @@ def test_restart_does_not_reopen_a_camera_a_wedged_read_still_holds():
             release.wait()  # a driver hang: never returns until released
             return super().read()
 
+    import pytest
+
     camera, bus = WedgedCamera(), FrameBus()
     service = CaptureService(camera, bus)
     service.start()
     try:
         assert _wait_until(lambda: service.is_running)
-        service.restart(stop_timeout=0.2)
+        # Raises, so the health monitor counts a FAILED restart: returning
+        # normally read as success and reset its failure count.
+        with pytest.raises(RuntimeError):
+            service.restart(stop_timeout=0.2)
         assert camera.reopens == 0, "reopened the camera under a thread still reading it"
         assert service.is_running, "the wedged thread is still the one holding the camera"
     finally:

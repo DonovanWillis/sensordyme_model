@@ -69,6 +69,10 @@ class CaptureService:
     def stop(self, timeout: float = 5.0) -> None:
         self._stop.set()
         if self._thread is not None:
+            if self._thread is threading.current_thread():
+                # Stop requested from inside the pump itself: the event is set
+                # and the loop exits at its next check. join() would raise.
+                return
             self._thread.join(timeout=timeout)
             if self._thread.is_alive():
                 # Keep the handle: start() must be able to see the thread is
@@ -97,7 +101,19 @@ class CaptureService:
                 self._health.report_failure(self.name, f"crashed: {exc}")
 
     def restart(self, stop_timeout: float = 5.0) -> None:
-        """Full recovery: stop the pump, reopen the device, start again."""
+        """Full recovery: stop the pump, reopen the device, start again.
+
+        Raises RuntimeError when it cannot do that, so the health monitor counts
+        a failed restart rather than a successful one:
+
+          * called from the pump thread itself. That used to happen through
+            HealthMonitor.report_failure, which ran the camera's restart on the
+            thread reporting the read failure: stop() then joined itself, raised,
+            and -- having already set the pump's stop event -- killed the pump.
+          * the pump is wedged in read() past `stop_timeout`.
+        """
+        if self._thread is not None and self._thread is threading.current_thread():
+            raise RuntimeError("capture restart called from the pump thread itself; refusing")
         self.stop(timeout=stop_timeout)
         if self.is_running:
             # The pump is wedged inside read() (a driver-level hang). Reopening
@@ -106,7 +122,7 @@ class CaptureService:
             # reopened camera with no pump. In-place recovery cannot help here;
             # the health monitor's escalation (watchdog → process restart) can.
             log.error("capture restart skipped: the pump thread is wedged in a camera read")
-            return
+            raise RuntimeError("capture pump is wedged in a camera read; not restarted")
         try:
             self._camera.reopen()
         except CameraError as exc:
@@ -126,9 +142,8 @@ class CaptureService:
         while not stop.is_set():
             # FPS throttle (moved here from Camera.frames so the bus timing is ours).
             elapsed = time.monotonic() - last_read
-            if elapsed < interval:
-                if stop.wait(interval - elapsed):
-                    break
+            if elapsed < interval and stop.wait(interval - elapsed):
+                break
             last_read = time.monotonic()
 
             try:
@@ -136,7 +151,12 @@ class CaptureService:
             except CameraError as exc:
                 consecutive_failures += 1
                 if self._health is not None:
-                    self._health.report_failure(self.name, str(exc))
+                    # Informational: the camera component is judged by its
+                    # pull check (frame age), and this loop is already doing
+                    # the in-place reopen. Counting each failed read toward the
+                    # restart threshold made three bad reads (~100 ms) trigger
+                    # a component restart that pre-empted the reopen below.
+                    self._health.report_failure(self.name, str(exc), escalate=False)
                 if consecutive_failures >= _READ_FAILURES_BEFORE_REOPEN:
                     log.warning(
                         "%d consecutive read failures — reopening the camera", consecutive_failures

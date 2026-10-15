@@ -30,6 +30,7 @@ import time
 from collections import deque
 from collections.abc import Sequence
 from dataclasses import dataclass, field
+from itertools import pairwise
 from typing import Optional
 
 from core import posture
@@ -63,7 +64,7 @@ JUMP_ANKLE_RISE = 0.12   # both ankles leaving their baseline together
 HAND_RAISED_MARGIN = 0.10   # wrist above shoulder by this many torso lengths
 # A wave is a raised hand OSCILLATING sideways: direction reversals, not just
 # motion. A wave needs at least three wide swings within the window
-# (out–back–out) — two would also match reaching toward something and pulling
+# (out-back-out) — two would also match reaching toward something and pulling
 # straight back, which is the nearest innocent motion this must not fire on.
 # Each swing must be wide enough that landmark jitter can't fake it.
 WAVE_MIN_SWINGS = 3
@@ -79,9 +80,15 @@ WAVE_MIN_SWING = 0.25       # horizontal wrist travel per swing, torso lengths
 # motion, zero reversals) and an ordinary gesture (a couple of slow reversals)
 # from crossing this bar.
 FLAIL_MIN_PEAK_SPEED = 1.6      # torso-lengths/s, peak instantaneous wrist speed
-FLAIL_MIN_PEAK_ACCEL = 6.0      # torso-lengths/s^2, peak instantaneous wrist acceleration --
+FLAIL_MIN_PEAK_ACCEL = 40.0     # torso-lengths/s^2, peak instantaneous wrist acceleration --
 # an alternative gate to peak speed: a sharp, jerky direction change can flag
-# flailing even in a window where peak speed alone is borderline
+# flailing even in a window where peak speed alone is borderline. Measured on
+# velocity VECTORS: a reversal at speed v within time T is 2v/T. The old value
+# (6.0) was tuned against differences of scalar SPEEDS, which read a reversal
+# at constant speed as zero; on vectors 6.0 would be cleared by any reversal
+# at all. 40 torso/s^2 (~20 m/s^2, ~2 g, for a ~0.5 m torso) sits above an
+# ordinary hand reversal (a 1 Hz, 10 cm wave peaks near 8) and is reached by
+# a snap reversal at ~1.3 torso/s on 15 fps samples -- "borderline" speed.
 FLAIL_MIN_REVERSALS = 4         # direction reversals within the window -- a higher bar than a
 # wave's 3, because flailing is chaotic (many quick reversals) rather than a
 # rhythmic swing
@@ -177,7 +184,11 @@ class _Sample:
     at: float
     hip_x: float
     hip_y: float
-    ankle_y: float
+    #: None when neither ankle is visible. Never substituted with hip_y: that
+    #: made the jump test's "both ankles leave their baseline" gate identical
+    #: to the hip-rise gate it exists to corroborate, so standing up from a
+    #: chair with the feet out of frame read as a jump.
+    ankle_y: Optional[float]
     torso: float
     # Wrist positions in aspect-corrected units, or None when not visible.
     # Kept per-side: a wave is one arm's motion, and averaging a moving wrist
@@ -274,7 +285,7 @@ class ActivityRecognizer:
         nose = _point(landmarks, NOSE)
         self._samples.append(_Sample(
             at=now, hip_x=hips[0] * self.aspect, hip_y=hips[1],
-            ankle_y=ankles[1] if ankles else hips[1], torso=torso,
+            ankle_y=ankles[1] if ankles else None, torso=torso,
             left_wrist=(left_wrist[0] * self.aspect, left_wrist[1]) if left_wrist else None,
             right_wrist=(right_wrist[0] * self.aspect, right_wrist[1]) if right_wrist else None,
             shoulder_y=shoulders[1],
@@ -314,7 +325,7 @@ class ActivityRecognizer:
         # Horizontal hip travel, in torso lengths per second. Total path rather
         # than net displacement, so pacing back and forth still reads as motion.
         path = sum(
-            abs(b.hip_x - a.hip_x) for a, b in zip(samples, samples[1:])
+            abs(b.hip_x - a.hip_x) for a, b in pairwise(samples)
         ) / torso
         speed = path / elapsed
 
@@ -334,12 +345,17 @@ class ActivityRecognizer:
         # baseline. Requiring the ankles too is what separates a jump from
         # standing up quickly, which raises the hips just as fast.
         hip_rise = (heights[0] - min(heights)) / torso
-        ankle_baseline = max(s.ankle_y for s in samples)
-        ankle_rise = (ankle_baseline - min(s.ankle_y for s in samples)) / torso
         state.signals["hip_rise_torso"] = round(hip_rise, 2)
-        state.signals["ankle_rise_torso"] = round(ankle_rise, 2)
+        # The ankle half of the test needs ankles actually observed: only
+        # samples with visible ankles count, and too few of them means "cannot
+        # say", not "the hips rose, so the ankles must have too".
+        ankle_heights = [s.ankle_y for s in samples if s.ankle_y is not None]
+        ankle_rise = None
+        if len(ankle_heights) >= MIN_SAMPLES:
+            ankle_rise = (max(ankle_heights) - min(ankle_heights)) / torso
+            state.signals["ankle_rise_torso"] = round(ankle_rise, 2)
 
-        if hip_rise >= JUMP_RISE and ankle_rise >= JUMP_ANKLE_RISE:
+        if hip_rise >= JUMP_RISE and ankle_rise is not None and ankle_rise >= JUMP_ANKLE_RISE:
             confidence = min(0.99, 0.55 + (hip_rise - JUMP_RISE) * 1.5)
             state.jumping = Attribute("jumping", True, round(confidence, 2))
 
@@ -395,7 +411,7 @@ class ActivityRecognizer:
                 swings = 0
                 swing = 0.0
                 direction = 0
-                for previous, current in zip(xs, xs[1:]):
+                for previous, current in pairwise(xs):
                     step = current - previous
                     if abs(step) < 1e-6:
                         continue
@@ -447,20 +463,24 @@ class ActivityRecognizer:
         if len(track) < MIN_SAMPLES:
             return
 
-        speeds: list[tuple[float, float]] = []  # (dt-midpoint speed, dt)
-        for (t0, p0), (t1, p1) in zip(track, track[1:]):
+        # Per-step velocity VECTORS (torso-lengths/s), not just speeds: a sharp
+        # reversal at constant speed is a large acceleration (the velocity
+        # flips sign) but a zero change in speed, and catching exactly that
+        # "jerky direction change" is what the acceleration gate is for.
+        velocities: list[tuple[float, float, float]] = []  # (vx, vy, dt)
+        for (t0, p0), (t1, p1) in pairwise(track):
             dt = t1 - t0
             if dt <= 0:
                 continue
-            speeds.append((math.hypot((p1[0] - p0[0]), p1[1] - p0[1]) / torso / dt, dt))
-        if not speeds:
+            velocities.append(((p1[0] - p0[0]) / torso / dt, (p1[1] - p0[1]) / torso / dt, dt))
+        if not velocities:
             return
-        peak_speed = max(v for v, _ in speeds)
+        peak_speed = max(math.hypot(vx, vy) for vx, vy, _ in velocities)
 
         peak_accel = 0.0
-        for (v0, _), (v1, dt1) in zip(speeds, speeds[1:]):
+        for (vx0, vy0, _), (vx1, vy1, dt1) in pairwise(velocities):
             if dt1 > 0:
-                peak_accel = max(peak_accel, abs(v1 - v0) / dt1)
+                peak_accel = max(peak_accel, math.hypot(vx1 - vx0, vy1 - vy0) / dt1)
 
         # Direction reversals over the full 2D displacement vector (flailing
         # isn't purely horizontal, unlike the wave counter above): accumulate
@@ -471,7 +491,7 @@ class ActivityRecognizer:
         reversals = 0
         seg_dx = seg_dy = 0.0
         prev_dir: Optional[tuple[float, float]] = None
-        for (_, p0), (_, p1) in zip(track, track[1:]):
+        for (_, p0), (_, p1) in pairwise(track):
             dx, dy = (p1[0] - p0[0]) / torso, (p1[1] - p0[1]) / torso
             step = math.hypot(dx, dy)
             if step < 1e-6:
@@ -544,7 +564,7 @@ class ActivityRecognizer:
                 continue
             path = sum(
                 math.hypot(b[0] - a[0], b[1] - a[1])
-                for (_, a), (_, b) in zip(track, track[1:])
+                for (_, a), (_, b) in pairwise(track)
             ) / torso
             speed = path / elapsed
             fastest = speed if fastest is None else max(fastest, speed)

@@ -107,7 +107,7 @@ def test_a_non_driver_modules_own_signals_are_not_silently_zeroed(tmp_path):
         rows = list(csv.reader(f))
     header, row = rows[0], rows[1]
     assert "flailing" in header and "motion_energy" in header
-    as_dict = dict(zip(header, row))
+    as_dict = dict(zip(header, row, strict=True))
     assert as_dict["flailing"] == "1"
     assert as_dict["flailing_confidence"] == "0.8100"
     assert as_dict["hands_visible"] == "2"
@@ -145,7 +145,7 @@ def test_a_schema_change_rotates_the_stale_file_instead_of_misaligning_it(tmp_pa
         rows = list(csv.reader(f))
     assert len(rows) == 2  # fresh header + the one new-schema row
     header, row = rows[0], rows[1]
-    assert dict(zip(header, row))["flailing"] == "1"
+    assert dict(zip(header, row, strict=True))["flailing"] == "1"
 
 
 def test_driver_family_and_other_modules_coexist_in_the_same_run(tmp_path):

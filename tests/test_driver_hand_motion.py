@@ -21,6 +21,8 @@ the match gate being too tight for a fast hand was the second half of the same
 defect.
 """
 
+from typing import ClassVar
+
 import test_driver_attention_scenarios as das
 
 import modules.driver_attention as driver_attention_module
@@ -46,7 +48,7 @@ class _FakeYoloModel:
     to succeed without a real (network-fetched) model -- same pattern
     test_occupancy_zones.py's _FakeModel uses."""
 
-    names = {0: "cell phone"}
+    names: ClassVar[dict[int, str]] = {0: "cell phone"}
 
     def predict(self, frame, **kwargs):
         return []
@@ -88,7 +90,7 @@ def _feed_hand_positions(module, frame, clock, positions, step=_STRIDE_S):
     process()'s debounce are all the real, unmodified code."""
     fired = []
     for cx, cy in positions:
-        module._hands.process = lambda rgb, pts=_hand_box_points(cx, cy): _FakeHandsResult(
+        module._hands.process = lambda rgb, pts=_hand_box_points(cx, cy): _FakeHandsResult(  # noqa: B008 - binds this iteration's points
             [_FakeHandLandmarks(pts)]
         )
         # Force this frame to be a stride tick regardless of yolo_every_n_frames.
@@ -219,8 +221,8 @@ def test_two_hands_keep_separate_identities_under_the_loosened_match_gate(
         wobble = 0.01 * (1 if i % 2 else -1)
         left = _hand_box_points(0.30 + wobble, 0.62)
         right = _hand_box_points(0.70 + wobble, 0.62)
-        module._hands.process = lambda rgb, l=left, r=right: _FakeHandsResult(
-            [_FakeHandLandmarks(l), _FakeHandLandmarks(r)]
+        module._hands.process = lambda rgb, left_pts=left, right_pts=right: _FakeHandsResult(
+            [_FakeHandLandmarks(left_pts), _FakeHandLandmarks(right_pts)]
         )
         module._frame_index = module._yolo_every_n_frames - 1
         module.process(frame)

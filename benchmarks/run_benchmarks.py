@@ -76,6 +76,46 @@ def _frame_source(video_path: Optional[str], camera_config: dict) -> Iterator[np
             camera.release()
 
 
+#: Every config key a module may name its detector weights under — the same
+#: tuple services/runtime.py's DeviceRuntime._WEIGHTS_KEYS uses.
+_WEIGHTS_KEYS = ("yolo_weights", "model_weights", "phone_weights", "detector_weights")
+
+
+def configure_accelerator(config: dict):
+    """Install config.yaml's `accelerator:` block, exactly as the runtime does at boot.
+
+    Without this core.accel keeps its empty default config, maybe_hailo_yolo()
+    returns None even with a seated HAT and a configured .hef, and every
+    benchmark silently measured the CPU path (on a developer machine) or a
+    detector-less module (on a device, where driver_attention catches the
+    missing backend and carries on with Face Mesh only).
+    """
+    from core import accel
+
+    return accel.configure(config.get("accelerator", {}) or {})
+
+
+def warmup_frame_count(module_config: dict) -> int:
+    """Frames to run untimed before measuring: enough to reach the first
+    detector stride tick, where lazily-loaded models (YOLO, Hands, a first-run
+    weights download, MPS init) actually load."""
+    strides = [
+        int(module_config.get(key) or 1) for key in ("yolo_every_n_frames", "phone_every_n_frames")
+    ]
+    return max(2, 1 + max(strides))
+
+
+def _detector_report(module, module_config: dict) -> dict:
+    """What detector this run actually used, and whether detection died mid-run."""
+    from core import detectors
+
+    weights = next((module_config[k] for k in _WEIGHTS_KEYS if module_config.get(k)), None)
+    device = module_config.get("device") or module_config.get("phone_device")
+    identity = detectors.model_identity(str(weights), device) if weights else None
+    error = getattr(module, "_object_detection_error", None) or getattr(module, "_phone_error", None)
+    return {"detector": identity, "object_detection_error": error}
+
+
 def benchmark_module(
     module_name: str, config: dict, duration_s: float, video_path: Optional[str], profile: str = "pi"
 ) -> dict:
@@ -85,6 +125,11 @@ def benchmark_module(
     `config["modules"][module_name]` and the module's own registry name, exactly as
     before this parameter existed. `profile="mac_max"` reads `config["mac_max"][module_name]`
     and looks up `f"{module_name}_max"` in the registry instead.
+
+    The first `warmup_frame_count()` frames are processed untimed, so one-off
+    model loads (and first-run weight downloads) are not counted as latency or
+    charged against the duration budget. The result records which detector
+    actually ran and any error that disabled object detection during the run.
     """
     if profile == "mac_max":
         module_cls = get_module_class(f"{module_name}_max")
@@ -97,24 +142,38 @@ def benchmark_module(
 
     latencies_ms: list[float] = []
     temps_c: list[tuple[float, float]] = []
+    warmup_remaining = warmup_frame_count(module_config)
 
     start = time.monotonic()
     last_temp_sample = 0.0
 
-    for frame in _frame_source(video_path, config.get("camera", {})):
-        elapsed = time.monotonic() - start
-        if elapsed >= duration_s:
-            break
+    try:
+        for frame in _frame_source(video_path, config.get("camera", {})):
+            if warmup_remaining > 0:
+                module.process(frame)
+                warmup_remaining -= 1
+                if warmup_remaining == 0:
+                    start = time.monotonic()  # the clock starts after warm-up
+                continue
 
-        t0 = time.perf_counter()
-        module.process(frame)
-        latencies_ms.append((time.perf_counter() - t0) * 1000.0)
+            elapsed = time.monotonic() - start
+            if elapsed >= duration_s:
+                break
 
-        if elapsed - last_temp_sample >= 1.0:
-            temp = read_cpu_temp_c()
-            if temp is not None:
-                temps_c.append((elapsed, temp))
-            last_temp_sample = elapsed
+            t0 = time.perf_counter()
+            module.process(frame)
+            latencies_ms.append((time.perf_counter() - t0) * 1000.0)
+
+            if elapsed - last_temp_sample >= 1.0:
+                temp = read_cpu_temp_c()
+                if temp is not None:
+                    temps_c.append((elapsed, temp))
+                last_temp_sample = elapsed
+        detector = _detector_report(module, module_config)
+    finally:
+        close = getattr(module, "close", None)
+        if callable(close):
+            close()
 
     n = len(latencies_ms)
     total_s = time.monotonic() - start
@@ -140,11 +199,17 @@ def benchmark_module(
         },
         "cpu_temp_c": temps_c,
         "module_config": module_config,
+        "warmup_frames": warmup_frame_count(module_config),
+        **detector,
     }
 
 
-def main(argv: Optional[list[str]] = None) -> None:
-    """CLI entrypoint: benchmark one or more modules and write JSON + summary CSV."""
+def main(argv: Optional[list[str]] = None) -> int:
+    """CLI entrypoint: benchmark one or more modules and write JSON + summary CSV.
+
+    Returns 1 if any module's object detection was disabled during its run —
+    its numbers would describe a module without its detector — else 0.
+    """
     parser = argparse.ArgumentParser(description="SensorDyme module benchmarks")
     parser.add_argument("--config", default="config.yaml")
     parser.add_argument(
@@ -173,9 +238,16 @@ def main(argv: Optional[list[str]] = None) -> None:
         module_names = args.modules or available_modules()
     duration_s = args.minutes * 60.0
 
+    # Before any module is built, as services/runtime.py does: otherwise the
+    # Hailo path can never be selected and the numbers describe a different
+    # backend from the one the device runs.
+    info = configure_accelerator(config)
+    print(f"accelerator: {info.detail}")
+
     RESULTS_DIR.mkdir(parents=True, exist_ok=True)
     timestamp = time.strftime("%Y%m%dT%H%M%S")
     summary_rows = []
+    detection_failures: list[str] = []
 
     # Filenames are byte-identical to before this flag existed when profile=="pi" (the
     # default); mac_max gets its own prefix so the two profiles' results never collide
@@ -188,7 +260,13 @@ def main(argv: Optional[list[str]] = None) -> None:
 
         out_path = RESULTS_DIR / f"{file_prefix}{module_name}_{timestamp}.json"
         out_path.write_text(json.dumps(result, indent=2))
-        print(f"  -> {out_path}  (fps={result['fps']:.1f}, p95={result['latency_ms']['p95']:.1f}ms)")
+        detector = result.get("detector") or {}
+        print(f"  -> {out_path}  (fps={result['fps']:.1f}, p95={result['latency_ms']['p95']:.1f}ms, "
+              f"detector={detector.get('name', 'none')}/{detector.get('backend', '-')})")
+        if result.get("object_detection_error"):
+            detection_failures.append(module_name)
+            print(f"  WARNING: object detection was DISABLED during this run "
+                  f"({result['object_detection_error']}) — these numbers exclude the detector.")
 
         summary_rows.append(
             {
@@ -200,6 +278,7 @@ def main(argv: Optional[list[str]] = None) -> None:
                 "p95_ms": f"{result['latency_ms']['p95']:.2f}",
                 "p99_ms": f"{result['latency_ms']['p99']:.2f}",
                 "frame_count": result["frame_count"],
+                "detector_backend": detector.get("backend", ""),
             }
         )
 
@@ -211,6 +290,11 @@ def main(argv: Optional[list[str]] = None) -> None:
             writer.writerows(summary_rows)
         print(f"Summary written to {summary_path}")
 
+    if detection_failures:
+        print(f"FAILED: object detection was disabled during the run for: {', '.join(detection_failures)}")
+        return 1
+    return 0
+
 
 if __name__ == "__main__":
-    main()
+    raise SystemExit(main())

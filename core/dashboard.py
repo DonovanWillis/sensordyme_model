@@ -19,6 +19,7 @@ no new dependencies.
 
 from __future__ import annotations
 
+import contextlib
 import hmac
 import json
 import select
@@ -53,6 +54,70 @@ _MAX_RISK_POINTS = 360  # ~6 minutes at 1 sample/s
 # 1 sample/s. services/runtime.py tracks the same duration independently for
 # the baked-in MJPEG/cv2 overlay; this one drives the web page's own flash.
 FLASH_DURATION_S = 1.5
+
+#: Most connections served at once. Each one is a thread for as long as it lasts
+#: (a /stream viewer for as long as it watches), and the server is reachable --
+#: unauthenticated, until the token check -- from the whole LAN: without a cap
+#: anyone on the Wi-Fi could open idle sockets until this process, which is also
+#: the detector, could not start threads of its own. Far above any real use.
+_MAX_CONNECTIONS = 64
+
+
+class _BoundedThreadingHTTPServer(ThreadingHTTPServer):
+    """ThreadingHTTPServer that refuses connections beyond `max_connections`."""
+
+    daemon_threads = True
+
+    def __init__(self, server_address, handler, max_connections: int = _MAX_CONNECTIONS) -> None:
+        self._slots = threading.BoundedSemaphore(max(1, int(max_connections)))
+        super().__init__(server_address, handler)
+
+    def process_request(self, request, client_address) -> None:
+        if not self._slots.acquire(blocking=False):
+            self.shutdown_request(request)  # full: close it now, hold nothing
+            return
+        try:
+            super().process_request(request, client_address)
+        except BaseException:
+            self._slots.release()
+            raise
+
+    def process_request_thread(self, request, client_address) -> None:
+        try:
+            super().process_request_thread(request, client_address)
+        finally:
+            self._slots.release()
+
+
+def _peer_closed(sock) -> bool:
+    """True once the client has closed its end of `sock` (see _Handler._peer_gone).
+
+    One non-blocking peek; writes nothing. Anything unreadable is reported as
+    still connected, so a transient condition never hangs up on a healthy viewer.
+    """
+    try:
+        # poll(), not select(): select() cannot take a descriptor numbered 1024
+        # or above and raises ValueError -- which read as "peer gone" and ended
+        # every stream once the process had that many files open.
+        poll = getattr(select, "poll", None)
+        if poll is not None:
+            poller = poll()
+            poller.register(sock, select.POLLIN | select.POLLERR | select.POLLHUP)
+            readable = bool(poller.poll(0))
+        else:  # pragma: no cover - platforms without poll()
+            readable = bool(select.select([sock], [], [], 0)[0])
+    except (OSError, ValueError):
+        return True  # socket already closed underneath us
+    if not readable:
+        return False
+    try:
+        # Readable on a request whose body is complete means EOF. Peek rather
+        # than read: nothing may be consumed from the stream.
+        return sock.recv(1, socket.MSG_PEEK) == b""
+    except (BlockingIOError, InterruptedError):
+        return False
+    except OSError:
+        return True
 
 
 class DashboardServer:
@@ -180,21 +245,7 @@ class DashboardServer:
                 connected, so a transient condition can never hang up on a healthy
                 viewer. Only a genuine EOF or a dead socket ends the stream.
                 """
-                sock = self.connection
-                try:
-                    readable = select.select([sock], [], [], 0)[0]
-                except (OSError, ValueError):
-                    return True  # socket already closed underneath us
-                if not readable:
-                    return False
-                try:
-                    # Readable on a request whose body is complete means EOF. Peek
-                    # rather than read: nothing may be consumed from the stream.
-                    return sock.recv(1, socket.MSG_PEEK) == b""
-                except (BlockingIOError, InterruptedError):
-                    return False
-                except OSError:
-                    return True
+                return _peer_closed(self.connection)
 
             def _json(self, obj: dict, status: int = 200) -> None:
                 body = json.dumps(obj).encode()
@@ -283,10 +334,8 @@ class DashboardServer:
                     elif self.path.startswith("/api/history"):
                         limit = 200
                         if "limit=" in self.path:
-                            try:
+                            with contextlib.suppress(ValueError):
                                 limit = min(2000, int(self.path.rsplit("limit=", 1)[1].split("&")[0]))
-                            except ValueError:
-                                pass
                         self._json({"events": dashboard.history(limit)})
                     elif self.path.startswith("/stream"):
                         self.send_response(200)
@@ -334,7 +383,9 @@ class DashboardServer:
                 self._host,
             )
 
-        self._httpd = ThreadingHTTPServer((self._host, self._port), _Handler)
+        self._httpd = _BoundedThreadingHTTPServer(
+            (self._host, self._port), _Handler, max_connections=_MAX_CONNECTIONS
+        )
         self._port = self._httpd.server_address[1]  # resolve port 0 -> actual
         thread = threading.Thread(target=self._httpd.serve_forever, daemon=True, name="dashboard")
         self._thread = thread  # is_alive() checks this, not merely that _httpd exists
@@ -343,7 +394,7 @@ class DashboardServer:
 
     @property
     def url(self) -> str:
-        host = "localhost" if self._host in ("127.0.0.1", "0.0.0.0") else self._host
+        host = "localhost" if self._host in ("127.0.0.1", "0.0.0.0") else self._host  # noqa: S104 - a comparison, not a bind
         return f"http://{host}:{self._port}"
 
     def close(self) -> None:
@@ -545,10 +596,17 @@ class DashboardServer:
 
         Delegates to core.network.WifiManager — the single owner of nmcli — which
         drives NetworkManager on the Pi and dry-runs anywhere without nmcli (so
-        the page stays fully testable on a dev Mac)."""
+        the page stays fully testable on a dev Mac).
+
+        provision(), not connect(): the request arrives OVER the network the
+        device is on (or its own setup hotspot). connect() let go of that network
+        before knowing whether the new one would accept it, so a mistyped
+        password cut off the very page it was typed into with no way back;
+        provision() validates first and restores the previous network on failure.
+        """
         from core.network import WifiManager
 
-        return WifiManager().connect(ssid, password)
+        return WifiManager().provision(ssid, password)
 
     # ------------------------------------------------------------------ readers (handler)
     def latest_jpeg(self) -> tuple[Optional[bytes], int]:
@@ -594,11 +652,25 @@ _SETUP_PAGE = """<!DOCTYPE html>
 <button onclick="go()">Connect</button>
 <div id="msg"></div>
 <script>
+// POST /setup/wifi is gated by the device token like every other write. This
+// page sent none, so on any network bind it was refused every time and showed
+// an empty message. The token comes from this page's own URL (/setup?token=...)
+// and travels as a header, the same way the main page carries it.
+const TOKEN = new URLSearchParams(location.search).get("token") || "";
 async function go(){
   const m=document.getElementById('msg'); m.textContent='Connecting…';
-  const r=await fetch('/setup/wifi',{method:'POST',headers:{'Content-Type':'application/json'},
-    body:JSON.stringify({ssid:document.getElementById('ssid').value,password:document.getElementById('pw').value})});
-  const j=await r.json(); m.textContent=j.message; m.style.color=j.ok?'#2BD9A9':'#FF6B60';
+  const headers={'Content-Type':'application/json'};
+  if(TOKEN){ headers['X-Device-Token']=TOKEN; }
+  try{
+    const r=await fetch('/setup/wifi',{method:'POST',headers:headers,
+      body:JSON.stringify({ssid:document.getElementById('ssid').value,password:document.getElementById('pw').value})});
+    const j=await r.json();
+    if(r.status===401){
+      m.textContent='This device needs its dashboard token: open this page as /setup?token=YOUR_TOKEN.';
+      m.style.color='#FF6B60'; return;
+    }
+    m.textContent=j.message||j.error||('HTTP '+r.status); m.style.color=j.ok?'#2BD9A9':'#FF6B60';
+  }catch(e){ m.textContent='No answer from the device: '+e; m.style.color='#FF6B60'; }
 }
 </script></div></body></html>
 """

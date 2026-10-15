@@ -30,7 +30,7 @@ class _FakeCamera:
         self.released = False
         _FakeCamera.opened.append(self)
 
-    def read(self):
+    def read(self, timeout_s=None):
         if self._budget[0] > 0:
             self._budget[0] -= 1
             raise CameraError("device or resource busy")

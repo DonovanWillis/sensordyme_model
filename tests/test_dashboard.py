@@ -12,7 +12,7 @@ from core.events import Event
 
 
 def _get(url):
-    with urllib.request.urlopen(url, timeout=5) as resp:
+    with urllib.request.urlopen(url, timeout=5) as resp:  # noqa: S310 - local test server URL
         return resp.status, resp.headers.get("Content-Type", ""), resp.read()
 
 
@@ -57,7 +57,7 @@ def test_no_viewers_until_a_client_reads_stream():
     try:
         assert server.has_viewers() is False  # nobody watching -> main loop skips encoding
 
-        resp = urllib.request.urlopen(url + "/stream", timeout=5)
+        resp = urllib.request.urlopen(url + "/stream", timeout=5)  # noqa: S310 - local test server URL
         try:
             deadline = time.time() + 5
             while time.time() < deadline and not server.has_viewers():
@@ -88,11 +88,11 @@ def test_jpeg_quality_and_stream_fps_are_configurable():
 
 
 def _post(url, payload, headers=None):
-    req = urllib.request.Request(
+    req = urllib.request.Request(  # noqa: S310 - local test server URL
         url, data=json.dumps(payload).encode(), headers={"Content-Type": "application/json", **(headers or {})}
     )
     try:
-        with urllib.request.urlopen(req, timeout=5) as resp:
+        with urllib.request.urlopen(req, timeout=5) as resp:  # noqa: S310 - local test server URL
             return resp.status, json.loads(resp.read())
     except urllib.error.HTTPError as exc:
         return exc.code, json.loads(exc.read() or b"{}")
@@ -126,13 +126,11 @@ def test_device_token_gates_api_when_set():
     server = DashboardServer(host="127.0.0.1", port=0, token="s3cret", presets={"a": {"module": "m"}})
     url = server.start()
     try:
-        try:
-            urllib.request.urlopen(url + "/api/state", timeout=5)
-            assert False, "should have been rejected"
-        except urllib.error.HTTPError as exc:
-            assert exc.code == 401
-        req = urllib.request.Request(url + "/api/state", headers={"X-Device-Token": "s3cret"})
-        with urllib.request.urlopen(req, timeout=5) as resp:
+        with pytest.raises(urllib.error.HTTPError) as rejected:
+            urllib.request.urlopen(url + "/api/state", timeout=5)  # noqa: S310 - local test server URL
+        assert rejected.value.code == 401
+        req = urllib.request.Request(url + "/api/state", headers={"X-Device-Token": "s3cret"})  # noqa: S310 - local test server URL
+        with urllib.request.urlopen(req, timeout=5) as resp:  # noqa: S310 - local test server URL
             assert resp.status == 200
         status, _ = _post(url + "/api/preset", {"preset": "a"}, headers={"X-Device-Token": "s3cret"})
         assert status == 202
@@ -293,7 +291,7 @@ def test_dashboard_unknown_path_is_404():
     url = server.start()
     try:
         try:
-            urllib.request.urlopen(url + "/nope", timeout=5)
+            urllib.request.urlopen(url + "/nope", timeout=5)  # noqa: S310 - local test server URL
             raised = False
         except urllib.error.HTTPError as exc:
             raised = exc.code == 404

@@ -92,16 +92,40 @@ class TestGracedConditionTracker:
         assert not graced.is_active
 
     def test_never_fires_from_noise_alone(self):
-        """Alternating noise never accumulates: grace bridges False gaps for
-        continuity of a TRUE episode, but firing still requires the sustain
-        threshold from the episode's own start."""
-        graced = GracedConditionTracker(2.0, release_s=0.4)
-        fired = None
-        for i in range(16):
-            fired = fired or graced.update(i % 2 == 0, i * 0.125)
-        assert fired is not None or True  # see assertion below for the real check
-        # The real property: a blink-length condition (0.25s) with noise around
-        # it must not fire a 2s threshold.
+        """What alternating input does to each configuration, asserted rather
+        than waved at. (This used to assert `fired is not None or True`, which
+        cannot fail, under a docstring claiming alternating noise never
+        accumulates -- false: the default tracker bridges every 1-frame False
+        gap and counts it, so it fires at sustain_s of WALL time with the
+        condition true only half of it. That is the blink-flurry false
+        drowsiness the eye-closure configuration exists to prevent.)
+
+        Eye-closure configuration (count_true_time_only, 2-frame grace):
+          * bridged False frames pause the clock, so the reported duration is
+            TRUE time and firing needs sustain_s of it (4s at 50% duty);
+          * a real reopening (longer than the frame grace) ends the episode,
+            so blinks separated by genuine openings never accumulate at all.
+        """
+        default = GracedConditionTracker(2.0, release_s=0.4)
+        eye = GracedConditionTracker(2.0, release_s=0.4, release_frames=2, count_true_time_only=True)
+        default_at = eye_at = eye_duration = None
+        for i in range(80):  # 10 s of alternating True/False at 8fps
+            t = i * 0.125
+            d = default.update(i % 2 == 0, t)
+            e = eye.update(i % 2 == 0, t)
+            default_at = default_at if default_at is not None or d is None else t
+            if e is not None and eye_at is None:
+                eye_at, eye_duration = t, e
+        assert default_at == pytest.approx(2.0), "documents the default tracker's bridging semantics"
+        assert eye_at is not None and eye_at >= 3.75
+        assert eye_duration == pytest.approx(2.0, abs=0.13)
+
+        blinks = GracedConditionTracker(2.0, release_s=0.4, release_frames=2, count_true_time_only=True)
+        for i in range(80):  # closed 2 frames, open 3 frames (a real reopening), for 10 s
+            assert blinks.update(i % 5 < 2, i * 0.125) is None
+
+        # And a blink-length condition (0.25s) with noise around it must not
+        # fire a 2s threshold in the default configuration either.
         fresh = GracedConditionTracker(2.0, release_s=0.4)
         assert fresh.update(True, 0.0) is None
         assert fresh.update(True, 0.125) is None
@@ -164,9 +188,7 @@ class TestAdaptiveBaseline:
         """A driver who blinks and even dozes still opens their eyes most of
         the time; the upper percentile must read the OPEN level, not the mix."""
         baseline = AdaptiveBaseline(window_s=60.0, min_samples=10)
-        for i in range(50):
-            value = 0.08 if i % 5 == 0 else 0.30     # 20% closed
-        # feed in one pass so closures interleave
+        # feed in one pass so closures interleave (20% closed)
         for i in range(50):
             baseline.observe(0.08 if i % 5 == 0 else 0.30, i * 0.5)
         reference = baseline.reference(calibrated=None)

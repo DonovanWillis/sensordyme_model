@@ -32,6 +32,7 @@ import pytest
 from core.detectors import upper_region
 from core.hand_perception import HandPerceptionResult
 from core.tracking import TrackedBox
+from core.zones import load_zones
 from modules.baby_monitoring import (
     INFANT_NO_ZONE_MAX_CONFIDENCE,
     MOUTH_ZONE_FRACTION,
@@ -39,7 +40,6 @@ from modules.baby_monitoring import (
     InfantIdentifier,
     _zone_containment,
 )
-from core.zones import load_zones
 
 W, H = 1000, 1000
 CRIB = {"crib": {"polygon": [[0.2, 0.2], [0.8, 0.2], [0.8, 0.9], [0.2, 0.9]], "kind": "safe"}}
@@ -128,7 +128,7 @@ def _run(module, boxes, seconds, start=0.0, step=0.1, hand_result_fn=None, motio
 
 
 # ============================================================ THE HEADLINE
-@pytest.mark.parametrize("where,caregiver", CAREGIVER_PLACEMENTS)
+@pytest.mark.parametrize(("where", "caregiver"), CAREGIVER_PLACEMENTS)
 def test_choking_risk_outcome_is_invariant_to_where_the_caregiver_stands(where, caregiver):
     """THE fix, stated as the property that was violated: with the infant's box
     lost and a caregiver in frame, ONE fixed real hazard must produce ONE
@@ -152,7 +152,7 @@ def test_choking_risk_outcome_is_invariant_to_where_the_caregiver_stands(where, 
     assert module._last_infant_identification.box is None
 
 
-@pytest.mark.parametrize("where,caregiver", CAREGIVER_PLACEMENTS)
+@pytest.mark.parametrize(("where", "caregiver"), CAREGIVER_PLACEMENTS)
 def test_a_real_hazard_at_the_infants_mouth_fires_wherever_the_caregiver_stands(where, caregiver):
     """The other half of invariance, and the true-positive guard: with the
     infant visible alongside the caregiver, the same fixed hazard must fire at

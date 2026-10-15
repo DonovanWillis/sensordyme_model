@@ -35,7 +35,7 @@ def test_the_object_vocabulary_is_the_coco_class_list(reg):
 
 
 # --------------------------------------------------------------- supported requests
-@pytest.mark.parametrize("target,predicate", [
+@pytest.mark.parametrize(("target", "predicate"), [
     ("person", "present"),
     ("person", "absent"),
     ("dog", "present"),

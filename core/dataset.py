@@ -30,10 +30,12 @@ the session id is recorded at capture time because it cannot be recovered later.
 
 from __future__ import annotations
 
+import contextlib
 import json
+import re
 import time
 import uuid
-from dataclasses import asdict, dataclass, field
+from dataclasses import asdict, dataclass, field, fields
 from pathlib import Path
 from typing import Optional
 
@@ -46,6 +48,11 @@ LABEL_NOT_USEFUL = "not_useful"    # right, but the user did not want to know
 
 REVIEW_LABELS = (LABEL_UNREVIEWED, LABEL_CORRECT, LABEL_FALSE_POSITIVE,
                  LABEL_MISSED, LABEL_NOT_USEFUL)
+
+#: The filenames capture() writes: "<12-hex session>_<16-hex id>.jpg". purge()
+#: deletes by this shape, so a frame the manifest lost track of is still found,
+#: while anything else someone put in the directory is left alone.
+_CAPTURED_IMAGE = re.compile(r"^[0-9a-f]{12}_[0-9a-f]{16}\.jpg$")
 
 
 @dataclass
@@ -101,17 +108,32 @@ class CaptureStore:
     # ------------------------------------------------------------------ state
     def _load(self) -> None:
         """Read an existing manifest so restarts extend a dataset rather than
-        silently starting a second one beside it."""
+        silently starting a second one beside it.
+
+        Line by line: a damaged line (a power cut mid-append) is skipped, not
+        the end of the manifest. Stopping at it used to hide every later sample
+        on every later boot -- the count froze, so `max_samples` stopped bounding
+        the card, and the next review() rewrote the manifest without them.
+        """
+        known = {f.name for f in fields(Sample)}
         try:
-            for line in self._manifest.read_text().splitlines():
-                if line.strip():
-                    self._samples.append(Sample(**json.loads(line)))
+            text = self._manifest.read_text()
         except FileNotFoundError:
-            pass
-        except (ValueError, TypeError):
+            return
+        except (OSError, UnicodeDecodeError):
             # A corrupt manifest must not stop the camera. The images are still
             # on disk; the export tool reports the discrepancy.
-            pass
+            return
+        for line in text.splitlines():
+            if not line.strip():
+                continue
+            try:
+                record = json.loads(line)
+                if not isinstance(record, dict):
+                    continue
+                self._samples.append(Sample(**{k: v for k, v in record.items() if k in known}))
+            except (ValueError, TypeError):
+                continue
 
     @property
     def count(self) -> int:
@@ -199,8 +221,20 @@ class CaptureStore:
         return sample
 
     def _append_manifest(self, sample: Sample) -> None:
+        # Start on a fresh line if the previous append was cut off mid-line;
+        # otherwise this record is glued onto the fragment and lost with it.
+        prefix = ""
+        try:
+            with self._manifest.open("rb") as existing:
+                existing.seek(0, 2)
+                if existing.tell() > 0:
+                    existing.seek(-1, 2)
+                    if existing.read(1) != b"\n":
+                        prefix = "\n"
+        except FileNotFoundError:
+            pass
         with self._manifest.open("a") as handle:
-            handle.write(json.dumps(sample.as_dict()) + "\n")
+            handle.write(prefix + json.dumps(sample.as_dict()) + "\n")
 
     # ------------------------------------------------------------------ review
     def review(self, sample_id: str, label: str, notes: str = "") -> bool:
@@ -233,19 +267,27 @@ class CaptureStore:
         return list(self._samples)
 
     def purge(self) -> int:
-        """Delete every captured sample. The user's right to change their mind."""
+        """Delete every captured sample. The user's right to change their mind.
+
+        Every captured frame on disk, not only the ones the manifest still
+        lists: a manifest damaged by a power cut must not leave footage behind
+        after someone asked for it to be deleted.
+        """
+        targets = {self.directory / sample.image for sample in self._samples}
+        with contextlib.suppress(OSError):
+            targets |= {
+                path for path in self.directory.iterdir() if _CAPTURED_IMAGE.match(path.name)
+            }
         removed = 0
-        for sample in self._samples:
+        for path in targets:
             try:
-                (self.directory / sample.image).unlink()
+                path.unlink()
                 removed += 1
             except OSError:
                 pass
         self._samples.clear()
-        try:
+        with contextlib.suppress(OSError):
             self._manifest.unlink()
-        except OSError:
-            pass
         return removed
 
 

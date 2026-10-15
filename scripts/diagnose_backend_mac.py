@@ -179,7 +179,7 @@ def mdns_advertising(timeout: float = 3.0) -> tuple[bool, str]:
 
     import socket
 
-    from cloud.mdns import SERVICE_TYPE, lan_ip
+    from cloud.mdns import SERVICE_TYPE, lan_ip, read_backend_id
 
     found: list[str] = []
 
@@ -193,18 +193,44 @@ def mdns_advertising(timeout: float = 3.0) -> tuple[bool, str]:
         def remove_service(self, zc, type_, name):
             pass
 
+    # Which record is OURS. Taking the first one found checked whichever
+    # backend answered first -- on a network with two, this could call our
+    # stale record current (the other one's address matched) or call a
+    # healthy one stale. The TXT `id` is what identifies a backend; read
+    # without minting one, so the diagnostic never invents an identity.
+    own_id = read_backend_id()
+
     zc = Zeroconf()
     try:
         ServiceBrowser(zc, SERVICE_TYPE, _Listener())
         time.sleep(timeout)
         if not found:
             return False, "not seen -- SENSORDYME_MDNS may be off, or the network blocks multicast"
-        info = zc.get_service_info(SERVICE_TYPE, found[0], timeout=int(timeout * 1000))
+        infos = [(name, zc.get_service_info(SERVICE_TYPE, name, timeout=int(timeout * 1000))) for name in found]
     finally:
         zc.close()
 
-    if info is None:
+    resolved = [(name, info) for name, info in infos if info is not None]
+    if not resolved:
         return False, f"advertised as {found[0]!r} but it would not resolve"
+
+    def record_id(info) -> Optional[str]:
+        raw = (info.properties or {}).get(b"id")
+        return raw.decode(errors="replace") if isinstance(raw, bytes) else None
+
+    if own_id is not None:
+        mine = [(name, info) for name, info in resolved if record_id(info) == own_id]
+        if not mine:
+            others = ", ".join(f"{name} (id {record_id(info)})" for name, info in resolved)
+            return False, (
+                f"this backend (id {own_id}) is not advertising; only other SensorDyme "
+                f"backends are visible: {others}"
+            )
+        name, info = mine[0]
+    else:
+        # No persisted id to match (the backend has never run from here):
+        # fall back to the first record, and say that is what was checked.
+        name, info = resolved[0]
 
     advertised = [socket.inet_ntoa(a) for a in (info.addresses or []) if len(a) == 4]
     actual = lan_ip()
@@ -217,7 +243,7 @@ def mdns_advertising(timeout: float = 3.0) -> tuple[bool, str]:
             f"Restart the backend so it re-announces: "
             f"launchctl kickstart -k gui/$(id -u)/com.sensordyme.backend"
         )
-    return True, f"visible and current ({found[0]} at {actual}:{info.port})"
+    return True, f"visible and current ({name} at {actual}:{info.port})"
 
 
 def main() -> int:

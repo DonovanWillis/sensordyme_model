@@ -23,6 +23,12 @@ struct ZoneEditorView: View {
     @State private var errorMessage: String?
     @State private var saving = false
     @StateObject private var saveProgress = ProgressTracker()
+    /// The live picture's real width / height, reported by the feed once a
+    /// frame decodes (FeedAspectRatioKey). The canvas takes this shape so the
+    /// picture fills it exactly and a tap normalised against the canvas is a
+    /// point normalised against the camera frame — which is what the device
+    /// tests polygons against. 4:3 (the shipped 640x480) until a frame arrives.
+    @State private var feedAspect: CGFloat = 4 / 3
 
     var body: some View {
         NavigationStack {
@@ -103,7 +109,10 @@ struct ZoneEditorView: View {
                 ))
             }
         }
-        .aspectRatio(4 / 3, contentMode: .fit)
+        .aspectRatio(feedAspect, contentMode: .fit)
+        .onPreferenceChange(FeedAspectRatioKey.self) { aspect in
+            if let aspect, aspect.isFinite, aspect > 0 { feedAspect = aspect }
+        }
         .clipShape(RoundedRectangle(cornerRadius: SD.Radius.lg, style: .continuous))
     }
 

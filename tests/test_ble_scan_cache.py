@@ -92,7 +92,9 @@ def test_a_failed_rescan_keeps_the_networks_already_found():
 
     server = make_server(flaky_scan)
     for _ in range(2):
-        server.refresh_networks()
+        # force: a back-to-back implicit refresh is rate-limited by design
+        # (tests/test_network_review_fixes.py); this is about the failed rescan.
+        server.refresh_networks(force=True)
         for _ in range(50):
             if not server._scanning:
                 break

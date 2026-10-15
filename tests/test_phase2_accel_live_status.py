@@ -33,7 +33,7 @@ def _reset_accel_state(monkeypatch):
     monkeypatch.setattr(accel, "_inference_count", 0, raising=False)
     monkeypatch.setattr(accel, "_last_inference_monotonic", None, raising=False)
     monkeypatch.setattr(accel, "_hailo_failed_reason", None, raising=False)
-    yield
+    return
 
 
 def _hat(present=True, runtime=True, detail="Hailo device at /dev/hailo0"):

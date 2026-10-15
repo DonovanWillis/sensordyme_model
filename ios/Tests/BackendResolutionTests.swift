@@ -309,6 +309,9 @@ check(twoNames.map(\.host) == ["a.local", "b.local"],
 //
 // Candidate A is found, its verification is slow; B is found, verified, and
 // becomes active; then A's verification finally returns. A must not win.
+// AppState (API.swift) calls this after every network wait in resolveBackend,
+// the heartbeat and revalidateBackend, with a generation it bumps on reconnect,
+// pinConfigured and adoptDiscovered.
 
 check(BackendResolution.verificationIsCurrent(generation: 2, current: 2),
       "a verification from the current generation is acted on")
@@ -439,6 +442,31 @@ check(BackendResolution.healthIdentityMatches(reported: nil, expected: "bk_mine"
       "a backend that predates the id field is not stranded")
 check(BackendResolution.healthIdentityMatches(reported: "", expected: "bk_mine"),
       "an empty id is treated as no id")
+
+// MARK: - Loopback is an address, not a prefix
+
+print("\nloopback is recognised by address, not by a name that starts with 127.:")
+check(BackendResolution.isLoopbackName("127.0.0.1"), "127.0.0.1 is loopback")
+check(BackendResolution.isLoopbackName("127.8.9.10"), "all of 127/8 is loopback")
+check(!BackendResolution.isLoopbackName("127.0.0.1.attacker.example"),
+      "a DNS name that merely STARTS with 127. is not loopback")
+check(!BackendResolution.cleartextPermitted("http://127.0.0.1.attacker.example:8787"),
+      "...so a password is never sent to it in the clear")
+check(BackendResolution.isLoopbackName("::1"), "IPv6 loopback is loopback")
+check(!BackendResolution.isUsableFromPhone("http://[::1]:8787", allowingLoopback: false),
+      "and is not a server a phone can reach")
+check(BackendResolution.isLoopbackName("localhost") && BackendResolution.isLoopbackName("dev.localhost"),
+      "localhost names still are")
+
+// MARK: - A resolved address as a URL host
+
+print("\nan address becomes a URL host with its scope removed before bracketing:")
+check(BackendResolution.urlHostLiteral("fe80::1%en0", isIPv6: true) == "[fe80::1]",
+      "a scoped link-local IPv6 address loses its scope and gains both brackets")
+check(URL(string: "http://\(BackendResolution.urlHostLiteral("fe80::1%en0", isIPv6: true)):8899") != nil,
+      "and is a valid URL (stripping after bracketing produced \"[fe80::1\", which is not)")
+check(BackendResolution.urlHostLiteral("192.168.1.20", isIPv6: false) == "192.168.1.20", "IPv4 unchanged")
+check(BackendResolution.urlHostLiteral("2001:db8::5", isIPv6: true) == "[2001:db8::5]", "unscoped IPv6 bracketed")
 
 print("\n\(failures == 0 ? "PASSED" : "\(failures) FAILED")")
 exit(failures == 0 ? 0 : 1)

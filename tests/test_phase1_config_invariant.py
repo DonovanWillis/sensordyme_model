@@ -173,3 +173,31 @@ def test_every_preset_alert_type_is_covered_by_a_list_migration():
         f"LIST_MIGRATIONS pushes types the repo's config.yaml does not list as loud: "
         f"{sorted(migrated_members - repo_loud)}"
     )
+
+
+def test_a_migrated_deployed_config_is_as_loud_as_a_fresh_checkout(deployed_config):
+    """The invariant above only covers presets that declare `alert_types`.
+    Driver Safety declares none -- it alerts on main.ALERT_EVENT_TYPES_PI -- so
+    `distraction` and `eyes_up`, made loud in the repo after this config
+    shipped, stayed soft (no push) on every deployed unit while the preset
+    check passed. Stated over the whole list instead: a unit migrated forward
+    from the oldest field config tags exactly what a fresh checkout tags."""
+    migrate(deployed_config)
+    device_loud = set(load_config(deployed_config)["alerts"]["loud_types"])
+    repo_loud = set(load_config(REPO_ROOT / "config.yaml")["alerts"]["loud_types"])
+    assert device_loud == repo_loud, (
+        f"missing on a migrated device: {sorted(repo_loud - device_loud)}; "
+        f"extra: {sorted(device_loud - repo_loud)}"
+    )
+
+
+def test_every_pi_alert_type_the_repo_makes_loud_reaches_deployed_devices(deployed_config):
+    """Same property from the alert-type side, independent of the fixture's
+    contents: every type the pi profile alerts on and the repo tags loud is
+    loud after migration."""
+    from main import ALERT_EVENT_TYPES_PI
+
+    migrate(deployed_config)
+    device_loud = set(load_config(deployed_config)["alerts"]["loud_types"])
+    repo_loud = set(load_config(REPO_ROOT / "config.yaml")["alerts"]["loud_types"])
+    assert sorted((ALERT_EVENT_TYPES_PI & repo_loud) - device_loud) == []

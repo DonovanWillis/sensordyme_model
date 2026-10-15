@@ -148,8 +148,10 @@ def test_full_customer_journey(backend):
     r = client.post("/v1/ingest", json={"events": [], "active_preset": "elderly_monitoring"}, headers=device_headers)
     assert r.json()["command"] is None
 
-    # 6b) AI configuration: plain language -> a preset + rules (keyword fallback path,
-    # since no GEMINI_API_KEY is set in the test environment)
+    # 6b) AI configuration: plain language -> a mode (keyword fallback path,
+    # since no model is reachable in the test environment). A mode proposal
+    # carries no rules: the device cannot run custom rules beside a mode (see
+    # cloud/app.py's _NOT_BESIDE_A_MODE).
     r = client.post(
         "/v1/ai/configure",
         json={"device_id": device_id, "prompt": "watch my baby and alert me if her face gets covered"},
@@ -158,13 +160,24 @@ def test_full_customer_journey(backend):
     assert r.status_code == 200
     proposal = r.json()
     assert proposal["preset"] == "baby_monitoring"
-    assert proposal["explanation"] and isinstance(proposal["rules"], list)
+    assert proposal["explanation"] and proposal["rules"] == []
+    assert proposal["draft_version"]
+
+    # ...and a custom request -> rules (what the model path returns: preset "").
+    app_module._ai_configure_llm = lambda prompt: {
+        "preset": "", "variant": "", "explanation": "Watching for someone on the floor.",
+        "settings": {}, "unsupported": [], "source": "jupiter",
+        "rules": [{"target": "on_floor", "predicate": "present", "secondary": "",
+                   "description": "someone on the floor", "zone": "", "persist_s": 5.0,
+                   "min_count": 1, "confidence": 0.6, "severity": "critical",
+                   "cooldown_s": 60.0, "schedule": "", "notify": "push"}],
+    }
     r = client.post(
         "/v1/ai/configure",
-        json={"device_id": device_id, "prompt": "alert me if grandpa falls"},
+        json={"device_id": device_id, "prompt": "alert me if grandpa ends up on the floor"},
         headers=auth,
     )
-    assert r.json()["preset"] == "elderly_monitoring"
+    assert r.json()["preset"] == "" and len(r.json()["rules"]) == 1
 
     # 6c) connected phone number: loud alerts also go out as SMS (log fallback w/o Twilio)
     assert client.post("/v1/account/phone", json={"phone": "not-a-number"}, headers=auth).status_code == 400

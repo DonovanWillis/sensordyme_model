@@ -22,6 +22,7 @@ worse than one that admits it doesn't know.
 
 from __future__ import annotations
 
+import contextlib
 import functools
 import os
 import shutil
@@ -44,6 +45,10 @@ UNKNOWN = "unknown"
 # it is merely between ticks.
 _STALE_S = 5.0
 
+#: `_camera`'s detail for the one FAILED state that is ordinary: the first
+#: moments of boot, before any frame has been published.
+_NO_FRAMES_YET = "no frames captured yet"
+
 
 @dataclass
 class Component:
@@ -65,7 +70,8 @@ def _read_temperature_c() -> Optional[float]:
     if shutil.which("vcgencmd"):
         try:
             out = subprocess.run(
-                ["vcgencmd", "measure_temp"], capture_output=True, text=True, timeout=2
+                ["vcgencmd", "measure_temp"],  # noqa: S607 - fixed argv; presence checked by shutil.which
+                capture_output=True, text=True, timeout=2, check=False,
             ).stdout
             return round(float(out.strip().replace("temp=", "").replace("'C", "")), 1)
         except (OSError, ValueError, subprocess.SubprocessError):
@@ -79,7 +85,8 @@ def _read_throttled() -> Optional[str]:
         return None
     try:
         out = subprocess.run(
-            ["vcgencmd", "get_throttled"], capture_output=True, text=True, timeout=2
+            ["vcgencmd", "get_throttled"],  # noqa: S607 - fixed argv; presence checked by shutil.which
+            capture_output=True, text=True, timeout=2, check=False,
         ).stdout
         return out.strip().replace("throttled=", "") or None
     except (OSError, subprocess.SubprocessError):
@@ -173,7 +180,7 @@ def _camera(bus, capture, caller: str = "default") -> Component:
         return Component(UNKNOWN, "camera pipeline not started")
     age = bus.age_s()
     if age == float("inf"):
-        return Component(FAILED, "no frames captured yet")
+        return Component(FAILED, _NO_FRAMES_YET)
     metrics = {"frame_age_s": round(age, 2)}
     fps = _measure_fps(bus, caller)
     if fps is not None:
@@ -289,10 +296,8 @@ def collect(
     if used_mb is not None:
         system_metrics["memory_used_mb"] = used_mb
         system_metrics["memory_total_mb"] = total_mb
-    try:
+    with contextlib.suppress(OSError):
         system_metrics["load_1m"] = round(os.getloadavg()[0], 2)
-    except OSError:
-        pass
 
     system_state = OK
     system_detail = "nominal"
@@ -343,17 +348,28 @@ def collect(
     # monitoring_active is documented as the one field a consumer should trust,
     # and it was answering yes with nothing to look at.
     #
-    # Keyed on the STALE-FRAME branch only, not on FAILED generally: `_camera`
-    # also reports FAILED for "no frames captured yet", which is the ordinary
-    # state during the first second of boot. Flipping on that would make a
-    # healthy device announce it is not monitoring every time it starts.
+    # Every FAILED camera state counts EXCEPT "no frames captured yet", which is
+    # the ordinary state during the first second of boot -- flipping on that
+    # would make a healthy device announce it is not monitoring every time it
+    # starts. This used to match the stale-frame detail only, which silently
+    # excluded "capture service stopped": a dead pump, frames long stale, and
+    # monitoring_active still True.
     camera_component = _camera(bus, capture, caller)
     camera_stopped = (
-        camera_component.state == FAILED and "no new frame" in camera_component.detail
+        camera_component.state == FAILED and camera_component.detail != _NO_FRAMES_YET
     )
 
     if detection_degraded is None:
         inference = _inference(heartbeat_age_s, module_name or "unknown")
+        # Processed-frame cadence, the interval that actually decides whether
+        # in-progress evidence survives (EventEngine's occlusion grace). The
+        # bus's own interval_stats measure capture cadence only, which stays
+        # at 33 ms while the inference loop stalls for a second. Flat keys: the
+        # app decodes metric values as scalars.
+        processed_stats = getattr(bus, "processed_interval_stats", None)
+        if callable(processed_stats):
+            for key, value in processed_stats(caller).items():
+                inference.metrics[f"processed_{key}"] = value
     else:
         # The loop is alive (its heartbeat still ticks) but it is deliberately
         # not analysing. That is a FAILURE of the product's purpose even though
@@ -372,8 +388,14 @@ def collect(
         "device_id": _device_id(),
         # The single field a consumer should trust for "is this thing watching?".
         # Everything else describes components; this describes the product.
+        #
+        # An inference loop whose heartbeat has gone stale is not watching
+        # either, however healthy the camera and accelerator look.
         "monitoring_active": (
-            detection_degraded is None and not accelerator_died and not camera_stopped
+            detection_degraded is None
+            and not accelerator_died
+            and not camera_stopped
+            and inference.state != FAILED
         ),
         "camera": asdict(camera_component),
         "inference": asdict(inference),

@@ -15,7 +15,6 @@ need to, because in both cases nothing reaches a camera.
 from __future__ import annotations
 
 import json
-import re
 from dataclasses import dataclass, field
 from typing import Optional
 
@@ -27,7 +26,7 @@ from jupiter.grammar import build_grammar
 from jupiter.providers import JupiterUnavailable, Provider, ProviderResult, get_provider
 from jupiter.schema import Interpretation, parse_response, schema_for_registry
 
-_JSON_BLOCK = re.compile(r"\{.*\}", re.DOTALL)
+_DECODER = json.JSONDecoder()
 
 
 @dataclass
@@ -76,14 +75,17 @@ def _extract_json_verbose(text: str) -> tuple[Optional[dict], bool]:
         return (parsed if isinstance(parsed, dict) else None), fenced
     except (ValueError, TypeError):
         pass
-    match = _JSON_BLOCK.search(text)
-    if not match:
-        return None, True
-    try:
-        parsed = json.loads(match.group(0))
-    except (ValueError, TypeError):
-        return None, True
-    return (parsed if isinstance(parsed, dict) else None), True
+    # The first object that decodes on its own, wherever it starts. A greedy
+    # `{.*}` span failed whenever trailing prose also held a brace ("replace
+    # {zone} with ...") or the model wrote two objects.
+    for start in (i for i, ch in enumerate(text) if ch == "{"):
+        try:
+            parsed, _end = _DECODER.raw_decode(text, start)
+        except ValueError:
+            continue
+        if isinstance(parsed, dict):
+            return parsed, True
+    return None, True
 
 
 def interpret(
@@ -95,7 +97,12 @@ def interpret(
     reg=None,
     use_grammar: bool = True,
 ) -> InterpretOutcome:
-    """Turn one plain-language request into validated SensorDyme rules."""
+    """Turn one plain-language request into validated SensorDyme rules.
+
+    `use_grammar=False` turns constrained decoding off entirely — neither the
+    JSON Schema nor the GBNF grammar is sent — which is what the eval's
+    `--no-grammar` run needs in order to measure what the constraint is worth.
+    """
     reg = reg or registry()
 
     try:
@@ -140,7 +147,9 @@ def interpret(
 
     system = prompt_module.system_prompt(reg)
     user = prompt_module.user_prompt(cleaned)
-    schema = schema_for_registry(reg)
+    # Ollama enforces the schema through `format`, so leaving it in place made
+    # an "unconstrained" run exactly as constrained as a normal one.
+    schema = schema_for_registry(reg) if use_grammar else None
     grammar = None
     if use_grammar:
         try:
@@ -150,18 +159,24 @@ def interpret(
 
     try:
         result: ProviderResult = backend.complete(system, user, schema=schema, grammar=grammar)
-    except JupiterUnavailable as exc:
+    except Exception as exc:  # noqa: BLE001 - any provider failure is "unavailable"
+        # JupiterUnavailable is the contract, but a third-party provider (or a
+        # requests error a built-in one failed to wrap) must still produce an
+        # answer the caller can fall back from, never an HTTP 500.
+        message = exc.message if isinstance(exc, JupiterUnavailable) else (
+            f"the AI provider failed: {exc}"
+        )
         return InterpretOutcome(
             interpretation=Interpretation(understood="", rules=[], unsupported=[{
                 "request": cleaned,
-                "reason": exc.message,
+                "reason": message,
                 "requires": "a reachable Jupiter model — see docs/JUPITER.md",
                 "support": "unsupported",
                 "alternatives": [],
             }]),
             provider=getattr(backend, "name", "unknown"),
             ok=False,
-            error=exc.message,
+            error=message,
             injection_suspected=injection,
         )
 

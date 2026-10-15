@@ -31,9 +31,28 @@ from core.capabilities import registry
 from jupiter.eval import compare, format_report, generate, run, validate_dataset
 from jupiter.grammar import grammar_stats
 from jupiter.providers import JupiterUnavailable, get_provider
+from jupiter.router import role_config
 
 
-def check(provider_names: list[str]) -> int:
+def build_provider(name: str, model: str = "", base_url: str = ""):
+    """The provider the backend would actually use for Configure-with-AI.
+
+    get_provider(name) with no config benchmarked qwen2.5:1.5b on localhost,
+    ignoring JUPITER_MODEL / JUPITER_BASE_URL / jupiter_config.yaml — so
+    `--check` could pass while the backend's real configure model (7b) was not
+    even pulled. The router's configure-role config applies whenever it names
+    this same provider; --model / --base-url override either way.
+    """
+    routed_name, config = role_config("configure")
+    config = dict(config) if routed_name == name.strip().lower() else {}
+    if model:
+        config["model"] = model
+    if base_url:
+        config["base_url"] = base_url
+    return get_provider(name, config)
+
+
+def check(provider_names: list[str], model: str = "", base_url: str = "") -> int:
     """Report whether each provider can actually answer, without scoring."""
     stats = grammar_stats()
     print(f"capability registry : {stats['targets']} targets x {stats['predicates']} "
@@ -41,7 +60,7 @@ def check(provider_names: list[str]) -> int:
     worst = 0
     for name in provider_names:
         try:
-            provider = get_provider(name)
+            provider = build_provider(name, model, base_url)
         except JupiterUnavailable as exc:
             print(f"{name:<22} UNAVAILABLE  {exc.message}")
             worst = 1
@@ -64,13 +83,16 @@ def main() -> int:
     parser.add_argument("--no-grammar", action="store_true",
                         help="disable constrained decoding, to measure what it is worth")
     parser.add_argument("--check", action="store_true", help="probe providers and exit")
+    parser.add_argument("--model", default="",
+                        help="model to score (default: what the backend's configure role uses)")
+    parser.add_argument("--base-url", default="", help="model server URL override")
     parser.add_argument("--out", type=Path, help="write the full report as JSON")
     parser.add_argument("--show-failures", type=int, default=10)
     args = parser.parse_args()
 
     providers = args.provider or ["jupiter"]
     if args.check:
-        return check(providers)
+        return check(providers, args.model, args.base_url)
 
     reg = registry()
     examples = generate(limit=args.cases, reg=reg, seed=args.seed)
@@ -91,7 +113,7 @@ def main() -> int:
     reports = []
     for name in providers:
         try:
-            provider = get_provider(name)
+            provider = build_provider(name, args.model, args.base_url)
         except JupiterUnavailable as exc:
             print(f"\n{name}: {exc.message}")
             continue
@@ -103,9 +125,9 @@ def main() -> int:
         print(f"\nrunning {name} ({detail})…")
         started = time.monotonic()
 
-        def progress(done, total, _name=name):
+        def progress(done, total, _name=name, _started=started):
             if done % 10 == 0 or done == total:
-                elapsed = time.monotonic() - started
+                elapsed = time.monotonic() - _started
                 print(f"  {_name}: {done}/{total}  {elapsed:.0f}s", end="\r", flush=True)
 
         reports.append(run(examples, provider, reg=reg,

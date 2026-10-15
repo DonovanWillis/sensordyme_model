@@ -7,21 +7,40 @@ import json
 from pathlib import Path
 from typing import Optional
 
-import matplotlib
+import matplotlib as mpl
 
-matplotlib.use("Agg")
+mpl.use("Agg")
 import matplotlib.pyplot as plt
 
 RESULTS_DIR = Path(__file__).parent / "results"
 REALTIME_FPS_THRESHOLD = 15.0  # below this, a module isn't considered real-time on this hardware
 
 
-def load_results(timestamp: Optional[str] = None) -> list[dict]:
-    """Load benchmark result JSON files, optionally filtered to one run's timestamp."""
+def _is_benchmark_result(data: object) -> bool:
+    """A run_benchmarks.py result, as opposed to the other JSON that shares the
+    directory (the committed accuracy baseline, accuracy_state_farm runs,
+    accuracy_protocol recordings and reports)."""
+    return isinstance(data, dict) and {"module", "fps", "latency_ms"} <= data.keys()
+
+
+def load_results(timestamp: Optional[str] = None, results_dir: Optional[Path] = None) -> list[dict]:
+    """Load benchmark result JSON files, optionally filtered to one run's timestamp.
+
+    Only run_benchmarks.py output is returned. benchmarks/results/ also holds
+    the committed baseline_phase1.json and other harnesses' JSON; globbing all
+    of it made every plot crash with KeyError: 'module' on a fresh checkout.
+    """
+    directory = results_dir or RESULTS_DIR
     pattern = f"*_{timestamp}.json" if timestamp else "*.json"
-    files = sorted(RESULTS_DIR.glob(pattern))
-    files = [f for f in files if not f.name.startswith("summary")]
-    return [json.loads(f.read_text()) for f in files]
+    results = []
+    for path in sorted(directory.glob(pattern)):
+        try:
+            data = json.loads(path.read_text())
+        except (OSError, ValueError):
+            continue
+        if _is_benchmark_result(data):
+            results.append(data)
+    return results
 
 
 def plot_fps_bar_chart(results: list[dict], out_path: Path) -> None:

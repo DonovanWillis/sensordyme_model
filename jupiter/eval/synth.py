@@ -22,6 +22,8 @@ Two limits worth stating plainly, because synthetic data flatters a model:
 from __future__ import annotations
 
 import itertools
+import math
+import re
 from collections.abc import Iterator
 from dataclasses import dataclass, field
 from typing import Optional
@@ -149,12 +151,21 @@ def generate(limit: int = 400, reg=None, seed: int = 0) -> list[Example]:
     refusals = refusals[:reserved]
     limit = max(1, limit - len(refusals))
 
+    # A quota per request shape. Sections used to fill in order against
+    # running totals, and the absence section added its 20 cases whatever the
+    # limit — so at the documented 40-case size there were no zone or relation
+    # cases at all, and those predicates went unmeasured.
+    quota = {
+        "present": math.ceil(limit * 0.40),
+        "absent": math.ceil(limit * 0.15),
+        "zone": math.ceil(limit * 0.25),
+    }
+    quota["relation"] = max(0, limit - sum(quota.values()))
+
     examples: list[Example] = []
 
     # --- supported: presence, the commonest request shape ------------------
-    for index, target in enumerate(labels):
-        if len(examples) >= limit * 0.45:
-            break
+    for index, target in enumerate(labels[:quota["present"]]):
         template = _pick(_PRESENT_TEMPLATES, index + seed)
         suffix, kind = _pick(_DURATION_SUFFIXES, index + seed)
         seconds = 5 * (index % 6 + 1)
@@ -167,7 +178,7 @@ def generate(limit: int = 400, reg=None, seed: int = 0) -> list[Example]:
 
     # --- supported: absence -------------------------------------------------
     if "absent" in predicates:
-        for index, target in enumerate(labels[:20]):
+        for index, target in enumerate(labels[:min(20, quota["absent"])]):
             request = _phrase(_pick(_ABSENT_TEMPLATES, index + seed), target=target)
             examples.append(Example(
                 request=request, expect_supported=True, target=target,
@@ -176,9 +187,8 @@ def generate(limit: int = 400, reg=None, seed: int = 0) -> list[Example]:
 
     # --- supported: zones, with and without schedules -----------------------
     if "in_zone" in predicates:
-        for index, (target, zone) in enumerate(itertools.product(labels[:12], ZONES)):
-            if len(examples) >= limit * 0.8:
-                break
+        zone_pairs = list(itertools.product(labels[:12], ZONES))[:quota["zone"]]
+        for index, (target, zone) in enumerate(zone_pairs):
             schedule_suffix, schedule = _pick(_SCHEDULE_SUFFIXES, index + seed)
             request = _phrase(_pick(_ZONE_TEMPLATES, index + seed), target=target, zone=zone)
             examples.append(Example(
@@ -190,7 +200,7 @@ def generate(limit: int = 400, reg=None, seed: int = 0) -> list[Example]:
     # --- supported: relations ----------------------------------------------
     if "near" in predicates:
         pairs = [(a, b) for a, b in itertools.product(labels[:10], labels[:10]) if a != b]
-        for index, (target, secondary) in enumerate(pairs[:40]):
+        for index, (target, secondary) in enumerate(pairs[:min(40, quota["relation"])]):
             request = _phrase(
                 _pick(_NEAR_TEMPLATES, index + seed), target=target, secondary=secondary
             )
@@ -203,27 +213,62 @@ def generate(limit: int = 400, reg=None, seed: int = 0) -> list[Example]:
 
 
 def _refusal_examples(labels) -> list[Example]:
-    """Requests that must be declined, built from what the registry lacks."""
-    examples: list[Example] = []
-    # --- refusals: objects the detector cannot see --------------------------
+    """Requests that must be declined, built from what the registry lacks.
+
+    Ordered so a SMALL reserved slice is still a fair test: round-robin across
+    targets (one template each, then the next template) rather than five
+    phrasings of one object, and targets the system prompt itself uses as a
+    worked refusal example last. Taking the first eight used to yield "can" x5
+    and "package" x3 — both answered verbatim in the prompt's few-shot
+    examples — so the refusal score measured recall of the prompt.
+    """
     # Asserted, not assumed: if one of these ever becomes detectable the dataset
     # must stop treating it as a refusal, and a silent wrong label here would
     # train exactly the wrong behaviour.
-    for target in UNDETECTABLE:
-        if target in labels:
-            continue
-        for template in _PRESENT_TEMPLATES:
-            examples.append(Example(
+    targets = [t for t in UNDETECTABLE if t not in labels]
+    shown = _targets_in_prompt_examples(targets)
+    groups: list[list[Example]] = [
+        [
+            Example(
                 request=_phrase(template, target=target), expect_supported=False,
                 target=target, tags=("refusal", "undetectable"),
-            ))
-
-    # --- refusals: not knowable from a camera at all ------------------------
-    for request in UNKNOWABLE:
-        examples.append(Example(
-            request=request, expect_supported=False, tags=("refusal", "unknowable"),
-        ))
+            )
+            for template in _PRESENT_TEMPLATES
+        ]
+        for target in targets if target not in shown
+    ]
+    # Not knowable from a camera at all, at any capability level.
+    groups.append([
+        Example(request=request, expect_supported=False, tags=("refusal", "unknowable"))
+        for request in UNKNOWABLE
+    ])
+    examples = _round_robin(groups)
+    for target in targets:
+        if target in shown:
+            examples.extend(
+                Example(
+                    request=_phrase(template, target=target), expect_supported=False,
+                    target=target, tags=("refusal", "undetectable", "in_prompt"),
+                )
+                for template in _PRESENT_TEMPLATES
+            )
     return examples
+
+
+def _targets_in_prompt_examples(targets) -> set[str]:
+    """Which of `targets` the system prompt's few-shot examples mention."""
+    from jupiter.prompt import _EXAMPLES
+
+    requests = " ".join(request.lower() for request, _answer in _EXAMPLES)
+    return {t for t in targets if re.search(rf"\b{re.escape(t)}s?\b", requests)}
+
+
+def _round_robin(groups: list[list[Example]]) -> list[Example]:
+    """First item of every group, then the second of every group, and so on."""
+    ordered: list[Example] = []
+    for row in itertools.zip_longest(*groups):
+        ordered.extend(item for item in row if item is not None)
+    return ordered
 
 
 def iter_jsonl(examples: list[Example]) -> Iterator[str]:

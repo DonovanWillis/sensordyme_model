@@ -46,6 +46,9 @@ enum DevicePresence {
         case neverReported
         /// No such device on this account.
         case notLinked
+        /// The account has devices, but which of them this phone's camera is
+        /// cannot be told — so nothing can be said about "your device".
+        case ambiguous
         /// The backend could not be asked, so the honest answer is "don't know".
         case undetermined
     }
@@ -57,17 +60,21 @@ enum DevicePresence {
     /// windows would let the device list say "online" while this said otherwise.
     static let liveWindow: TimeInterval = 30
 
+    /// - Parameter accountHasDevices: whether the account has any devices at
+    ///   all. With `backend` nil this separates "no device on the account" from
+    ///   "several, and none is known to be this phone's camera".
     static func verdict(
         foundOnNetwork: Bool,
         backend: BackendView?,
         backendReachable: Bool,
+        accountHasDevices: Bool = false,
         now: Date
     ) -> Verdict {
         if foundOnNetwork { return .reachable }
         // Bonjour is silent. What the backend says is now the only evidence
         // about whether the device itself is alive.
         guard backendReachable else { return .undetermined }
-        guard let backend else { return .notLinked }
+        guard let backend else { return accountHasDevices ? .ambiguous : .notLinked }
         guard let lastSeen = backend.lastSeen else { return .neverReported }
         let age = now.timeIntervalSince(lastSeen)
         // A negative age means the device's clock or ours is ahead. The Pi has no
@@ -86,6 +93,7 @@ enum DevicePresence {
         case .quiet(let since): return "Your device hasn't reported in \(duration(since))"
         case .neverReported: return "Your device hasn't been set up yet"
         case .notLinked: return "No device linked to this account"
+        case .ambiguous: return "Can't tell which of your devices this phone is linked to"
         case .undetermined: return "Can't check your device right now"
         }
     }
@@ -107,6 +115,9 @@ enum DevicePresence {
             return "Stand near your SensorDyme and set it up over Bluetooth."
         case .notLinked:
             return "Add your SensorDyme with its claim code to see it here."
+        case .ambiguous:
+            return "Your account has more than one device. Choose this phone's camera in "
+                 + "Settings → Live feed → Find my device."
         case .undetermined:
             return "SensorDyme can't reach your Mac at the moment, so it can't say "
                  + "whether your device is online. It will keep trying."
@@ -121,7 +132,7 @@ enum DevicePresence {
     /// button that cannot work is worse than no button.
     static func offersLocalRetry(_ verdict: Verdict) -> Bool {
         switch verdict {
-        case .aliveButElsewhere, .undetermined: return true
+        case .aliveButElsewhere, .undetermined, .ambiguous: return true
         case .reachable, .quiet, .neverReported, .notLinked: return false
         }
     }

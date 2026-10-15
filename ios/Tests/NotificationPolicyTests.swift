@@ -76,35 +76,47 @@ if case .suppress(.withinCooldown) = decide(critical: false, configured: true, a
     print("  FAIL configured rules must not bypass the cooldown — one policy, no per-source exceptions"); failures += 1
 }
 
-// ------------------------------------------- bounding the announced-events list
-print("\nthe announced list keeps the NEWEST ids, so nothing is re-announced:")
-// The bug: this was `Set.suffix(500)`. A Set has no order, so that kept an
-// arbitrary 500 — and an evicted id is one the next poll no longer recognises,
-// so it gets announced a second time. Only shows up past a few hundred events.
-let many = Set(1...600)
-let kept = NotificationPolicy.trimAnnounced(many, limit: 500)
-check(kept.count == 500, "trims to the limit")
-check(kept.contains(600), "the newest id is kept")
-check(kept.contains(599) && kept.contains(560), "so are the ones just before it")
-check(!kept.contains(1) && !kept.contains(100), "the oldest ids are the ones dropped")
-check(kept.max() == 600 && kept.min() == 101, "exactly the newest 500, nothing arbitrary")
-check(kept == kept.sorted(), "stored in ascending order, so the next trim is stable")
+// ------------------------------------------------ what counts as new, per device
+print("\nnew means newer than this device's high-water mark:")
+check(NotificationPolicy.freshEvents(ids: [12, 11, 10], mark: 10) == ([11, 12], 12),
+      "only ids above the mark are fresh, oldest first, and the mark moves up")
+check(NotificationPolicy.freshEvents(ids: [12, 11], mark: 12) == ([], 12),
+      "nothing new: nothing fresh, mark unchanged")
+check(NotificationPolicy.freshEvents(ids: [], mark: 7) == ([], 7), "no events: mark kept")
 
-check(NotificationPolicy.trimAnnounced([], limit: 500) == [], "an empty set stays empty")
-check(NotificationPolicy.trimAnnounced([7, 3, 9], limit: 500).sorted() == [3, 7, 9],
-      "under the limit, everything is kept")
-check(NotificationPolicy.trimAnnounced(Set(1...10), limit: 3) == [8, 9, 10],
-      "a small limit still keeps the newest, not the first found")
-check(NotificationPolicy.trimAnnounced(Set(1...10), limit: 0) == [],
-      "a zero limit is not a crash")
-check(NotificationPolicy.trimAnnounced(Set(1...10), limit: -5) == [],
-      "nor is a negative one")
-// The property that actually matters: an id announced this instant survives.
-let justAnnounced = 100_000
-var big = Set(1...900)
-big.insert(justAnnounced)
-check(NotificationPolicy.trimAnnounced(big, limit: 500).contains(justAnnounced),
-      "an id announced a moment ago is never the one evicted")
+print("\nthe first sight of a device is history, not news (fresh install, new account, demo):")
+check(NotificationPolicy.freshEvents(ids: [300, 200, 100], mark: nil) == ([], 300),
+      "seeded at the newest id, announcing nothing — a day-old fall is not posted as if it just happened")
+check(NotificationPolicy.freshEvents(ids: [], mark: nil) == ([], 0),
+      "a device with no events yet: everything after this is new")
+check(NotificationPolicy.freshEvents(ids: [5, 4], mark: 900) == ([], 5),
+      "a device whose ids fell below its mark (backend reset) is re-seeded, not silenced for ever")
+
+// The regression: one global set trimmed to the newest 500 ids. A quiet
+// camera's window became the smallest ids once a busy camera on the same
+// account logged 500 events, was evicted on every save, and its old "fall" was
+// announced again on every other poll. Replayed here against the poller's real
+// shape: 25-event window per device, both devices every tick.
+print("\na busy camera cannot make a quiet camera's old alert news again:")
+do {
+    var marks: [String: Int] = [:]
+    var reannounced = 0
+    func poll(_ device: String, _ window: [Int]) -> [Int] {
+        let (fresh, mark) = NotificationPolicy.freshEvents(ids: window, mark: marks[device])
+        marks[device] = mark
+        return fresh
+    }
+    _ = poll("quiet", [1000])            // first sight: seeded
+    _ = poll("busy", [999])
+    var newest = 1000
+    for _ in 0..<800 {                   // far past the old 500-id bound
+        newest += 1
+        _ = poll("busy", Array((max(1001, newest - 24)...newest).reversed()))
+        reannounced += poll("quiet", [1000]).count
+    }
+    check(reannounced == 0, "the quiet camera's event 1000 is never fresh again (was: re-posted ~every 30s)")
+    check(poll("quiet", [newest + 1, 1000]) == [newest + 1], "while its genuinely new event still is")
+}
 
 print("\n\(failures == 0 ? "PASSED" : "\(failures) FAILED")")
 exit(failures == 0 ? 0 : 1)

@@ -4,10 +4,15 @@ Exposes one primary service the SensorDyme app discovers while the device has
 no Wi-Fi:
 
     Service  5d1e0001-...   SensorDyme provisioning
-      char   5d1e0002  read          device info JSON {name, model, version, hostname}
+      char   5d1e0002  read          device info JSON {id, name, model, version, hostname}
       char   5d1e0003  write         Wi-Fi credentials JSON {"ssid": "...", "psk": "..."}
-      char   5d1e0004  read/notify   status JSON {"state": "...", "ssid": ..., "ip": ..., "error": ...}
+                                     (long/prepared writes are reassembled by offset)
+      char   5d1e0004  read/notify   status JSON {"state", "ssid", "ip", "device_id",
+                                     "reconfigurable", "provision": {"state":
+                                     "connecting"|"ok"|"error", "ssid", "attempt",
+                                     "ip"|"error", "message"}, "scanning"} -- <= 512 bytes
       char   5d1e0005  write         lightweight commands JSON {"action": "rescan" | "identify"}
+      char   5d1e0006  read          networks JSON [{"ssid", "signal", "secured"}] (cached)
 
 Bluetooth is for setup/config/commands ONLY — frames never move over BLE; the
 live feed always uses Wi-Fi (see core/dashboard.py's /stream).
@@ -25,8 +30,10 @@ served: while the device is offline, and for a few minutes after each boot
 
 from __future__ import annotations
 
+import contextlib
 import json
 import threading
+import time
 from collections.abc import Callable
 from typing import Optional
 
@@ -76,7 +83,7 @@ def _fit_networks(networks: list) -> bytes:
     """
     compact = []
     for network in networks:
-        candidate = compact + [network]
+        candidate = [*compact, network]
         encoded = json.dumps(candidate, separators=(",", ":")).encode()
         if len(encoded) > _MAX_NETWORK_PAYLOAD:
             break
@@ -84,8 +91,150 @@ def _fit_networks(networks: list) -> bytes:
     return json.dumps(compact, separators=(",", ":")).encode()
 
 
-class BLEUnavailable(RuntimeError):
+#: The status value is served whole on a read, so it must fit the attribute.
+_MAX_STATUS_PAYLOAD = _GATT_MAX_ATTRIBUTE_BYTES
+
+
+def _dumps(obj) -> bytes:
+    # Compact, and UTF-8 rather than \uXXXX escapes: a non-ASCII SSID costs 4
+    # bytes per character instead of 12 (an emoji is a surrogate pair).
+    return json.dumps(obj, separators=(",", ":"), ensure_ascii=False).encode("utf-8")
+
+
+def _clip(text: str, max_bytes: int) -> str:
+    """`text` cut to at most `max_bytes` of UTF-8, never mid-character."""
+    return text.encode("utf-8")[:max_bytes].decode("utf-8", "ignore")
+
+
+def _encode_status(status: dict) -> bytes:
+    """The status payload as bytes that always fit a GATT attribute (512).
+
+    Every field is kept while it fits. Past 512 BlueZ cut the value mid-string,
+    the app could not parse it, and a setup whose outcome was in that value
+    waited out its 90-second deadline and blamed the password. Observed sizes:
+    an error status for a 32-byte non-ASCII SSID was 531 bytes.
+    Reductions, in order, only as needed: the redundant `provision.message` and
+    `provision.ssid` (the app sent that SSID), then the free text clipped. The
+    fields the app decides on -- state, provision.state/attempt/ip/error,
+    device_id, scanning -- are never dropped.
+    """
+    payload = _dumps(status)
+    if len(payload) <= _MAX_STATUS_PAYLOAD:
+        return payload
+    slim = dict(status)
+    provision = dict(slim["provision"]) if isinstance(slim.get("provision"), dict) else None
+    if provision is not None:
+        provision.pop("message", None)
+        provision.pop("ssid", None)
+        slim["provision"] = provision
+    payload = _dumps(slim)
+    if len(payload) <= _MAX_STATUS_PAYLOAD:
+        return payload
+    for key in ("ssid", "error"):
+        if isinstance(slim.get(key), str):
+            slim[key] = _clip(slim[key], 64)
+    if provision is not None and isinstance(provision.get("error"), str):
+        provision["error"] = _clip(provision["error"], 160)
+    payload = _dumps(slim)
+    if len(payload) <= _MAX_STATUS_PAYLOAD:
+        return payload
+    keep = ("state", "attempt", "ip", "error")
+    minimal = {
+        "state": slim.get("state"),
+        "device_id": slim.get("device_id"),
+        "provision": (
+            {k: (_clip(v, 60) if k == "error" and isinstance(v, str) else v)
+             for k, v in provision.items() if k in keep}
+            if provision is not None else slim.get("provision")
+        ),
+        "scanning": slim.get("scanning", False),
+    }
+    return _dumps(minimal)[:_MAX_STATUS_PAYLOAD]
+
+
+def parse_credentials(data: bytes) -> Optional[tuple[str, str]]:
+    """(ssid, psk) from a credential write, or None when it is not one.
+
+    Only a JSON object with a string `ssid` is credentials. `psk` may be absent
+    or null (an open network). Anything else -- a list, a string, `{"ssid":
+    null}` -- is refused here rather than turned into a join attempt for a
+    network literally called "None".
+    """
+    try:
+        payload = json.loads(data.decode("utf-8"))
+    except (ValueError, UnicodeDecodeError):
+        return None
+    if not isinstance(payload, dict):
+        return None
+    ssid = payload.get("ssid")
+    psk = payload.get("psk")
+    if not isinstance(ssid, str):
+        return None
+    if psk is None:
+        psk = ""
+    if not isinstance(psk, str):
+        return None
+    return ssid, psk
+
+
+def parse_command(data: bytes) -> Optional[dict]:
+    """The command object from a command write, or None when it is not one."""
+    try:
+        payload = json.loads(data.decode("utf-8"))
+    except (ValueError, UnicodeDecodeError):
+        return None
+    return payload if isinstance(payload, dict) else None
+
+
+class _WriteAssembler:
+    """Reassembles a characteristic value written in pieces.
+
+    A value longer than one MTU arrives as a long (prepared) write, and BlueZ
+    hands each piece to WriteValue separately with its `offset`. Treating every
+    piece as a whole value parsed each as broken JSON and dropped it, while the
+    write itself was acknowledged -- so the app waited for an outcome to a write
+    the device had thrown away.
+
+    A value is dispatched once the bytes so far parse as JSON; until then they
+    are held (bounded by the attribute size). A new write at offset 0 starts over.
+    """
+
+    def __init__(self, limit: int = _GATT_MAX_ATTRIBUTE_BYTES) -> None:
+        self._limit = limit
+        self._buf = bytearray()
+
+    def feed(self, chunk: bytes, offset: int = 0) -> Optional[bytes]:
+        if offset == 0:
+            if self._buf:
+                log.warning("BLE: discarded %d bytes of an incomplete or malformed write",
+                            len(self._buf))
+            self._buf = bytearray()
+        elif offset != len(self._buf):
+            log.warning("BLE: write at offset %d does not follow the %d bytes held; ignored",
+                        offset, len(self._buf))
+            self._buf = bytearray()
+            return None
+        self._buf.extend(chunk)
+        if len(self._buf) > self._limit:
+            log.warning("BLE: write longer than %d bytes ignored", self._limit)
+            self._buf = bytearray()
+            return None
+        data = bytes(self._buf)
+        try:
+            json.loads(data.decode("utf-8"))
+        except (ValueError, UnicodeDecodeError):
+            return None  # incomplete (more pieces to come) or malformed
+        self._buf = bytearray()
+        return data
+
+
+class BLEUnavailable(RuntimeError):  # noqa: N818 - established exception name
     """BlueZ / dbus python bindings are not present on this platform."""
+
+
+class BLEStartError(RuntimeError):
+    """The bindings exist but the GATT server could not be brought up (no adapter,
+    bluetoothd down, registration refused). Transient: worth retrying later."""
 
 
 class BLEProvisioningServer:
@@ -126,43 +275,100 @@ class BLEProvisioningServer:
         self._on_credentials = on_credentials
         self._on_command = on_command
         self._status: dict = {"state": "provisioning"}
+        #: monotonic() when the last scan finished; rate-limits implicit refreshes.
+        self._scanned_at: Optional[float] = None
+        #: Set while a join is using the radio: no implicit or explicit scans.
+        self._scans_paused = False
         self._btmgmt_active = False
         self._thread: Optional[threading.Thread] = None
         self._mainloop = None
         self._status_chrc = None
         self._running = False
+        self._ready = threading.Event()
+        self._error: Optional[str] = None
 
     # ------------------------------------------------------------------ public API
+    #: How long start() waits for the GATT server to be exported and registering.
+    _START_TIMEOUT_S = 10.0
+    #: A read of the networks characteristic starts a fresh scan only when the
+    #: cached list is at least this old. See refresh_networks().
+    _IMPLICIT_SCAN_MIN_AGE_S = 15.0
+
     def start(self) -> None:
-        """Bring the GATT server + advertisement up. Raises BLEUnavailable off-Pi."""
+        """Bring the GATT server + advertisement up.
+
+        Raises BLEUnavailable off-Pi (no bindings) and BLEStartError when the
+        bindings exist but the server could not be brought up -- returning
+        normally used to mean only "a thread was started", so a server that died
+        during setup was reported as an open setup window.
+        """
         try:
             import dbus
             import dbus.mainloop.glib  # noqa: F401
-            from gi.repository import GLib  # noqa: F401
+            from gi.repository import GLib
         except ImportError as exc:
             raise BLEUnavailable(
                 "BLE provisioning needs BlueZ D-Bus bindings (apt: python3-dbus python3-gi)"
             ) from exc
 
-        self._thread = threading.Thread(target=self._run, daemon=True, name="ble-gatt")
+        self._ready = threading.Event()
+        self._error = None
+        # Created HERE, before the thread exists, so stop() always has a loop to
+        # quit. It used to be created late in _run(); a stop() that arrived first
+        # found None, quit nothing, and the thread went on to serve -- and
+        # advertise -- for the life of the process on a device past its window.
+        self._mainloop = GLib.MainLoop()
         self._running = True
+        self._thread = threading.Thread(target=self._run, daemon=True, name="ble-gatt")
         self._thread.start()
+        if not self._ready.wait(self._START_TIMEOUT_S):
+            log.warning("BLE: GATT setup still in progress after %.0fs", self._START_TIMEOUT_S)
+        elif self._error is not None:
+            reason = self._error
+            self.stop()
+            raise BLEStartError(reason)
         # Start scanning immediately rather than when the app asks. Setup takes
         # a person several seconds of tapping to reach the network screen; using
         # those seconds means the list is usually already there on arrival.
         self.refresh_networks()
 
-    def refresh_networks(self) -> None:
+    def is_alive(self) -> bool:
+        """Whether the GATT server thread is still serving."""
+        thread = self._thread
+        return thread is not None and thread.is_alive()
+
+    @property
+    def failure(self) -> Optional[str]:
+        """Why the server failed to start or stopped serving, if it did."""
+        return self._error
+
+    def set_scans_paused(self, paused: bool) -> None:
+        """Hold off Wi-Fi scans while a join is using the radio."""
+        with self._scan_lock:
+            self._scans_paused = bool(paused)
+
+    def refresh_networks(self, force: bool = False) -> None:
         """Kick off a scan on a worker thread. Returns immediately.
 
         Concurrent calls collapse into the running scan: the app re-reading, a
         rescan command, and the periodic refresh must not stack up several
         nmcli invocations against one radio.
+
+        Implicit refreshes (a read of the networks characteristic) are also
+        rate-limited to one per _IMPLICIT_SCAN_MIN_AGE_S. Without that the device
+        and the app formed a loop: every finished scan pushed `scanning: false`,
+        the app answered every such status by re-reading the list, and every
+        read started the next scan -- back-to-back radio sweeps for as long as
+        the phone stayed connected, the join included. `force` (the explicit
+        "rescan" command) skips the age check. Nothing scans while paused.
         """
         if self._scan_networks is None:
             return
         with self._scan_lock:
-            if self._scanning:
+            if self._scanning or self._scans_paused:
+                return
+            if (not force and self._scanned_at is not None
+                    and time.monotonic() - self._scanned_at < self._IMPLICIT_SCAN_MIN_AGE_S):
                 return
             self._scanning = True
         self.set_status(dict(self._status))  # surface scanning=True
@@ -181,21 +387,36 @@ class BLEProvisioningServer:
             if networks or not self._networks:
                 self._networks = networks
             self._scanning = False
+            self._scanned_at = time.monotonic()
         log.info("BLE: wifi scan found %d network(s)", len(networks))
         self.set_status(dict(self._status))  # surface scanning=False
 
     def stop(self) -> None:
         self._running = False
         self._stop_btmgmt_advertising()
-        if self._mainloop is not None:
-            try:
-                self._mainloop.quit()
-            except Exception:  # noqa: BLE001
-                pass
-        if self._thread is not None:
-            self._thread.join(timeout=5)
+        loop = self._mainloop
+        if loop is not None:
+            # If the loop is not running yet this quit is lost (GLib resets it on
+            # run()); _serve() re-checks _running before running and a timer
+            # re-checks it while running, so the thread still exits.
+            with contextlib.suppress(Exception):
+                loop.quit()
+        thread = self._thread
+        if thread is not None:
+            thread.join(timeout=5)
+            if thread.is_alive():
+                log.warning("BLE provisioning thread did not exit within 5s; it will on its next check")
             self._thread = None
         log.info("BLE provisioning stopped")
+
+    def _keep_running(self) -> bool:
+        """GLib timer: quit the loop once stop() has asked, even if its quit() was lost."""
+        if self._running:
+            return True
+        loop = self._mainloop
+        if loop is not None:
+            loop.quit()
+        return False
 
     # ------------------------------------------------------------------ advertising fallback
     _BTMGMT_INSTANCE = "1"
@@ -214,7 +435,9 @@ class BLEProvisioningServer:
         for command in commands:
             subcommand = command[3]  # ["sudo", "-n", "btmgmt", <subcommand>, ...]
             try:
-                result = subprocess.run(command, capture_output=True, text=True, timeout=10)
+                result = subprocess.run(  # noqa: S603 - fixed btmgmt argv built above
+                    command, capture_output=True, text=True, timeout=10, check=False
+                )
             except Exception as exc:  # noqa: BLE001
                 log.error("btmgmt fallback failed (%s): %s", subcommand, exc)
                 return
@@ -254,12 +477,12 @@ class BLEProvisioningServer:
         import subprocess
 
         try:
-            subprocess.run(
-                ["sudo", "-n", "btmgmt", "rm-adv", self._BTMGMT_INSTANCE],
-                capture_output=True, timeout=10,
+            subprocess.run(  # noqa: S603 - fixed argv
+                ["sudo", "-n", "btmgmt", "rm-adv", self._BTMGMT_INSTANCE],  # noqa: S607 - sudo from PATH
+                capture_output=True, timeout=10, check=False,
             )
-        except Exception:  # noqa: BLE001 - teardown must never raise
-            pass
+        except Exception as exc:  # noqa: BLE001 - teardown must never raise
+            log.debug("btmgmt rm-adv failed during teardown: %r", exc)
         self._btmgmt_active = False
 
     def is_advertising(self) -> bool:
@@ -279,8 +502,8 @@ class BLEProvisioningServer:
 
         try:
             result = subprocess.run(
-                ["sudo", "-n", "btmgmt", "advinfo"],
-                capture_output=True, text=True, timeout=10,
+                ["sudo", "-n", "btmgmt", "advinfo"],  # noqa: S607 - fixed argv; sudo from PATH
+                capture_output=True, text=True, timeout=10, check=False,
             )
         except Exception:  # noqa: BLE001
             return False
@@ -301,24 +524,60 @@ class BLEProvisioningServer:
                 # is indistinguishable from "there are none".
                 payload = dict(self._status)
                 payload["scanning"] = self._scanning
-                chrc.push_value(json.dumps(payload).encode())
+                chrc.push_value(_encode_status(payload))
             except Exception as exc:  # noqa: BLE001
                 log.warning("BLE status notify failed: %s", exc)
 
     # ------------------------------------------------------------------ GLib main loop thread
     def _run(self) -> None:
+        try:
+            self._serve()
+        except Exception as exc:  # reported via failure / is_alive()
+            if self._error is None:
+                self._error = f"{type(exc).__name__}: {exc}"
+            log.error("BLE provisioning server failed: %s", exc, exc_info=True)
+        finally:
+            self._ready.set()
+
+    def _serve(self) -> None:
         import dbus
         import dbus.mainloop.glib
         import dbus.service
         from gi.repository import GLib
 
         dbus.mainloop.glib.DBusGMainLoop(set_as_default=True)
-        bus = dbus.SystemBus()
-        adapter_path = self._find_adapter(bus)
-        if adapter_path is None:
-            log.error("no Bluetooth adapter found — BLE provisioning unavailable")
-            return
+        # A PRIVATE connection, closed on the way out. dbus.SystemBus() is one
+        # connection shared by the whole process, and every object exported on
+        # it stays registered until removed -- this never removed them, so the
+        # SECOND window in a process died at once with "Can't register the
+        # object-path handler ... there is already a handler" while the service
+        # reported it open. Every window after the first boot's closed was dead
+        # until a reboot.
+        bus = dbus.SystemBus(private=True)
+        exported: list = []
+        managers: list = []
+        try:
+            adapter_path = self._find_adapter(bus)
+            if adapter_path is None:
+                self._error = "no Bluetooth adapter found"
+                log.error("no Bluetooth adapter found — BLE provisioning unavailable")
+                return
+            self._export_and_serve(bus, adapter_path, exported, managers, dbus, GLib)
+        finally:
+            # Teardown must never raise: every step is best effort.
+            self._status_chrc = None
+            for manager, method, path in managers:
+                with contextlib.suppress(Exception):
+                    getattr(manager, method)(path)
+            for obj in exported:
+                with contextlib.suppress(Exception):
+                    obj.remove_from_connection()
+            with contextlib.suppress(Exception):
+                bus.close()
+            if self._btmgmt_active:
+                self._stop_btmgmt_advertising()
 
+    def _export_and_serve(self, bus, adapter_path, exported, managers, dbus, glib) -> None:
         server = self
 
         # --- D-Bus scaffolding (BlueZ's standard GATT server shape, condensed) ---
@@ -333,7 +592,7 @@ class BLEProvisioningServer:
                 self.objects.append(obj)
 
             @dbus.service.method(DBUS_OM_IFACE, out_signature="a{oa{sa{sv}}}")
-            def GetManagedObjects(self):
+            def GetManagedObjects(self):  # noqa: N802 - D-Bus/BlueZ method name
                 return {o.path: o.properties() for o in self.objects}
 
         class Characteristic(dbus.service.Object):
@@ -343,6 +602,8 @@ class BLEProvisioningServer:
                 self.flags = flags
                 self.service_path = service_path
                 self.notifying = False
+                self._assembler = _WriteAssembler()
+                self._read_cache: Optional[bytes] = None
                 super().__init__(bus_, self.path)
 
             def properties(self):
@@ -354,14 +615,14 @@ class BLEProvisioningServer:
                     }
                 }
 
-            def read_value(self) -> bytes:
+            def read_value(self, offset=0) -> bytes:
                 return b"{}"
 
             def write_value(self, data: bytes) -> None:
                 pass
 
             @dbus.service.method(GATT_CHRC_IFACE, in_signature="a{sv}", out_signature="ay")
-            def ReadValue(self, options):
+            def ReadValue(self, options):  # noqa: N802 - D-Bus/BlueZ method name
                 # Honour the offset. This is how ATT transfers a value larger
                 # than one MTU: the central issues Read Blob requests for
                 # successive chunks. Ignoring it — which this did — silently
@@ -370,30 +631,38 @@ class BLEProvisioningServer:
                 # networks at all in exactly the case that matters, a flat with
                 # a dozen of them. It was worse on iOS, which negotiates a
                 # smaller MTU than macOS.
+                #
+                # Later chunks come from the value serialised for offset 0, not a
+                # fresh one: a scan finishing (or a status change) between two
+                # Read Blobs spliced two different documents into invalid JSON.
                 offset = int(options.get("offset", 0))
-                return dbus.Array(self.read_value(offset)[offset:], signature="y")
+                if offset == 0 or self._read_cache is None:
+                    self._read_cache = bytes(self.read_value(offset))
+                return dbus.Array(self._read_cache[offset:], signature="y")
 
             @dbus.service.method(GATT_CHRC_IFACE, in_signature="aya{sv}")
-            def WriteValue(self, value, options):
-                self.write_value(bytes(value))
+            def WriteValue(self, value, options):  # noqa: N802 - D-Bus/BlueZ method name
+                data = self._assembler.feed(bytes(value), int(options.get("offset", 0)))
+                if data is not None:
+                    self.write_value(data)
 
             @dbus.service.method(GATT_CHRC_IFACE)
-            def StartNotify(self):
+            def StartNotify(self):  # noqa: N802 - D-Bus/BlueZ method name
                 self.notifying = True
 
             @dbus.service.method(GATT_CHRC_IFACE)
-            def StopNotify(self):
+            def StopNotify(self):  # noqa: N802 - D-Bus/BlueZ method name
                 self.notifying = False
 
             # BlueZ reads properties off the ObjectManager dict, but also probes
             # the standard Properties interface on each object; without this it
             # errors out mid-registration.
             @dbus.service.method(DBUS_PROP_IFACE, in_signature="s", out_signature="a{sv}")
-            def GetAll(self, interface):
+            def GetAll(self, interface):  # noqa: N802 - D-Bus/BlueZ method name
                 return self.properties().get(interface, {})
 
             @dbus.service.signal(DBUS_PROP_IFACE, signature="sa{sv}as")
-            def PropertiesChanged(self, interface, changed, invalidated):
+            def PropertiesChanged(self, interface, changed, invalidated):  # noqa: N802 - D-Bus/BlueZ method name
                 pass
 
             def push_value(self, data: bytes) -> None:
@@ -415,7 +684,7 @@ class BLEProvisioningServer:
                 }
 
             @dbus.service.method(DBUS_PROP_IFACE, in_signature="s", out_signature="a{sv}")
-            def GetAll(self, interface):
+            def GetAll(self, interface):  # noqa: N802 - D-Bus/BlueZ method name
                 return self.properties().get(interface, {})
 
         class DeviceInfoChrc(Characteristic):
@@ -424,12 +693,11 @@ class BLEProvisioningServer:
 
         class WifiCredsChrc(Characteristic):
             def write_value(self, data):
-                try:
-                    payload = json.loads(data.decode())
-                    ssid, psk = str(payload.get("ssid", "")), str(payload.get("psk", ""))
-                except (ValueError, UnicodeDecodeError):
+                credentials = parse_credentials(data)
+                if credentials is None:
                     log.warning("BLE: malformed credential write ignored")
                     return
+                ssid, psk = credentials
                 # Log the SSID only — never the passphrase.
                 log.info("BLE: received Wi-Fi credentials for '%s'", ssid)
                 server._on_credentials(ssid, psk)
@@ -449,8 +717,8 @@ class BLEProvisioningServer:
                     networks = list(server._networks)
                 if offset == 0:
                     # A read from the start is the app arriving on the network
-                    # screen, which is exactly when a fresh list is worth
-                    # starting. Later chunks of the same read must not restart it.
+                    # screen, which is when a fresh list is worth starting -- if
+                    # the cached one is not already fresh (rate-limited inside).
                     server.refresh_networks()
                 return _fit_networks(networks)
 
@@ -458,16 +726,17 @@ class BLEProvisioningServer:
             def read_value(self, offset=0):
                 payload = dict(server._status)
                 payload["scanning"] = server._scanning
-                return json.dumps(payload).encode()
+                return _encode_status(payload)
 
         class CommandChrc(Characteristic):
             def write_value(self, data):
                 if server._on_command is None:
                     return
-                try:
-                    server._on_command(json.loads(data.decode()))
-                except (ValueError, UnicodeDecodeError):
+                command = parse_command(data)
+                if command is None:
                     log.warning("BLE: malformed command write ignored")
+                    return
+                server._on_command(command)
 
         class Advertisement(dbus.service.Object):
             PATH = "/com/sensordyme/advertisement0"
@@ -480,7 +749,7 @@ class BLEProvisioningServer:
             # signature never matched BlueZ's call, so the advertisement's
             # properties could not be read.
             @dbus.service.method(DBUS_PROP_IFACE, in_signature="s", out_signature="a{sv}")
-            def GetAll(self, interface):
+            def GetAll(self, interface):  # noqa: N802 - D-Bus/BlueZ method name
                 return {
                     "Type": "peripheral",
                     "ServiceUUIDs": dbus.Array([SERVICE_UUID], signature="s"),
@@ -489,12 +758,15 @@ class BLEProvisioningServer:
                 }
 
             @dbus.service.method(LE_AD_IFACE)
-            def Release(self):
+            def Release(self):  # noqa: N802 - D-Bus/BlueZ method name
                 pass
 
         app = Application(bus)
+        exported.append(app)
         service = ProvisioningService(bus)
+        exported.append(service)
         app.add(service)
+        status_chrc = None
         for index, cls, uuid, flags in (
             (0, DeviceInfoChrc, CHAR_DEVICE_INFO_UUID, ["read"]),
             (1, WifiCredsChrc, CHAR_WIFI_CREDS_UUID, ["write"]),
@@ -503,9 +775,10 @@ class BLEProvisioningServer:
             (4, NetworksChrc, CHAR_NETWORKS_UUID, ["read"]),
         ):
             chrc = cls(bus, index, uuid, flags, service.PATH)
+            exported.append(chrc)
             app.add(chrc)
             if uuid == CHAR_STATUS_UUID:
-                self._status_chrc = chrc
+                status_chrc = chrc
 
         # The adapter must be powered before anything can be registered on it.
         adapter_props = None
@@ -533,7 +806,10 @@ class BLEProvisioningServer:
             log.warning("could not set adapter alias: %s", exc)
 
         advertisement = Advertisement(bus)
-        self._mainloop = GLib.MainLoop()
+        exported.append(advertisement)
+        if self._mainloop is None:
+            self._mainloop = glib.MainLoop()
+        loop = self._mainloop
 
         # CRITICAL: register ASYNCHRONOUSLY. BlueZ answers RegisterApplication by
         # calling back into this process (GetManagedObjects on our ObjectManager).
@@ -545,6 +821,8 @@ class BLEProvisioningServer:
 
         def _failed(what: str, error):
             log.error("BLE %s registration failed: %s", what, error)
+            if not self._running:
+                return  # stopping: never add an advertisement stop() already removed
             if what == "advertisement":
                 # bluetoothd's advertising manager is broken on the Pi 5's
                 # controller (BlueZ 5.66 + CYW43455: every AddAdvertising is
@@ -552,30 +830,33 @@ class BLEProvisioningServer:
                 # interface accepts the identical advertisement, so fall back to
                 # it -- the GATT service above is unaffected either way.
                 self._advertise_via_btmgmt()
+            else:
+                # Without the GATT application there is nothing to connect to:
+                # end this window so the provisioning service sees it and retries.
+                self._error = f"GATT application registration failed: {error}"
+                loop.quit()
 
+        if not self._running:
+            return  # stop() arrived while this thread was still setting up
+        self._status_chrc = status_chrc
         gatt_manager.RegisterApplication(
             Application.PATH, {},
             reply_handler=lambda: _registered("GATT application"),
             error_handler=lambda e: _failed("GATT application", e),
         )
+        managers.append((gatt_manager, "UnregisterApplication", Application.PATH))
         ad_manager.RegisterAdvertisement(
             advertisement.PATH, {},
             reply_handler=lambda: _registered("advertisement"),
             error_handler=lambda e: _failed("advertisement", e),
         )
+        # Unregister the advertisement before the application, as before.
+        managers.insert(0, (ad_manager, "UnregisterAdvertisement", advertisement.PATH))
 
+        glib.timeout_add(250, self._keep_running)
         log.info("BLE provisioning advertising as '%s'", self._device_name)
-        try:
-            self._mainloop.run()  # until stop() quits it
-        finally:
-            for manager, path, kind in (
-                (ad_manager, advertisement.PATH, "UnregisterAdvertisement"),
-                (gatt_manager, Application.PATH, "UnregisterApplication"),
-            ):
-                try:
-                    getattr(manager, kind)(path)
-                except Exception:  # noqa: BLE001 - teardown must never raise
-                    pass
+        self._ready.set()
+        loop.run()  # until stop() quits it
 
     @staticmethod
     def _find_adapter(bus) -> Optional[str]:

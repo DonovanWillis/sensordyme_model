@@ -93,12 +93,21 @@ def test_a_fallback_names_a_mode_the_app_can_render(prompt):
 
 
 @pytest.mark.parametrize("prompt", FALLBACK_PROMPTS)
-def test_every_fallback_rule_survives_the_backend_s_own_validation(prompt):
-    """Nothing the fallback proposes may be quietly moved to `unsupported` --
-    the fallback is the path used when nothing else is available."""
+def test_a_fallback_proposes_only_what_the_device_will_run(prompt):
+    """A keyword match names a MODE and promises nothing else.
+
+    Each fallback used to add a custom rule "on top" of the mode and say so
+    ("Added on top: an alert if someone is on the floor"). The app activates a
+    mode proposal by its mode name, which never delivers rules, and the device
+    can only run delivered rules as AI Custom -- which REPLACES the mode's own
+    detection. So the promised rule never ran, and delivering it would have
+    switched fall/drowsiness detection off. Nothing is quietly moved to
+    `unsupported` either: the mode is the whole answer."""
     proposal = cloud_app._validate_proposal(cloud_app._ai_fallback(prompt))
-    assert proposal["rules"], f"the fallback for {prompt!r} proposed no runnable rule"
+    assert proposal["preset"], f"the fallback for {prompt!r} named no mode"
+    assert proposal["rules"] == [], proposal["rules"]
     assert proposal["unsupported"] == [], proposal["unsupported"]
+    assert "added on top" not in proposal["explanation"].lower()
 
 
 @pytest.mark.parametrize("prompt", FALLBACK_PROMPTS)

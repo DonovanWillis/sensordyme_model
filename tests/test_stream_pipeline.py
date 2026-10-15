@@ -32,7 +32,7 @@ class FakeCamera:
     def __init__(self, config):
         self.released = False
 
-    def read(self):
+    def read(self, timeout_s=None):
         frame = np.zeros((48, 64, 3), dtype=np.uint8)
         frame[:, :, 1] = 128  # not uniform black, so the JPEG is a real image
         return frame

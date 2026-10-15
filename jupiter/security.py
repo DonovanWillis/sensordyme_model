@@ -39,6 +39,8 @@ MAX_REQUEST_CHARS = 600
 MAX_RULES = 8
 MAX_UNSUPPORTED = 8
 MAX_EXPLANATION_CHARS = 400
+# A rule description is a notification line, not a paragraph.
+MAX_DESCRIPTION_CHARS = 200
 
 # Phrases whose only purpose is to redirect the model. Matching them is not a
 # security boundary — trivially bypassed by rephrasing — but it is a cheap
@@ -64,7 +66,7 @@ _CONTROL_RE = re.compile(r"[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]")
 _FENCE_RE = re.compile(r"(<<<REQUEST|REQUEST>>>)", re.IGNORECASE)
 
 
-class RequestRejected(Exception):
+class RequestRejected(Exception):  # noqa: N818 - established exception name
     """The request was refused before reaching a model."""
 
     def __init__(self, reason: str) -> None:
@@ -90,9 +92,14 @@ def sanitise_request(request: str) -> str:
             f"the request is too long ({len(cleaned)} characters, limit {MAX_REQUEST_CHARS}). "
             "Describe one thing to watch for at a time."
         )
-    # Neutralise the fence so a request cannot escape its own block.
-    cleaned = _FENCE_RE.sub("", cleaned)
-    return cleaned
+    # Neutralise the fence so a request cannot escape its own block. Repeated
+    # until stable: one pass re-forms the fence from its own halves
+    # ("REQUESTREQUEST>>>>>>" -> "REQUEST>>>").
+    while True:
+        stripped = _FENCE_RE.sub("", cleaned)
+        if stripped == cleaned:
+            return cleaned
+        cleaned = stripped
 
 
 def looks_like_injection(request: str) -> bool:
@@ -123,6 +130,25 @@ def clamp_response(payload: dict) -> dict:
 
     return {
         "understood": understood,
-        "rules": [r for r in rules if isinstance(r, dict)],
-        "unsupported": [u for u in unsupported if isinstance(u, dict)],
+        "rules": [
+            _bounded_text_fields(r, {"description": MAX_DESCRIPTION_CHARS})
+            for r in rules if isinstance(r, dict)
+        ],
+        "unsupported": [
+            _bounded_text_fields(u, {"request": MAX_EXPLANATION_CHARS,
+                                     "reason": MAX_EXPLANATION_CHARS})
+            for u in unsupported if isinstance(u, dict)
+        ],
     }
+
+
+def _bounded_text_fields(entry: dict, limits: dict) -> dict:
+    """A copy of `entry` with its human-facing strings control-stripped and
+    capped. A rule's description becomes the push-notification text, so it
+    is as exposed as `understood` and gets the same treatment."""
+    bounded = dict(entry)
+    for key, limit in limits.items():
+        value = bounded.get(key)
+        if isinstance(value, str):
+            bounded[key] = _CONTROL_RE.sub("", value)[:limit]
+    return bounded

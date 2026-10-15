@@ -11,6 +11,8 @@ struct APIError: LocalizedError {
     /// No server was reached at all, as opposed to one that was reached and said
     /// no. Only this kind is worth retrying at a different address.
     var isUnreachable = false
+    /// The HTTP status, when a server answered. 0 for transport failures.
+    var status: Int = 0
     var errorDescription: String? { message }
 }
 
@@ -105,9 +107,10 @@ struct APIClient {
         // FastAPI errors arrive as {"detail": "..."}
         let detail = (try? JSONSerialization.jsonObject(with: data) as? [String: Any])?["detail"] as? String
         if status == 401 && sentToken {
-            return APIError(message: "Your session has expired. Please sign in again.", isAuthFailure: true)
+            return APIError(message: "Your session has expired. Please sign in again.",
+                            isAuthFailure: true, status: status)
         }
-        return APIError(message: detail ?? "request failed (\(status))")
+        return APIError(message: detail ?? "request failed (\(status))", status: status)
     }
 
     /// Did this fail to reach a server at all, rather than reach one that refused?
@@ -234,6 +237,17 @@ final class AppState: ObservableObject {
     /// Devices on the signed-in account, as last loaded. FeedLink needs it to
     /// know when "the linked camera" is unambiguous.
     @Published var accountDeviceCount: Int = 0
+    /// Where the account's SD- ids are kept for every DeviceLink to read (they
+    /// prefer a camera on this account when nothing is linked yet).
+    static let accountHardwareIDsKey = "accountHardwareIDs"
+    @AppStorage(AppState.accountHardwareIDsKey) private var accountHardwareIDsRaw: String = ""
+
+    /// Record what the device list just said about the account's devices.
+    func recordAccountDevices(_ devices: [Device]) {
+        accountDeviceCount = devices.count
+        let ids = devices.compactMap(\.hardwareId).filter { !$0.isEmpty }.joined(separator: ",")
+        if ids != accountHardwareIDsRaw { accountHardwareIDsRaw = ids }
+    }
     @AppStorage("accountEmail") var accountEmail: String = ""
     @AppStorage("demoMode") private var storedDemo: Bool = false
     /// Stored raw so the enum can gain cases without invalidating saved values.
@@ -297,6 +311,35 @@ final class AppState: ObservableObject {
     private var heartbeatTask: Task<Void, Never>?
     /// How many consecutive resolves have failed, for the backoff schedule.
     private var failedAttempts = 0
+    /// Bumped whenever something newer takes over the connection — a
+    /// reconnect, a typed address being pinned, a discovery result being
+    /// adopted. Every resolve, heartbeat and revalidation captures it before
+    /// it waits on the network and checks it afterwards
+    /// (`BackendResolution.verificationIsCurrent`), so a superseded one can
+    /// never overwrite newer state. Cancellation alone did not do this: a
+    /// cancelled probe returns "did not answer", and the cancelled heartbeat
+    /// then reported the backend unreachable — cancelling the new heartbeat and
+    /// un-confirming an address the user had just pinned.
+    private var connectionGeneration = 0
+
+    /// Whether work started under `generation` may still write connection state.
+    private func stillCurrent(_ generation: Int) -> Bool {
+        !Task.isCancelled
+            && BackendResolution.verificationIsCurrent(generation: generation, current: connectionGeneration)
+    }
+
+    /// Supersede every in-flight resolve, retry, search and heartbeat.
+    private func supersedeConnectionWork() {
+        connectionGeneration += 1
+        isLocatingBackend = false
+        heartbeatTask?.cancel()
+        heartbeatTask = nil
+        retryTask?.cancel()
+        retryTask = nil
+        resolveTask?.cancel()
+        resolveTask = nil
+        BackendLocator.shared.cancelSearch()
+    }
     /// Watches for the phone changing network, so a move is noticed rather than
     /// waited out.
     private var pathMonitor: NWPathMonitor?
@@ -513,12 +556,16 @@ final class AppState: ObservableObject {
         }
         Self.log.debug("starting a resolve")
 
+        let generation = connectionGeneration
         let task = Task { @MainActor [weak self] () -> String? in
             guard let self else { return nil }
 
             self.backendStatus = .searching
             self.isLocatingBackend = true
-            defer { self.isLocatingBackend = false }
+            // Only the resolve that is still current clears the flag: a
+            // superseded one finishing late used to switch the sign-in screen's
+            // "Finding your server…" off while its replacement was still looking.
+            defer { if generation == self.connectionGeneration { self.isLocatingBackend = false } }
 
             let known = BackendResolution.candidates(
                 configured: self.configuredBaseURL,
@@ -526,9 +573,13 @@ final class AppState: ObservableObject {
                 discovered: self.discoveredBaseURL
             )
             for candidate in known {
-                if Task.isCancelled { return nil }
+                if !self.stillCurrent(generation) { return nil }
                 let expected = self.expectedBackendID(for: candidate)
-                if let probe = await BackendLocator.probe(candidate),
+                let probe = await BackendLocator.probe(candidate)
+                // Superseded while waiting (a reconnect, a pinned address): the
+                // answer describes a question nobody is asking any more.
+                if !self.stillCurrent(generation) { return nil }
+                if let probe,
                    BackendResolution.healthIdentityMatches(reported: probe.id, expected: expected) {
                     // A discovered backend reached by its cached name before any
                     // id was learned (an install that predates the pin): learn it
@@ -545,10 +596,18 @@ final class AppState: ObservableObject {
                 Self.log.info("no backend at the known address \(candidate, privacy: .public)")
             }
 
-            if Task.isCancelled { return nil }
+            if !self.stillCurrent(generation) { return nil }
 
-            if self.mayDiscover,
-               let found = await BackendLocator.shared.search(remembering: self.knownBackendID) {
+            var found: BackendResolution.FoundBackend?
+            if self.mayDiscover {
+                found = await BackendLocator.shared.search(remembering: self.knownBackendID)
+            }
+            // Checked BEFORE adopting the result: a search that finishes after a
+            // typed address was pinned would otherwise confirm a LAN backend over
+            // it, and confirmed outranks configured.
+            if !self.stillCurrent(generation) { return nil }
+
+            if let found {
                 // The address goes to the discovery cache, never to configuration:
                 // an address found on one network must not outlive it as if
                 // somebody had chosen it. The id is the opposite — it IS worth
@@ -584,7 +643,7 @@ final class AppState: ObservableObject {
             // search that replaces it. Reporting it would overwrite that search's
             // status, arm a second retry, count an attempt nobody made, and could
             // drop a cached address that was never actually tested.
-            if Task.isCancelled { return nil }
+            if !self.stillCurrent(generation) { return nil }
 
             self.reportUnreachable(triedKnown: known)
             return nil
@@ -632,6 +691,7 @@ final class AppState: ObservableObject {
     /// iOS suspends the task outright once the app is backgrounded.
     private func startHeartbeat() {
         heartbeatTask?.cancel()
+        let generation = connectionGeneration
         heartbeatTask = Task { @MainActor [weak self] in
             while !Task.isCancelled {
                 try? await Task.sleep(nanoseconds: UInt64(Self.heartbeatInterval * 1_000_000_000))
@@ -639,7 +699,14 @@ final class AppState: ObservableObject {
                 // Only meaningful while we claim to be connected; any other state
                 // already has the resolver or the retry schedule working on it.
                 guard case .connected(let url) = self.backendStatus else { return }
-                if await BackendLocator.answers(url, expectedID: self.expectedBackendID(for: url)) { continue }
+                let answered = await BackendLocator.answers(url, expectedID: self.expectedBackendID(for: url))
+                // A heartbeat cancelled mid-probe sees "did not answer" from the
+                // cancellation itself. Acting on it un-confirmed whatever had
+                // replaced this heartbeat and cancelled ITS heartbeat.
+                guard self.stillCurrent(generation),
+                      case .connected(let still) = self.backendStatus, still == url
+                else { return }
+                if answered { continue }
                 Self.log.info("heartbeat: \(url, privacy: .public) stopped answering")
                 self.confirmedBaseURL = ""
                 self.reportUnreachable(triedKnown: [url])
@@ -728,7 +795,12 @@ final class AppState: ObservableObject {
             return
         }
         let address = confirmedBaseURL
-        if await BackendLocator.answers(address, expectedID: expectedBackendID(for: address)) {
+        let generation = connectionGeneration
+        let answered = await BackendLocator.answers(address, expectedID: expectedBackendID(for: address))
+        // A reconnect (network change) or a pinned address may have taken over
+        // while this waited; its result is no longer about what is in force.
+        guard stillCurrent(generation), confirmedBaseURL == address else { return }
+        if answered {
             backendStatus = .connected(address)
             // Logged even though nothing changed: a silent success is
             // indistinguishable from this never having run, which made the
@@ -748,13 +820,7 @@ final class AppState: ObservableObject {
         guard !isDemo else { return }
         confirmedBaseURL = ""
         failedAttempts = 0
-        heartbeatTask?.cancel()
-        heartbeatTask = nil
-        retryTask?.cancel()
-        retryTask = nil
-        resolveTask?.cancel()
-        resolveTask = nil
-        BackendLocator.shared.cancelSearch()
+        supersedeConnectionWork()
         Task { await resolveBackend() }
     }
 
@@ -810,13 +876,7 @@ final class AppState: ObservableObject {
         pathMonitor?.cancel()
         pathMonitor = nil
         lastPathID = nil
-        heartbeatTask?.cancel()
-        heartbeatTask = nil
-        retryTask?.cancel()
-        retryTask = nil
-        resolveTask?.cancel()
-        resolveTask = nil
-        BackendLocator.shared.cancelSearch()
+        supersedeConnectionWork()
     }
 
     /// Kept as the name the sign-in screen calls; the work is `resolveBackend`.
@@ -846,7 +906,13 @@ final class AppState: ObservableObject {
     /// Configuration already outranks discovery in `candidates`, so there is
     /// nothing the cache write was achieving.
     func pinConfigured(_ url: String) {
+        // Whatever was resolving under the old configuration is now answering
+        // the wrong question. Left running, a Bonjour result arriving a second
+        // later confirmed a LAN backend over the address just typed — and a
+        // confirmed address outranks a configured one.
+        supersedeConnectionWork()
         configuredBaseURL = url  // didSet clears the cache; leave it cleared
+        failedAttempts = 0
         confirm(url, source: .manual)
     }
 
@@ -874,6 +940,8 @@ final class AppState: ObservableObject {
            BackendResolution.mayPersistAsLocation(endpoint) {
             discoveredBaseURL = url
         }
+        supersedeConnectionWork()
+        failedAttempts = 0
         confirm(url, source: .bonjour)
     }
 
@@ -910,6 +978,7 @@ final class AppState: ObservableObject {
             deviceLocalURL = ""
             linkedDeviceID = ""
             deviceToken = ""
+            accountHardwareIDsRaw = ""
             UserDefaults.standard.removeObject(forKey: "alertPhone")
             UserDefaults.standard.removeObject(forKey: "smsOnLoud")
             AlertNotifier.shared.forgetAnnounced()
@@ -943,12 +1012,18 @@ final class AppState: ObservableObject {
         } else {
             AlertNotifier.shared.forgetAnnounced()  // leaving the demo: drop its ids
         }
+        let wasDemo = isDemo
         storedToken = ""
         accountEmail = ""
         storedDemo = false
         isDemo = false
         isSignedIn = false
         signOutNotice = nil
+        // A launch straight into the demo never started monitoring (it is
+        // skipped while isDemo), and the root `.task` that starts it has already
+        // run. Without this, leaving the demo left the sign-in screen with no
+        // path monitor and no search for the rest of the session.
+        if wasDemo { startBackendMonitoring() }
     }
 
     /// The token was rejected. Without this the polling views retry a dead token

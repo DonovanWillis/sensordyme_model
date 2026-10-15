@@ -155,7 +155,7 @@ def test_grammar_widens_when_a_model_is_registered(reg):
 
 def test_grammar_refuses_an_empty_registry():
     """A grammar matching everything is worse than none — it looks like a control."""
-    with pytest.raises(ValueError):
+    with pytest.raises(ValueError, match="registry is empty"):
         build_grammar(CapabilityRegistry([]))
 
 

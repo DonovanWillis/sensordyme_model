@@ -137,7 +137,7 @@ def _interpolated_fall(steps: int = 20):
                 a.x + (b.x - a.x) * frac, a.y + (b.y - a.y) * frac,
                 visibility=max(a.visibility, b.visibility),
             )
-            for a, b in zip(start, end)
+            for a, b in zip(start, end, strict=True)
         ])
     return frames
 

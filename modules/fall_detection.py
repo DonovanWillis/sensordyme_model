@@ -50,8 +50,10 @@ reads -- no extra model.
 
 from __future__ import annotations
 
+import contextlib
 import math
 import time
+from collections import deque
 from typing import Optional
 
 import cv2
@@ -61,9 +63,9 @@ import numpy as np
 from core import posture
 from core.activity import ActivityRecognizer
 from core.detections import Detection, DetectionFrame
-from core.event_engine import CONFIRMED, RESOLVED, EventEngine, RuleSpec
+from core.event_engine import CONFIRMED, DEVELOPING, OBSERVED, RESOLVED, EventEngine, RuleSpec
 from core.events import Event
-from core.zones import load_zones
+from core.zones import BoundaryCrossing, load_zones
 from modules.base import VisionModule, register_module
 
 HIP_LANDMARKS = [23, 24]
@@ -197,29 +199,29 @@ class FallDetectionModule(VisionModule):
         # of bed" is "leaving a safe zone" whether the subject is 6 months or
         # 86 years old, so this reuses that meaning rather than inventing a
         # bed-specific one.
-        self._zones = load_zones(config.get("zones", {}))
-        self._watched_zones = [z for z in self._zones if z.kind in ("restricted", "boundary")]
-        self._safe_zones = [z for z in self._zones if z.kind == "safe"]
         self._zone_engine = EventEngine({})
-        zone_confirm_s = float(config.get("zone_confirm_s", 2.0))
-        for zone in self._watched_zones:
-            self._zone_engine.add_rule(RuleSpec(
-                detection=f"zone_violation:{zone.name}", severity="critical",
-                persist_s=zone_confirm_s, min_frames=3, resolve_after_s=5.0,
-            ))
-        if self._safe_zones:
-            self._zone_engine.add_rule(RuleSpec(
-                detection="safe_zone_exit", severity="warning",
-                persist_s=zone_confirm_s, min_frames=3, resolve_after_s=5.0,
-            ))
+        self._zone_confirm_s = float(config.get("zone_confirm_s", 2.0))
+        # Installed by _install_zones so set_zones() can replace them in place
+        # when the user draws zones in the app. restricted -> zone_violation,
+        # safe -> safe_zone_exit, boundary -> a crossing watch (BoundaryCrossing,
+        # reported as zone_violation "crossed": a line alerts on CROSSING, not
+        # on standing inside it).
+        self._zones: list = []
+        self._watched_zones: list = []
+        self._safe_zones: list = []
+        self._boundary_watch: dict[str, BoundaryCrossing] = {}
+        self._install_zones(load_zones(config.get("zones", {})))
         self._still_max_motion = float(config.get("still_max_motion", 0.01))
         stillness_grace_s, stillness_resolve_s = 3.0, 10.0
-        self._zone_engine.add_rule(RuleSpec(
+        self._stillness_rule = RuleSpec(
             detection="unusual_stillness", severity="warning",
             persist_s=float(config.get("unusual_stillness_s", 600.0)),
             min_frames=10, occlusion_grace_s=stillness_grace_s,
             resolve_after_s=stillness_resolve_s,
-        ))
+            # No cooldown: a second episode needs a full unusual_stillness_s anyway.
+            cooldown_s=0.0,
+        )
+        self._zone_engine.add_rule(self._stillness_rule)
         # occlusion_grace_s bridges ABSENCE without resetting the held-time
         # clock, which is right for zone rules ("walked behind a chair") and
         # WRONG for a stillness rule: there, a False frame means THE SUBJECT
@@ -229,19 +231,85 @@ class FallDetectionModule(VisionModule):
         # demonstrably active.
         #
         # The engine itself can't tell the two apart (and isn't this module's
-        # to change), so the distinction is made HERE, at the feed: observed
-        # motion suppresses the stillness feed for long enough that the
-        # engine cannot bridge it -- past occlusion_grace_s so an unconfirmed
-        # track is genuinely dropped and its clock restarts from zero, and
-        # past resolve_after_s so an already-confirmed stillness actually
-        # resolves. A pose dropout (real missing evidence) sets no lockout
-        # and is still bridged exactly as before.
-        self._stillness_motion_lockout_s = max(stillness_grace_s, stillness_resolve_s) + 0.5
+        # to change), so the distinction is made HERE, at the feed. Observed
+        # motion drops an unconfirmed stillness track outright, so its clock
+        # restarts from zero, and holds the feed False past resolve_after_s so
+        # an already-confirmed stillness actually resolves. A pose dropout
+        # (real missing evidence) sets no lockout and is bridged.
+        self._stillness_motion_lockout_s = stillness_resolve_s + 0.5
         self._stillness_locked_until: Optional[float] = None
-        self._prev_centroid: Optional[tuple[float, float]] = None
+        # The last four frames' (visible-landmark set, centroid of those
+        # landmarks), for _torso_motion's visibility gating and median filter.
+        self._torso_history: deque = deque(maxlen=4)
+
+    # ------------------------------------------------------------------ zones
+    def _install_zones(self, zones: list) -> None:
+        """Make `zones` this module's zones, replacing the previous set in place.
+
+        Unchanged zones (same name, kind and polygon) keep their rule and
+        state. A removed or redrawn zone's rule is dropped from the engine with
+        every track and cooldown under it, so nothing stays latched. The fall
+        and stillness state machines are untouched.
+        """
+        old_zones, new_zones = list(self._zones), list(zones)
+        old_watched = {z for z in old_zones if z.kind == "restricted"}
+        new_watched = {z for z in new_zones if z.kind == "restricted"}
+        for zone in old_watched - new_watched:
+            self._retire_zone_rule(f"zone_violation:{zone.name}")
+        for zone in new_watched - old_watched:
+            self._zone_engine.add_rule(RuleSpec(
+                detection=f"zone_violation:{zone.name}", severity="critical",
+                persist_s=self._zone_confirm_s, min_frames=3, resolve_after_s=5.0,
+                # No cooldown on a safety zone: the default 30 s refused even
+                # to start tracking a second entry until it had expired.
+                cooldown_s=0.0,
+            ))
+        old_safe = {z for z in old_zones if z.kind == "safe"}
+        new_safe = {z for z in new_zones if z.kind == "safe"}
+        if old_safe != new_safe:
+            self._retire_zone_rule("safe_zone_exit")
+            if new_safe:
+                self._zone_engine.add_rule(RuleSpec(
+                    detection="safe_zone_exit", severity="warning",
+                    persist_s=self._zone_confirm_s, min_frames=3, resolve_after_s=5.0,
+                    cooldown_s=0.0,  # a second bed exit is a new event, not jitter
+                ))
+        self._boundary_watch = {
+            z.name: (
+                self._boundary_watch[z.name]
+                if z in old_zones and z.name in self._boundary_watch
+                else BoundaryCrossing(self._zone_confirm_s)
+            )
+            for z in new_zones if z.kind == "boundary"
+        }
+        self._zones = new_zones
+        self._watched_zones = [z for z in new_zones if z.kind == "restricted"]
+        self._safe_zones = [z for z in new_zones if z.kind == "safe"]
+
+    def _retire_zone_rule(self, detection: str) -> None:
+        """Withdraw a zone's rule. An alert confirmed under it is RESOLVED, not
+        silently dropped -- reported on the next frame by process() -- so a zone
+        redrawn in the app mid-violation does not leave the alert "active" in
+        the app and dashboard for good."""
+        transition = self._zone_engine.retire_rule(detection)
+        if transition is not None:
+            self.__dict__.setdefault("_retired_zone_transitions", []).append(transition)
+
+    def _take_retired_zone_events(self) -> list[Event]:
+        """The resolutions queued by _retire_zone_rule, as events, once."""
+        transitions = self.__dict__.pop("_retired_zone_transitions", None) or []
+        return self._zone_transition_events(transitions)
+
+    def set_zones(self, zones: list) -> None:
+        """Replace the configured zones with the app-drawn ones. See VisionModule.set_zones."""
+        self._install_zones(list(zones or []))
 
     def process(self, frame: np.ndarray) -> list[Event]:
         """Run pose estimation on `frame`, updating drop/stillness state and returning events."""
+        return self._take_retired_zone_events() + self._process_frame(frame)
+
+    def _process_frame(self, frame: np.ndarray) -> list[Event]:
+        """One frame's work; see process()."""
         now = time.monotonic()
         events: list[Event] = []
         h, _w = frame.shape[:2]
@@ -262,10 +330,16 @@ class FallDetectionModule(VisionModule):
             # state reset below (hip/centroid tracking) is unrelated and unchanged.
             self._activity.pose_lost(now)
             self._last_activity = None
+            # Fed (False) rather than skipped, so a CONFIRMED running/jumping
+            # cannot latch for ever through a dropout. EventEngine has no
+            # time-based reaper.
+            events += self._activity_events(now)
             self._last_hip_y = None
             self._prev_y = None
             self._prev_t = None
-            self._prev_centroid = None
+            self._torso_history.clear()
+            for watch in self._boundary_watch.values():
+                watch.update(None, now)
             # Deliberately NOT resetting _fall_pending_since/_still_since here:
             # a fall's violent phase is exactly when pose tracking is most
             # likely to drop out (see module docstring). Recording only WHEN
@@ -291,7 +365,7 @@ class FallDetectionModule(VisionModule):
             # across the gap exactly as before so a fall that happens DURING
             # the dropout is still recognized by the recovery path below.
             fall_transitions = self._fall_engine.update("fall", False, self._fall_confidence, now)
-            events += self._fall_transition_events(fall_transitions)
+            events += self._fall_transition_events(fall_transitions, now)
             transitions = []
             for zone in self._watched_zones:
                 transitions += self._zone_engine.update(f"zone_violation:{zone.name}", False, 0.85, now)
@@ -321,14 +395,6 @@ class FallDetectionModule(VisionModule):
         if self._last_posture.label in (posture.STANDING, posture.SITTING):
             self._last_upright_at = now
 
-        # A tracking gap just ended (results.pose_landmarks is truthy again
-        # this frame) -- capture when it started and clear the marker before
-        # any of the logic below, which reads self._pose_lost_since as "are
-        # we still inside a gap" (we are not, we're evaluating the frame
-        # right after one).
-        gap_start = self._pose_lost_since
-        self._pose_lost_since = None
-
         # Visibility-gated drop velocity: an average built from a landmark
         # MediaPipe is guessing at (low visibility) is not evidence, and
         # averaging it in unconditionally is missed-fall cause #1 (see module
@@ -342,6 +408,25 @@ class FallDetectionModule(VisionModule):
             sum(visible_ys) / len(visible_ys) * h
             if len(visible_ys) >= _MIN_TORSO_LANDMARKS_FOR_VELOCITY else None
         )
+
+        # The tracking gap the recovery path below reasons about. It covers
+        # BOTH no pose at all AND a pose whose torso landmarks are too
+        # low-visibility to measure (avg_y is None). The gating above made the
+        # second kind of gap common in exactly a fast, blurry fall. It
+        # used to count as "tracked", so the recovery path never saw a gap, and
+        # the velocity after it was averaged over the whole unmeasured stretch
+        # and stayed under the drop threshold. Measured: standing, then 1 s of
+        # low-visibility torso, then lying gave NO fall, while the identical
+        # 1 s as a full pose loss gave one. The gap only ends on a frame whose
+        # torso is measurable. Until then the marker stays set, and nothing
+        # below reads gap_start.
+        if avg_y is None:
+            if self._pose_lost_since is None:
+                self._pose_lost_since = now
+            gap_start = None
+        else:
+            gap_start = self._pose_lost_since
+            self._pose_lost_since = None
 
         velocity = 0.0
         if avg_y is not None:
@@ -450,6 +535,14 @@ class FallDetectionModule(VisionModule):
         # lying down while pending": once the person is confirmed down and
         # then gets back up, THIS frame's posture must be able to say so
         # immediately, or resolution could never begin.
+        #
+        # Stillness gates CONFIRMATION only. Once the fall is active it stays
+        # present for as long as the person is seen lying down, still or not,
+        # as config.yaml documents for fall_resolve_after_s ("must be seen NOT
+        # lying down for this long"). It used to require stillness here too,
+        # so a fallen person who struggled on the floor for 4 s got
+        # `fall_resolved` while still down. When they then went still (the
+        # struggle-then-lose-consciousness case) no new alert was possible.
         fall_present = False
         if self._fall_pending_since is not None:
             is_still = abs(velocity) < self._stillness_velocity_threshold * h
@@ -459,12 +552,12 @@ class FallDetectionModule(VisionModule):
                     self._still_since = now
             else:
                 self._still_since = None
-            fall_present = is_still and is_down
+            fall_present = is_down if self._fall_engine.is_active("fall") else (is_still and is_down)
             self._fall_confidence = self._compute_fall_confidence(h)
         else:
             self._fall_confidence = 0.0
         fall_transitions = self._fall_engine.update("fall", fall_present, self._fall_confidence, now)
-        events += self._fall_transition_events(fall_transitions)
+        events += self._fall_transition_events(fall_transitions, now)
 
         # Activity from the same landmarks — no extra inference.
         self._last_activity = self._activity.update(landmarks, now=now, aspect=aspect)
@@ -474,49 +567,107 @@ class FallDetectionModule(VisionModule):
         # Ankle midpoint, not a fabricated box: zones.py's own point-in-polygon
         # primitive, on the one point "is this person in this area" actually
         # means for someone who might be lying down as easily as standing.
-        # Occluded/invisible ankles (legs behind furniture, off the bottom of
-        # frame) skip zone evaluation for this frame rather than guessing --
-        # "can't see the feet" is not evidence the zone was left.
-        if self._watched_zones or self._safe_zones:
-            ankle_vis = [landmarks[i].visibility for i in ANKLE_LANDMARKS]
+        # Occluded or invisible ankles (legs behind furniture, under a blanket,
+        # off the bottom of the frame) do not count as "in the zone" or as
+        # "left the safe zone". They are fed as False (not observed), exactly
+        # like the pose-lost branch, rather than skipped. Skipped, a CONFIRMED
+        # alert was never fed again (EventEngine has no time-based reaper), so
+        # a bed exit stayed "active" all night once the person was back in
+        # bed under a blanket, and the NEXT real bed exit produced no event.
+        if self._watched_zones or self._safe_zones or self._boundary_watch:
+            ankle_vis = [getattr(landmarks[i], "visibility", 1.0) for i in ANKLE_LANDMARKS]
+            feet: Optional[tuple[float, float]] = None
             if all(v >= _MIN_ANKLE_VISIBILITY for v in ankle_vis):
-                foot_x = sum(landmarks[i].x for i in ANKLE_LANDMARKS) / len(ANKLE_LANDMARKS)
-                foot_y = sum(landmarks[i].y for i in ANKLE_LANDMARKS) / len(ANKLE_LANDMARKS)
-                for zone in self._watched_zones:
-                    inside = zone.contains(foot_x, foot_y)
-                    zone_transitions += self._zone_engine.update(
-                        f"zone_violation:{zone.name}", inside, 0.85, now
-                    )
-                if self._safe_zones:
-                    outside = not any(zone.contains(foot_x, foot_y) for zone in self._safe_zones)
-                    zone_transitions += self._zone_engine.update("safe_zone_exit", outside, 0.85, now)
+                feet = (
+                    sum(landmarks[i].x for i in ANKLE_LANDMARKS) / len(ANKLE_LANDMARKS),
+                    sum(landmarks[i].y for i in ANKLE_LANDMARKS) / len(ANKLE_LANDMARKS),
+                )
+            for zone in self._watched_zones:
+                inside = feet is not None and zone.contains(*feet)
+                zone_transitions += self._zone_engine.update(
+                    f"zone_violation:{zone.name}", inside, 0.85, now
+                )
+            if self._safe_zones:
+                outside = feet is not None and not any(zone.contains(*feet) for zone in self._safe_zones)
+                zone_transitions += self._zone_engine.update("safe_zone_exit", outside, 0.85, now)
+            for zone in self._zones:
+                if zone.kind != "boundary":
+                    continue
+                crossing = self._boundary_watch[zone.name].update(
+                    None if feet is None else zone.contains(*feet), now,
+                )
+                if crossing is not None:
+                    events.append(Event.now(
+                        "zone_violation", 0.0, 0.85, self.name, f"zone={zone.name} crossed ({crossing})",
+                    ))
 
         # Stillness from how little the hip/shoulder centroid has moved, in
         # normalized landmark coordinates (so the threshold means the same
         # thing at any capture resolution) -- independent of the vertical-only
         # velocity above, which exists to catch a FAST drop, not a slow lack
-        # of movement over minutes.
-        centroid = (
-            sum(landmarks[i].x for i in indices) / len(indices),
-            sum(landmarks[i].y for i in indices) / len(indices),
-        )
-        motion = 0.0
-        if self._prev_centroid is not None:
-            motion = math.hypot(centroid[0] - self._prev_centroid[0], centroid[1] - self._prev_centroid[1])
-        self._prev_centroid = centroid
-        # Observed motion is contradicting evidence, not missing evidence:
-        # it locks the stillness feed False long enough that the engine's
-        # occlusion grace cannot bridge it and the held-time clock genuinely
-        # restarts (see _stillness_motion_lockout_s in __init__).
-        if motion >= self._still_max_motion:
+        # of movement over minutes. None means not measurable this frame
+        # (missing evidence, see _torso_motion).
+        motion = self._torso_motion(landmarks)
+        # Observed motion is contradicting evidence, not missing evidence. It
+        # drops an unconfirmed stillness clock at once and holds the feed
+        # False past resolve_after_s, so a confirmed one resolves (see
+        # _stillness_motion_lockout_s in __init__).
+        if motion is not None and motion >= self._still_max_motion:
             self._stillness_locked_until = now + self._stillness_motion_lockout_s
+            if self._zone_engine.state_of("unusual_stillness") in (OBSERVED, DEVELOPING):
+                self._zone_engine.remove_rule("unusual_stillness")
+                self._zone_engine.add_rule(self._stillness_rule)
         elif self._stillness_locked_until is not None and now >= self._stillness_locked_until:
             self._stillness_locked_until = None
-        still = motion < self._still_max_motion and self._stillness_locked_until is None
+        still = motion is not None and motion < self._still_max_motion and self._stillness_locked_until is None
         zone_transitions += self._zone_engine.update("unusual_stillness", still, 0.8, now)
         events += self._zone_transition_events(zone_transitions)
 
         return events
+
+    def _torso_motion(self, landmarks) -> Optional[float]:
+        """Glitch-filtered, visibility-gated torso movement this frame, in
+        normalized units. None when it cannot be measured.
+
+        Two defects, both of which kept `unusual_stillness` (the backstop for a
+        person who is down and not moving) from ever firing:
+          * The centroid averaged all four torso landmarks whatever their
+            visibility. MediaPipe's guess at an occluded hip, or a landmark
+            moving in or out of view, read as movement. Only landmarks visible
+            (>= 0.5) are used now, and only when the same set is visible in all
+            four frames compared.
+          * A single jittery frame of 0.01 locked the feed for 10.5 s and
+            restarted the 600 s clock. Measured: Gaussian jitter of sigma 0.004
+            (about 2 px) on a motionless person lying down caused 29 restarts in
+            15 minutes, and the rule never fired. Motion is now the change in the
+            per-axis MEDIAN of the last three centroids, so a lone one-frame
+            excursion never registers, wherever it falls in the window. Real
+            movement moves the median and is reported a frame later.
+        """
+        points = {
+            i: (landmarks[i].x, landmarks[i].y)
+            for i in HIP_LANDMARKS + SHOULDER_LANDMARKS
+            if getattr(landmarks[i], "visibility", 1.0) >= _MIN_TORSO_LANDMARK_VISIBILITY
+        }
+        if len(points) < _MIN_TORSO_LANDMARKS_FOR_VELOCITY:
+            self._torso_history.clear()
+            return None
+        key = frozenset(points)
+        centroid = (
+            sum(p[0] for p in points.values()) / len(points),
+            sum(p[1] for p in points.values()) / len(points),
+        )
+        if self._torso_history and self._torso_history[-1][0] != key:
+            self._torso_history.clear()  # a different landmark set: not comparable
+        self._torso_history.append((key, centroid))
+        if len(self._torso_history) < 4:
+            return None
+        cs = [c for _, c in self._torso_history]
+
+        def _median3(i: int, axis: int) -> float:
+            return sorted(c[axis] for c in cs[i:i + 3])[1]
+
+        return math.hypot(_median3(1, 0) - _median3(0, 0), _median3(1, 1) - _median3(0, 1))
 
     def _zone_transition_events(self, transitions: list) -> list[Event]:
         """CONFIRMED/RESOLVED transitions -> Events, for both the zone and
@@ -555,7 +706,7 @@ class FallDetectionModule(VisionModule):
         base += 0.15 * posture_confidence
         return round(min(0.99, base), 3)
 
-    def _fall_transition_events(self, transitions: list) -> list[Event]:
+    def _fall_transition_events(self, transitions: list, now: float) -> list[Event]:
         """CONFIRMED/RESOLVED -> Events for the fall engine specifically (kept
         separate from _zone_transition_events: "fall" isn't a `label:name`
         keyed detection, and RESOLVED here also clears the state-machine
@@ -571,11 +722,44 @@ class FallDetectionModule(VisionModule):
                 ))
             elif tr.state == RESOLVED:
                 events.append(Event.now("fall_resolved", tr.duration_s, tr.confidence, self.name))
-                self._fall_pending_since = None
-                self._fall_pending_evidence_at = None
                 self._still_since = None
-                self._fall_via_recovery = False
+                if self._seen_upright():
+                    # Seen back off the floor (on their feet, or sitting up in a
+                    # chair): the fall is over, and a future one must be
+                    # detected from scratch. Re-arming here made someone who
+                    # sat up and then lay down still on a sofa within
+                    # fall_pending_timeout_s a brand-new "fall" with no drop.
+                    self._fall_pending_since = None
+                    self._fall_pending_evidence_at = None
+                    self._fall_via_recovery = False
+                else:
+                    # Resolved WITHOUT anyone seeing them get up: pose tracking
+                    # was lost for resolve_after_s (common for someone lying on
+                    # the floor), or the last posture was unreadable. Clearing
+                    # the pending state here used to make the person still
+                    # lying there when tracking came back invisible: no
+                    # velocity spike and no "recently upright" left to re-enter
+                    # by. It is re-armed instead. Seen lying down again, it
+                    # re-confirms after stillness_duration_s. Seen confidently
+                    # standing, it is cancelled. Neither within
+                    # fall_pending_timeout_s, it expires as usual.
+                    self._fall_pending_since = now
+                    self._fall_pending_evidence_at = self._fall_pending_since
         return events
+
+    def _seen_upright(self) -> bool:
+        """Last seen standing or sitting — torso vertical, i.e. off the floor.
+
+        No extra confidence bar: unlike cancelling a PENDING fall on one frame
+        (_STANDING_CANCEL_MIN_CONFIDENCE), this runs once a confirmed fall has
+        already resolved through resolve_after_s of not lying down, and the
+        classifier only says STANDING/SITTING for an upright torso. Sitting is
+        always reported at 0.6, so a 0.7 bar would never count it.
+        """
+        return self._last_posture is not None and self._last_posture.label in (
+            posture.STANDING, posture.SITTING,
+        )
+
 
     def _activity_events(self, now: float) -> list[Event]:
         """Turn the activity state into lifecycle-managed events.
@@ -585,16 +769,24 @@ class FallDetectionModule(VisionModule):
         running one alert with a start and an end, not thirty alerts.
         """
         state = self._last_activity
-        if state is None or not state.ready:
-            return []
-
         events: list[Event] = []
-        evidence = ", ".join(f"{k}={v}" for k, v in state.signals.items() if k != "reason")
-
-        for attribute in (state.running, state.jumping):
-            transitions = self._activity_engine.update(
-                attribute.name, attribute.present, attribute.confidence or 0.0, now
+        if state is None or not state.ready:
+            # Nothing measurable this frame. It is fed as "not present" rather
+            # than skipped. Skipped, a CONFIRMED running/jumping track was never
+            # updated again (EventEngine has no time-based reaper), so it
+            # latched for ever after a pose dropout and swallowed every later
+            # episode. resolve_after_s still decides when absence becomes a
+            # resolution.
+            attributes: tuple = (("running", False, 0.0), ("jumping", False, 0.0))
+            evidence = ""
+        else:
+            attributes = tuple(
+                (a.name, a.present, a.confidence or 0.0) for a in (state.running, state.jumping)
             )
+            evidence = ", ".join(f"{k}={v}" for k, v in state.signals.items() if k != "reason")
+
+        for name, present, confidence in attributes:
+            transitions = self._activity_engine.update(name, present, confidence, now)
             for transition in transitions:
                 if transition.state == CONFIRMED:
                     events.append(Event.now(
@@ -714,7 +906,5 @@ class FallDetectionModule(VisionModule):
         _apply_monitoring_mode/_switch_preset hot-swap between, and both already call
         old_module.close(), but this override was missing, so every swap away from
         fall_detection leaked a live Pose graph)."""
-        try:
+        with contextlib.suppress(Exception):  # closing twice must be harmless
             self._pose.close()
-        except Exception:  # noqa: BLE001 - closing twice must be harmless
-            pass

@@ -129,6 +129,19 @@ struct SimulatedFeedView: View {
 
 // MARK: - Real MJPEG stream reader (the device dashboard's /stream endpoint on the LAN).
 
+/// The live picture's width / height, once a frame has decoded.
+///
+/// Published so a view drawn OVER the feed (the zone editor) can size itself to
+/// the picture the camera really sends. The editor used a fixed 4:3 canvas while
+/// the feed letterboxes to the camera's own ratio, so on any other capture size
+/// the drawn polygon was normalised against the letterbox, not the frame.
+struct FeedAspectRatioKey: PreferenceKey {
+    static var defaultValue: CGFloat? { nil }
+    static func reduce(value: inout CGFloat?, nextValue: () -> CGFloat?) {
+        value = value ?? nextValue()
+    }
+}
+
 struct MJPEGView: View {
     let url: URL
     @EnvironmentObject private var state: AppState
@@ -189,6 +202,10 @@ struct MJPEGView: View {
                 }
             }
         }
+        .preference(
+            key: FeedAspectRatioKey.self,
+            value: reader.image.flatMap { $0.size.height > 0 ? $0.size.width / $0.size.height : nil }
+        )
         .onAppear {
             // Wired before start(), so the very first run of failures can trigger
             // a re-resolve. Adopting the answer needs no code here: DeviceLink
@@ -196,6 +213,11 @@ struct MJPEGView: View {
             // reads, so `onChange(of: url)` below picks it up and reconnects.
             reader.onAddressLooksStale = { Task { await link.resolve(force: true) } }
             reader.start(base: url.absoluteString, token: state.deviceToken)
+            // An address is not an identity: confirm the camera answering there
+            // is still the linked one (a DHCP swap, or two default-named Pis
+            // trading `sensordyme.local`). If not, DeviceLink re-resolves and the
+            // corrected address arrives through `onChange(of: url)`.
+            Task { await link.ensureConnection() }
         }
         .onDisappear { reader.stop() }
         // Backgrounding is not `onDisappear`. The view stays in the hierarchy when
@@ -271,7 +293,8 @@ final class MJPEGReader: NSObject, ObservableObject, URLSessionDataDelegate {
 
     private let retryPolicy = MJPEGRetryPolicy()
     private var parser = MJPEGFrameParser()
-    private var session: URLSession?
+    /// The session whose callbacks may act. See `CurrentConnection`.
+    private let connection = CurrentConnection<URLSession>()
     private var base = ""
     private var token = ""
     private var stopped = true
@@ -286,9 +309,6 @@ final class MJPEGReader: NSObject, ObservableObject, URLSessionDataDelegate {
     /// about Bonjour, and so the behaviour is testable without a network.
     var onAddressLooksStale: (() -> Void)?
 
-    private static let failuresBeforeReresolving = 3
-    private static let addressRecheckInterval: TimeInterval = 20
-
     // MARK: Lifecycle
 
     /// Point the reader at a device and (re)start it. Safe to call repeatedly —
@@ -297,7 +317,11 @@ final class MJPEGReader: NSObject, ObservableObject, URLSessionDataDelegate {
         // An unchanged target must not restart a healthy stream: `onChange` and
         // `onAppear` can both fire for the same values, and tearing the
         // connection down to rebuild it identically is a visible stutter.
-        if !stopped, base == self.base, token == self.token, state != .idle { return }
+        guard MJPEGReaderPolicy.needsRestart(
+            stopped: stopped, state: state,
+            currentBase: self.base, currentToken: self.token,
+            base: base, token: token
+        ) else { return }
         teardown()
         self.base = base
         self.token = token
@@ -321,8 +345,8 @@ final class MJPEGReader: NSObject, ObservableObject, URLSessionDataDelegate {
         // invalidateAndCancel(), not finishTasksAndInvalidate(): a live stream has
         // no natural end, so "finish" would never come. This also releases the
         // session's strong reference to this delegate.
-        session?.invalidateAndCancel()
-        session = nil
+        connection.current?.invalidateAndCancel()
+        connection.clear()
         // Bytes from a connection that is going away must never be spliced onto
         // bytes from its replacement: the result would start inside one frame and
         // end inside another, decode to nothing, and look like a broken camera.
@@ -362,7 +386,7 @@ final class MJPEGReader: NSObject, ObservableObject, URLSessionDataDelegate {
         configuration.networkServiceType = .video
 
         let session = URLSession(configuration: configuration, delegate: self, delegateQueue: nil)
-        self.session = session
+        connection.replace(with: session)
         // Not a bare `.connecting`: this attempt may take the full request
         // timeout to fail, and on attempt two onwards we already know why the
         // last one did. See MJPEGStreamState.inFlight.
@@ -375,14 +399,12 @@ final class MJPEGReader: NSObject, ObservableObject, URLSessionDataDelegate {
         session.dataTask(with: request).resume()
     }
 
-    /// How long without a single byte before the connection is considered dead.
-    /// The device pushes at `dashboard.stream_fps` (12/s by default), so silence
-    /// this long means the stream is not coming back on its own.
-    private static let idleTimeout: TimeInterval = 15
+    /// See `MJPEGReaderPolicy.idleTimeout`.
+    private static let idleTimeout = MJPEGReaderPolicy.idleTimeout
 
     /// Any drop (device rebooted, Wi-Fi blip, app came back from background)
     /// retries with capped exponential backoff instead of spinning forever.
-    private func scheduleReconnect(reason: String? = nil) {
+    private func scheduleReconnect(reason: String? = nil, countsAsTransportFailure: Bool = true) {
         guard !stopped else { return }
         teardown()  // cancels any retry already pending, so retries cannot pile up
         // Keep the last explanation while retrying rather than blanking it: the
@@ -391,15 +413,19 @@ final class MJPEGReader: NSObject, ObservableObject, URLSessionDataDelegate {
         // saying nothing is worse than one that keeps saying it.
         lastFailureReason = reason ?? lastFailureReason
         state = .reconnecting(attempt: retryAttempt + 1, reason: lastFailureReason)
-        consecutiveTransportFailures += 1
+        // Only failures to REACH the device count toward re-resolving its
+        // address; a device that answered and then went quiet has not moved.
+        if countsAsTransportFailure { consecutiveTransportFailures += 1 }
         // A device that answered yesterday and refuses every connection today has
         // usually taken a new DHCP address -- the stored one is a cache, not
         // configuration (see DeviceLink). Ask for a fresh address rather than
         // retrying a dead one until someone opens Settings. Rate-limited so a
         // genuinely absent device cannot turn the retry loop into a discovery loop.
         let now = Date()
-        if consecutiveTransportFailures >= Self.failuresBeforeReresolving,
-           now.timeIntervalSince(lastAddressRecheck) >= Self.addressRecheckInterval {
+        if MJPEGReaderPolicy.shouldReresolve(
+            consecutiveFailures: consecutiveTransportFailures,
+            sinceLastRecheck: now.timeIntervalSince(lastAddressRecheck)
+        ) {
             lastAddressRecheck = now
             onAddressLooksStale?()
         }
@@ -415,7 +441,7 @@ final class MJPEGReader: NSObject, ObservableObject, URLSessionDataDelegate {
     /// Whether a callback belongs to the connection that is current *now*.
     /// Everything in this class turns on this question — see the type's docs.
     private func isCurrent(_ session: URLSession) -> Bool {
-        self.session === session
+        connection.isCurrent(session)
     }
 
     // MARK: URLSessionDataDelegate
@@ -462,18 +488,19 @@ final class MJPEGReader: NSObject, ObservableObject, URLSessionDataDelegate {
             // cancelled itself was read as "the live stream dropped" and tore down
             // the healthy session that had already replaced it.
 
-            if status == 401 || status == 403 {
+            switch MJPEGReaderPolicy.completion(status: status, error: error, hasToken: !self.token.isEmpty) {
+            case .unauthorized(let hasToken):
                 // No amount of retrying supplies a token. Looping here is what
                 // turned a one-line settings mistake into a permanent spinner.
                 // The device DID answer, so this is not a transport failure and
                 // must not count toward re-resolving the address.
                 self.consecutiveTransportFailures = 0
                 self.image = nil
-                self.state = .unauthorized(hasToken: !self.token.isEmpty)
+                self.state = .unauthorized(hasToken: hasToken)
                 self.teardown()
-                return
+            case .reconnect(let reason, let countsAsTransportFailure):
+                self.scheduleReconnect(reason: reason, countsAsTransportFailure: countsAsTransportFailure)
             }
-            self.scheduleReconnect(reason: MJPEGStreamDiagnosis.describe(error))
         }
     }
 }

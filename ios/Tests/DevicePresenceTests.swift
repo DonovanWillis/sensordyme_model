@@ -41,6 +41,12 @@ check(verdict(found: false, nil) == .notLinked,
 check(verdict(found: false, ago(5), reachable: false) == .undetermined,
       "with no backend to ask, the honest answer is that we do not know")
 
+check(DevicePresence.verdict(foundOnNetwork: false, backend: nil, backendReachable: true,
+                             accountHasDevices: true, now: now) == .ambiguous,
+      "devices on the account but none known to be this camera: say so, not 'no device linked'")
+check(DevicePresence.offersLocalRetry(.ambiguous), "and offer to search again")
+check(DevicePresence.detail(.ambiguous).contains("Find my device"), "pointing at the fix")
+
 print("\nthe live window matches the backend's own `online` flag:")
 check(DevicePresence.liveWindow == 30, "30s, same as _HEALTH_STALE_S in cloud/app.py")
 check(verdict(found: false, ago(29)) == .aliveButElsewhere(since: 29), "just inside is alive")

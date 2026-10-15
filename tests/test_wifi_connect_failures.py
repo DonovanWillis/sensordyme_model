@@ -58,7 +58,7 @@ def test_a_failed_join_does_not_leave_a_broken_profile_behind(monkeypatch):
     retries a network it can never join on every future boot."""
     calls = fake_nmcli(monkeypatch, returncode=4, stderr="Secrets were required", saved="")
     WifiManager().connect("Typo", "wrong")
-    assert any(c[:2] == ["connection", "delete"] and c[2] == "Typo" for c in calls), \
+    assert any(c[:2] == ["connection", "delete"] and c[-1] == "Typo" for c in calls), \
         "the failed profile was left saved"
 
 

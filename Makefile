@@ -74,8 +74,11 @@ accuracy-dataset: ## Offline accuracy run against the State Farm dataset (no hum
 	@echo
 	$(VENV)/python benchmarks/accuracy_state_farm.py --per-class 100
 
-# Exits NONZERO when a metric regresses past --tolerance (default 0.03), so this
-# is the CI-usable form. baseline_phase1.json is the committed regression
+# Exits NONZERO when a metric regresses past --tolerance (default 0.03). Do NOT
+# branch on `make accuracy-gate`'s exit code:
+# make reports any failing recipe as 2, so the script's 1 (regression) and 2
+# (cannot run) arrive identical. CI calls the script directly for that reason.
+# baseline_phase1.json is the committed regression
 # reference — it is the one file under benchmarks/results/ that is NOT gitignored
 # (see .gitignore), because a gate with no baseline has nothing to compare to.
 accuracy-gate: ## Score against the committed baseline; nonzero on regression

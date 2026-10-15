@@ -122,7 +122,10 @@ class TestHandRoiBox:
     def test_roi_grows_with_torso_length(self):
         small = hand_roi_box(self._anchor(), torso_length_norm=0.15, frame_w=W, frame_h=H, aspect=1.0)
         large = hand_roi_box(self._anchor(), torso_length_norm=0.45, frame_w=W, frame_h=H, aspect=1.0)
-        area = lambda b: (b[2] - b[0]) * (b[3] - b[1])
+
+        def area(b):
+            return (b[2] - b[0]) * (b[3] - b[1])
+
         assert area(large) > area(small)
 
     def test_roi_grows_with_hand_speed(self):
@@ -130,7 +133,10 @@ class TestHandRoiBox:
                               hand_speed_diag_per_s=0.0)
         fast = hand_roi_box(self._anchor(), torso_length_norm=0.3, frame_w=W, frame_h=H, aspect=1.0,
                              hand_speed_diag_per_s=3.0)
-        area = lambda b: (b[2] - b[0]) * (b[3] - b[1])
+
+        def area(b):
+            return (b[2] - b[0]) * (b[3] - b[1])
+
         assert area(fast) > area(still)
 
     def test_roi_is_clamped_to_the_frame(self):
@@ -251,23 +257,35 @@ class TestHandPerceptionEngine:
         assert len(result.hands) == 1
         assert result.associations == {}
 
-    def test_a_confidently_classified_object_moving_with_the_hand_associates(self):
-        """The hand moves fast enough per step to cross adaptive scheduling's
-        own re-trigger threshold (a real carry/pickup motion would), so the
-        object gets multiple fresh detections -- not one frozen box the hand
-        then drifts away from, which would understate motion agreement for
-        reasons that have nothing to do with whether it's actually held."""
-        engine = HandPerceptionEngine(OBJECT_LABELS, association_threshold=0.5)
-        model = _FakeYoloModel()
-        # Same crop-relative small box each stride tick (moves with the ROI,
-        # which itself follows the wrist) -- classified as a phone at high confidence.
-        model.responses = [[((5, 5, 25, 25), 67, 0.9)]] * 6
-        wrist_positions = [(0.5 + 0.1 * i, 0.5) for i in range(6)]
+    def test_a_confidently_classified_object_moving_with_the_hand_associates(self, monkeypatch):
+        """A phone AT the hand, re-detected every tick (roi_min_move_diag=0
+        forces fresh ROI inference, as a real carry/pickup motion would), moving
+        in lock-step with the wrist, associates.
+
+        This used to return a fixed crop-relative box at the ROI's top-left
+        corner -- ~60px from the wrist -- and passed only because association
+        scored overlap against the whole ROI, which every crop detection
+        overlaps by construction. predict_roi is replaced here so the phone is
+        placed at the wrist in full-frame pixels, whatever the ROI's size."""
+        import core.hand_perception as hp
+
+        wrist_px = {}
+        calls = {"n": 0}
+
+        def phone_at_wrist(model, frame, roi, classes=None, conf=0.25):
+            calls["n"] += 1
+            x, y = wrist_px["xy"]
+            return [((int(x - 10), int(y - 10), int(x + 10), int(y + 10)), 67, 0.9)]
+
+        monkeypatch.setattr(hp, "predict_roi", phone_at_wrist)
+        engine = HandPerceptionEngine(OBJECT_LABELS, association_threshold=0.5, roi_min_move_diag=0.0)
         result = None
-        for i, (wx, wy) in enumerate(wrist_positions):
+        for i in range(6):
+            wx, wy = 0.3 + 0.08 * i, 0.5
+            wrist_px["xy"] = (wx * W, wy * H)
             lm = _standing_with_hands(right_wrist=(wx, wy))
-            result = engine.update(lm, FRAME, model, now=i * 0.1, aspect=1.0)
-        assert model.calls > 1, "test setup: the hand must have moved enough to re-trigger ROI inference"
+            result = engine.update(lm, FRAME, object(), now=i * 0.1, aspect=1.0)
+        assert calls["n"] > 1, "test setup: the moving hand must re-trigger ROI inference"
         assert "right_hand" in result.associations
         obj_track, score = result.associations["right_hand"]
         assert obj_track.label == "cell phone"

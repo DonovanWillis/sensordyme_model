@@ -125,6 +125,26 @@ struct SetupWizardView: View {
     /// the shipped default is BLE, which needs no address at all.
     static let provisioningHotspotSetupURL = URL(string: "http://10.42.0.1:8899/setup")
 
+    /// The setup page, carrying the device token when there is one.
+    ///
+    /// The page's Wi-Fi form posts to `/setup/wifi`, which on a network bind
+    /// requires the token. A page opened in Safari cannot be given a header, so
+    /// the device reads `?token=` and sends it on as X-Device-Token. URLComponents
+    /// percent-encodes it, so a token with `+ / = &` survives the trip.
+    static func setupURL(token: String) -> URL? {
+        guard let base = provisioningHotspotSetupURL else { return nil }
+        let cleaned = token.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !cleaned.isEmpty,
+              var components = URLComponents(url: base, resolvingAgainstBaseURL: false)
+        else { return base }
+        components.queryItems = [URLQueryItem(name: "token", value: cleaned)]
+        // URLQueryItem leaves "+" alone, and a server's form decoding reads it
+        // as a space; encode it explicitly.
+        components.percentEncodedQuery = components.percentEncodedQuery?
+            .replacingOccurrences(of: "+", with: "%2B")
+        return components.url ?? base
+    }
+
     private var hotspotStep: some View {
         VStack(spacing: 14) {
             stepBody(
@@ -132,7 +152,7 @@ struct SetupWizardView: View {
                 title: "Join its setup network",
                 text: "In Settings → Wi-Fi on this phone, join the network named SensorDyme-XXXX. Your device broadcasts it on first boot."
             )
-            if !state.isDemo, let setup = Self.provisioningHotspotSetupURL {
+            if !state.isDemo, let setup = Self.setupURL(token: state.deviceToken) {
                 Link(destination: setup) {
                     Label("Open device setup page", systemImage: "safari")
                         .font(.subheadline.bold())

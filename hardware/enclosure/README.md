@@ -23,8 +23,13 @@ clearance checks pass and both meshes are watertight.
   fully (all Pi-branded and typical USB-C cables fit).
 - **microSD**: 20 mm slot in the right wall at card height with a finger scoop
   — insert/remove without opening the enclosure.
-- **Camera Module 3 Wide NoIR**: four Ø5 pads (M2 self-tap) behind a centered
-  conical opening (Ø14 → Ø24, 59° half-angle) — clears the 120° diagonal FOV.
+- **Camera Module 3 Wide NoIR**: four Ø5 pads (M2 self-tap) behind a conical
+  opening (Ø14 → Ø24, 59° half-angle) — clears the 120° diagonal FOV. The lens
+  sits 8 mm left of the front-wall centre (`CAM_X`): centred, the 25 mm camera
+  board overlapped the 34 mm IR board by 0.5 mm and the IR board cut ~3.5 mm into
+  the front-right lid-screw boss. `verify()` now checks board envelopes against
+  each other, the bosses and the walls. The tracked `.stl` files predate this
+  change — re-run the script to regenerate them.
 - **IR illuminator**: Ø20 chamfered window + 28 × 28 mm post grid to the right
   of the camera. Boards vary — tune `IR_*` params in the script if yours
   differs, then re-run.

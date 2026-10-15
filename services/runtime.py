@@ -32,8 +32,8 @@ from typing import Optional
 
 import cv2
 
-from core import accel, device_health, monitoring_mode, sdnotify
-from core.alerts import AlertManager
+from core import accel, device_health, device_state, monitoring_mode, sdnotify
+from core.alerts import AlertLevel, AlertManager
 from core.camera import Camera, CameraError
 from core.dataset import CaptureStore
 from core.events import Event
@@ -58,6 +58,7 @@ log = get_logger("runtime")
 _HEALTH_SAMPLE_S = 5.0
 _CAMERA_OPEN_RETRIES = 5
 _CAMERA_OPEN_BACKOFF_S = 2.0
+_CAMERA_VERIFY_TIMEOUT_S = 10.0
 _VERSION = "0.2"
 # A module.process() call that keeps failing this many frames IN A ROW is not
 # a transient hiccup -- propagate so the existing recovery ladder (in-thread
@@ -83,6 +84,17 @@ _FLASH_DURATION_S = 1.5
 _MAX_SWAP_S = 120.0
 #: Quiet time after which a run of last-resort reboots counts as over.
 _REBOOT_CAMPAIGN_RESET_S = 24 * 3600.0
+#: A process restart for a component counts as "already tried" for this long.
+#: Long enough to cover the watchdog firing, the restart, boot and the
+#: component's own restart budget being spent again in the new process.
+_PROCESS_RESTART_WINDOW_S = 900.0
+#: How long the inference check accepts "starting" (heartbeat reset, not yet
+#: stamped). The loop stamps on every pass — even a no-frame timeout every
+#: 0.5 s — so a loop that has not stamped for this long is not starting, it is
+#: wedged, and must not read as healthy (or the watchdog is fed again).
+_INFERENCE_STARTING_GRACE_S = 30.0
+#: While DEGRADED (no detector), how often to try loading it again.
+_DETECTOR_RETRY_S = 60.0
 
 
 class _InferenceService(Service):
@@ -96,6 +108,67 @@ class _InferenceService(Service):
 
     def run(self, stop: threading.Event) -> None:
         self._runtime._inference_loop(stop)
+
+
+class _HealthReportService(Service):
+    """Samples device health for the uplink on its own thread.
+
+    It used to be sampled inside the inference loop, after a successfully
+    processed frame — so in exactly the failures it exists to report (camera
+    dead, detector degraded, a module failing every frame, a wedged loop) it
+    stopped being refreshed, and the backend kept serving the last healthy
+    snapshot ("capturing", monitoring_active true) for as long as the outage
+    lasted. Sampling also runs nmcli/vcgencmd, which must not stall inference.
+    """
+
+    name = "health_report"
+
+    def __init__(self, runtime: "DeviceRuntime") -> None:
+        super().__init__()
+        self._runtime = runtime
+
+    def run(self, stop: threading.Event) -> None:
+        while True:
+            uplink = self._runtime.uplink
+            if uplink is not None:
+                # Guarded: a few failed samples (nmcli restarting, say) must not
+                # spend the thread's crash budget and stop reporting for good.
+                try:
+                    uplink.set_health(self._runtime._collect_health("uplink"))
+                except Exception:
+                    log.exception("health sample failed; retrying next interval")
+            if stop.wait(_HEALTH_SAMPLE_S):
+                return
+
+
+class _NullEventLog:
+    """Stands in for EventLogger/TelemetryLogger when data/ cannot be written.
+
+    A read-only or full SD card is a documented field failure. Failing to open
+    a log file must cost the log, not the detection and alerts it records.
+    """
+
+    def log(self, *_args, **_kwargs) -> None:
+        return None
+
+    def log_if_due(self, *_args, **_kwargs) -> bool:
+        return False
+
+    def close(self) -> None:
+        return None
+
+
+def _zones_from_app(raw) -> list:
+    """core.zones.Zone objects from the uplink's zone dicts {name, polygon, kind}."""
+    return load_zones({
+        z["name"]: {"polygon": z.get("polygon"), "kind": z.get("kind", "restricted")}
+        for z in (raw or []) if isinstance(z, dict) and z.get("name")
+    })
+
+
+def _systemd_watchdog_armed() -> bool:
+    """Whether systemd will restart this process if health stops pinging."""
+    return sdnotify.enabled() and bool(os.environ.get("WATCHDOG_USEC"))
 
 
 class DeviceRuntime:
@@ -151,9 +224,20 @@ class DeviceRuntime:
         )
         self._evidence_max = int(alerts_cfg.get("evidence_max_files", 50))
 
-        # AI-configured rules. Zones come from the active module's config, so a
-        # rule naming "pool" resolves against the same polygon the module draws.
-        self.rule_engine = RuleEngine(zones=self._zones_for_module(module_name))
+        # Zones drawn in the app; None until the app has sent any. They are the
+        # device's zones whatever mode runs — the app's editor is where a person
+        # draws a crib or a keep-out area — so they are handed to every module
+        # and to the rule engine, and remembered across restarts so an offline
+        # device does not come back without them. See _effective_zones.
+        self._app_zones: Optional[list] = None
+        saved_zones = device_state.saved_zones()
+        if saved_zones is not None:
+            self._app_zones = _zones_from_app(saved_zones)
+
+        # AI-configured rules. A rule naming "pool" resolves against the same
+        # polygon the module watches.
+        self.rule_engine = RuleEngine(zones=self._effective_zones(module_name))
+        self._push_zones_to(module)
 
         # What someone configured survives the device being switched off.
         #
@@ -186,6 +270,9 @@ class DeviceRuntime:
         self.shutdown = threading.Event()
         self._module_lock = threading.Lock()  # guards module swaps vs. the inference loop
         self._heartbeat = 0.0  # monotonic time of the last completed inference iteration
+        # When the heartbeat was last reset to "starting"; bounds that grace.
+        self._heartbeat_reset_at = time.monotonic()
+        self._inference_service: Optional[_InferenceService] = None
         self._last_stream_push = 0.0
         self._flash_until = 0.0  # monotonic time; see _FLASH_DURATION_S
         self._consecutive_process_failures = 0  # see _MAX_CONSECUTIVE_PROCESS_FAILURES
@@ -202,7 +289,6 @@ class DeviceRuntime:
         self.camera: Optional[Camera] = None
         self.capture: Optional[CaptureService] = None
         self.wifi: Optional[WifiManager] = None
-        self._last_health_sample = 0.0
         self.dashboard = None
         self.uplink = None
         self.provisioning: Optional[ProvisioningService] = None
@@ -223,7 +309,9 @@ class DeviceRuntime:
                 camera = Camera(self.config.get("camera", {}))
                 # Prove it produces frames before declaring victory (the "verify
                 # the camera" boot step): one real read, not just a successful open.
-                camera.read()
+                # Bounded: a read that hangs used to hold the whole boot (no
+                # health, dashboard or BLE) until systemd's TimeoutStartSec.
+                camera.read(timeout_s=_CAMERA_VERIFY_TIMEOUT_S)
                 if attempt > 1:
                     log.info("camera opened on attempt %d", attempt)
                 return camera
@@ -242,7 +330,8 @@ class DeviceRuntime:
                 log.warning(
                     "camera open attempt %d/%d failed: %s", attempt, _CAMERA_OPEN_RETRIES, exc
                 )
-                time.sleep(_CAMERA_OPEN_BACKOFF_S)
+                if attempt < _CAMERA_OPEN_RETRIES:
+                    time.sleep(_CAMERA_OPEN_BACKOFF_S)
         raise CameraError(f"camera unavailable after {_CAMERA_OPEN_RETRIES} attempts: {last_exc}")
 
     def _build(self) -> None:
@@ -252,17 +341,46 @@ class DeviceRuntime:
         accel_cfg = self.config.get("accelerator", {})
         info = accel.configure(accel_cfg)
         if accel_cfg.get("required", False) and not info.usable:
-            raise RuntimeError(f"accelerator.required is set but: {info.detail}")
-        self._verify_detection_backend()
+            # DEGRADED, for the same reason as a missing detector: raising here
+            # exited before health, the dashboard or BLE existed, and under
+            # Restart=always that was a crash loop into StartLimitAction=reboot.
+            self._detection_degraded = f"accelerator.required is set but: {info.detail}"
+            log.error("DEGRADED: %s — monitoring is NOT active", self._detection_degraded)
+        else:
+            self._verify_detection_backend()
 
         logging_config = self.config.get("logging", {})
-        self.logger = EventLogger(logging_config.get("csv_path", "data/events.csv"))
-        self.telemetry = TelemetryLogger(
-            logging_config.get("telemetry_csv_path", "data/telemetry.csv"),
-            interval_s=float(logging_config.get("telemetry_interval_s", 0.5)),
-        )
+        try:
+            self.logger = EventLogger(logging_config.get("csv_path", "data/events.csv"))
+        except OSError as exc:
+            log.error("event log unavailable (%s); detection and alerts continue without it", exc)
+            self.logger = _NullEventLog()
+        try:
+            self.telemetry = TelemetryLogger(
+                logging_config.get("telemetry_csv_path", "data/telemetry.csv"),
+                interval_s=float(logging_config.get("telemetry_interval_s", 0.5)),
+                # Bounded: an unrotated telemetry file grew 15-26 MB/day until
+                # the SD card filled, which is what stops the event log too.
+                max_bytes=int(float(logging_config.get("telemetry_max_mb", 25)) * 1024 * 1024),
+            )
+        except OSError as exc:
+            log.error("telemetry log unavailable (%s); continuing without it", exc)
+            self.telemetry = _NullEventLog()
 
-        self.camera = self._open_camera()
+        try:
+            self.camera = self._open_camera()
+        except CameraError as exc:
+            # Boot DEGRADED rather than exit. Exiting here took health, the
+            # dashboard, the uplink and BLE provisioning down with it, and under
+            # Restart=always + StartLimitAction=reboot a missing ribbon became an
+            # unbounded reboot loop that also bypassed _last_resort's total
+            # bound. An unopened camera lets the capture service keep retrying
+            # the open, and the health ladder report and escalate it.
+            log.error(
+                "camera unavailable (%s); starting without it — capture keeps retrying "
+                "and /api/health reports it", exc,
+            )
+            self.camera = Camera(self.config.get("camera", {}), open_now=False)
         self.capture = CaptureService(self.camera, self.bus)
 
         # Warm-up inference on a dummy frame BEFORE services start: model loads
@@ -398,14 +516,17 @@ class DeviceRuntime:
             "camera",
             critical=True,
             check=camera_check,
-            restart=lambda: self.capture.restart(),
+            restart=lambda: self.capture.restart(),  # noqa: PLW0108 - late-binds self.capture
             check_interval_s=2.0,
         )
         self.health.register(
             "inference",
             critical=True,
             check=self._inference_check,
-            restart=self._restart_inference,
+            # With --display the loop runs on the main thread and cannot be
+            # bounced. A no-op restart "succeeded" three times in ~6s, spent the
+            # budget, and reached the last-resort reboot on a hand-run Pi.
+            restart=None if self.display else self._restart_inference,
             check_interval_s=2.0,
         )
         # live_status(), not status(): the endpoint must report what is actually
@@ -430,7 +551,7 @@ class DeviceRuntime:
             self.health.register(
                 "dashboard",
                 check=lambda: (self.dashboard.is_alive(), self.dashboard.url),
-                restart=lambda: self.dashboard.restart(),
+                restart=lambda: self.dashboard.restart(),  # noqa: PLW0108 - late-binds self.dashboard
                 check_interval_s=10.0,
             )
         if self.uplink is not None:
@@ -449,7 +570,11 @@ class DeviceRuntime:
         from core import thermal
         self.health.register("thermal", check=thermal.status, check_interval_s=20.0)
         self.health.register("wifi", check=wifi.status, check_interval_s=15.0)
-        self.health.register("provisioning", check=lambda: self.provisioning.status(), check_interval_s=15.0)
+        self.health.register(
+            "provisioning",
+            check=lambda: self.provisioning.status(),  # noqa: PLW0108 - late-binds self.provisioning
+            check_interval_s=15.0,
+        )
         for name, component in self.hardware.health_checks().items():
             self.health.register(name, check=component, check_interval_s=60.0)
 
@@ -457,8 +582,11 @@ class DeviceRuntime:
         self.supervisor = Supervisor(self.health)
         self.supervisor.add(self.capture)
         if not self.display:
-            self.supervisor.add(_InferenceService(self))
+            self._inference_service = _InferenceService(self)
+            self.supervisor.add(self._inference_service)
         self.supervisor.add(self.provisioning)
+        if self.uplink is not None:
+            self.supervisor.add(_HealthReportService(self))
 
     def _apply_requested_labels(self) -> None:
         """Tell the running module which objects the active rules need.
@@ -535,8 +663,10 @@ class DeviceRuntime:
         # this, a device that booted degraded and then switched to a module
         # needing no detector (fall_detection is MediaPipe-Pose-only) would stay
         # marked degraded while working perfectly -- the mirror of the bug this
-        # method exists to prevent.
-        self._detection_degraded = None
+        # method exists to prevent. Assigned once the answer is known, not
+        # cleared up front: health is sampled on other threads, and a cleared
+        # reason during a seconds-long load read as "monitoring active".
+        #
         # Unknown while verifying, then assigned ONCE, complete. Filling it in
         # piecemeal left a window (a CPU load can take seconds) in which events
         # went out naming the module with detector=None — or, before the swap
@@ -548,6 +678,7 @@ class DeviceRuntime:
         weights = next((module_cfg[k] for k in self._WEIGHTS_KEYS if module_cfg.get(k)), None)
         if not weights:
             log.info("object detection: %s uses no object detector", self.module_name)
+            self._detection_degraded = None
             self._model_identity = identity
             return
         from core import detectors
@@ -571,11 +702,34 @@ class DeviceRuntime:
             self._model_identity = identity
             return
         identity["detector"] = detectors.model_identity(str(weights), device)
+        self._detection_degraded = None
         self._model_identity = identity
         log.info(
             "object detection backend for %s: %s (%s) — model %s", self.module_name, backend, weights,
             identity["detector"],
         )
+
+    def _retry_detection_backend(self) -> None:
+        """While DEGRADED, try the detector again.
+
+        Boot verified it once, and only a preset switch ever re-checked: a
+        transient Hailo init failure (or a model provisioned after boot) left
+        the device refusing to analyse until someone restarted it. Wrapped as
+        a module swap so a slow load reads as busy, not hung.
+        """
+        accel_cfg = self.config.get("accelerator", {}) or {}
+        if accel_cfg.get("required", False):
+            # A required HAT is re-probed rather than bypassed: a CPU detector
+            # must not quietly stand in for an accelerator the config demands.
+            info = accel.configure(accel_cfg)
+            if not info.usable:
+                self._detection_degraded = f"accelerator.required is set but: {info.detail}"
+                return
+        with self._module_swap():
+            self._verify_detection_backend()
+        if self._detection_degraded is None:
+            log.info("object detection recovered for %s; monitoring is active again",
+                     self.module_name)
 
     def _active_module_config(self) -> dict:
         """The config the RUNNING module was built from (see __init__)."""
@@ -679,6 +833,34 @@ class DeviceRuntime:
         module_cfg = modules_cfg.get(module_name, {}) if isinstance(modules_cfg, dict) else {}
         return load_zones(module_cfg.get("zones", {}) if isinstance(module_cfg, dict) else {})
 
+    def _effective_zones(self, module_name: str) -> list:
+        """The zones in force for `module_name`: the app's once it has sent any
+        (an empty list included — the owner deleted them), else config.yaml's."""
+        if self._app_zones is not None:
+            return list(self._app_zones)
+        return self._zones_for_module(module_name)
+
+    def _push_zones_to(self, module) -> None:
+        """Hand the app's zones to a module, so its own zone alerts use them.
+
+        Without this the app's zones only ever reached AI-configured rules: a
+        crib drawn as "Stay inside" never produced safe_zone_exit, because
+        modules read config.yaml's zones once, at construction. A no-op until
+        the app has sent zones, so config.yaml zones keep working.
+        """
+        if self._app_zones is None:
+            return
+        set_zones = getattr(module, "set_zones", None)
+        if not callable(set_zones):
+            return
+        try:
+            set_zones(list(self._app_zones))
+        except Exception:  # bad zones must not stop detection
+            log.exception(
+                "module '%s' could not apply the app's zones; it keeps its previous zones",
+                getattr(module, "name", "?"),
+            )
+
     def _apply_monitoring_mode(self) -> None:
         with self._module_swap():
             self._apply_monitoring_mode_now()
@@ -712,10 +894,12 @@ class DeviceRuntime:
         except Exception as exc:  # noqa: BLE001 - a bad switch must not kill the device
             log.error("could not switch to '%s' for %s: %s", wanted, mode.value, exc)
             return
+        self._push_zones_to(new_module)
 
         with self._module_lock:
             old_module, self.module, self.module_name = self.module, new_module, wanted
             self._model_identity = None  # unknown, not the old module's, until verified below
+            self._consecutive_process_failures = 0  # the new module starts with a clean slate
         # The new module may need a detector the old one did not, or none at all.
         # Verified once at boot was not enough: a device could boot on Elderly
         # Monitoring (Pose-only, no detector required, so nothing was degraded),
@@ -730,8 +914,8 @@ class DeviceRuntime:
         if callable(close):
             try:
                 close()
-            except Exception:  # noqa: BLE001 - teardown must never raise
-                pass
+            except Exception as exc:  # noqa: BLE001 - teardown must never raise
+                log.debug("old module close() failed during swap: %r", exc)
 
         # Zones survive the swap when the swap is INTO AI-custom monitoring.
         #
@@ -747,10 +931,10 @@ class DeviceRuntime:
         #
         # Keyed on the MODE rather than on tracking the delivery, because in
         # AI-custom the zones always come from the app by definition, however
-        # they arrived. Leaving AI-custom restores the module's own zones -- see
-        # _exit_custom_monitoring, which is the only place that happens.
+        # they arrived. Otherwise the effective zones apply: the app's when it
+        # has sent any, else the new module's config.yaml zones.
         if mode is not monitoring_mode.MonitoringMode.AI_CUSTOM:
-            self.rule_engine.set_zones(self._zones_for_module(wanted))
+            self.rule_engine.set_zones(self._effective_zones(wanted))
         self.mode = mode
         log.info(
             "[MONITORING] mode=%s module=%s base_monitoring=%s%s",
@@ -775,8 +959,17 @@ class DeviceRuntime:
             # "Count the bottles" is only what they typed.
             contributing_signals=alert.message(),
         )
+        # Alert before recording, for the same reason as the module-event path.
+        # Keyed per RULE, at the rule's own severity: keyed on the event type
+        # (the target label), an info rule about "person at the door" put a
+        # critical "child in the pool" rule into cooldown, and a critical rule
+        # sounded as a one-chirp SOFT alert the first time.
+        self.alert_manager.notify(
+            event,
+            key=alert.rule_id,
+            level=AlertLevel.CONTINUOUS if alert.severity == "critical" else AlertLevel.SOFT,
+        )
         self.logger.log(event)
-        self.alert_manager.notify(event)
         severity = "loud" if alert.severity == "critical" else "soft"
         if self.dashboard is not None:
             self.dashboard.push_event(event, severity)
@@ -785,7 +978,12 @@ class DeviceRuntime:
             # Marked as configured. `notify: "push"` on a rule IS someone asking
             # to be told; the severity field is about how prominent it looks,
             # not about whether it is worth interrupting for.
-            self.uplink.push_event(event, severity, source="custom_rule", model=self._model_identity)
+            # The rule's own delivery choice (push / sms) travels with the event:
+            # the backend routes on it instead of texting for every alert.
+            self.uplink.push_event(
+                event, severity, source="custom_rule", model=self._model_identity,
+                notify=alert.notify,
+            )
 
     # ------------------------------------------------------------------ health hooks
     @contextmanager
@@ -813,7 +1011,11 @@ class DeviceRuntime:
             # Bounded: a swap that never finishes IS a hang.
             return busy < _MAX_SWAP_S, f"switching module ({busy:.0f}s)"
         if self._heartbeat == 0.0:
-            return True, "starting"
+            # Bounded. An unbounded "starting" read a loop that never stamped —
+            # wedged on its first frame, or a restart that never really
+            # happened — as healthy for ever, and resumed feeding the watchdog.
+            starting_for = time.monotonic() - self._heartbeat_reset_at
+            return starting_for < _INFERENCE_STARTING_GRACE_S, f"starting ({starting_for:.0f}s)"
         age = time.monotonic() - self._heartbeat
         return age < 10.0, f"last iteration {age:.1f}s ago"
 
@@ -823,8 +1025,16 @@ class DeviceRuntime:
         # Back to "starting": the restarted loop gets the same grace a fresh
         # boot does, instead of being declared dead again on the very next
         # check because the stamp still describes the loop being replaced.
+        # Only for a restart that HAPPENED: when the wedged thread outlives
+        # stop(), restart() raises, and the old stamp must keep reporting it.
+        previous = self._heartbeat
         self._heartbeat = 0.0
-        self.supervisor.restart("inference")
+        self._heartbeat_reset_at = time.monotonic()
+        try:
+            self.supervisor.restart("inference")
+        except Exception:
+            self._heartbeat = previous
+            raise
 
     def _last_resort(self, component: str) -> None:
         """A critical component is down and restarts are spent: reboot the Pi —
@@ -866,7 +1076,31 @@ class DeviceRuntime:
         # Without this the total was a LIFETIME count: after `reboot_max_total`
         # last resorts spread over months, auto-recovery was off for good.
         if state["last_at"] and now - state["last_at"] > _REBOOT_CAMPAIGN_RESET_S:
-            state = {"count": 0, "last_at": state["last_at"]}
+            state = {**state, "count": 0}
+
+        # Rung 4 before rung 5: a process restart before a reboot. The restart
+        # budget runs out in well under WatchdogSec, so this used to reboot
+        # before the watchdog ever restarted the process. While a critical
+        # component is DOWN the health monitor withholds the watchdog ping, so
+        # declining here IS the process restart — but only when systemd's
+        # watchdog is armed; without one nothing would restart us.
+        if _systemd_watchdog_armed():
+            tried_at = state["process_restarts"].get(component, 0.0)
+            if not 0.0 <= now - tried_at <= _PROCESS_RESTART_WINDOW_S:
+                state["process_restarts"] = {**state["process_restarts"], component: now}
+                if not self._write_reboot_state(state):
+                    log.critical(
+                        "'%s' is down and unrecoverable, and the recovery record could not "
+                        "be written to %s; staying up degraded.",
+                        component, self._REBOOT_STATE_PATH,
+                    )
+                    return
+                log.critical(
+                    "'%s' is down and its restarts are spent; the systemd watchdog will now "
+                    "restart the process. A reboot follows only if it goes down again within "
+                    "%.0f min.", component, _PROCESS_RESTART_WINDOW_S / 60,
+                )
+                return
 
         if state["count"] >= max_total > 0:
             log.critical(
@@ -897,7 +1131,28 @@ class DeviceRuntime:
             "LAST RESORT: rebooting because '%s' is unrecoverable (reboot %d of %d)",
             component, state["count"] + 1, max_total,
         )
-        subprocess.run(["sudo", "-n", "systemctl", "reboot"], check=False)
+        if not self._issue_reboot():
+            # Nothing rebooted (a missing sudoers rule, say), so the attempt must
+            # not spend the bound: put the record back as it was.
+            self._write_reboot_state(state)
+
+    def _issue_reboot(self) -> bool:
+        """Run the reboot command. False when it could not be issued."""
+        try:
+            result = subprocess.run(
+                ["sudo", "-n", "systemctl", "reboot"],  # noqa: S607 - fixed argv; sudoers-whitelisted
+                check=False, timeout=30,
+            )
+        except (OSError, subprocess.SubprocessError) as exc:
+            log.critical("reboot command could not run: %s — staying up degraded", exc)
+            return False
+        if result.returncode != 0:
+            log.critical(
+                "reboot command failed (exit %s) — check the sudoers rule from "
+                "setup_pi.sh; staying up degraded", result.returncode,
+            )
+            return False
+        return True
 
     #: Persisted across reboots, which is what makes the total bound meaningful --
     #: systemd's own StartLimitBurst counter does NOT survive a reboot, so it can
@@ -905,7 +1160,8 @@ class DeviceRuntime:
     _REBOOT_STATE_PATH = Path("data/.reboot_state.json")
 
     def _reboot_state(self) -> dict:
-        """{"count": int, "last_at": float} — zeros when absent or unreadable.
+        """{"count": int, "last_at": float, "process_restarts": {component: time}}
+        — empty values when absent or unreadable.
 
         An unreadable file reads as "no reboots yet", which is the permissive
         direction; that is safe ONLY because _record_reboot_request must succeed
@@ -914,18 +1170,28 @@ class DeviceRuntime:
         """
         try:
             raw = json.loads(self._REBOOT_STATE_PATH.read_text())
-            return {"count": int(raw.get("count", 0)), "last_at": float(raw.get("last_at", 0.0))}
-        except (OSError, ValueError, TypeError):
-            return {"count": 0, "last_at": 0.0}
+            restarts = raw.get("process_restarts") or {}
+            return {
+                "count": int(raw.get("count", 0)),
+                "last_at": float(raw.get("last_at", 0.0)),
+                "process_restarts": {
+                    str(k): float(v) for k, v in restarts.items()
+                } if isinstance(restarts, dict) else {},
+            }
+        except (OSError, ValueError, TypeError, AttributeError):
+            return {"count": 0, "last_at": 0.0, "process_restarts": {}}
 
     def _record_reboot_request(self, state: dict, now: float) -> bool:
-        """Persist the incremented reboot record. False if it could not be written.
+        """Persist the incremented reboot record. False if it could not be written."""
+        return self._write_reboot_state({**state, "count": state["count"] + 1, "last_at": now})
+
+    def _write_reboot_state(self, payload: dict) -> bool:
+        """Persist the recovery record. False if it could not be written.
 
         Atomic (tmp + fsync + replace) for the same reason core/monitoring_config.py
         is: a half-written record on a device that is about to power-cycle is worse
         than no record, and this file's whole job is to survive that power-cycle.
         """
-        payload = {"count": state["count"] + 1, "last_at": now}
         try:
             self._REBOOT_STATE_PATH.parent.mkdir(parents=True, exist_ok=True)
             tmp = self._REBOOT_STATE_PATH.with_suffix(".json.tmp")
@@ -943,9 +1209,10 @@ class DeviceRuntime:
     def _exit_custom_monitoring(self) -> None:
         """Someone explicitly picked a mode: that always wins over custom rules.
 
-        That includes the zones those rules were drawn for: once the custom
-        configuration is gone the module's own config.yaml zones are correct
-        again, and this is the only place that restoration happens.
+        Zones are reset to the effective zones for the running module: the
+        app's, when it has sent any (they are the device's zones, not the custom
+        configuration's — a crib drawn in the app must keep protecting the baby
+        preset), otherwise the module's own config.yaml zones.
 
         Before this, `_switch_preset` hot-swapped the running module but left
         `self.monitoring` (the saved rules + `overrides_mode`) untouched. That
@@ -964,10 +1231,7 @@ class DeviceRuntime:
             return
         self.monitoring.clear()
         self.rule_engine.replace_rules([])
-        # Restore the module's own zones with the rules they replaced. Without
-        # this the app's polygons would outlive the custom configuration and
-        # quietly shadow every later preset.
-        self.rule_engine.set_zones(self._zones_for_module(self.module_name))
+        self.rule_engine.set_zones(self._effective_zones(self.module_name))
         if self.uplink is not None:
             self.uplink.set_monitoring(self.monitoring.describe())
         log.info("[MONITORING] custom monitoring exited: explicit mode switch")
@@ -1024,16 +1288,25 @@ class DeviceRuntime:
         except Exception as exc:  # noqa: BLE001 - a bad preset must not kill the device
             print(f"SensorDyme: preset switch to '{name}' failed: {exc}")
             return
+        self._push_zones_to(new_module)
         # Exit custom monitoring BEFORE swapping the module, not after: an
         # explicit preset choice always overrides whatever custom rules were
         # running, and the module below must land as STANDARD, never as a
         # STANDARD module with AI_CUSTOM still recorded as the active mode.
-        self._exit_custom_monitoring()
+        try:
+            self._exit_custom_monitoring()
+        except Exception:
+            # The new module never went live; release its graphs (a dropped
+            # MediaPipe graph keeps its threads until close()) and give up.
+            with suppress(Exception):
+                new_module.close()
+            raise
         with self._module_lock:
             old_module = self.module
             self.module, self.module_name, self.active_preset = new_module, new_module_name, name
             self._model_identity = None  # unknown, not the old module's, until verified below
             self.alert_event_types = self.alert_types_for(new_module_name, preset)
+            self._consecutive_process_failures = 0  # the new module starts with a clean slate
         # Same reason as the AI-custom swap: a preset switch changes which module
         # runs, and different modules need different backends. Verified once at
         # boot leaves a device that switches into a detector-needing preset
@@ -1052,16 +1325,24 @@ class DeviceRuntime:
         self.mode = monitoring_mode.resolve(
             monitoring_active=self.monitoring.active, preset_module=new_module_name
         )
-        # Zones belong to the module's config, so a mode switch re-points custom
-        # rules at the new module's polygons instead of the previous mode's.
-        self.rule_engine.set_zones(self._zones_for_module(new_module_name))
-        old_module.close()  # release the old FaceMesh/graph — was leaked before
+        # Re-point custom rules at the zones in force for the new module: the
+        # app's when it has sent any, otherwise the new module's config.yaml.
+        self.rule_engine.set_zones(self._effective_zones(new_module_name))
+        # Release the old FaceMesh/graph (it used to leak). Guarded: the switch
+        # has already happened, and a close() that raised used to skip the
+        # dashboard/uplink updates below, leaving the app showing the old mode.
+        try:
+            old_module.close()
+        except Exception:  # teardown must never raise
+            log.exception("closing the previous module failed; continuing")
         if overrides:
             print(f"SensorDyme: variant '{variant_name}' overrides applied: {overrides}")
         if self.dashboard is not None:
             self.dashboard.set_active_preset(name, new_module_name)
         if self.uplink is not None:
             self.uplink.set_active_preset(name)
+        # The owner's choice survives a restart (see core/device_state.py).
+        device_state.save_preset(name, self.config.get("module"))
         # A mode change is not a detection: no confidence (core/confidence.py).
         switch_event = Event.now("preset_changed", 0.0, None, "system", f"mode -> {name}")
         self.logger.log(switch_event)
@@ -1118,11 +1399,15 @@ class DeviceRuntime:
             # activated rule silently doing nothing for one cycle.
             new_zones = self.uplink.pop_pending_zones()
             if new_zones is not None:
-                zones = load_zones({
-                    z["name"]: {"polygon": z.get("polygon"), "kind": z.get("kind", "restricted")}
-                    for z in new_zones if isinstance(z, dict) and z.get("name")
-                })
+                zones = _zones_from_app(new_zones)
+                self._app_zones = zones
+                device_state.save_zones(new_zones)
                 self.rule_engine.set_zones(zones)
+                # The running module's own zone alerts (crib exit, keep-out,
+                # line) use them too — not only AI-configured rules.
+                with self._module_lock:
+                    module = self.module
+                self._push_zones_to(module)
                 print(f"zones: {len(zones)} area(s) active ({', '.join(z.name for z in zones) or 'none'})")
 
             new_rules = self.uplink.pop_pending_rules()
@@ -1147,6 +1432,10 @@ class DeviceRuntime:
     # ------------------------------------------------------------------ the inference loop
     def _inference_loop(self, stop: threading.Event) -> None:
         last_seq = 0
+        # Each generation of the loop gets its own failure budget. Carried over,
+        # a loop restarted after escalating raised on its very first bad frame.
+        self._consecutive_process_failures = 0
+        last_detector_retry = time.monotonic()  # see _retry_detection_backend
         stream_interval = (
             self.dashboard.stream_interval if self.dashboard is not None else 0.0
         )
@@ -1169,6 +1458,12 @@ class DeviceRuntime:
                 # able to tell "degraded" from "hung", which are different
                 # failures with different fixes.
                 self._heartbeat = time.monotonic()
+                if time.monotonic() - last_detector_retry >= _DETECTOR_RETRY_S:
+                    last_detector_retry = time.monotonic()
+                    try:
+                        self._retry_detection_backend()
+                    except Exception:  # a failed retry must not crash the loop
+                        log.exception("detector retry failed; still DEGRADED")
                 stop.wait(0.5)
                 continue
             frame, seq = self.bus.wait_for_fresh(last_seq, timeout=0.5)
@@ -1200,6 +1495,9 @@ class DeviceRuntime:
             try:
                 events = module.process(frame)
                 self._consecutive_process_failures = 0
+                # Processed-frame cadence, not capture cadence: a stall here is
+                # what makes EventEngine drop in-progress evidence.
+                self.bus.record_processed()
             except Exception as exc:
                 self._consecutive_process_failures += 1
                 log.error(
@@ -1230,9 +1528,12 @@ class DeviceRuntime:
                 events = []
             evidence_due = False
             for event in events:
-                self.logger.log(event)
+                # Alert first, then record. The alert is the product; a log
+                # write that fails (full or read-only SD card) must never be
+                # what stands between a confirmed event and the buzzer.
                 if event.type in self.alert_event_types:
                     self.alert_manager.notify(event)
+                self.logger.log(event)
                 severity = (
                     "loud" if event.type in self.loud_types
                     else "soft" if event.type in self.soft_types or event.type in self.alert_event_types
@@ -1273,14 +1574,8 @@ class DeviceRuntime:
                     model_version=self._model_version(),
                 )
 
-            # Health is sampled here, on the thread that owns the frame bus and
-            # capture service, and handed to the uplink as a snapshot. Sampled at
-            # the uplink's own cadence rather than every frame: reading /proc and
-            # vcgencmd 30 times a second would cost more than it reports.
-            sampled_at = time.monotonic()
-            if self.uplink is not None and sampled_at - self._last_health_sample >= _HEALTH_SAMPLE_S:
-                self._last_health_sample = sampled_at
-                self.uplink.set_health(self._collect_health())
+            # Health for the uplink is sampled by _HealthReportService on its own
+            # thread, so it keeps reporting while this loop is not producing.
 
             snapshot = module.get_telemetry_snapshot()
             if snapshot is not None:
@@ -1450,6 +1745,10 @@ class DeviceRuntime:
             signal.signal(signal.SIGTERM, _request_shutdown)
             signal.signal(signal.SIGINT, _request_shutdown)
 
+        # The "starting" grace counts from when the loop is actually started,
+        # not from __init__ — _build (model warm-up, camera retries) can take
+        # longer than the grace itself.
+        self._heartbeat_reset_at = time.monotonic()
         self.supervisor.start_all()
         self.health.start()
         sdnotify.notify_ready()
@@ -1527,13 +1826,26 @@ class DeviceRuntime:
                 self.dashboard.close()
             self.logger.close()
             self.telemetry.close()
-            with self._module_lock:
-                self.module.close()
-            if self.camera is not None:
-                self.camera.release()
-            from core import detectors
+            # Native teardown only for what nothing is still using. A thread
+            # that outlived its join (a wedged read, a hung NPU call) may still
+            # be inside the module, the detector or the camera, and freeing
+            # them under it turns a hang into a native crash during stop.
+            inference_alive = (
+                self._inference_service is not None and self._inference_service.is_running
+            )
+            capture_alive = self.capture is not None and self.capture.is_running
+            if inference_alive:
+                log.error("inference thread did not stop; leaving the module and detector open")
+            else:
+                with self._module_lock:
+                    self.module.close()
+                from core import detectors
 
-            detectors.release_all()
+                detectors.release_all()
+            if capture_alive:
+                log.error("capture thread did not stop; leaving the camera open")
+            elif self.camera is not None:
+                self.camera.release()
             if self.display:
                 cv2.destroyAllWindows()
             log.info("shutdown complete")

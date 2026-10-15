@@ -5,6 +5,23 @@ set -euo pipefail
 
 cd "$(dirname "${BASH_SOURCE[0]}")"
 
+# The account the service runs as. Raspberry Pi OS Bookworm images have no
+# default `pi` user (the Imager makes you choose a name), and the unit file and
+# sudoers rule used to hardcode `pi` -- on any other name the service could not
+# start and the reboot/btmgmt rules applied to nobody. Override with
+# SENSORDYME_USER=name; otherwise the user who ran this script (via sudo or not).
+SERVICE_USER="${SENSORDYME_USER:-${SUDO_USER:-$(id -un)}}"
+if [ "$SERVICE_USER" = "root" ]; then
+  echo "ERROR: refusing to run the SensorDyme service as root." >&2
+  echo "  Run this as the device's normal user, or set SENSORDYME_USER=<name>." >&2
+  exit 1
+fi
+if ! id "$SERVICE_USER" >/dev/null 2>&1; then
+  echo "ERROR: service user '$SERVICE_USER' does not exist." >&2
+  exit 1
+fi
+echo "==> Service user: $SERVICE_USER"
+
 echo "==> Installing apt packages (picamera2, libcamera, gpio, audio, BLE, mDNS)"
 sudo apt-get update
 sudo apt-get install -y \
@@ -114,7 +131,9 @@ mkdir -p data/reports
 # Wi-Fi provisioning is BLE-based and runs INSIDE the main service now
 # (services/provisioning.py). The legacy hotspot oneshot is only installed when
 # config.yaml says `network.provisioning.method: hotspot`.
-if grep -q "method: hotspot" config.yaml 2>/dev/null; then
+# Matches the live key only: a commented-out "# method: hotspot" must not
+# install a hotspot that competes with in-process BLE provisioning.
+if grep -Eq '^[[:space:]]*method:[[:space:]]*"?hotspot"?([[:space:]]|#|$)' config.yaml 2>/dev/null; then
   echo "==> Installing legacy provisioning hotspot (config method: hotspot)"
   chmod +x scripts/provisioning_hotspot.sh
   sudo tee /etc/systemd/system/sensordyme-provisioning.service > /dev/null <<UNIT
@@ -139,6 +158,14 @@ sudo python3 scripts/publish_mdns.py /etc/avahi/services/sensordyme.service
 sudo systemctl restart avahi-daemon
 
 echo "==> Allowing the device to manage its own Wi-Fi (polkit)"
+# The polkit rule below grants to the netdev group; BlueZ's D-Bus policy lets the
+# bluetooth group register GATT applications. Make sure the service user is in
+# both (no-ops when already a member or when a group does not exist).
+for group in netdev bluetooth; do
+  if getent group "$group" >/dev/null 2>&1; then
+    sudo usermod -aG "$group" "$SERVICE_USER"
+  fi
+done
 # Without this the service runs as `pi` under systemd with no login session, so
 # polkit refuses settings.modify.system and saving a Wi-Fi profile fails with
 # "Insufficient privileges" — the device accepts credentials over Bluetooth and
@@ -147,12 +174,28 @@ sudo install -m 0644 deploy/polkit/10-sensordyme-network.rules \
   /etc/polkit-1/rules.d/10-sensordyme-network.rules
 sudo systemctl restart polkit
 
-echo "==> Allowing the health monitor's last-resort reboot (single sudoers rule)"
-sudo install -m 0440 deploy/sudoers/sensordyme-reboot /etc/sudoers.d/sensordyme-reboot
+echo "==> Allowing the last-resort reboot and BLE advertising (exact sudoers commands)"
+# Rendered for SERVICE_USER and checked BEFORE it goes anywhere near
+# /etc/sudoers.d: one syntax error in a drop-in breaks sudo for every user on
+# the device, including the one who would have to fix it.
+SUDOERS_TMP="$(mktemp)"
+sed "s/__SENSORDYME_USER__/${SERVICE_USER}/g" deploy/sudoers/sensordyme-reboot > "$SUDOERS_TMP"
+if command -v visudo >/dev/null 2>&1; then
+  if ! sudo visudo -cf "$SUDOERS_TMP"; then
+    rm -f "$SUDOERS_TMP"
+    echo "ERROR: the rendered sudoers rule failed visudo -cf; NOT installing it." >&2
+    exit 1
+  fi
+else
+  echo "WARNING: visudo not found; cannot validate the sudoers rule (not on a Pi?)" >&2
+fi
+sudo install -m 0440 "$SUDOERS_TMP" /etc/sudoers.d/sensordyme-reboot
+rm -f "$SUDOERS_TMP"
 
 echo "==> Installing systemd service (Type=notify + watchdog + preflight)"
 sudo cp sensordyme.service /etc/systemd/system/sensordyme.service
-sudo sed -i "s#__SENSORDYME_DIR__#$(pwd)#g" /etc/systemd/system/sensordyme.service
+sudo sed -i "s#__SENSORDYME_DIR__#$(pwd)#g; s#__SENSORDYME_USER__#${SERVICE_USER}#g" \
+  /etc/systemd/system/sensordyme.service
 sudo systemctl daemon-reload
 sudo systemctl enable sensordyme.service
 sudo systemctl restart sensordyme.service

@@ -109,9 +109,29 @@ final class BLEProvisioner: NSObject, ObservableObject {
     /// fixes. Keeping the last good state means the checklist can mark the one
     /// step that broke and leave the completed ones standing.
     @Published private(set) var stateBeforeFailure: State?
+    /// The connected device's own SD- id, from its device-info characteristic
+    /// (0002 `id`) or its status (`device_id`). Setup uses it to find THIS
+    /// device on Wi-Fi afterwards, rather than whichever camera was linked
+    /// before or happened to answer first.
+    @Published private(set) var deviceID: String?
     private var networksCharacteristic: CBCharacteristic?
+    private var deviceInfoCharacteristic: CBCharacteristic?
     private var sendTimeout: Task<Void, Never>?
     private var statusPoll: Task<Void, Never>?
+    private var connectTimeout: Task<Void, Never>?
+    /// Which status answers the outstanding credentials write. See
+    /// `ProvisioningStatus.AttemptTracker`.
+    private var attempts = ProvisioningStatus.AttemptTracker()
+    /// Whether the end of the device's current scan should be followed by one
+    /// more read of the list.
+    ///
+    /// The device starts a fresh scan on every read of the list, and the app
+    /// read the list on every status that said the scan had finished — so each
+    /// read started the scan whose end triggered the next read, and the device's
+    /// radio rescanned without pause for as long as Bluetooth stayed connected,
+    /// through the network join itself. A read asked for (on connect, or a tap)
+    /// earns exactly one follow-up when the scan it started finishes.
+    private var followUpReadWanted = false
 
     private var central: CBCentralManager?
     private var peripheral: CBPeripheral?
@@ -120,10 +140,18 @@ final class BLEProvisioner: NSObject, ObservableObject {
     private var peripheralsByID: [UUID: CBPeripheral] = [:]
 
     func startScan() {
+        // A retry can come while the previous link is still up (a refused
+        // password leaves Bluetooth connected). Close it and drop every
+        // reference to it first: a late callback from the old link would
+        // otherwise clear the NEW connection's characteristics.
+        central?.stopScan()
+        if let peripheral { central?.cancelPeripheralConnection(peripheral) }
+        clearLink()
         state = .scanning
         discovered = []
         networks = []
         peripheralsByID = [:]
+        deviceID = nil
         central = CBCentralManager(delegate: self, queue: .main)
         // Scanning begins in centralManagerDidUpdateState once Bluetooth is powered on.
     }
@@ -131,19 +159,56 @@ final class BLEProvisioner: NSObject, ObservableObject {
     func stop() {
         central?.stopScan()
         if let peripheral { central?.cancelPeripheralConnection(peripheral) }
-        peripheral = nil
-        credsCharacteristic = nil
-        statusCharacteristic = nil
+        clearLink()
         state = .idle
     }
 
+    /// How long a connection attempt may take. CoreBluetooth never times one
+    /// out by itself, so a device that walked out of range left "Pairing…"
+    /// spinning for ever.
+    private static let connectTimeoutSeconds: Double = 20
+
     func connect(id: UUID) {
-        guard let target = peripheralsByID[id] else { return }
+        guard let target = peripheralsByID[id] else {
+            fail("That SensorDyme is no longer in range. Search again.")
+            return
+        }
         let name = discovered.first { $0.id == id }?.name ?? "SensorDyme device"
         state = .connecting(name: name)
         central?.stopScan()
         peripheral = target
         central?.connect(target)
+        connectTimeout?.cancel()
+        connectTimeout = Task { [weak self] in
+            try? await Task.sleep(for: .seconds(Self.connectTimeoutSeconds))
+            guard !Task.isCancelled, let self else { return }
+            guard case .connecting = self.state else { return }
+            if let peripheral = self.peripheral { self.central?.cancelPeripheralConnection(peripheral) }
+            self.clearLink()
+            self.fail("Couldn't connect to \(name). Move closer to it and search again.")
+        }
+    }
+
+    /// Forget everything that belongs to one Bluetooth link.
+    private func clearLink() {
+        peripheral = nil
+        credsCharacteristic = nil
+        statusCharacteristic = nil
+        networksCharacteristic = nil
+        deviceInfoCharacteristic = nil
+        connectTimeout?.cancel(); connectTimeout = nil
+        sendTimeout?.cancel(); sendTimeout = nil
+        statusPoll?.cancel(); statusPoll = nil
+        // Per link: attempt numbers are one device's counter, and the next
+        // connection (perhaps to another device) reads its own baseline.
+        attempts = ProvisioningStatus.AttemptTracker()
+        followUpReadWanted = false
+        scanningNetworks = false
+    }
+
+    /// Whether a callback is about the link this provisioner is using now.
+    private func isCurrent(_ candidate: CBPeripheral) -> Bool {
+        peripheral?.identifier == candidate.identifier
     }
 
     /// Send Wi-Fi credentials to the connected device.
@@ -166,14 +231,8 @@ final class BLEProvisioner: NSObject, ObservableObject {
     /// stayed set, `refreshNetworks()` and `send()` both passed their checks and
     /// then quietly did nothing.
     private func handleDisconnect() {
-        peripheral = nil
-        credsCharacteristic = nil
-        statusCharacteristic = nil
-        networksCharacteristic = nil
-        sendTimeout?.cancel(); sendTimeout = nil
-        statusPoll?.cancel(); statusPoll = nil
+        clearLink()
         networks = []
-        scanningNetworks = false
 
         switch state {
         case .idle, .success, .failed:
@@ -194,6 +253,7 @@ final class BLEProvisioner: NSObject, ObservableObject {
     /// Move to `.failed`, remembering what was in progress.
     private func fail(_ reason: String) {
         if case .failed = state {} else { stateBeforeFailure = state }
+        attempts.finish()
         state = .failed(reason)
     }
 
@@ -222,15 +282,23 @@ final class BLEProvisioner: NSObject, ObservableObject {
     /// empty network list and a button that did nothing: every layer behaved
     /// exactly as written, and none of them said so.
     func refreshNetworks() {
-        guard let peripheral else {
+        guard peripheral != nil else {
             networkProblem = "Not connected to your SensorDyme."
             return
         }
-        guard let characteristic = networksCharacteristic else {
+        guard networksCharacteristic != nil else {
             networkProblem = "This SensorDyme didn't offer a Wi-Fi list. It may need a software update."
             return
         }
         networkProblem = nil
+        // An asked-for read: the scan it starts on the device earns one
+        // follow-up read when it finishes (see `followUpReadWanted`).
+        followUpReadWanted = true
+        readNetworks()
+    }
+
+    private func readNetworks() {
+        guard let peripheral, let characteristic = networksCharacteristic else { return }
         peripheral.readValue(for: characteristic)
     }
 
@@ -242,6 +310,7 @@ final class BLEProvisioner: NSObject, ObservableObject {
             return
         }
         state = .sending
+        attempts.beginWrite(ssid: ssid)
         peripheral.writeValue(payload, for: credsCharacteristic, type: .withResponse)
         startSendTimeout()
         startStatusPolling()
@@ -312,11 +381,28 @@ final class BLEProvisioner: NSObject, ObservableObject {
 extension BLEProvisioner: CBCentralManagerDelegate, CBPeripheralDelegate {
     nonisolated func centralManagerDidUpdateState(_ central: CBCentralManager) {
         Task { @MainActor in
+            guard central === self.central else { return }  // a manager startScan() replaced
             switch central.state {
             case .poweredOn:
+                // Back from off: say so. Leaving `.bluetoothOff` in place kept
+                // setup on "Bluetooth is off" while it was discovering devices.
+                if case .bluetoothOff = self.state { self.state = .scanning }
                 central.scanForPeripherals(withServices: [bleServiceUUID])
             case .unauthorized, .poweredOff:
-                self.state = .bluetoothOff
+                // Off mid-setup ends the link without a disconnect callback.
+                let wasJoining = self.awaitingOutcome
+                self.clearLink()
+                if wasJoining {
+                    // Not "Bluetooth is off" with the setup screen still saying
+                    // "Setting up…": the outcome is unknown, and the device may
+                    // well have joined.
+                    self.fail("Bluetooth was turned off while your SensorDyme was joining. It may have "
+                              + "joined anyway — search again to check before re-entering the password.")
+                } else {
+                    self.state = .bluetoothOff
+                }
+            case .unsupported:
+                self.fail("This phone can't use Bluetooth, which setup needs.")
             default:
                 break
             }
@@ -364,6 +450,7 @@ extension BLEProvisioner: CBCentralManagerDelegate, CBPeripheralDelegate {
 
     nonisolated func centralManager(_ central: CBCentralManager, didConnect peripheral: CBPeripheral) {
         Task { @MainActor in
+            guard self.isCurrent(peripheral) else { return }
             peripheral.delegate = self
             peripheral.discoverServices([bleServiceUUID])
         }
@@ -373,6 +460,8 @@ extension BLEProvisioner: CBCentralManagerDelegate, CBPeripheralDelegate {
         _ central: CBCentralManager, didFailToConnect peripheral: CBPeripheral, error: Error?
     ) {
         Task { @MainActor in
+            guard self.isCurrent(peripheral) else { return }
+            self.clearLink()
             self.fail(error?.localizedDescription ?? "could not connect")
         }
     }
@@ -391,12 +480,21 @@ extension BLEProvisioner: CBCentralManagerDelegate, CBPeripheralDelegate {
     nonisolated func centralManager(
         _ central: CBCentralManager, didDisconnectPeripheral peripheral: CBPeripheral, error: Error?
     ) {
-        Task { @MainActor in self.handleDisconnect() }
+        Task { @MainActor in
+            // Only the link in use. One this provisioner already let go of — a
+            // retry's startScan(), a connect timeout, stop() — has nothing left
+            // to clear, and acting on its late callback failed (or tore down)
+            // the search or connection that replaced it.
+            guard central === self.central, self.isCurrent(peripheral) else { return }
+            self.handleDisconnect()
+        }
     }
 
     nonisolated func peripheral(_ peripheral: CBPeripheral, didDiscoverServices error: Error?) {
         Task { @MainActor in
+            guard self.isCurrent(peripheral) else { return }
             guard let service = peripheral.services?.first(where: { $0.uuid == bleServiceUUID }) else {
+                self.connectTimeout?.cancel()
                 self.fail("device is missing the provisioning service")
                 return
             }
@@ -420,6 +518,8 @@ extension BLEProvisioner: CBCentralManagerDelegate, CBPeripheralDelegate {
         _ peripheral: CBPeripheral, didDiscoverCharacteristicsFor service: CBService, error: Error?
     ) {
         Task { @MainActor in
+            guard self.isCurrent(peripheral) else { return }
+            self.connectTimeout?.cancel()
             for characteristic in service.characteristics ?? [] {
                 switch characteristic.uuid {
                 case bleWifiCredsUUID:
@@ -427,25 +527,57 @@ extension BLEProvisioner: CBCentralManagerDelegate, CBPeripheralDelegate {
                 case bleStatusUUID:
                     self.statusCharacteristic = characteristic
                     peripheral.setNotifyValue(true, for: characteristic)
+                    // Read once now: the attempt number it carries is the
+                    // baseline a later outcome has to beat.
+                    peripheral.readValue(for: characteristic)
                 case bleNetworksUUID:
                     self.networksCharacteristic = characteristic
-                    // Ask immediately: the device scans on read, and the answer
-                    // is wanted the moment the setup form appears.
+                case bleDeviceInfoUUID:
+                    self.deviceInfoCharacteristic = characteristic
                     peripheral.readValue(for: characteristic)
                 default:
                     break
                 }
             }
-            if self.credsCharacteristic != nil {
-                self.state = .ready(name: peripheral.name ?? "SensorDyme device")
+            guard self.credsCharacteristic != nil else {
+                // Without it nothing can be sent, and the flow used to sit on
+                // "Pairing…" for ever.
+                self.fail("This SensorDyme didn't offer Wi-Fi setup over Bluetooth. It may need a software update.")
+                return
             }
+            // Ask immediately: the device scans on read, and the answer is
+            // wanted the moment the setup form appears.
+            self.refreshNetworks()
+            self.state = .ready(name: peripheral.name ?? "SensorDyme device")
         }
     }
 
     nonisolated func peripheral(
         _ peripheral: CBPeripheral, didUpdateValueFor characteristic: CBCharacteristic, error: Error?
     ) {
+        // A failed read leaves `characteristic.value` holding the PREVIOUS
+        // value. Parsing it again replayed an old status (or an old list) as if
+        // it had just arrived. The next poll or notification will bring a real one.
+        if let error {
+            let failedNetworksRead = characteristic.uuid == bleNetworksUUID
+            let reason = error.localizedDescription
+            Task { @MainActor in
+                guard self.isCurrent(peripheral), failedNetworksRead else { return }
+                self.networkProblem = "Couldn't read the device's Wi-Fi list: \(reason)"
+            }
+            return
+        }
         guard let data = characteristic.value else { return }
+
+        if characteristic.uuid == bleDeviceInfoUUID {
+            let info = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any]
+            let id = (info?["id"] as? String).flatMap { $0.uppercased().hasPrefix("SD-") ? $0 : nil }
+            Task { @MainActor in
+                guard self.isCurrent(peripheral), let id else { return }
+                self.deviceID = id
+            }
+            return
+        }
 
         if characteristic.uuid == bleNetworksUUID {
             let parsed = (try? JSONSerialization.jsonObject(with: data)) as? [[String: Any]] ?? []
@@ -457,7 +589,10 @@ extension BLEProvisioner: CBCentralManagerDelegate, CBPeripheralDelegate {
                     secured: entry["secured"] as? Bool ?? true
                 )
             }
-            Task { @MainActor in self.networks = Self.stableOrder(scanned) }
+            Task { @MainActor in
+                guard self.isCurrent(peripheral) else { return }
+                self.networks = Self.stableOrder(scanned)
+            }
             return
         }
 
@@ -465,11 +600,22 @@ extension BLEProvisioner: CBCentralManagerDelegate, CBPeripheralDelegate {
               let status = try? JSONSerialization.jsonObject(with: data) as? [String: Any]
         else { return }
         Task { @MainActor in
+            guard self.isCurrent(peripheral) else { return }
+            if let id = ProvisioningStatus.deviceID(in: status), self.deviceID == nil {
+                self.deviceID = id
+            }
+            let wasScanning = self.scanningNetworks
             self.scanningNetworks = (status["scanning"] as? Bool) ?? false
-            // A scan that just finished has a list waiting to be read.
-            if !self.scanningNetworks { self.refreshNetworks() }
+            // A scan that just FINISHED has a list waiting to be read — but only
+            // once per asked-for read. Reading on every "not scanning" status
+            // restarted the device's scan each time, for ever.
+            if wasScanning, !self.scanningNetworks, self.followUpReadWanted {
+                self.followUpReadWanted = false
+                self.readNetworks()
+            }
 
-            // Only read this as an outcome once one has been asked for.
+            // Only read this as an outcome once one has been asked for, and only
+            // a status that answers THIS write (see AttemptTracker).
             //
             // A device that is already on Wi-Fi reports "online" continuously
             // and truthfully. Treating that as the result of a credential write
@@ -477,7 +623,11 @@ extension BLEProvisioner: CBCentralManagerDelegate, CBPeripheralDelegate {
             // over Bluetooth — jumping from "Connect SensorDyme" straight to
             // "SensorDyme is ready" without ever showing a network or asking
             // for a password.
-            let outcome = ProvisioningStatus.interpret(status, awaitingOutcome: self.awaitingOutcome)
+            guard self.awaitingOutcome else {
+                self.attempts.observeIdle(status)
+                return
+            }
+            let outcome = self.attempts.outcome(for: status)
             // Only a settled answer stops the clock. Cancelling on "connecting"
             // disarmed the deadline at the exact moment the device began the
             // part that can hang, leaving notifications as the only channel —
@@ -493,6 +643,7 @@ extension BLEProvisioner: CBCentralManagerDelegate, CBPeripheralDelegate {
             case .joining:
                 self.state = .deviceConnecting
             case .joined(let ip):
+                self.attempts.finish()
                 self.state = .success(ip: ip)
             case .failed(let reason):
                 self.fail(reason)
@@ -503,8 +654,16 @@ extension BLEProvisioner: CBCentralManagerDelegate, CBPeripheralDelegate {
     nonisolated func peripheral(
         _ peripheral: CBPeripheral, didWriteValueFor characteristic: CBCharacteristic, error: Error?
     ) {
-        if let error {
-            Task { @MainActor in self.fail(error.localizedDescription) }
+        let isCredentials = characteristic.uuid == bleWifiCredsUUID
+        Task { @MainActor in
+            guard self.isCurrent(peripheral) else { return }
+            if let error {
+                self.fail(error.localizedDescription)
+            } else if isCredentials {
+                // The device records the new attempt before it answers the
+                // write, so from here on a status describes this write.
+                self.attempts.acknowledgeWrite()
+            }
         }
     }
 }

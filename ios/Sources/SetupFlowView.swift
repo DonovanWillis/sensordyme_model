@@ -477,7 +477,15 @@ private struct PasswordSheet: View {
 
     private func submit() {
         guard canSubmit else { return }
-        onSubmit(ssid.trimmingCharacters(in: .whitespaces), password)
+        onSubmit(networkName, password)
         password = ""
+    }
+
+    /// The SSID to send, exactly. Spaces are legal at either end of an SSID,
+    /// and trimming a scanned name meant a network whose name ends in a space
+    /// could be picked from the list but never joined. Only a typed name is
+    /// cleaned up, and only of line breaks a paste can bring.
+    private var networkName: String {
+        initialSSID.isEmpty ? ssid.trimmingCharacters(in: .newlines) : initialSSID
     }
 }

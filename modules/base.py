@@ -87,7 +87,7 @@ class VisionModule(ABC):
         """
         return False
 
-    def set_requested_labels(self, labels: set[str]) -> None:
+    def set_requested_labels(self, labels: set[str]) -> None:  # noqa: B027 - optional hook, no-op by default
         """Widen what this module asks the detector for, for AI-configured rules.
 
         Modules narrow their detector call to the classes their own logic needs
@@ -100,6 +100,26 @@ class VisionModule(ABC):
         The runtime calls this whenever the rule set changes. Default is a no-op:
         a module that cannot widen simply keeps its own classes, and the rule is
         reported as unenforceable rather than quietly ignored.
+        """
+
+    def set_zones(self, zones: list) -> None:  # noqa: B027 - deliberate no-op default
+        """Replace this module's zones with the ones the user drew in the app.
+
+        `zones` is a list of core.zones.Zone, exactly as core.zones.load_zones()
+        returns it. An empty list means the user has no zones, so every zone
+        rule is removed. Without this hook the app's polygons reached only the
+        AI-rule engine: a crib drawn as "Stay inside" never raised
+        safe_zone_exit, and baby_monitoring's infant identification never got
+        its crib.
+
+        Implementations replace their zone rules in place. They do not rebuild
+        the module or touch state unrelated to zones (timers, trackers,
+        calibration). Engine state belonging to a removed or redrawn zone is
+        dropped so nothing stays latched. A zone whose name, kind and polygon
+        are unchanged keeps its in-progress state, so re-sending the same zones
+        is a no-op.
+
+        Default is a no-op, for modules that have no zone concept.
         """
 
     def get_detections(self) -> Optional["DetectionFrame"]:
@@ -136,7 +156,7 @@ class VisionModule(ABC):
         """
         return None
 
-    def close(self) -> None:
+    def close(self) -> None:  # noqa: B027 - optional hook, no-op by default
         """Release module-held resources (models, mediapipe graphs, device handles).
 
         Called on shutdown and before a preset hot-swap replaces this module,
@@ -224,24 +244,72 @@ class GracedConditionTracker:
     detection latency does not change; only noise's power to restart the clock
     does. Mirrors what EventEngine's occlusion_grace_s already does for the
     module lifecycle path; this is the same idea for the in-module trackers.
+
+    Two opt-in options, for a condition whose False frames can be REAL rather
+    than noise (eye closure: the eye genuinely reopens between blinks):
+
+      * `release_frames`: release after this many consecutive False updates
+        (bridging at most `release_frames` frames) instead of after
+        `release_s` seconds. A landmark glitch is a frame or two at any frame
+        rate; 0.4s is 12 frames at 30fps -- long enough to bridge an eye that
+        really did reopen between two blinks.
+      * `count_true_time_only`: the sustained duration is the time the
+        condition was actually True (sample-and-hold: each True update owns
+        the interval until the next update), so bridged False frames pause the
+        clock instead of counting toward `sustain_s`. Without it a flurry of
+        short blinks with brief openings reads as one continuous closure.
+
+    Both default off, preserving the original semantics for every other user.
     """
 
-    def __init__(self, sustain_s: float, release_s: float = 0.4) -> None:
+    def __init__(
+        self,
+        sustain_s: float,
+        release_s: float = 0.4,
+        *,
+        release_frames: Optional[int] = None,
+        count_true_time_only: bool = False,
+    ) -> None:
         self._sustain_s = sustain_s
         self._release_s = release_s
+        self._release_frames = None if release_frames is None else max(0, int(release_frames))
+        self._count_true_only = bool(count_true_time_only)
         self._start: Optional[float] = None
         self._fired = False
         self._false_since: Optional[float] = None
+        self._false_frames = 0
+        self._true_time = 0.0
+        self._last_update: Optional[tuple[float, bool]] = None
+
+    def _reset(self) -> None:
+        self._start = None
+        self._fired = False
+        self._false_since = None
+        self._false_frames = 0
+        self._true_time = 0.0
 
     def update(self, condition: bool, now: float) -> Optional[float]:
         """Advance with this frame's condition. Returns the sustained duration
         the first moment `sustain_s` is crossed, else None (same contract as
         SustainedConditionTracker)."""
+        previous = self._last_update
+        self._last_update = (now, condition)
+        if (
+            self._count_true_only
+            and self._start is not None
+            and previous is not None
+            and previous[1]
+            and now > previous[0]
+        ):
+            self._true_time += now - previous[0]
+
         if condition:
             self._false_since = None
+            self._false_frames = 0
             if self._start is None:
                 self._start = now
-            elapsed = now - self._start
+                self._true_time = 0.0
+            elapsed = self._true_time if self._count_true_only else now - self._start
             if elapsed >= self._sustain_s and not self._fired:
                 self._fired = True
                 return elapsed
@@ -251,23 +319,34 @@ class GracedConditionTracker:
             return None
         if self._false_since is None:
             self._false_since = now
-        if now - self._false_since >= self._release_s:
-            self._start = None
-            self._fired = False
-            self._false_since = None
+        self._false_frames += 1
+        if self._release_frames is not None:
+            released = self._false_frames > self._release_frames
+        else:
+            released = now - self._false_since >= self._release_s
+        if released:
+            self._reset()
         return None
 
     @property
     def is_active(self) -> bool:
-        """True from firing until the condition has been clear for `release_s`."""
+        """True from firing until the condition has been clear for the release grace."""
         return self._fired
 
     def elapsed(self, now: float) -> float:
-        """Seconds the current episode has been running, 0.0 if none is in progress.
+        """Seconds the current episode has been running (or, with
+        `count_true_time_only`, has been True), 0.0 if none is in progress.
 
         For debug/observability only -- see SustainedConditionTracker.elapsed.
         """
-        return now - self._start if self._start is not None else 0.0
+        if self._start is None:
+            return 0.0
+        if self._count_true_only:
+            pending = 0.0
+            if self._last_update is not None and self._last_update[1] and now > self._last_update[0]:
+                pending = now - self._last_update[0]
+            return self._true_time + pending
+        return now - self._start
 
 
 class CorroboratedGraceTracker:

@@ -138,7 +138,7 @@ def test_a_baby_that_stops_being_detected_raises_person_absent_by_default():
     even registered, so the default and play_area presets raised ZERO events
     for ten minutes of a baby that had simply vanished from the frame."""
     module = _module(absence_warning_s=2.0)
-    events, _ = _run(module, [IN_CRIB], 0.05, 1.0)
+    _events, _ = _run(module, [IN_CRIB], 0.05, 1.0)
     events2, _ = _run(module, [], 0.0, 5.0, start=1.0)
     assert "person_absent" in [e.type for e in events2]
 

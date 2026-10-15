@@ -112,6 +112,32 @@ class BackendUnavailable(SystemExit):
         super().__init__(EXIT_CANNOT_RUN)
 
 
+#: Largest fraction of the sample that may be unreadable before the run is
+#: declared unable to measure anything. A sample whose images are missing (the
+#: manifest survived but data/state_farm/train/ did not) scores every metric as
+#: 0.0, which used to be reported as a four-metric REGRESSION (exit 1).
+MAX_SKIPPED_FRACTION = 0.05
+
+
+def sample_problem(scored: dict, requested: int) -> Optional[str]:
+    """Why a scored sample cannot support a measurement, or None if it can."""
+    scored_n = sum(s["n"] for s in scored["per_class"].values())
+    if requested == 0 or scored_n == 0:
+        return (
+            f"no image in the {requested}-image sample could be read (looked under "
+            f"{DATA_ROOT / 'train'}). The manifest exists but the images do not — re-run "
+            f"scripts/prepare_state_farm.py. (exit {EXIT_CANNOT_RUN} = could not run, NOT a regression)"
+        )
+    skipped_fraction = scored["skipped"] / requested
+    if skipped_fraction > MAX_SKIPPED_FRACTION:
+        return (
+            f"{scored['skipped']}/{requested} sampled images ({skipped_fraction:.0%}) could not be "
+            f"read — more than the {MAX_SKIPPED_FRACTION:.0%} a comparable measurement tolerates. "
+            f"(exit {EXIT_CANNOT_RUN} = could not run, NOT a regression)"
+        )
+    return None
+
+
 def load_sample(per_class: int, seed: int, split: str = "val") -> list[dict]:
     """Deterministic per-class sample from the subject-disjoint manifest.
 
@@ -131,7 +157,7 @@ def load_sample(per_class: int, seed: int, split: str = "val") -> list[dict]:
     for row in rows:
         by_class.setdefault(row["classname"], []).append(row)
 
-    rng = random.Random(seed)
+    rng = random.Random(seed)  # noqa: S311 - seeded, reproducible sampling; not crypto
     sample: list[dict] = []
     for name in sorted(by_class):
         pool = by_class[name]
@@ -178,7 +204,15 @@ def _load_detector(backend: str = "auto") -> tuple[object, str]:
     else:
         accel.configure(config.get("accelerator", {}))
 
-    model = get_yolo_model(weights)
+    try:
+        model = get_yolo_model(weights)
+    except Exception as exc:  # no backend / weights download failed: cannot run (re-raised)
+        # An exception escaping here used to exit 1 with a traceback — the
+        # REGRESSION code — for what is a "could not run" condition.
+        raise BackendUnavailable(
+            f"could not load the detector '{weights}': {exc}\n"
+            f"(exit {EXIT_CANNOT_RUN} = could not run, NOT a regression)"
+        ) from exc
     actual = "hailo" if type(model).__name__ == "HailoYOLO" else "cpu"
     if backend == "hailo" and actual != "hailo":
         # Refuse rather than silently mislabel. Publishing CPU numbers under a
@@ -199,16 +233,27 @@ def score_sample(sample: list[dict], sweep: tuple[float, ...], quiet: bool = Fal
     full sweep costs the same as a single threshold -- which is what makes the PR
     curve cheap enough to run in CI.
     """
-    import mediapipe as mp
-
     yolo, backend_used = _load_detector(backend)
     names = yolo.names
-    phone_id = next(k for k, v in names.items() if v == "cell phone")
-    person_id = next(k for k, v in names.items() if v == "person")
+    try:
+        phone_id = next(k for k, v in names.items() if v == "cell phone")
+        person_id = next(k for k, v in names.items() if v == "person")
+    except StopIteration as exc:
+        raise BackendUnavailable(
+            "the loaded detector has no 'cell phone'/'person' class — not a COCO detector, "
+            f"cannot measure (exit {EXIT_CANNOT_RUN})"
+        ) from exc
 
-    face_mesh = mp.solutions.face_mesh.FaceMesh(
-        max_num_faces=1, refine_landmarks=True, min_detection_confidence=0.5
-    )
+    try:
+        import mediapipe as mp
+
+        face_mesh = mp.solutions.face_mesh.FaceMesh(
+            max_num_faces=1, refine_landmarks=True, min_detection_confidence=0.5
+        )
+    except Exception as exc:  # import/graph failure is "cannot run", not a regression (re-raised)
+        raise BackendUnavailable(
+            f"MediaPipe FaceMesh is unavailable: {exc}\n(exit {EXIT_CANNOT_RUN} = could not run, NOT a regression)"
+        ) from exc
 
     floor = min(sweep)
     per_class: dict[str, dict] = {}
@@ -249,6 +294,9 @@ def score_sample(sample: list[dict], sweep: tuple[float, ...], quiet: bool = Fal
 
     return {
         "backend": backend_used,
+        # The file that actually ran (the .hef on the Hailo path), not the .pt
+        # name that is only a cache key there.
+        "detector": str(getattr(yolo, "model_name", None) or "unknown"),
         "per_class": per_class,
         "skipped": skipped,
         "elapsed_s": round(time.perf_counter() - started, 1),
@@ -429,17 +477,65 @@ def print_report(summary: dict, shipped_conf: float) -> None:
     print("=" * 74)
 
 
+def _curve_row(curve: list[dict], conf: float) -> Optional[dict]:
+    """The operating-curve row at exactly `conf`, or None if it was not swept."""
+    return next((row for row in curve if abs(row["conf"] - conf) < 1e-9), None)
+
+
+def baseline_conf(payload: dict) -> float:
+    """The threshold the baseline's phone recall was measured at."""
+    conf = payload.get("shipped_conf")
+    if conf is None:
+        conf = payload["summary"]["phone_at_shipped_conf"]["conf"]
+    return float(conf)
+
+
 def compare(summary: dict, baseline_path: Path, tolerance: float) -> int:
-    """Regression gate: fail if a headline metric dropped by more than `tolerance`."""
-    baseline = json.loads(baseline_path.read_text())["summary"]
+    """Regression gate: fail if a headline metric dropped by more than `tolerance`.
+
+    Phone recall is compared at ONE threshold — the one the baseline was
+    measured at — never "current shipped conf" against "baseline shipped conf".
+    Recall only rises as the threshold falls, so comparing across a threshold
+    change (baseline 0.35, config now 0.20) let a model that lost 20 points of
+    recall at a fixed threshold pass as "improved".
+
+    Returns EXIT_CANNOT_RUN (not a regression) when the two runs cannot be
+    compared: the baseline's threshold was not swept, or the baseline records
+    a different detector backend than this run used.
+    """
+    payload = json.loads(baseline_path.read_text())
+    baseline = payload["summary"]
+    conf = baseline_conf(payload)
+    now_row = _curve_row(summary["phone_curve"], conf)
+    was_row = _curve_row(baseline.get("phone_curve", []), conf) or baseline["phone_at_shipped_conf"]
+    if now_row is None:
+        print(
+            f"cannot compare: this run did not sweep the baseline's phone threshold {conf:.2f} "
+            f"(exit {EXIT_CANNOT_RUN} = could not run, NOT a regression)",
+            file=sys.stderr,
+        )
+        return EXIT_CANNOT_RUN
+    was_backend = payload.get("backend") or baseline.get("backend")
+    now_backend = summary.get("backend")
+    if was_backend and now_backend and was_backend != now_backend:
+        print(
+            f"cannot compare: the baseline was measured on the {was_backend!r} backend and this run "
+            f"used {now_backend!r} — different detectors, not a regression signal. Write a baseline "
+            f"for this backend with --baseline. (exit {EXIT_CANNOT_RUN})",
+            file=sys.stderr,
+        )
+        return EXIT_CANNOT_RUN
+    if not was_backend:
+        print("note: the baseline does not record its backend; assuming it matches this run "
+              f"({now_backend!r}).")
+    current_conf = summary["phone_at_shipped_conf"]["conf"]
+    if abs(current_conf - conf) > 1e-9:
+        print(f"note: config now ships conf={current_conf:.2f}; phone recall is compared at the "
+              f"baseline's conf={conf:.2f} so a threshold change cannot mask a model change.")
     checks = [
         ("face_availability", summary["face_availability"], baseline["face_availability"]),
         ("person_availability", summary["person_availability"], baseline["person_availability"]),
-        (
-            "phone_recall_at_shipped",
-            summary["phone_at_shipped_conf"]["recall"],
-            baseline["phone_at_shipped_conf"]["recall"],
-        ),
+        (f"phone_recall_at_{conf:.2f}", now_row["recall"], was_row["recall"]),
         ("phone_best_f1", summary["phone_best_f1"]["f1"], baseline["phone_best_f1"]["f1"]),
     ]
     print("\nREGRESSION CHECK vs", baseline_path)
@@ -491,7 +587,12 @@ def main(argv: Optional[list[str]] = None) -> int:
             config.get("modules", {}).get("driver_attention", {}).get("yolo_confidence_threshold", 0.35)
         )
 
-    sweep = tuple(sorted(set(DEFAULT_SWEEP) | {shipped_conf}))
+    sweep_points = set(DEFAULT_SWEEP) | {shipped_conf}
+    if args.compare and args.compare.exists():
+        # compare() measures phone recall at the BASELINE's threshold, so that
+        # threshold must be on this run's curve even if config has moved on.
+        sweep_points.add(baseline_conf(json.loads(args.compare.read_text())))
+    sweep = tuple(sorted(sweep_points))
 
     sample = load_sample(args.per_class, args.seed, args.split)
     if not args.quiet:
@@ -500,6 +601,10 @@ def main(argv: Optional[list[str]] = None) -> int:
               f"{args.split} split; subjects: {', '.join(subjects)}")
 
     scored = score_sample(sample, sweep, quiet=args.quiet, backend=args.backend)
+    problem = sample_problem(scored, len(sample))
+    if problem is not None:
+        print(problem, file=sys.stderr)
+        return EXIT_CANNOT_RUN
     summary = summarise(scored, sweep, shipped_conf)
     summary["backend"] = scored["backend"]
     print_report(summary, shipped_conf)
@@ -512,7 +617,7 @@ def main(argv: Optional[list[str]] = None) -> int:
         "seed": args.seed,
         "shipped_conf": shipped_conf,
         "backend": scored["backend"],
-        "models": {"detector": "yolo11n.pt", "face": "mediapipe face_mesh (refine_landmarks)"},
+        "models": {"detector": scored["detector"], "face": "mediapipe face_mesh (refine_landmarks)"},
         "summary": summary,
     }
 

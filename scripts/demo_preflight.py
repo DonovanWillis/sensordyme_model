@@ -257,13 +257,25 @@ def run(host: str, port: int) -> Report:
     inferences = accel_metrics.get("inferences") or 0
     last_s = accel_metrics.get("last_inference_s")
     npu_live = inferences > 0 and last_s is not None and last_s < 10.0
-    report.add(
-        "NPU actually inferring", npu_live,
-        f"{inferences} inferences"
-        + (f", last {last_s}s ago" if last_s is not None else ", none ever"),
-        "the accelerator is present but nothing is running on it — this is the "
-        "difference between a seated HAT and a working one",
-    )
+    active_module = _running_module(config, device)
+    if not _module_uses_a_detector(config, active_module):
+        # fall_detection is MediaPipe Pose only: zero NPU inferences is correct
+        # there, by design (device_health's `detector_required`, and the same
+        # exemption demo_cycle.sh makes). Failing it reported a healthy pose
+        # device as DEMO NOT READY.
+        report.add(
+            "NPU actually inferring", True,
+            f"not applicable — '{active_module}' runs no object detector "
+            f"({inferences} inferences)",
+        )
+    else:
+        report.add(
+            "NPU actually inferring", npu_live,
+            f"{inferences} inferences"
+            + (f", last {last_s}s ago" if last_s is not None else ", none ever"),
+            "the accelerator is present but nothing is running on it — this is the "
+            "difference between a seated HAT and a working one",
+        )
 
     # ---- 5 / 6. the model, by hash, not by filename -------------------------
     accel_cfg = config.get("accelerator", {}) or {}
@@ -492,6 +504,39 @@ def run(host: str, port: int) -> Report:
             warn_only=True,
         )
     return report
+
+
+#: Config keys that name an object detector's weights. The same tuple
+#: services/runtime.py's `_WEIGHTS_KEYS` uses for `detector_required`, so this
+#: gate and the device's own health report agree on which modules need the NPU.
+_WEIGHTS_KEYS = ("yolo_weights", "model_weights", "phone_weights", "detector_weights")
+
+
+def _running_module(config: dict, device: dict) -> str:
+    """The module the device says it is running, else the configured one.
+
+    /api/health's inference detail reads "analysing (<module>)" while
+    monitoring; when degraded it carries the reason instead, and config.yaml's
+    `module` is the best remaining answer.
+    """
+    detail = str((device.get("inference") or {}).get("detail") or "")
+    modules = (config.get("modules") or {}) if isinstance(config.get("modules"), dict) else {}
+    named = [name for name in modules if f"({name})" in detail]
+    if named:
+        return max(named, key=len)  # "driver_attention_openpilot" over "driver_attention"
+    return str(config.get("module") or "")
+
+
+def _module_uses_a_detector(config: dict, module_name: str) -> bool:
+    """Whether `module_name` runs the object detector (and so the NPU).
+
+    Unknown modules are assumed to need it: the NPU check must fail closed.
+    """
+    modules = config.get("modules") if isinstance(config.get("modules"), dict) else {}
+    module_cfg = modules.get(module_name) if module_name else None
+    if not isinstance(module_cfg, dict):
+        return True
+    return any(module_cfg.get(key) for key in _WEIGHTS_KEYS)
 
 
 def _override_state() -> str:

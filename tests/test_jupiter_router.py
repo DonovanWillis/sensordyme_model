@@ -41,7 +41,7 @@ class TestBuiltInDefaults:
             assert "opus" not in config["model"].lower()
 
     def test_unknown_role_is_rejected(self):
-        with pytest.raises(ValueError):
+        with pytest.raises(ValueError, match="unknown Jupiter role 'vision'"):
             role_config("vision")
 
 

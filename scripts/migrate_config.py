@@ -38,20 +38,20 @@ MIGRATIONS: list[tuple[str, str, str]] = [
     (
         "network.provisioning.reconfigure_window_s",
         "    reconfigure_window_s: 300",
-        "keep Bluetooth open this long after boot even when Wi-Fi is fine, so a"
-        " device can be moved to a new network without being taken offline first",
+        ("keep Bluetooth open this long after boot even when Wi-Fi is fine, so a"
+         " device can be moved to a new network without being taken offline first"),
     ),
     (
         "cloud.ca_cert_path",
         '  ca_cert_path: ""',
-        "opt-in TLS: path to a self-signed cert's PEM file to trust for cloud.base_url,"
-        " or leave empty. Off (empty) is identical to not having this key at all.",
+        ("opt-in TLS: path to a self-signed cert's PEM file to trust for cloud.base_url,"
+         " or leave empty. Off (empty) is identical to not having this key at all."),
     ),
     (
         "cloud.tls_insecure_skip_verify",
         "  tls_insecure_skip_verify: false",
-        "opt-in TLS: skips certificate verification entirely when true -- genuinely"
-        " insecure, dev-only. See config.yaml's fuller comment on this key.",
+        ("opt-in TLS: skips certificate verification entirely when true -- genuinely"
+         " insecure, dev-only. See config.yaml's fuller comment on this key."),
     ),
 ]
 
@@ -68,8 +68,8 @@ MIGRATIONS: list[tuple[str, str, str]] = [
 # rest of this script.
 LIST_MIGRATIONS: list[tuple[str, str, str]] = [
     ("alerts.loud_types", "unusual_stillness",
-     "baby/elderly presets' alert type was never in loud_types, so it could never produce a phone"
-     " notification (severity defaulted to soft) -- see config.yaml's fuller comment"),
+     ("baby/elderly presets' alert type was never in loud_types, so it could never produce a phone"
+      " notification (severity defaulted to soft) -- see config.yaml's fuller comment")),
     ("alerts.loud_types", "person_absent",
      "same gap as unusual_stillness above"),
     ("alerts.loud_types", "flailing",
@@ -92,9 +92,9 @@ LIST_MIGRATIONS: list[tuple[str, str, str]] = [
     # tests/test_phase1_config_invariant.py now checks this list against
     # presets.yaml directly, so a sixth cannot go missing the same way.
     ("alerts.loud_types", "fall",
-     "elderly_monitoring's PRIMARY alert. Absent here, a deployed device tagged a real fall"
-     " severity=soft and the cloud gate dropped the push and the SMS -- red screen, buzzer,"
-     " nobody told"),
+     ("elderly_monitoring's PRIMARY alert. Absent here, a deployed device tagged a real fall"
+      " severity=soft and the cloud gate dropped the push and the SMS -- red screen, buzzer,"
+      " nobody told")),
     ("alerts.loud_types", "zone_violation",
      "elderly/baby/security all declare it; same silent-soft gap as fall"),
     ("alerts.loud_types", "safe_zone_exit",
@@ -103,6 +103,17 @@ LIST_MIGRATIONS: list[tuple[str, str, str]] = [
      "baby_monitoring's alert type; same silent-soft gap as fall"),
     ("alerts.loud_types", "crowd",
      "security_monitoring's alert type; same silent-soft gap as fall"),
+    # Driver Safety declares no `alert_types` in presets.yaml -- it uses
+    # main.ALERT_EVENT_TYPES_PI -- so the preset-based invariant test could not
+    # see these two. The repo made them loud on 2026-08-11 (config.yaml's own
+    # comment on `distraction` describes the bug: soft, so never pushed), and
+    # a unit deployed from the 08-05..08-07 configs never received either.
+    ("alerts.loud_types", "distraction",
+     "driver_safety's sustained sideways look-away: was soft on deployed units, so never pushed"),
+    ("alerts.loud_types", "eyes_up",
+     "driver_safety's sustained look-up; same gap as distraction"),
+    ("alerts.loud_types", "infant_unidentified",
+     "baby_monitoring's 'choking-hazard scoring paused' alert; soft would never push"),
 ]
 
 
@@ -221,15 +232,32 @@ def _list_contains_member(lines: list[str], open_idx: int, close_idx: int, membe
     return re.search(rf"(?<![\w]){re.escape(member)}(?![\w])", code) is not None
 
 
+def _last_code_char(lines: list[str], start: int, stop: int) -> tuple[int, str] | None:
+    """(line index, character) of the last non-blank code character in
+    lines[start:stop], comments excluded; None if there is none."""
+    for i in range(stop - 1, start - 1, -1):
+        code = lines[i].split("#", 1)[0].rstrip()
+        if code:
+            return i, code[-1]
+    return None
+
+
 def append_list_member(lines: list[str], dotted: str, member: str) -> bool:
     """Add `member` to an existing flow-sequence value if it isn't already
     present anywhere in it. Returns whether a change was made.
 
-    Inserted as its own new line, immediately before the closing bracket's
-    line, rather than editing that line's existing text in place -- a flow
-    sequence does not care which physical line an item sits on, and this
-    sidesteps needing to parse past whatever trailing comment already sits
-    on the closing-bracket line.
+    Multi-line sequences get the member as its own new line, immediately
+    before the closing bracket's line -- a flow sequence does not care which
+    physical line an item sits on, and this sidesteps parsing past whatever
+    trailing comment already sits on the closing-bracket line. The item before
+    the insertion point must end with a comma or the two would fold into one
+    scalar ("b" + "fall," -> "b fall"), so one is added when it is missing.
+
+    A one-line sequence (`loud_types: [a, b]`) is edited in place. Inserting a
+    new line "before the closing bracket's line" there meant inserting it
+    above the KEY, outside the list: the next key's value absorbed it, or the
+    file stopped parsing -- and a device whose config does not parse does not
+    boot.
     """
     span = _list_span(lines, dotted)
     if span is None:
@@ -238,14 +266,37 @@ def append_list_member(lines: list[str], dotted: str, member: str) -> bool:
     open_idx, close_idx = span
     if _list_contains_member(lines, open_idx, close_idx, member):
         return False
+
+    if close_idx == open_idx:
+        line = lines[open_idx]
+        newline = "\n" if line.endswith("\n") else ""
+        body = line[: len(line) - len(newline)]
+        code, hash_, comment = body.partition("#")
+        close = code.rfind("]")
+        head = code[:close].rstrip()
+        separator = "" if head.endswith("[") else (" " if head.endswith(",") else ", ")
+        lines[open_idx] = head + separator + member + code[close:] + hash_ + comment + newline
+        return True
+
     # Indent new items to match the sequence's own continuation style: the
-    # line right after the opening one, if the sequence is multi-line;
-    # otherwise two spaces deeper than the key itself.
-    if close_idx > open_idx:
-        template = lines[open_idx + 1]
-        indent = template[: _indent_of(template)]
-    else:
-        indent = " " * (_indent_of(lines[open_idx]) + 2)
+    # first code line after the opening one -- deeper than the key, or YAML
+    # would read it as leaving the mapping -- else two spaces deeper than the key.
+    key_indent = _indent_of(lines[open_idx])
+    indent = " " * (key_indent + 2)
+    for template in lines[open_idx + 1 : close_idx + 1]:
+        if template.split("#", 1)[0].strip():
+            if _indent_of(template) > key_indent:
+                indent = template[: _indent_of(template)]
+            break
+
+    last = _last_code_char(lines, open_idx, close_idx)
+    if last is not None and last[1] not in ",[":
+        index = last[0]
+        line = lines[index]
+        newline = "\n" if line.endswith("\n") else ""
+        code, hash_, comment = line[: len(line) - len(newline)].partition("#")
+        stripped = code.rstrip()
+        lines[index] = stripped + "," + code[len(stripped):] + hash_ + comment + newline
     lines.insert(close_idx, f"{indent}{member},\n")
     return True
 
@@ -272,7 +323,7 @@ def migrate(path: Path) -> list[str]:
         if append_list_member(lines, dotted, member):
             added.append(f"{dotted}+={member}")
     if added:
-        stamp = datetime.now().strftime("%Y%m%d-%H%M%S")
+        stamp = datetime.now().strftime("%Y%m%d-%H%M%S")  # noqa: DTZ005 - local wall-clock stamp for a backup filename
         shutil.copy2(path, path.with_suffix(f".yaml.bak-{stamp}"))
         path.write_text("".join(lines))
     return added

@@ -15,6 +15,9 @@ struct DeviceLinkBanner: View {
     /// rather than guessing at the device's state from Bonjour alone.
     var backendDevice: Device?
     var backendReachable: Bool = true
+    /// Whether the account has devices at all — with no `backendDevice`, the
+    /// difference between "none on the account" and "can't tell which".
+    var accountHasDevices: Bool = false
 
     var body: some View {
         switch link.state {
@@ -52,6 +55,7 @@ struct DeviceLinkBanner: View {
                 )
             },
             backendReachable: backendReachable,
+            accountHasDevices: accountHasDevices,
             now: Date()
         )
         row(

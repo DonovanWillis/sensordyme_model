@@ -89,7 +89,8 @@ def throttling() -> dict:
 
     try:
         result = subprocess.run(
-            ["vcgencmd", "get_throttled"], capture_output=True, text=True, timeout=5
+            ["vcgencmd", "get_throttled"],  # noqa: S607 - fixed argv; vcgencmd from PATH, absent off-Pi
+            capture_output=True, text=True, timeout=5, check=False,
         )
         raw = result.stdout.strip().split("=")[-1]
         bits = int(raw, 16)

@@ -22,6 +22,7 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import hmac
+import ipaddress
 import json
 import logging
 import math
@@ -29,10 +30,11 @@ import os
 import re
 import secrets
 import sqlite3
+import threading
 import time
 from contextlib import asynccontextmanager, contextmanager, suppress
 from pathlib import Path
-from typing import Optional
+from typing import Any, Optional
 
 import jwt
 from fastapi import BackgroundTasks, Depends, FastAPI, Header, HTTPException, Request
@@ -45,8 +47,11 @@ from cloud.notify import COOLDOWN_S as NOTIFY_COOLDOWN_S
 from cloud.notify import gate
 from cloud.ratelimit import (
     AI_CONCURRENCY,
+    AI_GLOBAL_CONCURRENCY,
+    AI_GLOBAL_KEY,
     AI_RATE_LIMITER,
     CLAIM_LIMITER,
+    LOGIN_FAILURE_LIMITER,
     LOGIN_LIMITER,
     SIGNUP_LIMITER,
 )
@@ -283,6 +288,21 @@ async def _unencodable(_request: Request, _exc: UnicodeEncodeError) -> JSONRespo
     return JSONResponse(status_code=400, content={"detail": "text is not valid Unicode"})
 
 
+@app.exception_handler(sqlite3.OperationalError)
+async def _storage_unavailable(_request: Request, exc: sqlite3.OperationalError) -> JSONResponse:
+    """A full disk, an I/O error or a lock held past BUSY_TIMEOUT_S: the
+    request was fine and the server could not store it right now.
+
+    503, not 500 and never a 4xx: core/uplink.py re-queues a batch on any
+    non-4xx answer and drops it on most 4xx ones, so this is the status that
+    keeps a device's events instead of discarding them. The transaction this
+    happened in was never committed (`db()` commits only on a clean exit), so
+    nothing half-written is left behind for the retry to collide with.
+    """
+    log.error("storage unavailable: %s", exc)
+    return JSONResponse(status_code=503, content={"detail": "storage temporarily unavailable"})
+
+
 # ------------------------------------------------------------------------- storage
 #: How long a statement waits for a write lock before giving up.
 #:
@@ -450,6 +470,18 @@ def init_db() -> None:
             # detection module underneath a live camera. Previews land here;
             # only set_preset (Activate) promotes a draft into `ai_rules`.
             "ALTER TABLE devices ADD COLUMN ai_rules_draft TEXT",
+            # How many times AI Custom has been activated on this device. Mixed
+            # into the rules fingerprint (see _rules_version) so activating the
+            # SAME rules again is still a delivery: a device that left custom
+            # monitoring for a named preset keeps reporting the old version
+            # (core/uplink.py never resets it), so an unchanged rule set used to
+            # match and nothing was sent -- the app said AI Custom, the device
+            # stayed in the preset.
+            "ALTER TABLE devices ADD COLUMN ai_rules_activation INTEGER DEFAULT 0",
+            # The draft_version that produced the current `ai_rules`, so a
+            # retried Activate of the proposal already running is recognised
+            # rather than refused as stale (see set_preset).
+            "ALTER TABLE devices ADD COLUMN ai_rules_promoted_from TEXT",
         ):
             try:
                 conn.execute(statement)
@@ -474,6 +506,9 @@ def init_db() -> None:
             "CREATE UNIQUE INDEX IF NOT EXISTS idx_events_dedup "
             "ON events(device_id, event_key) WHERE event_key IS NOT NULL"
         )
+        # For retention (see _prune_events): an age cut-off without this is a
+        # full scan of the largest table, on a write transaction.
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_events_received ON events(received_at)")
 
 
 init_db()
@@ -491,9 +526,24 @@ def _hash_pw(password: str, salt: str) -> str:
 _NO_SUCH_USER_SALT = secrets.token_hex(16)
 
 
-def _issue_token(user_id: int) -> str:
+def _issue_token(user_id: int, email: str) -> str:
+    """A session for `user_id`, bound to the account's email.
+
+    `uid` alone is a row number, and row numbers are not identities across
+    databases: replace the database while keeping the signing key (a Fly
+    import over a deployment someone already signed in to, or a local
+    `cloud/sensordyme.db` lost while `.jwt_secret` survived) and every live
+    token silently became whoever holds that row number in the new file --
+    full access to a stranger's cameras. `current_token` checks the email
+    against the row, so such a token is refused instead.
+    """
     return jwt.encode(
-        {"uid": user_id, "exp": int(time.time()) + JWT_TTL_S, "jti": secrets.token_hex(16)},
+        {
+            "uid": user_id,
+            "email": email,
+            "exp": int(time.time()) + JWT_TTL_S,
+            "jti": secrets.token_hex(16),
+        },
         JWT_SECRET, algorithm="HS256",
     )
 
@@ -545,38 +595,47 @@ def current_token(authorization: str = Header(default="")) -> dict:
         # a forced re-login is worse than an unrevokable session — which is
         # the trade, stated plainly, rather than the absolute the old
         # comment implied.
+        #
+        # `email` is required for the same kind of reason, and it is the same
+        # kind of deliberate one-time cost: tokens issued before it existed are
+        # refused, and their owners sign in once more. See _issue_token for
+        # what an unbound uid allowed.
         payload = jwt.decode(
             authorization[7:], JWT_SECRET, algorithms=["HS256"],
-            options={"require": ["exp", "uid", "jti"]},
+            options={"require": ["exp", "uid", "jti", "email"]},
         )
     except jwt.PyJWTError as exc:
         raise HTTPException(401, f"invalid token: {exc}") from exc
+    uid = payload["uid"]
+    # Checked here, before uid reaches a query: a validly-signed token whose
+    # `uid` is a string, a list or null used to raise out of a dependency,
+    # which FastAPI turns into a 500. Not `isinstance(uid, int)` alone: bool is
+    # a subclass of int, and `True` would otherwise authenticate as user 1.
+    if type(uid) is not int:
+        raise HTTPException(401, "invalid token: uid claim is not a user id")
     with db() as conn:
         revoked = conn.execute(
             "SELECT 1 FROM revoked_tokens WHERE jti = ?", (payload["jti"],)
         ).fetchone()
+        account = conn.execute("SELECT email FROM users WHERE id = ?", (uid,)).fetchone()
     if revoked is not None:
         raise HTTPException(401, "this session has been signed out")
+    if account is None or not isinstance(payload["email"], str) or not hmac.compare_digest(
+        account["email"].encode(), payload["email"].encode("utf-8", "replace")
+    ):
+        # The signature is good, but the account it names is not the one in
+        # this database -- the database was replaced under the same key.
+        raise HTTPException(401, "this session is for an account this server does not have; sign in again")
     return payload
 
 
 def current_user(payload: dict = Depends(current_token)) -> int:
     """FastAPI dependency: resolve the JWT bearer token to a user id.
 
-    The type check is not defensive noise. `uid` is required by
-    `current_token`, so it is always present — but a validly-signed token
-    whose `uid` is a string, a list or null used to reach `int(...)` and
-    raise ValueError/TypeError out of a dependency, which FastAPI turns into
-    a 500. A token this server will not accept is a 401; a 500 says the
-    server broke, which sends the app's Connection doctor looking for an
-    outage that isn't there.
+    `current_token` has already checked that `uid` is a real int naming an
+    account whose email matches the token's, so this only narrows.
     """
-    uid = payload["uid"]
-    # Not `isinstance(uid, int)` alone: bool is a subclass of int, and
-    # `True` would otherwise authenticate as user 1.
-    if type(uid) is not int:
-        raise HTTPException(401, "invalid token: uid claim is not a user id")
-    return uid
+    return payload["uid"]
 
 
 _HEALTH_STALE_S = 30  # matches the `online` window
@@ -600,16 +659,31 @@ def _health_payload(row: sqlite3.Row, now: float) -> Optional[dict]:
     return report if isinstance(report, dict) else None
 
 
-def _rules_version(ai_rules_json: Optional[str]) -> str:
-    """Stable fingerprint of a device's stored rule set (empty when it has none)."""
+def _rules_version(ai_rules_json: Optional[str], activation: int = 0) -> str:
+    """Stable fingerprint of a device's stored rule set (empty when it has none).
+
+    `activation` (devices.ai_rules_activation) makes each Activate a new
+    version even when the rules are byte-for-byte the same, so re-activating
+    after a switch to a named preset is delivered again. 0 -- every row from
+    before the column existed -- keeps the original fingerprint, so a deploy
+    does not re-send every running rule set once.
+    """
     if not ai_rules_json:
         return ""
-    return hashlib.sha256(ai_rules_json.encode()).hexdigest()[:16]
+    material = ai_rules_json if not activation else f"{activation}\n{ai_rules_json}"
+    return hashlib.sha256(material.encode()).hexdigest()[:16]
 
 
 def _zones_version(zones_json: Optional[str]) -> str:
-    """Fingerprint of a device's zone set (empty when it has none)."""
-    if not zones_json or zones_json == "[]":
+    """Fingerprint of a device's zone set; empty only when none was ever set.
+
+    An EMPTY set is a real set with its own fingerprint. It used to share the
+    "nothing" fingerprint, which made deleting the last zone undeliverable:
+    ingest only sends zones whose version is non-empty, so the device -- which
+    treats `set_zones: []` as "clear them" (core/uplink.py) -- kept enforcing
+    the deleted polygon until it rebooted.
+    """
+    if not zones_json:
         return ""
     return hashlib.sha256(zones_json.encode()).hexdigest()[:16]
 
@@ -799,20 +873,54 @@ def send_sms(user_row: sqlite3.Row, body: str) -> None:
     _send_with_retry(once)
 
 
-def _notify(owner: Optional[sqlite3.Row], title: str, detail: str, device_name: str) -> None:
+def _notify(
+    owner: Optional[sqlite3.Row], title: str, detail: str, device_name: str,
+    push: bool = True, sms: bool = True,
+) -> None:
     """Push, then SMS, as a background task after `ingest()` has already
     responded — a slow or retrying provider must never make a device wait
     for its next poll. Each is independently caught and logged: a push
     failure (after retries) must not cancel the SMS, and vice versa.
+
+    Which channels to use is decided by the caller (`_notify_channels`).
     """
-    try:
-        send_push(owner, title, detail)
-    except Exception as exc:  # noqa: BLE001 - see send_push's own docstring
-        log.warning("notify: push delivery failed after retries: %r", exc)
-    try:
-        send_sms(owner, f"{title} — {detail} ({device_name})")
-    except Exception as exc:  # noqa: BLE001 - see send_sms's own docstring
-        log.warning("notify: sms delivery failed after retries: %r", exc)
+    if push:
+        try:
+            send_push(owner, title, detail)
+        except Exception as exc:  # noqa: BLE001 - see send_push's own docstring
+            log.warning("notify: push delivery failed after retries: %r", exc)
+    if sms:
+        try:
+            send_sms(owner, f"{title} — {detail} ({device_name})")
+        except Exception as exc:  # noqa: BLE001 - see send_sms's own docstring
+            log.warning("notify: sms delivery failed after retries: %r", exc)
+
+
+def _notify_channels(event: dict) -> tuple[bool, bool]:
+    """(push, sms) for one event that is allowed to interrupt someone.
+
+    SMS is the account's "text me on LOUD alerts" setting (`sms_on_loud`), and
+    it costs money per message. It used to go out for every event the gate let
+    through -- including a custom rule's `soft` warning, and a rule the person
+    set to "push". So:
+
+      * an event carrying `notify` (a configured rule's own choice; the device
+        sends it for custom-rule events) is honoured: "silent" -> nothing,
+        "sms" -> push and SMS whatever the severity.
+      * "push" is the DEFAULT rule setting and the only non-silent choice the
+        app offers, so it means "notify the usual way", exactly like an event
+        with no choice: push always, SMS only for a `loud` event. Reading it as
+        "never SMS" silently stopped every critical custom rule from texting
+        an owner who had turned on "text me on loud alerts".
+
+    `send_sms` still applies the account's own switch and phone number.
+    """
+    choice = str(event.get("notify") or "").strip().lower()
+    if choice == "silent":
+        return False, False
+    if choice == "sms":
+        return True, True
+    return True, str(event.get("severity", "")) == "loud"
 
 
 # ------------------------------------------------------------------------- alert copy
@@ -949,10 +1057,26 @@ class ClaimBody(BaseModel):
     claim_code: str = Field(max_length=64)
 
 
+#: Rules one Activate may carry. A proposal's rules come from one sentence; a
+#: few is normal, and each is evaluated on the device every frame.
+MAX_ACTIVATED_RULES = 32
+
+
 class PresetBody(BaseModel):
     # Re-sent to the device on every poll until it converges, so its size is
     # paid on every ingest response, not once.
     preset: str = Field(max_length=128)
+    # Both optional, so an app that sends only `preset` behaves exactly as it
+    # always has (see set_preset).
+    #
+    # draft_version: the `draft_version` /v1/ai/configure returned for the
+    # proposal the person is looking at. Activate is refused (409) if a newer
+    # preview has replaced it, instead of silently running something else.
+    draft_version: Optional[str] = Field(default=None, max_length=64)
+    # rules: the proposal's rules AS REVIEWED -- the person may have changed
+    # sensitivity, Push/Silent, "confirm for" and "then wait". Re-validated
+    # server-side exactly like a model's proposal; never trusted as sent.
+    rules: Optional[list[dict]] = Field(default=None, max_length=MAX_ACTIVATED_RULES)
 
 
 class NtfyBody(BaseModel):
@@ -1062,12 +1186,33 @@ def _client_ip(request: Request) -> str:
         forwarded = request.headers.get(header, "")
         candidate = forwarded.split(",")[0].strip()
         if candidate:
-            return candidate
+            return _rate_limit_key(candidate)
         # Configured but absent means the request did not come through the
         # proxy it was promised to. Fall through to the peer rather than
         # returning "" — one shared bucket is a limit, "" is also a limit, but
         # neither should silently look like a distinct client.
-    return request.client.host if request.client is not None else "unknown"
+    return _rate_limit_key(request.client.host) if request.client is not None else "unknown"
+
+
+def _rate_limit_key(address: str) -> str:
+    """One rate-limit bucket per HOST, not per address.
+
+    An IPv6 host is normally given a whole /64 and picks addresses from it
+    freely (privacy addresses rotate on their own), so keying on the full
+    address gave one machine 2^64 fresh buckets: measured, 40 password guesses
+    from 40 addresses in one /64 were all evaluated and none throttled. The /64
+    is the unit a single host controls. IPv4-mapped IPv6 is the IPv4 address it
+    carries. Anything that does not parse is used as-is.
+    """
+    try:
+        ip = ipaddress.ip_address(address.strip())
+    except ValueError:
+        return address
+    if isinstance(ip, ipaddress.IPv6Address):
+        if ip.ipv4_mapped is not None:
+            return str(ip.ipv4_mapped)
+        return str(ipaddress.ip_network(f"{ip}/64", strict=False))
+    return str(ip)
 
 
 @app.post("/v1/signup")
@@ -1087,21 +1232,29 @@ def signup(body: Credentials, request: Request):
             )
         except sqlite3.IntegrityError:
             raise HTTPException(409, "an account with this email already exists") from None
-    return {"token": _issue_token(cur.lastrowid), "email": email}
+    return {"token": _issue_token(cur.lastrowid, email), "email": email}
 
 
 @app.post("/v1/login")
 def login(body: Credentials, request: Request):
     if not LOGIN_LIMITER.allow(_client_ip(request)):
         raise HTTPException(429, "too many attempts — try again in a few minutes")
+    email = body.email.strip().lower()
+    # Per account as well as per address: see LOGIN_FAILURE_LIMITER. Checked
+    # before the lookup and applied to unknown emails too, so a throttled
+    # answer says nothing about whether an account exists.
+    if LOGIN_FAILURE_LIMITER.blocked(email):
+        raise HTTPException(429, "too many attempts — try again in a few minutes")
     with db() as conn:
-        row = conn.execute("SELECT * FROM users WHERE email = ?", (body.email.strip().lower(),)).fetchone()
+        row = conn.execute("SELECT * FROM users WHERE email = ?", (email,)).fetchone()
     if row is None:
         _hash_pw(body.password, _NO_SUCH_USER_SALT)
+        LOGIN_FAILURE_LIMITER.record(email)
         raise HTTPException(401, "wrong email or password")
     if not hmac.compare_digest(_hash_pw(body.password, row["salt"]), row["pw_hash"]):
+        LOGIN_FAILURE_LIMITER.record(email)
         raise HTTPException(401, "wrong email or password")
-    return {"token": _issue_token(row["id"]), "email": row["email"]}
+    return {"token": _issue_token(row["id"], row["email"]), "email": row["email"]}
 
 
 @app.post("/v1/logout")
@@ -1278,10 +1431,100 @@ def _stored_model(raw: Optional[str]) -> Optional[dict]:
     return value if isinstance(value, dict) else None
 
 
+#: Why a rule sent with a NAMED mode is not run. Stated, not silently dropped.
+#:
+#: The device has exactly one way to run delivered rules: as AI Custom, which
+#: replaces the mode's own module (services/runtime.py saves every delivered
+#: rule set with `overrides_mode` on, and core/monitoring_mode.py runs only the
+#: rules in that mode), and an explicit mode switch exits it. So "this mode,
+#: plus these rules on top" is not something any device can do today --
+#: delivering the rules would switch the mode's own detection OFF.
+_NOT_BESIDE_A_MODE = (
+    "Custom rules can't run alongside a monitoring mode on this device yet: "
+    "running them replaces the mode's own detection. The mode was turned on "
+    "without this rule."
+)
+
+
+def _beside_a_mode_unsupported(rules: list) -> list[dict]:
+    """`unsupported` entries for rules that came with a named mode."""
+    entries = []
+    for rule in rules or []:
+        if not isinstance(rule, dict):
+            continue
+        target = str(rule.get("target") or rule.get("detection") or "").strip()
+        predicate = str(rule.get("predicate") or "").strip()
+        entries.append({
+            "request": str(rule.get("description") or f"{predicate} {target}".strip())[:500],
+            "reason": _NOT_BESIDE_A_MODE,
+            "requires": "activate it on its own as a custom configuration (no mode), "
+                        "or device support for rules beside a mode",
+            "support": "unsupported",
+            "alternatives": [],
+        })
+    return entries
+
+
+#: The fields a rule may carry back from the app. Everything else is dropped:
+#: the rule is about to be stored and shipped to a device on every change.
+_ACTIVATED_RULE_KEYS = (
+    "target", "detection", "predicate", "secondary", "description", "zone",
+    "persist_s", "min_count", "confidence", "severity", "cooldown_s",
+    "schedule", "notify", "timezone",
+)
+
+#: An IANA zone name as the device's RuleEngine reads it ("Europe/London",
+#: "America/Argentina/Buenos_Aires", "Etc/GMT+5"): the zone a rule's `schedule`
+#: ("23:00-06:00") is meant in -- the owner's, sent by the app, since the
+#: device's own clock zone is whatever the image shipped with. Anything else is
+#: dropped rather than shipped to a device to interpret.
+_TIMEZONE_RE = re.compile(r"^[A-Za-z0-9/_+\-]{1,64}$")
+
+
+def _valid_timezone(value) -> Optional[str]:
+    return value if isinstance(value, str) and _TIMEZONE_RE.match(value) else None
+
+
+def _client_rules(rules: list) -> list[dict]:
+    """The reviewed rules as the app sent them, reduced to known fields with
+    bounded strings, ready for `_validate_proposal` (which does the real
+    checking). `caveat` is dropped on purpose: validation re-derives it."""
+    cleaned = []
+    for rule in rules or []:
+        if not isinstance(rule, dict):
+            continue
+        kept = {}
+        for key in _ACTIVATED_RULE_KEYS:
+            if key not in rule:
+                continue
+            value = rule[key]
+            kept[key] = _clean_text(value)[:500] if isinstance(value, str) else value
+        if "timezone" in kept and _valid_timezone(kept["timezone"]) is None:
+            del kept["timezone"]
+        cleaned.append(kept)
+    return cleaned
+
+
+def _loads_dict(raw: Optional[str]) -> dict:
+    try:
+        value = json.loads(raw or "{}")
+    except (ValueError, TypeError):
+        return {}
+    return value if isinstance(value, dict) else {}
+
+
 @app.post("/v1/devices/{device_id}/preset")
 def set_preset(device_id: int, body: PresetBody, uid: int = Depends(current_user)):
+    """Switch mode, or (preset "") activate AI Custom.
+
+    Response: {ok, desired_preset, rules_active, rules_version, unsupported}.
+      rules_active   how many custom rules are now set to run (0 for a mode)
+      rules_version  the fingerprint the device will report once it has them
+                     ("" when no custom rules are active)
+      unsupported    rules from this request that will NOT run, with why
+    """
     with db() as conn:
-        _owned_device(conn, device_id, uid)
+        device = _owned_device(conn, device_id, uid)
         # Store the current name for a mode, never a superseded one. The device
         # will apply and report the current name, so a stored alias could never
         # match on convergence and would re-send on every poll for ever.
@@ -1297,6 +1540,25 @@ def set_preset(device_id: int, body: PresetBody, uid: int = Depends(current_user
                 variant and variant not in (presets[base].get("variants") or {})
             ):
                 raise HTTPException(400, f"unknown mode '{body.preset}'")
+
+        draft_json = device["ai_rules_draft"]
+        # The proposal on screen must still be the one stored. A newer preview
+        # (the debounce firing while the person reads the last one) used to be
+        # what Activate promoted, so the device ran a configuration nobody had
+        # seen. With no draft left, the only acceptable version is the one
+        # already promoted -- a retried Activate, not a stale one.
+        if body.draft_version is not None:
+            expected = (
+                _rules_version(draft_json) if draft_json
+                else (device["ai_rules_promoted_from"] or "")
+            )
+            # Plain equality: the version is not a secret, and compare_digest
+            # raises TypeError on non-ASCII text (a 500 for a bad request).
+            if not expected or body.draft_version != expected:
+                raise HTTPException(
+                    409, "this proposal was replaced by a newer one; review it again before activating"
+                )
+
         # An empty preset IS the app's request for AI Custom (AIConfigureView's
         # Apply calls this with preset=""). Anything else is an explicit
         # request to leave custom monitoring in charge, whatever ai_rules
@@ -1305,32 +1567,74 @@ def set_preset(device_id: int, body: PresetBody, uid: int = Depends(current_user
             "UPDATE devices SET desired_preset = ?, custom_monitoring_wanted = ? WHERE id = ?",
             (normalized, 1 if normalized == "" else 0, device_id),
         )
-        # This endpoint is the ONLY act of acceptance anywhere in the flow, so
-        # it is where a previewed proposal (see /v1/ai/configure, which now
-        # only ever writes a draft) becomes the one the device actually runs.
-        #
-        # Promotion is limited to the AI Custom request. preset == "" is what
-        # AIConfigureView's Activate sends for a genuinely custom proposal,
-        # and — being the only request that sets custom_monitoring_wanted — the
-        # only one that turns rule delivery on at all. A named preset leaves
-        # the draft where it is rather than promoting or discarding it, which
-        # is the pre-existing contract for `ai_rules`: a configuration is kept
-        # across a mode switch so that coming back to Configure-with-AI still
-        # shows what was last configured, and delivery is gated on
-        # custom_monitoring_wanted rather than on the column being empty.
-        #
-        # The draft is consumed on promotion, so a second Activate has nothing
-        # left to re-promote and `ai_rules` stays the record of what is running.
-        if normalized == "":
-            draft = conn.execute(
-                "SELECT ai_rules_draft FROM devices WHERE id = ?", (device_id,)
-            ).fetchone()["ai_rules_draft"]
-            if draft:
-                conn.execute(
-                    "UPDATE devices SET ai_rules = ?, ai_rules_draft = NULL WHERE id = ?",
-                    (draft, device_id),
-                )
-    return {"ok": True, "desired_preset": normalized}
+
+        if normalized != "":
+            # A named mode never promotes or discards the draft (the
+            # pre-existing contract: reopening Configure-with-AI still shows what
+            # was last configured), and never runs rules -- see
+            # _NOT_BESIDE_A_MODE. Rules that came with it are reported back.
+            return {
+                "ok": True, "desired_preset": normalized, "rules_active": 0,
+                "rules_version": "", "unsupported": _beside_a_mode_unsupported(body.rules or []),
+            }
+
+        # AI Custom. This is the ONLY act of acceptance anywhere in the flow,
+        # so it is where a previewed proposal (see /v1/ai/configure, which only
+        # ever writes a draft) becomes the one the device actually runs.
+        promoted: Optional[str] = None
+        promoted_from = device["ai_rules_promoted_from"]
+        rejected: list[dict] = []
+        if body.rules is not None:
+            # The reviewed rules win over the stored copy: the person may have
+            # changed them. Everything else (explanation, source) comes from
+            # the draft they were reviewing, or the running configuration.
+            base_proposal = _loads_dict(draft_json) if draft_json else _loads_dict(device["ai_rules"])
+            prior_unsupported = [u for u in (base_proposal.get("unsupported") or []) if isinstance(u, dict)]
+            proposal = {
+                **base_proposal,
+                "preset": "",
+                "rules": _client_rules(body.rules),
+                "unsupported": [],
+            }
+            validated = _validate_proposal(proposal)
+            rejected = list(validated["unsupported"])
+            validated["unsupported"] = prior_unsupported + rejected
+            promoted = json.dumps(validated)
+            if draft_json:
+                promoted_from = _rules_version(draft_json)
+        elif draft_json:
+            # Today's behaviour for an app that sends no rules: the draft as
+            # previewed. The draft is consumed, so a second Activate has nothing
+            # left to re-promote and `ai_rules` stays the record of what runs.
+            promoted = draft_json
+            promoted_from = _rules_version(draft_json)
+
+        if promoted is not None:
+            conn.execute(
+                "UPDATE devices SET ai_rules = ?, ai_rules_draft = NULL, ai_rules_promoted_from = ?,"
+                " ai_rules_activation = COALESCE(ai_rules_activation, 0) + 1 WHERE id = ?",
+                (promoted, promoted_from, device_id),
+            )
+        else:
+            # Re-activating what is already stored. Still a new activation, so
+            # it is delivered even to a device that kept reporting the version
+            # from before it left custom monitoring.
+            conn.execute(
+                "UPDATE devices SET ai_rules_activation = COALESCE(ai_rules_activation, 0) + 1"
+                " WHERE id = ?",
+                (device_id,),
+            )
+        row = conn.execute(
+            "SELECT ai_rules, ai_rules_activation FROM devices WHERE id = ?", (device_id,)
+        ).fetchone()
+    active_rules = _rules_payload(row["ai_rules"])
+    return {
+        "ok": True,
+        "desired_preset": normalized,
+        "rules_active": len(active_rules),
+        "rules_version": _rules_version(row["ai_rules"], row["ai_rules_activation"] or 0),
+        "unsupported": rejected,
+    }
 
 
 # ------------------------------------------------------------------------- zones
@@ -1365,7 +1669,9 @@ def _clean_zones(raw: list) -> list[dict]:
             continue
         try:
             polygon = [(float(p[0]), float(p[1])) for p in points]
-        except (TypeError, ValueError, IndexError):
+        except (TypeError, ValueError, LookupError):
+            # LookupError, not just IndexError: a point sent as an object
+            # ({"x": .., "y": ..}) raises KeyError on p[0], which escaped as a 500.
             continue
         # Three points is the minimum that encloses an area; anything outside
         # 0..1 is not a normalised coordinate and cannot be trusted.
@@ -1604,73 +1910,46 @@ def _ai_configure_llm(prompt: str) -> Optional[dict]:
     return proposal
 
 
-# Keyword -> (mode, explanation, rules), where a rule is
-# (target, predicate, description, persist_s, severity).
+# Keyword -> (mode, explanation). The path taken when the language model is
+# UNREACHABLE -- which is the default on a deployment with no model server --
+# so it has to be exactly as honest as the model path.
 #
-# The rules are (target, predicate) pairs, which is the shape the device can
-# actually execute — `core/rules.py`'s ConfiguredRule reads `target` and
-# `predicate`, and evaluates the target as a DETECTION LABEL against each
-# frame. They used to be keyed `detection` with EVENT-TYPE names ("fall",
-# "phone_use", "zone_violation", "unusual_stillness"): names no detector ever
-# produces as a label. `_validate_proposal` read `target`, found it absent,
-# and assessed "" — which the capability layer accepts as a whole-frame
-# condition — so the rule passed validation, was delivered, was stored, and
-# then sat on the device permanently unable to fire. Silently: nothing in the
-# app, the backend or the device said the rule was inert.
-#
-# That is the path taken when the language model is UNREACHABLE, which is
-# exactly when it has to be trustworthy. Each pair below is checked against
-# `core.capabilities.registry()` by tests/test_phase1_cloud_ai_fallback.py, and
-# built through the device's own ConfiguredRule.from_dict, so "the fallback
-# only ships rules that can fire" is a property under test rather than a
-# claim in a comment.
-#
-# Predicates are kept to the ones core/rules.py evaluates explicitly
-# (`present`, `absent`) rather than the wider set the registry declares, so
-# what the description promises is what the device does.
+# A match names a MODE and nothing else. Each entry used to add a custom rule
+# "on top" of the mode ("Added on top: an alert if someone is on the floor"),
+# and the explanation promised it. No device could run it: delivered rules run
+# only as AI Custom, which replaces the mode's own module (services/runtime.py
+# saves every delivered rule set with `overrides_mode` on), and the app
+# activates a mode proposal with its mode name, which never delivers rules. So
+# the rule sat in a draft for ever while the person was told it was added.
+# Shipping it with the mode would have been worse: it would have switched the
+# mode's own detection (fall, drowsiness) OFF. See set_preset's
+# _NOT_BESIDE_A_MODE.
 _AI_FALLBACKS = [
     (("baby", "infant", "crib", "nursery", "toddler"), "baby_monitoring",
-     "Baby Monitoring: the mode watches for unusual stillness, frantic movement and "
-     "safe/danger zones. Added on top: an alert if the baby stops being visible at all. "
-     "Draw a safe zone around the crib (and any danger zones) in the app to enable area alerts.",
-     [("person", "absent", "Alert if nobody is visible in the camera's view for 30 seconds",
-       30.0, "critical")]),
+     ("Baby Monitoring: the mode watches for unusual stillness, frantic movement and "
+      "safe/danger zones. Draw a safe zone around the crib (and any danger zones) in the "
+      "app to enable area alerts.")),
     (("fall", "elder", "senior", "grandma", "grandpa"), "elderly_monitoring",
-     "Elderly Monitoring: immediate fall alerts (rapid drop then stillness — sitting down "
-     "won't trigger it), staying active until movement resumes. Added on top: an alert if "
-     "someone is on the floor, which also covers a slow slide down that never looks like a drop.",
-     [("on_floor", "present", "Alert if someone is on the floor for more than 5 seconds",
-       5.0, "critical")]),
+     ("Elderly Monitoring: immediate fall alerts (rapid drop then stillness — sitting down "
+      "won't trigger it), staying active until movement resumes.")),
     (("security", "intruder", "door", "burglar", "lurk", "linger", "trespass"), "security_monitoring",
-     "Security: person-count changes, plus restricted-zone and lingering alerts once you draw "
-     "zones in the app. Added on top: an alert for anyone who stays in view for half a minute, "
-     "which needs no zone drawn to work.",
-     [("person", "present", "Alert when someone stays in view for 30 seconds",
-       30.0, "critical")]),
+     ("Security: person-count changes, plus restricted-zone and lingering alerts once you draw "
+      "zones in the app.")),
     (("drive", "driving", "car", "phone", "drowsy", "road"), "driver_safety",
-     "Driver Safety: loud alerts for phone use while looking away and sustained eye closure. "
-     "Added on top: an alert whenever a phone is visible for more than a couple of seconds.",
-     [("cell phone", "present", "Alert when a phone is visible for more than 2 seconds",
-       2.0, "critical")]),
+     "Driver Safety: loud alerts for phone use while looking away and sustained eye closure."),
 ]
 
 
 def _ai_fallback(prompt: str) -> dict:
-    """Deterministic keyword configuration when Claude is unavailable. Returns the
-    same structured shape, honestly labeled with source=fallback."""
+    """Deterministic keyword configuration when the model is unavailable. Returns
+    the same structured shape, honestly labeled with source=fallback: a mode,
+    and no rules (see _AI_FALLBACKS for why)."""
     lowered = prompt.lower()
-    for keywords, preset, explanation, rules in _AI_FALLBACKS:
+    for keywords, preset, explanation in _AI_FALLBACKS:
         if any(k in lowered for k in keywords):
             return {
                 "preset": preset, "variant": "", "explanation": explanation,
-                "rules": [
-                    {"target": target, "predicate": predicate, "secondary": "",
-                     "description": desc, "zone": "", "persist_s": persist,
-                     "min_count": 1, "confidence": 0.6, "severity": sev, "cooldown_s": 60.0,
-                     "schedule": "", "notify": "push"}
-                    for target, predicate, desc, persist, sev in rules
-                ],
-                "settings": {}, "unsupported": [], "source": "fallback",
+                "rules": [], "settings": {}, "unsupported": [], "source": "fallback",
             }
     # No keyword matched. Historically this returned security_monitoring as a
     # "safe default", which was neither safe nor a default: it silently pointed
@@ -1803,23 +2082,47 @@ def _validate_proposal(data: dict) -> dict:
         rule["target"] = target
         rule["predicate"] = predicate
         rule["secondary"] = secondary
-        rule["persist_s"] = max(0.5, min(3600.0, float(rule.get("persist_s", 2.0) or 2.0)))
-        rule["confidence"] = max(0.2, min(0.95, float(rule.get("confidence", 0.6) or 0.6)))
-        rule["cooldown_s"] = max(10.0, min(86400.0, float(rule.get("cooldown_s", 60.0) or 60.0)))
-        rule["min_count"] = max(1, min(100, int(rule.get("min_count", 1) or 1)))
+        # Through _number, not float(): rules now also arrive from the app's
+        # review screen (set_preset), and "abc", NaN or 1e999 there was a 500.
+        rule["persist_s"] = max(0.5, min(3600.0, _number(rule.get("persist_s"), 2.0)))
+        rule["confidence"] = max(0.2, min(0.95, _number(rule.get("confidence"), 0.6)))
+        rule["cooldown_s"] = max(10.0, min(86400.0, _number(rule.get("cooldown_s"), 60.0)))
+        rule["min_count"] = int(max(1, min(100, _number(rule.get("min_count"), 1))))
         if rule.get("severity") not in ("info", "warning", "critical"):
             rule["severity"] = "warning"
+        if "timezone" in rule and _valid_timezone(rule["timezone"]) is None:
+            del rule["timezone"]
         if verdict.support is caps.Support.PARTIAL:
             # The user is told the rule is an approximation, on the rule itself,
             # so the caveat survives into the review screen and the rule list.
             rule["caveat"] = verdict.reason
         valid_rules.append(rule)
 
+    if preset and valid_rules:
+        # A mode proposal cannot carry rules the device would run: see
+        # _NOT_BESIDE_A_MODE. Said here, at preview, rather than discovered
+        # after Activate -- the review screen must not offer "Activate 1 rule"
+        # for a rule that will never run.
+        unsupported.extend(_beside_a_mode_unsupported(valid_rules))
+        valid_rules = []
+
     data["preset"] = preset
     data["mode"] = "preset" if preset else "custom"
     data["rules"] = valid_rules
     data["unsupported"] = unsupported
     return _decodable_proposal(data)
+
+
+def _number(value, default: float) -> float:
+    """`value` as a finite float, or `default` for anything that is not one
+    (missing, 0/empty as before, text, NaN, infinity, a bool)."""
+    if isinstance(value, bool) or value in (None, "", 0):
+        return float(default)
+    try:
+        number = float(value)
+    except (TypeError, ValueError, OverflowError):
+        return float(default)
+    return number if math.isfinite(number) else float(default)
 
 
 def _decodable_proposal(data: dict) -> dict:
@@ -1888,7 +2191,15 @@ def _ai_slot(uid: int):
         yield False
         return
     try:
-        yield AI_RATE_LIMITER.allow(key)
+        # And across accounts: the per-account bound alone let twenty accounts
+        # hold two calls each -- the whole default thread pool.
+        if not AI_GLOBAL_CONCURRENCY.acquire(AI_GLOBAL_KEY):
+            yield False
+            return
+        try:
+            yield AI_RATE_LIMITER.allow(key)
+        finally:
+            AI_GLOBAL_CONCURRENCY.release(AI_GLOBAL_KEY)
     finally:
         AI_CONCURRENCY.release(key)
 
@@ -1923,17 +2234,20 @@ def ai_configure(body: AIConfigureBody, uid: int = Depends(current_user)):
     # device the caller no longer owned. Putting `owner_id` in the WHERE clause
     # makes the check and the write one atomic statement rather than two facts
     # that have to still agree.
+    draft_json = json.dumps(result)
     with db() as conn:
         updated = conn.execute(
             "UPDATE devices SET ai_rules_draft = ? WHERE id = ? AND owner_id = ?",
-            (json.dumps(result), body.device_id, uid),
+            (draft_json, body.device_id, uid),
         ).rowcount
     if not updated:
         # Same 404 and same wording as `_owned_device`, so losing the device
         # mid-request is indistinguishable from never having had it — there is
         # nothing here worth telling an attacker apart.
         raise HTTPException(404, "no such device on this account")
-    return result
+    # Which draft this is, so Activate can say "this one" (see set_preset) and
+    # be refused if a newer preview has replaced it in the meantime.
+    return {**result, "draft_version": _rules_version(draft_json)}
 
 
 @app.get("/v1/devices/{device_id}/events/{event_id}/explain")
@@ -1960,7 +2274,9 @@ def explain_event(device_id: int, event_id: int, uid: int = Depends(current_user
         raise HTTPException(503, "explanations are unavailable on this backend") from None
 
     event = dict(row)
-    rule = parse_rule_for_event(device["ai_rules"], event.get("type", ""))
+    # `signals` disambiguates when several rules watch the same target: the
+    # device records the firing rule's own message there.
+    rule = parse_rule_for_event(device["ai_rules"], event.get("type", ""), event.get("signals"))
 
     # Inside the per-account model budget, availability probe included: the
     # probe alone can take seconds against an unreachable model. Over budget,
@@ -2034,7 +2350,7 @@ def _hardware_id(health) -> Optional[str]:
     return value if isinstance(value, str) and _HARDWARE_ID.match(value) else None
 
 
-def _finite(value):
+def _finite(value: Any) -> Any:
     """`value` with every non-finite float replaced by None.
 
     The request parser accepts NaN and 1e999; the response encoder refuses them.
@@ -2046,16 +2362,146 @@ def _finite(value):
     """
     if isinstance(value, float):
         return value if math.isfinite(value) else None
+    if isinstance(value, str):
+        return _clean_text(value)
     if isinstance(value, dict):
-        return {k: _finite(v) for k, v in value.items()}
+        return {_clean_text(str(k)): _finite(v) for k, v in value.items()}
     if isinstance(value, list):
         return [_finite(v) for v in value]
     return value
 
 
+def _clean_text(value: str) -> str:
+    """`value` with anything UTF-8 cannot carry (a lone surrogate) replaced.
+
+    JSON can spell "\\ud800"; the request parser accepts it, `json.dumps`
+    stores it escaped, and the response encoder then refuses it. One such
+    string in a device's `health` or `monitoring` made every later
+    GET /v1/devices for the account fail until the device reported again --
+    `monitoring` is kept until replaced, so possibly for ever. In an event
+    field it cost the event (sqlite refuses to bind it); in `active_preset` it
+    failed the whole poll with a 4xx, which the device answers by DROPPING the
+    batch, every poll.
+    """
+    return value.encode("utf-8", "replace").decode("utf-8")
+
+
+# ------------------------------------------------------------------------- retention
+def _env_number(name: str, default: float) -> float:
+    raw = os.environ.get(name, "").strip()
+    if not raw:
+        return default
+    try:
+        value = float(raw)
+    except ValueError:
+        log.warning("%s=%r is not a number; using %s", name, raw, default)
+        return default
+    return value if math.isfinite(value) else default
+
+
+#: Events older than this many days are deleted. 0 keeps them for ever.
+#:
+#: Nothing used to delete an event, on a 1 GB volume that a camera writes to
+#: every few seconds. A full disk is not a slow failure here: every ingest
+#: then fails, and before _storage_unavailable existed it failed with a 200
+#: that made devices throw their events away.
+EVENT_RETENTION_DAYS = _env_number("SENSORDYME_EVENT_RETENTION_DAYS", 90.0)
+#: Most events kept per device (newest kept). 0 means no cap. A runaway or
+#: chatty device is bounded even inside the age window.
+EVENT_MAX_PER_DEVICE = int(_env_number("SENSORDYME_EVENT_MAX_PER_DEVICE", 100_000))
+#: How often retention runs, at most. It is triggered by ingest, after the
+#: response, so an idle backend does no work and a busy one does it hourly.
+EVENT_PRUNE_INTERVAL_S = 3600.0
+#: Rows deleted per transaction, so a first run over a large backlog never
+#: holds the write lock long enough to stall a device's poll.
+_PRUNE_BATCH = 5000
+
+_prune_lock = threading.Lock()
+_next_prune_at = 0.0
+
+
+def _prune_events(now: Optional[float] = None) -> int:
+    """Apply the retention limits now. Returns how many events were deleted."""
+    now = time.time() if now is None else now
+    deleted = 0
+    if EVENT_RETENTION_DAYS > 0:
+        cutoff = now - EVENT_RETENTION_DAYS * 86400
+        while True:
+            with db() as conn:
+                gone = conn.execute(
+                    "DELETE FROM events WHERE id IN "
+                    "(SELECT id FROM events WHERE received_at < ? LIMIT ?)",
+                    (cutoff, _PRUNE_BATCH),
+                ).rowcount
+            deleted += gone
+            if gone < _PRUNE_BATCH:
+                break
+    if EVENT_MAX_PER_DEVICE > 0:
+        with db() as conn:
+            device_ids = [r["id"] for r in conn.execute("SELECT id FROM devices").fetchall()]
+        for device_id in device_ids:
+            while True:
+                with db() as conn:
+                    # Cheap proof a device is under the cap, before the OFFSET
+                    # walk below (which steps through up to EVENT_MAX_PER_DEVICE
+                    # index entries — every device, every hour). Event ids are
+                    # unique and increasing, so a device holds at most
+                    # newest - oldest + 1 events: two index seeks.
+                    oldest = conn.execute(
+                        "SELECT id FROM events WHERE device_id = ? ORDER BY id ASC LIMIT 1",
+                        (device_id,),
+                    ).fetchone()
+                    newest = conn.execute(
+                        "SELECT id FROM events WHERE device_id = ? ORDER BY id DESC LIMIT 1",
+                        (device_id,),
+                    ).fetchone()
+                    if oldest is None or newest["id"] - oldest["id"] + 1 <= EVENT_MAX_PER_DEVICE:
+                        break
+                    # The id of the oldest event to keep; everything older goes.
+                    # Both lookups use idx_events_device.
+                    boundary = conn.execute(
+                        "SELECT id FROM events WHERE device_id = ? ORDER BY id DESC LIMIT 1 OFFSET ?",
+                        (device_id, EVENT_MAX_PER_DEVICE - 1),
+                    ).fetchone()
+                    if boundary is None:
+                        break
+                    gone = conn.execute(
+                        "DELETE FROM events WHERE id IN (SELECT id FROM events"
+                        " WHERE device_id = ? AND id < ? ORDER BY id LIMIT ?)",
+                        (device_id, boundary["id"], _PRUNE_BATCH),
+                    ).rowcount
+                deleted += gone
+                if gone < _PRUNE_BATCH:
+                    break
+    if deleted:
+        log.info("retention: deleted %d event(s)", deleted)
+    return deleted
+
+
+def _prune_events_if_due() -> None:
+    """Run retention if the interval has passed and no other run is going.
+
+    Never raises: retention failing must not show up as a failed request (it
+    runs after the device has already had its answer).
+    """
+    global _next_prune_at  # noqa: PLW0603 - module-level retention schedule, guarded by _prune_lock
+    now = time.time()
+    if now < _next_prune_at or not _prune_lock.acquire(blocking=False):
+        return
+    try:
+        _next_prune_at = now + EVENT_PRUNE_INTERVAL_S
+        _prune_events(now)
+    except Exception as exc:  # noqa: BLE001 - see docstring
+        log.warning("retention: could not prune events (%r); will retry next interval", exc)
+    finally:
+        _prune_lock.release()
+
+
 @app.post("/v1/ingest")
 def ingest(body: IngestBody, background_tasks: BackgroundTasks, device: sqlite3.Row = Depends(current_device)):
     now = time.time()
+    # See _clean_text: an unencodable active_preset failed the whole poll.
+    reported_preset = _clean_text(body.active_preset) if body.active_preset is not None else None
     with db() as conn:
         hardware_id = _hardware_id(body.health)
         if hardware_id and device["owner_id"]:
@@ -2072,7 +2518,7 @@ def ingest(body: IngestBody, background_tasks: BackgroundTasks, device: sqlite3.
             " hardware_id = COALESCE(?, hardware_id) WHERE id = ?",
             (
                 now,
-                body.active_preset,
+                reported_preset,
                 json.dumps(_finite(body.health)) if body.health is not None else None,
                 json.dumps(_finite(body.monitoring)) if body.monitoring is not None else None,
                 hardware_id,
@@ -2120,6 +2566,9 @@ def ingest(body: IngestBody, background_tasks: BackgroundTasks, device: sqlite3.
             # entire cost of getting this wrong; the alternative was total
             # queue deadlock.
             try:
+                # Text the database cannot store (a lone surrogate) is replaced,
+                # not allowed to cost the event. See _clean_text.
+                e = _finite(e)  # noqa: PLW2901 - the cleaned event deliberately replaces the raw one
                 event_key = e.get("event_key")
                 # None is a statement — "no graded evidence" (core/confidence.py)
                 # — and is stored as NULL, never coerced to a 0 that would read
@@ -2166,7 +2615,15 @@ def ingest(body: IngestBody, background_tasks: BackgroundTasks, device: sqlite3.
                 # "notification".
                 if cursor.rowcount > 0:
                     newly_inserted_events.append(e)
-            except (TypeError, ValueError, sqlite3.Error) as exc:
+            except (TypeError, ValueError, OverflowError) as exc:
+                # Only what is wrong with THIS EVENT. A storage failure (a full
+                # disk, an I/O error) is not: it used to be caught here too, so
+                # the batch answered 200 -- and the device clears its queue on
+                # any 200 -- while SQLite had rolled back rows already counted
+                # as stored (measured: `stored: 3`, 1 row on disk) and
+                # notifications went out for events that did not exist. It now
+                # fails the request (503, see _storage_unavailable), nothing is
+                # committed, and the device sends the same batch again.
                 log.warning(
                     "ingest: skipped one malformed event from device %s (%s): key=%r type=%r",
                     device["id"], exc,
@@ -2175,10 +2632,12 @@ def ingest(body: IngestBody, background_tasks: BackgroundTasks, device: sqlite3.
                 )
                 continue
         row = conn.execute(
-            "SELECT desired_preset, ai_rules, zones, custom_monitoring_wanted FROM devices WHERE id = ?",
+            "SELECT desired_preset, ai_rules, zones, custom_monitoring_wanted, ai_rules_activation"
+            " FROM devices WHERE id = ?",
             (device["id"],),
         ).fetchone()
         desired, ai_rules_json, zones_json = row["desired_preset"], row["ai_rules"], row["zones"]
+        rules_activation = row["ai_rules_activation"] or 0
         custom_monitoring_wanted = bool(row["custom_monitoring_wanted"])
         # A device can report the same active_preset string while AI Custom
         # Monitoring runs on top of it — entering custom monitoring replaces the
@@ -2202,7 +2661,7 @@ def ingest(body: IngestBody, background_tasks: BackgroundTasks, device: sqlite3.
         # This also converges rows written before names were normalised.
         if (
             desired
-            and same_preset(desired, body.active_preset or device["active_preset"])
+            and same_preset(desired, reported_preset or device["active_preset"])
             and not device_reports_custom_active
         ):
             # Compare-and-swap, not an unconditional clear: `desired` was read
@@ -2253,6 +2712,11 @@ def ingest(body: IngestBody, background_tasks: BackgroundTasks, device: sqlite3.
     # against each other. Both are always active together.
     for e in newly_inserted_events:
         owner_id = owner["id"] if owner is not None else None
+        push, sms = _notify_channels(e)
+        if not (push or sms):
+            # A rule set to "silent" asked not to interrupt anyone, so it must
+            # not use up the account's cooldown either.
+            continue
         send, held = gate.evaluate(
             owner_id, str(e.get("severity", "")), source=str(e.get("source") or "module")
         )
@@ -2270,7 +2734,7 @@ def ingest(body: IngestBody, background_tasks: BackgroundTasks, device: sqlite3.
         # to keep prompt. `owner`/`device["name"]` are captured now, by
         # value, since the request-scoped `device` row (and the connection
         # that produced it) will be gone by the time this actually runs.
-        background_tasks.add_task(_notify, owner, title, detail, device["name"])
+        background_tasks.add_task(_notify, owner, title, detail, device["name"], push, sms)
 
     command = None
     # Same reasoning as the convergence check above: a matching name is not
@@ -2286,7 +2750,7 @@ def ingest(body: IngestBody, background_tasks: BackgroundTasks, device: sqlite3.
     # tests/test_rule_delivery.py's coexistence test for why this one has no
     # set_preset command at all.
     if desired and (
-        desired != (body.active_preset or device["active_preset"])
+        desired != (reported_preset or device["active_preset"])
         or device_reports_custom_active
     ):
         command = {"set_preset": desired}
@@ -2304,7 +2768,7 @@ def ingest(body: IngestBody, background_tasks: BackgroundTasks, device: sqlite3.
     # same version mismatch, resent set_rules, and the device reapplied it —
     # pulling itself back into custom monitoring within one poll interval of
     # every switch, for any account that had ever used Configure-with-AI.
-    version = _rules_version(ai_rules_json)
+    version = _rules_version(ai_rules_json, rules_activation)
     if custom_monitoring_wanted and version and version != (body.rules_version or ""):
         command = dict(command or {})
         command["set_rules"] = _rules_payload(ai_rules_json)
@@ -2340,4 +2804,6 @@ def ingest(body: IngestBody, background_tasks: BackgroundTasks, device: sqlite3.
     # accounted for elsewhere (a warning log, and the dedup this endpoint
     # relies on for retry-safety, respectively) -- this field means "how many
     # of these are now durable", which is the number a caller actually needs.
+    # Retention, after the response: see _prune_events_if_due.
+    background_tasks.add_task(_prune_events_if_due)
     return {"ok": True, "stored": len(newly_inserted_events), "command": command}

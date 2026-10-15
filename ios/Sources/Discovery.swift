@@ -46,9 +46,13 @@ final class DeviceDiscovery: ObservableObject {
     /// timer: without this, each start queues its own sleeping task, and the one
     /// from an abandoned search stops a newer search 10 seconds into it.
     private var autoStop: Task<Void, Never>?
+    /// Bumped by every `start()`, so a bounded search can tell whether the
+    /// browse it started is still the one running. See `discoverOnce`.
+    private(set) var scanGeneration = 0
 
     func start() {
         stop()
+        scanGeneration += 1
         isSearching = true
         found = []
         let browser = NWBrowser(
@@ -203,15 +207,15 @@ final class DeviceDiscovery: ObservableObject {
             guard case .ready = state,
                   let remote = connection?.currentPath?.remoteEndpoint,
                   case let .hostPort(host, port) = remote else { return }
-            let ip: String
+            // Scope ("%en0") off BEFORE brackets on -- the other order produced
+            // "[fe80::1", which is not a URL. See BackendResolution.urlHostLiteral.
+            let cleaned: String
             switch host {
-            case .ipv4(let addr): ip = "\(addr)"
-            case .ipv6(let addr): ip = "[\(addr)]"
-            case .name(let hostname, _): ip = hostname
+            case .ipv4(let addr): cleaned = BackendResolution.urlHostLiteral("\(addr)", isIPv6: false)
+            case .ipv6(let addr): cleaned = BackendResolution.urlHostLiteral("\(addr)", isIPv6: true)
+            case .name(let hostname, _): cleaned = BackendResolution.urlHostLiteral(hostname, isIPv6: false)
             @unknown default: return
             }
-            // Strip any interface scope suffix ("%en0") NWEndpoint may append.
-            let cleaned = ip.split(separator: "%").first.map(String.init) ?? ip
             let url = "http://\(cleaned):\(port.rawValue)"
             Task { @MainActor in
                 guard let self else { return }
@@ -232,23 +236,49 @@ struct DeviceHealth: Decodable {
         let critical: Bool
     }
 
+    /// The `device` block the runtime adds (core/device_health.py). Only the
+    /// identity is read: it is what says WHICH camera answered at an address.
+    struct Identity: Decodable {
+        let device_id: String?
+    }
+
     let state: String
     let uptime_s: Double
     let components: [String: Component]
+    var device: Identity? = nil
 
-    static func fetch(baseURL: String, token: String) async throws -> DeviceHealth {
+    /// The camera's own SD- id, when it reported one.
+    var deviceID: String? { device?.device_id }
+
+    static func fetch(baseURL: String, token: String, timeout: TimeInterval = 8) async throws -> DeviceHealth {
         guard let url = URL(string: baseURL)?.appendingPathComponent("api/health") else {
             throw APIError(message: "invalid device address")
         }
         var request = URLRequest(url: url)
-        request.timeoutInterval = 8
-        if !token.isEmpty {
-            request.setValue(token, forHTTPHeaderField: "X-Device-Token")
+        request.timeoutInterval = timeout
+        request.cachePolicy = .reloadIgnoringLocalCacheData
+        let cleaned = token.trimmingCharacters(in: .whitespacesAndNewlines)
+        if !cleaned.isEmpty {
+            request.setValue(cleaned, forHTTPHeaderField: MJPEGStreamRequest.tokenHeader)
         }
         let (data, response) = try await URLSession.shared.data(for: request)
-        guard (response as? HTTPURLResponse)?.statusCode == 200 else {
-            throw APIError(message: "device did not answer (is it on and on your network?)")
+        let status = (response as? HTTPURLResponse)?.statusCode ?? 0
+        if let problem = Self.problem(status: status, hasToken: !cleaned.isEmpty) {
+            throw APIError(message: problem, status: status)
         }
         return try JSONDecoder().decode(DeviceHealth.self, from: data)
+    }
+
+    /// What a non-200 from the device means. A 401/403 is the device ANSWERING
+    /// and refusing the token -- reporting it as "did not answer, is it on your
+    /// network?" sent people to fix Wi-Fi over a settings mistake.
+    static func problem(status: Int, hasToken: Bool) -> String? {
+        switch status {
+        case 200: return nil
+        case 401, 403:
+            return MJPEGStreamState.unauthorized(hasToken: hasToken).message
+        default:
+            return "device did not answer (is it on and on your network?)"
+        }
     }
 }

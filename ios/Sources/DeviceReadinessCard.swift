@@ -12,6 +12,7 @@ import SwiftUI
 /// omitted or assumed good — "we didn't ask" and "it works" are different
 /// answers.
 struct DeviceReadinessCard: View {
+    @EnvironmentObject private var state: AppState
     let baseURL: String?
 
     @State private var health: DeviceHealth?
@@ -91,15 +92,19 @@ struct DeviceReadinessCard: View {
 
     private func load() async {
         defer { loading = false }
-        guard let baseURL, let url = URL(string: baseURL)?.appendingPathComponent("api/health") else {
+        guard let baseURL, !baseURL.isEmpty else {
             failure = "No address for this device yet."
             return
         }
-        var request = URLRequest(url: url)
-        request.timeoutInterval = 6
         do {
-            let (data, _) = try await URLSession.shared.data(for: request)
-            health = try JSONDecoder().decode(DeviceHealth.self, from: data)
+            // Through DeviceHealth.fetch, with the device token. The dashboard
+            // fails closed on a network bind (core/dashboard.py `_authorized`),
+            // so the token-less request this used to make got a 401 on every
+            // real device and the card said "it may still be starting up" after
+            // every successful setup.
+            health = try await DeviceHealth.fetch(baseURL: baseURL, token: state.deviceToken, timeout: 6)
+        } catch let error as APIError where error.status == 401 || error.status == 403 {
+            failure = error.message
         } catch {
             failure = "Couldn't read the device's status just now — it may still be starting up."
         }

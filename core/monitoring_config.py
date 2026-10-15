@@ -21,6 +21,7 @@ module exists to prevent.
 
 from __future__ import annotations
 
+import contextlib
 import json
 import os
 import tempfile
@@ -82,17 +83,32 @@ class MonitoringConfig:
             # the configured base mode than to refuse to start.
             log.warning("monitoring config unreadable (%s) — starting without it", exc)
             return False
+        if not isinstance(raw, dict):
+            # Valid JSON of the wrong shape (`null`, a list, a hand edit) is as
+            # unreadable as broken JSON, and must not crash the device's boot.
+            log.warning("monitoring config is not a JSON object — starting without it")
+            return False
+
+        rules = raw.get("rules")
+        try:
+            updated_at = float(raw.get("updated_at") or 0.0)
+        except (TypeError, ValueError, OverflowError):
+            updated_at = 0.0
 
         self.instruction = str(raw.get("instruction") or "")
-        self.rules = list(raw.get("rules") or [])
+        # Only rule OBJECTS. list() of a dict or a string produced junk entries
+        # that still made `active` true -- custom monitoring "on", the base
+        # module's events discarded, and not one rule the engine could run.
+        self.rules = [r for r in rules if isinstance(r, dict)] if isinstance(rules, list) else []
         self.version = str(raw.get("version") or "")
-        self.updated_at = float(raw.get("updated_at") or 0.0)
+        self.updated_at = updated_at if updated_at == updated_at else 0.0  # NaN -> 0
         # Defaults FALSE. A file written by an older format, hand-edited, or
         # produced by anything that omits the key used to activate AI-custom
         # monitoring and silence the configured module -- the most disruptive
         # possible reading of an absent field. The safe default is "keep running
-        # the module the operator configured"; overriding it is an explicit act.
-        self.overrides_mode = bool(raw.get("overrides_mode", False))
+        # the module the operator configured"; overriding it is an explicit act,
+        # so only a real JSON `true` counts (bool("false") is True).
+        self.overrides_mode = raw.get("overrides_mode", False) is True
         if self.rules:
             log.info(
                 "restored custom monitoring: %d rule(s) — %r",
@@ -131,6 +147,7 @@ class MonitoringConfig:
             "updated_at": self.updated_at,
             "overrides_mode": self.overrides_mode,
         }
+        tmp = None
         try:
             self._path.parent.mkdir(parents=True, exist_ok=True)
             # Atomic: a half-written file would make the device forget its
@@ -145,6 +162,9 @@ class MonitoringConfig:
         except OSError as exc:
             # Losing the write is bad; crashing the monitoring loop is worse.
             log.error("could not save monitoring config: %s", exc)
+            if tmp is not None:
+                with contextlib.suppress(OSError):
+                    os.unlink(tmp)  # don't strand one .tmp per failed save on a full card
 
 
 def load_or_empty(path: Path | str = DEFAULT_PATH) -> MonitoringConfig:

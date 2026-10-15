@@ -51,7 +51,7 @@ def test_predict_roi_only_sees_the_cropped_region_not_the_full_frame():
 def test_predict_roi_clamps_the_roi_to_frame_bounds():
     model = _FakeModel([((0, 0, 10, 10), 0, 0.9)])
     # Runs off the left/top edge of the frame -- must clamp, not crash or wrap.
-    [(box, cls, conf)] = predict_roi(model, FRAME, roi=(-50, -50, 50, 50))
+    [(box, _cls, conf)] = predict_roi(model, FRAME, roi=(-50, -50, 50, 50))
     assert box == (0, 0, 10, 10)
     assert conf == pytest.approx(0.9, abs=1e-4)
 

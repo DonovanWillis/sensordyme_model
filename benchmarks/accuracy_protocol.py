@@ -196,10 +196,12 @@ def grade(protocol_path: Path, events_path: Path) -> int:
     for e in alertable:
         ok = False
         for p in phases:
-            if p["start_dt"] <= e["ts"] <= p["end_dt"] + timedelta(seconds=grace_s):
-                if e["type"] in set(p["expected"]) | set(p["tolerated"]):
-                    ok = True
-                    break
+            if (
+                p["start_dt"] <= e["ts"] <= p["end_dt"] + timedelta(seconds=grace_s)
+                and e["type"] in set(p["expected"]) | set(p["tolerated"])
+            ):
+                ok = True
+                break
         if not ok:
             false_positives.append(e)
 

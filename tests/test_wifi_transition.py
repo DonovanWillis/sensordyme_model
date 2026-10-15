@@ -25,8 +25,22 @@ class FakeNM:
         self.psks = dict(psks or {})
         self.correct = dict(correct or {})
 
+    @staticmethod
+    def _normalise(args):
+        """Strip the forms nmcli needs but this fake does not: `-e no` and the
+        explicit `id` selector before a connection name."""
+        args = list(args)
+        if args[:2] == ["-e", "no"]:
+            args = args[2:]
+        for i in range(1, len(args) - 1):
+            if args[i] == "id" and args[i - 1] in ("up", "delete", "modify", "show"):
+                del args[i]
+                break
+        return args
+
     def run(self, args, timeout=10):
         self.calls.append(args)
+        args = self._normalise(args)
         ok = types.SimpleNamespace(returncode=0, stdout="", stderr="")
 
         if args[:3] == ["-t", "-f", "NAME,TYPE"]:
@@ -82,7 +96,7 @@ def test_the_profile_is_saved_before_the_working_network_is_given_up(monkeypatch
     assert wifi.provision("HomeWiFi", "correct")[0] is True
 
     add = next(i for i, c in enumerate(nm.calls) if c[:2] == ["connection", "add"])
-    up = next(i for i, c in enumerate(nm.calls) if c[:2] == ["connection", "up"] and c[2] == "HomeWiFi")
+    up = next(i for i, c in enumerate(nm.calls) if c[:2] == ["connection", "up"] and c[-1] == "HomeWiFi")
     assert add < up, "the device switched away before the new network was saved"
 
 

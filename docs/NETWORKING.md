@@ -210,6 +210,23 @@ Read it with:
 sudo journalctl -u sensordyme -n 50 --no-pager | grep cloud_uplink
 ```
 
+### `base_url` must be the final address
+
+The uplink does not follow redirects. A `base_url` of `http://host` in front of a
+proxy that forces HTTPS answers 301, and following it would send the device key
+to wherever `Location` points and turn the POST into a GET that can never
+succeed. Instead the device says so once and keeps every event queued:
+
+```
+cloud_uplink: http://host:8787 answered HTTP 301, redirecting to https://host/v1/ingest.
+Redirects are not followed (the device key would go with them): set
+cloud.base_url to the final address. Events are kept until then.
+```
+
+The same goes for a wrong path or a proxy that answers 404: events are kept and
+retried. Only answers that reject the batch itself (400, 422, or a 413 for a
+single event) drop it, so that one bad batch cannot block every newer alert.
+
 ## What is unaffected
 
 Losing the backend costs you the app and remote configuration. It does **not**

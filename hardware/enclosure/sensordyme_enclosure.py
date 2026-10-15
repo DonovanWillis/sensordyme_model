@@ -84,8 +84,21 @@ BOSSES = [
 ]
 LID_HOLE_D, LID_CBORE_D, LID_CBORE_DEPTH = 3.4, 6.8, 2.2
 
-# Camera Module 3 (front wall, centered)
-CAM_X = WALL + IX / 2                     # 54
+# Front-wall board layout. The camera and the IR board share the front wall's
+# inner face (both on 2 mm pads), between the two front corner bosses, which
+# leaves x 12..96 for 25 mm + 34 mm of board. With the camera centred (x 54) the
+# 34 mm IR board overlapped the camera board by 0.5 mm on one side and the
+# front-right lid-screw boss by ~3.5 mm on the other: no position for it
+# fitted. So the camera sits 8 mm left of centre and verify() checks every
+# board envelope against the other board and the bosses. Lid features that
+# used CAM_X as "the middle of the box" (vents, logo) are pinned to CENTER_X so
+# the lid is unchanged.
+CENTER_X = WALL + IX / 2                  # 54
+BOARD_T, BOARD_CLR = 1.6, 1.0             # PCB thickness; min board clearance
+
+# Camera Module 3 (front wall, left of centre — see the layout note above)
+CAM_BOARD_W, CAM_BOARD_H = 25.0, 24.0     # CM3 board, x by z
+CAM_X = 46.0                              # lens axis x
 CAM_Z = 22.0                              # lens axis height
 CAM_HOLE_DX, CAM_HOLE_DZ = 21.0, 12.5     # CM3 hole grid
 CAM_PAD_D, CAM_PAD_H = 5.0, 2.0
@@ -99,7 +112,8 @@ CAM_PADS = [
 ]
 
 # IR illuminator (front wall, right of camera) — tune for your exact board
-IR_X, IR_Z = CAM_X + 29.0, 22.0           # 83
+IR_BOARD = 34.0                           # square board envelope (generic <=34)
+IR_X, IR_Z = 77.5, 22.0
 IR_OPEN_R = 10.0                          # 20 dia LED window
 IR_GRID = 28.0                            # post spacing (square)
 IR_PAD_D, IR_PAD_H = 5.0, 2.0
@@ -124,7 +138,7 @@ GUIDES = [(34.0, 20.0), (34.0, 28.0), (64.0, 20.0), (64.0, 28.0)]
 # ventilation
 LID_VENT_W, LID_VENT_L = 3.2, 63.0        # slots over the cooler
 LID_VENT_YS = [38.0 + 6.5 * i for i in range(8)]           # y centers 38..83.5
-LID_VENT_X = CAM_X + 4.5                  # centered over the Pi (58.5)
+LID_VENT_X = CENTER_X + 4.5               # centered over the Pi (58.5)
 WALL_VENT_L, WALL_VENT_H = 14.0, 3.5
 WALL_VENT_ZS = [32.5, 38.5]
 SIDE_VENT_YS = [24.0, 44.0, 64.0, 84.0]
@@ -133,7 +147,7 @@ REAR_VENT_XS = [25.0, 45.0, 65.0]
 # lid fit
 SKIRT_T, SKIRT_DEPTH, SKIRT_CLR = 1.8, 4.0, 0.3
 LOGO_TEXT, LOGO_SIZE, LOGO_DEPTH = "SensorDyme", 7.0, 0.6
-LOGO_POS = (CAM_X, 17.0)
+LOGO_POS = (CENTER_X, 17.0)
 
 FEET = [(14.0, 14.0), (OX - 14.0, 14.0), (14.0, OY - 14.0), (OX - 14.0, OY - 14.0)]
 FOOT_D, FOOT_DEPTH = 11.0, 1.2
@@ -261,8 +275,8 @@ def build_lid():
     seg_l = box(WALL + SKIRT_CLR, sy0, zs0, WALL + SKIRT_CLR + SKIRT_T, sy1, zs1)
     seg_rt = box(WALL + IX - SKIRT_CLR - SKIRT_T, sy0, zs0, WALL + IX - SKIRT_CLR, sy1, zs1)
     for seg in (seg_f, seg_r, seg_l, seg_rt):
-        seg = seg.edges("<Z").chamfer(0.7)      # lead-in for easy seating
-        lid = lid.union(seg)
+        chamfered = seg.edges("<Z").chamfer(0.7)  # lead-in for easy seating
+        lid = lid.union(chamfered)
 
     for yc in LID_VENT_YS:                      # big vent field over the cooler
         lid = lid.cut(box(LID_VENT_X - LID_VENT_L / 2, yc - LID_VENT_W / 2, BASE_H - SKIRT_DEPTH - 1,
@@ -289,6 +303,16 @@ def build_lid():
 
 
 # ------------------------------------------------------------- verification
+def _box_gap(a, b):
+    """Clearance between two (x0, x1, z0, z1) rectangles in one plane;
+    negative when they overlap."""
+    dx = max(b[0] - a[1], a[0] - b[1])
+    dz = max(b[2] - a[3], a[2] - b[3])
+    if dx < 0 and dz < 0:
+        return max(dx, dz)                 # overlapping: the shallower depth
+    return math.hypot(max(dx, 0.0), max(dz, 0.0))
+
+
 def verify():
     checks = []
 
@@ -317,7 +341,7 @@ def verify():
     chk("USB-C cutout covers connector (x)", USBC_CUT_W / 2 - 9.0 / 2 - 1.0, 0.0)
     chk("USB-C cutout covers connector (z)", (USBC_CUT_Z + USBC_CUT_H) - 14.2 - 1.0, 0.0)
     # camera
-    cam_board_z0, cam_board_z1 = CAM_Z - 12.0, CAM_Z + 12.0
+    cam_board_z0, cam_board_z1 = CAM_Z - CAM_BOARD_H / 2, CAM_Z + CAM_BOARD_H / 2
     chk("camera board above floor", cam_board_z0 - FLOOR, 2.0)
     chk("camera board below skirt", (BASE_H - SKIRT_DEPTH) - cam_board_z1, 2.0)
     half_angle = math.degrees(math.atan((CAM_OPEN_OUTER_R - CAM_OPEN_INNER_R) / WALL))
@@ -333,6 +357,27 @@ def verify():
     # IR window clear of camera cone at the exterior face
     chk("IR window clear of camera cone",
         (IR_X - IR_OPEN_R - 2.0) - (CAM_X + CAM_OPEN_OUTER_R), 1.0)
+    # front-wall boards: each envelope against the other and the corner bosses
+    board_y0 = WALL + CAM_PAD_H               # boards sit on the pads' faces
+    board_y1 = board_y0 + BOARD_T
+    boards = {
+        "camera board": (CAM_X - CAM_BOARD_W / 2, CAM_X + CAM_BOARD_W / 2,
+                         CAM_Z - CAM_BOARD_H / 2, CAM_Z + CAM_BOARD_H / 2),
+        "IR board": (IR_X - IR_BOARD / 2, IR_X + IR_BOARD / 2,
+                     IR_Z - IR_BOARD / 2, IR_Z + IR_BOARD / 2),
+    }
+    chk("camera board clear of IR board",
+        _box_gap(boards["camera board"], boards["IR board"]), BOARD_CLR)
+    for board, (x0, x1, _z0, _z1) in boards.items():
+        for bx, by in BOSSES:              # bosses run floor to rim: z always overlaps
+            near_x = min(max(bx, x0), x1)
+            near_y = min(max(by, board_y0), board_y1)
+            chk(f"{board} clear of lid boss ({bx:.0f},{by:.0f})",
+                math.hypot(bx - near_x, by - near_y) - BOSS_R, BOARD_CLR)
+        chk(f"{board} inside side walls", min(x0 - WALL, WALL + IX - x1), BOARD_CLR)
+    ir_z0, ir_z1 = boards["IR board"][2:]
+    chk("IR board above floor", ir_z0 - FLOOR, 2.0)
+    chk("IR board below skirt", (BASE_H - SKIRT_DEPTH) - ir_z1, 2.0)
     # SD slot below board top, above floor
     chk("SD slot under board", BOARD_TOP - SD_SLOT_Z1 + 0.6, 0.0)
 

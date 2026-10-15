@@ -58,7 +58,12 @@ final class AlertWatcher: ObservableObject {
         //
         // Nothing is lost by waiting: AppState is already retrying on its own
         // schedule, and the moment it reconnects this resumes on the next tick.
-        guard case .connected = state.backendStatus else { return }
+        //
+        // `periodicRefreshMayRun`, not `backendStatus == .connected`: the demo
+        // never resolves a backend (it has none), so the connected-only check
+        // meant a demo alert never reached the lock screen unless a real backend
+        // happened to be reachable — the opposite of what a demo needs.
+        guard state.periodicRefreshMayRun else { return }
 
         // A failed poll is silent on purpose. The backend being briefly
         // unreachable is normal — the phone changes network, the Mac sleeps —

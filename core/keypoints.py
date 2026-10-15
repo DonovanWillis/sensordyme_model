@@ -28,7 +28,7 @@ from enum import Enum
 from typing import Optional
 
 
-class Part(str, Enum):
+class Part(str, Enum):  # noqa: UP042 - StrEnum would change str()/format() of members
     """Named body parts. Values are stable strings so they survive storage."""
 
     NOSE = "nose"
@@ -330,7 +330,7 @@ def from_coco_keypoints(points: Iterable, aspect: float = 1.0,
         Part.LEFT_KNEE, Part.RIGHT_KNEE, Part.LEFT_ANKLE, Part.RIGHT_ANKLE,
     ]
     keypoints: dict[Part, Keypoint] = {}
-    for part, row in zip(order, points):
+    for part, row in zip(order, points, strict=False):
         try:
             x, y = float(row[0]), float(row[1])
             confidence = float(row[2]) if len(row) > 2 else 1.0

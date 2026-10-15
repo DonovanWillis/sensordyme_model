@@ -25,7 +25,7 @@ _CONFIGURED = False
 
 def setup_logging(level: str | None = None) -> None:
     """Configure the root sensordyme logger once; later calls only adjust the level."""
-    global _CONFIGURED
+    global _CONFIGURED  # noqa: PLW0603 - configure-once flag for the process
     resolved = (os.environ.get("SENSORDYME_LOG_LEVEL") or level or "INFO").upper()
     root = logging.getLogger("sensordyme")
     if not _CONFIGURED:

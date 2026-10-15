@@ -170,6 +170,11 @@ class DriverAttentionDashSentinelModule(VisionModule):
         self._last_features = features
         self._last_bbox = face_selection.bbox
     else:
+      # Their app.py resets the extractor here too (src/app.py, the no-face
+      # branch). Without it eye-closure / look-away counters and the 30-frame
+      # pose smoothing survived the face loss and were scored against the next
+      # face that appeared.
+      self._extractor.reset()
       score = self._scorer.update_no_face()
       self._last_bbox = None
 
@@ -198,6 +203,25 @@ class DriverAttentionDashSentinelModule(VisionModule):
 
   def is_alert_active(self) -> bool:
     return self._last_score is not None and self._last_score.status == "DROWSY"
+
+  def close(self) -> None:
+    """Save the driver profile (their app.py does this in `finally` on exit) and
+    release FaceMesh. Safe to call twice; the runtime calls it on swap and
+    shutdown. Without it up to save_profile_every_seconds of profile learning
+    was lost every session."""
+    if getattr(self, "_closed", False):
+      return
+    self._closed = True
+    try:
+      self._profile.save()
+    except Exception as exc:  # noqa: BLE001 - a failed save must not block shutdown
+      print(f"driver_attention_dashsentinel: could not save the driver profile: {exc}")
+    face_mesh, self._face_mesh = self._face_mesh, None
+    if face_mesh is not None:
+      try:
+        face_mesh.close()
+      except Exception:  # noqa: BLE001, S110 - releasing a graph must never raise into shutdown
+        pass
 
   def get_telemetry_snapshot(self) -> Optional[dict]:
     if self._last_score is None or self._last_features is None:

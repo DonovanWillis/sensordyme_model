@@ -51,7 +51,39 @@ def load_samples(source: Path) -> list[Sample]:
     return samples
 
 
-def export(source: Path, out: Path, reviewed_only: bool, copy: bool) -> dict:
+_SPLITS = ("train", "val", "test")
+
+
+def _prepare_out(out: Path, overwrite: bool) -> None:
+    """Refuse to write a new export over an old one, or clear the old one.
+
+    Writing into a previous export's directory rewrote each labels.jsonl but
+    left the earlier images where they were. Sessions shift between splits as
+    new ones are recorded, so a session now in `test` still had its frames in
+    `train/images` — the leak the by-session split exists to prevent, for any
+    loader that globs the image folders.
+    """
+    existing = [name for name in (*_SPLITS, "manifest.json") if (out / name).exists()]
+    if not existing:
+        return
+    if not overwrite:
+        raise SystemExit(
+            f"{out} already holds an export ({', '.join(existing)}). Choose an empty "
+            "directory, or pass --overwrite to replace it."
+        )
+    if not (out / "manifest.json").is_file():
+        # Only ever delete what this tool demonstrably wrote.
+        raise SystemExit(
+            f"{out} has {', '.join(existing)} but no manifest.json, so it is not an "
+            "export this tool wrote; refusing to delete anything in it."
+        )
+    for name in _SPLITS:
+        shutil.rmtree(out / name, ignore_errors=True)
+    (out / "manifest.json").unlink()
+
+
+def export(source: Path, out: Path, reviewed_only: bool, copy: bool,
+           overwrite: bool = False) -> dict:
     samples = load_samples(source)
     if reviewed_only:
         samples = [s for s in samples if s.review != LABEL_UNREVIEWED]
@@ -65,6 +97,10 @@ def export(source: Path, out: Path, reviewed_only: bool, copy: bool) -> dict:
     if not samples:
         raise SystemExit("nothing to export")
 
+    # Before any frame is copied or moved (with --move, refusing halfway would
+    # leave frames in neither place), and only once there is something to
+    # write, so --overwrite never deletes an export to replace it with nothing.
+    _prepare_out(out, overwrite)
     splits = split_by_session(samples)
     out.mkdir(parents=True, exist_ok=True)
 
@@ -140,9 +176,12 @@ def main() -> None:
                         help="export only samples a human has labelled")
     parser.add_argument("--move", action="store_true",
                         help="move rather than copy, freeing space on the device")
+    parser.add_argument("--overwrite", action="store_true",
+                        help="replace a previous export in --out instead of refusing")
     args = parser.parse_args()
 
-    manifest = export(args.source, args.out, args.reviewed_only, copy=not args.move)
+    manifest = export(args.source, args.out, args.reviewed_only, copy=not args.move,
+                      overwrite=args.overwrite)
 
     print(f"\nexported {manifest['samples']} sample(s) to {args.out}")
     print(f"  sessions : {len(manifest['sessions'])}")

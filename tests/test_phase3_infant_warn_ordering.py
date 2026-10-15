@@ -25,8 +25,6 @@ from __future__ import annotations
 
 import inspect
 
-import pytest
-
 from modules import baby_monitoring
 from modules.baby_monitoring import INFANT_REACQUIRE_S, BabyMonitoringModule
 

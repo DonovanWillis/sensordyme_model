@@ -62,7 +62,7 @@ class TestComposedCapabilitiesAreAlreadyAvailable:
 
     def test_a_long_persist_s_rule_on_lying_down_validates(self, reg):
         draft = RuleDraft(target="lying_down", predicate="present", persist_s=120.0)
-        ok, reason, extra = draft.validate(reg)
+        ok, reason, _extra = draft.validate(reg)
         assert ok, reason
 
     def test_holding_a_drink_object_validates_with_a_caveat(self, reg):

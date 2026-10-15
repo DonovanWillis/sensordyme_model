@@ -88,6 +88,20 @@ ROI_SPEED_EXPANSION = 0.5
 #: ROI to a point.
 ROI_MIN_RADIUS_FRAC = 0.05
 
+#: Half-size of the box that stands for the HAND itself (not the search
+#: region), in torso lengths: a hand is roughly a third of a torso length
+#: long, so +-0.2 torso around the palm centre covers it. Association scores
+#: spatial agreement against THIS box. The ROI (above) is only where to look:
+#: when association scored against the ROI, every object the crop found
+#: "overlapped the hand" by construction and the spatial term stopped
+#: discriminating -- a still object 0.6 torso lengths from a still wrist
+#: scored as held.
+HAND_BOX_RADIUS_TORSO = 0.2
+#: The palm centre sits beyond the wrist along the forearm by about this
+#: fraction of the elbow-to-wrist length (hand ~0.11 body heights from wrist
+#: to fingertip, forearm ~0.15).
+_PALM_EXTRAPOLATION = 0.35
+
 #: Below this speed (box-diagonals/second), a tracked box counts as "not
 #: really moving" for the purposes of velocity-agreement scoring.
 _STILL_SPEED = 0.08
@@ -186,6 +200,30 @@ def hand_roi_box(
     return (max(0, x1), max(0, y1), min(frame_w, x2), min(frame_h, y2))
 
 
+def hand_box(
+    anchor: HandAnchor, torso_length_norm: float, frame_w: int, frame_h: int, aspect: float,
+    radius_torso: float = HAND_BOX_RADIUS_TORSO,
+) -> Box:
+    """The hand's own extent, in pixel xyxy -- what association is scored
+    against (the ROI from hand_roi_box is only the search region).
+
+    Centred on the palm: the wrist extrapolated along the forearm when the
+    elbow is visible, else the wrist itself. Sized in torso lengths, with the
+    same aspect handling as hand_roi_box.
+    """
+    wx, wy = anchor.wrist
+    if anchor.elbow is not None:
+        ex, ey = anchor.elbow
+        wx, wy = wx + (wx - ex) * _PALM_EXTRAPOLATION, wy + (wy - ey) * _PALM_EXTRAPOLATION
+    radius_y = max(radius_torso * torso_length_norm, ROI_MIN_RADIUS_FRAC / 2.0)
+    radius_x = radius_y / max(aspect, 1e-6)
+    x1 = int((wx - radius_x) * frame_w)
+    y1 = int((wy - radius_y) * frame_h)
+    x2 = int((wx + radius_x) * frame_w)
+    y2 = int((wy + radius_y) * frame_h)
+    return (max(0, x1), max(0, y1), min(frame_w, x2), min(frame_h, y2))
+
+
 # ------------------------------------------------------------------ association
 def _velocity_vector(track: TrackedBox, aspect: float = 1.0) -> Optional[tuple[float, float]]:
     """(dx, dy) over the track's full trail, in box-diagonals/second --
@@ -236,15 +274,25 @@ def _velocity_agreement(hand: TrackedBox, obj: TrackedBox, aspect: float) -> flo
     return max(0.0, min(1.0, 0.6 * direction_term + 0.4 * speed_ratio))
 
 
-def _spatial_agreement(hand: TrackedBox, obj: TrackedBox, aspect: float, proximity_range_diag: float) -> float:
+def _spatial_agreement(
+    hand: TrackedBox, obj: TrackedBox, aspect: float, proximity_range_diag: float,
+    hand_extent: Optional[Box] = None,
+) -> float:
     """[0, 1]: overlap where it exists, graceful falloff by distance
     (in hand-diagonal units) otherwise -- an object beside or below the
-    hand, or between fingers, is not always overlapping its box."""
-    overlap = iou(hand.box, obj.box)
+    hand, or between fingers, is not always overlapping its box.
+
+    `hand_extent`, when given, is the hand's own box (see hand_box) and is
+    what overlap/distance are measured against instead of the track's box --
+    HandPerceptionEngine's hand track carries the ROI, which every object the
+    ROI crop finds overlaps by construction."""
+    box = hand_extent if hand_extent is not None else hand.box
+    overlap = iou(box, obj.box)
     if overlap > 0:
         return max(overlap, 0.85)  # any real overlap is already strong evidence
-    scale = max(hand.diagonal, 1e-6)
-    hx, hy = hand.centroid
+    x1, y1, x2, y2 = box
+    scale = max(math.hypot((x2 - x1) * aspect, y2 - y1), 1e-6)
+    hx, hy = (x1 + x2) / 2.0, (y1 + y2) / 2.0
     ox, oy = obj.centroid
     distance = math.hypot((ox - hx) * aspect, oy - hy) / scale
     return max(0.0, 1.0 - distance / proximity_range_diag)
@@ -252,6 +300,7 @@ def _spatial_agreement(hand: TrackedBox, obj: TrackedBox, aspect: float, proximi
 
 def association_score(
     hand: TrackedBox, obj: TrackedBox, aspect: float = 1.0, proximity_range_diag: float = 2.5,
+    hand_extent: Optional[Box] = None,
 ) -> float:
     """A single [0, 1] score for "is `obj` being carried by `hand`",
     combining spatial agreement, trajectory agreement, and detector
@@ -269,8 +318,12 @@ def association_score(
     for the same reason: an uncertain detection should scale the whole
     claim down, not add independent baseline evidence for a relationship
     the boxes' own geometry doesn't support.
+
+    `aspect` is only for NORMALISED box coordinates; pixel boxes (everything
+    HandPerceptionEngine tracks) are isotropic and take the default 1.0.
+    `hand_extent`: see _spatial_agreement.
     """
-    spatial = _spatial_agreement(hand, obj, aspect, proximity_range_diag)
+    spatial = _spatial_agreement(hand, obj, aspect, proximity_range_diag, hand_extent)
     motion = _velocity_agreement(hand, obj, aspect)
     core = spatial * (0.4 + 0.6 * motion)
     confidence_factor = 0.7 + 0.3 * (0.5 * min(1.0, hand.confidence) + 0.5 * min(1.0, obj.confidence))
@@ -286,6 +339,9 @@ class HandPerceptionResult:
     objects: list[TrackedBox] = field(default_factory=list)
     #: hand label ("left_hand"/"right_hand") -> (object track, association score)
     associations: dict[str, tuple[TrackedBox, float]] = field(default_factory=dict)
+    #: hand label -> the hand's own extent (pixel xyxy) this frame. `hands`
+    #: tracks carry the search ROI as their box; association is scored here.
+    hand_boxes: dict[str, Box] = field(default_factory=dict)
 
 
 class HandPerceptionEngine:
@@ -366,18 +422,26 @@ class HandPerceptionEngine:
         already returned to the caller (shared, not reloaded here)."""
         h, w = frame.shape[:2]
         anchors = detect_hand_anchors(landmarks)
+        # `aspect` corrects NORMALISED landmark coordinates (x spans w, y spans
+        # h). Every box from here on is in PIXELS, which are already isotropic,
+        # so the trackers and association below run at aspect 1.0 -- passing
+        # the frame aspect there inflated horizontal distances and speeds by w/h.
         torso = torso_length_from_landmarks(landmarks, aspect)
 
         hand_detections = []
         rois: dict[str, Box] = {}
+        hand_extents: dict[str, Box] = {}
         for anchor in anchors:
             label = f"{anchor.side}_hand"
             prior = next((t for t in self._hand_tracker.tracks if t.label == label), None)
-            speed = (prior.velocity(aspect) or 0.0) if prior is not None else 0.0
+            speed = (prior.velocity(1.0) or 0.0) if prior is not None else 0.0
             roi = hand_roi_box(anchor, torso or ROI_MIN_RADIUS_FRAC, w, h, aspect, speed)
             rois[label] = roi
+            hand_extents[label] = hand_box(anchor, torso or ROI_MIN_RADIUS_FRAC, w, h, aspect)
+            # The hand TRACK keeps the ROI as its box (callers read its size and
+            # draw it); association below scores against the hand's own extent.
             hand_detections.append((label, roi, anchor.visibility))
-        hand_tracks = self._hand_tracker.update(hand_detections, now, aspect)
+        hand_tracks = self._hand_tracker.update(hand_detections, now, 1.0)
 
         object_detections: list[tuple[str, Box, float]] = []
         for hand in hand_tracks:
@@ -400,7 +464,7 @@ class HandPerceptionEngine:
                     object_detections.append((label, box, score))
                 else:
                     object_detections.append((UNKNOWN_OBJECT, box, score))
-        self._object_tracker.update(object_detections, now, aspect)
+        self._object_tracker.update(object_detections, now, 1.0)
         # ALL currently-alive object tracks, not just this-frame's matched-or-
         # new ones: adaptive ROI scheduling deliberately skips re-running
         # detection for a hand that hasn't moved much (see _should_run_roi),
@@ -418,10 +482,12 @@ class HandPerceptionEngine:
         for hand in hand_tracks:
             best_obj, best_score = None, 0.0
             for obj in object_tracks:
-                score = association_score(hand, obj, aspect)
+                score = association_score(hand, obj, 1.0, hand_extent=hand_extents.get(hand.label))
                 if score > best_score:
                     best_obj, best_score = obj, score
             if best_obj is not None and best_score >= self._association_threshold:
                 associations[hand.label] = (best_obj, best_score)
 
-        return HandPerceptionResult(hands=hand_tracks, objects=object_tracks, associations=associations)
+        return HandPerceptionResult(
+            hands=hand_tracks, objects=object_tracks, associations=associations, hand_boxes=hand_extents,
+        )

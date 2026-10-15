@@ -18,7 +18,14 @@ struct AIConfigureView: View {
     @State private var thinking = false
     @State private var proposal: AIProposal?
     @State private var applied = false
+    /// What the backend confirmed on activation (ActivationSummary). Nil until
+    /// an activation succeeds.
+    @State private var appliedSummary: ActivationSummary?
+    @State private var activating = false
     @State private var errorMessage: String?
+    /// Not an error: why the screen is showing a fresh proposal (the one being
+    /// reviewed was replaced on the server before it could be activated).
+    @State private var notice: String?
     @FocusState private var promptFocused: Bool
     @StateObject private var thinkingProgress = ProgressTracker()
 
@@ -40,6 +47,12 @@ struct AIConfigureView: View {
                         Label(errorMessage, systemImage: "exclamationmark.circle.fill")
                             .font(SD.Typography.callout)
                             .foregroundStyle(SD.Colors.danger)
+                    }
+                    if let notice {
+                        Label(notice, systemImage: "arrow.triangle.2.circlepath")
+                            .font(SD.Typography.callout)
+                            .foregroundStyle(SD.Colors.warning)
+                            .fixedSize(horizontal: false, vertical: true)
                     }
                     if let proposal {
                         understandingCard(proposal)
@@ -104,7 +117,7 @@ struct AIConfigureView: View {
                 .padding(.vertical, 2)
             }
 
-            Button(action: configure) {
+            Button { configure() } label: {
                 if thinking {
                     HStack(spacing: SD.Space.xs) {
                         ProgressView().tint(SD.Colors.textOnAccent)
@@ -235,19 +248,22 @@ struct AIConfigureView: View {
                         .frame(maxWidth: 160)
                     }
 
+                    // Full schema range on a log scale (DurationScale). The linear
+                    // 1–60 s / 30–1800 s sliders clamped a valid rule — a 120 s
+                    // sleep rule, a 0.5 s phone rule — the moment they were touched.
                     settingRow("Confirm for") {
-                        Text("\(Int(binding.wrappedValue.persist_s))s")
+                        Text(DurationText.short(binding.wrappedValue.persist_s))
                             .font(SD.Typography.caption.monospacedDigit())
                             .foregroundStyle(SD.Colors.textSecondary)
                     }
-                    Slider(value: binding.persist_s, in: 1...60, step: 1)
+                    Slider(value: durationBinding(binding.persist_s, scale: .persistence), in: 0...1)
 
                     settingRow("Then wait") {
-                        Text("\(Int(binding.wrappedValue.cooldown_s / 60))m")
+                        Text(DurationText.short(binding.wrappedValue.cooldown_s))
                             .font(SD.Typography.caption.monospacedDigit())
                             .foregroundStyle(SD.Colors.textSecondary)
                     }
-                    Slider(value: binding.cooldown_s, in: 30...1800, step: 30)
+                    Slider(value: durationBinding(binding.cooldown_s, scale: .cooldown), in: 0...1)
                     Text("How long the condition must hold before alerting, and how long before it can alert again.")
                         .font(SD.Typography.caption)
                         .foregroundStyle(SD.Colors.textTertiary)
@@ -318,16 +334,39 @@ struct AIConfigureView: View {
                 message: "SensorDyme couldn't turn that into something it can watch for. Try describing it differently, or see what it would need above."
             )
         } else if applied {
-            Label("Active on \(device.name)", systemImage: "checkmark.circle.fill")
-                .font(SD.Typography.headline)
-                .foregroundStyle(SD.Colors.success)
-                .frame(maxWidth: .infinity)
-                .padding(.vertical, SD.Space.xs)
+            VStack(spacing: SD.Space.xxs) {
+                if appliedSummary?.kind == .modeSwitched {
+                    Label("Switched to \(Preset.title(for: proposal.preset))", systemImage: "checkmark.circle.fill")
+                        .font(SD.Typography.headline)
+                        .foregroundStyle(SD.Colors.success)
+                } else {
+                    Label("Active on \(device.name)", systemImage: "checkmark.circle.fill")
+                        .font(SD.Typography.headline)
+                        .foregroundStyle(SD.Colors.success)
+                }
+                if let appliedNote = appliedSummary?.note {
+                    Text(appliedNote)
+                        .font(SD.Typography.caption)
+                        .foregroundStyle(SD.Colors.textSecondary)
+                        .multilineTextAlignment(.center)
+                        .fixedSize(horizontal: false, vertical: true)
+                }
+            }
+            .frame(maxWidth: .infinity)
+            .padding(.vertical, SD.Space.xs)
         } else {
             Button { apply(proposal) } label: {
-                Text("Activate \(proposal.rules.count == 1 ? "rule" : "\(proposal.rules.count) rules")")
+                if activating {
+                    ProgressView().tint(SD.Colors.textOnAccent)
+                } else if !proposal.isCustom {
+                    // A named mode is what this turns on; rules never run beside one.
+                    Text("Switch to \(Preset.title(for: proposal.preset))")
+                } else {
+                    Text("Activate \(proposal.rules.count == 1 ? "rule" : "\(proposal.rules.count) rules")")
+                }
             }
             .buttonStyle(SDButtonStyle(kind: .primary))
+            .disabled(activating)
         }
     }
 
@@ -365,10 +404,22 @@ struct AIConfigureView: View {
         )
     }
 
-    private func configure() {
+    /// A slider position bound to a duration on `scale`. Only a touch writes:
+    /// an untouched rule keeps its exact value, whatever the scale's steps.
+    private func durationBinding(_ seconds: Binding<Double>, scale: DurationScale) -> Binding<Double> {
+        Binding(
+            get: { scale.position(for: seconds.wrappedValue) },
+            set: { seconds.wrappedValue = scale.seconds(at: $0) }
+        )
+    }
+
+    /// - Parameter notice: shown with the new proposal, to say why it is new.
+    private func configure(notice: String? = nil) {
         thinking = true
         errorMessage = nil
+        self.notice = notice
         applied = false
+        appliedSummary = nil
         promptFocused = false
         Task {
             defer { thinking = false }
@@ -384,27 +435,38 @@ struct AIConfigureView: View {
     }
 
     private func apply(_ proposal: AIProposal) {
+        activating = true
+        errorMessage = nil
+        notice = nil
         Task {
+            defer { activating = false }
             do {
-                // Rules are already persisted by the configure call, but that
-                // alone does not tell the backend to actually turn them on —
-                // /v1/devices/{id}/preset is what marks intent
-                // (custom_monitoring_wanted on the device row), and nothing
-                // else does. This used to be skipped for a genuinely custom
-                // proposal (empty preset) on the theory that sending "" was a
-                // pointless or even unwanted mode change — but an empty
-                // desired_preset is falsy server-side and never produces a
-                // set_preset command, so it never actually changes what mode
-                // is selected. It only sets the "please deliver and run these
-                // rules" flag. Skipping it meant tapping Activate for any
-                // open-ended prompt (no named preset matched) saved the rules
-                // but never told the device to run them — the button showed
-                // "Active on {device}" while nothing was ever delivered. Both
-                // branches now call it; for a named-preset proposal this is
-                // unchanged from before.
-                try await state.backend.setPreset(deviceID: device.id, preset: proposal.preset)
-                withAnimation(SD.Motion.standard) { applied = true }
+                // The proposal as reviewed — the edited rules and the draft they
+                // came from — not just its preset. See BackendAPI.activate.
+                let result = try await state.backend.activate(deviceID: device.id, proposal: proposal)
+                let summary = ActivationSummary.summarize(
+                    isCustom: proposal.isCustom, rulesSent: proposal.rules.count,
+                    rulesActive: result.rulesActive
+                )
+                withAnimation(SD.Motion.standard) {
+                    // Every rule the backend could not run goes under "Not yet
+                    // possible", with its reason.
+                    let known = Set(self.proposal?.unsupported.map(\.id) ?? [])
+                    let moved = (result.unsupported ?? []).filter { !known.contains($0.id) }
+                    self.proposal?.unsupported += moved
+                    // None of the sent rules run: they are not "rules being
+                    // edited" any more, they are listed with why.
+                    if result.rulesActive == 0 { self.proposal?.rules = [] }
+                    appliedSummary = summary
+                    applied = summary.kind != .nothingRunning
+                    if summary.kind == .nothingRunning { errorMessage = summary.note }
+                }
                 await onApplied()
+            } catch let error as APIError where error.status == 409 {
+                // The draft this proposal came from was replaced (another
+                // preview, from this phone or another). Activating it would
+                // run something nobody reviewed, so fetch it again.
+                configure(notice: "The proposal changed — review it again before activating it.")
             } catch {
                 errorMessage = error.localizedDescription
             }

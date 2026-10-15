@@ -51,11 +51,12 @@ def test_fallback_produces_valid_structured_proposal(backend):
     data = resp.json()
     assert data["preset"] == "baby_monitoring"
     assert data["source"] == "fallback"
-    assert data["rules"]
-    rule = data["rules"][0]
-    assert (rule["target"], rule["predicate"]) == ("person", "absent")
-    assert 0.2 <= rule["confidence"] <= 0.95
+    # A mode and nothing else: the device cannot run custom rules beside a
+    # mode, so the fallback no longer promises one "on top" (see
+    # tests/test_phase1_cloud_ai_fallback.py).
+    assert data["rules"] == []
     assert data["unsupported"] == []
+    assert data["draft_version"]
 
 
 def test_unmatched_prompt_is_honest_not_fake(backend):
@@ -107,7 +108,9 @@ def test_validation_moves_unsupported_detections_out_of_rules(backend):
 def test_validation_clamps_out_of_range_values(backend):
     app_module, client, headers = backend
     app_module._ai_configure_llm = lambda prompt: {
-        "preset": "security_monitoring", "variant": "", "explanation": "t", "settings": {},
+        # preset "": a custom configuration, the only kind that runs rules
+        # (a mode proposal's rules are reported as unsupported instead).
+        "preset": "", "variant": "", "explanation": "t", "settings": {},
         "unsupported": [], "source": "claude",
         # A RUNNABLE rule with out-of-range numbers, which is what this test
         # is about. It used to name `detection: "zone_violation"` -- an event
@@ -144,6 +147,14 @@ def test_proposal_is_persisted_on_the_device_as_a_draft(backend):
     (Activate) promotes the draft. See tests/test_phase1_cloud_ai_draft.py.
     """
     app_module, client, headers = backend
+    app_module._ai_configure_llm = lambda prompt: {
+        "preset": "", "variant": "", "explanation": "floor watch", "settings": {},
+        "unsupported": [], "source": "jupiter",
+        "rules": [{"target": "on_floor", "predicate": "present", "secondary": "",
+                   "description": "someone on the floor", "zone": "", "persist_s": 5.0,
+                   "min_count": 1, "confidence": 0.6, "severity": "critical",
+                   "cooldown_s": 60.0, "schedule": "", "notify": "push"}],
+    }
     client.post("/v1/ai/configure",
                 json={"device_id": 1, "prompt": "watch grandpa for falls"}, headers=headers)
     with app_module.db() as conn:
@@ -152,7 +163,7 @@ def test_proposal_is_persisted_on_the_device_as_a_draft(backend):
         ).fetchone()
     assert row["ai_rules"] is None, "a preview must never become the running configuration"
     saved = json.loads(row["ai_rules_draft"])
-    assert saved["preset"] == "elderly_monitoring"
+    assert saved["preset"] == ""
     assert (saved["rules"][0]["target"], saved["rules"][0]["predicate"]) == ("on_floor", "present")
 
     # Activate promotes it, and that is the only thing that does.

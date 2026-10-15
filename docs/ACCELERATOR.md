@@ -8,7 +8,8 @@ Hailo's Dataflow Compiler. This page is the honest map of what runs where.
 
 | Model | Backend | Notes |
 |---|---|---|
-| YOLO object detection (phone/food/person — occupancy, driver_attention, openpilot phone check) | **Hailo** on a device; ultralytics-on-CPU on a developer Mac | via `core/accel.py` → `core/detectors.py` |
+| YOLO object detection (phone/food/person — occupancy, driver_attention, baby_monitoring) | **Hailo** on a device; ultralytics-on-CPU on a developer Mac | via `core/accel.py` → `core/detectors.py` |
+| Comparison modules' phone check (openpilot, skinnemoen) | **MPS/CPU** as configured (`phone_device: mps`) | an explicit device pin bypasses the accelerator; only `phone_device: null` routes it to Hailo |
 | MediaPipe Face Mesh (EAR/yaw/pitch/PERCLOS) | **CPU today** | see the correction below — a Hailo build of the *landmark* net does exist |
 | openpilot dmonitoring_model.onnx | **CPU** (onnxruntime) | would need its own Hailo compilation; not done |
 
@@ -210,6 +211,30 @@ What is still worth doing on a fresh board: validate with
 `journalctl -u sensordyme | grep accel` and a look at the overlay boxes. Confirm
 the log line naming **six raw output tensors and no on-chip NMS** — that is the
 line that tells you the confidence thresholds in `config.yaml` mean what they say.
+
+### Open question: anchor offset in the raw decode (unverified)
+
+`HailoYOLO._decode_raw` places each anchor at the cell **centre**,
+`(i + 0.5) * stride`. That is an assumption nobody has checked against a
+reference. Upstream DAMO-YOLO (`ZeroHead.get_single_level_center_priors`, the
+NanoDet-Plus convention) and, as recalled, the Model Zoo's damoyolo postprocess
+config (`nanodet_split`, `scale_factors: [0.0, 0.0]`) put priors at the cell's
+**top-left** corner, `i * stride`. If they are right, every box this decoder
+returns is shifted right and down by stride/2 — +4 / +8 / +16 px at strides
+8 / 16 / 32 in letterbox pixels (the same in frame pixels on a 640×480 camera).
+
+None of the device measurements above can see this: phone recall, person
+availability and spurious-box rates are presence metrics, and a constant shift
+does not change presence. It does bias zone membership, the near-mouth region,
+hand–phone IoU and crib containment.
+
+**The check that settles it:** take ~50 frames with one clearly visible person,
+decode them with this `.hef` and with a reference — the DAMO-YOLO PyTorch
+checkpoint of the same model, or the Model Zoo's own eval postprocess run on this
+`.hef` — and compare the mean (dx, dy) between matched person boxes. A constant
+bias near +stride/2 means change the anchor to `xs * stride` / `ys * stride` and
+update the two hand-computed expectations in `tests/test_phase3_raw_decode.py`;
+a mean near zero means the current code is right and this note can go.
 
 **An init failure does not fall back to CPU.** It did before Phase 4, and that
 fallback was the AGPL path; the device no longer has `ultralytics` installed, so

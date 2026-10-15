@@ -32,6 +32,55 @@ def _is_num(value) -> bool:
     return isinstance(value, (int, float)) and not isinstance(value, bool)
 
 
+#: Sink names main.build_alert_manager knows how to build.
+_KNOWN_SINKS = ("console", "sound", "gpio_buzzer")
+
+
+def _validate_alerts(alerts: dict, where: str, errors: list[str], warnings: list[str]) -> None:
+    """An `alerts:`-shaped block (the pi profile's, or mac_max's own).
+
+    The list keys matter most. YAML reads `loud_types: fall` as the STRING
+    "fall", and every consumer iterates it -- character by character -- so
+    nothing was loud any more (no push for any event) and `sinks: gpio_buzzer`
+    built no sink at all, with no error and no warning.
+    """
+    if "cooldown_s" in alerts:
+        _check(errors, _is_num(alerts["cooldown_s"]) and alerts["cooldown_s"] >= 0,
+               f"`{where}.cooldown_s:` must be a non-negative number, got {alerts['cooldown_s']!r}")
+    if "escalation_window_s" in alerts:
+        value = alerts["escalation_window_s"]
+        _check(errors, _is_num(value) and value >= 0,
+               f"`{where}.escalation_window_s:` must be a non-negative number, got {value!r}")
+    for key in ("sinks", "loud_types", "soft_types"):
+        if key not in alerts:
+            continue
+        value = alerts[key]
+        if not (isinstance(value, list) and all(isinstance(item, str) and item for item in value)):
+            errors.append(f"`{where}.{key}:` must be a list of names like [a, b], got {value!r}")
+    sinks = alerts.get("sinks")
+    if isinstance(sinks, list):
+        for sink in sinks:
+            if isinstance(sink, str) and sink not in _KNOWN_SINKS:
+                warnings.append(f"`{where}.sinks:` unknown sink {sink!r} will be skipped "
+                                f"(known: {', '.join(_KNOWN_SINKS)})")
+    loud, soft = alerts.get("loud_types"), alerts.get("soft_types")
+    if isinstance(loud, list) and isinstance(soft, list):
+        both = sorted({t for t in loud if isinstance(t, str)} & {t for t in soft if isinstance(t, str)})
+        if both:
+            warnings.append(
+                f"`{where}`: {both} listed in both loud_types and soft_types -- the buzzer "
+                "plays them soft while the event is tagged loud"
+            )
+    if "gpio_buzzer_pin" in alerts:
+        pin = alerts["gpio_buzzer_pin"]
+        _check(errors, isinstance(pin, int) and not isinstance(pin, bool) and 0 <= pin <= 27,
+               f"`{where}.gpio_buzzer_pin:` must be a BCM GPIO number 0-27, got {pin!r}")
+    if "evidence_max_files" in alerts:
+        value = alerts["evidence_max_files"]
+        _check(errors, isinstance(value, int) and not isinstance(value, bool) and value >= 0,
+               f"`{where}.evidence_max_files:` must be a non-negative integer, got {value!r}")
+
+
 def validate(config: dict) -> tuple[list[str], list[str]]:
     """Validate the top-level runtime config. Returns (errors, warnings)."""
     errors: list[str] = []
@@ -170,9 +219,11 @@ def validate(config: dict) -> tuple[list[str], list[str]]:
             errors.append(f"`{section}:` must be a mapping, got {config[section]!r}")
 
     alerts = config.get("alerts")
-    if isinstance(alerts, dict) and "cooldown_s" in alerts:
-        _check(errors, _is_num(alerts["cooldown_s"]) and alerts["cooldown_s"] >= 0,
-               f"`alerts.cooldown_s:` must be a non-negative number, got {alerts['cooldown_s']!r}")
+    if isinstance(alerts, dict):
+        _validate_alerts(alerts, "alerts", errors, warnings)
+    mac_max = config.get("mac_max")
+    if isinstance(mac_max, dict) and isinstance(mac_max.get("alerts"), dict):
+        _validate_alerts(mac_max["alerts"], "mac_max.alerts", errors, warnings)
 
     if isinstance(health, dict):
         for key in ("reboot_max_total",):

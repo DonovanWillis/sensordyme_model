@@ -48,6 +48,15 @@ class FrameBus:
         #: Bounded per consumer; 4096 at ~30 fps is over two minutes of history,
         #: far more than any sampling period needs.
         self._intervals: dict[str, deque[float]] = {}
+        #: PROCESSED-frame cadence, which is not the same thing as the publish
+        #: cadence above. Inference always takes the newest frame, so a 1.2 s
+        #: inference stall leaves publish intervals at 33 ms -- yet it is
+        #: exactly the gap between two PROCESSED frames that makes EventEngine
+        #: drop in-progress evidence. A processing consumer stamps each frame
+        #: it finishes with record_processed(); readers drain per-caller
+        #: windows with processed_interval_stats(), like interval_stats().
+        self._processed_at: dict[str, float] = {}
+        self._processed_intervals: dict[tuple[str, str], deque[float]] = {}
 
     def publish(self, frame: np.ndarray) -> None:
         """Store `frame` as the newest and wake every waiting consumer."""
@@ -88,25 +97,39 @@ class FrameBus:
                 return {}
             samples = sorted(buffer)
             buffer.clear()
-        if not samples:
-            return {}
+        return _summarise(samples)
 
-        def pct(p: float) -> float:
-            return samples[min(len(samples) - 1, int(p * len(samples)))]
+    def record_processed(self, consumer: str = "inference") -> None:
+        """Stamp that `consumer` finished processing one frame.
 
-        return {
-            "frames": len(samples),
-            "p50_ms": round(1000 * pct(0.50), 1),
-            "p95_ms": round(1000 * pct(0.95), 1),
-            "p99_ms": round(1000 * pct(0.99), 1),
-            "max_ms": round(1000 * samples[-1], 1),
-            # The three thresholds that mean something to this product: a quarter
-            # second is a visibly dropped frame, half a second is a stall, and one
-            # second is the point at which in-progress evidence is discarded.
-            "stalls_250ms": sum(1 for s in samples if s > 0.25),
-            "stalls_500ms": sum(1 for s in samples if s > 0.50),
-            "evidence_losing_stalls_1s": sum(1 for s in samples if s > 1.0),
-        }
+        Call it once per frame the consumer actually processed (the inference
+        loop: right after module.process). The interval since the previous
+        stamp goes into every reader window registered for that consumer.
+        """
+        now = time.monotonic()
+        with self._cond:
+            previous = self._processed_at.get(consumer)
+            self._processed_at[consumer] = now
+            if previous is None:
+                return
+            interval = now - previous
+            for (who, _reader), samples in self._processed_intervals.items():
+                if who == consumer:
+                    samples.append(interval)
+
+    def processed_interval_stats(self, caller: str = "default", consumer: str = "inference") -> dict:
+        """Processed-frame interval distribution for `consumer` since THIS
+        caller's last call, then reset -- same keys and the same first-call
+        registration semantics as interval_stats()."""
+        key = (consumer, caller)
+        with self._cond:
+            buffer = self._processed_intervals.get(key)
+            if buffer is None:
+                self._processed_intervals[key] = deque(maxlen=4096)
+                return {}
+            samples = sorted(buffer)
+            buffer.clear()
+        return _summarise(samples)
 
     def latest(self) -> tuple[Optional[np.ndarray], int]:
         """The newest frame and its sequence number, without waiting. (None, 0) before first publish."""
@@ -140,3 +163,26 @@ class FrameBus:
             if self._seq == 0:
                 return float("inf")
             return time.monotonic() - self._published_at
+
+
+def _summarise(samples: list[float]) -> dict:
+    """Percentiles and stall counts over sorted interval samples ({} if none)."""
+    if not samples:
+        return {}
+
+    def pct(p: float) -> float:
+        return samples[min(len(samples) - 1, int(p * len(samples)))]
+
+    return {
+        "frames": len(samples),
+        "p50_ms": round(1000 * pct(0.50), 1),
+        "p95_ms": round(1000 * pct(0.95), 1),
+        "p99_ms": round(1000 * pct(0.99), 1),
+        "max_ms": round(1000 * samples[-1], 1),
+        # The three thresholds that mean something to this product: a quarter
+        # second is a visibly dropped frame, half a second is a stall, and one
+        # second is the point at which in-progress evidence is discarded.
+        "stalls_250ms": sum(1 for s in samples if s > 0.25),
+        "stalls_500ms": sum(1 for s in samples if s > 0.50),
+        "evidence_losing_stalls_1s": sum(1 for s in samples if s > 1.0),
+    }

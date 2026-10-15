@@ -23,7 +23,7 @@ Two things this deliberately does NOT do:
 from __future__ import annotations
 
 from core.capabilities import registry
-from jupiter.schema import NOTIFY_KINDS, SEVERITIES
+from jupiter.schema import NO_TARGET, NOTIFY_KINDS, SEVERITIES
 
 
 def _alternation(values) -> str:
@@ -38,7 +38,9 @@ def build_grammar(reg=None) -> str:
     Targets and predicates are closed alternations drawn from the registry;
     free text (description, zone, explanation) stays an open string, because
     those are for the human and constraining them would only make the model
-    fight the grammar.
+    fight the grammar. The target also admits NO_TARGET, for the same reason
+    schema_for_registry does: without a legal "cannot", constrained decoding
+    turns an honest refusal into a confident wrong label.
     """
     reg = reg or registry()
     labels = sorted(reg.labels())
@@ -73,14 +75,15 @@ rule        ::= "{{" ws "\\"target\\"" ws ":" ws target ws ","
 gap         ::= "{{" ws "\\"request\\"" ws ":" ws string ws ","
                 ws "\\"reason\\"" ws ":" ws string ws "}}"
 
-target      ::= {_alternation(labels)}
-secondary   ::= "\\"\\"" | target
+target      ::= label | {_alternation([NO_TARGET])}
+secondary   ::= "\\"\\"" | label
+label       ::= {_alternation(labels)}
 predicate   ::= {_alternation(predicates)}
 severity    ::= {_alternation(SEVERITIES)}
 notify      ::= {_alternation(NOTIFY_KINDS)}
 
 string      ::= "\\"" char* "\\""
-char        ::= [^"\\\\] | "\\\\" ["\\\\/bfnrt]
+char        ::= [^"\\\\\\x00-\\x1f] | "\\\\" ["\\\\/bfnrt]
 number      ::= "-"? digit+ ("." digit+)?
 integer     ::= "-"? digit+
 digit       ::= [0-9]

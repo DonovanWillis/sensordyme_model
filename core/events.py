@@ -34,7 +34,8 @@ class Event:
 
     @staticmethod
     def now(
-        type: str, duration: float, confidence: Optional[float], module_name: str, contributing_signals: str = ""
+        type: str,  # noqa: A002 - mirrors the Event.type field; renaming changes the keyword API
+        duration: float, confidence: Optional[float], module_name: str, contributing_signals: str = ""
     ) -> "Event":
         """Build an Event stamped with the current UTC time."""
         return Event(

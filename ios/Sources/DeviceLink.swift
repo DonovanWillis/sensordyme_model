@@ -114,13 +114,28 @@ final class DeviceLink: ObservableObject {
 
     // MARK: Resolution
 
+    /// SD- ids the backend reports for this account's devices, written by
+    /// AppState after each device-list load. Read here so every DeviceLink
+    /// (the device list's, the live feed's, setup's) prefers a camera that is
+    /// actually on this account over whichever one Bonjour happened to answer
+    /// with first.
+    private var accountHardwareIDs: [String] {
+        (UserDefaults.standard.string(forKey: AppState.accountHardwareIDsKey) ?? "")
+            .split(separator: ",").map(String.init)
+    }
+
     /// Make sure there is a usable address, doing the least work that achieves it.
+    ///
+    /// The cached address is a location, not an identity, so answering is not
+    /// enough: when the device identifies itself (an authorised `/api/health`)
+    /// it has to be the linked camera. See `FeedLink.cachedAddressIsLinkedCamera`.
     func ensureConnection() async {
         if !cachedURL.isEmpty {
             let token = reloadGuard.begin()
-            let ok = await reachable(cachedURL)
+            let probe = await probe(cachedURL)
             guard reloadGuard.isLatest(token) else { return }  // a resolve() has since started/finished
-            if ok {
+            if probe.answered,
+               FeedLink.cachedAddressIsLinkedCamera(reportedID: probe.deviceID, linkedID: serviceName) {
                 state = .connected(url: cachedURL)
                 return
             }
@@ -129,7 +144,12 @@ final class DeviceLink: ObservableObject {
     }
 
     /// Re-discover the device and adopt its current address.
-    func resolve(force: Bool) async {
+    ///
+    /// - Parameter expecting: the SD- id of one specific device (the one setup
+    ///   just provisioned). Only that device is accepted, and it becomes the
+    ///   linked camera only if nothing else is linked yet — setting up a second
+    ///   camera must not silently move the first one's live feed.
+    func resolve(force: Bool, expecting: String? = nil) async {
         if !force, case .searching = state { return }
         let token = reloadGuard.begin()
         state = .searching
@@ -140,22 +160,15 @@ final class DeviceLink: ObservableObject {
         // Prefer the device we were previously linked to. On a network with
         // several SensorDymes, silently adopting a different one would be worse
         // than failing — the user would be watching someone else's camera.
-        var match = found.first { $0.id == serviceName }
-
-        if match == nil, serviceName.isEmpty {
-            match = found.first
-        }
-
-        // Devices linked before identity moved to the device's own ID stored a
-        // Bonjour service name instead. That no longer matches anything, so the
-        // app would report a perfectly healthy device as missing and make the
-        // user re-pair it. Adopt it — but only when exactly one device answers,
-        // so this can never silently rebind someone to a neighbour's camera.
-        if match == nil, !serviceName.hasPrefix("SD-"), found.count == 1 {
-            match = found.first
-        }
-
-        guard let match else {
+        // FeedLink.chooseCamera holds the whole rule, including the migration of
+        // a legacy service name and the "only a camera on this account" filter.
+        let chosen = FeedLink.chooseCamera(
+            found: found.map(\.id),
+            linked: expecting == nil ? serviceName : "",
+            accountHardwareIDs: accountHardwareIDs,
+            expecting: expecting
+        )
+        guard let chosen, let match = found.first(where: { $0.id == chosen }) else {
             // Silence from Bonjour has several causes and the app cannot tell
             // them apart: the device may be powered off, on another network, out
             // of range, or on a network that blocks multicast.
@@ -171,8 +184,13 @@ final class DeviceLink: ObservableObject {
             return
         }
 
-        serviceName = match.id
-        cachedURL = match.url
+        let adopt = expecting == nil
+            || serviceName.isEmpty
+            || serviceName.uppercased() == match.id.uppercased()
+        if adopt {
+            serviceName = match.id
+            cachedURL = match.url
+        }
         lastResolvedAt = Date()
         state = .connected(url: match.url)
     }
@@ -196,22 +214,37 @@ final class DeviceLink: ObservableObject {
     /// A short probe against the device's own health endpoint. Deliberately
     /// brief: this runs on app foreground, and a long timeout would make a
     /// moved device feel like a hung app.
-    private func reachable(_ urlString: String) async -> Bool {
+    ///
+    /// Sends the device token when there is one, because only an authorised
+    /// answer carries the camera's identity — and identity is what this check
+    /// is really for. Without a token a 401/403 still counts as "a SensorDyme
+    /// answered": with no token accepted, the stream cannot show a stranger's
+    /// camera either.
+    private func probe(_ urlString: String) async -> (answered: Bool, deviceID: String?) {
         guard let url = URL(string: urlString)?.appendingPathComponent("api/health") else {
-            return false
+            return (false, nil)
         }
         var request = URLRequest(url: url)
         request.timeoutInterval = 2.5
         request.cachePolicy = .reloadIgnoringLocalCacheData
+        let token = (Keychain.get("deviceToken") ?? "").trimmingCharacters(in: .whitespacesAndNewlines)
+        if !token.isEmpty {
+            request.setValue(token, forHTTPHeaderField: MJPEGStreamRequest.tokenHeader)
+        }
         do {
-            let (_, response) = try await URLSession.shared.data(for: request)
+            let (data, response) = try await URLSession.shared.data(for: request)
             // 200, or 401/403 from a device that wants its token: that is a
             // SensorDyme answering. Anything else (a 404 from whatever now holds
             // this DHCP address) is not, and accepting it reported a stranger's
             // box as the camera.
-            return (response as? HTTPURLResponse).map { [200, 401, 403].contains($0.statusCode) } ?? false
+            let status = (response as? HTTPURLResponse)?.statusCode ?? 0
+            guard [200, 401, 403].contains(status) else { return (false, nil) }
+            let identity = status == 200
+                ? (try? JSONDecoder().decode(DeviceHealth.self, from: data))?.deviceID
+                : nil
+            return (true, identity)
         } catch {
-            return false
+            return (false, nil)
         }
     }
 }
@@ -227,9 +260,14 @@ extension DeviceDiscovery {
     @MainActor
     func discoverOnce(timeout: TimeInterval) async -> [Found] {
         start()
+        let generation = scanGeneration
         try? await Task.sleep(for: .seconds(timeout))
         let results = found
-        stop()
+        // Only stop the browse this call started. When a second search began
+        // while this one slept, `found` and the browser now belong to it, and
+        // stopping here cut it short -- it then returned an empty list and
+        // reported a device that was right there as not found.
+        if scanGeneration == generation { stop() }
         return results
     }
 }

@@ -180,38 +180,9 @@ struct MonitorZone: Codable, Identifiable, Hashable {
 
 struct ZonesResponse: Codable { let zones: [MonitorZone] }
 
-struct EventItem: Codable, Identifiable, Hashable {
-    /// Server row id. Optional so an older backend that omits it still decodes —
-    /// the app just can't ask why that event fired.
-    let eventID: Int?
-    let timestamp: String
-    let type: String
-    let confidence: Double?
-    let signals: String?
-    let severity: String?
-    /// "custom_rule" when this is something the user explicitly configured.
-    /// Optional so an older backend still decodes.
-    let source: String?
-    /// Which exact model produced this event. Nil for events recorded before
-    /// model tracking, and from an older backend that does not send it.
-    var model: EventModel? = nil
-
-    enum CodingKeys: String, CodingKey {
-        case eventID = "id"
-        case timestamp, type, confidence, signals, severity, source, model
-    }
-
-    /// Whether the user asked to be told about this specifically.
-    ///
-    /// Severity alone cannot answer that: a configured rule defaults to
-    /// "warning" -> "soft", which the notifier dropped — so the one event
-    /// someone had asked for was the only one that never arrived.
-    var isConfigured: Bool { source == "custom_rule" }
-
-    var id: String { "\(eventID.map(String.init) ?? "")\(timestamp)\(type)\(signals ?? "")" }
-
-    var date: Date? { ISO8601DateFormatter.flexible.date(from: timestamp) }
-
+/// The severity reading needs the design system's `SDStatus`, so it lives here
+/// rather than beside the Foundation-only `EventItem` (EventModel.swift).
+extension EventItem {
     /// Matches jupiter/explain.py's severity mapping, so the app and the
     /// explanation endpoint never disagree about how alarming something is.
     var severityStatus: SDStatus {
@@ -226,13 +197,6 @@ struct EventItem: Codable, Identifiable, Hashable {
     }
 
     var isCritical: Bool { severityStatus == .alert }
-
-    /// "phone_use_while_distracted" -> "Phone use while distracted"
-    var title: String {
-        let words = type.replacingOccurrences(of: "_", with: " ")
-            .replacingOccurrences(of: ":", with: " in ")
-        return words.prefix(1).uppercased() + words.dropFirst()
-    }
 }
 
 /// One fact the device recorded, as returned by /explain.
@@ -346,11 +310,3 @@ struct Order: Codable, Identifiable, Hashable {
 }
 
 struct OrdersResponse: Codable { let orders: [Order] }
-
-extension ISO8601DateFormatter {
-    static let flexible: ISO8601DateFormatter = {
-        let formatter = ISO8601DateFormatter()
-        formatter.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
-        return formatter
-    }()
-}

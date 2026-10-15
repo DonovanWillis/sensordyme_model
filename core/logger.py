@@ -13,14 +13,23 @@ NUL bytes — which is exactly what was found on the device: 944 NUL bytes acros
 The cost is a real disk sync per event, which would be unacceptable for
 telemetry at two rows a second but is nothing here: a device producing thirty
 events an hour syncs once every two minutes.
+
+A write that fails is logged and dropped, never raised. A full card (ENOSPC)
+or one the kernel remounted read-only (EROFS) makes every write fail, and the
+caller is the inference loop: an exception here used to escape it before the
+alert for the very event being logged was dispatched, and then kill the loop
+on each restart. Losing a log row is bad; losing detection is worse.
 """
 
 from __future__ import annotations
 
+import contextlib
 import csv
+import math
 import os
+import time
 from pathlib import Path
-from typing import Union
+from typing import Any, Union
 
 from core.events import Event
 from core.logging_setup import get_logger
@@ -28,6 +37,54 @@ from core.logging_setup import get_logger
 log = get_logger("logger")
 
 _HEADER = ["timestamp", "type", "duration_s", "confidence", "module", "contributing_signals"]
+
+#: How often a persistently failing write is re-reported. Every event would
+#: otherwise log a stack of identical errors on a card that is simply full.
+_ERROR_LOG_EVERY_S = 60.0
+
+
+class _WriteErrors:
+    """Rate-limited reporting for a write path that may fail on every call."""
+
+    def __init__(self, what: str) -> None:
+        self._what = what
+        self._last_logged = -math.inf
+        self._suppressed = 0
+
+    def report(self, exc: BaseException) -> None:
+        now = time.monotonic()
+        if now - self._last_logged < _ERROR_LOG_EVERY_S:
+            self._suppressed += 1
+            return
+        extra = f" ({self._suppressed} more since the last report)" if self._suppressed else ""
+        log.error("could not write the %s: %s%s", self._what, exc, extra)
+        self._last_logged = now
+        self._suppressed = 0
+
+
+def _is_empty_or_missing(path: Path) -> bool:
+    """Whether a CSV needs its header written.
+
+    `not exists()` alone is wrong for an existing EMPTY file -- what repair()
+    leaves when the only line was damaged, or what a power cut leaves right
+    after creation -- and rows appended to it have no header at all, so every
+    reader keyed by column name takes the first event as the header.
+    """
+    try:
+        return path.stat().st_size == 0
+    except FileNotFoundError:
+        return True
+
+
+def _close_quietly(handle) -> None:
+    """Close a file whose final flush may fail (a full card): the close must
+    still release the descriptor and must not raise into a shutdown path."""
+    try:
+        handle.close()
+    except OSError as exc:
+        log.warning("closing a log file lost buffered data: %s", exc)
+        with contextlib.suppress(OSError):
+            handle.close()  # buffered data is discarded; the descriptor is released
 
 
 def repair(path: Union[str, Path]) -> int:
@@ -84,28 +141,71 @@ class EventLogger:
         each having to tolerate corruption separately.
         """
         self._path = Path(csv_path)
-        self._path.parent.mkdir(parents=True, exist_ok=True)
+        self._errors = _WriteErrors(f"event log {self._path}")
+        self._file: Any = None    # open text file, or None while it cannot be opened
+        self._writer: Any = None
+        self._last_open_attempt = -math.inf
+        try:
+            self._path.parent.mkdir(parents=True, exist_ok=True)
+        except OSError as exc:
+            self._errors.report(exc)
         repair(self._path)
-        is_new = not self._path.exists()
-        self._file = self._path.open("a", newline="")
-        self._writer = csv.writer(self._file)
-        if is_new:
-            self._writer.writerow(_HEADER)
+        self._open()
+
+    def _open(self) -> bool:
+        """Open for append, writing the header to a new or empty file.
+
+        False (and logged) when the file cannot be opened -- a read-only card
+        must not stop the device booting; log() retries now and then.
+        """
+        self._last_open_attempt = time.monotonic()
+        handle = None
+        try:
+            needs_header = _is_empty_or_missing(self._path)
+            handle = self._path.open("a", newline="")
+            writer = csv.writer(handle)
+            if needs_header:
+                writer.writerow(_HEADER)
+                handle.flush()
+        except OSError as exc:
+            self._errors.report(exc)
+            if handle is not None:
+                _close_quietly(handle)
+            return False
+        self._file, self._writer = handle, writer
+        if needs_header:
             self._sync()
+        return True
+
+    def _ensure_open(self) -> bool:
+        """Whether the file is open, retrying an earlier failure once a minute."""
+        if self._file is not None:
+            return True
+        if time.monotonic() - self._last_open_attempt < _ERROR_LOG_EVERY_S:
+            return False
+        return self._open()
 
     def log(self, event: Event) -> None:
-        """Append one event as a CSV row and sync it to the card."""
-        self._writer.writerow(
-            [
-                event.timestamp.isoformat(),
-                event.type,
-                f"{event.duration:.3f}",
-                "" if event.confidence is None else f"{event.confidence:.3f}",
-                event.module_name,
-                event.contributing_signals,
-            ]
-        )
-        self._sync()
+        """Append one event as a CSV row and sync it to the card. Never raises
+        on a write failure: the row is dropped and the failure logged."""
+        if not self._ensure_open():
+            return
+        try:
+            self._writer.writerow(
+                [
+                    event.timestamp.isoformat(),
+                    event.type,
+                    f"{event.duration:.3f}",
+                    "" if event.confidence is None else f"{event.confidence:.3f}",
+                    event.module_name,
+                    event.contributing_signals,
+                ]
+            )
+            self._file.flush()
+        except OSError as exc:
+            self._errors.report(exc)
+            return
+        self._fsync()
 
     def _sync(self) -> None:
         """Flush to the OS and then to the card.
@@ -114,7 +214,14 @@ class EventLogger:
         kernel may write after it has already extended the file, which is how a
         power cut produces a longer file full of NULs.
         """
-        self._file.flush()
+        try:
+            self._file.flush()
+        except OSError as exc:
+            self._errors.report(exc)
+            return
+        self._fsync()
+
+    def _fsync(self) -> None:
         try:
             os.fsync(self._file.fileno())
         except OSError as exc:
@@ -123,11 +230,14 @@ class EventLogger:
             log.warning("could not sync the event log: %s", exc)
 
     def close(self) -> None:
-        """Flush, sync and close the underlying file."""
+        """Flush, sync and close the underlying file. Never raises on I/O errors."""
+        if self._file is None:
+            return
         try:
             self._sync()
         finally:
-            self._file.close()
+            _close_quietly(self._file)
+            self._file = None
 
     def __enter__(self) -> "EventLogger":
         return self

@@ -10,6 +10,12 @@ import Foundation
 // its own replacement. Sessions multiplied, at least one became orphaned and
 // impossible to cancel, and the badge -- which was only ever cleared inside the
 // "a frame decoded" branch -- stayed on.
+//
+// MJPEGReader itself (FeedViews.swift) needs URLSession delegates and UIKit, so
+// it cannot be compiled here. Every decision it makes is in MJPEGStream.swift
+// instead -- `CurrentConnection` (which callbacks may act), `MJPEGReaderPolicy`
+// (restart, completion, re-resolve) -- and the reader calls exactly those, so
+// the tests below exercise the reader's real logic, not a description of it.
 
 var failures = 0
 func check(_ condition: Bool, _ what: String) {
@@ -322,12 +328,84 @@ do {
     // Not a tautology: it pins the relationship that produced the symptom, so if
     // the retry cap ever grows past the request timeout, this is the place that
     // says the ratio has changed.
-    let requestTimeout = 15.0          // MJPEGReader.idleTimeout
+    let requestTimeout = MJPEGReaderPolicy.idleTimeout   // what MJPEGReader uses
     let policy = MJPEGRetryPolicy()
     check(policy.delay(forAttempt: 0) < requestTimeout,
           "the first retry delay is far shorter than a connection timeout")
     check(policy.maximumDelay <= requestTimeout,
           "even the capped delay does not exceed it — so a bare 'connecting…' would always dominate")
+}
+
+// ------------------------------------------------- which callbacks may act
+print("\nonly the current connection's callbacks act (the session storm):")
+do {
+    final class Session {}
+    let gate = CurrentConnection<Session>()
+    let a = Session(), b = Session(), c = Session()
+    gate.replace(with: a)
+    check(gate.isCurrent(a), "the open connection's callbacks act")
+    // stop() then start(): A is cancelled, B opens before A's completion arrives.
+    gate.clear()
+    gate.replace(with: b)
+    check(!gate.isCurrent(a), "A's late completion is dropped -- it must not tear down B (the storm)")
+    check(gate.isCurrent(b), "B's callbacks act")
+    gate.replace(with: c)
+    check(!gate.isCurrent(b) && gate.isCurrent(c), "each replacement supersedes the one before")
+    gate.clear()
+    check(!gate.isCurrent(c), "after stop(), nothing acts")
+}
+
+// ------------------------------------------------------- what start() does
+print("\nstart() restarts only when something changed:")
+do {
+    func restart(stopped: Bool = false, state: MJPEGStreamState = .streaming,
+                 base: String = "http://d:8899", token: String = "t") -> Bool {
+        MJPEGReaderPolicy.needsRestart(stopped: stopped, state: state,
+                                       currentBase: "http://d:8899", currentToken: "t",
+                                       base: base, token: token)
+    }
+    check(!restart(), "the same target on a healthy stream is left alone (no stutter)")
+    check(!restart(state: .reconnecting(attempt: 2, reason: nil)), "nor is one already retrying")
+    check(!restart(state: .unauthorized(hasToken: true)),
+          "a refused token with the same token stays refused rather than looping")
+    check(restart(token: "new"), "a new token reconnects")
+    check(restart(base: "http://e:8899"), "a new address reconnects")
+    check(restart(stopped: true), "a stopped reader starts")
+    check(restart(state: .idle), "an idle reader starts")
+}
+
+// ------------------------------------------------- what a finished stream means
+print("\na finished connection is classified by what actually answered:")
+do {
+    let timeout = NSError(domain: NSURLErrorDomain, code: NSURLErrorTimedOut)
+    let refused = NSError(domain: NSURLErrorDomain, code: NSURLErrorCannotConnectToHost)
+    check(MJPEGReaderPolicy.completion(status: 401, error: nil, hasToken: true) == .unauthorized(hasToken: true),
+          "401 is a token problem, not a drop")
+    check(MJPEGReaderPolicy.completion(status: 403, error: nil, hasToken: false) == .unauthorized(hasToken: false),
+          "and so is 403, remembering whether a token was sent")
+    check(MJPEGReaderPolicy.completion(status: 200, error: timeout, hasToken: true)
+          == .reconnect(reason: MJPEGReaderPolicy.cameraStalledReason, countsAsTransportFailure: false),
+          "200 then silence is a stalled CAMERA -- not 'the device didn't answer', and no reason to re-resolve")
+    if case let .reconnect(reason, counts) = MJPEGReaderPolicy.completion(status: nil, error: refused, hasToken: true) {
+        check(counts, "nothing answering counts toward re-resolving the address")
+        check(reason?.contains("new address") == true, "and says why")
+    } else {
+        check(false, "a refused connection is retried")
+    }
+    if case let .reconnect(_, counts) = MJPEGReaderPolicy.completion(status: 404, error: nil, hasToken: true) {
+        check(counts, "a 404 from whatever now holds the address counts too")
+    } else {
+        check(false, "a 404 is retried")
+    }
+}
+
+print("\nre-resolving the address is rate-limited:")
+do {
+    check(!MJPEGReaderPolicy.shouldReresolve(consecutiveFailures: 2, sinceLastRecheck: 999),
+          "two failures are not enough")
+    check(MJPEGReaderPolicy.shouldReresolve(consecutiveFailures: 3, sinceLastRecheck: 20), "three are")
+    check(!MJPEGReaderPolicy.shouldReresolve(consecutiveFailures: 9, sinceLastRecheck: 5),
+          "but not again within the recheck interval")
 }
 
 print(failures == 0 ? "\nPASSED" : "\n\(failures) FAILURE(S)")

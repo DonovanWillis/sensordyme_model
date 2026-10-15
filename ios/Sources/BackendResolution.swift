@@ -374,9 +374,29 @@ enum BackendResolution {
         "Refusing to send your sign-in to \(host) without encryption. A server on the internet must use https://."
     }
 
+    /// Loopback by name or by address.
+    ///
+    /// The address check is "an IPv4 literal in 127/8", not "starts with 127.":
+    /// the prefix test also matched `127.0.0.1.attacker.example`, a DNS name that
+    /// can resolve anywhere, and `cleartextPermitted` then let a password travel
+    /// to it in the clear.
     static func isLoopbackName(_ host: String) -> Bool {
-        let name = host.lowercased()
-        return name == "localhost" || name.hasSuffix(".localhost") || name.hasPrefix("127.")
+        var name = host.lowercased()
+        if name.hasPrefix("[") && name.hasSuffix("]") { name = String(name.dropFirst().dropLast()) }
+        if name == "localhost" || name.hasSuffix(".localhost") { return true }
+        if name == "::1" || name == "0:0:0:0:0:0:0:1" { return true }
+        return name.hasPrefix("127.") && isIPv4Literal(name)
+    }
+
+    /// A resolved address as it must appear in a URL's host position.
+    ///
+    /// NWEndpoint renders a link-local IPv6 address with its interface scope
+    /// (`fe80::1%en0`). The scope has to come off BEFORE the brackets go on:
+    /// stripping it afterwards cut `[fe80::1%en0]` down to `[fe80::1`, an
+    /// unterminated literal that `URL(string:)` rejects outright.
+    static func urlHostLiteral(_ address: String, isIPv6: Bool) -> String {
+        let unscoped = address.split(separator: "%", maxSplits: 1).first.map(String.init) ?? address
+        return isIPv6 ? "[\(unscoped)]" : unscoped
     }
 
     static func isIPLiteral(_ host: String) -> Bool {
@@ -543,6 +563,11 @@ enum BackendResolution {
     /// found and verified and becomes active, then A's verification finally
     /// returns and overwrites it. Generations make "newest verified wins" a
     /// check rather than a hope.
+    ///
+    /// AppState bumps its generation whenever something newer takes over (a
+    /// reconnect, a typed address being pinned, a discovery result being
+    /// adopted) and every resolve, heartbeat and foreground revalidation checks
+    /// this after each network wait, before it writes any connection state.
     static func verificationIsCurrent(generation: Int, current: Int) -> Bool {
         generation >= current
     }

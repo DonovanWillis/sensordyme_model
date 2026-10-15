@@ -58,24 +58,23 @@ final class AlertNotifier: NSObject, ObservableObject {
         set { UserDefaults.standard.set(newValue?.timeIntervalSince1970 ?? 0, forKey: "lastNotifiedAt") }
     }
 
-    /// Event ids already announced. Persisted because the poller re-reads the
-    /// same events every few seconds, and re-announcing them would turn one
-    /// event into a stream of duplicate alerts.
-    private var announced: Set<Int> {
-        get { Set(UserDefaults.standard.array(forKey: "announcedEvents") as? [Int] ?? []) }
-        set {
-            // Bounded to the NEWEST ids. `newValue.suffix(500)` was the obvious
-            // spelling and the wrong one: a Set has no order, so it kept an
-            // arbitrary 500 and could drop an id announced seconds ago — which the
-            // next poll then re-announces as a duplicate. See
-            // NotificationPolicy.trimAnnounced.
-            UserDefaults.standard.set(NotificationPolicy.trimAnnounced(newValue), forKey: "announcedEvents")
-        }
+    /// Per device, the newest event id already considered. Persisted because
+    /// the poller re-reads the same events every few seconds, and re-announcing
+    /// them would turn one event into a stream of duplicate alerts. Per device
+    /// rather than one global set: see `NotificationPolicy.freshEvents`.
+    private static let marksKey = "announcedMarks"
+    /// The global newest-500 set this replaces. Removed, never read.
+    private static let legacyAnnouncedKey = "announcedEvents"
+
+    private var marks: [String: Int] {
+        get { UserDefaults.standard.dictionary(forKey: Self.marksKey) as? [String: Int] ?? [:] }
+        set { UserDefaults.standard.set(newValue, forKey: Self.marksKey) }
     }
 
     private override init() {
         super.init()
         UNUserNotificationCenter.current().delegate = self
+        UserDefaults.standard.removeObject(forKey: Self.legacyAnnouncedKey)
     }
 
     /// Forget which events were announced, for a different account or the demo.
@@ -84,7 +83,7 @@ final class AlertNotifier: NSObject, ObservableObject {
     /// `lastNotifiedAt` is kept: the cooldown still applies, so the first poll
     /// afterwards cannot turn old history into a burst of alerts.
     func forgetAnnounced() {
-        UserDefaults.standard.removeObject(forKey: "announcedEvents")
+        UserDefaults.standard.removeObject(forKey: Self.marksKey)
     }
 
     func requestPermission() async {
@@ -106,12 +105,27 @@ final class AlertNotifier: NSObject, ObservableObject {
     /// Announce any events not yet seen. Safe to call on every poll.
     func announce(_ events: [EventItem], device: Device, simulated: Bool) async {
         guard authorized else { return }
-        var seen = announced
-        var suppressed = 0
+        let key = String(device.id)
+        var allMarks = marks
+        let (fresh, mark) = NotificationPolicy.freshEvents(
+            ids: events.compactMap(\.eventID), mark: allMarks[key]
+        )
+        allMarks[key] = mark
+        // Stored before anything is awaited. The decision below is made, and
+        // `lastNotifiedAt` moved, before posting too: posting suspends, and a
+        // second poll arriving in that gap (a quick inactive -> active, which
+        // restarts the watcher) used to read the old state and post the same
+        // event again.
+        marks = allMarks
 
+        var byID: [Int: EventItem] = [:]
+        for event in events { if let id = event.eventID, byID[id] == nil { byID[id] = event } }
+
+        var toPost: [EventItem] = []
+        var suppressed = 0
         // Oldest first, so a burst arrives in the order it happened.
-        for event in events.reversed() {
-            guard let id = event.eventID else { continue }
+        for id in fresh {
+            guard let event = byID[id] else { continue }
 
             // The whole decision lives in NotificationPolicy, which is a pure
             // function with tests. Inlining it here is how it drifted before:
@@ -121,16 +135,14 @@ final class AlertNotifier: NSObject, ObservableObject {
             let decision = NotificationPolicy.decide(
                 isCritical: event.isCritical,
                 isConfigured: event.isConfigured,
-                alreadySeen: seen.contains(id),
+                alreadySeen: false,
                 now: Date(),
                 lastNotifiedAt: lastNotifiedAt,
                 cooldown: Self.cooldown
             )
-            seen.insert(id)   // considered, whatever we decide — never reconsidered
-
             switch decision {
             case .notify:
-                await post(event, device: device, simulated: simulated)
+                toPost.append(event)
                 lastNotifiedAt = Date()
             case .suppress(.withinCooldown):
                 // Recorded, not interrupted. Already in the event history.
@@ -140,9 +152,11 @@ final class AlertNotifier: NSObject, ObservableObject {
             }
         }
 
-        announced = seen
         if suppressed > 0 {
             suppressedDuringCooldown += suppressed
+        }
+        for event in toPost {
+            await post(event, device: device, simulated: simulated)
         }
     }
 
@@ -187,9 +201,14 @@ final class AlertNotifier: NSObject, ObservableObject {
         return parts.joined(separator: " · ")
     }
 
-    /// Forget what has been announced — so a rehearsed demo can be run twice.
+    /// Let a rehearsed demo alert through at once.
+    ///
+    /// Every demo trigger is a new event, so it is never "already announced";
+    /// what holds a second rehearsal back is the 20-second cooldown. Clearing
+    /// the per-device marks instead would only make the next poll treat
+    /// everything as history (see `NotificationPolicy.freshEvents`).
     func resetAnnounced() {
-        UserDefaults.standard.removeObject(forKey: "announcedEvents")
+        lastNotifiedAt = nil
     }
 }
 

@@ -211,8 +211,8 @@ def backend(tmp_path, monkeypatch):
 
 def test_endpoint_explains_a_real_stored_event(backend):
     _, client, headers = backend
-    event_id = client.get("/v1/devices/1/events", headers=headers).json()["events"]
-    resp = client.get("/v1/devices/1/events/1/explain", headers=headers)
+    event_id = client.get("/v1/devices/1/events", headers=headers).json()["events"][0]["id"]
+    resp = client.get(f"/v1/devices/1/events/{event_id}/explain", headers=headers)
     assert resp.status_code == 200
     body = resp.json()
     assert body["severity"] == CRITICAL
@@ -254,3 +254,56 @@ def test_routine_events_may_still_be_rephrased():
     result = explain(routine, provider=provider)
     assert result.severity == INFO
     assert result.narrative == "Someone walked through."
+
+
+# --------------------------------------------------------------------- AI-rule events
+# services/runtime.py `_emit_rule_alert` sends an AI rule's alert with
+# type=<target>, signals=<the rule's description (or count message)> and
+# source="custom_rule". These pin how explain() reads that shape.
+POOL_AND_EMPTY = json.dumps({"rules": [
+    {"target": "person", "predicate": "absent", "description": "Room became empty",
+     "persist_s": 10.0, "schedule": "23:00-06:00", "zone": ""},
+    {"target": "person", "predicate": "in_zone", "description": "Someone at the pool",
+     "persist_s": 3.0, "schedule": "", "zone": "pool"},
+]})
+
+
+def test_one_target_with_several_rules_is_not_explained_by_the_first_one():
+    """A pool alert used to be explained with the OTHER person rule's schedule."""
+    assert parse_rule_for_event(POOL_AND_EMPTY, "person") is None
+
+
+def test_the_events_own_description_picks_its_rule_among_several():
+    rule = parse_rule_for_event(POOL_AND_EMPTY, "person", signals="Someone at the pool")
+    assert rule is not None and rule["zone"] == "pool"
+    event = {"type": "person", "severity": "soft", "source": "custom_rule",
+             "signals": "Someone at the pool", "duration": 3.0}
+    text = explain(event, rule).plain_text()
+    assert "23:00" not in text and "3 seconds" in text
+
+
+def test_signals_that_match_no_rule_still_claim_nothing():
+    assert parse_rule_for_event(POOL_AND_EMPTY, "person", signals="2 persons visible") is None
+
+
+def test_a_configured_rules_sentence_is_one_fact_not_split_on_commas():
+    event = {"type": "person", "severity": "soft", "source": "custom_rule",
+             "signals": "Bottle raised to the mouth (an approximation of drinking, "
+                        "not a confirmed one)"}
+    labels = [f.label for f in facts_from_event(event)]
+    assert labels == [event["signals"]]
+
+
+def test_module_signals_are_still_split_into_facts():
+    labels = [f.label for f in facts_from_event(
+        {"type": "distraction", "source": "module", "signals": "gaze_off + phone, hand_overlap"})]
+    assert labels == ["Gaze off", "Phone", "Hand overlap"]
+
+
+def test_no_recorded_facts_means_the_model_is_not_asked_to_narrate():
+    """Handed "Observations:" and nothing else, a model writes fiction."""
+    provider = ScriptedProvider(config={"default": "A stranger tried the front door twice."})
+    result = explain({"type": "person", "severity": "soft"}, None, provider=provider)
+    assert provider.calls == []
+    assert result.source == "facts"
+    assert "stranger" not in result.as_dict()["narrative"]

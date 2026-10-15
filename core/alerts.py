@@ -11,6 +11,14 @@ Escalation policy:
     a repeat within `escalation_window_s` escalates to a continuous tone.
   * No alert of the same type fires more than once per `cooldown_s`, regardless
     of level (debounces rapid repeated detections).
+  * A caller that knows better can pass `key=` (what the cooldown and
+    escalation are tracked by, instead of the event type) and `level=` (the
+    level to play, instead of the policy above). AI-configured rules need both:
+    every rule's event is typed by the object it watches ("person"), so keyed by
+    type an info rule about the front door silenced a critical pool rule for the
+    whole cooldown, and the critical one then played the soft chirp.
+  * A sink that raises is logged and skipped; it never stops the other sinks or
+    propagates into the inference loop that called notify().
 """
 
 from __future__ import annotations
@@ -24,6 +32,9 @@ from enum import Enum
 from typing import Optional, Protocol
 
 from core.events import Event
+from core.logging_setup import get_logger
+
+log = get_logger("alerts")
 
 
 class AlertLevel(Enum):
@@ -61,7 +72,7 @@ class SoundSink:
     def __init__(self) -> None:
         """Detect the best available playback backend."""
         try:
-            import simpleaudio  # type: ignore
+            import simpleaudio  # type: ignore[import-not-found]
 
             self._simpleaudio = simpleaudio
         except ImportError:
@@ -131,7 +142,7 @@ class SoundSink:
             wf.setsampwidth(2)
             wf.setframerate(fs)
             wf.writeframes(tone.tobytes())
-        subprocess.run(["aplay", "-q", path], check=False)
+        subprocess.run(["aplay", "-q", path], check=False)  # noqa: S603, S607 - fixed argv, our own temp file
         os.unlink(path)
 
 
@@ -143,6 +154,14 @@ class GPIOBuzzerSink:
         from gpiozero import Buzzer  # lazy import: this line never executes on Mac
 
         self._buzzer = Buzzer(pin)
+        # One physical buzzer, many overlapping requests. Each buzz used to own
+        # an on/sleep/off thread, so a short buzz that overlapped a longer one
+        # switched the buzzer OFF in the middle of it: a soft chime 50ms before
+        # a loud alarm cut the alarm to ~0.1s. `_off_at` is the latest moment
+        # any outstanding request wants the buzzer on; only the request that
+        # owns that moment may turn it off.
+        self._lock = threading.Lock()
+        self._off_at = 0.0
 
     def emit(self, event: Event, level: AlertLevel) -> None:
         """Buzz briefly for SOFT alerts, longer for CONTINUOUS ones.
@@ -156,9 +175,17 @@ class GPIOBuzzerSink:
         threading.Thread(target=self._buzz, args=(on_s,), daemon=True).start()
 
     def _buzz(self, on_s: float) -> None:
-        self._buzzer.on()
-        time.sleep(on_s)
-        self._buzzer.off()
+        try:
+            with self._lock:
+                self._off_at = max(self._off_at, time.monotonic() + on_s)
+                self._buzzer.on()
+            time.sleep(on_s)
+            with self._lock:
+                # A later or longer request extended _off_at: leave it on.
+                if time.monotonic() >= self._off_at - 1e-3:
+                    self._buzzer.off()
+        except Exception as exc:  # noqa: BLE001 - a GPIO fault must never kill anything
+            log.warning("buzzer failed: %s", exc)
 
 
 class AlertManager:
@@ -187,30 +214,48 @@ class AlertManager:
         self._fixed_levels = fixed_levels or {}
         self._last_alert_time: dict[str, float] = {}
 
-    def notify(self, event: Event, now: Optional[float] = None) -> AlertLevel:
+    def notify(
+        self,
+        event: Event,
+        now: Optional[float] = None,
+        *,
+        key: Optional[str] = None,
+        level: Optional[AlertLevel] = None,
+    ) -> AlertLevel:
         """Apply escalation/cooldown policy for `event` and dispatch to all sinks.
 
         Args:
             event: The triggering event.
             now: Override for the current time (monotonic seconds); used by tests.
+            key: What cooldown and escalation are tracked by. Defaults to
+                `event.type`; pass something finer (e.g. a rule id) when one
+                event type covers alerts that must not silence each other.
+            level: The level to dispatch at, overriding fixed levels and
+                time-based escalation. The cooldown still applies.
 
         Returns:
             The AlertLevel that was (or would have been) dispatched.
         """
         now = time.monotonic() if now is None else now
-        last = self._last_alert_time.get(event.type)
+        cooldown_key = event.type if key is None else key
+        last = self._last_alert_time.get(cooldown_key)
 
         if last is not None and (now - last) < self._cooldown_s:
             return AlertLevel.SUPPRESSED
 
-        if event.type in self._fixed_levels:
-            level = self._fixed_levels[event.type]
+        if level is not None:
+            chosen = level
+        elif event.type in self._fixed_levels:
+            chosen = self._fixed_levels[event.type]
         elif last is not None and (now - last) < self._escalation_window_s:
-            level = AlertLevel.CONTINUOUS
+            chosen = AlertLevel.CONTINUOUS
         else:
-            level = AlertLevel.SOFT
+            chosen = AlertLevel.SOFT
 
-        self._last_alert_time[event.type] = now
+        self._last_alert_time[cooldown_key] = now
         for sink in self._sinks:
-            sink.emit(event, level)
-        return level
+            try:
+                sink.emit(event, chosen)
+            except Exception as exc:  # noqa: BLE001 - one broken sink must not silence the rest
+                log.error("alert sink %s failed: %s", type(sink).__name__, exc)
+        return chosen

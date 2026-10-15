@@ -64,6 +64,24 @@ server logs a warning, serves normally, and the app falls back to Settings.
 
 Changing the secret invalidates existing tokens — the app will ask you to sign in again.
 
+If another SensorDyme backend on the same network already answers for
+`sensordyme-backend.local`, this one does not claim that name too (two machines
+answering for one name sends devices to whichever replies first). It announces
+itself as `sensordyme-backend-<id>.local` instead and logs a warning naming it;
+point this backend's devices at that name. One backend per network — the normal
+case — keeps the plain name.
+
+## Sessions
+
+A session token names its account by row id **and** email, and the email is
+checked against the database on every request. A token whose account is not the
+one in this database (the database was replaced or imported under the same
+signing key) is refused with 401 rather than read as whoever now has that row id.
+
+Tokens issued before tokens carried the email are refused the same way: after
+upgrading, every signed-in phone signs in once more. That is deliberate and
+one-time.
+
 ## Provision a device
 
 ```bash
@@ -194,12 +212,17 @@ fly apps restart
 `scripts/fly_import_db.py` refuses anything that is not a healthy SensorDyme
 database — the realistic mistake is uploading the freshly-created *empty* file
 and wiping the deployment with it — and backs up whatever it replaces on the
-volume before writing.
+volume before writing (through SQLite's backup API, so commits still in the
+live database's WAL are in the backup too).
 
-The JWT secret is deliberately **not** migrated: a fresh key is generated on the
-volume, so everyone signs in once more. Accounts, devices, device keys and event
-history all come across; only sessions do not. Copy `cloud/.jwt_secret` to
-`/data/.jwt_secret` (mode 0600) if you would rather keep existing sessions alive.
+Sessions do not come across: the import **rotates** the signing key at
+`$SENSORDYME_JWT_SECRET_FILE` (`/data/.jwt_secret`), so every phone signs in once
+more after `fly apps restart` — including anyone who signed in to the fresh
+deployment before the import. Accounts, devices, device keys and event history
+all come across. To keep the imported database's own sessions alive instead,
+copy `cloud/.jwt_secret` to `/data/.jwt_secret` (mode 0600) and run the import
+with `--keep-sessions`. If the key comes from `SENSORDYME_JWT_SECRET`, the script
+cannot rotate it and says so: rotate it with `fly secrets set`.
 
 ### Rate limiting behind the proxy
 
@@ -210,6 +233,31 @@ the proxy for *every* request — so without it all users share one
 login with ten tries. `app.py` trusts no header unless this names one, because a
 header the proxy does not overwrite is spoofable by exactly the caller being
 limited.
+
+An IPv6 caller is limited per /64 (the block one host controls), not per
+address, and failed logins are also limited per account: 20 per 15 minutes per
+email, from any address. Only failures count, so normal sign-ins never use it
+up; the cost is that someone who knows an email can stop it signing in on a new
+phone for that window (existing sessions are unaffected).
+
+## Event retention
+
+Events are deleted after `SENSORDYME_EVENT_RETENTION_DAYS` (default 90) and
+capped at `SENSORDYME_EVENT_MAX_PER_DEVICE` (default 100000, newest kept) per
+device; `0` turns either limit off. It runs at most hourly, after an ingest
+response, in small batches. Without it the 1 GB volume fills, and a full disk
+fails every ingest (now with a 503, which devices retry, rather than a 200 that
+made them drop the batch).
+
+## Notifications
+
+A notification goes out for a `loud` event, or for one from a rule the user
+configured (`source: custom_rule`), at most one per account per 20 s. Push is
+always used; SMS only for `loud` events (the account's "text me on loud alerts"
+setting). An event carrying `notify` — a configured rule's own choice — is
+honoured: `silent` sends nothing, `sms` push and SMS whatever the severity,
+and `push` (the default) behaves like no choice at all — push, plus SMS for a
+`loud` event.
 
 **Do not** generate the JWT secret inline on the command line
 (`export SENSORDYME_JWT_SECRET=$(openssl rand -hex 32)`, as this file used to

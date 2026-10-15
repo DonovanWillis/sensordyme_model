@@ -171,6 +171,11 @@ struct DiagnosticsView: View {
                     .joined(separator: ", ")
                 results.append(.init(name: "Device reachable", passed: true,
                                      detail: "overall \(health.state)\(summary.isEmpty ? "" : " (\(summary))")"))
+            } catch let error as APIError where error.status == 401 || error.status == 403 {
+                // The device answered and refused the token: a settings problem,
+                // so no advice about Wi-Fi or power, which cannot fix it.
+                results.append(.init(name: "Device reachable", passed: false,
+                                     detail: "the device answered but \(error.message)"))
             } catch {
                 results.append(.init(name: "Device reachable", passed: false,
                                      detail: "\(error.localizedDescription) Same Wi-Fi? Device powered?"))

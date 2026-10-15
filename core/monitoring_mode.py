@@ -28,7 +28,7 @@ from enum import Enum
 from typing import Optional
 
 
-class MonitoringMode(str, Enum):
+class MonitoringMode(str, Enum):  # noqa: UP042 - StrEnum would change str()/format() of members
     OFF = "off"
     STANDARD = "standard"
     AI_CUSTOM = "ai_custom"

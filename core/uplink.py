@@ -23,10 +23,31 @@ from typing import Optional
 #: the backend accepts turns every flush after a long outage into a 422.
 MAX_QUEUE = 1000
 
-#: HTTP answers that say "try again later" or "fix the key", not "this body is
-#: wrong". Any OTHER 4xx means the backend will refuse the same batch every
-#: time, so re-queuing it would block every newer alert behind it forever.
-_RETRYABLE_4XX = frozenset({401, 403, 408, 409, 425, 429})
+#: The ONLY answers that mean "this body is wrong, and will be wrong every time":
+#: the request was read and refused for its content. A batch answered with one of
+#: these is dropped so it cannot block every newer alert behind it forever.
+#:
+#: Deliberately an allow-list. It used to be "any 4xx except a retryable few",
+#: which also dropped batches for answers that say nothing about the batch -- a
+#: 404 from a wrong base_url path or a proxy, a 405 from a POST that a 301 had
+#: turned into a GET -- so a misconfigured address silently discarded every
+#: alert, each poll, for as long as it stayed wrong. Everything else is kept and
+#: retried; a 413 for a single event (too big to ever fit) is handled separately.
+_BODY_REJECTED_4XX = frozenset({400, 422})
+
+
+class _RedirectedError(Exception):
+    """The backend answered with a redirect, which this client refuses to follow.
+
+    Following one re-sends X-Device-Key to wherever the Location points (requests
+    strips only `Authorization` on a cross-host hop), and a 301/302 turns the POST
+    into a GET that can never succeed.
+    """
+
+    def __init__(self, response) -> None:
+        self.response = response
+        self.location = (getattr(response, "headers", None) or {}).get("Location", "")
+        super().__init__(f"HTTP {response.status_code} redirect to {self.location or '?'}")
 
 #: Most events sent in one POST. A backlog after a long outage used to go up
 #: whole, and a large one exceeds the backend's body limit (413); sending it in
@@ -129,7 +150,14 @@ class CloudUplink:
         self._stop.set()
 
     # ------------------------------------------------------------------ main-loop side
-    def push_event(self, event, severity: str, source: str = "module", model: Optional[dict] = None) -> None:
+    def push_event(
+        self,
+        event,
+        severity: str,
+        source: str = "module",
+        model: Optional[dict] = None,
+        notify: Optional[str] = None,
+    ) -> None:
         """Queue one alert event for the next sync cycle.
 
         `source` distinguishes a preset's own detection from something the user
@@ -148,37 +176,42 @@ class CloudUplink:
         notification for something that already fired once. The server
         deduplicates on (device_id, event_key) — see cloud/app.py's ingest
         INSERT — so a resend is a no-op instead of a duplicate.
+
+        `notify` is a rule's own delivery choice (e.g. "push", "sms", "silent"),
+        sent only when given so the backend can honour it; events without one
+        carry no `notify` key at all, exactly as before.
         """
         with self._lock:
-            self._queue.append(
-                {
-                    "event_key": uuid.uuid4().hex,
-                    # Which exact model produced this: module + detector name,
-                    # sha256 and backend (DeviceRuntime.model_identity). Taken
-                    # NOW, at queue time, so an event queued before a module
-                    # switch keeps the identity of the model that produced it.
-                    "model": _json_safe(dict(model)) if model else None,
-                    "timestamp": event.timestamp.isoformat(),
-                    "type": event.type,
-                    # None is a statement ("no graded evidence"), not a missing 0:
-                    # see core/confidence.py. Sent as null, stored as NULL.
-                    "confidence": (
-                        None if event.confidence is None
-                        else round(_finite(event.confidence), 3)
-                    ),
-                    "signals": _json_safe(event.contributing_signals),
-                    # Seconds the condition was sustained before this fired --
-                    # already computed by every module (Event.duration), but
-                    # previously dropped here rather than sent, so a genuinely
-                    # informative number never reached a notification. Used as
-                    # a fallback when `signals` is empty (e.g. fall_detection's
-                    # "fall" event carries no signals text today) rather than
-                    # the bare, contextless "alert" that produced.
-                    "duration": round(_finite(event.duration), 3),
-                    "severity": severity,
-                    "source": source,
-                }
-            )
+            item = {
+                "event_key": uuid.uuid4().hex,
+                # Which exact model produced this: module + detector name,
+                # sha256 and backend (DeviceRuntime.model_identity). Taken
+                # NOW, at queue time, so an event queued before a module
+                # switch keeps the identity of the model that produced it.
+                "model": _json_safe(dict(model)) if model else None,
+                "timestamp": event.timestamp.isoformat(),
+                "type": event.type,
+                # None is a statement ("no graded evidence"), not a missing 0:
+                # see core/confidence.py. Sent as null, stored as NULL.
+                "confidence": (
+                    None if event.confidence is None
+                    else round(_finite(event.confidence), 3)
+                ),
+                "signals": _json_safe(event.contributing_signals),
+                # Seconds the condition was sustained before this fired --
+                # already computed by every module (Event.duration), but
+                # previously dropped here rather than sent, so a genuinely
+                # informative number never reached a notification. Used as
+                # a fallback when `signals` is empty (e.g. fall_detection's
+                # "fall" event carries no signals text today) rather than
+                # the bare, contextless "alert" that produced.
+                "duration": round(_finite(event.duration), 3),
+                "severity": severity,
+                "source": source,
+            }
+            if notify is not None:
+                item["notify"] = str(notify)
+            self._queue.append(item)
 
     def set_monitoring(self, described: Optional[dict]) -> None:
         """What custom configuration, if any, is currently in charge.
@@ -295,7 +328,12 @@ class CloudUplink:
                     headers=headers,
                     timeout=10,
                     verify=self._verify,
+                    # Never follow: see _RedirectedError. A redirect is a base_url to
+                    # fix, reported below, with every event kept meanwhile.
+                    allow_redirects=False,
                 )
+                if 300 <= int(getattr(resp, "status_code", 200) or 200) < 400:
+                    raise _RedirectedError(resp)
                 resp.raise_for_status()
                 # 2) the ingest response carries any pending command
                 command = resp.json().get("command") or {}
@@ -337,7 +375,14 @@ class CloudUplink:
                     # rejected device key sends someone to debug a network that
                     # is working perfectly.
                     status = getattr(getattr(exc, "response", None), "status_code", None)
-                    if status in (401, 403):
+                    if isinstance(exc, _RedirectedError):
+                        print(
+                            f"cloud_uplink: {self._base_url} answered HTTP {status}, redirecting "
+                            f"to {exc.location or '(no Location)'}. Redirects are not followed "
+                            f"(the device key would go with them): set cloud.base_url to the "
+                            f"final address. Events are kept until then."
+                        )
+                    elif status in (401, 403):
                         print(
                             f"cloud_uplink: {self._base_url} rejected this device's key "
                             f"(HTTP {status}). The backend is reachable; the key is wrong or "
@@ -364,12 +409,7 @@ class CloudUplink:
                         f"cloud_uplink: batch of {len(batch)} too large for the backend; "
                         f"retrying in batches of {self._batch_max}"
                     )
-                elif (
-                    batch
-                    and isinstance(status, int)
-                    and 400 <= status < 500
-                    and status not in _RETRYABLE_4XX
-                ):
+                elif batch and (status in _BODY_REJECTED_4XX or (status == 413 and len(batch) == 1)):
                     # The backend read this batch and refused it; it will refuse
                     # it again. Re-queuing it at the front is what used to block
                     # every newer alert behind it forever.

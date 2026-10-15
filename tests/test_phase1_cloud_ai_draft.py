@@ -44,6 +44,11 @@ def backend(tmp_path, monkeypatch):
     for mod in ("cloud.app", "cloud", "cloud.ratelimit"):
         sys.modules.pop(mod, None)
     app_module = importlib.import_module("cloud.app")
+    # A deterministic CUSTOM proposal, the shape the model path returns (preset
+    # ""). The keyword fallback used to stand in for it here, but it now names a
+    # mode and carries no rules (cloud/app.py's _AI_FALLBACKS), so it can no
+    # longer exercise draft promotion.
+    monkeypatch.setattr(app_module, "_ai_configure_llm", _custom_proposal)
     client = TestClient(app_module.app)
     with app_module.db() as conn:
         conn.execute(
@@ -56,6 +61,18 @@ def backend(tmp_path, monkeypatch):
     headers = {"Authorization": f"Bearer {token}"}
     client.post("/v1/devices/claim", json={"claim_code": "AA-BB-CC"}, headers=headers)
     return app_module, client, headers
+
+
+def _custom_proposal(prompt):
+    target = "on_floor" if "fall" in prompt else "person"
+    return {
+        "preset": "", "variant": "", "explanation": f"Watching: {prompt}",
+        "settings": {}, "unsupported": [], "source": "jupiter",
+        "rules": [{"target": target, "predicate": "present", "secondary": "",
+                   "description": f"{target} seen", "zone": "", "persist_s": 5.0,
+                   "min_count": 1, "confidence": 0.6, "severity": "critical",
+                   "cooldown_s": 60.0, "schedule": "", "notify": "push"}],
+    }
 
 
 def poll(client, rules_version=""):
@@ -71,7 +88,7 @@ def poll(client, rules_version=""):
 
 def stored(app_module, column):
     with app_module.db() as conn:
-        return conn.execute(f"SELECT {column} FROM devices WHERE id = 1").fetchone()[column]
+        return conn.execute(f"SELECT {column} FROM devices WHERE id = 1").fetchone()[column]  # noqa: S608 - test helper; callers pass literal column names
 
 
 def activate(client, headers, preset=""):
@@ -106,7 +123,8 @@ def test_a_preview_does_not_touch_the_running_configuration(backend):
         headers=headers,
     )
     assert preview.status_code == 200
-    assert preview.json()["preset"] == "security_monitoring"  # a genuinely different config
+    # A genuinely different configuration (a different target).
+    assert preview.json()["rules"][0]["target"] == "person"
 
     # The device's next poll must say nothing at all.
     assert poll(client, rules_version=live_version) is None, (
@@ -129,7 +147,8 @@ def test_a_preview_is_kept_as_a_draft_so_activate_can_still_apply_it(backend):
     assert stored(app_module, "ai_rules") is None, "a preview must not be the live configuration"
     draft = stored(app_module, "ai_rules_draft")
     assert draft is not None
-    assert json.loads(draft)["preset"] == proposal["preset"] == "elderly_monitoring"
+    assert json.loads(draft)["rules"] == proposal["rules"]
+    assert proposal["rules"][0]["target"] == "on_floor"
 
 
 def test_the_app_flow_still_works_end_to_end(backend):

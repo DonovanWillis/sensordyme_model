@@ -21,6 +21,7 @@ broken implementation.
 import threading
 import time
 from http.server import BaseHTTPRequestHandler, HTTPServer
+from typing import ClassVar
 
 import pytest
 
@@ -32,7 +33,7 @@ from cloud import app as cloud_app  # noqa: E402
 class _CaptureHandler(BaseHTTPRequestHandler):
     """Records the raw Title header bytes of every POST it receives."""
 
-    received: list[bytes] = []
+    received: ClassVar[list[bytes]] = []
 
     def do_POST(self):
         length = int(self.headers.get("Content-Length") or 0)

@@ -19,6 +19,8 @@ The defects:
   * Two config values were unguarded divisors inside the frame loop (bug 7).
 """
 
+from typing import ClassVar
+
 import numpy as np
 import pytest
 import test_driver_attention_scenarios as das
@@ -199,7 +201,7 @@ class _FakeYoloModel:
     everything downstream (class mapping, the spatial gate, the edge event)
     is the real module code."""
 
-    names = {0: "person", 39: "bottle", 67: "cell phone"}
+    names: ClassVar[dict[int, str]] = {0: "person", 39: "bottle", 67: "cell phone"}
 
     def __init__(self, boxes):
         self._boxes = boxes

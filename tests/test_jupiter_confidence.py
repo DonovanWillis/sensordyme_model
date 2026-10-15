@@ -61,12 +61,14 @@ class TestRuleFieldFidelity:
         RuleDraft.from_dict() silently repairs — this must catch it too, not
         only outright absence."""
         fidelity, malformed = _rule_field_fidelity(_rule(confidence="pretty sure"))
+        assert fidelity < 1.0
         assert "confidence" in malformed
 
     def test_a_bool_does_not_count_as_a_number_or_int(self):
         """Python's bool is an int subclass; a rule field holding `true`
         instead of a number is still malformed, not an accidental pass."""
         fidelity, malformed = _rule_field_fidelity(_rule(min_count=True))
+        assert fidelity < 1.0
         assert "min_count" in malformed
 
     def test_non_dict_rule_scores_zero(self):

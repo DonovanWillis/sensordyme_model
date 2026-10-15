@@ -62,13 +62,13 @@ with the current camera/models (what it would need is listed).
 |---|---|---|
 | ✅ | Fall (rapid drop then stillness) (`fall`) | MediaPipe Pose hip/shoulder velocity + stillness confirmation (temporal, not single-frame; sitting/lying deliberately does NOT trigger it) |
 | ✅ | Person remaining on floor after fall (`on_floor`) | fall alert stays active until significant movement resumes |
-| ✅ | Person present / absent (`presence`) | YOLO person + event lifecycle |
+| 🟡 | Person present / absent (`presence`) | MediaPipe Pose: a tracked skeleton reads as a person, a label AI-configured present/absent rules can target (this mode runs no object detector) **Caveat:** no built-in presence/absence alert in this mode, and pose tracking -- not a person detector -- decides presence, so someone the pose model loses (far away, heavily occluded) reads as absent |
 | ✅ | Restricted areas / stairs / wandering (`zone_events`) | user-drawn zones tested against the ankle midpoint + persistence |
 | ✅ | Getting out of bed (a user-drawn 'bed' safe zone) (`bed_exit`) | safe_zone_exit -- the same mechanism baby_monitoring.py uses for a crib, applied to a bed zone; soft severity by default (getting up is often benign; a real fall afterward is caught separately by the fall detector above) |
 | ✅ | Motionless for an unusual period (`stillness`) | hip/shoulder centroid movement over a long window (deliberately 10 minutes by default, to not flag ordinary resting/reading) |
-| 🟡 | Standing / sitting / lying classification (`posture`) | pose landmarks exist in the fall module **Caveat:** explicit posture classification not implemented; falls are detected by trajectory, not posture, precisely to avoid lying-down false alarms |
+| 🟡 | Standing / sitting / lying classification (`posture`) | core/posture.py classifies standing / sitting / lying_down (plus on_floor) from pose landmarks; each is a label AI-configured rules can target **Caveat:** posture raises no built-in alert: falls are detected by trajectory, not posture, precisely to avoid lying-down false alarms |
 | ❌ | Struggling to stand / loss of balance / stumble / gait analysis (`struggling`) | temporal gait models; current pose pipeline detects falls, not gait quality |
-| 🔵 | Time-conditioned rules (nighttime activity, outside hours) (`schedule`) | rule schedules — representable in AI-configure rules, enforcement lands with the scheduler |
+| 🟡 | Time-conditioned rules (nighttime activity, outside hours) (`schedule`) | AI-configured rules carry an HH:MM-HH:MM window, enforced on the device (core/rules.py) in the rule's timezone when it names one, else device local time **Caveat:** applies to AI-configured rules only; this mode's own alerts are not time-conditioned |
 | ❌ | Smoke / fire / flooding visible (`smoke_fire_flood`) | dedicated smoke/fire segmentation models (COCO has no such classes); a smoke/heat sensor is the honest hardware answer |
 | ❌ | Unknown person / caregiver identification (`unknown_person`) | face recognition — deliberately not shipped (privacy); person-count changes ARE detected |
 | ✅ | Multiple people present (`multiple_people`) | person-count events |
@@ -88,4 +88,4 @@ with the current camera/models (what it would need is listed).
 | ❌ | Smoke / fire visible (`smoke_fire`) | dedicated detection models; a smoke detector is the honest hardware answer |
 | ❌ | Known vs unknown person (`known_person`) | face recognition — deliberately not shipped (privacy) |
 | ❌ | Face covering / carrying weapon / climbing barrier (`mask_or_weapon`) | specialized models with serious false-positive stakes; we refuse to approximate these with the current stack — actions like 'person entered restricted area' are reported instead of labels like 'burglar' |
-| 🔵 | Armed hours / motion during configured times (`schedule`) | rule schedules — representable in AI-configure rules, enforcement lands with the scheduler |
+| 🟡 | Armed hours / motion during configured times (`schedule`) | AI-configured rules carry an HH:MM-HH:MM window, enforced on the device (core/rules.py) in the rule's timezone when it names one, else device local time **Caveat:** applies to AI-configured rules only; this mode's own zone/lingering/crowd alerts are not time-conditioned |

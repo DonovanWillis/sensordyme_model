@@ -18,8 +18,10 @@ The schema is the contract in three places at once:
 
 from __future__ import annotations
 
+import math
 import re
 from dataclasses import dataclass, field
+from itertools import pairwise
 from typing import Any, Optional
 
 from core.capabilities import Support, registry
@@ -81,9 +83,12 @@ class RuleDraft:
         """
         def number(key: str, default: float) -> float:
             try:
-                return float(raw.get(key, default))
-            except (TypeError, ValueError):
+                value = float(raw.get(key, default))
+            except (TypeError, ValueError, OverflowError):
                 return default
+            # json.loads accepts NaN, Infinity and 1e999; none of them is a
+            # duration or a threshold, and NaN survives every clamp.
+            return value if math.isfinite(value) else default
 
         def text(key: str) -> str:
             value = raw.get(key)
@@ -91,7 +96,7 @@ class RuleDraft:
 
         try:
             min_count = int(raw.get("min_count", 1))
-        except (TypeError, ValueError):
+        except (TypeError, ValueError, OverflowError):
             min_count = 1
 
         description = raw.get("description")
@@ -220,7 +225,7 @@ def schema_for_registry(reg=None) -> dict:
     # the area of interest". Constrained decoding had turned an honest refusal
     # into a confident wrong answer — worse than the unconstrained failure,
     # which validation caught. A legal token for "cannot" fixes the cause.
-    labels = sorted(reg.labels()) + [NO_TARGET]
+    labels = [*sorted(reg.labels()), NO_TARGET]
     predicates = sorted(reg.predicates())
 
     rule = {
@@ -228,7 +233,8 @@ def schema_for_registry(reg=None) -> dict:
         "properties": {
             "target": {"type": "string", "enum": labels},
             "predicate": {"type": "string", "enum": predicates},
-            "secondary": {"type": "string", "enum": ["", *labels]},
+            # "" is "no second object"; NO_TARGET is only a target-side escape.
+            "secondary": {"type": "string", "enum": ["", *sorted(reg.labels())]},
             "description": {"type": "string"},
             "zone": {"type": "string"},
             "persist_s": {"type": "number", "minimum": PERSIST_MIN, "maximum": PERSIST_MAX},
@@ -318,7 +324,7 @@ def _target_guess_candidates(description: str) -> list[str]:
     """
     words = [w for w in re.findall(r"[a-z']+", description.lower()) if len(w) > 2]
     words = [w for w in words if w not in _TARGET_GUESS_STOPWORDS]
-    bigrams = [f"{a} {b}" for a, b in zip(words, words[1:])]
+    bigrams = [f"{a} {b}" for a, b in pairwise(words)]
     return bigrams + words
 
 
@@ -346,7 +352,10 @@ def _assess_no_target(description: str, predicate: str, reg) -> dict:
     best = None
     for candidate in _target_guess_candidates(description):
         verdict = reg.assess(candidate, predicate)
-        if verdict.support is Support.UNSUPPORTED:
+        # A detectable word ("person" in "a person wearing a helmet") is not
+        # the thing that could not be served, so it must not supply the reason
+        # a refusal gives — the gap the user hit is in the words that fail.
+        if verdict.ok or verdict.support is Support.UNSUPPORTED:
             continue
         if verdict.capabilities:
             best = verdict
@@ -361,6 +370,15 @@ def _assess_no_target(description: str, predicate: str, reg) -> dict:
         "support": best.support.value,
         "alternatives": list(best.alternatives),
     }
+
+
+def _string_list(value: Any) -> list[str]:
+    """A list of strings from untrusted output. The app decodes `alternatives`
+    as [String], so one non-string element (or a bare string, which list()
+    splits into characters) failed the whole proposal's decode."""
+    if not isinstance(value, list):
+        return []
+    return [item for item in value if isinstance(item, str)]
 
 
 def parse_response(payload: Any, reg=None) -> Interpretation:
@@ -390,7 +408,7 @@ def parse_response(payload: Any, reg=None) -> Interpretation:
                 "reason": str(entry.get("reason", "not supported")),
                 "requires": str(entry.get("requires", "") or "additional model or training data"),
                 "support": str(entry.get("support", "") or "unsupported"),
-                "alternatives": list(entry.get("alternatives") or []),
+                "alternatives": _string_list(entry.get("alternatives")),
             })
 
     for entry in payload.get("rules") or []:

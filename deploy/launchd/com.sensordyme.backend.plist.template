@@ -54,12 +54,19 @@
         <key>Crashed</key>
         <true/>
     </dict>
-    <!-- Restart budget, not an unconditional respawn loop: a genuinely broken
-         config (bad JWT secret file permissions, port already taken by
-         something else) should surface as "stopped", not spin forever eating
-         CPU and filling the log. -->
+    <!-- What actually happens on failure, because this used to claim otherwise.
+         launchd has NO restart budget: with SuccessfulExit=false any non-zero
+         exit (a crash, a port already taken, a broken config) is restarted,
+         every ThrottleInterval seconds, indefinitely. That is the deliberate
+         choice here: the usual cause at login is transient (the port is still
+         held by a uvicorn from before, the volume is not mounted yet) and
+         retrying heals it with nobody involved. The cost is one failed start
+         per interval in cloud/backend.log while the cause persists, so the
+         interval is 30s rather than 10s; `scripts/diagnose_backend_mac.py`
+         and `launchctl print gui/$(id -u)/com.sensordyme.backend` (look at
+         "last exit code" and "runs") show a job stuck in that loop. -->
     <key>ThrottleInterval</key>
-    <integer>10</integer>
+    <integer>30</integer>
 
     <key>StandardOutPath</key>
     <string>__REPO_DIR__/cloud/backend.log</string>

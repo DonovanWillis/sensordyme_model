@@ -15,6 +15,7 @@ requires bouncing the rest.
 from __future__ import annotations
 
 import threading
+import time
 from typing import Optional
 
 from core.health import HealthMonitor
@@ -23,6 +24,11 @@ from core.logging_setup import get_logger
 log = get_logger("supervisor")
 
 _RESTART_BACKOFF_S = [1.0, 3.0, 10.0]  # per-service crash restart delays, then give up
+#: A run() that lasted this long before crashing was a healthy stretch, not a
+#: crash loop, so the in-thread restart budget starts over. Without it the
+#: budget was for the generation's whole life: three crashes spread over days
+#: ended the thread on the fourth, exactly like three in three seconds.
+_CRASH_BUDGET_RESET_AFTER_S = 300.0
 
 
 class Service:
@@ -59,6 +65,11 @@ class Service:
     def stop(self, timeout: float = 5.0) -> None:
         self._stop.set()
         if self._thread is not None:
+            if self._thread is threading.current_thread():
+                # Asked to stop from inside its own run(): the event is set, so
+                # the loop exits at its next check. Joining here would raise
+                # "cannot join current thread"; keep the handle, it is alive.
+                return
             self._thread.join(timeout=timeout)
             if self._thread.is_alive():
                 # Keep the handle: start() must be able to see the thread is
@@ -68,9 +79,25 @@ class Service:
                 return
         self._thread = None
 
-    def restart(self) -> None:
+    def restart(self, stop_timeout: float = 5.0) -> None:
+        """Stop this service and start a fresh generation.
+
+        Raises RuntimeError when no fresh generation could be started: when
+        called from the service's own thread, or when the old thread is still
+        alive after stop()'s timeout (wedged). Returning normally in that case
+        told the health monitor the restart had worked -- it then reset the
+        failure count, and a wedged loop could read as recovered while nothing
+        was running at all.
+        """
+        if self._thread is not None and self._thread is threading.current_thread():
+            raise RuntimeError(f"service {self.name} cannot restart itself from its own thread")
         log.info("restarting service %s", self.name)
-        self.stop()
+        self.stop(timeout=stop_timeout)
+        if self.is_running:
+            raise RuntimeError(
+                f"service {self.name} is still running after the stop timeout (wedged); "
+                "not started again"
+            )
         self._crashes = 0
         self.start()
 
@@ -85,10 +112,13 @@ class Service:
         # by a successor generation's event instead of its own.
         stop = self._stop
         while not stop.is_set():
+            started = time.monotonic()
             try:
                 self.run(stop)
                 return  # clean exit
             except Exception as exc:
+                if time.monotonic() - started >= _CRASH_BUDGET_RESET_AFTER_S:
+                    self._crashes = 0  # a long healthy run, not a crash loop
                 log.error("service %s crashed: %s", self.name, exc, exc_info=True)
                 if self._health is not None:
                     self._health.report_failure(self.name, f"crashed: {exc}")

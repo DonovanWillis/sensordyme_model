@@ -138,14 +138,19 @@ def test_the_ios_model_decodes_exactly_the_keys_the_backend_returns():
     halves of one contract; a renamed key on either side decodes as nil in the
     app, silently. ios/Tests/EventModelTests.swift checks the Swift half runs."""
     swift = (REPO / "ios" / "Sources" / "EventModel.swift").read_text()
-    detector_block = swift[swift.index("struct Detector") : swift.index("/// The vision module")]
+    # EventModel.swift also holds EventItem (the event row itself), so each
+    # struct is read on its own rather than every top-level `let` in the file.
+    model_block = swift[swift.index("struct EventModel") : swift.index("struct EventItem")]
+    detector_block = model_block[
+        model_block.index("struct Detector") : model_block.index("/// The vision module")
+    ]
     detector_keys = set(re.findall(r"let (\w+):", detector_block))
-    top_keys = set(re.findall(r"^    let (\w+):", swift, re.MULTILINE))
+    top_keys = set(re.findall(r"^    let (\w+):", model_block, re.MULTILINE))
     assert top_keys == set(IDENTITY)
     assert detector_keys == set(IDENTITY["detector"])
-    models = (REPO / "ios" / "Sources" / "Models.swift").read_text()
-    assert "case timestamp, type, confidence, signals, severity, source, model" in models
-    assert "let confidence: Double?" in models, "null confidence must decode"
+    item_block = swift[swift.index("struct EventItem") :]
+    assert "case timestamp, type, confidence, signals, severity, source, model" in item_block
+    assert "let confidence: Double?" in item_block, "null confidence must decode"
 
 
 def test_the_uplink_records_the_identity_at_queue_time():

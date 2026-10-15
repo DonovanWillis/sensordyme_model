@@ -235,8 +235,12 @@ jobs:
   #     0  clean run, no regression
   #     1  a metric regressed past --tolerance   -> the job SHOULD go red
   #     2  could not run at all                  -> the job should NOT go red
-  # Code 2 covers a missing dataset AND a missing --compare baseline, and it is
-  # raised by a DatasetMissing(SystemExit) subclass that prints to stderr.
+  # Code 2 covers a missing dataset, a missing --compare baseline, a sample whose
+  # images could not be read, a detector/FaceMesh backend that would not load,
+  # and a baseline recorded on a different backend; it is raised by
+  # DatasetMissing / BackendUnavailable (SystemExit subclasses) or returned as
+  # EXIT_CANNOT_RUN, always with a message on stderr. The step calls the
+  # harness directly rather than through make — see the note on that step.
   # (Before that fix the idiom was `raise SystemExit("string")`, and Python exits
   # 1 for any non-integer argument — so "cannot run" and "regressed" were the
   # same code and `continue-on-error` would have swallowed real regressions.)
@@ -309,14 +313,21 @@ jobs:
       # nonzero when a metric drops by more than --tolerance (default 0.03).
       # Note: yolo11n.pt is gitignored, so ultralytics downloads it here on
       # first use.
-      - name: make accuracy-gate
+      #
+      # The harness is invoked DIRECTLY, not via `make accuracy-gate`: make
+      # exits 2 whenever a recipe fails, whatever code the recipe returned, so
+      # a real regression (harness exit 1) reached the branch below as 2 —
+      # "could not run, not a failure" — and this gate could never go red.
+      # Keep these arguments in sync with the Makefile's accuracy-gate target.
+      - name: accuracy gate
         if: steps.dataset.outputs.present == 'true'
         env:
           QT_QPA_PLATFORM: offscreen
           MPLBACKEND: Agg
         run: |
           set +e
-          make accuracy-gate
+          .venv/bin/python benchmarks/accuracy_state_farm.py --per-class 100 \
+            --compare benchmarks/results/baseline_phase1.json
           code=$?
           set -e
           case "$code" in

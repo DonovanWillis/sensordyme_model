@@ -110,7 +110,7 @@ def make_fake_landmarks(pitch_deg=0.0, yaw_deg=0.0):
     points = [[0.5, 0.5] for _ in range(478)]
 
     pose_px = _pose_pixel_points(pitch_deg, yaw_deg)
-    for key, (px, py) in zip(_POSE_ORDER, pose_px):
+    for key, (px, py) in zip(_POSE_ORDER, pose_px, strict=False):
         idx = POSE_LANDMARK_IDS[key]
         points[idx] = [px / W, py / H]
 

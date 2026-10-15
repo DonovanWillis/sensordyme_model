@@ -23,6 +23,7 @@ WOULD have been issued.
 from __future__ import annotations
 
 import json
+import subprocess
 
 import pytest
 
@@ -32,12 +33,13 @@ from services.runtime import DeviceRuntime
 class _Recorder:
     """Stands in for subprocess.run, recording reboot attempts instead of making them."""
 
-    def __init__(self) -> None:
+    def __init__(self, returncode: int = 0) -> None:
         self.calls: list[list[str]] = []
+        self.returncode = returncode
 
     def __call__(self, args, **_kwargs):
         self.calls.append(list(args))
-        return
+        return subprocess.CompletedProcess(args, self.returncode)
 
 
 @pytest.fixture()

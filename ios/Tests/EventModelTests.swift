@@ -34,14 +34,39 @@ let unhashed = #"{"module": "m", "detector": {"name": "yolo11n.pt", "sha256": nu
 let cpu = try? JSONDecoder().decode(EventModel.self, from: unhashed.data(using: .utf8)!)
 check(cpu?.summary == "yolo11n.pt", "a detector whose file could not be hashed is named, not invented")
 
+// These decode the app's real `EventItem` (EventModel.swift), against rows
+// shaped exactly like cloud/app.py's device_events():
+//   {**dict(row), "model": _stored_model(row["model"])} with the SELECTed columns
+//   id, timestamp, type, confidence, signals, severity, source, duration, model.
+print("\nreal event rows decode as EventItem:")
+let current = """
+{"events": [
+ {"id": 812, "timestamp": "2026-10-15T01:13:52.642123+00:00", "type": "fall",
+  "confidence": 0.94, "signals": "rapid_drop + stillness", "severity": "loud",
+  "source": "module", "duration": 2.1,
+  "model": {"module": "fall_detection", "detector": null}},
+ {"id": 811, "timestamp": "2026-10-15T01:12:00+00:00", "type": "person",
+  "confidence": null, "signals": "", "severity": "soft", "source": "custom_rule",
+  "duration": null, "model": null}
+]}
+""".data(using: .utf8)!
+struct EventsBody: Decodable { let events: [EventItem] }
+let rows = (try? JSONDecoder().decode(EventsBody.self, from: current))?.events ?? []
+check(rows.count == 2, "a current backend's rows decode, unknown columns (duration) and all")
+check(rows.first?.eventID == 812, "the row id is the event id, so /explain can be asked")
+check(rows.first?.model?.summary == "fall_detection", "the model identity rides along")
+check(rows.first?.date != nil, "a timestamp with microseconds and an offset parses")
+check(rows.last?.date != nil,
+      "a whole-second timestamp parses too (isoformat drops a zero fraction)")
+check(rows.last?.confidence == nil, "null confidence: no graded evidence, not 0%")
+check(rows.last?.isConfigured == true, "source custom_rule is something the user asked for")
+check(rows.first?.title == "Fall", "the type reads as a title")
+
 print("\nhistory is still readable:")
-struct Row: Decodable { let type: String; let confidence: Double?; let model: EventModel? }
-let old = #"{"type": "drowsiness", "confidence": 0.71}"#.data(using: .utf8)!
-let oldRow = try? JSONDecoder().decode(Row.self, from: old)
-check(oldRow != nil && oldRow?.model == nil, "an event from before model tracking (no key)")
-let nulls = #"{"type": "frequent_glancing", "confidence": null, "model": null}"#.data(using: .utf8)!
-let nullRow = try? JSONDecoder().decode(Row.self, from: nulls)
-check(nullRow != nil && nullRow?.confidence == nil, "null confidence: no graded evidence, not 0%")
+let old = #"{"events": [{"timestamp": "2026-01-02T03:04:05.000+00:00", "type": "drowsiness", "confidence": 0.71}]}"#
+let oldRows = (try? JSONDecoder().decode(EventsBody.self, from: old.data(using: .utf8)!))?.events
+check(oldRows?.count == 1, "an event from a backend that predates ids, severity, source and model")
+check(oldRows?.first?.eventID == nil && oldRows?.first?.model == nil, "...with those simply absent")
 
 print("\n\(failures == 0 ? "PASSED" : "\(failures) FAILED")")
 exit(failures == 0 ? 0 : 1)

@@ -129,7 +129,7 @@ _last_inference_monotonic: Optional[float] = None
 
 def record_inference() -> None:
     """Called by HailoYOLO after each successful on-device inference."""
-    global _inference_count, _last_inference_monotonic
+    global _inference_count, _last_inference_monotonic  # noqa: PLW0603 - process-wide inference counters
     _inference_count += 1
     _last_inference_monotonic = time.monotonic()
 
@@ -163,7 +163,7 @@ def failure_reason() -> Optional[str]:
 
 def configure(accel_cfg: dict, info: Optional[AcceleratorInfo] = None) -> AcceleratorInfo:
     """Install the `accelerator:` config block; returns the detection result."""
-    global _accel_cfg, _accel_info, _hailo_failed_reason
+    global _accel_cfg, _accel_info, _hailo_failed_reason  # noqa: PLW0603 - process-wide accelerator state
     _accel_cfg = dict(accel_cfg or {})
     _accel_info = info if info is not None else detect()
     _hailo_failed_reason = None
@@ -244,7 +244,7 @@ def live_status() -> tuple[bool, str]:
 
 def _refuse(reason: str, *, error: bool = False) -> None:
     """Record why the accelerator is not being used (status() reports it) and log it."""
-    global _hailo_failed_reason
+    global _hailo_failed_reason  # noqa: PLW0603 - process-wide accelerator state
     _hailo_failed_reason = reason
     (log.error if error else log.warning)("%s", reason)
 
@@ -277,6 +277,7 @@ def maybe_hailo_yolo(weights: str):
     unpinned config still loads, loudly, with the computed hash recorded as the
     model's identity so every event it produces stays traceable.
     """
+    global _hailo_failed_reason  # noqa: PLW0603 - process-wide accelerator state
     if not _accel_cfg.get("enabled", True):
         return None
     hef_path = _accel_cfg.get("yolo_hef")
@@ -330,6 +331,11 @@ def maybe_hailo_yolo(weights: str):
                     "loaded. Refusing to run it.", error=True)
             return None
         _hailo_models[key] = model
+        # A verified model is now on the chip, so any earlier refusal (e.g. a
+        # transient "Hailo init failed" at boot that a lazy retry has since
+        # recovered from) no longer describes this device. Left in place,
+        # status() kept reporting that stale failure while inference ran.
+        _hailo_failed_reason = None
         log.info("object detection '%s' -> Hailo (%s, sha256 %s)", weights, hef_path, actual[:12])
         return model
 
@@ -555,8 +561,14 @@ class HailoYOLO:
                 )
         return scales
 
-    def predict(self, frame: np.ndarray, verbose: bool = False, classes=None, conf: float = 0.25):
-        """Ultralytics-shaped predict: BGR frame in, [Result] out, boxes in pixel xyxy."""
+    def predict(self, frame: np.ndarray, verbose: bool = False, classes=None, conf: float = 0.25, **_ignored):
+        """Ultralytics-shaped predict: BGR frame in, [Result] out, boxes in pixel xyxy.
+
+        Extra ultralytics keywords (`device=`, `imgsz=`, ...) are accepted and
+        ignored: the comparison modules pass `device=` on every call, and
+        without this a null device pin -- the only way they can reach the
+        accelerator -- raised TypeError and disabled their phone detection.
+        """
         import cv2
 
         h, w = frame.shape[:2]
@@ -592,7 +604,7 @@ class HailoYOLO:
         # One output tensor (NMS postprocess): per image, a list per class of Nx5 rows.
         per_class = raw[next(iter(raw))][0]
 
-        wanted = set(int(c) for c in classes) if classes is not None else None
+        wanted = {int(c) for c in classes} if classes is not None else None
         boxes: list[_ShimBox] = []
         for cls_id, rows in enumerate(per_class):
             if wanted is not None and cls_id not in wanted:
@@ -629,7 +641,7 @@ class HailoYOLO:
             at 0.85, channel 56 (`chair`) and 67 (`cell phone`) plausibly lit.
             Channels beyond the COCO 80 are padding and are dropped.
         """
-        wanted = set(int(c) for c in classes) if classes is not None else None
+        wanted = {int(c) for c in classes} if classes is not None else None
         all_boxes: list[np.ndarray] = []
         all_scores: list[np.ndarray] = []
         all_classes: list[np.ndarray] = []
@@ -659,6 +671,24 @@ class HailoYOLO:
             dist = (prob * np.arange(self._DFL_BINS, dtype=np.float32)).sum(axis=2)  # (N,4) l,t,r,b
 
             # Anchor points at cell centres, in letterboxed-input pixels.
+            #
+            # OPEN QUESTION (2026-10 review, not yet settled on hardware): the
+            # +0.5 cell-centre offset below is an ASSUMPTION. Upstream DAMO-YOLO
+            # (ZeroHead.get_single_level_center_priors, the NanoDet-Plus
+            # convention) and, as recalled, the Hailo Model Zoo's damoyolo
+            # postprocess config (nanodet_split, scale_factors [0.0, 0.0]) place
+            # priors at the cell's top-left corner, i*stride. If so, every box
+            # here is shifted right/down by stride/2 (+4/+8/+16 px at P3/P4/P5
+            # in letterbox pixels). Nothing in the repo measures box POSITION
+            # (the device numbers are presence/recall metrics, which a constant
+            # shift cannot move), so the code is left as is until checked.
+            # The check: run the same frames through this decoder and through a
+            # reference (DAMO-YOLO PyTorch, or the Model Zoo's own eval
+            # postprocess on the same .hef) and compare mean (dx, dy) of matched
+            # person boxes. A constant ~+stride/2 bias means change this to
+            # `xs * stride` / `ys * stride` (and the two hand-computed
+            # expectations in tests/test_phase3_raw_decode.py). See
+            # docs/ACCELERATOR.md, "Open question: anchor offset".
             ys, xs = np.divmod(np.nonzero(keep)[0], grid)
             cx = (xs + 0.5) * stride
             cy = (ys + 0.5) * stride
@@ -759,7 +789,14 @@ class HailoYOLO:
         the lock for ever; waiting on it unconditionally hung shutdown until
         systemd killed the process. After the timeout the instance is marked
         closed and left: process exit releases the chip.
+
+        Once closed (including by a timed-out close), further calls return at
+        once: release_all() calls close() once per cache key aliasing this
+        instance plus once more via release_hailo_models(), and re-waiting the
+        full timeout on each made a wedged shutdown stall 2s per alias.
         """
+        if self._closed:
+            return
         if not self._lock.acquire(timeout=self._CLOSE_TIMEOUT_S):
             self._closed = True
             log.warning("accel: inference still in progress after %.1fs; not waiting to close the Hailo device",
@@ -772,7 +809,7 @@ class HailoYOLO:
             self._teardown()
             try:
                 self._vdevice.release()
-            except Exception:  # noqa: BLE001
-                pass
+            except Exception as exc:  # noqa: BLE001
+                log.debug("accel: VDevice.release() failed during close: %r", exc)
         finally:
             self._lock.release()

@@ -325,3 +325,88 @@ enum MJPEGStreamURL {
         return url.appendingPathComponent("stream")
     }
 }
+
+// MARK: - The reader's decisions
+
+/// What `MJPEGReader` (FeedViews.swift) decides, as pure functions.
+///
+/// The reader itself needs URLSession and UIKit, so ios/Tests/run.sh cannot
+/// compile it. Everything it DECIDES lives here instead — when a start() must
+/// reconnect, what a finished connection means, when to re-resolve the address
+/// — so MJPEGStreamTests exercises the same code the reader runs rather than a
+/// copy of it.
+enum MJPEGReaderPolicy {
+    /// How long without a single byte before the connection is considered dead.
+    /// The device pushes at `dashboard.stream_fps` (12/s by default), so silence
+    /// this long means the stream is not coming back on its own.
+    static let idleTimeout: TimeInterval = 15
+    /// Transport failures in a row before the address is worth re-resolving.
+    static let failuresBeforeReresolving = 3
+    /// The least time between two re-resolves, so an absent device cannot turn
+    /// the retry loop into a discovery loop.
+    static let addressRecheckInterval: TimeInterval = 20
+
+    /// Whether `start()` has to tear the connection down and open a new one.
+    ///
+    /// An unchanged target must not restart a healthy stream: `onChange` and
+    /// `onAppear` can both fire for the same values, and tearing the connection
+    /// down to rebuild it identically is a visible stutter.
+    static func needsRestart(
+        stopped: Bool, state: MJPEGStreamState,
+        currentBase: String, currentToken: String,
+        base: String, token: String
+    ) -> Bool {
+        stopped || state == .idle || base != currentBase || token != currentToken
+    }
+
+    /// What a finished connection means.
+    enum Completion: Equatable {
+        /// The device refused the token. Not retried: no amount of waiting
+        /// supplies a token.
+        case unauthorized(hasToken: Bool)
+        /// Try again. `countsAsTransportFailure` is false when the device DID
+        /// answer: re-resolving its address cannot help with a camera that
+        /// stopped producing frames.
+        case reconnect(reason: String?, countsAsTransportFailure: Bool)
+    }
+
+    static let cameraStalledReason = "connected, but the camera stopped sending frames"
+
+    /// - Parameters:
+    ///   - status: the HTTP status of the finished task's response, nil when
+    ///     nothing answered.
+    static func completion(status: Int?, error: Error?, hasToken: Bool) -> Completion {
+        if status == 401 || status == 403 { return .unauthorized(hasToken: hasToken) }
+        if status == 200 {
+            // The device answered and then went quiet. Calling that "the device
+            // didn't answer in time" sent people to their Wi-Fi over a camera
+            // that had stopped; it is also no reason to look for a new address.
+            let ns = error.map { $0 as NSError }
+            if ns?.domain == NSURLErrorDomain, ns?.code == NSURLErrorTimedOut {
+                return .reconnect(reason: cameraStalledReason, countsAsTransportFailure: false)
+            }
+            return .reconnect(reason: MJPEGStreamDiagnosis.describe(error), countsAsTransportFailure: false)
+        }
+        return .reconnect(reason: MJPEGStreamDiagnosis.describe(error), countsAsTransportFailure: true)
+    }
+
+    /// Whether repeated failures justify asking discovery for a fresh address.
+    static func shouldReresolve(consecutiveFailures: Int, sinceLastRecheck: TimeInterval) -> Bool {
+        consecutiveFailures >= failuresBeforeReresolving && sinceLastRecheck >= addressRecheckInterval
+    }
+}
+
+/// The one connection whose callbacks may act.
+///
+/// URLSession delivers `didCompleteWithError` for a task the reader cancelled
+/// itself, asynchronously, after a replacement has opened. Read as "the stream
+/// dropped", that stale callback tore down the healthy replacement, whose own
+/// cancellation then did the same to the next — sessions multiplied and the
+/// "reconnecting…" badge never cleared. Every callback is checked here first.
+final class CurrentConnection<Connection: AnyObject> {
+    private(set) var current: Connection?
+
+    func replace(with connection: Connection) { current = connection }
+    func clear() { current = nil }
+    func isCurrent(_ connection: Connection) -> Bool { current === connection }
+}

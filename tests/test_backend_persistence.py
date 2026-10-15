@@ -52,10 +52,19 @@ class TestLaunchdPlist:
         bound_port = args[args.index("--port") + 1]
         assert plist["EnvironmentVariables"]["SENSORDYME_PORT"] == bound_port
 
-    def test_restarts_on_crash_but_not_forever_on_a_broken_config(self):
+    def test_restarts_on_failure_and_says_honestly_that_it_keeps_trying(self):
+        """launchd has no restart budget: SuccessfulExit=false restarts every
+        non-zero exit, every ThrottleInterval, for ever. The template used to
+        claim a broken config would "surface as stopped"; it never did. The
+        interval is what bounds the cost (one failed start per 30 s in the
+        log), and the comment must say what really happens."""
         plist = self._load()
         assert plist["KeepAlive"]["Crashed"] is True
-        assert plist["ThrottleInterval"] > 0
+        assert plist["KeepAlive"]["SuccessfulExit"] is False
+        assert plist["ThrottleInterval"] >= 30
+        text = PLIST_TEMPLATE.read_text()
+        assert 'surface as "stopped"' not in text
+        assert "NO restart budget" in text
 
     def test_starts_at_login(self):
         assert self._load()["RunAtLoad"] is True
@@ -93,7 +102,7 @@ class TestDiagnoseBackend:
         assert not any(a == "-iTCP" for a in called_args)
 
     def test_http_get_json_surfaces_connection_errors(self):
-        with pytest.raises(OSError):
+        with pytest.raises(OSError, match="Connection refused"):
             diag.http_get_json("http://127.0.0.1:1/v1/health", timeout=0.5)
 
     def test_launchd_status_when_not_installed(self):
@@ -110,6 +119,7 @@ class TestDiagnoseBackend:
             )
             ok, detail = diag.launchd_status()
         assert ok is True
+        assert detail == "running"
 
     def test_launchd_status_when_installed_but_stopped(self):
         with patch.object(diag.subprocess, "run") as mock_run:

@@ -64,31 +64,34 @@ enum NotificationPolicy {
         return .notify
     }
 
-    /// How many announced event ids to remember.
+    /// Which of one device's events are new since the last poll, and the
+    /// high-water mark to store for that device afterwards.
     ///
-    /// The list exists only to stop the poller re-announcing what it already
-    /// announced, so it needs to cover the window an event can still be returned
-    /// in — the app asks for the newest 25-200 events — with a wide margin, not
-    /// the whole history.
-    static let announcedHistoryLimit = 500
-
-    /// The ids worth keeping out of everything announced so far.
+    /// Replaces a single global set of "announced" ids trimmed to the newest
+    /// 500. The poller re-reads each device's latest 25 events on every tick,
+    /// so on an account with a busy camera and a quiet one, the quiet camera's
+    /// ids became the smallest in the set, were evicted on every save, and were
+    /// announced again on the next poll — one day-old "Fall" re-posted every
+    /// ~30 seconds, for ever. A per-device mark cannot be evicted by another
+    /// device's traffic, and needs no size bound.
     ///
-    /// Keeps the NEWEST ids, and that is the whole point. This was
-    /// `Set.suffix(500)`, which looks like "keep the most recent 500" and is not:
-    /// `Set` has no order, so `suffix` returns 500 elements in whatever order the
-    /// hash table happens to iterate. Past 500 events the ids retained were
-    /// arbitrary, so a *just-announced* alert could be evicted while an ancient
-    /// one was kept — and an evicted id is one the next poll no longer recognises,
-    /// so it announces it again. That is a duplicate alert for an event the user
-    /// was already told about, appearing only on accounts with a few hundred
-    /// events, which is why it would not show up early.
+    /// The first sight of a device (no mark) SEEDS the mark without reporting
+    /// anything fresh: on a new install, after another account signed in, or on
+    /// entering the demo, everything the poller sees is history, and announcing
+    /// it posted the oldest critical event in the window — possibly days old,
+    /// with nothing in the notification to say so.
     ///
-    /// Event ids are monotonic (sqlite AUTOINCREMENT), so "newest" is "largest"
-    /// and no timestamp is needed.
-    static func trimAnnounced(_ ids: Set<Int>, limit: Int = announcedHistoryLimit) -> [Int] {
-        guard limit > 0 else { return [] }
-        guard ids.count > limit else { return ids.sorted() }
-        return ids.sorted().suffix(limit)
+    /// Event ids are monotonic per backend (sqlite AUTOINCREMENT), so "new" is
+    /// "greater than the mark". A device whose newest id is BELOW its mark has a
+    /// different history (the backend was reset), so it is re-seeded rather than
+    /// silenced for ever.
+    ///
+    /// - Returns: the fresh ids, oldest first, and the mark to store.
+    static func freshEvents(ids: [Int], mark: Int?) -> (fresh: [Int], mark: Int) {
+        let newest = ids.max()
+        guard let mark else { return ([], newest ?? 0) }
+        if let newest, newest < mark { return ([], newest) }
+        let fresh = Set(ids.filter { $0 > mark }).sorted()
+        return (fresh, max(mark, newest ?? mark))
     }
 }

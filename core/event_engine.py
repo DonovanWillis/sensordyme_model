@@ -102,6 +102,24 @@ class EventEngine:
         self._tracks.pop(detection, None)
         self._last_resolved.pop(detection, None)
 
+    def retire_rule(self, detection: str, now: Optional[float] = None) -> Optional[Transition]:
+        """remove_rule, except a CONFIRMED alert is resolved on the way out.
+
+        Returns that RESOLVED transition (None when nothing was confirmed), for
+        the caller to report. remove_rule alone suits an identity that simply
+        stopped existing; this is for a rule withdrawn while its alert may be
+        live — a zone redrawn in the app mid-violation — where dropping it
+        silently left the alert "active" in the app and dashboard for good.
+        """
+        now = time.monotonic() if now is None else now
+        rule = self._rules.get(detection)
+        track = self._tracks.get(detection)
+        transition = None
+        if rule is not None and track is not None and track.state == CONFIRMED:
+            transition = self._transition(track, rule, RESOLVED, now)
+        self.remove_rule(detection)
+        return transition
+
     def update(self, detection: str, present: bool, confidence: float = 1.0,
                now: Optional[float] = None) -> list[Transition]:
         """Advance one detection with this frame's observation; return transitions."""
@@ -126,15 +144,23 @@ class EventEngine:
                 return out
 
             # Gap longer than the occlusion grace, before confirmation: start over.
+            restarted = False
             if track.state in (OBSERVED, DEVELOPING) and now - track.last_seen > rule.occlusion_grace_s:
                 track.first_seen = now
                 track.frames = 0
-                track.confidence = 0.0
                 track.state = OBSERVED
+                restarted = True
 
             track.last_seen = now
             track.frames += 1
-            track.confidence += _EMA_ALPHA * (confidence - track.confidence)
+            if restarted:
+                # Seeded exactly like a brand-new track. Restarting the EMA from
+                # 0.0 instead made a restarted track slower to confirm than a new
+                # one, and one whose confidence sits exactly on min_confidence
+                # could approach it forever and never confirm.
+                track.confidence = confidence
+            else:
+                track.confidence += _EMA_ALPHA * (confidence - track.confidence)
             held = now - track.first_seen
 
             if track.state in (OBSERVED, DEVELOPING):

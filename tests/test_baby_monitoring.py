@@ -95,7 +95,10 @@ def test_motion_energy_computation():
     white = np.full((240, 320, 3), 255, dtype=np.uint8)
     assert module._motion_energy(black) == 0.0       # first frame: no reference
     assert module._motion_energy(black) < 0.001      # identical frame: still
-    assert module._motion_energy(white) > 0.5        # full change: huge motion
+    # A change counts once it has persisted for one more frame (glitch filter,
+    # see _motion_energy). A lasting full change is then huge motion.
+    module._motion_energy(white)
+    assert module._motion_energy(white) > 0.5
 
 
 def test_annotate_draws_without_camera(tmp_path):
@@ -438,12 +441,12 @@ def test_holding_confidence_is_fused_not_a_flat_constant():
     established = _module(holding_object_confirm_s=0.1)
     events = []
     t = 0.0
-    NEAR_CRIB_NOT_OVERLAPPING = (620, 350, 680, 500)  # close enough to stay the SAME track
+    near_crib_not_overlapping = (620, 350, 680, 500)  # close enough to stay the SAME track
     # once it moves into PHONE_IN_CRIB below (within BoxTracker's match gate),
     # but not yet overlapping IN_CRIB=(400,300,600,800) (x1=620 > x2=600)
     for _ in range(20):  # tracked nearby (NOT overlapping) for ~2s first
         events += established._reason(
-            [IN_CRIB], 0.05, W, H, t, object_boxes={"phone": [NEAR_CRIB_NOT_OVERLAPPING]},
+            [IN_CRIB], 0.05, W, H, t, object_boxes={"phone": [near_crib_not_overlapping]},
         )
         t += 0.1
     for _ in range(4):  # then moves into overlap -- same track, now well-established

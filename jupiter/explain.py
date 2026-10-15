@@ -30,6 +30,10 @@ INFO = "info"
 
 _SEVERITY_BY_STORED = {"loud": CRITICAL, "soft": WARNING, "log": INFO}
 
+#: `events.source` for an alert from an AI-configured rule (services/runtime.py
+#: `_emit_rule_alert` -> core/uplink.py push_event), as opposed to "module".
+CUSTOM_RULE_SOURCE = "custom_rule"
+
 # Event types whose consequence is severe enough to outrank the stored severity.
 # Kept short and explicit; a device that shouts about everything gets ignored.
 _ALWAYS_CRITICAL = frozenset({"fall", "on_floor", "safe_zone_exit", "zone_violation"})
@@ -105,7 +109,14 @@ def facts_from_event(event: dict, rule: Optional[dict] = None) -> list[Fact]:
     facts: list[Fact] = []
 
     signals = str(event.get("signals") or "").strip()
-    if signals:
+    if signals and str(event.get("source") or "") == CUSTOM_RULE_SOURCE:
+        # A configured rule's signals are ONE sentence: the rule's own
+        # description, or a count message (services/runtime.py sends
+        # Alert.message()). Splitting it on commas turned "Bottle raised to the
+        # mouth (an approximation of drinking, not a confirmed one)" into two
+        # "observations", the second reading "Not a confirmed one)".
+        facts.append(Fact(signals))
+    elif signals:
         # Modules write these as "gaze_off + phone + hand_overlap".
         for signal in [s.strip() for s in signals.replace("+", ",").split(",") if s.strip()]:
             facts.append(Fact(humanise(signal)))
@@ -211,7 +222,12 @@ def explain(
     #
     # Rephrasing is still worth having for routine events, where readability
     # matters more than precision and the cost of a clumsy sentence is nil.
-    if provider is None or severity == CRITICAL:
+    #
+    # With no recorded facts there is nothing to rephrase: the model was handed
+    # "Observations:" and an empty list, and whatever it wrote back ("A stranger
+    # tried the door handle") was shown as the explanation. The headline alone
+    # is the honest answer then.
+    if provider is None or severity == CRITICAL or not facts:
         return explanation
 
     # The model is handed the facts and asked only to join them into a sentence.
@@ -231,21 +247,40 @@ def explain(
         if narrative and len(narrative) <= 300:
             explanation.narrative = narrative
             explanation.source = result.provider
-    except Exception:  # noqa: BLE001 - an explanation must never fail the request
+    except Exception:  # noqa: BLE001, S110 - an explanation must never fail the request; deterministic text stands
         pass
     return explanation
 
 
-def parse_rule_for_event(ai_rules_json: Optional[str], event_type: str) -> Optional[dict]:
-    """Find the stored rule an event came from, if any."""
+def parse_rule_for_event(
+    ai_rules_json: Optional[str], event_type: str, signals: Optional[str] = None
+) -> Optional[dict]:
+    """Find the stored rule an event came from, if exactly one can be named.
+
+    An AI-rule event's type is only the rule's TARGET (services/runtime.py
+    `_emit_rule_alert`), and one target often has several rules: "someone
+    leaves" + "someone at the pool" are both `person`, the drinking
+    composition is two `person` rules. Taking the first match explained a pool
+    alert with the other rule's 23:00-06:00 schedule — a confident, invented
+    reason. So: one candidate is the answer; several are narrowed by the
+    event's `signals`, which for a configured rule is the rule's own
+    description; still ambiguous means no rule, and the explanation makes no
+    claim about thresholds rather than a wrong one.
+    """
     try:
         rules = json.loads(ai_rules_json or "{}").get("rules") or []
     except (ValueError, TypeError, AttributeError):
         return None
     base = (event_type or "").split(":")[0]
-    for rule in rules:
-        if not isinstance(rule, dict):
-            continue
-        if rule.get("target") == base or rule.get("detection") == base:
-            return rule
+    matches = [
+        rule for rule in rules
+        if isinstance(rule, dict) and (rule.get("target") == base or rule.get("detection") == base)
+    ]
+    if len(matches) == 1:
+        return matches[0]
+    said = str(signals or "").strip()
+    if said:
+        described = [r for r in matches if str(r.get("description") or "").strip() == said]
+        if len(described) == 1:
+            return described[0]
     return None

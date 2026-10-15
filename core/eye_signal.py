@@ -85,7 +85,7 @@ def iris_openness(points: Sequence[Point]) -> Optional[float]:
     dividing the eyelid gap by it cancels camera distance AND spectacle-lens
     magnification — the two things that make an absolute pixel threshold wrong.
 
-    Typical values: comfortably open ≈ 0.7–1.1, closed < 0.2. Returns None
+    Typical values: comfortably open ≈ 0.7-1.1, closed < 0.2. Returns None
     when neither eye yields a usable iris (landmarks missing or degenerate),
     which callers must treat as "no opinion", never as "closed".
     """
@@ -95,7 +95,7 @@ def iris_openness(points: Sequence[Point]) -> Optional[float]:
         (LEFT_IRIS, LEFT_EYE_VERTICALS, (362, 263)),
     ):
         try:
-            center_r, right_r, _top, left_r, _bottom = (points[i] for i in iris)
+            _center_r, right_r, _top, left_r, _bottom = (points[i] for i in iris)
             corner_a, corner_b = points[corners[0]], points[corners[1]]
         except (IndexError, TypeError):
             continue
@@ -126,6 +126,15 @@ _RIGHT_EYE_SOCKET = (33, 160, 158, 133, 153, 144)
 # re-derived from nothing.
 EYE_GAZE_SCALE_DEG = 40.0
 
+# Nominal open-eye palpebral aperture as a fraction of the corner-to-corner eye
+# width (~10mm over ~30mm; MediaPipe's 6-point open-eye EAR of ~0.3 says the
+# same). The vertical iris offset is normalised by THIS fixed fraction of the
+# width rather than by the measured lid aperture: the aperture is exactly what
+# changes when the lids droop, squint or close, and dividing by it turned a
+# closing eye into "looking up" (the lids' centroid sinks toward the lower lid
+# while the iris stays put -- a still head with closed eyes read +24 deg up).
+_NOMINAL_APERTURE_FRACTION = 0.35
+
 
 def eye_gaze_offset_deg(
     points: Sequence[Point], scale_deg: float = EYE_GAZE_SCALE_DEG
@@ -134,23 +143,33 @@ def eye_gaze_offset_deg(
     within each eye's own socket -- averaged across both eyes, independent of
     head pose.
 
-    Returns None when neither eye's socket geometry is usable (degenerate width/
-    height -- an extreme angle or a landmark dropout), never a wrong number.
+    The socket reference is the two eye CORNERS (canthi), not the eyelids: the
+    corners are fixed to the skull, while the lids move with blinks, squints
+    and drowsiness. Both axes are normalised by the corner-to-corner width
+    (vertical by a nominal fraction of it, see _NOMINAL_APERTURE_FRACTION), so
+    the lids opening or closing does not move the reading at all. The static
+    offset of the iris from the corner line is removed by calibration (the
+    pi profile calibrates an eye-offset baseline alongside the head pose).
+
+    Returns None when neither eye's socket geometry is usable (degenerate
+    width -- an extreme angle or a landmark dropout), never a wrong number.
     """
 
     def _eye_component(socket: tuple[int, ...], iris_index: int) -> Optional[tuple[float, float]]:
         try:
-            eye_points = [points[i] for i in socket]
+            corner_a, corner_b = points[socket[0]], points[socket[3]]
             iris = points[iris_index]
         except (IndexError, TypeError):
             return None
-        xs = [p[0] for p in eye_points]
-        ys = [p[1] for p in eye_points]
-        center_x, center_y = sum(xs) / len(xs), sum(ys) / len(ys)
-        width, height = max(xs) - min(xs), max(ys) - min(ys)
-        if width <= 0 or height <= 0:
+        width = math.hypot(corner_b[0] - corner_a[0], corner_b[1] - corner_a[1])
+        if width <= 0:
             return None
-        return (iris[0] - center_x) / width, (iris[1] - center_y) / height
+        center_x = (corner_a[0] + corner_b[0]) / 2.0
+        center_y = (corner_a[1] + corner_b[1]) / 2.0
+        return (
+            (iris[0] - center_x) / width,
+            (iris[1] - center_y) / (width * _NOMINAL_APERTURE_FRACTION),
+        )
 
     right = _eye_component(_RIGHT_EYE_SOCKET, RIGHT_IRIS[0])
     left = _eye_component(_LEFT_EYE_SOCKET, LEFT_IRIS[0])
@@ -212,7 +231,7 @@ class AdaptiveBaseline:
     Two guards keep it honest:
 
       * **The band.** When a calibrated baseline exists, adaptation is clamped
-        to [band_low, band_high] × that baseline. A driver whose eyes are
+        to [band_low, band_high] x that baseline. A driver whose eyes are
         genuinely closing for minutes cannot drag the reference — and with it
         the closure threshold — down to meet them. Glasses shift a baseline by
         tens of percent; pathology would need to move it much further.

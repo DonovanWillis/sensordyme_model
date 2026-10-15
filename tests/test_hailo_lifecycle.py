@@ -357,8 +357,25 @@ def test_closing_does_not_hang_behind_a_wedged_inference(hailo, monkeypatch):
     model = detectors.get_yolo_model("yolo11n.pt")
     model.predict(FRAME)  # pipeline held
     release = threading.Event()
-    monkeypatch.setattr(InferVStreams, "infer", lambda self, inputs: release.wait() or {})
-    worker = threading.Thread(target=lambda: model.predict(FRAME), daemon=True)
+
+    def wedged_infer(self, inputs):
+        # Blocks until released, then answers like the real NMS output. (This
+        # used to be `release.wait() or {}`, which returned True — Event.wait's
+        # result — and made the worker die with "'bool' object is not
+        # iterable": a fake artefact, not a predict() bug.)
+        release.wait()
+        return {"nms": [[np.zeros((0, 5), dtype=np.float32) for _ in range(80)]]}
+
+    monkeypatch.setattr(InferVStreams, "infer", wedged_infer)
+    worker_errors: list[BaseException] = []
+
+    def run_worker():
+        try:
+            model.predict(FRAME)
+        except BaseException as exc:  # noqa: BLE001 - surfaced by the assert below
+            worker_errors.append(exc)
+
+    worker = threading.Thread(target=run_worker, daemon=True)
     worker.start()
     time.sleep(0.05)
     monkeypatch.setattr(type(model), "_CLOSE_TIMEOUT_S", 0.1)
@@ -369,6 +386,8 @@ def test_closing_does_not_hang_behind_a_wedged_inference(hailo, monkeypatch):
         model._ensure_ready()
     release.set()
     worker.join(timeout=2)
+    assert not worker.is_alive()
+    assert worker_errors == [], "the in-flight inference must finish cleanly after a timed-out close"
 
 
 def test_a_file_swapped_during_the_load_is_refused(hailo, monkeypatch):

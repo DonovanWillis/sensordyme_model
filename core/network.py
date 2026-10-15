@@ -11,7 +11,6 @@ opens BLE provisioning if nothing connects within the grace period.
 
 from __future__ import annotations
 
-import re
 import shutil
 import subprocess
 
@@ -21,6 +20,7 @@ import subprocess
 # annotations are strings and nothing introspects them, but a trap for any future
 # schema/DI tooling that does.
 import threading
+import time
 from typing import Optional
 
 from core.logging_setup import get_logger
@@ -33,6 +33,60 @@ log = get_logger("wifi")
 # the key and then stalls (slow DHCP, a captive portal), not the expected wait.
 # Kept deliberately: without it a stalled join hangs setup with no way out.
 _CONNECT_TIMEOUT_S = 45
+
+#: How long provision() waits, after `connection up` returns, for the device to be
+#: really on the new network with an address.
+_SETTLE_TIMEOUT_S = 20.0
+
+
+def _split_terse(line: str) -> list[str]:
+    """Split one line of nmcli terse output (`-t` / `-g`) into its fields.
+
+    nmcli escapes ':' and '\\' inside values with a backslash (`--escape` defaults
+    to yes, see nmcli(1)), so "Cafe: Free" arrives as "Cafe\\: Free". Splitting on
+    every ':' renames the network; splitting on unescaped ones but not undoing the
+    escapes leaves "Cafe\\: Free", which never equals the SSID the app sent -- a
+    join that worked was then reported as failed and rolled back.
+    """
+    fields: list[str] = []
+    current: list[str] = []
+    escaped = False
+    for ch in line:
+        if escaped:
+            current.append(ch)
+            escaped = False
+        elif ch == "\\":
+            escaped = True
+        elif ch == ":":
+            fields.append("".join(current))
+            current = []
+        else:
+            current.append(ch)
+    if escaped:  # a lone trailing backslash is literal
+        current.append("\\")
+    fields.append("".join(current))
+    return fields
+
+
+def _con(name: str) -> list[str]:
+    """A connection reference by NAME, never left for nmcli to interpret.
+
+    Without the explicit `id` selector nmcli matches the argument against names,
+    UUIDs and D-Bus paths alike, and treats the literal words `id`, `uuid` and
+    `path` as selectors -- so a network called "uuid" could not be brought up or
+    cleaned up, and an SSID equal to another profile's UUID addressed that profile.
+    """
+    return ["id", name]
+
+
+def _wifi_profile_names(stdout: str) -> list[str]:
+    """Wi-Fi profile names from `nmcli -t -f NAME,TYPE connection show` output."""
+    names = []
+    for line in stdout.splitlines():
+        fields = _split_terse(line)
+        if len(fields) >= 2 and fields[-1] == "802-11-wireless" and fields[0]:
+            names.append(fields[0])
+    return names
 
 
 def explain_connect_failure(raw: str, ssid: str) -> str:
@@ -72,7 +126,10 @@ def nmcli_available() -> bool:
 
 
 def _run(args: list[str], timeout: float = 10) -> subprocess.CompletedProcess:
-    return subprocess.run(["nmcli", *args], capture_output=True, text=True, timeout=timeout)
+    return subprocess.run(  # noqa: S603 - nmcli with argv built by this module, never a shell
+        ["nmcli", *args],  # noqa: S607 - nmcli is resolved from PATH (nmcli_available())
+        capture_output=True, text=True, timeout=timeout, check=False,
+    )
 
 
 class WifiManager:
@@ -100,11 +157,14 @@ class WifiManager:
         if not nmcli_available():
             return None
         try:
-            result = _run(["-t", "-f", "ACTIVE,SSID", "device", "wifi"])
+            # `--rescan no`: a bare `device wifi` (list) rescans whenever the AP
+            # list is older than 30s (nmcli(1)), and this runs every few seconds
+            # for health reporting -- a radio sweep each time, for a read.
+            result = _run(["-t", "-f", "ACTIVE,SSID", "device", "wifi", "list", "--rescan", "no"])
             for line in result.stdout.splitlines():
-                active, _, ssid = line.partition(":")
-                if active == "yes" and ssid:
-                    return ssid
+                fields = _split_terse(line)
+                if len(fields) >= 2 and fields[0] == "yes" and fields[1]:
+                    return fields[1]
         except Exception as exc:  # noqa: BLE001
             log.warning("nmcli ssid query failed: %s", exc)
         return None
@@ -130,14 +190,10 @@ class WifiManager:
             return []
         try:
             result = _run(["-t", "-f", "NAME,TYPE", "connection", "show"])
-            return [
-                line.partition(":")[0]
-                for line in result.stdout.splitlines()
-                if line.endswith(":802-11-wireless")
-            ]
         except Exception as exc:  # noqa: BLE001
             log.warning("nmcli connection list failed: %s", exc)
             return []
+        return _wifi_profile_names(result.stdout)
 
     def scan(self, limit: int = 20) -> list[dict]:
         """Wi-Fi networks this device can see, strongest first.
@@ -168,11 +224,11 @@ class WifiManager:
 
         seen: dict[str, dict] = {}
         for line in result.stdout.splitlines():
-            # nmcli escapes colons inside fields as "\:", so split on unescaped ones.
-            parts = re.split(r"(?<!\\):", line)
+            # nmcli escapes ':' and '\' inside fields; _split_terse undoes both.
+            parts = _split_terse(line)
             if len(parts) < 3:
                 continue
-            ssid = parts[0].replace("\\:", ":").strip()
+            ssid = parts[0].strip()
             if not ssid:
                 continue  # hidden network
             try:
@@ -197,11 +253,14 @@ class WifiManager:
             return False, "network name required"
         if not nmcli_available():
             return True, f"dry-run (no nmcli on this platform): would join '{ssid}'"
+        # Read BEFORE the attempt and outside the try, so every failure path below
+        # -- the timeout included -- can tell a profile this attempt created from
+        # one that already worked.
+        existing = set(self.saved_networks())
         try:
             args = ["device", "wifi", "connect", ssid]
             if password:
                 args += ["password", password]
-            existing = set(self.saved_networks())
             result = _run(args, timeout=_CONNECT_TIMEOUT_S)
             if result.returncode == 0:
                 log.info("joined wifi '%s'", ssid)
@@ -220,7 +279,11 @@ class WifiManager:
                 self.forget_network(ssid)
             return False, explain_connect_failure(raw, ssid)
         except subprocess.TimeoutExpired:
-            self.forget_network(ssid)
+            # Same rule as the failure branch above: only clean up what this
+            # attempt created. Deleting unconditionally here forgot a network that
+            # had been working, the first time a retry against it stalled.
+            if ssid not in existing:
+                self.forget_network(ssid)
             return False, (
                 f"'{ssid}' did not respond in time. It may be out of range of the "
                 f"device, or the network may be asking for a sign-in page."
@@ -249,7 +312,7 @@ class WifiManager:
             while not stop.is_set():
                 try:
                     process = subprocess.Popen(
-                        ["nmcli", "monitor"],
+                        ["nmcli", "monitor"],  # noqa: S607 - nmcli is resolved from PATH
                         stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True,
                     )
                 except Exception as exc:  # noqa: BLE001
@@ -282,10 +345,38 @@ class WifiManager:
         except Exception:  # noqa: BLE001
             return None
         for line in result.stdout.splitlines():
-            parts = line.split(":")
-            if len(parts) >= 2 and parts[1] == "802-11-wireless":
+            parts = _split_terse(line)
+            if len(parts) >= 2 and parts[1] == "802-11-wireless" and parts[0]:
                 return parts[0]
         return None
+
+    def _visible_security(self, ssid: str) -> tuple[bool, str]:
+        """(visible, SECURITY) for `ssid` from the cached scan list -- no rescan.
+
+        Used to build a profile NetworkManager can actually activate: a WPA3-only
+        (SAE) network refuses `wpa-psk`, and a hidden network is only found when
+        the profile says `hidden yes` (NetworkManager then probes for it by name).
+        """
+        try:
+            result = _run(["-t", "-f", "SSID,SECURITY", "device", "wifi", "list", "--rescan", "no"])
+        except Exception:  # noqa: BLE001 - unknown is treated as "not visible"
+            return False, ""
+        for line in result.stdout.splitlines():
+            parts = _split_terse(line)
+            if len(parts) >= 2 and parts[0] == ssid:
+                return True, parts[1]
+        return False, ""
+
+    @staticmethod
+    def _key_mgmt(security: str) -> str:
+        """`sae` for a WPA3-only network, otherwise `wpa-psk` (WPA2, and WPA2/WPA3
+        transition mode, which accepts it)."""
+        tokens = security.upper().split()
+        if any(t.startswith("WPA3") for t in tokens) and not any(
+            t in ("WPA1", "WPA2", "WPA") for t in tokens
+        ):
+            return "sae"
+        return "wpa-psk"
 
     def provision(self, ssid: str, password: str) -> tuple[bool, str]:
         """Move the device to `ssid`, keeping the current network until it works.
@@ -320,14 +411,20 @@ class WifiManager:
         saved_psk: Optional[str] = None
 
         try:
+            visible, security = self._visible_security(ssid)
+            key_mgmt = self._key_mgmt(security)
             if not existed:
                 args = [
                     "connection", "add", "type", "wifi", "con-name", ssid,
                     "ifname", "wlan0", "ssid", ssid,
                     "connection.autoconnect", "yes",
                 ]
+                if not visible:
+                    # Typed by hand and not in the scan: most likely hidden.
+                    # Harmless for a visible network the cache simply missed.
+                    args += ["802-11-wireless.hidden", "yes"]
                 if password:
-                    args += ["wifi-sec.key-mgmt", "wpa-psk", "wifi-sec.psk", password]
+                    args += ["wifi-sec.key-mgmt", key_mgmt, "wifi-sec.psk", password]
                 result = _run(args)
                 if result.returncode != 0:
                     reason = result.stderr.strip() or "could not save that network"
@@ -341,11 +438,11 @@ class WifiManager:
                 # used to leave a working device off Wi-Fi with a broken
                 # profile, across reboots.
                 saved_psk = self._stored_psk(ssid)
-                _run(["connection", "modify", ssid,
-                      "wifi-sec.key-mgmt", "wpa-psk", "wifi-sec.psk", password])
+                _run(["connection", "modify", *_con(ssid),
+                      "wifi-sec.key-mgmt", key_mgmt, "wifi-sec.psk", password])
 
             # Only now is the working connection at risk.
-            result = _run(["connection", "up", ssid], timeout=_CONNECT_TIMEOUT_S)
+            result = _run(["connection", "up", *_con(ssid)], timeout=_CONNECT_TIMEOUT_S)
             if result.returncode == 0 and self._settled_on(ssid):
                 log.info("switched to wifi '%s'", ssid)
                 self._prefer(ssid)
@@ -363,12 +460,20 @@ class WifiManager:
 
     @staticmethod
     def _stored_psk(ssid: str) -> Optional[str]:
-        """The passphrase NetworkManager holds for profile `ssid`, or None."""
+        """The passphrase NetworkManager holds for profile `ssid`, or None.
+
+        `-e no`: `-g` is terse mode, which escapes ':' and '\\' by default, so a
+        passphrase containing either came back altered -- and a failed attempt
+        then "restored" that altered value, breaking a working profile. Only the
+        trailing newline is removed: leading/trailing spaces are legal in a WPA
+        passphrase.
+        """
         try:
-            result = _run(["-s", "-g", "802-11-wireless-security.psk", "connection", "show", ssid])
+            result = _run(["-e", "no", "-s", "-g", "802-11-wireless-security.psk",
+                           "connection", "show", *_con(ssid)])
         except Exception:  # noqa: BLE001 - absence means nothing to restore
             return None
-        value = result.stdout.strip() if result.returncode == 0 else ""
+        value = result.stdout.rstrip("\r\n") if result.returncode == 0 else ""
         return value or None
 
     def _settled_on(self, ssid: str) -> bool:
@@ -378,14 +483,13 @@ class WifiManager:
         network works. Reporting success on that alone is how a device ends up
         "connected" to something that never gave it an address.
         """
-        import time
-
-        deadline = time.monotonic() + 20
-        while time.monotonic() < deadline:
+        deadline = time.monotonic() + _SETTLE_TIMEOUT_S
+        while True:
             if self.current_ssid() == ssid and self.ip_address() and self.is_online():
                 return True
+            if time.monotonic() >= deadline:
+                return False
             time.sleep(0.5)
-        return False
 
     def _roll_back(self, ssid: str, created: bool, previous: Optional[str],
                    restore_psk: Optional[str] = None) -> None:
@@ -394,15 +498,15 @@ class WifiManager:
             if created:
                 # Leaving it saved means NetworkManager retries a network that
                 # rejected us on every future boot.
-                _run(["connection", "delete", ssid])
+                _run(["connection", "delete", *_con(ssid)])
             elif restore_psk is not None:
-                _run(["connection", "modify", ssid, "wifi-sec.psk", restore_psk])
+                _run(["connection", "modify", *_con(ssid), "wifi-sec.psk", restore_psk])
                 if previous == ssid:
                     log.info("switch failed — restoring '%s' with its previous password", ssid)
-                    _run(["connection", "up", ssid], timeout=_CONNECT_TIMEOUT_S)
+                    _run(["connection", "up", *_con(ssid)], timeout=_CONNECT_TIMEOUT_S)
             if previous and previous != ssid:
                 log.info("switch failed — returning to '%s'", previous)
-                _run(["connection", "up", previous], timeout=_CONNECT_TIMEOUT_S)
+                _run(["connection", "up", *_con(previous)], timeout=_CONNECT_TIMEOUT_S)
         except Exception as exc:  # noqa: BLE001 - recovery must never raise
             log.error("could not restore the previous network: %s", exc)
 
@@ -426,36 +530,32 @@ class WifiManager:
                 if name == ssid:
                     continue
                 result = _run(["-t", "-f", "connection.autoconnect-priority",
-                               "connection", "show", name])
+                               "connection", "show", *_con(name)])
                 value = result.stdout.strip().rsplit(":", 1)[-1]
                 if value.lstrip("-").isdigit():
                     highest = max(highest, int(value))
-            _run(["connection", "modify", ssid,
+            _run(["connection", "modify", *_con(ssid),
                   "connection.autoconnect", "yes",
                   "connection.autoconnect-priority", str(highest + 1)])
         except Exception as exc:  # noqa: BLE001
             log.warning("could not set autoconnect priority for '%s': %s", ssid, exc)
 
     def saved_networks(self) -> list[str]:
-        """SSIDs NetworkManager already has profiles for, strongest priority first."""
+        """Names of the Wi-Fi profiles NetworkManager already has."""
         if not nmcli_available():
             return []
         try:
             result = _run(["-t", "-f", "NAME,TYPE", "connection", "show"])
         except Exception:  # noqa: BLE001
             return []
-        return [
-            line.rsplit(":", 1)[0]
-            for line in result.stdout.splitlines()
-            if line.endswith(":802-11-wireless") and line.rsplit(":", 1)[0]
-        ]
+        return _wifi_profile_names(result.stdout)
 
     def forget_network(self, ssid: str) -> bool:
         """Delete a saved profile. Used to clean up after a failed join."""
         if not nmcli_available() or not ssid:
             return False
         try:
-            result = _run(["connection", "delete", ssid])
+            result = _run(["connection", "delete", *_con(ssid)])
             return result.returncode == 0
         except Exception:  # noqa: BLE001
             return False

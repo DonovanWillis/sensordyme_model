@@ -74,7 +74,7 @@ from core.activity import (
 )
 from core.detections import Detection, DetectionFrame
 from core.detectors import get_yolo_model, iou, upper_region
-from core.event_engine import CONFIRMED, RESOLVED, EventEngine, RuleSpec
+from core.event_engine import CONFIRMED, DEVELOPING, OBSERVED, RESOLVED, EventEngine, RuleSpec
 from core.events import Event
 from core.hand_perception import (
     UNKNOWN_OBJECT,
@@ -84,7 +84,7 @@ from core.hand_perception import (
 )
 from core.logging_setup import get_logger
 from core.tracking import BoxTracker
-from core.zones import Zone, load_zones
+from core.zones import BoundaryCrossing, Zone, load_zones
 from modules.base import VisionModule, register_module
 
 _PERSON_CLASS = 0  # COCO
@@ -278,6 +278,24 @@ INFANT_ID_WEIGHTS = {"zone": 0.50, "persistence": 0.20, "stability": 0.20, "scal
 #: crib zone configured completes on the very next frame.
 INFANT_IDENTITY_MAX_SIZE_RATE = 2.0
 INFANT_IDENTITY_MAX_MOVE_RATE = 1.5
+#: The shortest time baseline the two rates above are measured over. They used
+#: to divide a per-detection box change by the time since the previous
+#: _reason() call, one frame. A detector's box jitter is a fixed amount per
+#: detection, so dividing it by 1/fps made the "rate" scale with frame rate.
+#: Measured on a lone, motionless infant with no crib zone and 2-3% box jitter:
+#: identified 99.5% of the time at 10 fps, 45% at 15 fps, and 0-9% at 30 fps
+#: (every frame broke its own identity). A real swap is a step change of
+#: 18-64% in size and/or 0.9+ diagonals of movement, so it still clears the
+#: rates over 0.2 s with a wide margin, while jitter over 0.2 s does not come
+#: close at any frame rate.
+_IDENTITY_MIN_BASELINE_S = 0.2
+#: A second person box with at least this fraction of its own area inside the
+#: identified infant's box is a duplicate detection of the infant (the Hailo
+#: backend emits these on 12.7-16% of single-person frames), not "somebody
+#: else seen alongside the infant". Recording a duplicate as not-the-infant
+#: used to bar the infant itself for as long as that track lived, if the
+#: infant's next box happened to match the duplicate's track.
+INFANT_DUPLICATE_MIN_OVERLAP = 0.8
 #: Bonus for the track already established as the infant. This is temporal
 #: identity, the strongest signal available with no safe zone configured (and
 #: config.yaml ships `zones: {}`): once a subject has been identified as the
@@ -405,6 +423,17 @@ def _shape_stability(history: "deque[tuple[float, float, float, float]]") -> Opt
     ))
 
 
+def _contained_fraction(inner: tuple, outer: tuple) -> float:
+    """Fraction of `inner`'s own area lying inside `outer` (0 for a degenerate box)."""
+    ix1, iy1, ix2, iy2 = inner
+    ox1, oy1, ox2, oy2 = outer
+    area = max(0.0, ix2 - ix1) * max(0.0, iy2 - iy1)
+    if area <= 0:
+        return 0.0
+    overlap = max(0.0, min(ix2, ox2) - max(ix1, ox1)) * max(0.0, min(iy2, oy2) - max(iy1, oy1))
+    return overlap / area
+
+
 def _scale_score(area: float, frame_area: float, largest_area: float) -> float:
     """[0, 1] "reads like a small subject": part frame fraction, part size
     relative to the largest person in frame. The relative half is unavailable
@@ -466,17 +495,29 @@ class InfantIdentifier:
     ) -> bool:
         """Has this track's box changed too fast to still be the same subject?
 
-        Rates, not per-frame deltas, so the answer does not depend on the frame
-        interval (this module already runs detection every Nth frame, and
-        `now` is caller-supplied). See INFANT_IDENTITY_MAX_SIZE_RATE.
+        `previous` is the sample from _identity_reference: at least
+        _IDENTITY_MIN_BASELINE_S old where history allows, and the elapsed
+        time is never taken as shorter than that. A per-frame delta divided by
+        one frame interval makes detector jitter look faster the higher the
+        frame rate. See _IDENTITY_MIN_BASELINE_S and
+        INFANT_IDENTITY_MAX_SIZE_RATE.
         """
         prev_t, px, py, prev_diagonal = previous
-        dt = now - prev_t
-        if dt <= 0 or prev_diagonal <= 1e-6:
+        if now < prev_t or prev_diagonal <= 1e-6:
             return False
+        dt = max(now - prev_t, _IDENTITY_MIN_BASELINE_S)
         size_rate = abs(diagonal - prev_diagonal) / prev_diagonal / dt
         move_rate = math.hypot(cx - px, cy - py) / prev_diagonal / dt
         return size_rate > INFANT_IDENTITY_MAX_SIZE_RATE or move_rate > INFANT_IDENTITY_MAX_MOVE_RATE
+
+    @staticmethod
+    def _identity_reference(history: "deque", now: float) -> tuple[float, float, float, float]:
+        """The most recent sample at least _IDENTITY_MIN_BASELINE_S old, or the
+        oldest one if the track is younger than that."""
+        for sample in reversed(history):
+            if now - sample[0] >= _IDENTITY_MIN_BASELINE_S:
+                return sample
+        return history[0]
 
     def update(
         self, boxes: list[tuple[int, int, int, int]], confidences: list[float],
@@ -501,12 +542,19 @@ class InfantIdentifier:
         for track in matched:
             history = self._history.setdefault(track.track_id, deque())
             cx, cy = track.centroid
-            if history and self._identity_broken(history[-1], cx, cy, track.diagonal, now):
+            if history and self._identity_broken(
+                self._identity_reference(history, now), cx, cy, track.diagonal, now,
+            ):
                 # Somebody else's box has almost certainly been grafted onto
                 # this track. Forget everything the track had accumulated: it
-                # is an unknown subject again, and must re-qualify.
+                # is an unknown subject again, and must re-qualify. That
+                # includes being "known somebody else". If the infant's box is
+                # what landed on a caregiver's track (a pick-up and put-down),
+                # keeping that mark would bar the infant for as long as the
+                # track lives.
                 history.clear()
                 self._identity_since[track.track_id] = now
+                self._not_the_infant.discard(track.track_id)
                 if self._infant_track_id == track.track_id:
                     self._infant_track_id = None
                     self._quarantine[track.track_id] = now + self.reacquire_s
@@ -537,6 +585,7 @@ class InfantIdentifier:
         scored: list[tuple[float, object, dict]] = []
         rejected: list[str] = []
         every_candidate: list[dict] = []
+        zone_qualified_ids: dict[int, bool] = {}
         for track in matched:
             # NOT track.age_s: a track whose identity was broken above spends
             # its own time, not the previous subject's. See _identity_broken.
@@ -549,17 +598,27 @@ class InfantIdentifier:
             available: dict[str, float] = {}
             reject: Optional[str] = None
 
-            if track.track_id in self._not_the_infant:
-                reject = "seen in frame alongside the infant, so this is somebody else"
-
             zone_qualified = False
+            zone_reject: Optional[str] = None
             if self.safe_zones:
                 containment = _zone_containment(track.box, self.safe_zones, w, h)
                 signals["zone_containment"] = round(containment, 3)
                 available["zone"] = containment
                 zone_qualified = containment >= self.min_containment
-                if reject is None and not zone_qualified:
-                    reject = f"only {containment:.0%} inside the safe zone (needs {self.min_containment:.0%})"
+                if not zone_qualified:
+                    zone_reject = f"only {containment:.0%} inside the safe zone (needs {self.min_containment:.0%})"
+            zone_qualified_ids[track.track_id] = zone_qualified
+
+            # Crib containment is independent positive evidence. It overrides
+            # "seen alongside the infant", which is only temporal evidence, the
+            # same way it overrides the quarantine below. Otherwise one stray
+            # mark (for example a duplicate box on the infant that the infant's
+            # next box then matched) bars a baby lying fully inside its own
+            # crib indefinitely.
+            if track.track_id in self._not_the_infant and not zone_qualified:
+                reject = "seen in frame alongside the infant, so this is somebody else"
+            elif zone_reject is not None:
+                reject = zone_reject
 
             # Crib containment is independent positive evidence, so it clears a
             # quarantine; temporal evidence alone does not, because temporal
@@ -623,6 +682,34 @@ class InfantIdentifier:
         cap = 1.0 if self.safe_zones else INFANT_NO_ZONE_MAX_CONFIDENCE
         confidence = min(best_score, cap)
 
+        # A quarantined track in frame is the subject the infant's identity
+        # just broke on, and it is as likely to be the infant as anyone else.
+        # Without this, a pick-up and put-down with no crib zone went wrong
+        # every time. The infant came back on its own (now quarantined) track,
+        # and the caregiver who stepped aside got a fresh track that qualified
+        # on 3 s of persistence alone. The CAREGIVER was identified as the
+        # infant within 3 s, the real infant was then recorded as not-the-
+        # infant, and choking risk was scored against the adult with no
+        # infant_unidentified warning at all. Decline instead, on temporal
+        # evidence alone, until the quarantine has run out. Crib containment
+        # and incumbency are not temporal-only and are unaffected.
+        if best_track.track_id != self._infant_track_id and not zone_qualified_ids.get(best_track.track_id):
+            quarantined = [
+                track.track_id for track in matched
+                if track.track_id != best_track.track_id and self._quarantine.get(track.track_id, 0.0) > now
+            ]
+            if quarantined:
+                return InfantIdentification(
+                    box=None, identified=False, confidence=round(confidence, 3),
+                    reason=(
+                        f"the infant's identity broke on track #{quarantined[0]}, which is still in "
+                        f"frame -- cannot tell whether #{best_track.track_id} or #{quarantined[0]} "
+                        f"is the infant until that is re-established"
+                    ),
+                    signals=all_signals, people_in_frame=len(matched), eligible=len(scored),
+                    rejected=tuple(rejected),
+                )
+
         if best_score < self.min_confidence:
             return InfantIdentification(
                 box=None, identified=False, confidence=round(confidence, 3),
@@ -646,8 +733,11 @@ class InfantIdentifier:
 
         self._infant_track_id = best_track.track_id
         for track in matched:
-            if track.track_id != best_track.track_id:
-                self._not_the_infant.add(track.track_id)
+            if track.track_id == best_track.track_id:
+                continue
+            if _contained_fraction(track.box, best_track.box) >= INFANT_DUPLICATE_MIN_OVERLAP:
+                continue  # a duplicate detection of the infant, not somebody else
+            self._not_the_infant.add(track.track_id)
         reason = (
             f"identified (track #{best_track.track_id}, score {best_score:.2f})"
             if self.safe_zones else
@@ -845,7 +935,6 @@ class BabyMonitoringModule(VisionModule):
                 f"'{self._weights}' class name -- check config.yaml spelling"
             )
 
-        self._zones: list[Zone] = load_zones(config.get("zones", {}))
         # The distinct labels this module was configured to recognize -- used both to
         # register one holding_object rule PER LABEL below and to make sure every
         # registered rule gets a present/absent update every frame (see _reason),
@@ -856,24 +945,32 @@ class BabyMonitoringModule(VisionModule):
         self._engine = EventEngine({})
         still_s = float(config.get("still_warning_s", 120.0))
         absence_s = float(config.get("absence_warning_s", 30.0))
-        zone_s = float(config.get("zone_confirm_s", 2.0))
-        for zone in self._zones:
-            if zone.kind == "restricted":
-                self._engine.add_rule(RuleSpec(
-                    detection=f"zone_violation:{zone.name}", severity="critical",
-                    persist_s=zone_s, min_frames=3, resolve_after_s=5.0,
-                ))
-        if any(z.kind == "safe" for z in self._zones):
-            self._engine.add_rule(RuleSpec(
-                detection="safe_zone_exit", severity="critical",
-                persist_s=zone_s, min_frames=3, resolve_after_s=5.0,
-            ))
-        stillness_grace_s, stillness_resolve_s = 3.0, 10.0
-        self._engine.add_rule(RuleSpec(
+        self._zone_confirm_s = float(config.get("zone_confirm_s", 2.0))
+        # Zone rules (restricted -> zone_violation:<name>, safe ->
+        # safe_zone_exit, boundary -> a crossing watch) are installed by
+        # _install_zones so set_zones() can replace them in place when the user
+        # draws zones in the app.
+        self._zones: list[Zone] = []
+        self._boundary_watch: dict[str, BoundaryCrossing] = {}
+        self._install_zones(load_zones(config.get("zones", {})))
+        # The stillness clock bridges gaps in DETECTION up to absence_s, not
+        # 3 s. The two rules have to cover each other. A motionless baby whose
+        # marginal box is detected in runs (seen 4 s, lost 4 s; seen 1.5 s,
+        # lost 20 s) used to raise NEITHER: every gap over 3 s restarted the
+        # 120 s stillness clock, and every sighting over 1 s restarted the
+        # 30 s absence clock. Measured: 30 minutes, zero alerts. Now any gap
+        # short enough not to be person_absent is bridged for stillness, and
+        # any gap long enough is person_absent.
+        stillness_grace_s, stillness_resolve_s = max(3.0, absence_s), 10.0
+        self._stillness_rule = RuleSpec(
             detection="unusual_stillness", severity="warning",
             persist_s=still_s, min_frames=10, occlusion_grace_s=stillness_grace_s,
             resolve_after_s=stillness_resolve_s,
-        ))
+            # No cooldown: a second stillness episode is a fresh observation,
+            # and the rule needs a full still_warning_s to confirm anyway.
+            cooldown_s=0.0,
+        )
+        self._engine.add_rule(self._stillness_rule)
         # occlusion_grace_s bridges ABSENCE without resetting the held-time
         # clock -- correct for zone rules ("walked behind a chair"), wrong
         # here: for a stillness rule a False frame means THE SUBJECT MOVED,
@@ -883,19 +980,22 @@ class BabyMonitoringModule(VisionModule):
         # push alert on a demonstrably active child.
         #
         # The engine can't tell the two apart and isn't this module's to
-        # change, so the distinction is made at the FEED (see _reason):
-        # observed motion suppresses the stillness feed for longer than the
-        # engine can bridge -- past occlusion_grace_s so an unconfirmed
-        # track is dropped and its clock restarts from zero, and past
-        # resolve_after_s so an already-confirmed stillness actually
-        # resolves. Losing the person's box (real missing evidence) sets no
-        # lockout and is still bridged exactly as before.
-        self._stillness_motion_lockout_s = max(stillness_grace_s, stillness_resolve_s) + 0.5
+        # change, so the distinction is made at the FEED (see _reason). On
+        # observed motion an unconfirmed stillness track is dropped outright,
+        # so its clock restarts from zero, and the feed is held False past
+        # resolve_after_s so an already-confirmed stillness actually resolves.
+        # Losing the person's box (real missing evidence) sets no lockout and
+        # is bridged.
+        self._stillness_motion_lockout_s = stillness_resolve_s + 0.5
         self._stillness_locked_until: Optional[float] = None
         if self._expect_presence:
             self._engine.add_rule(RuleSpec(
                 detection="person_absent", severity="warning",
                 persist_s=absence_s, min_frames=5, resolve_after_s=5.0,
+                # No cooldown. A second absence soon after the first resolves
+                # is the baby vanishing AGAIN. With the engine's default 30 s,
+                # the second alert took ~59 s instead of 30 s.
+                cooldown_s=0.0,
             ))
         self._engine.add_rule(RuleSpec(
             detection="activity_burst", severity="info",
@@ -1159,14 +1259,106 @@ class BabyMonitoringModule(VisionModule):
         self._last_object_confidences: dict[str, list[float]] = {}
         self._last_frame_size: tuple[int, int] = (0, 0)
         self._last_count = -1
-        self._prev_gray: Optional[np.ndarray] = None
+        # Last three downsampled grayscale frames and their previous per-pixel
+        # median, for _motion_energy's glitch filter.
+        self._gray_window: deque = deque(maxlen=3)
+        self._prev_gray_median: Optional[np.ndarray] = None
         self._last_motion = 0.0
         self._last_pose_proto = None
         self._last_pose_landmarks = None
         self._last_activity: Optional[ActivityState] = None
         self._last_hand_result: Optional[HandPerceptionResult] = None
-        self._hand_debug_snapshot_saved = False  # TEMPORARY, see process()
+        # Developer-only hand-perception diagnostics (a saved annotated frame and a
+        # periodic stdout line). OFF unless `hand_debug: true` is set
+        # explicitly. When on, the diagnostic writes a nursery frame to
+        # data/. Unconditional, that broke config.yaml's privacy promise that
+        # frames are never written to disk except as opt-in evidence.
+        self._hand_debug = bool(config.get("hand_debug", False))
+        self._hand_debug_snapshot_saved = False
         self._status = "watching"
+
+    # ------------------------------------------------------------------ zones
+    def _install_zones(self, zones: list[Zone]) -> None:
+        """Make `zones` this module's zones, replacing the previous set in place.
+
+        A zone whose name, kind and polygon are unchanged keeps its rule and
+        any in-progress or confirmed state. A removed or redrawn zone has its
+        rule, and every track and cooldown under it, dropped from the engine,
+        so nothing stays latched to a polygon that no longer exists.
+        """
+        old_zones = list(self._zones)
+        new_zones = list(zones)
+        old_restricted = {z for z in old_zones if z.kind == "restricted"}
+        new_restricted = {z for z in new_zones if z.kind == "restricted"}
+        for zone in old_restricted - new_restricted:
+            self._retire_zone_rule(f"zone_violation:{zone.name}")
+        for zone in new_restricted - old_restricted:
+            self._engine.add_rule(RuleSpec(
+                detection=f"zone_violation:{zone.name}", severity="critical",
+                persist_s=self._zone_confirm_s, min_frames=3, resolve_after_s=5.0,
+                # No cooldown on a safety zone. The engine's default 30 s
+                # refused even to START tracking a second entry for 30 s after
+                # the first resolved. resolve_after_s already stops flapping.
+                cooldown_s=0.0,
+            ))
+        old_safe = {z for z in old_zones if z.kind == "safe"}
+        new_safe = {z for z in new_zones if z.kind == "safe"}
+        if old_safe != new_safe:
+            # safe_zone_exit aggregates every safe zone, so any change to the
+            # set invalidates its state.
+            self._retire_zone_rule("safe_zone_exit")
+            if new_safe:
+                self._engine.add_rule(RuleSpec(
+                    detection="safe_zone_exit", severity="critical",
+                    persist_s=self._zone_confirm_s, min_frames=3, resolve_after_s=5.0,
+                    # No cooldown: a baby climbing out of the crib again shortly
+                    # after being put back took ~29 s to alert instead of 2 s.
+                    cooldown_s=0.0,
+                ))
+        kept_watches = {
+            z.name: self._boundary_watch[z.name]
+            for z in new_zones
+            if z.kind == "boundary" and z in old_zones and z.name in self._boundary_watch
+        }
+        self._boundary_watch = {
+            z.name: kept_watches.get(z.name) or BoundaryCrossing(self._zone_confirm_s)
+            for z in new_zones if z.kind == "boundary"
+        }
+        self._zones = new_zones
+        identifier = getattr(self, "_infant_identifier", None)
+        if identifier is not None:
+            identifier.safe_zones = [z for z in new_zones if z.kind == "safe"]
+
+    def _retire_zone_rule(self, detection: str) -> None:
+        """Withdraw a zone's rule. An alert confirmed under it is RESOLVED, not
+        silently dropped -- reported on the next frame by process() -- so a zone
+        redrawn in the app mid-violation does not leave the alert "active" in
+        the app and dashboard for good."""
+        transition = self._engine.retire_rule(detection)
+        if transition is not None:
+            self.__dict__.setdefault("_retired_zone_transitions", []).append(transition)
+
+    def _take_retired_zone_events(self) -> list[Event]:
+        """The resolutions queued by _retire_zone_rule, as events, once."""
+        transitions = self.__dict__.pop("_retired_zone_transitions", None) or []
+        events = []
+        for tr in transitions:
+            # "zone_violation:pool", "safe_zone_exit", "person_lingering:pool:7"
+            base, _, rest = tr.detection.partition(":")
+            zone = rest.split(":", 1)[0]
+            events.append(Event.now(
+                f"{base}_resolved", tr.duration_s, tr.confidence, self.name,
+                f"zone={zone}" if zone else "",
+            ))
+        return events
+
+    def set_zones(self, zones: list) -> None:
+        """Replace the configured zones with the app-drawn ones. See VisionModule.set_zones.
+
+        This is also how InfantIdentifier gets the user's crib. Its strongest
+        identification signal used to be reachable only by editing config.yaml.
+        """
+        self._install_zones(list(zones or []))
 
     # ------------------------------------------------------------------ perception
     def _detect_people(self, frame: np.ndarray) -> list[tuple[int, int, int, int]]:
@@ -1210,16 +1402,61 @@ class BabyMonitoringModule(VisionModule):
         self._last_object_confidences = object_confidences
         return boxes
 
-    def _motion_energy(self, frame: np.ndarray) -> float:
-        """Mean absolute inter-frame difference on a downsampled grayscale (0..1)."""
+    def _motion_energy(self, frame: np.ndarray, boxes: Optional[list] = None) -> float:
+        """Mean absolute inter-frame difference on a downsampled grayscale (0..1).
+
+        With person `boxes`, it is measured only inside them (their union, on
+        the same 160x120 difference image, so no extra cost). Stillness is a
+        claim about the SUBJECT. Averaged over the whole frame, a crib mobile,
+        a ceiling fan, a TV or a curtain kept the frame "moving" and made
+        unusual_stillness unreachable for a motionless baby. With no boxes the
+        whole frame is used, as before.
+
+        Glitch-filtered with a per-pixel temporal median of the last three
+        frames, compared against the previous median. One anomalous frame
+        (exposure flicker, a dropped or garbled frame, an IR flash) used to
+        produce two high raw differences, into it and back out, and each one
+        restarted the stillness clock. A median of three never contains a lone
+        outlier, wherever it falls in the window, so such a frame contributes
+        nothing. A change that persists (movement, or a step that stays) moves
+        the median one frame later. The cost is two elementwise min/max passes
+        over 160x120. The first two frames, before a median exists, fall back
+        to the raw difference.
+        """
         small = cv2.resize(frame, (160, 120))
         gray = cv2.cvtColor(small, cv2.COLOR_BGR2GRAY).astype(np.float32) / 255.0
-        if self._prev_gray is None:
-            self._prev_gray = gray
+        window = self._gray_window
+        if window and window[-1].shape != gray.shape:
+            window.clear()
+            self._prev_gray_median = None
+        window.append(gray)
+        if len(window) == 1:
             return 0.0
-        motion = float(np.mean(np.abs(gray - self._prev_gray)))
-        self._prev_gray = gray
-        return motion
+        mask = None
+        if boxes:
+            h, w = frame.shape[:2]
+            sx, sy = 160.0 / max(w, 1), 120.0 / max(h, 1)
+            mask = np.zeros(gray.shape, dtype=bool)
+            for x1, y1, x2, y2 in boxes:
+                c1, c2 = max(0, int(x1 * sx)), min(160, int(np.ceil(x2 * sx)))
+                r1, r2 = max(0, int(y1 * sy)), min(120, int(np.ceil(y2 * sy)))
+                if c2 > c1 and r2 > r1:
+                    mask[r1:r2, c1:c2] = True
+            if not mask.any():
+                mask = None
+
+        def _mean_diff(a: np.ndarray, b: np.ndarray) -> float:
+            diff = np.abs(a - b)
+            return float(diff[mask].mean() if mask is not None else diff.mean())
+
+        if len(window) < 3:
+            return _mean_diff(window[-1], window[-2])
+        a, b, c = window
+        median = np.maximum(np.minimum(a, b), np.minimum(np.maximum(a, b), c))
+        previous, self._prev_gray_median = self._prev_gray_median, median
+        if previous is None:
+            return _mean_diff(c, b)
+        return _mean_diff(median, previous)
 
     def _update_activity(self, frame: np.ndarray, w: int, h: int, now: float) -> Optional[ActivityState]:
         """Run MediaPipe Pose and advance the rolling-window activity classifier
@@ -1242,14 +1479,65 @@ class BabyMonitoringModule(VisionModule):
         aspect = w / max(h, 1)
         return self._activity.update(results.pose_landmarks.landmark, now=now, aspect=aspect)
 
+    def _hand_diagnostics(self, frame: np.ndarray, hand_result: HandPerceptionResult, aspect: float) -> None:
+        """Hand-perception ground truth for live tuning. Only runs when `hand_debug: true`.
+
+        It writes an annotated full frame and the hand crops to data/ (once per
+        module instance), and prints the per-hand association scores every 15th
+        frame. Opt-in because the first writes footage of the nursery to disk.
+        """
+        # TEMPORARY diagnostic (remove once confirmed): ground truth for
+        # what the ROI detector is actually looking at -- saved once
+        # (not every frame) so this can't fill the disk on a long-running
+        # device.
+        if not self._hand_debug_snapshot_saved and hand_result.hands:
+            self._hand_debug_snapshot_saved = True
+            try:
+                import os
+                os.makedirs("data", exist_ok=True)
+                snap = frame.copy()
+                for hand in hand_result.hands:
+                    hx1, hy1, hx2, hy2 = (int(v) for v in hand.box)
+                    cv2.rectangle(snap, (hx1, hy1), (hx2, hy2), (255, 0, 255), 2)
+                    cv2.putText(snap, hand.label, (hx1, max(12, hy1 - 6)),
+                                cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 0, 255), 1)
+                cv2.imwrite("data/hand_debug_frame.jpg", snap)
+                for hand in hand_result.hands:
+                    hx1, hy1, hx2, hy2 = (int(v) for v in hand.box)
+                    crop = frame[max(0, hy1):hy2, max(0, hx1):hx2]
+                    if crop.size > 0:
+                        cv2.imwrite(f"data/hand_debug_crop_{hand.label}.jpg", crop)
+            except Exception as exc:  # noqa: BLE001 -- diagnostics must never crash the service
+                log.debug("hand debug snapshot could not be written: %r", exc)
+        # TEMPORARY diagnostic (remove once live association behavior is
+        # confirmed): shows what the ROI detector actually found per
+        # hand and the best (even sub-threshold) association score --
+        # "nothing held" and "held but scored too low" look identical
+        # from get_telemetry_snapshot's objects_in_hand count alone.
+        if hand_result.hands and self._frame_index % 15 == 0:
+            per_hand = []
+            for hand in hand_result.hands:
+                best = max(
+                    (association_score(hand, o, aspect) for o in hand_result.objects),
+                    default=None,
+                )
+                per_hand.append(f"{hand.label} roi_diag={hand.diagonal:.0f}px best_score={best}")
+            objs = [(o.label, round(o.confidence, 2)) for o in hand_result.objects]
+            print(f"sensordyme.hand_debug: {per_hand} objects={objs}", flush=True)
+
     # ------------------------------------------------------------------ reasoning
     def process(self, frame: np.ndarray) -> list[Event]:
+        """Analyse one frame; returns its events."""
+        return self._take_retired_zone_events() + self._process_frame(frame)
+
+    def _process_frame(self, frame: np.ndarray) -> list[Event]:
+        """One frame's work; see process()."""
         now = time.monotonic()
         self._frame_index += 1
         if self._frame_index % self._detect_every_n == 0 or self._last_count < 0:
             self._last_boxes = self._detect_people(frame)
         boxes = self._last_boxes
-        self._last_motion = self._motion_energy(frame)
+        self._last_motion = self._motion_energy(frame, boxes)
         h, w = frame.shape[:2]
         self._last_frame_size = (w, h)
 
@@ -1268,44 +1556,9 @@ class BabyMonitoringModule(VisionModule):
                     self._last_pose_landmarks, frame, self._model, now, aspect,
                     coco_class_filter=self._hand_class_filter,
                 )
-                # TEMPORARY diagnostic (remove once confirmed): ground truth for
-                # what the ROI detector is actually looking at -- saved once
-                # (not every frame) so this can't fill the disk on a long-running
-                # device.
-                if not self._hand_debug_snapshot_saved and hand_result.hands:
-                    self._hand_debug_snapshot_saved = True
-                    try:
-                        import os
-                        os.makedirs("data", exist_ok=True)
-                        snap = frame.copy()
-                        for hand in hand_result.hands:
-                            hx1, hy1, hx2, hy2 = (int(v) for v in hand.box)
-                            cv2.rectangle(snap, (hx1, hy1), (hx2, hy2), (255, 0, 255), 2)
-                            cv2.putText(snap, hand.label, (hx1, max(12, hy1 - 6)),
-                                        cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 0, 255), 1)
-                        cv2.imwrite("data/hand_debug_frame.jpg", snap)
-                        for hand in hand_result.hands:
-                            hx1, hy1, hx2, hy2 = (int(v) for v in hand.box)
-                            crop = frame[max(0, hy1):hy2, max(0, hx1):hx2]
-                            if crop.size > 0:
-                                cv2.imwrite(f"data/hand_debug_crop_{hand.label}.jpg", crop)
-                    except Exception:  # noqa: BLE001 -- diagnostics must never crash the service
-                        pass
-                # TEMPORARY diagnostic (remove once live association behavior is
-                # confirmed): shows what the ROI detector actually found per
-                # hand and the best (even sub-threshold) association score --
-                # "nothing held" and "held but scored too low" look identical
-                # from get_telemetry_snapshot's objects_in_hand count alone.
-                if hand_result.hands and self._frame_index % 15 == 0:
-                    per_hand = []
-                    for hand in hand_result.hands:
-                        best = max(
-                            (association_score(hand, o, aspect) for o in hand_result.objects),
-                            default=None,
-                        )
-                        per_hand.append(f"{hand.label} roi_diag={hand.diagonal:.0f}px best_score={best}")
-                    objs = [(o.label, round(o.confidence, 2)) for o in hand_result.objects]
-                    print(f"sensordyme.hand_debug: {per_hand} objects={objs}", flush=True)
+                # Developer-only, opt-in (`hand_debug: true`). See __init__.
+                if self._hand_debug:
+                    self._hand_diagnostics(frame, hand_result, aspect)
         self._last_hand_result = hand_result
 
         return self._reason(
@@ -1314,7 +1567,7 @@ class BabyMonitoringModule(VisionModule):
         )
 
     def _reason(self, boxes: list, motion: float, w: int, h: int, now: float,
-                bottle_boxes: list = (), object_boxes: dict = None,
+                bottle_boxes: list = (), object_boxes: Optional[dict] = None,
                 activity_state: Optional[ActivityState] = None,
                 hand_result: Optional[HandPerceptionResult] = None) -> list[Event]:
         """Pure decision layer (unit-testable without camera or model)."""
@@ -1345,14 +1598,35 @@ class BabyMonitoringModule(VisionModule):
             )
             transitions += self._engine.update("safe_zone_exit", outside, 0.85, now)
 
+        # Boundary zones ("Line" in the app): a settled change of which side
+        # anyone's feet are on, in either direction, reported as a
+        # zone_violation with "crossed" in its detail. They used to be
+        # registered nowhere in this module, so a drawn line was ignored
+        # without a word. Nobody visible is no observation, not a crossing.
+        for zone in self._zones:
+            if zone.kind != "boundary":
+                continue
+            inside = any(zone.contains_box(b, w, h) for b in boxes) if present else None
+            crossing = self._boundary_watch[zone.name].update(inside, now)
+            if crossing is not None:
+                events.append(Event.now(
+                    "zone_violation", 0.0, 0.85, self.name, f"zone={zone.name} crossed ({crossing})",
+                ))
+
         # Stillness: subject visible with very little motion. Motion observed
-        # WHILE the subject is visible is contradicting evidence and locks
-        # the feed False long enough that the engine's occlusion grace cannot
-        # bridge it (see _stillness_motion_lockout_s in __init__); the
-        # subject not being visible at all is missing evidence and sets no
-        # lockout, so a brief detection dropout is bridged exactly as before.
+        # WHILE the subject is visible is contradicting evidence. It drops an
+        # unconfirmed stillness clock at once and holds the feed False past
+        # resolve_after_s, so a confirmed one resolves (see
+        # _stillness_motion_lockout_s in __init__). The subject not being
+        # visible at all is missing evidence and sets no lockout, so a
+        # detection dropout is bridged. `motion` from process() is already
+        # glitch-filtered (see _motion_energy): a one-frame flash no longer
+        # restarts the clock.
         if present and motion >= self._still_max_motion:
             self._stillness_locked_until = now + self._stillness_motion_lockout_s
+            if self._engine.state_of("unusual_stillness") in (OBSERVED, DEVELOPING):
+                self._engine.remove_rule("unusual_stillness")
+                self._engine.add_rule(self._stillness_rule)
         elif self._stillness_locked_until is not None and now >= self._stillness_locked_until:
             self._stillness_locked_until = None
         still = present and motion < self._still_max_motion and self._stillness_locked_until is None
@@ -1658,9 +1932,9 @@ class BabyMonitoringModule(VisionModule):
         h, w = frame.shape[:2]
         for zone in self._zones:
             pts = np.array([[int(x * w), int(y * h)] for x, y in zone.polygon], dtype=np.int32)
-            color = (0, 0, 220) if zone.kind == "restricted" else (0, 200, 0)
+            color = {"restricted": (0, 0, 220), "boundary": (0, 165, 255)}.get(zone.kind, (0, 200, 0))
             cv2.polylines(frame, [pts], isClosed=True, color=color, thickness=2)
-            cv2.putText(frame, zone.name, tuple(pts[0]), cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 1)
+            cv2.putText(frame, zone.name, tuple(int(v) for v in pts[0]), cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 1)
         identification = self._last_infant_identification
         for (x1, y1, x2, y2) in self._last_boxes:
             cv2.rectangle(frame, (x1, y1), (x2, y2), (255, 180, 0), 2)
@@ -1740,8 +2014,8 @@ class BabyMonitoringModule(VisionModule):
         if self._pose is not None:
             try:
                 self._pose.close()
-            except Exception:  # noqa: BLE001 - closing twice must be harmless
-                pass
+            except Exception as exc:  # noqa: BLE001 - closing twice must be harmless
+                log.debug("pose graph close failed (harmless): %r", exc)
 
     def get_detections(self) -> DetectionFrame:
         """People seen in the most recent *detection* frame, for custom rules.

@@ -42,7 +42,7 @@ def test_failures_escalate_to_restart_then_recovery_resets():
 
 def test_last_resort_fires_once_after_restart_budget_spent():
     last_resort = []
-    monitor = HealthMonitor(on_last_resort=lambda name: last_resort.append(name))
+    monitor = HealthMonitor(on_last_resort=last_resort.append)
     monitor.register(
         "inference",
         critical=True,
@@ -58,7 +58,7 @@ def test_last_resort_fires_once_after_restart_budget_spent():
 
 def test_noncritical_component_only_degrades_and_never_escalates():
     last_resort = []
-    monitor = HealthMonitor(on_last_resort=lambda name: last_resort.append(name))
+    monitor = HealthMonitor(on_last_resort=last_resort.append)
     monitor.register("cloud_uplink", critical=False, check=lambda: (False, "offline"))
     _drive_checks(monitor, "cloud_uplink", 10)
     snap = monitor.snapshot()

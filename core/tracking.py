@@ -21,6 +21,7 @@ from __future__ import annotations
 import math
 import time
 from dataclasses import dataclass, field
+from itertools import pairwise
 from typing import Optional
 
 from core.keypoints import Skeleton
@@ -295,7 +296,7 @@ class TrackedBox:
         if diagonal <= 1e-6:
             return None
         peak: Optional[float] = None
-        for (t0, x0, y0), (t1, x1, y1) in zip(self.trail, self.trail[1:]):
+        for (t0, x0, y0), (t1, x1, y1) in pairwise(self.trail):
             dt = t1 - t0
             if dt <= 0:
                 continue
@@ -338,7 +339,7 @@ class TrackedBox:
         count = 0
         seg_dx = seg_dy = 0.0
         prev_dir: Optional[tuple[float, float]] = None
-        for (_, x0, y0), (_, x1, y1) in zip(self.trail, self.trail[1:]):
+        for (_, x0, y0), (_, x1, y1) in pairwise(self.trail):
             dx, dy = (x1 - x0) * aspect / diagonal, (y1 - y0) / diagonal
             step = math.hypot(dx, dy)
             if step < 1e-6:

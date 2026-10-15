@@ -88,16 +88,12 @@ def main() -> int:
     if not PBXPROJ.exists():
         raise SystemExit(f"no project at {PBXPROJ} — run `xcodegen generate` in ios/ first")
 
-    text = PBXPROJ.read_text()
+    original = text = PBXPROJ.read_text()
     names = args.files
     if args.sync:
         names = sorted(p.name for p in SOURCES.glob("*.swift"))
     if not names:
         parser.error("give filenames, or --sync")
-
-    # One backup per run, so a bad edit is always recoverable.
-    backup = PBXPROJ.with_suffix(".pbxproj.bak")
-    backup.write_text(text)
 
     removed = []
     if args.prune or args.sync:
@@ -124,6 +120,12 @@ def main() -> int:
         print("nothing to change; the project matches ios/Sources")
         return 0
 
+    # Backed up only when this run is about to change the project. Writing it
+    # on every run meant a second, no-op run replaced the only pre-edit copy
+    # with the (possibly bad) edited project, so the edit was no longer
+    # recoverable.
+    backup = PBXPROJ.with_suffix(".pbxproj.bak")
+    backup.write_text(original)
     PBXPROJ.write_text(text)
     for name in added:
         print(f"  + {name}")
