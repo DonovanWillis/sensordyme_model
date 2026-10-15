@@ -47,6 +47,7 @@ from __future__ import annotations
 
 import argparse
 import csv
+import itertools
 import json
 import random
 import sys
@@ -286,6 +287,42 @@ def phone_curve(per_class: dict, sweep: tuple[float, ...]) -> list[dict]:
     return curve
 
 
+def phone_calibration(per_class: dict, edges: tuple[float, ...] = (0.0, 0.2, 0.4, 0.6, 0.8, 1.01)) -> dict:
+    """Is the detector's phone score a calibrated probability on labelled frames?
+
+    A phone event's confidence IS this score (core/confidence.py, "model"), so
+    this is the calibration measurement that number rests on: among frames whose
+    best phone box scored in a band, how often was a phone really present?
+    Frames with no phone box at all carry no score and are excluded.
+
+    Two caveats travel with every number here. The observed rate depends on the
+    sample's class mix (`base_rate`: 4 phone classes against 2 non-phone ones),
+    so it is calibration ON THIS MIX, not a universal correction. And State Farm's
+    camera geometry is not SensorDyme's (see the module docstring), so this is a
+    measurement to watch, not a mapping to apply on device.
+    """
+    scored = [(s, True) for c in PHONE_POSITIVE for s in per_class.get(c, {}).get("phone_scores", []) if s > 0]
+    scored += [(s, False) for c in PHONE_NEGATIVE for s in per_class.get(c, {}).get("phone_scores", []) if s > 0]
+    n_pos = sum(len(per_class.get(c, {}).get("phone_scores", [])) for c in PHONE_POSITIVE)
+    n_all = n_pos + sum(len(per_class.get(c, {}).get("phone_scores", [])) for c in PHONE_NEGATIVE)
+    bins, ece = [], 0.0
+    for lo, hi in itertools.pairwise(edges):
+        members = [(s, y) for s, y in scored if lo <= s < hi]
+        if not members:
+            continue
+        mean_score = sum(s for s, _ in members) / len(members)
+        rate = sum(1 for _, y in members if y) / len(members)
+        ece += len(members) / len(scored) * abs(mean_score - rate)
+        bins.append({"band": [lo, min(hi, 1.0)], "n": len(members),
+                     "mean_score": round(mean_score, 3), "phone_rate": round(rate, 3)})
+    return {
+        "bins": bins,
+        "ece": round(ece, 3) if scored else None,
+        "frames_with_a_score": len(scored),
+        "base_rate": round(n_pos / n_all, 3) if n_all else None,
+    }
+
+
 def summarise(scored: dict, sweep: tuple[float, ...], shipped_conf: float) -> dict:
     per_class = scored["per_class"]
     total_n = sum(s["n"] for s in per_class.values())
@@ -295,6 +332,7 @@ def summarise(scored: dict, sweep: tuple[float, ...], shipped_conf: float) -> di
     all_person_conf = [c for s in per_class.values() for c in s["person_conf"]]
 
     curve = phone_curve(per_class, sweep)
+    calibration = phone_calibration(per_class)
     at_shipped = min(curve, key=lambda r: abs(r["conf"] - shipped_conf))
     best_f1 = max(curve, key=lambda r: r["f1"])
 
@@ -313,6 +351,7 @@ def summarise(scored: dict, sweep: tuple[float, ...], shipped_conf: float) -> di
         "phone_at_shipped_conf": at_shipped,
         "phone_best_f1": best_f1,
         "phone_undetectable_at_any_conf": round(undetectable, 4),
+        "phone_calibration": calibration,
         "per_class": {
             name: {
                 "label": CLASS_LABELS.get(name, name),
@@ -373,6 +412,12 @@ def print_report(summary: dict, shipped_conf: float) -> None:
           f"F1 {shipped['f1']:.3f}  (n={shipped['n_pos']} pos / {shipped['n_neg']} neg)")
     print(f"  best F1 at      conf={best['conf']:.2f} : recall {100 * best['recall']:.1f}%, "
           f"F1 {best['f1']:.3f}")
+    cal = summary.get("phone_calibration") or {}
+    if cal.get("bins"):
+        print(f"\n  Phone-score calibration (ECE {cal['ece']}, base rate {cal['base_rate']} on this mix):")
+        for b in cal["bins"]:
+            print(f"    score {b['band'][0]:.1f}-{b['band'][1]:.1f}: n={b['n']:4d}  mean score {b['mean_score']:.2f}"
+                  f"  -> phone present {100 * b['phone_rate']:5.1f}%")
     print(f"  {100 * summary['phone_undetectable_at_any_conf']:.1f}% of phone-present frames yield NO box "
           "at any confidence")
     print("      -- a model ceiling; no threshold change recovers those")

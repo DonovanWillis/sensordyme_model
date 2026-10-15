@@ -165,3 +165,25 @@ def test_a_conjunction_is_never_more_certain_than_its_weakest_part():
     assert both == pytest.approx(0.72)
     assert both is not None and both <= min(0.9, 0.8)
     assert joint(0.9, None) is None, "unknown evidence for one part makes the whole unknown"
+
+
+def test_phone_calibration_measures_score_against_labelled_truth():
+    """benchmarks/accuracy_state_farm.py: a phone event's confidence is the
+    detector's score, so the benchmark measures whether that score behaves as a
+    probability on labelled frames (reliability bins + ECE)."""
+    from benchmarks.accuracy_state_farm import phone_calibration
+
+    per_class = {
+        # 10 phone frames scored 0.9; 9 of them real phones -> rate 0.9 (calibrated)
+        "c1": {"phone_scores": [0.9] * 9 + [0.0]},
+        "c0": {"phone_scores": [0.9] + [0.3] * 4 + [0.0] * 5},
+        # 4 frames at 0.3, none of them phones -> rate 0.0 (over-confident by 0.3)
+    }
+    cal = phone_calibration(per_class)
+    by_band = {tuple(b["band"]): b for b in cal["bins"]}
+    assert by_band[(0.8, 1.0)]["phone_rate"] == pytest.approx(0.9)
+    assert by_band[(0.2, 0.4)]["phone_rate"] == 0.0
+    assert cal["frames_with_a_score"] == 14, "frames with no phone box carry no score"
+    # ECE: 10/14 * |0.9-0.9| + 4/14 * |0.3-0.0|
+    assert cal["ece"] == pytest.approx(4 / 14 * 0.3, abs=0.001)
+    assert cal["base_rate"] == 0.5

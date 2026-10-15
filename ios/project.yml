@@ -14,6 +14,12 @@ targets:
       path: Info.plist
       properties:
         UILaunchScreen: {}
+        # From build settings, not literals, so a build can be identified on a
+        # phone: `xcrun devicectl device info apps` reports exactly these. Every
+        # build used to say 1.0 (1), which could not tell an old install from one
+        # built from this repository.
+        CFBundleShortVersionString: $(MARKETING_VERSION)
+        CFBundleVersion: $(CURRENT_PROJECT_VERSION)
         # Where this build's backend lives. Empty by default: no domain is
         # assumed, and an unset build setting expands to "" which the app reads
         # as "not configured" and falls back to mDNS discovery on the LAN — the
@@ -43,6 +49,8 @@ targets:
     settings:
       base:
         PRODUCT_BUNDLE_IDENTIFIER: com.sensordyme.app
+        MARKETING_VERSION: "1.0"
+        CURRENT_PROJECT_VERSION: "1" # override per build, e.g. CURRENT_PROJECT_VERSION=20261014.2230
         SWIFT_VERSION: "5.9"
         CODE_SIGN_STYLE: Automatic
         DEVELOPMENT_TEAM: D6ZR59ZR7Q # personal team set in Xcode; kept here so regeneration preserves it
