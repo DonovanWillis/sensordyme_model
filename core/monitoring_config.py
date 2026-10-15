@@ -31,7 +31,10 @@ from core.logging_setup import get_logger
 
 log = get_logger("monitoring")
 
-DEFAULT_PATH = Path("data/monitoring.json")
+#: Overridable like the backend's own state paths (SENSORDYME_DB and friends),
+#: so a process — the test suite above all — can keep its hands off the real
+#: device configuration. Unset on a device: the default is unchanged.
+DEFAULT_PATH = Path(os.environ.get("SENSORDYME_MONITORING_PATH") or "data/monitoring.json")
 
 
 class MonitoringConfig:

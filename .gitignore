@@ -77,6 +77,11 @@ setup*.log
 # codes, orders, event history. Was committed through e57b1bb and purged from
 # history on 2026-08-06 — never track it again.
 cloud/*.db
+# ...and SQLite's side files, which hold the same rows (recent writes) while the
+# backend is running — present exactly when a `git add .` is most likely.
+cloud/*.db-wal
+cloud/*.db-shm
+cloud/*.db-journal
 
 # JWT signing key, generated and persisted by cloud/app.py on first run.
 cloud/.jwt_secret
