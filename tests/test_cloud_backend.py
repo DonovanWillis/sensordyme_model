@@ -1762,3 +1762,39 @@ def test_a_device_event_type_cannot_inject_a_header(backend):
     app_module, _client = backend
     title = app_module._readable_title("evil\r\nX-Injected: 1")
     assert "\r" not in title and "\n" not in title
+
+
+def test_health_reports_the_same_backend_id_as_the_mdns_record(backend, tmp_path, monkeypatch):
+    """The app pins the TXT record's id and now checks it against /v1/health too:
+    every backend answers to the same sensordyme-backend.local name, so a cached
+    name can lead to a different backend than the one that was found. The two
+    ids disagreeing would make the app refuse its own backend."""
+    app_module, client = backend
+    monkeypatch.setattr(app_module.mdns, "BACKEND_ID_FILE", str(tmp_path / ".backend_id"))
+    body = client.get("/v1/health").json()
+    assert body["id"] == app_module.mdns.backend_id()
+    assert body["id"].startswith("bk_")
+
+
+def test_an_unpersistable_backend_id_is_still_one_id_per_process(backend, monkeypatch):
+    """A temporary id that changed on every call would make /v1/health disagree
+    with the TXT record advertised a moment earlier."""
+    app_module, client = backend
+    monkeypatch.setattr(app_module.mdns, "BACKEND_ID_FILE", "/proc/definitely/not/writable")
+    first = client.get("/v1/health").json()["id"]
+    assert client.get("/v1/health").json()["id"] == first == app_module.mdns.backend_id()
+
+
+def test_a_non_finite_health_report_does_not_take_down_the_device_list(backend):
+    """Starlette accepts NaN / 1e999 in a request body, but the response encoder
+    refuses them: stored verbatim, one bad health report made GET /v1/devices a
+    500 for the whole account until the device sent a clean one. Ingest already
+    guarded events against exactly this; health and monitoring were missed."""
+    app_module, client = backend
+    auth, device_headers, _ = _claim_a_device(app_module, client)
+    raw = b'{"events": [], "health": {"state": "ok", "detail": "x", "temp_c": NaN, "fps": 1e999}, "monitoring": {"score": -Infinity}}'
+    resp = client.post("/v1/ingest", content=raw,
+                       headers={**device_headers, "Content-Type": "application/json"})
+    assert resp.status_code == 200
+    listed = client.get("/v1/devices", headers=auth)
+    assert listed.status_code == 200, listed.text

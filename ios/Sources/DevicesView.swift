@@ -31,6 +31,7 @@ struct DevicesView: View {
     @State private var reloadGuard = LatestRequestGuard()
 
     private let refreshTimer = Timer.publish(every: 10, on: .main, in: .common).autoconnect()
+    @State private var timedReloadInFlight = false
 
     var body: some View {
         NavigationStack {
@@ -140,7 +141,16 @@ struct DevicesView: View {
                 link.start()
                 await link.ensureConnection()
             }
-            .onReceive(refreshTimer) { _ in Task { await reload() } }
+            .onReceive(refreshTimer) { _ in
+                // Same rule as DeviceDetailView: one timed reload at a time, and
+                // none into a backend AppState is already retrying on its own.
+                guard !timedReloadInFlight, state.periodicRefreshMayRun else { return }
+                timedReloadInFlight = true
+                Task {
+                    await reload()
+                    timedReloadInFlight = false
+                }
+            }
         }
         .tint(SD.Colors.accent)
     }

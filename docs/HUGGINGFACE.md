@@ -308,7 +308,7 @@ Avoid PaliGemma: the Gemma license carries use restrictions that need legal revi
 Verified locally:
 
 ```
-/Users/donov/sensordyne-models/.venv/…/ultralytics-8.3.28.dist-info/METADATA
+.venv/…/ultralytics-8.3.28.dist-info/METADATA
   License: AGPL-3.0
 ```
 

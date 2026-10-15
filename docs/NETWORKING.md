@@ -90,6 +90,19 @@ a healthy deployed URL is never abandoned for whatever is on the local Wi-Fi.
 `ios/project.yml` ships that setting empty, and a test enforces that it is never
 a LAN address again.
 
+"Answers as a SensorDyme backend" is not "is MY backend", though. Every backend
+advertises the same `sensordyme-backend.local` name, so a cached name (or a cached
+address DHCP has since given to another Mac) can lead to a classmate's server on a
+shared network. `/v1/health` therefore also reports the backend's stable `id` —
+the same value as the `id` in the `_sensordyme-api._tcp` TXT record, kept in
+`cloud/.backend_id` — and the app refuses a discovered or cached address whose id
+contradicts the one it pinned. A typed address is never second-guessed.
+
+If the id genuinely changed (a fresh checkout or a new Mac without
+`cloud/.backend_id`), the app will report "Found a SensorDyme server … but not the
+one this app uses". Either copy `cloud/.backend_id` from the old installation, or
+in the app open Settings → Manual server address → **Forget remembered server**.
+
 ## Second: is `cloud.base_url` a fixed IP address?
 
 The next most likely reason a working device appears to break is that

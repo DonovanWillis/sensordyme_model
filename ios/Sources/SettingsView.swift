@@ -388,8 +388,14 @@ struct ManualBackendView: View {
                 }
                 .disabled(draft.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty || checking)
 
-                if !state.configuredBaseURL.isEmpty {
-                    Button("Clear and go back to automatic", role: .destructive) {
+                // Also offered when only an identity is pinned: a backend whose id
+                // was regenerated (a fresh checkout, cloud/.backend_id deleted) is
+                // otherwise refused for ever, and this was the only way out — but
+                // it used to appear only after typing an address first.
+                if !state.configuredBaseURL.isEmpty || !state.knownBackendID.isEmpty {
+                    Button(state.configuredBaseURL.isEmpty
+                           ? "Forget remembered server and search again"
+                           : "Clear and go back to automatic", role: .destructive) {
                         draft = ""
                         message = "Cleared. SensorDyme will find your server on the network again."
                         state.useAutomaticBackend()

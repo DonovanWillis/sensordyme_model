@@ -535,7 +535,9 @@ class DeviceRuntime:
         from core import detectors
 
         try:
-            backend = detectors.require_backend(str(weights), module_cfg.get("device"))
+            # `phone_device` is the comparison modules' name for the same pin.
+            device = module_cfg.get("device") or module_cfg.get("phone_device")
+            backend = detectors.require_backend(str(weights), device)
         except Exception as exc:  # noqa: BLE001 - the reason is reported, not swallowed
             # DEGRADED, not dead, and not pretending. Crash-looping here would
             # take down health, the dashboard and BLE provisioning too, leaving

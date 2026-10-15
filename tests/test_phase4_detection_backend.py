@@ -158,3 +158,23 @@ def test_weights_keys_cover_every_shipped_module():
         f"these config keys name model weights but are not in _WEIGHTS_KEYS, so the "
         f"boot check would silently skip them: {sorted(suspicious)}"
     )
+
+
+@pytest.mark.parametrize("module_name", ["driver_attention_openpilot", "driver_attention_skinnemoen"])
+def test_the_phone_detector_device_pin_is_passed_through(monkeypatch, module_name):
+    """The comparison modules load their phone detector with `phone_device`, not
+    `device`. Reading only `device` verified (yolo11n.pt, None) at boot while the
+    module asked for (yolo11n.pt, "mps") — a different cache entry and possibly a
+    different backend — so health could report a detector the module never got."""
+    from core import detectors
+
+    seen = {}
+    monkeypatch.setattr(
+        detectors,
+        "require_backend",
+        lambda w, d=None: seen.update(weights=w, device=d) or "ultralytics",
+    )
+    DeviceRuntime._verify_detection_backend(
+        _runtime(module_name, {"phone_weights": "yolo11n.pt", "phone_device": "mps"})
+    )
+    assert seen == {"weights": "yolo11n.pt", "device": "mps"}

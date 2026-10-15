@@ -713,6 +713,11 @@ if(TOKEN){
   const cam = document.getElementById("cam");
   if(cam) cam.src = "/stream?token=" + encodeURIComponent(TOKEN);
 }
+// Everything below that reaches innerHTML is escaped first. Event signals carry
+// rule descriptions, and those come from the AI rule interpreter: text a model
+// wrote is not markup this page may execute, on the origin holding TOKEN.
+const ESC = {"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"};
+function esc(v){ return String(v == null ? "" : v).replace(/[&<>"']/g, ch => ESC[ch]); }
 function fmt(s){const m=Math.floor(s/60),h=Math.floor(m/60);return h?h+":"+String(m%60).padStart(2,"0")+":"+String(s%60).padStart(2,"0"):m+":"+String(s%60).padStart(2,"0");}
 async function tick(){
   try{
@@ -726,10 +731,10 @@ async function tick(){
     pill.textContent = s.alert_active ? "ALERT" : "OK";
     pill.className = "pill" + (s.alert_active ? " alert" : "");
     document.getElementById("flashOverlay").classList.toggle("on", !!s.flash_active);
-    document.getElementById("counts").innerHTML = s.counts.map(c=>`<span class="chip">${c.type} <b>${c.n}</b></span>`).join("") || '<span class="empty">no alerts yet</span>';
+    document.getElementById("counts").innerHTML = s.counts.map(c=>`<span class="chip">${esc(c.type)} <b>${esc(c.n)}</b></span>`).join("") || '<span class="empty">no alerts yet</span>';
     document.getElementById("timeline").innerHTML = s.events.length ? s.events.map(e=>
-      `<li><span class="dot ${e.severity}"></span><span class="t">${e.time}</span>
-       <span class="ev"><b>${e.type}</b><span class="sig">${e.signals||""}</span></span></li>`).join("")
+      `<li><span class="dot ${esc(e.severity)}"></span><span class="t">${esc(e.time)}</span>
+       <span class="ev"><b>${esc(e.type)}</b><span class="sig">${esc(e.signals)}</span></span></li>`).join("")
       : '<li class="empty">no events yet</li>';
     const cv = document.getElementById("spark"), ctx = cv.getContext("2d");
     ctx.clearRect(0,0,cv.width,cv.height);
@@ -748,8 +753,8 @@ async function loadModes(){
     const card = document.getElementById("modecard"); card.style.display = "block";
     document.getElementById("modes").innerHTML = p.presets.map(m=>
       `<button class="chip" style="cursor:pointer;border:1px solid ${m.active?'var(--accent)':'var(--line)'};
-        ${m.active?'font-weight:700;color:var(--accent);':''}" title="${m.description}"
-        onclick="setMode('${m.name}')">${m.title}</button>`).join("");
+        ${m.active?'font-weight:700;color:var(--accent);':''}" title="${esc(m.description)}"
+        data-name="${esc(m.name)}" onclick="setMode(this.dataset.name)">${esc(m.title)}</button>`).join("");
   }catch(e){}
 }
 async function setMode(name){

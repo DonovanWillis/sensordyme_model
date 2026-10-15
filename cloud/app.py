@@ -998,6 +998,11 @@ def health():
     its file unreadable can serve nothing, and reporting it healthy kept Fly
     routing to it. One trivial query, on a connection that is opened anyway.
     """
+    # `id` is the same stable identity the mDNS TXT record carries. The app pins
+    # it, and checks it HERE as well as in the TXT record: every backend answers
+    # to the same `sensordyme-backend.local` name, and a cached name or address
+    # can lead to a different backend than the one that was found, so "it says
+    # service=sensordyme-cloud" alone is not "it is my backend".
     try:
         with db() as conn:
             conn.execute("SELECT 1").fetchone()
@@ -1005,10 +1010,10 @@ def health():
         log.error("health: database unavailable (%s)", exc)
         return JSONResponse(
             status_code=503,
-            content={"ok": False, "service": "sensordyme-cloud", "time": time.time(),
-                     "detail": "database unavailable"},
+            content={"ok": False, "service": "sensordyme-cloud", "id": mdns.backend_id(),
+                     "time": time.time(), "detail": "database unavailable"},
         )
-    return {"ok": True, "service": "sensordyme-cloud", "time": time.time()}
+    return {"ok": True, "service": "sensordyme-cloud", "id": mdns.backend_id(), "time": time.time()}
 
 
 def _trusted_client_ip_header() -> str:
@@ -1192,7 +1197,15 @@ def claim_device(body: ClaimBody, request: Request, uid: int = Depends(current_u
             raise HTTPException(404, "unknown claim code")
         if row["owner_id"] is not None and row["owner_id"] != uid:
             raise HTTPException(409, "device already claimed by another account")
-        conn.execute("UPDATE devices SET owner_id = ? WHERE id = ?", (uid, row["id"]))
+        # Conditional, not a blind overwrite: two accounts holding the same code
+        # could both pass the check above before either wrote, and both got a
+        # 200 while the last writer silently took the device.
+        claimed = conn.execute(
+            "UPDATE devices SET owner_id = ? WHERE id = ? AND (owner_id IS NULL OR owner_id = ?)",
+            (uid, row["id"], uid),
+        )
+        if claimed.rowcount == 0:
+            raise HTTPException(409, "device already claimed by another account")
     return {"ok": True, "device_id": row["id"], "name": row["name"]}
 
 
@@ -1960,6 +1973,25 @@ def explain_event(device_id: int, event_id: int, uid: int = Depends(current_user
 
 
 # ------------------------------------------------------------------------- device API
+def _finite(value):
+    """`value` with every non-finite float replaced by None.
+
+    The request parser accepts NaN and 1e999; the response encoder refuses them.
+    Stored verbatim in `health` or `monitoring`, one such value made every later
+    GET /v1/devices for the account a 500 until the device reported again. The
+    events loop below already guards its own floats; this is the same rule for
+    the two blobs that are stored whole. (Current firmware sanitises before
+    sending -- core/uplink.py's _json_safe -- so this is for any other client.)
+    """
+    if isinstance(value, float):
+        return value if math.isfinite(value) else None
+    if isinstance(value, dict):
+        return {k: _finite(v) for k, v in value.items()}
+    if isinstance(value, list):
+        return [_finite(v) for v in value]
+    return value
+
+
 @app.post("/v1/ingest")
 def ingest(body: IngestBody, background_tasks: BackgroundTasks, device: sqlite3.Row = Depends(current_device)):
     now = time.time()
@@ -1970,8 +2002,8 @@ def ingest(body: IngestBody, background_tasks: BackgroundTasks, device: sqlite3.
             (
                 now,
                 body.active_preset,
-                json.dumps(body.health) if body.health is not None else None,
-                json.dumps(body.monitoring) if body.monitoring is not None else None,
+                json.dumps(_finite(body.health)) if body.health is not None else None,
+                json.dumps(_finite(body.monitoring)) if body.monitoring is not None else None,
                 device["id"],
             ),
         )

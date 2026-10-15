@@ -1,7 +1,7 @@
 """Per-IP rate limiting for endpoints reachable before (or instead of) auth.
 
 `/v1/login`, `/v1/signup` and `/v1/devices/claim` all take a guessable secret
-(a password, an email/password pair, an 8-character claim code) from an
+(a password, an email/password pair, a 12-hex-digit claim code) from an
 unauthenticated caller, with nothing else in front of them — no proxy, no
 WAF, no account lockout. Without a limit here, an attacker with network
 reachability to the backend can make unlimited guesses at whatever cost of

@@ -431,6 +431,34 @@ final class AppState: ObservableObject {
         )
     }
 
+    /// Whether a periodic screen refresh should run now.
+    ///
+    /// A poll into a backend known to be absent is not a refresh: each failed
+    /// request starts a full resolve (a health check per known address plus a
+    /// Bonjour browse), so a 4-second poll defeated the 2-60s retry backoff and
+    /// searched continuously. AlertWatcher learned this first; the screens share
+    /// the rule now. Nothing is lost by skipping — AppState is already retrying,
+    /// and the next tick after it reconnects refreshes as normal.
+    var periodicRefreshMayRun: Bool {
+        if isDemo { return true }
+        if case .connected = backendStatus { return true }
+        return false
+    }
+
+    /// The backend id an address must report to count as ours, or nil for none.
+    ///
+    /// A typed or built-in address is somebody's explicit choice and is never
+    /// second-guessed. Anything else came from discovery — including the
+    /// `sensordyme-backend.local` name every backend shares — and must lead back
+    /// to the backend that was pinned. See `BackendResolution.healthIdentityMatches`.
+    private func expectedBackendID(for url: String) -> String? {
+        let url = url.trimmingCharacters(in: .whitespacesAndNewlines)
+        let explicit = [configuredBaseURL, Self.productionBaseURL]
+            .map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
+        if explicit.contains(url) { return nil }
+        return knownBackendID.isEmpty ? nil : knownBackendID
+    }
+
     var api: APIClient {
         let base = effectiveBaseURL
         return APIClient(
@@ -490,7 +518,18 @@ final class AppState: ObservableObject {
             )
             for candidate in known {
                 if Task.isCancelled { return nil }
-                if await BackendLocator.answers(candidate) {
+                let expected = self.expectedBackendID(for: candidate)
+                if let probe = await BackendLocator.probe(candidate),
+                   BackendResolution.healthIdentityMatches(reported: probe.id, expected: expected) {
+                    // A discovered backend reached by its cached name before any
+                    // id was learned (an install that predates the pin): learn it
+                    // now, so the next network's other backends cannot pass.
+                    if expected == nil, self.knownBackendID.isEmpty,
+                       candidate == self.discoveredBaseURL,
+                       let id = probe.id, !id.isEmpty {
+                        Self.log.info("remembering backend id \(id, privacy: .public) from its health check")
+                        self.knownBackendID = id
+                    }
                     self.confirm(candidate, source: .cached)
                     return candidate
                 }
@@ -558,6 +597,7 @@ final class AppState: ObservableObject {
         confirmedBaseURL = url
         backendStatus = .connected(url)
         failedAttempts = 0
+        BackendLocator.shared.clearAmbiguity()
         retryTask?.cancel()
         retryTask = nil
         Self.log.info("backend connected at \(url, privacy: .public)")
@@ -590,7 +630,7 @@ final class AppState: ObservableObject {
                 // Only meaningful while we claim to be connected; any other state
                 // already has the resolver or the retry schedule working on it.
                 guard case .connected(let url) = self.backendStatus else { return }
-                if await BackendLocator.answers(url) { continue }
+                if await BackendLocator.answers(url, expectedID: self.expectedBackendID(for: url)) { continue }
                 Self.log.info("heartbeat: \(url, privacy: .public) stopped answering")
                 self.confirmedBaseURL = ""
                 self.reportUnreachable(triedKnown: [url])
@@ -679,7 +719,7 @@ final class AppState: ObservableObject {
             return
         }
         let address = confirmedBaseURL
-        if await BackendLocator.answers(address) {
+        if await BackendLocator.answers(address, expectedID: expectedBackendID(for: address)) {
             backendStatus = .connected(address)
             // Logged even though nothing changed: a silent success is
             // indistinguishable from this never having run, which made the
@@ -834,13 +874,43 @@ final class AppState: ObservableObject {
     }
 
     func signIn(_ auth: AuthResponse) {
+        claimLocalState(for: auth.email)
         storedToken = auth.token
         accountEmail = auth.email
         isSignedIn = true
         signOutNotice = nil
     }
 
+    /// Which account the phone-local state below belongs to.
+    @AppStorage("localStateOwner") private var localStateOwner: String = ""
+
+    /// Phone-local state is per account, not per phone: the paired camera's LAN
+    /// address and token, the SMS number in Settings, and the set of events
+    /// already announced. None of it was ever cleared, so a second account
+    /// signing in on the same phone saw the first account's live feed, and one
+    /// tap of Save attached the first person's phone number to it.
+    ///
+    /// Reset on a CHANGE of account rather than on sign-out, because sign-out
+    /// also happens when a session merely expires (`expireSession`), and making
+    /// the same person re-pair their camera for that would be a regression.
+    private func claimLocalState(for owner: String) {
+        let owner = owner.lowercased()
+        guard owner != localStateOwner else { return }
+        if !localStateOwner.isEmpty {
+            Self.log.info("a different account signed in; clearing the previous account's local state")
+            deviceLocalURL = ""
+            deviceToken = ""
+            UserDefaults.standard.removeObject(forKey: "alertPhone")
+            UserDefaults.standard.removeObject(forKey: "smsOnLoud")
+            AlertNotifier.shared.forgetAnnounced()
+        }
+        localStateOwner = owner
+    }
+
     func enterDemo() {
+        // The demo's simulated event ids would collide with a real backend's;
+        // it does not take over the real account's paired camera, though.
+        AlertNotifier.shared.forgetAnnounced()
         storedDemo = true
         isDemo = true
         accountEmail = "demo@sensordyme.app"
@@ -860,6 +930,8 @@ final class AppState: ObservableObject {
         if !isDemo {
             let client = api
             Task { try? await client.logout() }
+        } else {
+            AlertNotifier.shared.forgetAnnounced()  // leaving the demo: drop its ids
         }
         storedToken = ""
         accountEmail = ""

@@ -104,7 +104,7 @@ Read carefully, **§13 is conditioned on modifying the Program.** SensorDyme doe
 not patch ultralytics' source; it imports it. So the sharper question for
 SensorDyme is not §13 in isolation — it is:
 
-- **Is `sensordyne-models` a "work based on the Program"?** If importing
+- **Is `sensordyme_model` a "work based on the Program"?** If importing
   `ultralytics` into `core/detectors.py` creates a combined work, then the whole
   application is covered, the combined work *is* the modified Program for §13
   purposes, and §13 fires on `/stream`. The FSF's stated position is that

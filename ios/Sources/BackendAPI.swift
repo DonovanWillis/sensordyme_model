@@ -246,17 +246,11 @@ extension APIClient: BackendAPI {
     }
 
     func orders() async throws -> [Order] {
-        guard let baseURL else {
-            // `noBackendMessage` rather than a literal: AppState knows how many
-            // attempts have failed, and this does not. Naming Settings on the
-            // first failure is what made automatic discovery look broken while
-            // it was still running. See BackendResolution.failureMessage.
-            throw APIError(message: noBackendMessage, isUnreachable: true)
-        }
-        var req = URLRequest(url: baseURL.appendingPathComponent("v1/orders"))
-        if let token { req.setValue("Bearer \(token)", forHTTPHeaderField: "Authorization") }
-        let (data, _) = try await URLSession.shared.data(for: req)
-        return try JSONDecoder().decode(OrdersResponse.self, from: data).orders
+        // Through getJSON, which checks the status: decoding a 401's
+        // {"detail": ...} as OrdersResponse showed "The data couldn't be read
+        // because it is missing" and never noticed the session had expired.
+        let response: OrdersResponse = try await getJSON("v1/orders")
+        return response.orders
     }
 }
 

@@ -403,5 +403,21 @@ check(BackendResolution.ResolutionSource.manual.rawValue == "manual", "loggable"
 check(BackendResolution.ResolutionSource.cached != .bonjour,
       "\"the cache answered\" and \"Bonjour just found it\" are the same URL and different facts")
 
+// MARK: - The health check confirms WHICH backend, not just that one answered
+
+print("\na cached name or address must lead back to the backend that was pinned:")
+check(!BackendResolution.healthIdentityMatches(reported: "bk_theirs", expected: "bk_mine"),
+      "a different backend at the shared sensordyme-backend.local name is refused")
+check(BackendResolution.healthIdentityMatches(reported: "bk_mine", expected: "bk_mine"),
+      "our own backend is accepted")
+check(BackendResolution.healthIdentityMatches(reported: "bk_theirs", expected: ""),
+      "with nothing pinned yet there is nothing to contradict")
+check(BackendResolution.healthIdentityMatches(reported: "bk_theirs", expected: nil),
+      "a typed address carries no expectation: it is the user's explicit choice")
+check(BackendResolution.healthIdentityMatches(reported: nil, expected: "bk_mine"),
+      "a backend that predates the id field is not stranded")
+check(BackendResolution.healthIdentityMatches(reported: "", expected: "bk_mine"),
+      "an empty id is treated as no id")
+
 print("\n\(failures == 0 ? "PASSED" : "\(failures) FAILED")")
 exit(failures == 0 ? 0 : 1)

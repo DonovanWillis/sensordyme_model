@@ -342,3 +342,21 @@ def test_the_query_token_is_url_decoded():
         assert _status(url + "/api/state?token=" + urllib.parse.quote(token, safe="")) == 200
     finally:
         server.close()
+
+
+def test_event_text_is_escaped_before_it_reaches_innerhtml():
+    """Event signals carry rule descriptions written by the AI rule interpreter.
+    Rendered raw into innerHTML they were markup the page would execute, on the
+    origin that holds the dashboard token in its URL."""
+    import re
+
+    from core import dashboard
+
+    page = dashboard._PAGE
+    assert "function esc(" in page
+    # Every field interpolated into the event, count and mode templates is
+    # escaped. The one bare ${...} left picks between two constant CSS values.
+    for field in ("e.type", "e.signals", "e.time", "e.severity", "c.type", "m.title", "m.description", "m.name"):
+        assert re.search(r"\$\{" + re.escape(field), page) is None, f"{field} reaches innerHTML unescaped"
+        assert f"esc({field})" in page
+    assert "setMode('${" not in page, "a preset name must not be spliced into an inline JS string"

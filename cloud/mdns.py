@@ -6,7 +6,7 @@ on its own: DHCP moves the machine, and the address that was written down keeps
 pointing at nothing. A new phone starts from zero and cannot sign in at all,
 because sign-in needs an address before it needs a password.
 
-So the server announces itself instead. It publishes `_sensordyme-cloud._tcp`
+So the server announces itself instead. It publishes `_sensordyme-api._tcp`
 over mDNS, the app browses for it, and the address becomes a detail neither of
 them has to remember. Same mechanism the device already uses for its own feed
 (`_sensordyme._tcp`, see scripts/publish_mdns.py) — this is the cloud half.
@@ -89,6 +89,11 @@ def backend_id() -> str:
             return existing
     except OSError:
         pass
+    # An id that could not be persisted must still be ONE id for the life of the
+    # process: /v1/health reports it too, and a health id that differs from the
+    # TXT id advertised a moment earlier would make the app refuse this backend.
+    if str(path) in _TEMPORARY_IDS:
+        return _TEMPORARY_IDS[str(path)]
     minted = f"bk_{secrets.token_hex(6)}"
     try:
         path.write_text(minted + "\n")
@@ -99,7 +104,12 @@ def backend_id() -> str:
             "could not persist the backend id to %s (%s); using a temporary one "
             "that will change on restart", path, exc,
         )
+        _TEMPORARY_IDS[str(path)] = minted
     return minted
+
+
+#: Ids minted for a location that could not be written, by path. See backend_id.
+_TEMPORARY_IDS: dict[str, str] = {}
 
 #: How often to re-check whether the address and hostname we announced are still
 #: the ones this machine has.

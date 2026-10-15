@@ -95,7 +95,12 @@ final class BackendLocator: ObservableObject {
             var healthy: [BackendResolution.FoundBackend] = []
             for candidate in discovered {
                 if Task.isCancelled { return nil }
-                if await Self.answers(candidate.url) {
+                // Checked against the candidate's OWN TXT id: two backends on
+                // one network both answer to sensordyme-backend.local, and the
+                // de-duplicated name can carry the id of the one that did not
+                // win the name. A label that disagrees with what answers is
+                // dropped rather than trusted.
+                if await Self.answers(candidate.url, expectedID: candidate.id) {
                     healthy.append(candidate)
                 } else {
                     Self.log.info(
@@ -115,7 +120,7 @@ final class BackendLocator: ObservableObject {
                 Self.log.error(
                     "\(all.count, privacy: .public) SensorDyme backends answered and none is the one this app knows; not choosing between them")
                 let found = all.count == 1 ? "Found a SensorDyme server" : "Found \(all.count) SensorDyme servers"
-                self.ambiguity = "\(found) on this Wi-Fi, but not the one this app uses. Your server may be asleep or on another network; to use a different one, open Settings → Manual server address."
+                self.ambiguity = "\(found) on this Wi-Fi, but not the one this app uses. Your server may be asleep or on another network. If it was reinstalled or moved to a new Mac, open Settings → Manual server address → Forget remembered server."
                 return nil
             case .none:
                 return nil
@@ -138,6 +143,13 @@ final class BackendLocator: ObservableObject {
         stopBrowsing()
     }
 
+    /// A connection was confirmed, by whatever path: an earlier search's "found
+    /// N servers, none ours" no longer describes anything, and left set it was
+    /// shown as the reason for the NEXT, unrelated outage.
+    func clearAmbiguity() {
+        ambiguity = nil
+    }
+
     // MARK: - Health check
 
     /// Does a real SensorDyme backend answer here?
@@ -146,10 +158,29 @@ final class BackendLocator: ObservableObject {
     /// how the app used to report a connection to something that was not the
     /// backend: the request completes, the status is 200, and the body identifies
     /// the service as ours.
-    static func answers(_ base: String) async -> Bool {
+    ///
+    /// And, when `expectedID` is given, a fourth: it is the backend we pinned,
+    /// not merely a backend. See `BackendResolution.healthIdentityMatches`.
+    static func answers(_ base: String, expectedID: String? = nil) async -> Bool {
+        guard let probe = await probe(base) else { return false }
+        guard BackendResolution.healthIdentityMatches(reported: probe.id, expected: expectedID) else {
+            log.error(
+                "\(base, privacy: .public) is a SensorDyme backend, but \(probe.id ?? "none", privacy: .public), not \(expectedID ?? "none", privacy: .public)")
+            return false
+        }
+        return true
+    }
+
+    /// What a SensorDyme backend at `base` says about itself, or nil if none answers.
+    struct HealthProbe {
+        /// The backend's stable id, when it reports one (older backends do not).
+        let id: String?
+    }
+
+    static func probe(_ base: String) async -> HealthProbe? {
         guard let url = URL(string: base)?.appendingPathComponent("v1/health") else {
             log.error("not a usable base URL: \(base, privacy: .public)")
-            return false
+            return nil
         }
         var request = URLRequest(url: url)
         request.timeoutInterval = 5
@@ -160,15 +191,16 @@ final class BackendLocator: ObservableObject {
         do {
             let (data, response) = try await URLSession.shared.data(for: request)
             guard let http = response as? HTTPURLResponse, http.statusCode == 200 else {
-                return false
+                return nil
             }
             guard
                 let payload = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
-                let service = payload["service"] as? String
-            else { return false }
-            return service == expectedService
+                let service = payload["service"] as? String,
+                service == expectedService
+            else { return nil }
+            return HealthProbe(id: payload["id"] as? String)
         } catch {
-            return false
+            return nil
         }
     }
 

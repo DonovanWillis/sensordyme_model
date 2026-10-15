@@ -78,6 +78,15 @@ final class AlertNotifier: NSObject, ObservableObject {
         UNUserNotificationCenter.current().delegate = self
     }
 
+    /// Forget which events were announced, for a different account or the demo.
+    /// Event ids are per backend (the demo's start at 1, like a fresh server's),
+    /// so another account's ids would silence this one's first real alerts.
+    /// `lastNotifiedAt` is kept: the cooldown still applies, so the first poll
+    /// afterwards cannot turn old history into a burst of alerts.
+    func forgetAnnounced() {
+        UserDefaults.standard.removeObject(forKey: "announcedEvents")
+    }
+
     func requestPermission() async {
         do {
             authorized = try await UNUserNotificationCenter.current()

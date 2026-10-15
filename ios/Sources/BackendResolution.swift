@@ -146,6 +146,26 @@ enum BackendResolution {
         return .ambiguous(found)
     }
 
+    /// Is the backend that answered a health check the one we expected?
+    ///
+    /// `chooseBackend` pins the id from the TXT record, but that only guarded the
+    /// Bonjour path. A cached `sensordyme-backend.local` — the same name for EVERY
+    /// backend — or a cached address that DHCP has since handed to another Mac
+    /// was accepted on "service == sensordyme-cloud" alone, so the pin was
+    /// bypassed on exactly the shared networks it exists for. /v1/health now
+    /// reports the id too, and this is the rule for comparing them.
+    ///
+    /// No expectation passes (nothing pinned yet, or a typed address, which is
+    /// the user's explicit choice). A backend that reports no id passes too: it
+    /// predates the field, and refusing it would strand every older server. An
+    /// id is identification, not authentication — it stops the app confusing two
+    /// honest backends, not an attacker who copies the id.
+    static func healthIdentityMatches(reported: String?, expected: String?) -> Bool {
+        guard let expected, !expected.isEmpty else { return true }
+        guard let reported, !reported.isEmpty else { return true }
+        return reported == expected
+    }
+
     // MARK: - What to try, in what order
 
     /// Every address worth trying right now, best first, with the ones that

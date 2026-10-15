@@ -40,6 +40,7 @@ struct DeviceDetailView: View {
     @State private var hasLoaded = false
 
     private let refreshTimer = Timer.publish(every: 4, on: .main, in: .common).autoconnect()
+    @State private var timedReloadInFlight = false
 
     /// A loud alert in the last minute lights up the feed border + status.
     /// Whether to show the red alert state.
@@ -177,7 +178,18 @@ struct DeviceDetailView: View {
         }
         .refreshable { await reload() }
         .task { await reload() }
-        .onReceive(refreshTimer) { _ in Task { await reload() } }
+        .onReceive(refreshTimer) { _ in
+            // One timed reload at a time. Each is two sequential requests; on a
+            // link slower than the 4s tick every reload was superseded by the
+            // next before it landed, so LatestRequestGuard discarded them all
+            // and the screen never updated while requests piled up.
+            guard !timedReloadInFlight, state.periodicRefreshMayRun else { return }
+            timedReloadInFlight = true
+            Task {
+                await reload()
+                timedReloadInFlight = false
+            }
+        }
     }
 
     // MARK: Status
