@@ -33,3 +33,8 @@
 # Removing this line is NOT the remaining licence work — the device install no
 # longer references it. Keeping it is what preserves the dev path.
 ultralytics==8.3.28
+
+# Imported directly by modules/driver_attention_max.py (require_mps), so pinned
+# here rather than left to whatever ultralytics happens to resolve. Same
+# developer-only status as ultralytics: never on a device.
+torch==2.14.1

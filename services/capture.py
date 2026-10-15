@@ -96,9 +96,17 @@ class CaptureService:
             if self._health is not None:
                 self._health.report_failure(self.name, f"crashed: {exc}")
 
-    def restart(self) -> None:
+    def restart(self, stop_timeout: float = 5.0) -> None:
         """Full recovery: stop the pump, reopen the device, start again."""
-        self.stop()
+        self.stop(timeout=stop_timeout)
+        if self.is_running:
+            # The pump is wedged inside read() (a driver-level hang). Reopening
+            # the device under a thread still reading it is the one thing that
+            # must not happen, and start() would refuse anyway — leaving a
+            # reopened camera with no pump. In-place recovery cannot help here;
+            # the health monitor's escalation (watchdog → process restart) can.
+            log.error("capture restart skipped: the pump thread is wedged in a camera read")
+            return
         try:
             self._camera.reopen()
         except CameraError as exc:

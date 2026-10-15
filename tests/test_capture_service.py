@@ -117,3 +117,31 @@ def test_a_crash_inside_run_is_contained_not_silent():
         assert reported[0][0] == "camera"
     finally:
         service.stop()
+
+
+def test_restart_does_not_reopen_a_camera_a_wedged_read_still_holds():
+    """A driver-level hang can keep the pump inside read() past stop()'s join
+    timeout. restart() used to reopen the camera anyway — under a thread that
+    was still reading it — and then start() refused to run, leaving a reopened
+    camera with no pump at all. Leave the device alone; a wedged thread is the
+    process-level recovery's job (the systemd watchdog), not an in-place one."""
+    import threading
+
+    release = threading.Event()
+
+    class WedgedCamera(FakeCamera):
+        def read(self):
+            release.wait()  # a driver hang: never returns until released
+            return super().read()
+
+    camera, bus = WedgedCamera(), FrameBus()
+    service = CaptureService(camera, bus)
+    service.start()
+    try:
+        assert _wait_until(lambda: service.is_running)
+        service.restart(stop_timeout=0.2)
+        assert camera.reopens == 0, "reopened the camera under a thread still reading it"
+        assert service.is_running, "the wedged thread is still the one holding the camera"
+    finally:
+        release.set()
+        service.stop()
