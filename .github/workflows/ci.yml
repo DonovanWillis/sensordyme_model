@@ -378,13 +378,11 @@ jobs:
       # 3.13 wheel, and uvx would otherwise default to the newest interpreter
       # and fail to resolve before it audits anything.
       #
-      # KNOWN STATE as of 2026-08-29 — 16 advisories in 4 packages:
-      #   starlette 0.46.2   9  (transitive, via fastapi 0.115.*)
-      #   zeroconf  0.132.2  5  (cloud/requirements.txt pins the 0.132.* series,
-      #                          which locks in every one of these; the fixes
-      #                          are all in 0.149.x)
-      #   protobuf  4.25.9   1  (transitive, via mediapipe)
+      # KNOWN STATE as of 2026-10-14 — 2 advisories in 2 packages:
+      #   protobuf  4.25.9   1  (transitive, via mediapipe 0.10.14)
       #   pytest    8.3.3    1  (test-only; fix is in 9.0.3)
+      # Cleared 2026-10-14: starlette (pinned 1.4.* beside fastapi 0.141.*) and
+      # zeroconf (0.151.*, which also fixes the 5 s .local lookup).
       # Bumping any of these means changing requirements.txt or
       # cloud/requirements.txt, which are production pins — that is a deliberate
       # change with a test run behind it, not something CI should force.

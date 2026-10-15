@@ -1,13 +1,24 @@
 # SensorDyme cloud backend — deploy anywhere that runs Python (Fly.io, Railway,
 # a $5 VPS, ...). Run: uvicorn cloud.app:app --host 0.0.0.0 --port 8787
-fastapi==0.115.*
+# 0.141 + an explicit starlette 1.4: fastapi 0.115 capped starlette below 0.47,
+# which locked in 7 advisories (PYSEC-2026-161/248/249/1941/1942/2280/2281, all
+# fixed by 1.3.1). starlette is pinned here because it is the HTTP layer this
+# backend actually serves, not a detail of fastapi. Validated against the full
+# backend test set before the bump (409 passed, same as before).
+fastapi==0.141.*
+starlette==1.4.*
 uvicorn[standard]==0.32.*
 pyjwt==2.*
 requests==2.*
 # Announces the backend on the LAN (_sensordyme-api._tcp) so the app can find it
 # without anyone typing an address. Optional: cloud/mdns.py degrades to a warning
 # if it is missing, and a deployment with a real public address does not need it.
-zeroconf==0.132.*
+# 0.150.4+ answers an AAAA query for our IPv4-only host with a CORRECT NSEC
+# ("this name has only A"). 0.132 sent one owned by the service instance name,
+# with a bitmap listing the MISSING type, which resolvers ignore — so every
+# lookup of sensordyme-backend.local that asked for IPv6 stalled 5 s (measured:
+# 5.004 s before, 0.001-0.013 s after). No AAAA record is published either way.
+zeroconf==0.151.*
 
 # app.py imports core.presets at module scope, which reads presets.yaml. PyYAML
 # arrives transitively via uvicorn[standard] today, so this has always worked --

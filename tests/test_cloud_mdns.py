@@ -801,3 +801,19 @@ class TestRefreshTimer:
             assert twice.wait(5), "the timer stopped after the first failure"
         finally:
             advertiser.stop()
+
+
+def test_the_zeroconf_pin_includes_the_nsec_fix():
+    """zeroconf before 0.150.4 answered an AAAA query for our IPv4-only host with
+    an NSEC owned by the service INSTANCE name, listing the missing type. Resolvers
+    ignore that, so every lookup of sensordyme-backend.local that asked for IPv6
+    stalled 5 s (measured 5.004 s; 0.001-0.013 s after the upgrade)."""
+    import re
+    from pathlib import Path
+
+    from zeroconf import __version__ as installed
+
+    pin = re.search(r"^zeroconf==0\.(\d+)\.\*", (Path(__file__).resolve().parent.parent / "cloud" / "requirements.txt").read_text(), re.M)
+    assert pin and int(pin.group(1)) >= 151, "cloud/requirements.txt pins a zeroconf without the NSEC fix"
+    major, minor, patch = (int(p) for p in installed.split(".")[:3])
+    assert (major, minor, patch) >= (0, 150, 4), f"installed zeroconf {installed} predates the NSEC fix"

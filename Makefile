@@ -139,8 +139,8 @@ typecheck: ## Type-check with pyright (config in pyrightconfig.json)
 audit: ## Audit the pinned dependencies for known CVEs
 	@echo ">>> Auditing the REQUIREMENTS FILES, not the local .venv: those pins are"
 	@echo ">>> what actually ships to the Pi and to the cloud host, and they give the"
-	@echo ">>> same answer on every machine. As of 2026-08-29 this reports 16"
-	@echo ">>> advisories, concentrated in starlette (via fastapi) and zeroconf."
+	@echo ">>> same answer on every machine. As of 2026-10-14 this reports 2"
+	@echo ">>> advisories: protobuf (via mediapipe) and pytest (test-only)."
 	@echo ">>> requirements-device.txt is listed EXPLICITLY, not left to the"
 	@echo ">>> '-r requirements-device.txt' include inside requirements.txt: if"
 	@echo ">>> pip-audit ever stops following includes, the pins that actually"
