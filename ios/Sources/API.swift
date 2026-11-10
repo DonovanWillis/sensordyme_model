@@ -139,7 +139,7 @@ struct APIClient {
         #endif
         switch error.code {
         case .cannotConnectToHost:
-            return "Nothing is answering at \(host). Is the backend running on your Mac? SensorDyme will keep looking; you can also check Settings → Server."
+            return "Nothing is answering at \(host). Is the backend running on your Mac? ORYN EDGE will keep looking; you can also check Settings → Server."
         case .cannotFindHost, .dnsLookupFailed:
             return "Can't find \(host) — check Settings → Server, or set the address yourself in Settings → Manual server address."
         case .notConnectedToInternet, .networkConnectionLost:

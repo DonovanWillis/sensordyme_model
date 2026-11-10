@@ -38,6 +38,12 @@ struct DeviceDetailView: View {
     @State private var showRename = false
     @State private var newName = ""
     @State private var hasLoaded = false
+    /// What is being typed into the inline Ask Jupiter bar.
+    @State private var jupiterDraft = ""
+    /// The request handed to the Ask Jupiter screen when it opens (and sent
+    /// straight away when non-empty).
+    @State private var jupiterRequest = ""
+    @State private var showHistory = false
 
     private let refreshTimer = Timer.publish(every: 4, on: .main, in: .common).autoconnect()
     @State private var timedReloadInFlight = false
@@ -57,6 +63,7 @@ struct DeviceDetailView: View {
     }
 
     var body: some View {
+        ScrollViewReader { proxy in
         ScrollView {
             VStack(spacing: SD.Space.md) {
                 // Above the feed, not below the fold: this view polls every 4s and
@@ -65,20 +72,37 @@ struct DeviceDetailView: View {
                     ConnectionBanner(message: errorMessage) { await reload() }
                 }
 
+                // The camera is the centrepiece and always comes first.
                 FeedCard(device: device, alertActive: alertActive)
 
                 statusRow
-                healthCard
-                configureCard
+
+                askJupiterSection
                 modeCard
-                activityCard
+                manageCard
+
+                // Last on purpose: detail for someone who went looking for it,
+                // not something competing with the picture.
+                healthCard
+                    .id("health")
             }
             .padding(.horizontal, SD.Space.md)
-            .padding(.bottom, SD.Space.lg)
+            .padding(.top, SD.Space.xs)
+            .padding(.bottom, SD.Space.xl)
         }
-        .background(SD.Colors.background)
+        .task {
+            guard DebugLaunch.scrollToBottom else { return }
+            try? await Task.sleep(for: .seconds(1))
+            withAnimation { proxy.scrollTo("health", anchor: .bottom) }
+        }
+        }
+        .scrollDismissesKeyboard(.interactively)
+        .orynScreen()
         .navigationTitle(device.name)
         .navigationBarTitleDisplayMode(.inline)
+        .navigationDestination(isPresented: $showHistory) {
+            EventHistoryView(device: device, initialEvents: events)
+        }
         .toolbar {
             ToolbarItem(placement: .topBarTrailing) {
                 Menu {
@@ -91,7 +115,7 @@ struct DeviceDetailView: View {
                     Button {
                         showZones = true
                     } label: {
-                        Label("Areas", systemImage: "square.dashed")
+                        Label("Detection areas", systemImage: "square.dashed")
                     }
                     if state.isDemo {
                         Button {
@@ -100,14 +124,14 @@ struct DeviceDetailView: View {
                             Label("Run a demo alert", systemImage: "play.circle")
                         }
                     }
-                    NavigationLink {
-                        ReportsView(device: device)
-                    } label: {
-                        Label("Full report", systemImage: "chart.bar")
-                    }
                 } label: {
-                    Image(systemName: "ellipsis.circle")
+                    Image(systemName: "ellipsis")
+                        .font(.system(size: 15, weight: .semibold))
+                        .foregroundStyle(SD.Colors.textPrimary)
+                        .frame(width: 32, height: 32)
+                        .contentShape(Rectangle())
                 }
+                .accessibilityLabel("Device options")
             }
         }
         .alert("Rename device", isPresented: $showRename) {
@@ -120,8 +144,8 @@ struct DeviceDetailView: View {
             }
             Button("Cancel", role: .cancel) {}
         }
-        .sheet(isPresented: $showAI) {
-            AIConfigureView(device: device) { await reload() }
+        .sheet(isPresented: $showAI, onDismiss: { jupiterRequest = "" }) {
+            AIConfigureView(device: device, initialPrompt: jupiterRequest) { await reload() }
         }
         .sheet(isPresented: $showZones) {
             ZoneEditorView(device: device)
@@ -172,7 +196,7 @@ struct DeviceDetailView: View {
                 if let match = events.first(where: { $0.eventID == id }) {
                     selectedEvent = match
                 } else {
-                    errorMessage = "Couldn't open that alert — try Recent Activity below."
+                    errorMessage = "Couldn't open that alert. Open Event history below to find it."
                 }
                 notifier.pendingEventID = nil
             }
@@ -182,7 +206,15 @@ struct DeviceDetailView: View {
             if !notifier.authorized { await notifier.requestPermission() }
         }
         .refreshable { await reload() }
-        .task { await reload() }
+        .task {
+            await reload()
+            if DebugLaunch.openJupiter {
+                jupiterRequest = DebugLaunch.jupiterPrompt ?? ""
+                showAI = true
+            } else if DebugLaunch.openHistory {
+                showHistory = true
+            }
+        }
         .onReceive(refreshTimer) { _ in
             // One timed reload at a time. Each is two sequential requests; on a
             // link slower than the 4s tick every reload was superseded by the
@@ -199,6 +231,8 @@ struct DeviceDetailView: View {
 
     // MARK: Status
 
+    /// Online, alert state and what it is watching for — the same three facts
+    /// as before, from the same sources, in one quiet line under the picture.
     private var statusRow: some View {
         HStack(spacing: SD.Space.xs) {
             SDStatusPill(
@@ -209,13 +243,19 @@ struct DeviceDetailView: View {
                 status: alertActive ? .alert : .online,
                 text: alertActive ? "Alert" : "All clear"
             )
-            Spacer()
-            Text(customMonitoringActive
-                 ? (device.monitoring?.title ?? "AI Custom Monitoring")
-                 : Preset.title(for: device.activePreset))
-                .font(SD.Typography.caption.weight(.semibold))
-                .foregroundStyle(customMonitoringActive ? SD.Colors.accent : SD.Colors.textSecondary)
-                .lineLimit(1)
+            Spacer(minLength: SD.Space.xs)
+            HStack(spacing: 5) {
+                if customMonitoringActive {
+                    Image(systemName: "sparkles")
+                        .font(.system(size: 10, weight: .semibold))
+                }
+                Text(customMonitoringActive
+                     ? (device.monitoring?.title ?? "AI Custom Monitoring")
+                     : Preset.title(for: device.activePreset))
+                    .font(SD.Typography.caption.weight(.medium))
+                    .lineLimit(1)
+            }
+            .foregroundStyle(customMonitoringActive ? SD.Colors.textPrimary : SD.Colors.textTertiary)
         }
     }
 
@@ -226,26 +266,37 @@ struct DeviceDetailView: View {
     // these disappear rather than freezing on their last happy values.
 
     @ViewBuilder private var healthCard: some View {
-        if let health = device.health {
-            SDCard {
-                VStack(alignment: .leading, spacing: SD.Space.sm) {
-                    SDSectionHeader(title: "Device health")
-                    healthRow("Camera", systemImage: "camera.fill", health.camera, metric: "fps", suffix: " fps")
-                    healthRow("AI", systemImage: "cpu", health.accelerator)
-                    healthRow("Monitoring", systemImage: "eye.fill", health.inference)
-                    healthRow("Network", systemImage: "wifi", health.network)
+        VStack(alignment: .leading, spacing: SD.Space.xs) {
+            SDSectionHeader(title: "Device health")
+                .padding(.horizontal, SD.Space.xxs)
+            if let health = device.health {
+                SDCard {
+                    VStack(alignment: .leading, spacing: SD.Space.sm) {
+                        healthRow("Camera", systemImage: "camera", health.camera, metric: "fps", suffix: " fps")
+                        OrynRowDivider(inset: 22 + SD.Space.sm)
+                        healthRow("AI", systemImage: "cpu", health.accelerator)
+                        OrynRowDivider(inset: 22 + SD.Space.sm)
+                        healthRow("Monitoring", systemImage: "eye", health.inference)
+                        OrynRowDivider(inset: 22 + SD.Space.sm)
+                        healthRow("Network", systemImage: "wifi", health.network)
+                    }
                 }
-            }
-        } else if device.online {
-            // Online but silent about itself: an older device build that predates
-            // health reporting. Say so plainly instead of showing nothing.
-            SDCard {
-                Label(
-                    "This device isn't reporting its status yet. Update it to see camera and AI health here.",
-                    systemImage: "info.circle"
-                )
-                .font(SD.Typography.caption)
-                .foregroundStyle(SD.Colors.textSecondary)
+            } else {
+                // Online but silent about itself: an older device build that
+                // predates health reporting. Offline: the backend withholds a
+                // stale report. Either way, say so instead of leaving a gap.
+                SDCard {
+                    HStack(alignment: .top, spacing: SD.Space.sm) {
+                        Image(systemName: "info.circle")
+                            .foregroundStyle(SD.Colors.textTertiary)
+                        Text(device.online
+                             ? "This device isn't reporting its status yet. Update it to see camera and AI health here."
+                             : "Health appears here while the device is online.")
+                            .font(SD.Typography.caption)
+                            .foregroundStyle(SD.Colors.textTertiary)
+                            .fixedSize(horizontal: false, vertical: true)
+                    }
+                }
             }
         }
     }
@@ -283,7 +334,7 @@ struct DeviceDetailView: View {
                         .foregroundStyle(SD.Colors.textSecondary)
                 }
                 if component.isKnown {
-                    Circle().fill(component.status.tint).frame(width: 8, height: 8)
+                    Circle().fill(component.status.tint).frame(width: 7, height: 7)
                 } else {
                     Image(systemName: "questionmark.circle")
                         .font(.caption)
@@ -296,37 +347,116 @@ struct DeviceDetailView: View {
         }
     }
 
-    // MARK: Configure with AI
+    // MARK: Ask Jupiter
+    //
+    // Was "Configure with AI". Same flow underneath: the request goes to
+    // `/v1/ai/configure`, comes back as a draft, and nothing changes on the
+    // device until the person reviews it and taps Activate in AIConfigureView.
 
-    private var configureCard: some View {
-        Button { showAI = true } label: {
-            SDCard {
-                HStack(spacing: SD.Space.sm) {
-                    ZStack {
-                        RoundedRectangle(cornerRadius: SD.Radius.sm, style: .continuous)
-                            .fill(SD.Colors.accentMuted)
-                            .frame(width: 38, height: 38)
-                        Image(systemName: "wand.and.stars")
-                            .foregroundStyle(SD.Colors.accent)
+    private var askJupiterSection: some View {
+        VStack(alignment: .leading, spacing: SD.Space.xs) {
+            AskJupiterBar(text: $jupiterDraft) {
+                guard let request = JupiterPrompt.normalized(jupiterDraft) else { return }
+                jupiterRequest = request
+                jupiterDraft = ""
+                showAI = true
+            }
+            HStack(spacing: SD.Space.xxs) {
+                Text("Tell \(device.name) what to watch for. You review it before anything changes.")
+                    .font(SD.Typography.caption)
+                    .foregroundStyle(SD.Colors.textTertiary)
+                    .fixedSize(horizontal: false, vertical: true)
+                Spacer(minLength: SD.Space.xs)
+                Button {
+                    jupiterRequest = ""
+                    showAI = true
+                } label: {
+                    Text("Examples")
+                        .font(SD.Typography.caption.weight(.semibold))
+                        .foregroundStyle(SD.Colors.textSecondary)
+                }
+                .buttonStyle(.plain)
+            }
+            .padding(.horizontal, SD.Space.xxs)
+        }
+    }
+
+    // MARK: Manage
+
+    /// What used to be scattered between the toolbar menu and a long activity
+    /// card: the places you go *from* a device, as rows.
+    private var manageCard: some View {
+        VStack(alignment: .leading, spacing: SD.Space.xs) {
+            SDSectionHeader(title: "Manage")
+                .padding(.horizontal, SD.Space.xxs)
+            SDCard(padding: SD.Space.xxs) {
+                VStack(spacing: 0) {
+                    Button { showHistory = true } label: {
+                        OrynNavRow(
+                            icon: "clock.arrow.circlepath",
+                            title: "Event history",
+                            detail: historyDetail,
+                            trailing: alertActive ? "ALERT" : nil
+                        )
                     }
-                    VStack(alignment: .leading, spacing: 2) {
-                        Text("Configure with AI")
-                            .font(SD.Typography.headline)
-                            .foregroundStyle(SD.Colors.textPrimary)
-                        Text("Describe what to watch for in your own words")
-                            .font(SD.Typography.caption)
-                            .foregroundStyle(SD.Colors.textSecondary)
-                            .lineLimit(2)
+                    .buttonStyle(SDRowButtonStyle(minHeight: 60))
+
+                    OrynRowDivider()
+
+                    Button { showZones = true } label: {
+                        OrynNavRow(
+                            icon: "square.dashed",
+                            title: "Detection areas",
+                            detail: "Draw where rules apply"
+                        )
                     }
-                    Spacer(minLength: SD.Space.xxs)
-                    Image(systemName: "chevron.right")
-                        .font(.caption.weight(.semibold))
-                        .foregroundStyle(SD.Colors.textTertiary)
+                    .buttonStyle(SDRowButtonStyle(minHeight: 60))
+
+                    OrynRowDivider()
+
+                    NavigationLink {
+                        ReportsView(device: device)
+                    } label: {
+                        OrynNavRow(
+                            icon: "chart.bar",
+                            title: "Report",
+                            detail: "Patterns across recent events"
+                        )
+                    }
+                    .buttonStyle(SDRowButtonStyle(minHeight: 60))
+
+                    if state.isDemo {
+                        OrynRowDivider()
+                        Button { showDemoTrigger = true } label: {
+                            OrynNavRow(
+                                icon: "play.circle",
+                                title: "Run a demo alert",
+                                detail: "Simulated: see an alert end to end"
+                            )
+                        }
+                        .buttonStyle(SDRowButtonStyle(minHeight: 60))
+                    }
                 }
             }
         }
-        .buttonStyle(.plain)
     }
+
+    /// One honest line about the history: the latest event, or that there is none.
+    private var historyDetail: String {
+        if !hasLoaded && events.isEmpty { return "Loading…" }
+        guard let latest = events.first else { return "Nothing to report yet" }
+        let title = latest.type.replacingOccurrences(of: "_", with: " ").capitalized
+        if let date = latest.date {
+            return "\(title) · \(Self.relative.localizedString(for: date, relativeTo: .now))"
+        }
+        return title
+    }
+
+    private static let relative: RelativeDateTimeFormatter = {
+        let formatter = RelativeDateTimeFormatter()
+        formatter.unitsStyle = .short
+        return formatter
+    }()
 
     // MARK: Mode
 
@@ -337,30 +467,30 @@ struct DeviceDetailView: View {
     private var activeVariant: String? { Preset.split(device.activePreset).variant }
 
     private var modeCard: some View {
+        VStack(alignment: .leading, spacing: SD.Space.xs) {
+        SDSectionHeader(title: "Monitoring mode")
+            .padding(.horizontal, SD.Space.xxs)
         SDCard {
             VStack(alignment: .leading, spacing: SD.Space.sm) {
-                SDSectionHeader(title: "Monitoring mode")
-
                 // What is ACTUALLY running, when it is not one of the presets
                 // below. The device reports this itself, so it cannot disagree
                 // with what the device is doing.
                 if customMonitoringActive, let custom = device.monitoring {
                     VStack(alignment: .leading, spacing: SD.Space.xs) {
                         HStack(spacing: SD.Space.sm) {
-                            Image(systemName: "sparkles")
+                            OrynMark(height: 16, color: SD.Colors.signal)
                                 .frame(width: 26)
-                                .foregroundStyle(SD.Colors.accent)
                             VStack(alignment: .leading, spacing: 1) {
                                 Text(custom.title)
                                     .font(SD.Typography.body)
                                     .foregroundStyle(SD.Colors.textPrimary)
-                                Text("Active — this replaces the modes below")
+                                Text("Set by Jupiter · replaces the modes below")
                                     .font(SD.Typography.caption)
-                                    .foregroundStyle(SD.Colors.accent)
+                                    .foregroundStyle(SD.Colors.textSecondary)
                             }
                             Spacer(minLength: 0)
                             Image(systemName: "checkmark.circle.fill")
-                                .foregroundStyle(SD.Colors.accent)
+                                .foregroundStyle(SD.Colors.success)
                         }
 
                         Text(custom.summary)
@@ -375,16 +505,17 @@ struct DeviceDetailView: View {
                         .font(SD.Typography.caption)
                         .foregroundStyle(SD.Colors.textTertiary)
 
-                    Divider().overlay(SD.Colors.border)
+                    Rectangle().fill(SD.Colors.border).frame(height: 1)
                 }
 
                 ForEach(Preset.catalog) { preset in
                     modeRow(preset)
                     if preset.id != Preset.catalog.last?.id {
-                        Divider().overlay(SD.Colors.border)
+                        Rectangle().fill(SD.Colors.border).frame(height: 1)
                     }
                 }
             }
+        }
         }
     }
 
@@ -406,8 +537,9 @@ struct DeviceDetailView: View {
             Button { setMode(preset.name) } label: {
                 HStack(spacing: SD.Space.sm) {
                     Image(systemName: preset.icon)
+                        .font(.system(size: 15))
                         .frame(width: 26)
-                        .foregroundStyle(isActive ? SD.Colors.accent : SD.Colors.textTertiary)
+                        .foregroundStyle(isActive ? SD.Colors.textPrimary : SD.Colors.textDisabled)
                     VStack(alignment: .leading, spacing: 1) {
                         Text(preset.title)
                             .font(SD.Typography.body)
@@ -424,7 +556,7 @@ struct DeviceDetailView: View {
                         case .inactive, .switching, .active:
                             Text(preset.subtitle)
                                 .font(SD.Typography.caption)
-                                .foregroundStyle(SD.Colors.textSecondary)
+                                .foregroundStyle(SD.Colors.textTertiary)
                         }
                     }
                     Spacer(minLength: SD.Space.xxs)
@@ -433,7 +565,7 @@ struct DeviceDetailView: View {
                         Image(systemName: "checkmark.circle.fill")
                             .foregroundStyle(SD.Colors.success)
                     case .switching:
-                        ProgressView().controlSize(.small)
+                        ProgressView().controlSize(.small).tint(SD.Colors.textSecondary)
                     case .queuedOffline:
                         Image(systemName: "wifi.slash")
                             .foregroundStyle(SD.Colors.warning)
@@ -484,44 +616,9 @@ struct DeviceDetailView: View {
         .padding(.vertical, SD.Space.xxs)
     }
 
-    // MARK: Activity
-
-    private var activityCard: some View {
-        SDCard {
-            VStack(alignment: .leading, spacing: SD.Space.sm) {
-                SDSectionHeader(title: "Recent activity")
-
-                if !events.isEmpty {
-                    EventTimeline(events: events) { selectedEvent = $0 }
-                        .padding(.bottom, SD.Space.xxs)
-                    Divider().overlay(SD.Colors.border)
-                }
-
-                if events.isEmpty {
-                    if !hasLoaded {
-                        SDLoadingState(message: "Loading activity…")
-                    } else {
-                        SDEmptyState(
-                            icon: "checkmark.circle",
-                            title: "Nothing to report",
-                            message: "Events appear here as soon as \(device.name) sees something worth telling you about."
-                        )
-                    }
-                } else {
-                    ForEach(events.prefix(25)) { event in
-                        Button { selectedEvent = event } label: {
-                            EventRow(event: event)
-                                .contentShape(Rectangle())
-                        }
-                        .buttonStyle(.plain)
-                        if event.id != events.prefix(25).last?.id {
-                            Divider().overlay(SD.Colors.border)
-                        }
-                    }
-                }
-            }
-        }
-    }
+    // Recent activity moved to EventHistoryView (Manage → Event history). The
+    // events are still loaded here: they drive `alertActive`, the
+    // notification-tap → alert sheet, and the history row's summary.
 
     private func setMode(_ name: String) {
         // Only refuse a tap that would change nothing.
@@ -683,9 +780,14 @@ struct EventRow: View {
             }
             Spacer(minLength: SD.Space.xxs)
             if let date = event.date {
-                Text(date, style: .relative)
-                    .font(SD.Typography.caption)
+                // Abbreviated ("3 min. ago") rather than the live ".relative"
+                // style ("2 min, 52 sec"), which was wide enough to wrap the
+                // event title onto two lines.
+                Text(date, format: .relative(presentation: .numeric, unitsStyle: .abbreviated))
+                    .font(SD.Typography.mono)
                     .foregroundStyle(SD.Colors.textTertiary)
+                    .lineLimit(1)
+                    .fixedSize()
             }
         }
         .padding(.vertical, SD.Space.xxs)

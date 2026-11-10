@@ -31,11 +31,11 @@ struct FeedCard: View {
         // fixed card height.
         .frame(height: isLiveFeed ? nil : 230)
         .frame(maxWidth: .infinity)
-        .clipShape(RoundedRectangle(cornerRadius: 22))
+        .clipShape(RoundedRectangle(cornerRadius: SD.Radius.lg, style: .continuous))
         .overlay(
-            RoundedRectangle(cornerRadius: 22)
-                .strokeBorder(alertActive ? AnyShapeStyle(SD.Colors.danger) : AnyShapeStyle(.quaternary),
-                              lineWidth: alertActive ? 3 : 1)
+            RoundedRectangle(cornerRadius: SD.Radius.lg, style: .continuous)
+                .strokeBorder(alertActive ? SD.Colors.danger : SD.Colors.borderStrong,
+                              lineWidth: alertActive ? 2 : 1)
         )
         .animation(.easeInOut(duration: 0.4), value: alertActive)
     }
@@ -43,17 +43,22 @@ struct FeedCard: View {
     private var feedPlaceholder: some View {
         ZStack {
             SD.Colors.canvas
-            VStack(spacing: 10) {
-                Image(systemName: "video.slash.fill").font(.title).foregroundStyle(SD.Colors.textSecondary)
+            CameraGrid()
+                .stroke(SD.Colors.border.opacity(0.6), lineWidth: 1)
+            VStack(spacing: SD.Space.sm) {
+                Image(systemName: "video.slash")
+                    .font(.system(size: 22, weight: .light))
+                    .foregroundStyle(SD.Colors.textTertiary)
                 // No longer "set the device address in Settings": nobody types an
                 // address any more — the device is found over Bonjour, and the
                 // only thing a person can actually do about an empty address is
                 // get the device powered on and onto this Wi-Fi. Naming a setting
                 // that fills itself in sends someone looking for a field to edit.
-                Text("The live picture comes straight from your SensorDyme, so it needs to be switched on and on this Wi-Fi.\nSensorDyme finds it by itself.")
-                    .font(.caption)
+                Text("The live picture comes straight from your SensorDyme, so it needs to be switched on and on this Wi-Fi. ORYN EDGE finds it by itself.")
+                    .font(SD.Typography.caption)
                     .multilineTextAlignment(.center)
-                    .foregroundStyle(SD.Colors.textSecondary)
+                    .foregroundStyle(SD.Colors.textTertiary)
+                    .padding(.horizontal, SD.Space.xl)
             }
         }
     }
@@ -88,13 +93,13 @@ struct SimulatedFeedView: View {
                     .offset(x: 12 * sin(t * 0.35), y: 8)
 
                 // tracking box drifting like a live detector
-                RoundedRectangle(cornerRadius: 10)
-                    .strokeBorder(alert ? AnyShapeStyle(SD.Colors.danger) : AnyShapeStyle(SD.Colors.accent), lineWidth: 2)
+                RoundedRectangle(cornerRadius: 4)
+                    .strokeBorder(alert ? SD.Colors.danger : SD.Colors.textPrimary.opacity(0.7), lineWidth: 1.5)
                     .frame(width: 130, height: 150)
                     .offset(x: 12 * sin(t * 0.35), y: 4 + 4 * sin(t * 0.9))
 
                 // sweeping scan line
-                LinearGradient(colors: [.clear, SD.Colors.accent.opacity(0.35), .clear],
+                LinearGradient(colors: [.clear, SD.Colors.textPrimary.opacity(0.12), .clear],
                                startPoint: .top, endPoint: .bottom)
                     .frame(height: 46)
                     .offset(y: CGFloat(((t * 40).truncatingRemainder(dividingBy: 300)) - 150))
@@ -102,28 +107,54 @@ struct SimulatedFeedView: View {
 
                 VStack {
                     HStack {
-                        Label("LIVE", systemImage: "dot.radiowaves.left.and.right")
-                            .font(.caption2.bold())
-                            .padding(.horizontal, 10).padding(.vertical, 5)
-                            .background(Capsule().fill(.red.opacity(0.85)))
-                            .foregroundStyle(.white)
+                        FeedLiveBadge()
                         Spacer()
-                        Text(Preset.title(for: preset))
-                            .font(.caption2.bold())
-                            .padding(.horizontal, 10).padding(.vertical, 5)
-                            .background(Capsule().fill(.ultraThinMaterial))
+                        FeedTag(text: Preset.title(for: preset))
                     }
                     Spacer()
                     HStack {
-                        Label("demo device — simulated feed", systemImage: "sparkles")
-                            .font(.caption2)
-                            .foregroundStyle(.white.opacity(0.65))
+                        FeedTag(text: "Demo · simulated feed")
                         Spacer()
                     }
                 }
                 .padding(12)
             }
         }
+    }
+}
+
+/// ORYN's live indicator: a signal-orange dot and "LIVE" on a dark plate.
+/// Orange rather than red, so "live" can never be mistaken for "alert".
+struct FeedLiveBadge: View {
+    var body: some View {
+        HStack(spacing: 6) {
+            Circle().fill(SD.Colors.signal).frame(width: 6, height: 6)
+            Text("LIVE")
+                .font(SD.Typography.eyebrow)
+                .kerning(1.2)
+                .foregroundStyle(SD.Colors.textPrimary)
+        }
+        .padding(.horizontal, 9)
+        .padding(.vertical, 5)
+        .background(Capsule().fill(Color.black.opacity(0.6)))
+        .overlay(Capsule().strokeBorder(Color.white.opacity(0.08), lineWidth: 1))
+    }
+}
+
+/// A small label laid over footage.
+struct FeedTag: View {
+    let text: String
+
+    var body: some View {
+        Text(text.uppercased())
+            .font(SD.Typography.eyebrow)
+            .kerning(1)
+            .foregroundStyle(SD.Colors.textSecondary)
+            .lineLimit(1)
+            .padding(.horizontal, 9)
+            .padding(.vertical, 5)
+            .background(Capsule().fill(Color.black.opacity(0.6)))
+            .overlay(Capsule().strokeBorder(Color.white.opacity(0.08), lineWidth: 1))
     }
 }
 
@@ -176,7 +207,7 @@ struct MJPEGView: View {
                     .aspectRatio(image.size.height > 0 ? image.size.width / image.size.height : 4 / 3,
                                  contentMode: .fit)
             } else if reader.state.isRecoverableAutomatically {
-                ProgressView().tint(.white)
+                ProgressView().tint(SD.Colors.textSecondary)
                     .frame(height: 230)
             } else {
                 // A state that will never heal on its own gets an icon rather than
@@ -195,9 +226,11 @@ struct MJPEGView: View {
                           ? "wifi.exclamationmark" : "exclamationmark.triangle.fill")
                         .font(.caption2)
                         .multilineTextAlignment(.center)
-                        .padding(6)
-                        .background(.black.opacity(0.6), in: Capsule())
-                        .foregroundStyle(.white)
+                        .padding(.horizontal, 10)
+                        .padding(.vertical, 6)
+                        .background(Color.black.opacity(0.65), in: Capsule())
+                        .overlay(Capsule().strokeBorder(Color.white.opacity(0.08), lineWidth: 1))
+                        .foregroundStyle(SD.Colors.textPrimary)
                         .padding(8)
                 }
             }

@@ -60,6 +60,7 @@ struct ReportsView: View {
             }
             .padding()
         }
+        .orynScreen()
         .navigationTitle("Report")
         .navigationBarTitleDisplayMode(.inline)
         .toolbar {
@@ -88,7 +89,7 @@ struct ReportsView: View {
     private func scoreCard(_ report: DeviceReport) -> some View {
         HStack(spacing: 20) {
             ZStack {
-                Circle().stroke(.quaternary, lineWidth: 10)
+                Circle().stroke(SD.Colors.borderStrong, lineWidth: 10)
                 Circle()
                     .trim(from: 0, to: Double(report.safetyScore) / 100)
                     .stroke(SD.Colors.accent, style: StrokeStyle(lineWidth: 10, lineCap: .round))

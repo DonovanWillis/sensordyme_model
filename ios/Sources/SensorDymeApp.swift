@@ -10,15 +10,20 @@ struct SensorDymeApp: App {
         // AlertNotifier sets it in its initialiser; it used to be created lazily,
         // when the root view's AlertWatcher was first installed — after launch.
         _ = AlertNotifier.shared
+        // Before the first window exists, so no bar or tab ever draws in the
+        // system theme and then flips.
+        OrynAppearance.apply()
     }
 
     var body: some Scene {
         WindowGroup {
             RootView()
                 .environmentObject(state)
-                // Applied at the root so every screen, sheet and alert inherits
-                // it — a theme applied per-screen leaves modals in the old one.
-                .preferredColorScheme(state.appearance.colorScheme)
+                // ORYN EDGE is dark by design. Applied at the root so every
+                // screen, sheet and alert inherits it — a theme applied
+                // per-screen leaves modals in the old one.
+                .preferredColorScheme(.dark)
+                .tint(SD.Colors.accent)
                 // At the root, and not per-screen, because losing the backend is
                 // not something one screen recovers from: the app has to keep
                 // looking whether the user is on the sign-in screen, the device
@@ -32,9 +37,17 @@ struct RootView: View {
     @EnvironmentObject private var state: AppState
     @StateObject private var watcher = AlertWatcher()
     @Environment(\.scenePhase) private var scenePhase
+    @State private var tab: Tab = .devices
+
+    enum Tab: String { case devices, shop, settings }
 
     var body: some View {
         content
+            .background(SD.Colors.background.ignoresSafeArea())
+            .task {
+                if DebugLaunch.demo && !state.isSignedIn { state.enterDemo() }
+                if let requested = DebugLaunch.tab.flatMap(Tab.init(rawValue:)) { tab = requested }
+            }
             .onChange(of: scenePhase) { _, phase in
                 // Coming back from suspension is the case that used to need a
                 // force-quit: iOS freezes the app's tasks, the Mac's address may
@@ -70,13 +83,16 @@ struct RootView: View {
     @ViewBuilder
     private var content: some View {
         if state.isSignedIn {
-            TabView {
+            TabView(selection: $tab) {
                 DevicesView()
-                    .tabItem { Label("Devices", systemImage: "video.fill") }
+                    .tabItem { Label("Devices", systemImage: "square.grid.2x2") }
+                    .tag(Tab.devices)
                 ShopView()
-                    .tabItem { Label("Shop", systemImage: "shippingbox.fill") }
+                    .tabItem { Label("Shop", systemImage: "bag") }
+                    .tag(Tab.shop)
                 SettingsView()
-                    .tabItem { Label("Settings", systemImage: "gearshape.fill") }
+                    .tabItem { Label("Settings", systemImage: "slider.horizontal.3") }
+                    .tag(Tab.settings)
             }
             .tint(SD.Colors.accent)
             // Watch for alerts from every screen, not just the device detail

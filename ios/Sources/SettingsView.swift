@@ -19,10 +19,11 @@ struct SettingsView: View {
     var body: some View {
         NavigationStack {
             Form {
+            Group {
                 if state.isDemo {
                     Section {
                         HStack(spacing: 12) {
-                            LogoMark(size: 30, accented: true)
+                            OrynMark(height: 22)
                             Text("Demo mode — everything you see is a simulated device.")
                                 .font(.subheadline)
                         }
@@ -30,28 +31,20 @@ struct SettingsView: View {
                     }
                 }
 
-                Section("Appearance") {
-                    Picker("Theme", selection: Binding(
-                        get: { state.appearance },
-                        set: { state.appearance = $0 }
-                    )) {
-                        ForEach(SD.Appearance.allCases) { option in
-                            Label(option.title, systemImage: option.icon).tag(option)
-                        }
-                    }
-                    .pickerStyle(.segmented)
-                    Text("System follows your phone's setting. Light and Dark override it for SensorDyme only.")
-                        .font(SD.Typography.caption)
-                        .foregroundStyle(SD.Colors.textSecondary)
-                }
-
-
                 // Every "can't reach the backend" message in the app tells the
                 // user to come here, and for a while there was nothing here to
                 // come to: this section had been removed while the messages that
                 // point at it stayed, so the app named a fix that did not exist.
                 Section("Server") {
-                    LabeledContent("Status") { backendStatusLabel }
+                    // A plain row, not LabeledContent: on iOS 26 a LabeledContent
+                    // whose value is a Label grew to several hundred points tall,
+                    // leaving a blank card. (Same fix as rebuild/oryn-edge-app c3a9c87.)
+                    HStack {
+                        Text("Status")
+                        Spacer(minLength: SD.Space.sm)
+                        backendStatusLabel
+                    }
+                    .accessibilityElement(children: .combine)
                     if let address = backendAddress {
                         LabeledContent("Address", value: address)
                             .font(.footnote)
@@ -71,7 +64,7 @@ struct SettingsView: View {
                             .font(.footnote)
                             .foregroundStyle(SD.Colors.textSecondary)
                     }
-                    Text("SensorDyme finds your Mac on the Wi-Fi by itself and reconnects when it moves, restarts, or the phone rejoins the network. You should not need to type an address.")
+                    Text("ORYN EDGE finds your server on the Wi-Fi by itself and reconnects when it moves, restarts, or the phone rejoins the network. You should not need to type an address.")
                         .font(.footnote)
                         .foregroundStyle(SD.Colors.textSecondary)
                 }
@@ -161,7 +154,7 @@ struct SettingsView: View {
                     if let problem = discovery.problem {
                         Text(problem)
                             .font(.footnote)
-                            .foregroundStyle(.orange)
+                            .foregroundStyle(SD.Colors.warning)
                     } else if discovery.found.isEmpty && !discovery.isSearching && state.deviceLocalURL.isEmpty {
                         Text("The device publishes itself on the Wi-Fi it is joined to, so the phone has to be on that same network.")
                             .font(.footnote)
@@ -190,7 +183,7 @@ struct SettingsView: View {
                     if let health {
                         LabeledContent("Overall") {
                             Label(health.state, systemImage: health.state == "ok" ? "checkmark.circle.fill" : "exclamationmark.triangle.fill")
-                                .foregroundStyle(health.state == "ok" ? .green : .orange)
+                                .foregroundStyle(health.state == "ok" ? SD.Colors.success : SD.Colors.warning)
                         }
                         LabeledContent("Uptime", value: Self.uptimeLabel(health.uptime_s))
                         ForEach(health.components.sorted(by: { $0.key < $1.key }), id: \.key) { name, component in
@@ -198,7 +191,7 @@ struct SettingsView: View {
                                 LabeledContent(name) {
                                     Text(component.state == "ok" ? "ok" : component.detail)
                                         .font(.caption)
-                                        .foregroundStyle(component.state == "ok" ? .green : .orange)
+                                        .foregroundStyle(component.state == "ok" ? SD.Colors.success : SD.Colors.warning)
                                         .lineLimit(2)
                                 }
                             }
@@ -261,7 +254,12 @@ struct SettingsView: View {
                     }
                 }
             }
+            .orynRows()
+        }
+        .orynFormStyle()
             .navigationTitle("Settings")
+            .navigationBarTitleDisplayMode(.large)
+            .toolbarBackground(SD.Colors.background, for: .navigationBar)
             .sheet(isPresented: $showSetup) { SetupFlowView() }
             .onAppear { tokenDraft = state.deviceToken }
         }
@@ -287,7 +285,7 @@ struct SettingsView: View {
                 .foregroundStyle(SD.Colors.textSecondary)
         case .unreachable:
             Label("Not connected", systemImage: "exclamationmark.triangle.fill")
-                .foregroundStyle(.orange)
+                .foregroundStyle(SD.Colors.warning)
         case .unknown:
             Label("Not checked yet", systemImage: "minus.circle")
                 .foregroundStyle(SD.Colors.textSecondary)
@@ -373,6 +371,7 @@ struct ManualBackendView: View {
 
     var body: some View {
         Form {
+            Group {
             Section {
                 TextField("http://192.168.1.50:8787", text: $draft)
                     .textInputAutocapitalization(.never)
@@ -400,7 +399,7 @@ struct ManualBackendView: View {
                            ? "Forget remembered server and search again"
                            : "Clear and go back to automatic", role: .destructive) {
                         draft = ""
-                        message = "Cleared. SensorDyme will find your server on the network again."
+                        message = "Cleared. ORYN EDGE will find your server on the network again."
                         state.useAutomaticBackend()
                     }
                 }
@@ -408,10 +407,13 @@ struct ManualBackendView: View {
                 if let message {
                     Text(message)
                 } else {
-                    Text("While this is set, SensorDyme uses it in preference to whatever it finds on the network. Clear it to go back to finding your Mac automatically.")
+                    Text("While this is set, ORYN EDGE uses it in preference to whatever it finds on the network. Clear it to go back to finding your Mac automatically.")
                 }
             }
         }
+            .orynRows()
+        }
+        .orynFormStyle()
         .navigationTitle("Manual server address")
         .onAppear { draft = state.configuredBaseURL }
     }
@@ -441,6 +443,6 @@ struct ManualBackendView: View {
             return
         }
         state.pinConfigured(candidate)
-        message = "Saved — SensorDyme is using that address."
+        message = "Saved. ORYN EDGE is using that address."
     }
 }

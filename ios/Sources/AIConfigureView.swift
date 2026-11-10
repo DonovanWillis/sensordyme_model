@@ -1,7 +1,11 @@
 import SwiftUI
 
-/// Describe what to watch for in plain language; review what SensorDyme
-/// understood; adjust it; activate it.
+/// Ask Jupiter: describe what to watch for in plain language; review what
+/// Jupiter understood; adjust it; activate it.
+///
+/// Formerly "Configure with AI". The flow is unchanged — `POST /v1/ai/configure`
+/// returns a draft, the person edits and reviews it, and only Activate
+/// (`POST /v1/devices/{id}/preset`) changes the device.
 ///
 /// The review step is the point. A user is being asked to trust a camera in
 /// their home with a rule they typed one sentence for — showing them the
@@ -12,9 +16,14 @@ struct AIConfigureView: View {
     @EnvironmentObject private var state: AppState
     @Environment(\.dismiss) private var dismiss
     let device: Device
+    /// A request typed into the device screen's Ask Jupiter bar. When present it
+    /// is filled in and sent as the screen opens, so the bar feels like asking,
+    /// not like navigating to a form.
+    var initialPrompt: String = ""
     let onApplied: () async -> Void
 
     @State private var prompt = ""
+    @State private var didSendInitial = false
     @State private var thinking = false
     @State private var proposal: AIProposal?
     @State private var applied = false
@@ -26,16 +35,16 @@ struct AIConfigureView: View {
     /// Not an error: why the screen is showing a fresh proposal (the one being
     /// reviewed was replaced on the server before it could be activated).
     @State private var notice: String?
-    @FocusState private var promptFocused: Bool
     @StateObject private var thinkingProgress = ProgressTracker()
 
     /// Deliberately spans what works and what doesn't, so the honest answers are
     /// discovered during setup rather than in front of an investor.
     private let examples = [
-        "Alert me if my dog gets on the couch",
-        "Tell me when the room becomes empty",
+        "Watch for someone entering the room after 10 PM",
+        "Alert me when someone picks up my laptop",
+        "Monitor for signs of driver distraction",
         "Alert me if someone stays on the floor for 30 seconds",
-        "Alert me if more than three people come in",
+        "Tell me when the room becomes empty",
     ]
 
     var body: some View {
@@ -68,71 +77,114 @@ struct AIConfigureView: View {
                 .padding(.horizontal, SD.Space.md)
                 .padding(.bottom, SD.Space.xl)
             }
-            .background(SD.Colors.background)
+            .orynScreen()
             .scrollDismissesKeyboard(.interactively)
-            .navigationTitle("Configure with AI")
             .navigationBarTitleDisplayMode(.inline)
             .toolbar {
+                ToolbarItem(placement: .principal) {
+                    HStack(spacing: 8) {
+                        OrynMark(height: 14)
+                        Text("Ask Jupiter")
+                            .font(.system(size: 16, weight: .semibold))
+                            .foregroundStyle(SD.Colors.textPrimary)
+                    }
+                    .accessibilityElement(children: .combine)
+                    .accessibilityAddTraits(.isHeader)
+                }
                 ToolbarItem(placement: .cancellationAction) {
                     Button("Done") { dismiss() }
                 }
             }
         }
         .tint(SD.Colors.accent)
+        .presentationBackground(SD.Colors.background)
+        .onAppear {
+            guard !didSendInitial else { return }
+            didSendInitial = true
+            if let request = JupiterPrompt.normalized(initialPrompt) {
+                prompt = request
+                configure()
+            }
+        }
     }
 
     // MARK: Prompt
 
     private var promptCard: some View {
-        VStack(alignment: .leading, spacing: SD.Space.sm) {
-            Text("What should \(device.name) watch for?")
-                .font(SD.Typography.title)
-                .foregroundStyle(SD.Colors.textPrimary)
-                .padding(.top, SD.Space.xs)
+        VStack(alignment: .leading, spacing: SD.Space.md) {
+            VStack(alignment: .leading, spacing: SD.Space.xxs) {
+                SDEyebrow("Jupiter · \(device.name)")
+                Text(proposal == nil && !thinking
+                     ? "What should \(device.name) watch for?"
+                     : "Your request")
+                    .font(SD.Typography.title)
+                    .foregroundStyle(SD.Colors.textPrimary)
+            }
+            .padding(.top, SD.Space.sm)
 
-            SDCard(padding: SD.Space.xs) {
-                TextField("Describe it in your own words…", text: $prompt, axis: .vertical)
-                    .font(SD.Typography.body)
-                    .lineLimit(3...6)
-                    .padding(SD.Space.xs)
-                    .focused($promptFocused)
+            AskJupiterBar(
+                text: $prompt,
+                busy: thinking,
+                expands: true,
+                autoFocus: JupiterPrompt.normalized(initialPrompt) == nil
+            ) {
+                configure()
             }
 
-            ScrollView(.horizontal, showsIndicators: false) {
+            if thinking {
                 HStack(spacing: SD.Space.xs) {
-                    ForEach(examples, id: \.self) { example in
-                        Button { prompt = example } label: {
-                            Text(example)
-                                .font(SD.Typography.caption)
-                                .lineLimit(1)
-                                .padding(.horizontal, SD.Space.sm)
-                                .padding(.vertical, SD.Space.xs)
-                                .background(Capsule().fill(SD.Colors.surfaceRaised))
-                                .overlay(Capsule().strokeBorder(SD.Colors.border, lineWidth: 1))
-                                .foregroundStyle(SD.Colors.textSecondary)
+                    ThinkingDots()
+                    Text("Jupiter is working it out…")
+                        .font(SD.Typography.caption)
+                        .foregroundStyle(SD.Colors.textTertiary)
+                    SDProgress(phase: thinkingProgress.phase)
+                }
+                .padding(.horizontal, SD.Space.xxs)
+                .transition(.opacity)
+            } else if proposal == nil {
+                VStack(alignment: .leading, spacing: SD.Space.xs) {
+                    SDEyebrow("Try")
+                        .padding(.horizontal, SD.Space.xxs)
+                    VStack(spacing: 0) {
+                        ForEach(examples, id: \.self) { example in
+                            Button { prompt = example } label: {
+                                HStack(spacing: SD.Space.sm) {
+                                    Image(systemName: "arrow.turn.down.right")
+                                        .font(.system(size: 11, weight: .medium))
+                                        .foregroundStyle(SD.Colors.textDisabled)
+                                    Text(example)
+                                        .font(SD.Typography.callout)
+                                        .foregroundStyle(SD.Colors.textSecondary)
+                                        .multilineTextAlignment(.leading)
+                                    Spacer(minLength: 0)
+                                }
+                            }
+                            .buttonStyle(SDRowButtonStyle(minHeight: 44))
+                            if example != examples.last {
+                                Rectangle().fill(SD.Colors.border).frame(height: 1)
+                                    .padding(.leading, SD.Space.sm + 11 + SD.Space.sm)
+                            }
                         }
-                        .buttonStyle(.plain)
                     }
+                    .padding(SD.Space.xxs)
+                    .background(
+                        RoundedRectangle(cornerRadius: SD.Radius.lg, style: .continuous)
+                            .fill(SD.Colors.surface)
+                    )
+                    .overlay(
+                        RoundedRectangle(cornerRadius: SD.Radius.lg, style: .continuous)
+                            .strokeBorder(SD.Colors.border, lineWidth: 1)
+                    )
+                    Text("Jupiter turns your words into rules for this device. Nothing changes until you review and activate them.")
+                        .font(SD.Typography.caption)
+                        .foregroundStyle(SD.Colors.textTertiary)
+                        .fixedSize(horizontal: false, vertical: true)
+                        .padding(.horizontal, SD.Space.xxs)
+                        .padding(.top, SD.Space.xxs)
                 }
-                .padding(.vertical, 2)
             }
-
-            Button { configure() } label: {
-                if thinking {
-                    HStack(spacing: SD.Space.xs) {
-                        ProgressView().tint(SD.Colors.textOnAccent)
-                        Text("Working it out…")
-                    }
-                } else {
-                    HStack(spacing: SD.Space.xs) {
-                        Text(proposal == nil ? "Continue" : "Try again")
-                        SDProgress(phase: thinkingProgress.phase)
-                    }
-                }
-            }
-            .buttonStyle(SDButtonStyle(kind: .primary))
-            .disabled(prompt.trimmingCharacters(in: .whitespaces).isEmpty || thinking)
         }
+        .animation(SD.Motion.standard, value: thinking)
     }
 
     // MARK: What was understood
@@ -141,7 +193,10 @@ struct AIConfigureView: View {
         SDCard {
             VStack(alignment: .leading, spacing: SD.Space.sm) {
                 HStack {
-                    SDSectionHeader(title: "SensorDyme understands")
+                    HStack(spacing: 6) {
+                        OrynMark(height: 11, color: SD.Colors.textTertiary)
+                        SDSectionHeader(title: "Jupiter understood")
+                    }
                     if applied {
                         SDStatusPill(status: .online, text: "Active")
                     }
@@ -331,7 +386,7 @@ struct AIConfigureView: View {
             SDEmptyState(
                 icon: "questionmark.circle",
                 title: "Nothing to activate",
-                message: "SensorDyme couldn't turn that into something it can watch for. Try describing it differently, or see what it would need above."
+                message: "Jupiter couldn't turn that into something this device can watch for. Try describing it differently, or see what it would need above."
             )
         } else if applied {
             VStack(spacing: SD.Space.xxs) {
@@ -420,12 +475,20 @@ struct AIConfigureView: View {
         self.notice = notice
         applied = false
         appliedSummary = nil
-        promptFocused = false
+        // The same text the backend will accept: trimmed, and refused rather
+        // than truncated when over its limit (the bar already won't send it).
+        guard JupiterPrompt.canSubmit(prompt), let request = JupiterPrompt.normalized(prompt) else {
+            thinking = false
+            if JupiterPrompt.isOverLimit(prompt) {
+                errorMessage = "That request is too long for Jupiter (\(JupiterPrompt.maxLength) characters at most). Describe one thing to watch for at a time."
+            }
+            return
+        }
         Task {
             defer { thinking = false }
             do {
                 let result = try await thinkingProgress.track {
-                    try await state.backend.aiConfigure(deviceID: device.id, prompt: prompt)
+                    try await state.backend.aiConfigure(deviceID: device.id, prompt: request)
                 }
                 withAnimation(SD.Motion.standard) { proposal = result }
             } catch {

@@ -32,6 +32,7 @@ struct ShopView: View {
                 }
                 .padding()
             }
+            .orynScreen()
             .navigationTitle("Shop")
             .task { await reloadOrders() }
             .refreshable { await reloadOrders() }
@@ -41,16 +42,21 @@ struct ShopView: View {
     private var productCard: some View {
         VStack(spacing: 14) {
             ZStack {
-                RoundedRectangle(cornerRadius: 24).fill(SD.Colors.accent)
+                RoundedRectangle(cornerRadius: SD.Radius.lg, style: .continuous).fill(SD.Colors.canvas)
+                RoundedRectangle(cornerRadius: SD.Radius.lg, style: .continuous).strokeBorder(SD.Colors.borderStrong, lineWidth: 1)
+                CameraGrid().stroke(SD.Colors.border, lineWidth: 1)
+                    .clipShape(RoundedRectangle(cornerRadius: SD.Radius.lg, style: .continuous))
                 VStack(spacing: 10) {
-                    LogoMark(size: 66)
-                        .colorScheme(.dark)
+                    OrynMark(height: 54)
                     Text("SensorDyme Unit")
-                        .font(.title3.bold())
-                        .foregroundStyle(.white)
-                    Text("IR night vision · edge AI · every mode included")
-                        .font(.caption)
-                        .foregroundStyle(.white.opacity(0.85))
+                        .font(SD.Typography.title)
+                        .foregroundStyle(SD.Colors.textPrimary)
+                    Text("IR night vision · edge AI · every mode")
+                        .font(SD.Typography.eyebrow)
+                        .kerning(1)
+                        .multilineTextAlignment(.center)
+                        .foregroundStyle(SD.Colors.textTertiary)
+                        .padding(.horizontal, SD.Space.md)
                 }
                 .padding(.vertical, 30)
             }
@@ -75,14 +81,14 @@ struct ShopView: View {
             TextField("Full shipping address", text: $address, axis: .vertical)
                 .lineLimit(2...4)
                 .padding(12)
-                .background(RoundedRectangle(cornerRadius: 12).fill(.background.secondary))
-                .overlay(RoundedRectangle(cornerRadius: 12).strokeBorder(.quaternary))
+                .background(RoundedRectangle(cornerRadius: SD.Radius.md, style: .continuous).fill(SD.Colors.field))
+                .overlay(RoundedRectangle(cornerRadius: SD.Radius.md, style: .continuous).strokeBorder(SD.Colors.borderStrong))
 
             Button {
                 placeOrder()
             } label: {
                 if placing {
-                    ProgressView().tint(.white)
+                    ProgressView().tint(SD.Colors.textOnAccent)
                 } else {
                     Text("Place order — $\(unitPrice * quantity)")
                 }

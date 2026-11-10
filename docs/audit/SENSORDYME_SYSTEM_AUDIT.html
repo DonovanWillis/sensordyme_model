@@ -1,0 +1,1051 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>SensorDyme System Audit</title>
+<style>
+:root{
+  --bg:#f6f7f9; --panel:#ffffff; --ink:#1b1f27; --muted:#5d6675; --line:#e2e5ea;
+  --accent:#2f6fde; --accent-soft:#e8f0fd; --code:#f1f3f6;
+  --pass:#13804a; --pass-bg:#e5f5ec; --fail:#c62f2f; --fail-bg:#fbe9e9;
+  --block:#a35a00; --block-bg:#fdf1e1; --nt:#5d6675; --nt-bg:#eef0f3;
+  --d-box:#ffffff; --d-stroke:#9aa3b2; --d-hi:#2f6fde; --d-hi-bg:#e8f0fd; --d-warn:#a35a00; --d-warn-bg:#fdf1e1;
+}
+@media (prefers-color-scheme: dark){
+  :root:not([data-theme="light"]){
+    --bg:#111418; --panel:#181c22; --ink:#e6e9ee; --muted:#9aa3b2; --line:#2a3039;
+    --accent:#7aa7ff; --accent-soft:#1c2a44; --code:#1f242c;
+    --pass:#4fd08a; --pass-bg:#15301f; --fail:#ff7b7b; --fail-bg:#3a1a1a;
+    --block:#f0b35a; --block-bg:#3a2a12; --nt:#9aa3b2; --nt-bg:#222831;
+    --d-box:#1f242c; --d-stroke:#5d6675; --d-hi:#7aa7ff; --d-hi-bg:#1c2a44; --d-warn:#f0b35a; --d-warn-bg:#3a2a12;
+  }
+}
+:root[data-theme="dark"]{
+  --bg:#111418; --panel:#181c22; --ink:#e6e9ee; --muted:#9aa3b2; --line:#2a3039;
+  --accent:#7aa7ff; --accent-soft:#1c2a44; --code:#1f242c;
+  --pass:#4fd08a; --pass-bg:#15301f; --fail:#ff7b7b; --fail-bg:#3a1a1a;
+  --block:#f0b35a; --block-bg:#3a2a12; --nt:#9aa3b2; --nt-bg:#222831;
+  --d-box:#1f242c; --d-stroke:#5d6675; --d-hi:#7aa7ff; --d-hi-bg:#1c2a44; --d-warn:#f0b35a; --d-warn-bg:#3a2a12;
+}
+*{box-sizing:border-box}
+html{scroll-behavior:smooth;scroll-padding-top:16px}
+body{margin:0;background:var(--bg);color:var(--ink);font:15px/1.6 -apple-system,BlinkMacSystemFont,"Segoe UI",Inter,system-ui,sans-serif}
+.layout{display:grid;grid-template-columns:280px minmax(0,1fr);min-height:100vh}
+nav.toc{position:sticky;top:0;height:100vh;overflow:auto;border-right:1px solid var(--line);background:var(--panel);padding:22px 18px}
+nav.toc .brand{font-weight:700;font-size:15px;margin-bottom:2px}
+nav.toc .sub{color:var(--muted);font-size:12px;margin-bottom:16px}
+nav.toc ol{list-style:none;padding:0;margin:0;counter-reset:s}
+nav.toc li a{display:block;padding:5px 8px;border-radius:6px;color:var(--ink);text-decoration:none;font-size:13.5px}
+nav.toc li a:hover{background:var(--accent-soft);color:var(--accent)}
+nav.toc li a span{color:var(--muted);display:inline-block;width:24px;font-variant-numeric:tabular-nums}
+main{padding:40px 56px 120px;max-width:1120px}
+header.title h1{font-size:30px;line-height:1.2;margin:0 0 8px;letter-spacing:-.01em}
+header.title .meta{color:var(--muted);font-size:13.5px}
+section{margin-top:56px}
+h2{font-size:22px;margin:0 0 14px;padding-bottom:8px;border-bottom:1px solid var(--line);letter-spacing:-.005em}
+h2 .n{color:var(--accent);margin-right:8px;font-variant-numeric:tabular-nums}
+h3{font-size:16.5px;margin:28px 0 8px}
+h4{font-size:14.5px;margin:18px 0 6px;color:var(--muted);text-transform:uppercase;letter-spacing:.04em}
+p{margin:8px 0 12px}
+a{color:var(--accent)}
+code,kbd{font:12.5px/1.4 ui-monospace,SFMono-Regular,Menlo,monospace;background:var(--code);padding:1px 5px;border-radius:4px}
+pre{background:var(--code);padding:14px 16px;border-radius:8px;overflow:auto;font:12.5px/1.5 ui-monospace,SFMono-Regular,Menlo,monospace;border:1px solid var(--line)}
+pre code{background:none;padding:0}
+.tablewrap{overflow-x:auto;margin:10px 0 18px;border:1px solid var(--line);border-radius:8px;background:var(--panel)}
+table{border-collapse:collapse;width:100%;font-size:13.5px}
+th,td{text-align:left;vertical-align:top;padding:8px 12px;border-bottom:1px solid var(--line)}
+th{font-weight:600;background:var(--code);white-space:nowrap}
+tr:last-child td{border-bottom:none}
+td code{white-space:nowrap}
+.badge{display:inline-block;font-size:11.5px;font-weight:700;letter-spacing:.03em;padding:2px 8px;border-radius:999px;white-space:nowrap}
+.PASS{color:var(--pass);background:var(--pass-bg)}
+.FAIL{color:var(--fail);background:var(--fail-bg)}
+.BLOCKED{color:var(--block);background:var(--block-bg)}
+.NT{color:var(--nt);background:var(--nt-bg)}
+.callout{border:1px solid var(--line);border-left:4px solid var(--accent);background:var(--panel);border-radius:8px;padding:12px 16px;margin:14px 0}
+.callout.warn{border-left-color:var(--block)}
+.callout.bad{border-left-color:var(--fail)}
+.callout.good{border-left-color:var(--pass)}
+.callout strong:first-child{display:block;margin-bottom:4px}
+.grid2{display:grid;grid-template-columns:1fr 1fr;gap:14px}
+.card{background:var(--panel);border:1px solid var(--line);border-radius:10px;padding:14px 16px}
+.card h4{margin-top:0}
+.kpis{display:grid;grid-template-columns:repeat(4,1fr);gap:12px;margin:18px 0}
+.kpi{background:var(--panel);border:1px solid var(--line);border-radius:10px;padding:12px 14px}
+.kpi .v{font-size:22px;font-weight:700;font-variant-numeric:tabular-nums}
+.kpi .l{font-size:12px;color:var(--muted)}
+figure{margin:16px 0 22px;background:var(--panel);border:1px solid var(--line);border-radius:10px;padding:14px}
+figure svg{width:100%;height:auto;display:block}
+figcaption{color:var(--muted);font-size:12.5px;margin-top:8px}
+svg text{font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",system-ui,sans-serif;fill:var(--ink)}
+svg .box{fill:var(--d-box);stroke:var(--d-stroke);stroke-width:1.2}
+svg .hi{fill:var(--d-hi-bg);stroke:var(--d-hi);stroke-width:1.4}
+svg .warnbox{fill:var(--d-warn-bg);stroke:var(--d-warn);stroke-width:1.4;stroke-dasharray:5 3}
+svg .grp{fill:none;stroke:var(--d-stroke);stroke-dasharray:4 4;stroke-width:1}
+svg .ln{stroke:var(--d-stroke);stroke-width:1.4;fill:none}
+svg .lnhi{stroke:var(--d-hi);stroke-width:1.6;fill:none}
+svg .t-s{font-size:11px;fill:var(--muted)}
+svg .t-b{font-size:12.5px;font-weight:600}
+svg .t-g{font-size:11.5px;font-weight:700;fill:var(--muted);letter-spacing:.06em}
+ul,ol.plain{padding-left:20px;margin:6px 0 12px}
+li{margin:3px 0}
+.muted{color:var(--muted)}
+.toggle{position:fixed;top:14px;right:16px;background:var(--panel);border:1px solid var(--line);color:var(--ink);border-radius:8px;padding:6px 10px;font-size:12.5px;cursor:pointer}
+@media (max-width:900px){
+  .layout{grid-template-columns:1fr}
+  nav.toc{position:static;height:auto;border-right:none;border-bottom:1px solid var(--line)}
+  main{padding:24px 16px 80px}
+  .grid2,.kpis{grid-template-columns:1fr 1fr}
+}
+@media (max-width:520px){.grid2,.kpis{grid-template-columns:1fr}}
+@media print{nav.toc,.toggle{display:none}.layout{display:block}main{max-width:none;padding:0}}
+</style>
+</head>
+<body>
+<button class="toggle" id="themeToggle" type="button">Theme</button>
+<div class="layout">
+<nav class="toc" aria-label="Table of contents">
+  <div class="brand">SensorDyme Audit</div>
+  <div class="sub">9 Nov 2026 · branch <code>integration/all</code></div>
+  <ol>
+    <li><a href="#s1"><span>1</span>Executive summary</a></li>
+    <li><a href="#s2"><span>2</span>Repository overview</a></li>
+    <li><a href="#s3"><span>3</span>Software architecture</a></li>
+    <li><a href="#s4"><span>4</span>Web application</a></li>
+    <li><a href="#s5"><span>5</span>Backend</a></li>
+    <li><a href="#s6"><span>6</span>Raspberry Pi hardware</a></li>
+    <li><a href="#s7"><span>7</span>YOLO computer vision</a></li>
+    <li><a href="#s8"><span>8</span>EVE / Jupiter intelligence</a></li>
+    <li><a href="#s9"><span>9</span>LLM integration</a></li>
+    <li><a href="#s10"><span>10</span>iOS / Xcode</a></li>
+    <li><a href="#s11"><span>11</span>Communication &amp; data flows</a></li>
+    <li><a href="#s12"><span>12</span>Dependencies</a></li>
+    <li><a href="#s13"><span>13</span>Test results</a></li>
+    <li><a href="#s14"><span>14</span>Issues &amp; fixes</a></li>
+    <li><a href="#s15"><span>15</span>Current capabilities</a></li>
+    <li><a href="#s16"><span>16</span>Incomplete / broken</a></li>
+    <li><a href="#s17"><span>17</span>YOLO training readiness</a></li>
+    <li><a href="#s18"><span>18</span>Next steps</a></li>
+  </ol>
+</nav>
+
+<main>
+<header class="title">
+  <h1>SensorDyme — Complete System Architecture &amp; Technical Audit</h1>
+  <div class="meta">Audit date: Monday 9 November 2026 · Repository: <code>~/Sensordyme/sensordyme_model</code> (origin <code>DonovanWillis/sensordyme_model</code>, branch <code>integration/all</code> @ <code>a779b4d</code>) · Method: static inspection plus live tests against the running Mac backend, the Raspberry Pi over SSH and LAN, local Ollama, and Xcode 27.2.</div>
+</header>
+
+<!-- 1 -->
+<section id="s1">
+<h2><span class="n">1</span>Executive summary</h2>
+<p>SensorDyme is an edge computer-vision monitoring product with four main parts:</p>
+<ul>
+  <li>a <b>Raspberry Pi 5</b> with a Camera Module 3 NoIR Wide and a Hailo-8L AI HAT+, running a Python detection runtime;</li>
+  <li>a <b>FastAPI + SQLite backend</b> that currently runs on your Mac as a launchd service;</li>
+  <li>a <b>SwiftUI iOS app</b>;</li>
+  <li>an LLM layer called <b>Jupiter</b>, which turns plain-language monitoring requests into structured detection rules.</li>
+</ul>
+<p>Everything lives in one repository, <code>sensordyme_model</code>. A separate folder, <code>~/Sensordyme-website</code>, holds a static marketing site.</p>
+
+<div class="callout bad"><strong>Why everything stopped working</strong>
+Shortly before this audit, the previous working checkout <code>~/sensordyme_model</code> was moved to the macOS Trash, and a fresh clone was made at <code>~/Sensordyme/sensordyme_model</code>. The backend's launchd job still pointed at the old path. The old checkout held every piece of runtime state that git deliberately does not track:
+<ul>
+  <li>the SQLite database (accounts, devices, events);</li>
+  <li>the JWT signing secret;</li>
+  <li>the backend identity file;</li>
+  <li>the <code>.venv</code>;</li>
+  <li><code>data/</code>;</li>
+  <li>the generated Xcode project.</li>
+</ul>
+The backend kept running from inside the Trash, but it could not open its database (every request returned HTTP 500 or 503). It also reported a new, freshly generated backend id (<code>bk_6251e874…</code>), so the iPhone app, which pins the original id <code>bk_0eb63f4fc338</code>, would refuse to use it. The Pi's cloud uplink was failing with HTTP 500 for the same reason.</div>
+
+<div class="callout warn"><strong>Unpushed work found in the Trash, now backed up</strong>
+The trashed checkout is on branch <code>rebuild/oryn-edge-app</code>, which has <b>48 commits (20–22 Oct 2026, 96 files, about +6.8k lines)</b> that exist nowhere else: not on GitHub and not in the new clone. They contain the "ORYN Edge" rebrand of the device and app. Separately, GitHub's <code>integration/all</code> has a newer commit <code>a779b4d "sfxbx"</code> (15 Oct, by a collaborator) that the old checkout never fetched. The two lines have diverged. All 48 commits are now saved as a verified git bundle (see §14). <b>Do not empty the Trash until you have decided what to do with them.</b></div>
+
+<div class="kpis">
+  <div class="kpi"><div class="v">Restored</div><div class="l">Backend: health OK, original id kept</div></div>
+  <div class="kpi"><div class="v">Connected</div><div class="l">Pi → backend uplink (HTTP 200)</div></div>
+  <div class="kpi"><div class="v">8.6k+</div><div class="l">Hailo-8L inferences counted live</div></div>
+  <div class="kpi"><div class="v">0 errors</div><div class="l">iOS Swift compile for iPhone</div></div>
+</div>
+
+<h3>What was done</h3>
+<ul>
+  <li><b>Backed up</b> the trashed checkout before changing anything: all branches as a git bundle, a consistent SQLite snapshot, secrets, <code>data/</code>, and the old Xcode project. Location: <code>~/sensordyme-cutover-backups/20261109-audit/</code>.</li>
+  <li><b>Restored the backend</b> in the new checkout:
+    <ul>
+      <li>created a Python 3.11 <code>.venv</code>;</li>
+      <li>moved the DB, JWT secret and backend id into <code>cloud/</code> (all gitignored);</li>
+      <li>repointed <code>~/Library/LaunchAgents/com.sensordyme.backend.plist</code> at the new path, with the original saved first.</li>
+    </ul>
+    Result: <code>/v1/health</code> returns <code>ok:true</code> with the original id. The Pi reconnected at 21:04:19 and its queued events were ingested.</li>
+  <li><b>Verified the Pi hardware live</b>: Pi 5, IMX708 Wide NoIR, Hailo-8L running HailoRT 4.20 firmware, and the DAMO-YOLO <code>.hef</code> whose checksum matches the pin. A real annotated frame was pulled through the authenticated MJPEG stream.</li>
+  <li><b>Verified Jupiter (the LLM layer) live</b> against local Ollama <code>qwen2.5:7b-instruct</code>.</li>
+  <li><b>Regenerated the Xcode project</b> with XcodeGen and built for your iPhone (<code>Donovan's iPhone</code>, iPhone18,2). Swift compiled with 0 errors. Final code signing was waiting on a macOS Keychain approval when this report was written; see §10 and §13 for the final state.</li>
+  <li><b>No tracked source file was modified.</b> Every change is to gitignored runtime state, the LaunchAgent, or new files (this report and the backups).</li>
+</ul>
+
+<h3>About "EVE"</h3>
+<p>No component named EVE exists anywhere in the repository, its git history, or your home directory. The AI layer that matches your description (it processes monitoring instructions and turns detections into decisions) is called <b>Jupiter</b> (<code>jupiter/</code>). This report covers it under "EVE / Jupiter". If EVE is a planned product name for this layer, or lives somewhere else (another machine, or ORYN), it was not found here.</p>
+</section>
+
+<!-- 2 -->
+<section id="s2">
+<h2><span class="n">2</span>Complete repository overview</h2>
+<p>The repo has 410 tracked files. Line counts below cover <code>.py</code>, <code>.swift</code> and <code>.sh</code> files.</p>
+<div class="tablewrap"><table>
+<tr><th>Path</th><th>Files / lines</th><th>Purpose</th></tr>
+<tr><td><code>main.py</code></td><td>1 / 361</td><td>Device entry point. Picks the profile (<code>pi</code> or <code>mac_max</code>), restores the saved preset, configures the accelerator, builds the module, and hands off to <code>services/runtime.py</code>.</td></tr>
+<tr><td><code>core/</code></td><td>39 / 11.8k</td><td>The platform library:
+  <ul>
+    <li>camera abstraction</li>
+    <li>FrameBus</li>
+    <li>detectors and the Hailo wrapper (<code>accel.py</code>)</li>
+    <li>event engine and confidence</li>
+    <li>rules and zones (AI rules)</li>
+    <li>alerts (console, sound, GPIO buzzer)</li>
+    <li>CSV logger</li>
+    <li>device HTTP dashboard</li>
+    <li>cloud uplink</li>
+    <li>health and thermal monitoring</li>
+    <li>identity</li>
+    <li>capability registry, which every LLM schema is derived from</li>
+    <li>dataset capture</li>
+    <li>VLM judge</li>
+  </ul></td></tr>
+<tr><td><code>modules/</code></td><td>10 / 9.2k</td><td>Detection "apps":
+  <ul>
+    <li><code>driver_attention</code> (default)</li>
+    <li><code>driver_attention_max</code> (Mac GPU)</li>
+    <li>three comparison variants: <code>openpilot</code>, <code>skinnemoen</code>, <code>dashsentinel</code></li>
+    <li><code>fall_detection</code></li>
+    <li><code>occupancy</code></li>
+    <li><code>baby_monitoring</code></li>
+  </ul>
+  All share <code>modules/base.py</code>.</td></tr>
+<tr><td><code>services/</code></td><td>6 / 3.7k</td><td>Runtime orchestration:
+  <ul>
+    <li><code>runtime.py</code>: the main coordinator</li>
+    <li><code>capture.py</code>: camera thread</li>
+    <li><code>supervisor.py</code>: thread restarts</li>
+    <li><code>provisioning.py</code>: Wi-Fi watcher</li>
+    <li><code>ble_gatt.py</code>: BLE GATT provisioning server</li>
+  </ul></td></tr>
+<tr><td><code>cloud/</code></td><td>9 / 3.9k</td><td>FastAPI backend:
+  <ul>
+    <li><code>app.py</code>, 2.8k lines, one file</li>
+    <li><code>mdns.py</code>: zeroconf advertisement</li>
+    <li><code>notify.py</code>: push/SMS gating</li>
+    <li><code>ratelimit.py</code></li>
+    <li><code>manage.py</code>: CLI to create devices</li>
+    <li><code>Dockerfile</code>: for Fly.io</li>
+  </ul></td></tr>
+<tr><td><code>jupiter/</code></td><td>13 / 2.8k</td><td>LLM layer:
+  <ul>
+    <li>natural language → validated detection rules (configure)</li>
+    <li>grounded alert explanations (explain)</li>
+    <li>provider router: Ollama, OpenAI-compatible, Anthropic</li>
+    <li>security, confidence scoring and evaluation harness</li>
+  </ul></td></tr>
+<tr><td><code>ios/</code></td><td>56 / 14.8k</td><td>SwiftUI iPhone app. <code>project.yml</code> is the XcodeGen spec. <code>Sources/</code> has 45 Swift files; <code>Tests/</code> holds script-run logic tests.</td></tr>
+<tr><td><code>tests/</code></td><td>128 / 31.6k</td><td>pytest suite: unit, regression and "phase" hardening tests.</td></tr>
+<tr><td><code>scripts/</code></td><td>19 / 3.4k</td><td>Operations:
+  <ul>
+    <li><code>preflight.py</code>: boot checks</li>
+    <li><code>install_backend_mac.sh</code></li>
+    <li><code>diagnose_backend_mac.py</code></li>
+    <li><code>publish_mdns.py</code></li>
+    <li><code>ble_provision_client.py</code></li>
+    <li>dataset tools: <code>export_dataset.py</code>, <code>prepare_state_farm.py</code>, Label Studio import</li>
+    <li><code>jupiter_eval.py</code></li>
+    <li><code>fly_import_db.py</code></li>
+    <li><code>migrate_config.py</code></li>
+  </ul></td></tr>
+<tr><td><code>benchmarks/</code></td><td>6 / 1.3k</td><td>Latency, FPS and thermal benchmarks; the State Farm accuracy benchmark and its regression gate; the mac_max scenario protocol.</td></tr>
+<tr><td><code>hardware/</code></td><td>6 / 0.6k</td><td>Hardware abstraction layer (<code>hal.py</code>) with null drivers for IMU, GPS, IO expander, audio, LEDs, buttons and an ESP32 bridge; the enclosure CAD script.</td></tr>
+<tr><td><code>deploy/</code></td><td>—</td><td>LaunchAgent template, avahi service file (stale copy), sudoers rule (reboot and btmgmt), polkit network rule.</td></tr>
+<tr><td><code>docs/</code></td><td>21 files</td><td>ACCELERATOR, NETWORKING, JUPITER, TRAINING, DATASET_COLLECTION, DETECTIONS, LICENSING, the PHASE 5–8 readiness logs, and evidence logs.</td></tr>
+<tr><td><code>config.yaml</code> / <code>presets.yaml</code></td><td>1001 / —</td><td><code>config.yaml</code> holds all device configuration (profile, camera, dashboard, cloud, accelerator, alerts, per-module thresholds, mac_max, vlm). <code>presets.yaml</code> holds the four product modes: <code>driver_safety</code>, <code>elderly_monitoring</code>, <code>security_monitoring</code>, <code>baby_monitoring</code>.</td></tr>
+<tr><td><code>third_party/DashSentinel</code></td><td>—</td><td>A vendored earlier driver-monitor project, including firmware and PCB. Used by the <code>dashsentinel</code> comparison module.</td></tr>
+<tr><td><code>site/index.html</code></td><td>1 / 1164</td><td>A standalone marketing page. Nothing serves or links to it, and its stats are stale ("87/87 tests").</td></tr>
+<tr><td><code>dmonitoring_model.onnx</code></td><td>16 MB</td><td>openpilot's driver-monitoring model, used only by the non-default <code>driver_attention_openpilot</code> comparison module.</td></tr>
+<tr><td>Tooling</td><td>—</td><td><code>Makefile</code> (dev, test, lint, typecheck, audit, deploy, …), <code>ruff.toml</code>, <code>pyrightconfig.json</code>, <code>.pre-commit-config.yaml</code>, <code>.github/workflows/ci.yml</code>, <code>fly.toml</code>, <code>sensordyme.service</code> (systemd).</td></tr>
+</table></div>
+
+<h3>Runtime state that git does not track</h3>
+<p>The README lists the following as "carry by hand". Losing them is what broke the system.</p>
+<div class="tablewrap"><table>
+<tr><th>Path</th><th>Contents</th><th>Status now</th></tr>
+<tr><td><code>cloud/sensordyme.db</code></td><td>users, devices, events, orders, revoked tokens</td><td>Restored (4 users, 2 devices)</td></tr>
+<tr><td><code>cloud/.jwt_secret</code></td><td>session signing key</td><td>Restored, so existing phone sessions stay valid</td></tr>
+<tr><td><code>cloud/.backend_id</code></td><td><code>bk_0eb63f4fc338</code>, which the app pins</td><td>Restored</td></tr>
+<tr><td><code>data/</code></td><td>calibration, <code>monitoring.json</code>, State Farm dataset, telemetry</td><td>Restored (copied)</td></tr>
+<tr><td><code>ios/SensorDyme.xcodeproj</code>, <code>ios/Info.plist</code></td><td>generated by XcodeGen</td><td>Regenerated</td></tr>
+<tr><td><code>.venv/</code></td><td>Python environment</td><td>Rebuilt (Python 3.11)</td></tr>
+</table></div>
+</section>
+
+<!-- 3 -->
+<section id="s3">
+<h2><span class="n">3</span>Software architecture</h2>
+<p>The system has three runtime tiers plus an LLM service. The device does all vision locally. Frames never leave the LAN, and only event metadata travels upstream. The backend is the account and control plane. The iPhone talks to the backend for accounts, events and configuration, and talks <i>directly</i> to the device on the LAN for live video.</p>
+
+<figure>
+<svg viewBox="0 0 980 520" role="img" aria-label="System architecture diagram">
+  <!-- groups -->
+  <rect class="grp" x="10" y="20" width="330" height="480" rx="12"/>
+  <text class="t-g" x="26" y="42">RASPBERRY PI 5 · sensordyme.local</text>
+  <rect class="grp" x="370" y="20" width="300" height="480" rx="12"/>
+  <text class="t-g" x="386" y="42">MAC · sensordyme-backend.local</text>
+  <rect class="grp" x="700" y="20" width="270" height="480" rx="12"/>
+  <text class="t-g" x="716" y="42">IPHONE</text>
+
+  <!-- Pi -->
+  <rect class="box" x="30" y="60" width="290" height="44" rx="8"/><text class="t-b" x="44" y="80">Camera Module 3 NoIR Wide</text><text class="t-s" x="44" y="96">IMX708 · Picamera2 · 640×480</text>
+  <rect class="box" x="30" y="122" width="290" height="44" rx="8"/><text class="t-b" x="44" y="142">CaptureService → FrameBus</text><text class="t-s" x="44" y="158">services/capture.py · core/frame_bus.py</text>
+  <rect class="hi" x="30" y="184" width="290" height="62" rx="8"/><text class="t-b" x="44" y="204">Inference loop + active module</text><text class="t-s" x="44" y="220">services/runtime.py · modules/*.py</text><text class="t-s" x="44" y="236">MediaPipe (CPU) + YOLO detector</text>
+  <rect class="hi" x="30" y="264" width="140" height="56" rx="8"/><text class="t-b" x="42" y="284">Hailo-8L NPU</text><text class="t-s" x="42" y="300">DAMO-YOLO .hef</text><text class="t-s" x="42" y="313">core/accel.py</text>
+  <rect class="box" x="180" y="264" width="140" height="56" rx="8"/><text class="t-b" x="192" y="284">Events / Rules</text><text class="t-s" x="192" y="300">event_engine · rules</text><text class="t-s" x="192" y="313">alerts · logger</text>
+  <rect class="box" x="30" y="338" width="140" height="56" rx="8"/><text class="t-b" x="42" y="358">Dashboard :8899</text><text class="t-s" x="42" y="374">/stream /api/*</text><text class="t-s" x="42" y="387">X-Device-Token</text>
+  <rect class="box" x="180" y="338" width="140" height="56" rx="8"/><text class="t-b" x="192" y="358">CloudUplink</text><text class="t-s" x="192" y="374">POST /v1/ingest · 2 s</text><text class="t-s" x="192" y="387">X-Device-Key</text>
+  <rect class="box" x="30" y="412" width="290" height="44" rx="8"/><text class="t-b" x="44" y="432">Health · BLE provisioning · avahi</text><text class="t-s" x="44" y="448">systemd watchdog · _sensordyme._tcp</text>
+
+  <!-- Mac -->
+  <rect class="hi" x="390" y="60" width="260" height="78" rx="8"/><text class="t-b" x="404" y="82">FastAPI backend :8787</text><text class="t-s" x="404" y="98">cloud/app.py (uvicorn, launchd)</text><text class="t-s" x="404" y="114">JWT auth · rate limits · retention</text><text class="t-s" x="404" y="128">_sensordyme-api._tcp (zeroconf)</text>
+  <rect class="box" x="390" y="160" width="260" height="44" rx="8"/><text class="t-b" x="404" y="180">SQLite (WAL)</text><text class="t-s" x="404" y="196">cloud/sensordyme.db</text>
+  <rect class="hi" x="390" y="226" width="260" height="62" rx="8"/><text class="t-b" x="404" y="246">Jupiter (in-process)</text><text class="t-s" x="404" y="262">jupiter/interpret.py · explain.py</text><text class="t-s" x="404" y="278">schema from core/capabilities.py</text>
+  <rect class="box" x="390" y="310" width="260" height="44" rx="8"/><text class="t-b" x="404" y="330">Ollama :11434</text><text class="t-s" x="404" y="346">qwen2.5:7b / 1.5b-instruct</text>
+  <rect class="warnbox" x="390" y="376" width="260" height="44" rx="8"/><text class="t-b" x="404" y="396">Anthropic fallback (off)</text><text class="t-s" x="404" y="412">SENSORDYME_ALLOW_EXTERNAL_AI</text>
+  <rect class="box" x="390" y="442" width="260" height="44" rx="8"/><text class="t-b" x="404" y="462">ntfy.sh / Twilio SMS</text><text class="t-s" x="404" y="478">background alerts (no APNs)</text>
+
+  <!-- iPhone -->
+  <rect class="hi" x="720" y="60" width="230" height="62" rx="8"/><text class="t-b" x="734" y="82">SensorDyme app</text><text class="t-s" x="734" y="98">SwiftUI · iOS 17+</text><text class="t-s" x="734" y="112">com.sensordyme.app</text>
+  <rect class="box" x="720" y="140" width="230" height="44" rx="8"/><text class="t-b" x="734" y="160">BackendLocator</text><text class="t-s" x="734" y="176">Bonjour + id pinning</text>
+  <rect class="box" x="720" y="202" width="230" height="44" rx="8"/><text class="t-b" x="734" y="222">APIClient (JWT)</text><text class="t-s" x="734" y="238">devices · events · AI · zones</text>
+  <rect class="box" x="720" y="264" width="230" height="44" rx="8"/><text class="t-b" x="734" y="284">MJPEGReader</text><text class="t-s" x="734" y="300">live feed, direct to device</text>
+  <rect class="box" x="720" y="326" width="230" height="44" rx="8"/><text class="t-b" x="734" y="346">BLEProvisioner</text><text class="t-s" x="734" y="362">Wi-Fi setup over GATT</text>
+  <rect class="box" x="720" y="388" width="230" height="44" rx="8"/><text class="t-b" x="734" y="408">AlertWatcher + local notifs</text><text class="t-s" x="734" y="424">polls events every 15 s</text>
+
+  <!-- arrows -->
+  <defs><marker id="ah" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" fill="var(--d-stroke)"/></marker>
+  <marker id="ahh" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" fill="var(--d-hi)"/></marker></defs>
+  <path class="ln" d="M175 104 V122" marker-end="url(#ah)"/>
+  <path class="ln" d="M175 166 V184" marker-end="url(#ah)"/>
+  <path class="ln" d="M100 246 V264" marker-end="url(#ah)" marker-start="url(#ah)"/>
+  <path class="ln" d="M250 246 V264" marker-end="url(#ah)"/>
+  <path class="ln" d="M250 320 V338" marker-end="url(#ah)"/>
+  <path class="ln" d="M100 246 C 20 280, 20 320, 60 338" marker-end="url(#ah)"/>
+  <path class="lnhi" d="M320 366 C 350 366, 360 100, 390 100" marker-end="url(#ahh)"/>
+  <text class="t-s" x="326" y="230">events ↑ / commands ↓</text>
+  <path class="ln" d="M520 138 V160" marker-end="url(#ah)"/>
+  <path class="ln" d="M520 204 V226" marker-end="url(#ah)" marker-start="url(#ah)"/>
+  <path class="ln" d="M520 288 V310" marker-end="url(#ah)"/>
+  <path class="lnhi" d="M720 224 C 690 224, 680 100, 650 100" marker-end="url(#ahh)"/>
+  <text class="t-s" x="664" y="160">HTTPS/HTTP + JWT</text>
+  <path class="lnhi" d="M720 286 C 560 286, 420 520, 170 380" marker-end="url(#ahh)" stroke-dasharray="6 4"/>
+  <text class="t-s" x="480" y="508">MJPEG /stream + /api/health over LAN (X-Device-Token)</text>
+  <path class="ln" d="M720 348 C 600 440, 400 470, 320 440" stroke-dasharray="2 4" marker-end="url(#ah)"/>
+</svg>
+<figcaption>Figure 1. Runtime topology as verified live on 9 Nov 2026. Blue edges are the main data paths. The dashed orange box is configured but disabled.</figcaption>
+</figure>
+
+<h3>Device process model</h3>
+<p>The device runs as one systemd service (<code>sensordyme.service</code>, <code>Type=notify</code>, with a watchdog) in one Python process with supervised threads:</p>
+<ul>
+  <li><b>Capture</b> owns the camera.</li>
+  <li><b>Inference</b> always processes the <i>newest</i> frame, never a backlog.</li>
+  <li><b>Dashboard</b>, <b>CloudUplink</b>, <b>Provisioning</b> and <b>HealthMonitor</b> run alongside.</li>
+</ul>
+<p>The heavy work (capture I/O, MediaPipe/ONNX, Hailo calls, JPEG encode) releases the GIL. Recovery escalates in this order (<code>ARCHITECTURE.md</code>):</p>
+<ol>
+  <li>in-place camera re-open</li>
+  <li>component restart</li>
+  <li>service-thread restart</li>
+  <li>the watchdog lets systemd restart the process</li>
+  <li>rate-limited reboot</li>
+</ol>
+
+<h3>Profiles and presets</h3>
+<p><code>config.yaml: profile: pi</code> is the shipping product. <code>mac_max</code> is a Mac-only demo and accuracy-ceiling profile: YOLO11x on Apple MPS plus a VLM judge.</p>
+<p><code>presets.yaml</code> maps product modes to modules:</p>
+<div class="tablewrap"><table>
+<tr><th>Preset</th><th>Module</th></tr>
+<tr><td><code>driver_safety</code></td><td><code>driver_attention</code></td></tr>
+<tr><td><code>elderly_monitoring</code></td><td><code>fall_detection</code></td></tr>
+<tr><td><code>security_monitoring</code></td><td><code>occupancy</code></td></tr>
+<tr><td><code>baby_monitoring</code></td><td><code>baby_monitoring</code></td></tr>
+</table></div>
+<p>A fifth runtime mode, <b>AI_CUSTOM</b>, runs Jupiter-generated rules on top of <code>occupancy</code>, or <code>fall_detection</code> when every rule is pose-only.</p>
+</section>
+
+<!-- 4 -->
+<section id="s4">
+<h2><span class="n">4</span>Web application architecture</h2>
+<div class="callout"><strong>There is no separate SPA or web framework.</strong>
+SensorDyme's "web application" consists of two parts:
+<ol class="plain">
+  <li>the <b>on-device dashboard</b>: inline HTML/CSS/JS served by Python's stdlib <code>ThreadingHTTPServer</code> in <code>core/dashboard.py</code>;</li>
+  <li>the <b>backend REST API</b>, which only the iOS app uses (there is no web client for it).</li>
+</ol>
+<code>site/index.html</code> and <code>~/Sensordyme-website/sensordynewebsite</code> (about, product, solutions, technology pages, with a CNAME) are static marketing sites with no API calls.</div>
+
+<h3>Device dashboard (<code>core/dashboard.py</code>, port 8899)</h3>
+<ul>
+  <li><b>Frontend.</b> A single inline page (<code>_PAGE</code>) with five parts:
+    <ul>
+      <li>live video panel with an alert pill and a red flash overlay on each new event;</li>
+      <li>risk sparkline drawn on a canvas;</li>
+      <li>mode chips for switching presets;</li>
+      <li>session stats;</li>
+      <li>alert timeline.</li>
+    </ul>
+    It polls <code>/api/state</code> every 400 ms and <code>/api/presets</code> every 5 s. All inserted text is escaped. A second page, <code>_SETUP_PAGE</code>, is a Wi-Fi form used by the legacy hotspot onboarding flow.</li>
+  <li><b>Auth.</b> Every <code>/api/*</code> and <code>/stream</code> request, and every POST, needs <code>X-Device-Token</code> (or <code>?token=</code> for the <code>&lt;img&gt;</code> MJPEG case), compared in constant time. If no token is configured on a non-loopback bind, it <i>fails closed</i>. The shipped <code>config.yaml</code> has <code>token: null</code>; your Pi has a token set.</li>
+  <li><b>Account management.</b> None at the device level. Accounts live in the backend.</li>
+</ul>
+<div class="tablewrap"><table>
+<tr><th>Method</th><th>Path</th><th>Auth</th><th>Returns</th></tr>
+<tr><td>GET</td><td><code>/</code>, <code>/index*</code></td><td>none</td><td>Dashboard HTML</td></tr>
+<tr><td>GET</td><td><code>/setup*</code></td><td>none</td><td>Wi-Fi setup HTML</td></tr>
+<tr><td>GET</td><td><code>/api/state</code></td><td>token</td><td>module, live signal snapshot (EAR, yaw, PERCLOS, risk…), last 60 events, counts, risk history</td></tr>
+<tr><td>GET</td><td><code>/api/presets</code></td><td>token</td><td>active preset plus the catalogue</td></tr>
+<tr><td>GET</td><td><code>/api/health</code></td><td>token</td><td>HealthMonitor snapshot (camera, inference, accelerator, uplink, wifi, thermal, HAL), plus a device block containing the <code>SD-</code> id</td></tr>
+<tr><td>GET</td><td><code>/api/history?limit=</code></td><td>token</td><td>tail of <code>data/events.csv</code> (≤2000 rows)</td></tr>
+<tr><td>GET</td><td><code>/stream</code></td><td>token</td><td>MJPEG, about 12 fps, quality 60. Frames are encoded only while someone is watching.</td></tr>
+<tr><td>POST</td><td><code>/api/preset</code></td><td>token</td><td>switch mode → 202</td></tr>
+<tr><td>POST</td><td><code>/setup/wifi</code></td><td>token</td><td>joins Wi-Fi via nmcli</td></tr>
+</table></div>
+<p><b>Live check:</b> <code>/</code> returned 200. All gated endpoints returned 401 without a token (correct). With the device's own token, <code>/api/health</code>, <code>/api/state</code> and <code>/stream</code> all returned data (§13).</p>
+</section>
+
+<!-- 5 -->
+<section id="s5">
+<h2><span class="n">5</span>Backend architecture</h2>
+
+<h3>Stack</h3>
+<ul>
+  <li>FastAPI 0.141, Starlette 1.4 and uvicorn, in one module <code>cloud/app.py</code> (about 2.8k lines).</li>
+  <li>SQLite in WAL mode with a 15 s busy timeout. Files are set to 0600.</li>
+  <li>Migrations are additive: <code>CREATE TABLE IF NOT EXISTS</code> plus a list of <code>ALTER TABLE ADD COLUMN</code>. There is no version table. This is why the older database opened cleanly under the new code.</li>
+  <li>Request bodies are capped at 4 MB.</li>
+  <li><code>sqlite3.OperationalError</code> is mapped to 503, so devices retry instead of dropping events.</li>
+  <li>Retention: 90 days or 100k events per device, applied at most hourly.</li>
+</ul>
+
+<h3>Deployment</h3>
+<p><b>Current: Mac LaunchAgent</b> <code>com.sensordyme.backend</code>.</p>
+<ul>
+  <li>Runs <code>uvicorn cloud.app:app --host 0.0.0.0 --port 8787</code>.</li>
+  <li>Environment: <code>SENSORDYME_MDNS=1</code>.</li>
+  <li>Logs go to <code>cloud/backend.log</code>.</li>
+</ul>
+<p><b>Alternative: Fly.io</b> (<code>fly.toml</code>, app <code>sensordyme-api</code>, volume mounted at <code>/data</code>). It is configured but not in use, and CI does not deploy it.</p>
+
+<h3>Data model</h3>
+<div class="tablewrap"><table>
+<tr><th>Table</th><th>Key columns</th></tr>
+<tr><td><code>users</code></td><td>email (unique), pw_hash, salt, ntfy_topic, phone, sms_on_loud</td></tr>
+<tr><td><code>devices</code></td><td>name, claim_code, device_key, owner_id, active_preset / desired_preset, monitoring, last_seen, health (JSON), hardware_id (<code>SD-…</code>), zones, ai_rules, ai_rules_draft, ai_rules_activation, custom_monitoring_wanted</td></tr>
+<tr><td><code>events</code></td><td>device_id, timestamp, type, confidence, signals, severity, source, event_key (dedup), duration, model (JSON)</td></tr>
+<tr><td><code>orders</code></td><td>user_id, quantity, address, status</td></tr>
+<tr><td><code>revoked_tokens</code></td><td>jti, exp</td></tr>
+</table></div>
+
+<h3>Authentication</h3>
+<ul>
+  <li><b>Users</b>
+    <ul>
+      <li>Passwords are hashed with PBKDF2-HMAC-SHA256 (200k iterations, per-user salt). Unknown emails take the same time to fail.</li>
+      <li>Sessions are HS256 JWTs with a 30-day lifetime and a revocable <code>jti</code>.</li>
+    </ul></li>
+  <li><b>Devices</b>
+    <ul>
+      <li>Each device sends <code>X-Device-Key</code> (<code>dk_…</code>), created with <code>cloud/manage.py create-device</code>.</li>
+      <li>Users claim a device with a 12-hex claim code.</li>
+    </ul></li>
+  <li><b>Rate limits (in memory)</b>
+    <ul>
+      <li>login, signup and claim: 10 per 5 minutes per IP;</li>
+      <li>failed logins: 20 per 15 minutes per email;</li>
+      <li>AI: 30 per minute and 2 concurrent per account, 8 concurrent globally.</li>
+    </ul></li>
+</ul>
+
+<h3>Notifications</h3>
+<p>There is no APNs. Background alerts are delivered to <b>ntfy.sh</b> topics. SMS goes through Twilio when the <code>TWILIO_*</code> environment variables are set; otherwise it is only logged. <code>cloud/notify.py</code> only lets an event through when both of these hold:</p>
+<ul>
+  <li>it is "loud" or comes from a <code>custom_rule</code>;</li>
+  <li>the account is outside its 20 s cooldown.</li>
+</ul>
+
+<h3>API endpoints (complete)</h3>
+<div class="tablewrap"><table>
+<tr><th>Method</th><th>Path</th><th>Auth</th><th>Purpose</th><th>Used by iOS</th></tr>
+<tr><td>GET</td><td><code>/v1/health</code></td><td>—</td><td>liveness plus the <code>id</code> (backend identity)</td><td>✓</td></tr>
+<tr><td>POST</td><td><code>/v1/signup</code></td><td>— (rate-limited)</td><td>create an account → JWT</td><td>✓</td></tr>
+<tr><td>POST</td><td><code>/v1/login</code></td><td>— (rate-limited)</td><td>→ JWT</td><td>✓</td></tr>
+<tr><td>POST</td><td><code>/v1/logout</code></td><td>JWT</td><td>revoke the current token</td><td>✓</td></tr>
+<tr><td>POST</td><td><code>/v1/account/ntfy</code></td><td>JWT</td><td>set the background-alert topic</td><td>✓</td></tr>
+<tr><td>POST</td><td><code>/v1/account/phone</code></td><td>JWT</td><td>SMS number and opt-in</td><td>✓</td></tr>
+<tr><td>POST / GET</td><td><code>/v1/orders</code></td><td>JWT</td><td>hardware shop orders</td><td>✓</td></tr>
+<tr><td>POST</td><td><code>/v1/devices/claim</code></td><td>JWT</td><td>claim a device by code</td><td>✓</td></tr>
+<tr><td>GET</td><td><code>/v1/devices</code></td><td>JWT</td><td>owned devices, online state, health, hardware_id</td><td>✓</td></tr>
+<tr><td>POST</td><td><code>/v1/devices/{id}/name</code></td><td>JWT</td><td>rename</td><td>✓</td></tr>
+<tr><td>GET</td><td><code>/v1/devices/{id}/events</code></td><td>JWT</td><td>last N events, including model identity</td><td>✓</td></tr>
+<tr><td>POST</td><td><code>/v1/devices/{id}/preset</code></td><td>JWT</td><td>switch mode; with <code>preset:""</code>, activate AI rules</td><td>✓</td></tr>
+<tr><td>GET / POST</td><td><code>/v1/devices/{id}/zones</code></td><td>JWT</td><td>user-drawn polygons</td><td>✓</td></tr>
+<tr><td>POST</td><td><code>/v1/ai/configure</code></td><td>JWT + AI limits</td><td>Jupiter: natural language → draft rules</td><td>✓</td></tr>
+<tr><td>GET</td><td><code>/v1/devices/{id}/events/{eid}/explain</code></td><td>JWT + AI slot</td><td>Jupiter: "why did this alert fire"</td><td>✓</td></tr>
+<tr><td>POST</td><td><code>/v1/ingest</code></td><td>X-Device-Key</td><td>device heartbeat: events up, commands down</td><td>(device)</td></tr>
+</table></div>
+<p>All 18 routes were confirmed by introspecting <code>app.routes</code>. Every endpoint the iOS app calls exists. There is no DELETE route anywhere: no account deletion, password reset, device unclaim or key rotation.</p>
+</section>
+
+<!-- 6 -->
+<section id="s6">
+<h2><span class="n">6</span>Raspberry Pi hardware architecture</h2>
+<p>All facts below were read live from the device over SSH (<code>pi@sensordyme</code>, 11.20.6.16 on Wi-Fi "MyResNet-5G").</p>
+<div class="tablewrap"><table>
+<tr><th>Item</th><th>Observed</th></tr>
+<tr><td>Board</td><td>Raspberry Pi 5 Model B Rev 1.1, 4 GB; kernel 6.12.93+rpt-rpi-2712 (aarch64)</td></tr>
+<tr><td>Camera</td><td><code>imx708_wide_noir</code> (Camera Module 3 NoIR Wide), 4608×2592 sensor, runtime 640×480</td></tr>
+<tr><td>Accelerator</td><td><code>/dev/hailo0</code>; <code>hailortcli identify</code> reports Device Architecture <b>HAILO8L</b>, firmware 4.20.0. Packages: <code>hailo-all 4.20.0</code>, <code>hailort 4.20.0</code>, <code>python3-hailort</code>, <code>hailo-tappas-core 3.31</code>.</td></tr>
+<tr><td>Model on device</td><td><code>models/damoyolo_tinynasL20_T.hef</code> (18.5 MB). Its sha256 starts <code>e69136d3…</code>, matching <code>accelerator.yolo_hef_sha256</code>.</td></tr>
+<tr><td>Thermal / power</td><td>58.7 °C, fan level 2/4, <code>get_throttled=0x0</code> (no under-voltage)</td></tr>
+<tr><td>Storage / RAM</td><td>58 GB SD, 22% used; 0.8 GB of 4 GB RAM used</td></tr>
+<tr><td>Service</td><td><code>sensordyme.service</code> active, 0 restarts, running <code>/home/pi/sensordyme/main.py --no-display</code></td></tr>
+<tr><td>Health state</td><td><code>degraded</code> at the time of the check. Its only cause was <code>cloud_uplink</code> being offline because of the backend outage. Camera, inference, accelerator, dashboard, Wi-Fi, thermal and provisioning were all <code>ok</code>. Optional HAL parts (IMU, GPS, IO expander, audio, LEDs, buttons, ESP32) report "not fitted".</td></tr>
+<tr><td>Network discovery</td><td>avahi advertises <code>_sensordyme._tcp</code> → <code>sensordyme.local:8899</code>, TXT <code>path=/stream version=0.2 id=SD-3D248632</code></td></tr>
+<tr><td>Backend link</td><td><code>cloud.base_url = http://sensordyme-backend.local:8787</code>; device_key set; poll every 2 s</td></tr>
+<tr><td>Tailscale</td><td><b>Not installed</b> on the Pi or on the Mac. The repo has no Tailscale integration: it appears only as an interface name to exclude from mDNS and as a suggestion in <code>docs/NETWORKING.md</code>.</td></tr>
+<tr><td>Deployed code version</td><td><code>/home/pi/sensordyme</code> is <b>not a git checkout</b>. It was rsynced by <code>make deploy</code> and the files are dated <b>30 Aug 2026</b>. Of the 56 source files the Pi shares with the repo, only <b>8 are byte-identical</b>, and <code>core/confidence.py</code> and <code>core/device_state.py</code> are missing on the device. Consequence: uploaded events carry no <code>model</code> identity.</td></tr>
+</table></div>
+<div class="callout warn"><strong>Clock note</strong>systemd reports the service started on "15 Oct", but the device uptime was 17 minutes. The Pi 5 has no RTC battery, so timestamps are taken before NTP syncs. This is harmless here, but early-boot log timestamps can be misleading.</div>
+</section>
+
+<!-- 7 -->
+<section id="s7">
+<h2><span class="n">7</span>YOLO computer vision architecture</h2>
+
+<h3>Which detector, where</h3>
+<div class="tablewrap"><table>
+<tr><th>Target</th><th>Model</th><th>Runtime</th><th>Source / pin</th></tr>
+<tr><td><b>Pi (shipping)</b></td><td>DAMO-YOLO <code>damoyolo_tinynasL20_T</code> (COCO-80, Apache-2.0)</td><td>HailoRT on the Hailo-8L, raw-tensor build (6 outputs, no on-chip NMS)</td><td>Hailo Model Zoo v2.15.0. Downloaded by <code>setup_pi.sh</code>, which checks sha256 <code>e69136d3…</code>. Re-verified on every load.</td></tr>
+<tr><td>Mac dev (pi profile)</td><td>YOLO11n (<code>yolo11n.pt</code>)</td><td>ultralytics 8.3.28 / PyTorch on CPU</td><td>auto-downloaded. AGPL, so it is kept off the device.</td></tr>
+<tr><td>mac_max</td><td>YOLO11x (or RT-DETR-l)</td><td>ultralytics on Apple MPS</td><td>Mac only</td></tr>
+<tr><td>openpilot comparison</td><td><code>dmonitoring_model.onnx</code></td><td>onnxruntime CPU</td><td>in the repo root; not checksum-pinned</td></tr>
+<tr><td>Face / hands / pose</td><td>MediaPipe 0.10.14 (Face Mesh, Hands, Pose)</td><td>CPU (no Hailo build exists)</td><td>pip</td></tr>
+</table></div>
+<p>The weight names in <code>config.yaml</code> (<code>yolo_weights: yolo11n.pt</code>, and so on) are only <i>cache keys</i> on the device. <code>core/accel.py</code> maps every name to the one shared <code>HailoYOLO</code> instance for the configured <code>.hef</code>.</p>
+
+<h3>Frame-to-alert pipeline</h3>
+<figure>
+<svg viewBox="0 0 980 300" role="img" aria-label="YOLO inference pipeline">
+  <defs><marker id="a2" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto"><path d="M0,0 L10,5 L0,10 z" fill="var(--d-stroke)"/></marker></defs>
+  <rect class="box" x="10" y="30" width="130" height="64" rx="8"/><text class="t-b" x="22" y="54">Picamera2</text><text class="t-s" x="22" y="70">RGB888 = BGR</text><text class="t-s" x="22" y="84">640×480 @30</text>
+  <rect class="box" x="165" y="30" width="130" height="64" rx="8"/><text class="t-b" x="177" y="54">FrameBus</text><text class="t-s" x="177" y="70">latest-frame slot</text><text class="t-s" x="177" y="84">zero-copy</text>
+  <rect class="box" x="320" y="30" width="150" height="64" rx="8"/><text class="t-b" x="332" y="54">module.process()</text><text class="t-s" x="332" y="70">YOLO every 3rd frame</text><text class="t-s" x="332" y="84">(driver_attention)</text>
+  <rect class="hi" x="495" y="30" width="150" height="64" rx="8"/><text class="t-b" x="507" y="54">Letterbox → RGB</text><text class="t-s" x="507" y="70">pad 114 · uint8 NHWC</text><text class="t-s" x="507" y="84">accel.py:564</text>
+  <rect class="hi" x="670" y="30" width="140" height="64" rx="8"/><text class="t-b" x="682" y="54">Hailo-8L infer</text><text class="t-s" x="682" y="70">InferVStreams</text><text class="t-s" x="682" y="84">held open, locked</text>
+  <rect class="hi" x="835" y="30" width="135" height="64" rx="8"/><text class="t-b" x="847" y="54">Decode</text><text class="t-s" x="847" y="70">DFL 17 bins · NMS 0.5</text><text class="t-s" x="847" y="84">un-letterbox</text>
+  <path class="ln" d="M140 62 H165" marker-end="url(#a2)"/><path class="ln" d="M295 62 H320" marker-end="url(#a2)"/><path class="ln" d="M470 62 H495" marker-end="url(#a2)"/><path class="ln" d="M645 62 H670" marker-end="url(#a2)"/><path class="ln" d="M810 62 H835" marker-end="url(#a2)"/>
+  <path class="ln" d="M902 94 V130 H780" marker-end="url(#a2)"/>
+  <rect class="box" x="630" y="112" width="150" height="64" rx="8"/><text class="t-b" x="642" y="136">Detections</text><text class="t-s" x="642" y="152">COCO name · conf · box</text><text class="t-s" x="642" y="166">module class filter</text>
+  <rect class="box" x="440" y="112" width="165" height="64" rx="8"/><text class="t-b" x="452" y="136">Signal fusion</text><text class="t-s" x="452" y="152">+ MediaPipe face/hands</text><text class="t-s" x="452" y="166">EAR · gaze · overlap</text>
+  <rect class="box" x="250" y="112" width="165" height="64" rx="8"/><text class="t-b" x="262" y="136">EventEngine</text><text class="t-s" x="262" y="152">observed→confirmed</text><text class="t-s" x="262" y="166">EMA · persist · cooldown</text>
+  <rect class="box" x="60" y="112" width="165" height="64" rx="8"/><text class="t-b" x="72" y="136">Event</text><text class="t-s" x="72" y="152">type · confidence</text><text class="t-s" x="72" y="166">severity · signals</text>
+  <path class="ln" d="M630 144 H605" marker-end="url(#a2)"/><path class="ln" d="M440 144 H415" marker-end="url(#a2)"/><path class="ln" d="M250 144 H225" marker-end="url(#a2)"/>
+  <rect class="box" x="10" y="216" width="150" height="56" rx="8"/><text class="t-b" x="22" y="238">AlertManager</text><text class="t-s" x="22" y="254">console/sound/GPIO</text>
+  <rect class="box" x="180" y="216" width="150" height="56" rx="8"/><text class="t-b" x="192" y="238">EventLogger</text><text class="t-s" x="192" y="254">data/events.csv</text>
+  <rect class="box" x="350" y="216" width="150" height="56" rx="8"/><text class="t-b" x="362" y="238">Dashboard</text><text class="t-s" x="362" y="254">/api/state · overlay</text>
+  <rect class="hi" x="520" y="216" width="170" height="56" rx="8"/><text class="t-b" x="532" y="238">CloudUplink</text><text class="t-s" x="532" y="254">alert-worthy only</text>
+  <rect class="hi" x="710" y="216" width="260" height="56" rx="8"/><text class="t-b" x="722" y="238">RuleEngine (AI_CUSTOM)</text><text class="t-s" x="722" y="254">get_detections() → Jupiter rules</text>
+  <path class="ln" d="M142 176 C142 196, 85 196, 85 216" marker-end="url(#a2)"/><path class="ln" d="M142 176 C142 196, 255 196, 255 216" marker-end="url(#a2)"/><path class="ln" d="M142 176 C142 200, 425 196, 425 216" marker-end="url(#a2)"/><path class="ln" d="M142 176 C142 204, 605 196, 605 216" marker-end="url(#a2)"/>
+  <path class="ln" d="M705 176 V200 H840 V216" marker-end="url(#a2)"/>
+</svg>
+<figcaption>Figure 2. Detection path on the Pi. Code references: <code>services/capture.py</code>, <code>core/frame_bus.py</code>, <code>services/runtime.py:1433–1668</code>, <code>core/accel.py:454–766</code>, <code>core/event_engine.py</code>, <code>core/rules.py</code>.</figcaption>
+</figure>
+
+<h3>Key mechanics</h3>
+<ul>
+  <li><b>One surface for both backends.</b> Modules call <code>get_yolo_model(weights).predict(frame, classes=[…], conf=…)</code>. Hailo and ultralytics expose the same interface.</li>
+  <li><b>Hailo lifecycle.</b>
+    <ul>
+      <li>Setup chain: <code>VDevice</code> → <code>ConfigureParams.create_from_hef(PCIe)</code> → network group → <code>InferVStreams</code>.</li>
+      <li>The network is activated once and held open; calls are serialised by a lock.</li>
+      <li>A device fault tears it down, and the next frame rebuilds it.</li>
+      <li><code>release_all()</code> runs at shutdown.</li>
+    </ul></li>
+  <li><b>Decoding the raw HEF.</b>
+    <ul>
+      <li>Output shapes are paired into box and class heads.</li>
+      <li>Boxes use DFL over 17 bins.</li>
+      <li>Class scores are assumed to be already sigmoid'd.</li>
+      <li>Class-wise greedy NMS in numpy, IoU 0.50, hard-coded.</li>
+      <li>Class names always come from the hard-coded <code>COCO_NAMES</code>.</li>
+    </ul></li>
+  <li><b>Confidence thresholds.</b>
+    <ul>
+      <li>driver_attention: 0.20, with person filtered at 0.50</li>
+      <li>occupancy: 0.5</li>
+      <li>baby_monitoring: 0.4</li>
+      <li>mac_max: 0.4</li>
+    </ul></li>
+  <li><b>Integrity.</b>
+    <ul>
+      <li>The <code>.hef</code> sha256 is checked against the pin at every load (not every frame), and re-hashed after load.</li>
+      <li>On a mismatch the model is refused and the runtime goes DEGRADED.</li>
+      <li>The Pi has no CPU fallback, because ultralytics is deliberately not installed there.</li>
+    </ul></li>
+  <li><b>Model identity.</b> Each uplinked event carries <code>model: {module, detector:{name, sha256, backend}}</code>, which the backend stores in <code>events.model</code>. <i>Your Pi's older code doesn't send it yet.</i></li>
+  <li><b>Updating the model.</b> There is no OTA. Changing the model means re-running <code>setup_pi.sh</code> and editing the config, because <code>make deploy</code> deliberately excludes <code>*.hef</code> and <code>config.yaml</code>.</li>
+</ul>
+
+<h3>Live evidence</h3>
+<p><code>/api/health</code> accelerator component reported: "Hailo NPU in use — 8577 inferences, last 0.11s ago" and "running on the Hailo-8 accelerator". A frame from <code>/stream</code> showed the full overlay: EAR, yaw, risk bar, "FACE NOT VISIBLE", and a YOLO box. That box was a <b>false positive</b>: a window blind labelled <code>spoon</code>. The unit was pointed at a desk rather than a driver, which also produced repeated <code>eating_drinking</code> and <code>phone_detected</code> log events.</p>
+
+<h3>Known CV defects (from code review)</h3>
+<ol class="plain">
+  <li>One exception in <code>_update_object_detections</code> permanently disables object detection in driver_attention and mac_max until restart, and health still reports monitoring as active (<code>modules/driver_attention.py:1331–1359</code>).</li>
+  <li>Open anchor-offset question in the DFL decoder: the code places anchors at cell centre + 0.5 (<code>accel.py:673–694</code>). If upstream DAMO-YOLO differs, every box is shifted by stride/2. Nothing measures box position.</li>
+  <li><code>setup_pi.sh</code> accepts an older <code>4c71eab8…</code> build that <code>config.yaml</code> forbids. Such a device installs and then boots DEGRADED. Most published accuracy numbers were measured on that older build.</li>
+  <li><code>scripts/migrate_config.py</code> never adds <code>accelerator.yolo_hef</code> or its sha pin. An old config becomes either DEGRADED or unpinned.</li>
+  <li>NMS IoU and class names are hard-coded, so a custom-class model would silently use the wrong names.</li>
+</ol>
+</section>
+
+<!-- 8 -->
+<section id="s8">
+<h2><span class="n">8</span>EVE / Jupiter intelligence architecture</h2>
+<p>Jupiter is a <b>coordinator, not a vision model</b> (<code>jupiter/__init__.py</code>). Vision never passes through the LLM. Jupiter has exactly two LLM roles:</p>
+<div class="grid2">
+<div class="card"><h4>configure</h4>Turns a user's request ("tell me if someone holds a phone for 10 s") into a list of <code>RuleDraft</code> objects. Each rule has these fields:
+<ul>
+  <li>target, predicate, secondary</li>
+  <li>zone, persist_s, min_count</li>
+  <li>confidence, severity, cooldown, schedule, notify</li>
+</ul>
+Every field is validated against the capability registry (<code>core/capabilities.py</code>).</div>
+<div class="card"><h4>explain</h4>Rephrases a deterministic list of facts about one alert (signals, confidence, duration, zone, model) into at most 30 words. It is never used for CRITICAL events (falls, zone exits); those keep their deterministic text.</div>
+</div>
+
+<figure>
+<svg viewBox="0 0 980 230" role="img" aria-label="Jupiter configure flow">
+  <defs><marker id="a3" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto"><path d="M0,0 L10,5 L0,10 z" fill="var(--d-stroke)"/></marker></defs>
+  <rect class="box" x="10" y="20" width="140" height="70" rx="8"/><text class="t-b" x="22" y="44">iOS AIConfigure</text><text class="t-s" x="22" y="60">POST /v1/ai/configure</text><text class="t-s" x="22" y="74">{device_id, prompt}</text>
+  <rect class="box" x="170" y="20" width="150" height="70" rx="8"/><text class="t-b" x="182" y="44">security.py</text><text class="t-s" x="182" y="60">≤600 chars · strip fence</text><text class="t-s" x="182" y="74">flag injection</text>
+  <rect class="hi" x="340" y="20" width="150" height="70" rx="8"/><text class="t-b" x="352" y="44">prompt + schema</text><text class="t-s" x="352" y="60">registry → enums</text><text class="t-s" x="352" y="74">11 few-shot examples</text>
+  <rect class="hi" x="510" y="20" width="150" height="70" rx="8"/><text class="t-b" x="522" y="44">Ollama qwen2.5:7b</text><text class="t-s" x="522" y="60">JSON-schema-constrained</text><text class="t-s" x="522" y="74">local · no key</text>
+  <rect class="box" x="680" y="20" width="140" height="70" rx="8"/><text class="t-b" x="692" y="44">parse + clamp</text><text class="t-s" x="692" y="60">RuleDraft.validate</text><text class="t-s" x="692" y="74">confidence.score</text>
+  <rect class="box" x="840" y="20" width="130" height="70" rx="8"/><text class="t-b" x="852" y="44">_validate_proposal</text><text class="t-s" x="852" y="60">server re-check</text><text class="t-s" x="852" y="74">→ ai_rules_draft</text>
+  <path class="ln" d="M150 55 H170" marker-end="url(#a3)"/><path class="ln" d="M320 55 H340" marker-end="url(#a3)"/><path class="ln" d="M490 55 H510" marker-end="url(#a3)"/><path class="ln" d="M660 55 H680" marker-end="url(#a3)"/><path class="ln" d="M820 55 H840" marker-end="url(#a3)"/>
+  <rect class="box" x="840" y="130" width="130" height="70" rx="8"/><text class="t-b" x="852" y="154">User reviews</text><text class="t-s" x="852" y="170">Activate → preset ""</text><text class="t-s" x="852" y="184">→ ai_rules (+version)</text>
+  <rect class="box" x="640" y="130" width="180" height="70" rx="8"/><text class="t-b" x="652" y="154">/v1/ingest response</text><text class="t-s" x="652" y="170">command.set_rules</text><text class="t-s" x="652" y="184">+ rules_version, zones</text>
+  <rect class="hi" x="420" y="130" width="200" height="70" rx="8"/><text class="t-b" x="432" y="154">Device RuleEngine</text><text class="t-s" x="432" y="170">data/monitoring.json</text><text class="t-s" x="432" y="184">occupancy / fall module</text>
+  <rect class="box" x="200" y="130" width="200" height="70" rx="8"/><text class="t-b" x="212" y="154">Per-frame evaluation</text><text class="t-s" x="212" y="170">present · absent · near · holding</text><text class="t-s" x="212" y="184">near_mouth · still · count · zone</text>
+  <rect class="box" x="10" y="130" width="170" height="70" rx="8"/><text class="t-b" x="22" y="154">custom_rule alert</text><text class="t-s" x="22" y="170">local alert + uplink</text><text class="t-s" x="22" y="184">→ ntfy / SMS / app</text>
+  <path class="ln" d="M905 90 V130" marker-end="url(#a3)"/><path class="ln" d="M840 165 H820" marker-end="url(#a3)"/><path class="ln" d="M640 165 H620" marker-end="url(#a3)"/><path class="ln" d="M420 165 H400" marker-end="url(#a3)"/><path class="ln" d="M200 165 H180" marker-end="url(#a3)"/>
+</svg>
+<figcaption>Figure 3. From a sentence to an on-device rule. Code references: <code>cloud/app.py:1867–2250</code> (configure), <code>:1516–1635</code> (activate), <code>:2758–2795</code> (delivery), <code>core/uplink.py:343–356</code>, <code>services/runtime.py:1413–1430, 946–989</code>, <code>core/rules.py:530–650</code>.</figcaption>
+</figure>
+
+<h3>How detections become decisions</h3>
+<ul>
+  <li><b>Built-in presets.</b> Each module fuses YOLO boxes with MediaPipe signals into per-frame booleans. <code>EventEngine</code> confirms them using persistence, a minimum frame count, occlusion grace and cooldown, then assigns a severity tier (loud, soft or log).</li>
+  <li><b>AI_CUSTOM.</b> The <code>RuleEngine</code> checks each rule against the raw <code>DetectionFrame</code> (COCO label, confidence, box) on every frame. It applies schedule windows, binds rules to zones (an undrawn zone makes the rule <i>inert</i>, never frame-wide), and enforces floors: persist ≥ 0.5 s, ≥ 2 frames, cooldown ≥ 5 s.</li>
+  <li><b>Human in the loop.</b> A Jupiter proposal is only ever stored as a <i>draft</i>. The user has to press Activate in the app before the device receives it.</li>
+</ul>
+
+<h3>Context, memory and history</h3>
+<p><b>None is implemented.</b> Each <code>interpret()</code> call is stateless: one system prompt plus one user message (<code>docs/JUPITER.md</code>: "no memory across requests"). Only the following persist:</p>
+<ul>
+  <li>the rules themselves, with the original instruction;</li>
+  <li>the events table, which explain reads one event at a time, deterministically;</li>
+  <li>the VLM judge's in-memory streak.</li>
+</ul>
+<p><code>core/reports.py</code> builds a weekly PDF from events.csv with no LLM involved, and only tests call it. <code>core/activity.py</code> does deterministic pose-based activity classification.</p>
+
+<h3>Functional vs planned</h3>
+<div class="tablewrap"><table>
+<tr><th>Capability</th><th>State</th></tr>
+<tr><td>Configure pipeline, provider router, schema and grammar from the registry</td><td><span class="badge PASS">WORKS</span> verified live (§13)</td></tr>
+<tr><td>Draft → Activate → device delivery → per-frame rule evaluation</td><td>implemented and unit-tested; not exercised end to end on the Pi today</td></tr>
+<tr><td>Explain, with deterministic fallback</td><td>implemented</td></tr>
+<tr><td>Anthropic cloud fallback</td><td>implemented, <b>off</b> (needs <code>SENSORDYME_ALLOW_EXTERNAL_AI</code>, <code>ANTHROPIC_API_KEY</code>, and the <code>anthropic</code> package, which is not in cloud requirements)</td></tr>
+<tr><td>Memory or history-aware reasoning, tools, vision routing</td><td>not implemented</td></tr>
+<tr><td>Capabilities declared as unavailable</td><td>identity tracking (enters/exits), action recognition, fire/smoke, packages, eyewear</td></tr>
+</table></div>
+</section>
+
+<!-- 9 -->
+<section id="s9">
+<h2><span class="n">9</span>LLM integration</h2>
+<div class="tablewrap"><table>
+<tr><th>Integration</th><th>Where</th><th>Model</th><th>Enabled?</th></tr>
+<tr><td>Jupiter configure</td><td>backend</td><td>Ollama <code>qwen2.5:7b-instruct</code> (JSON-schema-constrained)</td><td><b>Yes</b>. Ollama is running locally with this model.</td></tr>
+<tr><td>Jupiter explain</td><td>backend</td><td>Ollama <code>qwen2.5:1.5b-instruct</code></td><td>Yes</td></tr>
+<tr><td>Cloud fallback</td><td>backend</td><td>Anthropic <code>claude-sonnet-5</code> (<code>jupiter/providers.py</code>)</td><td>No (off by default)</td></tr>
+<tr><td>VLM judge</td><td><code>core/vlm_judge.py</code>, mac_max only</td><td>configured as <code>gemini-3.1-flash-lite</code> through an OpenAI-compatible endpoint (<code>GEMINI_API_KEY</code>). The code's default is Anthropic.</td><td>Only under <code>profile: mac_max</code>. <b>Never on the Pi.</b></td></tr>
+</table></div>
+
+<h3>Measured accuracy (repo docs, 40 synthetic cases)</h3>
+<div class="tablewrap"><table>
+<tr><th>Model</th><th>Target</th><th>Predicate</th><th>Refusal</th><th>Latency (mean / p95)</th></tr>
+<tr><td><code>qwen2.5:1.5b</code></td><td>78.1%</td><td>78.1%</td><td>97.5%</td><td>1.0 / 1.6 s</td></tr>
+<tr><td><code>qwen2.5:7b</code></td><td>100%</td><td>93.75%</td><td>100%</td><td>5.4 / 6.5 s</td></tr>
+</table></div>
+<p>No result files are committed. These figures appear only in prose in the docs.</p>
+
+<h3>How YOLO and an LLM should divide the work</h3>
+<div class="grid2">
+<div class="card"><h4>Computer vision (YOLO + MediaPipe): perception</h4>
+<ul>
+  <li>Runs every frame, in milliseconds, on the device, deterministically.</li>
+  <li>Answers "what objects or poses are where, with what score".</li>
+  <li>Handles all safety-critical, time-critical alerting (drowsiness, falls, zone exits).</li>
+  <li>Does not need connectivity and never sends frames off the device.</li>
+</ul></div>
+<div class="card"><h4>LLM (Jupiter): intent and language</h4>
+<ul>
+  <li><b>Before</b> runtime, it compiles what the user wants into checkable rules (already built).</li>
+  <li><b>After</b> an event, it explains the alert in plain words (already built).</li>
+  <li>Possible future uses:
+    <ul>
+      <li>summarise event history ("unusual activity this week");</li>
+      <li>suggest rule adjustments from false-alarm feedback;</li>
+      <li>triage ambiguous events, optionally with a VLM looking at a single frame on demand.</li>
+    </ul></li>
+  <li>Never in the per-frame loop, and never the only gate on a safety alert.</li>
+</ul></div>
+</div>
+<p>The architecture already follows this split. The natural extensions are listed in §18.</p>
+</section>
+
+<!-- 10 -->
+<section id="s10">
+<h2><span class="n">10</span>iOS / Xcode architecture</h2>
+
+<h3>Project</h3>
+<ul>
+  <li>XcodeGen spec <code>ios/project.yml</code>. Generated (gitignored): <code>SensorDyme.xcodeproj</code>, <code>Info.plist</code>.</li>
+  <li>Bundle id <code>com.sensordyme.app</code>. iOS 17.0+. Swift 5.9 mode.</li>
+  <li><code>DEVELOPMENT_TEAM D6ZR59ZR7Q</code>, which matches the OU of your installed "Apple Development" certificate. Signing is automatic.</li>
+  <li><b>No package dependencies.</b> System frameworks only: SwiftUI, Network, CoreBluetooth, UserNotifications, Charts and Security.</li>
+  <li>Info.plist keys:
+    <ul>
+      <li><code>NSAllowsArbitraryLoads</code>: the "no cleartext credentials to internet hosts" rule is enforced in code by <code>BackendResolution.cleartextPermitted</code>;</li>
+      <li>local-network usage description;</li>
+      <li>Bonjour services <code>_sensordyme._tcp</code> and <code>_sensordyme-api._tcp</code>;</li>
+      <li>Bluetooth usage description.</li>
+    </ul></li>
+  <li>No push entitlement and no background modes.</li>
+</ul>
+
+<h3>App structure</h3>
+<ul>
+  <li><code>SensorDymeApp</code> → <code>RootView</code>:
+    <ul>
+      <li>signed out → <code>AuthView</code>: sign in, sign up, or "Try the demo" (a full <code>MockAPI</code>);</li>
+      <li>signed in → tabs <b>Devices / Shop / Settings</b>.</li>
+    </ul></li>
+  <li>Shared state lives in one <code>@MainActor AppState</code> (<code>API.swift</code>): backend addresses and pinned id, Keychain tokens, device link, connection status, a 20 s heartbeat, and an <code>NWPathMonitor</code> that triggers a reconnect when the network changes.</li>
+  <li><b>DeviceDetailView</b>:
+    <ul>
+      <li>live MJPEG feed;</li>
+      <li>mode switcher;</li>
+      <li>event list (polled every 4 s), with event details;</li>
+      <li>an "explain" view per event;</li>
+      <li>AI Configure (prompt → editable proposal → Activate);</li>
+      <li>zone editor (normalised polygons);</li>
+      <li>Reports (Swift Charts);</li>
+      <li>rename.</li>
+    </ul></li>
+  <li><b>Settings</b>: server address (automatic or manual), device link with "Find my device", device token, device health card, SMS, ntfy background alerts, a 6-stage connection doctor (<code>DiagnosticsView</code>), and BLE setup.</li>
+  <li><b>Finding the backend.</b>
+    <ul>
+      <li>Precedence: typed URL &gt; build-time <code>SENSORDYME_API_BASE_URL</code> (empty) &gt; Bonjour <code>_sensordyme-api._tcp</code>.</li>
+      <li>Every candidate is health-checked: it must answer <code>service=="sensordyme-cloud"</code> with the pinned <code>id</code>.</li>
+    </ul></li>
+  <li><b>Finding the device.</b>
+    <ul>
+      <li>Bonjour <code>_sensordyme._tcp</code>, matched by its TXT <code>id=SD-…</code>.</li>
+      <li>The live feed is shown only when the <code>SD-</code> id matches the backend device's <code>hardware_id</code> (<code>FeedLink.swift</code>).</li>
+    </ul></li>
+  <li><b>Notifications.</b>
+    <ul>
+      <li>Local notifications only, posted by <code>AlertWatcher</code>, which polls every 15 s in the foreground.</li>
+      <li>Background alerts go through ntfy or SMS.</li>
+      <li>APNs is listed as future work.</li>
+    </ul></li>
+  <li><b>BLE provisioning.</b>
+    <ul>
+      <li>Service <code>5d1e0001-5344-4d45-b000-536e447a6d65</code>.</li>
+      <li>Characteristics: info <code>…0002</code>, creds <code>…0003</code>, status <code>…0004</code>, networks <code>…0006</code>.</li>
+    </ul></li>
+</ul>
+
+<h3>Recovery steps performed</h3>
+<ol class="plain">
+  <li><code>xcodegen generate</code> → <code>ios/SensorDyme.xcodeproj</code> (scheme <code>SensorDyme</code>).</li>
+  <li><code>xcodebuild -scheme SensorDyme -destination id=&lt;your iPhone&gt; -allowProvisioningUpdates build</code>. Xcode chose the "iOS Team Provisioning Profile: com.sensordyme.app" and your Apple Development identity. <b>Swift compilation: 0 errors, 0 source warnings.</b></li>
+  <li>Code signing stopped at a macOS <b>Keychain access prompt</b> for the signing key (SecurityAgent). That needs your password and a click on <i>Always Allow</i>. It cannot be automated.</li>
+  <li id="ios-final">Final state: <span id="ios-final-state">the command-line build ended <code>** BUILD FAILED **</code> at CodeSign with <code>errSecInternalComponent</code>, because the Keychain prompt was never approved. Signing from a non-interactive shell needs that one-time approval. Everything before signing succeeded.</span></li>
+</ol>
+
+<h3>How to install on your iPhone yourself</h3>
+<pre><code>cd ~/Sensordyme/sensordyme_model/ios
+xcodegen generate             # only if project.yml changed
+open SensorDyme.xcodeproj     # select "Donovan's iPhone" → Run (⌘R)
+# If the phone says "Untrusted Developer":
+#   Settings → General → VPN &amp; Device Management → trust your Apple ID</code></pre>
+<p>In the app, under Settings → Server, keep it on <b>automatic</b>. It will find <code>SensorDyme Cloud (0eb63f4f)</code> over Bonjour. The phone must be on the same Wi-Fi as the Mac (MyResNet-5G). If it had pinned something else, use <i>Manual server address → Forget remembered server</i>.</p>
+
+<h3>Code-quality notes (not blocking)</h3>
+<ul>
+  <li><code>APIClient.getJSON/postJSON</code> skip the "find the server again and retry" logic and the error mapping used by <code>request()</code>. This affects AI configure, zones, explain, rename, orders and logout, which handle a backend move less gracefully than the other calls.</li>
+  <li>"Add device" still opens the legacy hotspot wizard. <code>ClaimDeviceView</code>, <code>ensureBackend()</code> and <code>stopBackendMonitoring()</code> are unused.</li>
+  <li>Deprecations: <code>NetService</code> and <code>.cornerRadius</code>. Several Swift 6 strict-concurrency issues would appear if the language mode were raised.</li>
+</ul>
+</section>
+
+<!-- 11 -->
+<section id="s11">
+<h2><span class="n">11</span>System communication &amp; data flows</h2>
+<div class="tablewrap"><table>
+<tr><th>Link</th><th>Transport</th><th>Auth</th><th>Discovery</th><th>Payload</th></tr>
+<tr><td>Pi → backend</td><td>HTTP POST <code>/v1/ingest</code> every 2 s (outbound only)</td><td><code>X-Device-Key</code></td><td>static <code>cloud.base_url</code> (sensordyme-backend.local)</td><td>Up: up to 100 events plus preset, health, monitoring, rules_version and zones_version. Down: <code>command</code> containing set_preset, set_rules or set_zones.</td></tr>
+<tr><td>iPhone → backend</td><td>HTTP(S) JSON</td><td>Bearer JWT</td><td>Bonjour <code>_sensordyme-api._tcp</code> with id pinning</td><td>accounts, devices, events, AI, zones, orders</td></tr>
+<tr><td>iPhone → Pi</td><td>HTTP on the LAN</td><td><code>X-Device-Token</code></td><td>Bonjour <code>_sensordyme._tcp</code> (TXT id)</td><td>MJPEG <code>/stream</code>, <code>/api/health</code></td></tr>
+<tr><td>iPhone → Pi (setup)</td><td>BLE GATT</td><td>none ("Just Works"; a known limitation)</td><td>advertises <code>SensorDyme-XXXX</code></td><td><code>{ssid, psk}</code>; status</td></tr>
+<tr><td>Backend → Ollama</td><td>HTTP <code>localhost:11434/api/chat</code></td><td>none (loopback)</td><td>config / env</td><td>prompt + JSON schema → rule JSON</td></tr>
+<tr><td>Backend → user</td><td>ntfy.sh / Twilio</td><td>topic / Twilio creds</td><td>—</td><td>loud or custom-rule events (20 s cooldown)</td></tr>
+</table></div>
+
+<h3>Offline behaviour</h3>
+<ul>
+  <li>The device keeps detecting, alerting locally and serving its dashboard with no network.</li>
+  <li>Uplink events queue in memory: at most 500, newest kept, lost on restart.</li>
+  <li>The backend deduplicates resent events on <code>(device_id, event_key)</code>.</li>
+  <li>This was confirmed during the audit: after the backend was restored, the Pi's queued backlog arrived in one burst at 21:04:18.</li>
+</ul>
+
+<h3>Privacy boundary</h3>
+<p>Frames never leave the device and are never uploaded. Only event metadata goes to the backend. The single exception is the mac_max VLM judge, which sends JPEGs to an external API, and it runs only on a Mac.</p>
+</section>
+
+<!-- 12 -->
+<section id="s12">
+<h2><span class="n">12</span>External tools, libraries &amp; dependencies</h2>
+<div class="tablewrap"><table>
+<tr><th>Layer</th><th>Dependencies</th><th>Notes</th></tr>
+<tr><td>Device (<code>requirements-device.txt</code>)</td><td>OpenCV, MediaPipe 0.10.14, NumPy, onnxruntime, PyYAML, requests, dbus/bleak for BLE, gpiozero; system packages picamera2, libcamera, HailoRT 4.20 (<code>hailo-all</code>)</td><td>No torch and no ultralytics on the device (AGPL avoidance)</td></tr>
+<tr><td>Mac dev (<code>requirements.txt</code>)</td><td>the device stack plus ultralytics 8.3.28, torch 2.14.1</td><td>Python 3.11–3.12 only (MediaPipe)</td></tr>
+<tr><td>Backend (<code>cloud/requirements.txt</code>)</td><td>fastapi 0.141, starlette 1.4, uvicorn 0.32, pyjwt 2, zeroconf 0.151, requests, pyyaml, numpy</td><td><code>anthropic</code> is optional and not listed</td></tr>
+<tr><td>Dev (<code>requirements-dev.txt</code>)</td><td>pytest, ruff, pyright, pip-audit, mutmut, …</td><td>Starlette 1.4's TestClient needs <code>httpx2</code> or <code>httpx</code>. Neither is listed directly. <code>httpx</code> only arrives transitively through <code>anthropic</code> in <code>requirements.txt</code>, which is fragile.</td></tr>
+<tr><td>LLM</td><td>Ollama (installed at <code>/usr/local/bin/ollama</code>), qwen2.5 7B and 1.5B</td><td>Local. No API key needed.</td></tr>
+<tr><td>iOS</td><td>Xcode 27.2, XcodeGen (Homebrew), system frameworks only</td><td>No Swift packages</td></tr>
+<tr><td>External services</td><td>ntfy.sh, Twilio (optional), Fly.io (optional), Hailo Model Zoo S3 (model download), GitHub</td><td>—</td></tr>
+<tr><td>Data / labelling</td><td>Label Studio (import script), State Farm Distracted Driver dataset (in <code>data/state_farm</code>)</td><td>classification-oriented</td></tr>
+</table></div>
+</section>
+
+<!-- 13 -->
+<section id="s13">
+<h2><span class="n">13</span>System-wide test results</h2>
+<p>Results: PASS means verified with the evidence shown. BLOCKED means it could not complete without something only you can provide. NOT TESTED means out of reach in this session.</p>
+<div class="tablewrap"><table id="results">
+<tr><th>Component</th><th>Test</th><th>Result</th><th>Details / evidence</th></tr>
+<tr><td>Backend</td><td>Health before fix</td><td><span class="badge FAIL">FAIL</span></td><td><code>{"ok":false,…,"detail":"database unavailable"}</code>; log <code>sqlite3.OperationalError: unable to open database file</code>; process running from <code>~/.Trash/sensordyme_model</code></td></tr>
+<tr><td>Backend</td><td>Startup and health after restore</td><td><span class="badge PASS">PASS</span></td><td><code>{"ok":true,"service":"sensordyme-cloud","id":"bk_0eb63f4fc338"}</code> on 127.0.0.1 and on <code>sensordyme-backend.local:8787</code></td></tr>
+<tr><td>Backend</td><td>Database connectivity</td><td><span class="badge PASS">PASS</span></td><td>Existing DB opened under the new code with additive migrations: 4 users, 2 devices, 5,672 events before the retention pass</td></tr>
+<tr><td>Backend</td><td>Authentication lifecycle</td><td><span class="badge PASS">PASS</span></td><td>On an isolated DB copy (port 8790): signup 200, login returns a JWT, <code>/v1/devices</code> 200, bad claim code 404, logout 200, then the same token gets 401</td></tr>
+<tr><td>Backend</td><td>Route coverage for iOS</td><td><span class="badge PASS">PASS</span></td><td>18 routes introspected; all 17 used by the app exist</td></tr>
+<tr><td>Backend</td><td>mDNS advertisement</td><td><span class="badge PASS">PASS</span></td><td><code>dns-sd</code>: <code>SensorDyme Cloud (0eb63f4f)</code> → <code>sensordyme-backend.local:8787</code>, TXT <code>id=bk_0eb63f4fc338</code></td></tr>
+<tr><td>Webapp</td><td>Device dashboard startup and API</td><td><span class="badge PASS">PASS</span></td><td><code>GET /</code> 200 (HTML). <code>/api/*</code> and <code>/stream</code> return 401 without a token and 200 with the device token.</td></tr>
+<tr><td>Raspberry Pi</td><td>Remote connectivity</td><td><span class="badge PASS">PASS</span></td><td>mDNS <code>sensordyme.local</code> → 11.20.6.16; TCP 8899 and 22 open; SSH <code>pi@sensordyme</code> with key auth. The first probe failed with "no route to host" while the Pi's Wi-Fi woke up.</td></tr>
+<tr><td>Raspberry Pi</td><td>Pi → backend uplink</td><td><span class="badge PASS">PASS</span></td><td>Before: <code>cloud_uplink … returned HTTP 500</code> (59 failures). After: journal shows <code>cloud_uplink recovered (connected)</code> at 21:04:19; backend log shows 352× <code>POST /v1/ingest 200</code>; the DB shows <code>last_seen</code> 0.46 s ago.</td></tr>
+<tr><td>Raspberry Pi</td><td>Tailscale</td><td><span class="badge NT">NOT TESTED</span></td><td>Not installed on the Pi or the Mac, and not integrated in the code</td></tr>
+<tr><td>Camera</td><td>Image capture</td><td><span class="badge PASS">PASS</span></td><td><code>rpicam-hello --list-cameras</code> lists <code>imx708_wide_noir</code>; health shows camera <code>ok</code> (last frame 0.0 s ago); a real 640×480 annotated JPEG (20.7 KB) was pulled from <code>/stream</code></td></tr>
+<tr><td>YOLO</td><td>Inference</td><td><span class="badge PASS">PASS</span></td><td>Inference component <code>ok</code> ("analysing (driver_attention)"); YOLO boxes drawn on the live frame; detection events <code>phone_detected</code> and <code>eating_drinking</code> generated. Accuracy issue: a false positive "spoon" on a window blind.</td></tr>
+<tr><td>Hailo</td><td>Hardware acceleration</td><td><span class="badge PASS">PASS</span></td><td><code>hailortcli</code>: HAILO8L, firmware 4.20.0. Health: "Hailo NPU in use — 8577 inferences, last 0.11s ago". <code>.hef</code> sha256 matches the pin (<code>e69136d3…</code>).</td></tr>
+<tr><td>Detection</td><td>Events and alerts</td><td><span class="badge PASS">PASS</span></td><td><code>/api/state</code> listed confirmed events with confidence and severity (drowsiness 0.82 loud, attention_lost 0.90 loud, …); events reached the backend (<code>events</code> rows up to id 5774)</td></tr>
+<tr><td>Detection</td><td>Model identity on events</td><td><span class="badge FAIL">FAIL</span></td><td><code>events.model</code> is NULL for new rows because the Pi runs code from 30 Aug that predates this feature</td></tr>
+<tr><td>EVE / Jupiter</td><td>Configure (NL → rules) live</td><td><span class="badge PASS">PASS</span></td><td>Ollama <code>qwen2.5:7b-instruct</code>:
+  <ul>
+    <li>"holding a phone for more than 10 seconds" → <code>person holding cell phone, persist 10 s</code> (1.6 s)</li>
+    <li>"detect if a fire starts" → correctly refused with reason <code>needs_model</code></li>
+    <li>"person near the front door after 10pm" → <b>flawed</b>: invented <code>secondary="dining table"</code> and dropped the 10 pm schedule</li>
+  </ul></td></tr>
+<tr><td>EVE / Jupiter</td><td>Activate → device rules end to end</td><td><span class="badge NT">NOT TESTED</span></td><td>Would change your live device's monitoring mode, so it was left alone. Covered by unit tests (<code>test_rule_delivery.py</code>).</td></tr>
+<tr><td>Alerts</td><td>Push / SMS delivery</td><td><span class="badge NT">NOT TESTED</span></td><td>Sending real ntfy or SMS messages is outward-facing; Twilio is not configured</td></tr>
+<tr><td>Python suite</td><td>pytest</td><td id="pytest-result"><span class="badge PASS">PASS</span></td><td id="pytest-detail"><b>2042 passed, 2 skipped, 0 failed</b> in 94.6 s (Python 3.11, full <code>requirements.txt</code> plus dev deps, <code>SENSORDYME_MDNS=0</code>). An earlier run with only the cloud and dev deps had 58 collection errors: missing <code>cv2</code>, and a missing TestClient HTTP package.</td></tr>
+<tr><td>iOS</td><td>Logic tests (<code>ios/Tests/run.sh</code>)</td><td><span class="badge PASS">PASS</span></td><td>10 suites, 495 assertions, all <code>ok</code>, exit 0</td></tr>
+<tr><td>iOS</td><td>Xcode build</td><td id="ios-build-result"><span class="badge BLOCKED">BLOCKED</span></td><td id="ios-build-detail">Swift compile and link succeeded (0 errors, 0 source warnings). The final <code>CodeSign</code> step failed with <code>errSecInternalComponent</code> after the Keychain prompt went unanswered for about 20 minutes. The fix is to build from the Xcode GUI, or approve the prompt with <i>Always Allow</i> (§10).</td></tr>
+<tr><td>iOS</td><td>iPhone deployment</td><td id="ios-deploy-result"><span class="badge BLOCKED">BLOCKED</span></td><td id="ios-deploy-detail">"Donovan's iPhone" is paired and available (iPhone18,2). Install follows a successful signed build.</td></tr>
+<tr><td>iOS</td><td>iOS ↔ backend</td><td><span class="badge PASS">PASS</span> (server side)</td><td>Every endpoint the app calls answers correctly and the backend advertises the pinned id. In-app verification follows the install.</td></tr>
+<tr><td>End to end</td><td>Camera → Hailo → event → backend</td><td><span class="badge PASS">PASS</span></td><td>Frames are captured, inferred on Hailo, confirmed as events, uplinked and stored. The phone leg is pending the install.</td></tr>
+</table></div>
+</section>
+
+<!-- 14 -->
+<section id="s14">
+<h2><span class="n">14</span>Issues discovered &amp; fixes implemented</h2>
+<h3>Fixes implemented (complete change log)</h3>
+<div class="tablewrap"><table>
+<tr><th>#</th><th>Change</th><th>Path</th><th>Reversible?</th></tr>
+<tr><td>1</td><td>Backup: git bundle of every branch in the trashed checkout (verified), with a consistent SQLite <code>.backup</code>, <code>.jwt_secret</code>, <code>.backend_id</code>, <code>.claim_code_key</code>, <code>data/</code>, <code>.secrets/</code>, the old <code>SensorDyme.xcodeproj</code> and <code>Info.plist</code>, and <code>yolo11n.pt</code>. Permissions 700/600.</td><td><code>~/sensordyme-cutover-backups/20261109-audit/</code></td><td>new folder</td></tr>
+<tr><td>2</td><td>Saved the original LaunchAgent</td><td><code>…/20261109-audit/com.sensordyme.backend.plist.before-audit</code></td><td>—</td></tr>
+<tr><td>3</td><td>LaunchAgent paths changed from <code>/Users/donov/sensordyme_model</code> to <code>/Users/donov/Sensordyme/sensordyme_model</code>; reloaded with <code>launchctl bootout</code>/<code>bootstrap</code></td><td><code>~/Library/LaunchAgents/com.sensordyme.backend.plist</code></td><td>restore from #2</td></tr>
+<tr><td>4</td><td>Created a Python 3.11 venv. Installed <code>cloud/requirements.txt</code>, <code>requirements-dev.txt</code> and <code>requirements.txt</code> (all pinned project deps)<span id="httpx-note"></span>.</td><td><code>sensordyme_model/.venv/</code> (gitignored)</td><td>delete the folder</td></tr>
+<tr><td>5</td><td>Restored runtime state: DB copied with sqlite <code>.backup</code> after stopping the old process; secrets chmod 600</td><td><code>cloud/sensordyme.db</code>, <code>cloud/.jwt_secret</code>, <code>cloud/.backend_id</code>, <code>data/</code> (all gitignored)</td><td>yes</td></tr>
+<tr><td>6</td><td>Generated the Xcode project</td><td><code>ios/SensorDyme.xcodeproj</code>, <code>ios/Info.plist</code> (gitignored)</td><td>regenerable</td></tr>
+<tr><td>7</td><td>This report</td><td><code>docs/audit/SENSORDYME_SYSTEM_AUDIT.html</code> (new, untracked)</td><td>—</td></tr>
+</table></div>
+<p><b>Not modified:</b> no tracked source, configuration or test file in the repository, and nothing on the Raspberry Pi (only read-only commands were run there).</p>
+<p><b>Side effect to know about:</b> when the backend started, its built-in retention job deleted <b>3,131 events older than 90 days</b>. They are still in the backup database.</p>
+
+<h3>Issues discovered (by severity)</h3>
+<div class="tablewrap"><table>
+<tr><th>Severity</th><th>Issue</th><th>Status</th></tr>
+<tr><td><span class="badge FAIL">Critical</span></td><td>Backend running from the Trash with no database; wrong backend id (the app would refuse it); Pi uplink returning 500</td><td>Fixed</td></tr>
+<tr><td><span class="badge FAIL">Critical</span></td><td>48 unpushed commits (<code>rebuild/oryn-edge-app</code>) exist only in the Trash</td><td>Backed up; your decision needed (§18)</td></tr>
+<tr><td><span class="badge BLOCKED">High</span></td><td>Pi runs code from 30 Aug; only 8 of 56 source files match the repo; no model identity</td><td>Open: deploy when ready</td></tr>
+<tr><td><span class="badge BLOCKED">High</span></td><td>Jupiter configure hallucinated a secondary object and dropped a schedule ("after 10pm")</td><td>Open (prompt or few-shot fix plus an eval case)</td></tr>
+<tr><td><span class="badge BLOCKED">High</span></td><td>Object detection permanently disabled after one exception in driver_attention</td><td>Open</td></tr>
+<tr><td><span class="badge BLOCKED">Medium</span></td><td>The API tests depend on <code>httpx</code> only transitively (through <code>anthropic</code>). With only the dev and cloud deps installed, 16 API test files fail to collect.</td><td>Open (pin <code>httpx</code> in <code>requirements-dev.txt</code>)</td></tr>
+<tr><td><span class="badge BLOCKED">Medium</span></td><td>BLE Wi-Fi provisioning is unauthenticated (documented)</td><td>Open (design in <code>ARCHITECTURE.md</code>)</td></tr>
+<tr><td><span class="badge BLOCKED">Medium</span></td><td><code>setup_pi.sh</code> accepts a <code>.hef</code> build that the runtime rejects; <code>migrate_config.py</code> skips the accelerator keys</td><td>Open</td></tr>
+<tr><td><span class="badge BLOCKED">Medium</span></td><td><code>make deploy</code> excludes <code>*.db</code> but not <code>*.db-wal</code>/<code>*.db-shm</code></td><td>Open</td></tr>
+<tr><td><span class="badge BLOCKED">Medium</span></td><td>No device-key rotation or revocation, no unclaim, no account deletion or password reset</td><td>Open</td></tr>
+<tr><td><span class="badge NT">Low</span></td><td>Stale docs and comments:
+  <ul>
+    <li>"Claude" as the primary AI and "set ANTHROPIC_API_KEY" in user-facing fallback text</li>
+    <li>VLM comments that say Anthropic while the config uses Gemini</li>
+    <li>YOLO11n in docstrings and docs</li>
+    <li>"Hailo-8" instead of 8L</li>
+    <li>DEVELOPMENT.md version pins</li>
+    <li>"87/87 tests" on the site</li>
+    <li>a stale avahi file</li>
+    <li>dead <code>_RULE_SCHEMA</code> and <code>_PROPOSAL_SCHEMA</code></li>
+  </ul></td><td>Open</td></tr>
+<tr><td><span class="badge NT">Low</span></td><td>No Tailscale or remote access. The Pi is only reachable on the same LAN.</td><td>By design so far</td></tr>
+</table></div>
+</section>
+
+<!-- 15 -->
+<section id="s15">
+<h2><span class="n">15</span>Current system capabilities (verified or implemented)</h2>
+<ul>
+  <li>On-device driver monitoring:
+    <ul>
+      <li>eyes closed and drowsiness (EAR, PERCLOS);</li>
+      <li>head pose and gaze off-road;</li>
+      <li>phone use;</li>
+      <li>eating and drinking;</li>
+      <li>a fused risk score.</li>
+    </ul>
+    Also fall detection, occupancy and security, and baby monitoring, each switchable by preset from the app or the dashboard.</li>
+  <li>Hailo-8L-accelerated DAMO-YOLO with checksum-pinned integrity, and MediaPipe on the CPU.</li>
+  <li>Self-healing runtime: systemd watchdog, recovery ladder, and health reporting at <code>/api/health</code>.</li>
+  <li>Token-protected local dashboard and MJPEG live view.</li>
+  <li>Offline-tolerant uplink to a FastAPI backend with accounts, device claiming, event history, zones, ntfy push and SMS.</li>
+  <li>Natural-language monitoring rules through Jupiter on a local LLM, with server-side validation and a human Activate step; grounded alert explanations.</li>
+  <li>iOS app: login, devices, live feed, events, AI configure, zones, reports, BLE setup, diagnostics, local notifications, demo mode.</li>
+  <li>Test infrastructure: 128 pytest files, Swift logic tests, CI with lint, typecheck, audit and mutation testing.</li>
+</ul>
+</section>
+
+<!-- 16 -->
+<section id="s16">
+<h2><span class="n">16</span>Incomplete or broken functionality</h2>
+<ul>
+  <li><b>EVE</b> does not exist in the codebase under that name. The equivalent layer is Jupiter. History and memory-aware reasoning are not implemented.</li>
+  <li><b>APNs push</b> is not implemented. Notifications are local while the app is in the foreground, plus ntfy and SMS.</li>
+  <li><b>Remote access</b> is missing: no Tailscale, and Fly.io is configured but unused. Away from the LAN, the phone cannot reach the Mac backend or the Pi.</li>
+  <li><b>Over-the-air model and code updates</b> are missing. Updates need <code>make deploy</code> and <code>setup_pi.sh</code> by hand.</li>
+  <li><b>Pi software is stale</b> compared with the repo (§6).</li>
+  <li><b>Jupiter's cloud fallback</b> is off, and the <code>anthropic</code> package is not in the backend requirements.</li>
+  <li><b>Pose-based capabilities on the backend:</b> <code>mediapipe</code> is not in <code>cloud/requirements.txt</code>, so a Fly-deployed backend would treat resting, waving and lying down as unavailable. The Mac venv does now have MediaPipe.</li>
+  <li><b>Declared but unavailable:</b> identity tracking, action recognition, fire/smoke, packages, eyewear.</li>
+  <li><b>Diverged history:</b> the ORYN Edge rebrand branch is not merged or pushed.</li>
+</ul>
+</section>
+
+<!-- 17 -->
+<section id="s17">
+<h2><span class="n">17</span>YOLO training &amp; labeling readiness</h2>
+<div class="tablewrap"><table>
+<tr><th>#</th><th>Desired capability</th><th>Exists today</th><th>Achievable with existing tools</th><th>Needs building</th></tr>
+<tr><td>1</td><td>Upload image/video datasets</td><td>Partial. <code>core/dataset.py</code> CaptureStore does opt-in on-device capture of rule alerts and periodic negatives to <code>manifest.jsonl</code>.</td><td>Label Studio and CVAT both accept uploads</td><td>A web upload UI tied to SensorDyme</td></tr>
+<tr><td>2</td><td>Organize datasets</td><td>Partial: session split (<code>split_by_session</code>), State Farm prep script</td><td>FiftyOne, or Label Studio projects</td><td>Dataset registry and versioning</td></tr>
+<tr><td>3</td><td>Annotate / label</td><td>Classification-only Label Studio import (<code>scripts/import_state_farm_labelstudio.py</code>)</td><td>Label Studio with a bounding-box template, or CVAT</td><td>A detection project config</td></tr>
+<tr><td>4</td><td>AI-assisted labeling</td><td>No</td><td>Label Studio ML backend, pre-annotating with the current DAMO-YOLO or with an open-vocabulary detector (Grounding DINO / OWL-ViT)</td><td>Glue service</td></tr>
+<tr><td>5</td><td>Review and correct</td><td>Review labels in CaptureStore (no UI)</td><td>Label Studio review stage</td><td>—</td></tr>
+<tr><td>6</td><td>Export in YOLO format</td><td><b>No.</b> <code>export_dataset.py</code> writes images plus <code>labels.jsonl</code> and has no YOLO-txt or COCO writer.</td><td>Label Studio and CVAT export YOLO and COCO directly</td><td>A YOLO and COCO exporter for CaptureStore</td></tr>
+<tr><td>7</td><td>Train new models</td><td><b>No training script.</b> <code>prepare_state_farm.py</code> only <i>suggests</i> an AGPL <code>yolo classify</code> command.</td><td>Detection: DAMO-YOLO's official training repo (Apache-2.0); or YOLOX / RT-DETR (Apache-2.0)</td><td>A training pipeline (GPU machine or cloud)</td></tr>
+<tr><td>8</td><td>Evaluate performance</td><td>Partial: <code>benchmarks/accuracy_state_farm.py</code> (presence PR curve, regression gate, <code>--backend hailo</code>); latency and thermal benchmarks</td><td>pycocotools mAP</td><td>Box-level mAP / IoU evaluation; a committed baseline for the shipped <code>.hef</code></td></tr>
+<tr><td>9</td><td>Compare versions</td><td>The <code>--baseline/--compare</code> gate in accuracy_state_farm</td><td>FiftyOne, Weights &amp; Biases, MLflow</td><td>A comparison dashboard</td></tr>
+<tr><td>10</td><td>Deploy to SensorDyme</td><td>Manual: <code>setup_pi.sh</code> plus the <code>accelerator.yolo_hef</code> and <code>yolo_hef_sha256</code> pin</td><td>Hailo Dataflow Compiler (x86 Linux): parse → optimize with calibration images → compile to <code>.hef</code></td><td>A compile pipeline, OTA, custom class names in <code>HailoYOLO</code> (COCO names are hard-coded), and a configurable class count and NMS IoU</td></tr>
+<tr><td>11</td><td>Track versions and performance</td><td>Per-event <code>model</code> identity (name, sha256, backend) in the backend schema; not yet sent by your Pi</td><td>MLflow model registry</td><td>Registry, plus metrics per model version from <code>events.model</code></td></tr>
+</table></div>
+<div class="callout"><strong>Readiness summary</strong>
+The repo is <b>strong on inference, integrity and measurement</b>. It pins the model, records model identity, and has a regression gate. It is <b>weak on everything upstream of a <code>.hef</code></b>: there is no detection labelling, no YOLO-format export, no training code, and no DFC compile step. The quickest credible path:
+<ol class="plain">
+  <li>Self-host Label Studio with a bounding-box template, plus an ML backend that pre-labels with the current DAMO-YOLO.</li>
+  <li>Export to YOLO or COCO.</li>
+  <li>Fine-tune DAMO-YOLO-T (Apache-2.0, the same architecture as the shipped model) on a GPU.</li>
+  <li>Compile with the Hailo DFC on x86 Linux, using about 64–1024 calibration frames from the real NoIR camera.</li>
+  <li>Evaluate with the existing benchmark gate, extended with mAP.</li>
+  <li>Pin the sha256 and deploy.</li>
+</ol>
+Two code changes are prerequisites: custom class names, and a configurable class count and NMS IoU in <code>core/accel.py</code>. Stay off ultralytics for anything that ships (AGPL).</div>
+</section>
+
+<!-- 18 -->
+<section id="s18">
+<h2><span class="n">18</span>Recommended next steps</h2>
+<h3>Now (your action needed)</h3>
+<ol class="plain">
+  <li><b>Approve the Keychain prompt</b> ("codesign wants to access key…" → Mac password → <i>Always Allow</i>), then press Run in Xcode, or ask me to install with <code>xcrun devicectl</code>.</li>
+  <li><b>Decide about <code>rebuild/oryn-edge-app</code></b> (48 unpushed commits). Do not empty the Trash first. To recover them:
+<pre><code>cd ~/Sensordyme/sensordyme_model
+git fetch ~/sensordyme-cutover-backups/20261109-audit/trashed-checkout-all-branches.bundle \
+    rebuild/oryn-edge-app:rebuild/oryn-edge-app
+git push -u origin rebuild/oryn-edge-app   # preserves it on GitHub</code></pre>
+  It diverges from <code>a779b4d</code> on origin, so merging is a separate decision.</li>
+  <li><b>Remember the runtime state lives in the checkout.</b> Next time you move or re-clone, carry <code>cloud/sensordyme.db</code>, <code>.jwt_secret</code>, <code>.backend_id</code> and <code>data/</code>, or set <code>SENSORDYME_DB</code> and <code>SENSORDYME_BACKEND_ID_FILE</code> to a location outside the repo, such as <code>~/Library/Application Support/SensorDyme</code>, so a re-clone can't break the backend again.</li>
+</ol>
+<h3>Short term</h3>
+<ol class="plain">
+  <li>Deploy current code to the Pi (<code>make deploy</code>, then restart the service) after choosing which branch is canonical. This brings model identity and the newer fixes.</li>
+  <li>Pin <code>httpx</code> directly in <code>requirements-dev.txt</code>. Today the API tests only work because <code>anthropic</code> happens to pull it in.</li>
+  <li>Fix the driver_attention "one exception disables detection" path, and make NMS IoU and class names configurable.</li>
+  <li>Add Jupiter eval cases for time-of-day schedules and "near a place" phrasing, and tighten the few-shot examples to stop invented secondary objects.</li>
+  <li>Add Tailscale to the Mac and the Pi (or deploy the backend to Fly with a persistent <code>SENSORDYME_BACKEND_ID_FILE</code> on the volume) for access away from home.</li>
+</ol>
+<h3>Medium term</h3>
+<ol class="plain">
+  <li>APNs push for real background alerts.</li>
+  <li>Authenticated BLE provisioning (the HMAC proof design is already in <code>ARCHITECTURE.md</code>).</li>
+  <li>The training pipeline described in §17, then a labelling and training dashboard built on Label Studio and MLflow instead of from scratch.</li>
+  <li>An EVE / Jupiter "memory" tier: per-device event summaries fed into explain, plus weekly LLM-written reports from <code>core/reports.py</code> data. Keep it off the real-time path.</li>
+</ol>
+</section>
+
+<p class="muted" style="margin-top:60px;font-size:12.5px">This report contains no secrets. Device keys, dashboard tokens, JWT secrets and passwords were read only where needed to run tests, and were never printed or stored here. Generated 9 Nov 2026.</p>
+</main>
+</div>
+<script>
+(function(){
+  var root=document.documentElement, btn=document.getElementById('themeToggle'), key='sd-audit-theme';
+  try{var s=localStorage.getItem(key); if(s) root.setAttribute('data-theme',s);}catch(e){}
+  btn.addEventListener('click',function(){
+    var cur=root.getAttribute('data-theme') || (matchMedia('(prefers-color-scheme: dark)').matches?'dark':'light');
+    var next=cur==='dark'?'light':'dark'; root.setAttribute('data-theme',next);
+    try{localStorage.setItem(key,next);}catch(e){}
+  });
+})();
+</script>
+</body>
+</html>

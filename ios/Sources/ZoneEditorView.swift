@@ -49,8 +49,8 @@ struct ZoneEditorView: View {
                 .padding(.horizontal, SD.Space.md)
                 .padding(.bottom, SD.Space.xl)
             }
-            .background(SD.Colors.background)
-            .navigationTitle("Areas")
+            .orynScreen()
+            .navigationTitle("Detection areas")
             .navigationBarTitleDisplayMode(.inline)
             .toolbar {
                 ToolbarItem(placement: .cancellationAction) {
