@@ -47,7 +47,7 @@ struct DemoTriggerView: View {
                 .padding(.horizontal, SD.Space.md)
                 .padding(.bottom, SD.Space.xl)
             }
-            .background(SD.Colors.background)
+            .orynScreen()
             .navigationTitle("Demo alerts")
             .navigationBarTitleDisplayMode(.inline)
             .toolbar {

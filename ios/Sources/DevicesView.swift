@@ -33,10 +33,18 @@ struct DevicesView: View {
     private let refreshTimer = Timer.publish(every: 10, on: .main, in: .common).autoconnect()
     @State private var timedReloadInFlight = false
 
+    /// Debug-only: the device a launch argument asked to open (see DebugLaunch).
+    @State private var launchTarget: Device?
+
+    private var onlineCount: Int { devices.filter(\.online).count }
+
     var body: some View {
         NavigationStack {
             ScrollView {
                 LazyVStack(spacing: SD.Space.sm) {
+                    header
+                        .padding(.bottom, SD.Space.xs)
+
                     // Shown whether or not devices are loaded: a failed refresh
                     // leaves stale cards on screen that look perfectly current.
                     if let errorMessage {
@@ -45,8 +53,9 @@ struct DevicesView: View {
                     }
 
                     if !devices.isEmpty {
-                        SDSectionHeader(title: devices.count == 1 ? "Your device" : "Your devices")
+                        fleetSummary
                             .padding(.top, SD.Space.xxs)
+                            .padding(.bottom, SD.Space.xxs)
                     }
                     // The backend's view of the same device, so the banner can
                     // tell "switched off" from "not on this Wi-Fi" instead of
@@ -72,8 +81,9 @@ struct DevicesView: View {
                 .padding(.horizontal, SD.Space.md)
                 .padding(.bottom, SD.Space.lg)
             }
-            .background(SD.Colors.background)
+            .orynScreen()
             .navigationDestination(for: Device.self) { DeviceDetailView(device: $0) }
+            .navigationDestination(item: $launchTarget) { DeviceDetailView(device: $0) }
             // A tapped notification opens its device, which then consumes
             // pendingEventID and shows the alert. Without this the id was set
             // and nothing was listening unless that screen was already open —
@@ -110,25 +120,11 @@ struct DevicesView: View {
                     notificationTarget = devices.first
                 }
             }
-            .navigationTitle("SensorDyme")
-            .navigationBarTitleDisplayMode(.large)
-            .toolbar {
-                ToolbarItem(placement: .topBarTrailing) {
-                    HStack(spacing: SD.Space.xs) {
-                        // Sits beside the add button so a background refresh is
-                        // visible without occupying a row of its own.
-                        SDProgress(phase: refreshing.phase)
-                        Button { showSetup = true } label: {
-                            Label("Connect over Bluetooth", systemImage: "sensor.tag.radiowaves.forward")
-                        }
-                        .tint(SD.Colors.accent)
-                        Button { showClaim = true } label: {
-                            Label("Add device", systemImage: "plus")
-                        }
-                        .tint(SD.Colors.accent)
-                    }
-                }
-            }
+            // The home screen draws its own header (brand, actions, title) so
+            // the ORYN lockup is never squeezed into a toolbar slot. Pushed
+            // screens keep the standard navigation bar.
+            .navigationTitle("Your Devices")
+            .toolbar(.hidden, for: .navigationBar)
             .sheet(isPresented: $showClaim) { SetupWizardView { await reload() } }
             .sheet(isPresented: $showSetup) {
                 SetupFlowView()
@@ -137,6 +133,7 @@ struct DevicesView: View {
             .refreshable { await reload() }
             .task {
                 await reload()
+                if DebugLaunch.openDevice, launchTarget == nil { launchTarget = devices.first }
                 // Re-resolve the device's address on launch and whenever the
                 // network changes, so a move never requires typing an IP.
                 link.start()
@@ -154,6 +151,61 @@ struct DevicesView: View {
             }
         }
         .tint(SD.Colors.accent)
+    }
+
+    private var header: some View {
+        VStack(alignment: .leading, spacing: SD.Space.lg) {
+            HStack(spacing: SD.Space.xs) {
+                OrynNavBrand()
+                Spacer()
+                // Beside the actions so a background refresh is visible
+                // without occupying a row of its own.
+                SDProgress(phase: refreshing.phase)
+                headerButton("dot.radiowaves.left.and.right", label: "Connect over Bluetooth") {
+                    showSetup = true
+                }
+                headerButton("plus", label: "Add device") { showClaim = true }
+            }
+            .padding(.top, SD.Space.xs)
+
+            Text("Your Devices")
+                .font(.system(size: 32, weight: .semibold))
+                .kerning(-0.6)
+                .foregroundStyle(SD.Colors.textPrimary)
+                .accessibilityAddTraits(.isHeader)
+        }
+        .frame(maxWidth: .infinity, alignment: .leading)
+    }
+
+    private func headerButton(_ icon: String, label: String, action: @escaping () -> Void) -> some View {
+        Button(action: action) {
+            Image(systemName: icon)
+                .font(.system(size: 14, weight: .medium))
+                .foregroundStyle(SD.Colors.textPrimary)
+                .frame(width: 38, height: 38)
+                .background(Circle().fill(SD.Colors.surface))
+                .overlay(Circle().strokeBorder(SD.Colors.borderStrong, lineWidth: 1))
+                .contentShape(Circle())
+        }
+        .buttonStyle(.plain)
+        .accessibilityLabel(label)
+    }
+
+    /// One line under the title: how many devices, how many are up. Counted
+    /// from the same `online` flag the cards show, so the two always agree.
+    private var fleetSummary: some View {
+        HStack(spacing: SD.Space.sm) {
+            SDEyebrow("\(devices.count) \(devices.count == 1 ? "device" : "devices")")
+            Rectangle().fill(SD.Colors.borderStrong).frame(width: 1, height: 10)
+            HStack(spacing: 6) {
+                Circle()
+                    .fill(onlineCount > 0 ? SD.Colors.success : SD.Colors.offline)
+                    .frame(width: 6, height: 6)
+                SDEyebrow("\(onlineCount) online", color: onlineCount > 0 ? SD.Colors.textSecondary : SD.Colors.textTertiary)
+            }
+            Spacer()
+        }
+        .accessibilityElement(children: .combine)
     }
 
     /// The backend's record of the camera this phone links, for the banner.
@@ -178,7 +230,7 @@ struct DevicesView: View {
             SDEmptyState(
                 icon: "sensor.tag.radiowaves.forward",
                 title: "No devices yet",
-                message: "Add your SensorDyme with the claim code printed on the card in the box — or connect one over Bluetooth to put it on your Wi-Fi.",
+                message: "Add your SensorDyme with the claim code printed on the card in the box, or connect one over Bluetooth to put it on your Wi-Fi.",
                 actionTitle: "Add device",
                 action: { showClaim = true }
             )
@@ -244,40 +296,98 @@ struct DeviceCard: View {
         return formatter
     }()
 
-    var body: some View {
-        SDCard {
-            HStack(spacing: SD.Space.sm) {
-                ZStack {
-                    RoundedRectangle(cornerRadius: SD.Radius.md, style: .continuous)
-                        .fill(device.online ? SD.Colors.accentMuted : SD.Colors.surfaceRaised)
-                        .frame(width: 46, height: 46)
-                    Image(systemName: "video.fill")
-                        .font(.system(size: 18))
-                        .foregroundStyle(device.online ? SD.Colors.accent : SD.Colors.textTertiary)
-                }
+    /// The mode glyph shown in the preview tile — what the camera is doing,
+    /// not a generic camera icon.
+    private var modeIcon: String {
+        if device.monitoring?.active == true { return "sparkles" }
+        let base = Preset.split(device.activePreset).base
+        return Preset.catalog.first(where: { $0.name == base })?.icon ?? "video"
+    }
 
-                VStack(alignment: .leading, spacing: SD.Space.xxs) {
+    var body: some View {
+        VStack(spacing: 0) {
+            preview
+            HStack(alignment: .center, spacing: SD.Space.sm) {
+                VStack(alignment: .leading, spacing: 3) {
                     Text(device.name)
                         .font(SD.Typography.headline)
                         .foregroundStyle(SD.Colors.textPrimary)
                         .lineLimit(1)
                     Text(subtitle)
                         .font(SD.Typography.caption)
-                        .foregroundStyle(SD.Colors.textSecondary)
+                        .foregroundStyle(SD.Colors.textTertiary)
                         .lineLimit(1)
                 }
-
                 Spacer(minLength: SD.Space.xs)
-
-                SDStatusPill(status: status, pulses: device.online)
-
-                Image(systemName: "chevron.right")
-                    .font(.caption.weight(.semibold))
-                    .foregroundStyle(SD.Colors.textTertiary)
+                Image(systemName: "arrow.up.right")
+                    .font(.system(size: 13, weight: .semibold))
+                    .foregroundStyle(SD.Colors.textSecondary)
+                    .frame(width: 32, height: 32)
+                    .background(Circle().fill(SD.Colors.surfaceRaised))
+                    .overlay(Circle().strokeBorder(SD.Colors.border, lineWidth: 1))
             }
+            .padding(.horizontal, SD.Space.md)
+            .padding(.vertical, SD.Space.sm + 2)
         }
+        .background(
+            RoundedRectangle(cornerRadius: SD.Radius.lg, style: .continuous)
+                .fill(SD.Colors.surface)
+        )
+        .clipShape(RoundedRectangle(cornerRadius: SD.Radius.lg, style: .continuous))
+        .overlay(
+            RoundedRectangle(cornerRadius: SD.Radius.lg, style: .continuous)
+                .strokeBorder(SD.Colors.border, lineWidth: 1)
+        )
+        .contentShape(RoundedRectangle(cornerRadius: SD.Radius.lg, style: .continuous))
         .accessibilityElement(children: .combine)
         .accessibilityLabel("\(device.name), \(status.label), \(subtitle)")
+    }
+
+    /// A camera-shaped tile standing in for a thumbnail. The backend holds no
+    /// frames (privacy by design — frames never leave the LAN), so this is a
+    /// representation, not a picture: never a fake snapshot.
+    private var preview: some View {
+        ZStack {
+            SD.Colors.canvas
+            CameraGrid()
+                .stroke(SD.Colors.border.opacity(device.online ? 0.9 : 0.5), lineWidth: 1)
+            Image(systemName: modeIcon)
+                .font(.system(size: 30, weight: .light))
+                .foregroundStyle(device.online ? SD.Colors.textSecondary : SD.Colors.textDisabled)
+            VStack {
+                HStack {
+                    SDStatusPill(status: status, pulses: device.online)
+                    Spacer()
+                    if let id = device.hardwareId {
+                        Text(id)
+                            .font(SD.Typography.mono)
+                            .foregroundStyle(SD.Colors.textDisabled)
+                    }
+                }
+                Spacer()
+            }
+            .padding(SD.Space.sm)
+        }
+        .frame(height: 132)
+        .overlay(alignment: .bottom) {
+            Rectangle().fill(SD.Colors.border).frame(height: 1)
+        }
+        .opacity(device.online ? 1 : 0.85)
+    }
+}
+
+/// A faint rule-of-thirds grid — a viewfinder, so a
+/// device tile reads as a camera without pretending to be footage.
+struct CameraGrid: Shape {
+    func path(in rect: CGRect) -> Path {
+        var path = Path()
+        for fraction in [1.0 / 3, 2.0 / 3] {
+            path.move(to: CGPoint(x: rect.width * fraction, y: 0))
+            path.addLine(to: CGPoint(x: rect.width * fraction, y: rect.height))
+            path.move(to: CGPoint(x: 0, y: rect.height * fraction))
+            path.addLine(to: CGPoint(x: rect.width, y: rect.height * fraction))
+        }
+        return path
     }
 }
 
@@ -294,6 +404,7 @@ struct ClaimDeviceView: View {
     var body: some View {
         NavigationStack {
             Form {
+            Group {
                 Section("Claim code") {
                     TextField("1A2B-3C4D-5E6F", text: $code)
                         .textInputAutocapitalization(.characters)
@@ -311,6 +422,9 @@ struct ClaimDeviceView: View {
                     }
                 }
             }
+            .orynRows()
+        }
+        .orynFormStyle()
             .navigationTitle("Add device")
             .navigationBarTitleDisplayMode(.inline)
             .toolbar {

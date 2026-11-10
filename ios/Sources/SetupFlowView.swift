@@ -26,7 +26,7 @@ struct SetupFlowView: View {
                 .padding(.horizontal, SD.Space.md)
                 .padding(.vertical, SD.Space.md)
             }
-            .background(SD.Colors.background)
+            .orynScreen()
             .navigationTitle("Connect SensorDyme")
             .navigationBarTitleDisplayMode(.inline)
             .toolbar {
@@ -46,7 +46,7 @@ struct SetupFlowView: View {
         switch flow.phase {
         case .bluetoothUnavailable:
             headline("Bluetooth is off",
-                     "SensorDyme sets up your device's Wi-Fi over Bluetooth. Turn it on in Settings, and allow SensorDyme to use it.")
+                     "ORYN EDGE sets up your SensorDyme's Wi-Fi over Bluetooth. Turn it on in Settings, and allow ORYN EDGE to use it.")
         case .findingDevice where !flow.ble.discovered.isEmpty:
             headline("SensorDyme found", "Tap Connect to set up its Wi-Fi.")
         case .findingDevice:
@@ -94,7 +94,7 @@ struct SetupFlowView: View {
                           systemImage: "1.circle")
                         .font(SD.Typography.callout)
                         .foregroundStyle(SD.Colors.textPrimary)
-                    Label("Settings → SensorDyme → allow Bluetooth",
+                    Label("Settings → ORYN EDGE → allow Bluetooth",
                           systemImage: "2.circle")
                         .font(SD.Typography.callout)
                         .foregroundStyle(SD.Colors.textPrimary)
@@ -386,6 +386,7 @@ private struct PasswordSheet: View {
     var body: some View {
         NavigationStack {
             Form {
+            Group {
                 if initialSSID.isEmpty {
                     Section("Network name") {
                         TextField("Exactly as it appears", text: $ssid)
@@ -452,6 +453,9 @@ private struct PasswordSheet: View {
                     .listRowBackground(Color.clear)
                 }
             }
+            .orynRows()
+        }
+        .orynFormStyle()
             .navigationTitle(initialSSID.isEmpty ? "Other network" : initialSSID)
             .navigationBarTitleDisplayMode(.inline)
             .toolbar {

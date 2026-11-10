@@ -287,7 +287,7 @@ enum MJPEGStreamDiagnosis {
             // iOS reports a refused connection and a blocked-by-Local-Network
             // connection with the same code, and a confident wrong explanation
             // sends someone to fix the wrong thing.
-            return "can't reach the device — it may have a new address on this network, or Local Network permission may be off for SensorDyme in iOS Settings"
+            return "can't reach the device — it may have a new address on this network, or Local Network permission may be off for ORYN EDGE in iOS Settings"
         case NSURLErrorCannotFindHost:
             return "that address doesn't resolve on this network"
         case NSURLErrorTimedOut:

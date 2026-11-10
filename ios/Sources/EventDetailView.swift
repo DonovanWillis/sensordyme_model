@@ -53,7 +53,7 @@ struct EventDetailView: View {
                 .padding(.horizontal, SD.Space.md)
                 .padding(.bottom, SD.Space.xl)
             }
-            .background(SD.Colors.background)
+            .orynScreen()
             .navigationTitle("Alert")
             .navigationBarTitleDisplayMode(.inline)
             .toolbar {

@@ -1,90 +1,105 @@
 import SwiftUI
 
-// MARK: - SensorDyme design system
+// MARK: - ORYN EDGE design system
 //
-// One source of truth for colour, type, spacing, radius, elevation, and the
-// components built from them. Screens compose these tokens rather than
-// hard-coding values, so the product reads as one system instead of a dozen
-// separately-styled screens.
+// One source of truth for colour, type, spacing, radius and the components
+// built from them. Screens compose these tokens rather than hard-coding values,
+// so the app reads as one ORYN product instead of a dozen separately-styled
+// screens. Change a token here and every screen follows.
 //
-// The previous theme used a three-stop electric→violet→magenta gradient as its
-// identity, applied to buttons, avatars, borders, logo, and backgrounds alike.
-// A gradient everywhere is a gradient nowhere — and saturated magenta is a
-// strange thing to see on a device that watches sleeping infants and elderly
-// parents. This system inverts that: neutrals carry the interface, one accent
-// marks what is interactive, and saturated colour is reserved for *status*, so
-// when something turns amber or red it means something every time.
+// The palette is ORYN's own (ORYN-WEBSITE `--color-ink-*`, `--color-bone-*`,
+// `--color-steel-*`, `--color-signal`, `--color-data-*`), so the app and the web
+// platform are visibly the same company:
+//
+//   * ink   — near-black graphite surfaces, stacked by elevation
+//   * bone  — warm off-white for type and the primary action
+//   * steel — the greys between them, for secondary text
+//   * signal — ORYN orange, used sparingly as a brand moment, never as chrome
+//   * data  — status only (ok / attention / alert), so a colour always *means*
+//             something
+//
+// ORYN EDGE is dark by design. The SD namespace and its token names are kept
+// from the SensorDyme app so every screen adopted the new identity without its
+// logic being touched.
 
 enum SD {
 
     // MARK: Colour
 
-    /// Semantic colours, all adaptive. A phone in a bright car interior is a
-    /// real use case, so nothing here assumes a dark UI.
     enum Colors {
-        // Foundation. True white and true black, as specified.
-        //
-        // A white page with white cards needs *something* to separate them, and
-        // the honest choices are a tint or a line. Lines win here: tinted cards
-        // on white drift grey as they stack, while a hairline stays crisp and
-        // keeps the page feeling like paper rather than a stack of panels.
-        // Dark mode mirrors it — black page, barely-lifted cards, hairline.
-        static let background = adaptive(light: 0xFFFFFF, dark: 0x000000)
-        static let surface = adaptive(light: 0xFFFFFF, dark: 0x0C0C0D)
-        static let surfaceRaised = adaptive(light: 0xF7F7F8, dark: 0x161618)
+        // Surfaces, darkest to lightest. Each step is one level of elevation;
+        // there are no shadows in a dark UI — a lighter surface does that job.
+        /// The page.
+        static let background = Color(hex: 0x0A0B0C)   // ink-900
+        /// Cards and grouped rows.
+        static let surface = Color(hex: 0x0F1112)      // ink-850
+        /// Things inside cards: chips, tiles, pressed rows.
+        static let surfaceRaised = Color(hex: 0x141618) // ink-800
+        /// Text inputs and the Ask Jupiter bar.
+        static let field = Color(hex: 0x191C1E)        // ink-750
 
-        /// Behind video, in both modes. Footage reads best on a neutral dark
-        /// field, and a white box around a night-vision frame looks broken.
+        /// Behind video. Pure black: footage reads best on a neutral field and a
+        /// tinted box around a night-vision frame looks like a rendering fault.
         static let canvas = Color(hex: 0x000000)
 
         // Text
-        static let textPrimary = adaptive(light: 0x000000, dark: 0xFFFFFF)
-        static let textSecondary = adaptive(light: 0x5A5A5E, dark: 0xA8A8AD)
-        static let textTertiary = adaptive(light: 0x8E8E93, dark: 0x707075)
-        static let textOnAccent = Color.white
+        static let textPrimary = Color(hex: 0xF2F1ED)   // bone-50
+        static let textSecondary = Color(hex: 0xB6BABE) // steel-200
+        /// Captions and metadata. steel-300 rather than steel-400: 400 is under
+        /// 4.5:1 on ink and these are small.
+        static let textTertiary = Color(hex: 0x8F959B)  // steel-300
+        /// Placeholders and disabled glyphs only.
+        static let textDisabled = Color(hex: 0x6C7278)  // steel-400
+        static let textOnAccent = Color(hex: 0x0A0B0C)  // ink on bone
 
-        // Lines. The only thing separating a white card from a white page, so
-        // they carry real weight here rather than being decorative.
-        static let border = adaptive(light: 0xE5E5E7, dark: 0x2A2A2E)
-        static let borderStrong = adaptive(light: 0xC9C9CE, dark: 0x3C3C42)
+        // Lines. Hairlines carry the structure, so they stay quiet.
+        static let border = Color(hex: 0x202326)        // ink-700
+        static let borderStrong = Color(hex: 0x2B2F32)  // ink-600
+        /// A focused field or the selected option.
+        static let borderFocus = Color(hex: 0xF2F1ED).opacity(0.42)
 
-        /// The one interactive colour. If it is blue, you can tap it.
-        static let accent = adaptive(light: 0x0A62F0, dark: 0x4C8DFF)
-        static let accentMuted = adaptive(light: 0xEDF3FE, dark: 0x101B2E)
+        /// The interactive colour: bone. If it is the brightest thing on the
+        /// screen and it isn't a status, you can tap it.
+        static let accent = Color(hex: 0xF2F1ED)
+        static let accentMuted = Color(hex: 0x202326)
 
-        // Status. Deliberately distinct from the accent so "interactive" and
+        /// ORYN signal orange. A brand moment — the live indicator, Jupiter's
+        /// focus — not a general-purpose accent.
+        static let signal = Color(hex: 0xFF6A2B)
+
+        // Status. Deliberately distinct from bone so "interactive" and
         // "something is happening" can never be confused.
-        static let success = adaptive(light: 0x0B7A45, dark: 0x30D07A)
-        static let successMuted = adaptive(light: 0xEBF7F0, dark: 0x0A1F15)
-        static let warning = adaptive(light: 0x9A5B00, dark: 0xF5A524)
-        static let warningMuted = adaptive(light: 0xFCF3E8, dark: 0x241A0B)
-        static let danger = adaptive(light: 0xC00F0C, dark: 0xFF5F57)
-        static let dangerMuted = adaptive(light: 0xFDEDEC, dark: 0x260F0E)
-        static let offline = adaptive(light: 0x8E8E93, dark: 0x636368)
-
-        private static func adaptive(light: UInt32, dark: UInt32) -> Color {
-            Color(uiColor: UIColor { traits in
-                UIColor(Color(hex: traits.userInterfaceStyle == .dark ? dark : light))
-            })
-        }
+        static let success = Color(hex: 0x8DBF63)       // data-veg
+        static let successMuted = Color(hex: 0x131A10)
+        static let warning = Color(hex: 0xE9B949)       // data-amber
+        static let warningMuted = Color(hex: 0x1D180C)
+        static let danger = Color(hex: 0xE5544B)        // data-alert
+        static let dangerMuted = Color(hex: 0x231110)
+        static let offline = Color(hex: 0x6C7278)       // steel-400
     }
 
     // MARK: Typography
 
-    /// A deliberately short scale. Fewer, more distinct steps make hierarchy
-    /// obvious; a dozen near-identical sizes make everything look the same.
-    /// All sizes are relative so Dynamic Type still works.
+    /// SF Pro for reading, SF Mono for labels — the pairing ORYN uses on the web
+    /// (Geist / Geist Mono). A short scale: fewer, more distinct steps make the
+    /// hierarchy obvious. Relative sizes, so Dynamic Type still works.
     enum Typography {
-        static let display = Font.system(size: 32, weight: .bold, design: .default)
-        static let title = Font.system(.title2, design: .default).weight(.semibold)
-        static let headline = Font.system(.headline, design: .default)
-        static let body = Font.system(.body, design: .default)
-        static let callout = Font.system(.callout, design: .default)
-        static let label = Font.system(.subheadline, design: .default).weight(.medium)
-        static let caption = Font.system(.caption, design: .default)
-        /// Numbers that update in place (latency, FPS, temperature) — monospaced
-        /// digits stop the layout twitching on every refresh.
-        static let metric = Font.system(.title3, design: .rounded).monospacedDigit().weight(.semibold)
+        static let display = Font.system(size: 30, weight: .semibold)
+        static let title = Font.system(.title2).weight(.semibold)
+        static let headline = Font.system(.headline).weight(.semibold)
+        static let body = Font.system(.body)
+        static let callout = Font.system(.callout)
+        static let label = Font.system(.subheadline).weight(.medium)
+        static let caption = Font.system(.caption)
+        /// Uppercase section labels and tags. Pair with `.kerning(SD.Typography.eyebrowKerning)`
+        /// — or use `SDEyebrow`, which does both.
+        static let eyebrow = Font.system(size: 11, weight: .medium, design: .monospaced)
+        static let eyebrowKerning: CGFloat = 1.4
+        /// Small machine values: addresses, ids, timings.
+        static let mono = Font.system(.caption, design: .monospaced)
+        /// Numbers that update in place — monospaced digits stop the layout
+        /// twitching on every refresh.
+        static let metric = Font.system(.title3).monospacedDigit().weight(.medium)
     }
 
     // MARK: Spacing — a 4pt grid
@@ -100,36 +115,29 @@ enum SD {
     }
 
     // MARK: Radius
+    //
+    // Tighter than the old app. ORYN's shapes are precise rather than soft.
 
     enum Radius {
-        static let sm: CGFloat = 8
-        static let md: CGFloat = 12
-        static let lg: CGFloat = 16
-        static let xl: CGFloat = 20
+        static let sm: CGFloat = 6
+        static let md: CGFloat = 10
+        static let lg: CGFloat = 14
+        static let xl: CGFloat = 18
     }
 
     // MARK: Elevation
 
-    /// Shadows soft enough to read as depth rather than decoration, and skipped
-    /// entirely in dark mode where a raised surface colour does the job better.
+    /// Kept for API compatibility. A dark UI shows depth with surface steps,
+    /// not shadows, so this draws nothing.
     struct Elevation: ViewModifier {
-        @Environment(\.colorScheme) private var scheme
         var strength: CGFloat = 1
-
-        func body(content: Content) -> some View {
-            content.shadow(
-                color: .black.opacity(scheme == .dark ? 0 : 0.06 * strength),
-                radius: 12 * strength, x: 0, y: 4 * strength
-            )
-        }
+        func body(content: Content) -> some View { content }
     }
 
     // MARK: Appearance
 
-    /// The user's theme choice. `system` is the default because most people
-    /// want the app to match the phone, but an explicit choice has to be
-    /// honoured — someone who runs their phone dark and wants SensorDyme white
-    /// in a bright car is making a real request, not a mistake.
+    /// Retained so a saved preference still decodes. ORYN EDGE is always dark;
+    /// see SensorDymeApp, which no longer reads this to pick a colour scheme.
     enum Appearance: String, CaseIterable, Identifiable {
         case system, light, dark
 
@@ -151,7 +159,6 @@ enum SD {
             }
         }
 
-        /// nil means "don't override", which is what lets `system` work.
         var colorScheme: ColorScheme? {
             switch self {
             case .system: nil
@@ -165,10 +172,9 @@ enum SD {
 
     enum Motion {
         /// One spring for everything that moves, so the app feels like one product.
-        static let standard = Animation.spring(response: 0.32, dampingFraction: 0.85)
+        static let standard = Animation.spring(response: 0.34, dampingFraction: 0.88)
         static let gentle = Animation.easeInOut(duration: 0.25)
-        /// For acknowledging a touch. Anything slower reads as lag on the one
-        /// interaction where lag is least forgivable.
+        /// For acknowledging a touch. Anything slower reads as lag.
         static let quick = Animation.easeOut(duration: 0.12)
     }
 }
@@ -186,6 +192,27 @@ extension Color {
 extension View {
     func sdElevation(_ strength: CGFloat = 1) -> some View {
         modifier(SD.Elevation(strength: strength))
+    }
+}
+
+// MARK: - Labels
+
+/// The ORYN section label: small, uppercase, monospaced, tracked out.
+struct SDEyebrow: View {
+    let text: String
+    var color: Color = SD.Colors.textTertiary
+
+    init(_ text: String, color: Color = SD.Colors.textTertiary) {
+        self.text = text
+        self.color = color
+    }
+
+    var body: some View {
+        Text(text.uppercased())
+            .font(SD.Typography.eyebrow)
+            .kerning(SD.Typography.eyebrowKerning)
+            .foregroundStyle(color)
+            .lineLimit(1)
     }
 }
 
@@ -209,7 +236,6 @@ struct SDCard<Content: View>: View {
                 RoundedRectangle(cornerRadius: SD.Radius.lg, style: .continuous)
                     .strokeBorder(SD.Colors.border, lineWidth: 1)
             )
-            .sdElevation(raised ? 1 : 0.5)
     }
 }
 
@@ -219,14 +245,12 @@ struct SDSectionHeader: View {
 
     var body: some View {
         HStack(alignment: .firstTextBaseline) {
-            Text(title)
-                .font(SD.Typography.label)
-                .foregroundStyle(SD.Colors.textSecondary)
+            SDEyebrow(title)
             Spacer()
             if let action {
                 Button(action.title, action: action.perform)
                     .font(SD.Typography.caption.weight(.semibold))
-                    .foregroundStyle(SD.Colors.accent)
+                    .foregroundStyle(SD.Colors.textSecondary)
             }
         }
     }
@@ -240,36 +264,47 @@ struct SDButtonStyle: ButtonStyle {
     var kind: Kind = .primary
     var fullWidth = true
 
+    @Environment(\.isEnabled) private var isEnabled
+
     func makeBody(configuration: Configuration) -> some View {
         configuration.label
-            .font(SD.Typography.headline)
+            .font(SD.Typography.label.weight(.semibold))
             .foregroundStyle(foreground)
-            .frame(maxWidth: fullWidth ? .infinity : nil)
-            .padding(.vertical, 14)
+            .frame(maxWidth: fullWidth ? .infinity : nil, minHeight: kind == .tertiary ? 40 : 50)
             .padding(.horizontal, fullWidth ? 0 : SD.Space.md)
             .background(background)
             .clipShape(RoundedRectangle(cornerRadius: SD.Radius.md, style: .continuous))
             .overlay(
                 RoundedRectangle(cornerRadius: SD.Radius.md, style: .continuous)
-                    .strokeBorder(kind == .secondary ? SD.Colors.borderStrong : .clear, lineWidth: 1)
+                    .strokeBorder(borderColor, lineWidth: 1)
             )
-            .opacity(configuration.isPressed ? 0.86 : 1)
+            .opacity(isEnabled ? (configuration.isPressed ? 0.78 : 1) : 0.4)
             .scaleEffect(configuration.isPressed ? 0.985 : 1)
-            .animation(SD.Motion.standard, value: configuration.isPressed)
+            .animation(SD.Motion.quick, value: configuration.isPressed)
+            .contentShape(Rectangle())
     }
 
     private var foreground: Color {
         switch kind {
-        case .primary, .destructive: SD.Colors.textOnAccent
+        case .primary: SD.Colors.textOnAccent
         case .secondary: SD.Colors.textPrimary
-        case .tertiary: SD.Colors.accent
+        case .tertiary: SD.Colors.textSecondary
+        case .destructive: SD.Colors.danger
+        }
+    }
+
+    private var borderColor: Color {
+        switch kind {
+        case .secondary: SD.Colors.borderStrong
+        case .destructive: SD.Colors.danger.opacity(0.35)
+        case .primary, .tertiary: .clear
         }
     }
 
     @ViewBuilder private var background: some View {
         switch kind {
         case .primary: SD.Colors.accent
-        case .destructive: SD.Colors.danger
+        case .destructive: SD.Colors.dangerMuted
         case .secondary: SD.Colors.surface
         case .tertiary: Color.clear
         }
@@ -324,8 +359,9 @@ enum SDStatus {
     }
 }
 
-/// Compact status chip. Carries a text label as well as colour — colour alone
-/// fails colour-blind users and is unreadable in bright sun.
+/// Compact status chip: a dot and a short uppercase label in a hairline capsule.
+/// Recognisable at a glance without shouting — and it carries a word as well as a
+/// colour, because colour alone fails colour-blind users and bright sun.
 struct SDStatusPill: View {
     let status: SDStatus
     var text: String?
@@ -334,22 +370,35 @@ struct SDStatusPill: View {
     @State private var pulse = false
 
     var body: some View {
-        HStack(spacing: SD.Space.xxs + 2) {
-            Circle()
-                .fill(status.tint)
-                .frame(width: 7, height: 7)
-                .opacity(pulses && pulse ? 0.35 : 1)
-                .animation(
-                    pulses ? SD.Motion.gentle.repeatForever(autoreverses: true) : nil,
-                    value: pulse
-                )
-            Text(text ?? status.label)
-                .font(SD.Typography.caption.weight(.semibold))
-                .foregroundStyle(status == .offline ? SD.Colors.textSecondary : status.tint)
+        HStack(spacing: 6) {
+            ZStack {
+                if pulses {
+                    Circle()
+                        .fill(status.tint.opacity(0.35))
+                        .frame(width: 12, height: 12)
+                        .scaleEffect(pulse ? 1 : 0.5)
+                        .opacity(pulse ? 0 : 1)
+                        .animation(
+                            .easeOut(duration: 1.6).repeatForever(autoreverses: false),
+                            value: pulse
+                        )
+                }
+                Circle()
+                    .fill(status.tint)
+                    .frame(width: 6, height: 6)
+            }
+            .frame(width: 12, height: 12)
+            Text((text ?? status.label).uppercased())
+                .font(SD.Typography.eyebrow)
+                .kerning(1)
+                .foregroundStyle(status == .offline ? SD.Colors.textTertiary : status.tint)
+                .lineLimit(1)
         }
-        .padding(.horizontal, SD.Space.xs)
-        .padding(.vertical, SD.Space.xxs + 1)
+        .padding(.leading, 6)
+        .padding(.trailing, 10)
+        .padding(.vertical, 5)
         .background(Capsule().fill(status.wash))
+        .overlay(Capsule().strokeBorder(status.tint.opacity(status == .offline ? 0.25 : 0.22), lineWidth: 1))
         .onAppear { if pulses { pulse = true } }
         .accessibilityElement(children: .combine)
         .accessibilityLabel(text ?? status.label)
@@ -366,10 +415,10 @@ struct SDLoadingState: View {
 
     var body: some View {
         VStack(spacing: SD.Space.sm) {
-            ProgressView()
+            ProgressView().tint(SD.Colors.textSecondary)
             Text(message)
                 .font(SD.Typography.callout)
-                .foregroundStyle(SD.Colors.textSecondary)
+                .foregroundStyle(SD.Colors.textTertiary)
         }
         .frame(maxWidth: .infinity)
         .padding(.vertical, SD.Space.xl)
@@ -386,20 +435,30 @@ struct SDEmptyState: View {
     var body: some View {
         VStack(spacing: SD.Space.sm) {
             Image(systemName: icon)
-                .font(.system(size: 34, weight: .light))
-                .foregroundStyle(SD.Colors.textTertiary)
+                .font(.system(size: 20, weight: .regular))
+                .foregroundStyle(SD.Colors.textSecondary)
+                .frame(width: 48, height: 48)
+                .background(
+                    RoundedRectangle(cornerRadius: SD.Radius.md, style: .continuous)
+                        .fill(SD.Colors.surfaceRaised)
+                )
+                .overlay(
+                    RoundedRectangle(cornerRadius: SD.Radius.md, style: .continuous)
+                        .strokeBorder(SD.Colors.border, lineWidth: 1)
+                )
+                .padding(.bottom, SD.Space.xxs)
             Text(title)
                 .font(SD.Typography.headline)
                 .foregroundStyle(SD.Colors.textPrimary)
             Text(message)
                 .font(SD.Typography.callout)
-                .foregroundStyle(SD.Colors.textSecondary)
+                .foregroundStyle(SD.Colors.textTertiary)
                 .multilineTextAlignment(.center)
                 .fixedSize(horizontal: false, vertical: true)
             if let actionTitle, let action {
                 Button(actionTitle, action: action)
-                    .buttonStyle(SDButtonStyle(kind: .tertiary, fullWidth: false))
-                    .padding(.top, SD.Space.xxs)
+                    .buttonStyle(SDButtonStyle(kind: .secondary, fullWidth: false))
+                    .padding(.top, SD.Space.xs)
             }
         }
         .frame(maxWidth: .infinity)
@@ -419,15 +478,20 @@ struct SDErrorState: View {
 
     var body: some View {
         VStack(spacing: SD.Space.sm) {
-            Image(systemName: "exclamationmark.triangle.fill")
-                .font(.system(size: 30))
+            Image(systemName: "exclamationmark.triangle")
+                .font(.system(size: 20))
                 .foregroundStyle(SD.Colors.warning)
+                .frame(width: 48, height: 48)
+                .background(
+                    RoundedRectangle(cornerRadius: SD.Radius.md, style: .continuous)
+                        .fill(SD.Colors.warningMuted)
+                )
             Text(title)
                 .font(SD.Typography.headline)
                 .foregroundStyle(SD.Colors.textPrimary)
             Text(message)
                 .font(SD.Typography.callout)
-                .foregroundStyle(SD.Colors.textSecondary)
+                .foregroundStyle(SD.Colors.textTertiary)
                 .multilineTextAlignment(.center)
                 .fixedSize(horizontal: false, vertical: true)
             if let retry {
@@ -435,7 +499,7 @@ struct SDErrorState: View {
                     retrying = true
                     Task { await retry(); retrying = false }
                 } label: {
-                    if retrying { ProgressView() } else { Text("Try again") }
+                    if retrying { ProgressView().tint(SD.Colors.textPrimary) } else { Text("Try again") }
                 }
                 .buttonStyle(SDButtonStyle(kind: .secondary, fullWidth: false))
                 .disabled(retrying)
@@ -454,16 +518,17 @@ struct SDErrorState: View {
 /// one — the screen just quietly stops changing.
 struct ConnectionBanner: View {
     let message: String
-    var title = "Can't reach the backend"
+    var title = "Can't reach the server"
     var retry: (() async -> Void)?
 
     @State private var retrying = false
 
     var body: some View {
         HStack(alignment: .top, spacing: SD.Space.sm) {
-            Image(systemName: "exclamationmark.triangle.fill")
-                .font(SD.Typography.headline)
-                .foregroundStyle(SD.Colors.warning)
+            Rectangle()
+                .fill(SD.Colors.warning)
+                .frame(width: 2)
+                .clipShape(Capsule())
             VStack(alignment: .leading, spacing: SD.Space.xxs + 2) {
                 Text(title)
                     .font(SD.Typography.label)
@@ -478,9 +543,11 @@ struct ConnectionBanner: View {
                         Task { await retry(); retrying = false }
                     } label: {
                         if retrying {
-                            ProgressView().controlSize(.small)
+                            ProgressView().controlSize(.small).tint(SD.Colors.textPrimary)
                         } else {
-                            Text("Try again").font(SD.Typography.caption.weight(.semibold))
+                            Text("Try again")
+                                .font(SD.Typography.caption.weight(.semibold))
+                                .foregroundStyle(SD.Colors.accent)
                         }
                     }
                     .disabled(retrying)
@@ -496,7 +563,7 @@ struct ConnectionBanner: View {
         )
         .overlay(
             RoundedRectangle(cornerRadius: SD.Radius.md, style: .continuous)
-                .strokeBorder(SD.Colors.warning.opacity(0.35), lineWidth: 1)
+                .strokeBorder(SD.Colors.warning.opacity(0.22), lineWidth: 1)
         )
         .accessibilityElement(children: .combine)
     }
@@ -513,10 +580,7 @@ struct SDMetric: View {
 
     var body: some View {
         VStack(alignment: .leading, spacing: SD.Space.xxs) {
-            Text(label.uppercased())
-                .font(.system(size: 10, weight: .semibold))
-                .kerning(0.6)
-                .foregroundStyle(SD.Colors.textTertiary)
+            SDEyebrow(label)
             HStack(spacing: SD.Space.xxs + 2) {
                 Text(value)
                     .font(SD.Typography.metric)
@@ -530,33 +594,18 @@ struct SDMetric: View {
     }
 }
 
-// MARK: - Brand mark
+// MARK: - Brand mark (compatibility)
+//
+// The SensorDyme hexagon is retired. These names stay so existing call sites
+// compile, and now draw ORYN's real mark from the asset catalog (OrynBrand.swift).
 
-/// The SensorDyme mark: a rounded hexagon with a knocked-out S. Drop a real
-/// asset named "Logo" into an asset catalog to replace this 1:1.
 struct LogoMark: View {
     var size: CGFloat = 64
-    /// Accent-filled rather than gradient-filled. The mark is an identity, not
-    /// a decoration, and it has to stay legible at 22pt in a navigation bar.
+    /// Retained for source compatibility; the ORYN mark is always bone.
     var accented = false
 
     var body: some View {
-        ZStack {
-            Hexagon()
-                .fill(accented ? SD.Colors.accent : SD.Colors.textPrimary)
-                .overlay(
-                    Hexagon().stroke(
-                        accented ? SD.Colors.accent : SD.Colors.textPrimary,
-                        style: StrokeStyle(lineWidth: size * 0.14, lineJoin: .round)
-                    )
-                )
-            Text("S")
-                .font(.system(size: size * 0.62, weight: .black, design: .rounded))
-                .italic()
-                .foregroundStyle(SD.Colors.background)
-        }
-        .frame(width: size, height: size * 1.12)
-        .accessibilityLabel("SensorDyme")
+        OrynMark(height: size)
     }
 }
 
@@ -564,46 +613,19 @@ struct LogoLockup: View {
     var markSize: CGFloat = 72
 
     var body: some View {
-        VStack(spacing: markSize * 0.26) {
-            LogoMark(size: markSize, accented: true)
-            Text("SENSORDYME")
-                .font(.system(size: markSize * 0.26, weight: .semibold, design: .default))
-                .kerning(markSize * 0.055)
-                .foregroundStyle(SD.Colors.textPrimary)
-        }
-    }
-}
-
-struct Hexagon: Shape {
-    func path(in rect: CGRect) -> Path {
-        let w = rect.width, h = rect.height
-        let inset = w * 0.07
-        let points = [
-            CGPoint(x: w / 2, y: inset),
-            CGPoint(x: w - inset, y: h * 0.27),
-            CGPoint(x: w - inset, y: h * 0.73),
-            CGPoint(x: w / 2, y: h - inset),
-            CGPoint(x: inset, y: h * 0.73),
-            CGPoint(x: inset, y: h * 0.27),
-        ]
-        var path = Path()
-        path.addLines(points)
-        path.closeSubpath()
-        return path
+        OrynEdgeLockup(markHeight: markSize)
     }
 }
 
 // MARK: - Compatibility shims
 //
-// Kept so existing screens compile while they migrate to the tokens above.
-// New code should use SDCard / SDButtonStyle / SD.Colors directly.
+// Kept so existing screens compile. New code should use SDCard / SDButtonStyle
+// / SD.Colors directly.
 
 enum Brand {
     static let ink = SD.Colors.canvas
     static let electric = SD.Colors.accent
     static let surface = SD.Colors.surface
-    /// Was a three-stop electric→violet→magenta sweep used on every surface;
-    /// now a flat accent, so "brand" and "status" stop competing for attention.
     static let gradient = SD.Colors.accent
     static let alertGradient = SD.Colors.danger
     static let okGradient = SD.Colors.success
@@ -621,7 +643,6 @@ struct BrandCard: ViewModifier {
                 RoundedRectangle(cornerRadius: SD.Radius.lg, style: .continuous)
                     .strokeBorder(SD.Colors.border, lineWidth: 1)
             )
-            .sdElevation(0.5)
     }
 }
 
@@ -637,20 +658,19 @@ struct BrandButtonStyle: ButtonStyle {
     }
 }
 
-/// A calm, very slow accent wash for hero surfaces. The old version cycled hue
-/// through magenta on a six-second loop behind the sign-in form, which is a lot
-/// of movement on the first screen of a safety product.
+/// The hero backdrop behind sign-in: ink with a faint graphite glow at the top,
+/// where the logo sits. Static — a safety product's first screen should be calm.
 struct AnimatedBrandBackground: View {
-    @State private var shift = false
-
     var body: some View {
-        LinearGradient(
-            colors: [SD.Colors.accent.opacity(0.16), SD.Colors.accent.opacity(0.03)],
-            startPoint: shift ? .topLeading : .top,
-            endPoint: .bottomTrailing
-        )
-        .animation(.easeInOut(duration: 14).repeatForever(autoreverses: true), value: shift)
-        .onAppear { shift = true }
+        ZStack {
+            SD.Colors.background
+            RadialGradient(
+                colors: [Color(hex: 0x202326).opacity(0.9), SD.Colors.background.opacity(0)],
+                center: UnitPoint(x: 0.5, y: 0.0),
+                startRadius: 10,
+                endRadius: 520
+            )
+        }
         .ignoresSafeArea()
     }
 }

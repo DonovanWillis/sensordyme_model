@@ -13,7 +13,13 @@ targets:
     info:
       path: Info.plist
       properties:
-        UILaunchScreen: {}
+        # ORYN EDGE launches on ink, not a white flash.
+        UILaunchScreen:
+          UIColorName: LaunchBackground
+        # The name under the icon. The bundle id stays com.sensordyme.app: changing
+        # it would orphan the saved session in the Keychain and need a new
+        # provisioning profile, for no user-visible gain.
+        CFBundleDisplayName: ORYN EDGE
         # From build settings, not literals, so a build can be identified on a
         # phone: `xcrun devicectl device info apps` reports exactly these. Every
         # build used to say 1.0 (1), which could not tell an old install from one
@@ -42,10 +48,10 @@ targets:
         # by cloud/mdns.py) — the latter is how sign-in works without anyone typing an
         # address. iOS returns nothing for a service type that is not declared here, and
         # says nothing about why, so this list must stay in step with both publishers.
-        NSLocalNetworkUsageDescription: SensorDyme finds your device and your server on your Wi-Fi, so you can sign in and see the live feed without typing an address.
+        NSLocalNetworkUsageDescription: ORYN EDGE finds your SensorDyme and your server on your Wi-Fi, so you can sign in and see the live feed without typing an address.
         NSBonjourServices: [_sensordyme._tcp, _sensordyme-api._tcp]
         # Bluetooth: provisioning the device's Wi-Fi when it has no network yet
-        NSBluetoothAlwaysUsageDescription: SensorDyme uses Bluetooth to set up your device's Wi-Fi connection.
+        NSBluetoothAlwaysUsageDescription: ORYN EDGE uses Bluetooth to set up your SensorDyme's Wi-Fi connection.
     settings:
       base:
         PRODUCT_BUNDLE_IDENTIFIER: com.sensordyme.app

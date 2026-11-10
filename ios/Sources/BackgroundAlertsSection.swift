@@ -25,7 +25,7 @@ struct BackgroundAlertsSection: View {
         Section("Alerts when the app is closed") {
             VStack(alignment: .leading, spacing: SD.Space.xs) {
                 Label(
-                    "SensorDyme's own notifications only arrive while the app is open. These arrive whenever your device is powered on.",
+                    "ORYN EDGE's own notifications only arrive while the app is open. These arrive whenever your device is powered on.",
                     systemImage: "bell.badge"
                 )
                 .font(SD.Typography.callout)
@@ -95,7 +95,7 @@ struct BackgroundAlertsSection: View {
                     .fixedSize(horizontal: false, vertical: true)
             }
 
-            Text("Alerts go out through ntfy.sh, which is free and needs no Apple account. They arrive branded \"ntfy\" — a native SensorDyme push needs a paid Apple Developer membership, and swapping to it changes nothing about which alerts are sent.")
+            Text("Alerts go out through ntfy.sh, which is free and needs no Apple account. They arrive branded \"ntfy\" — a native ORYN EDGE push needs a paid Apple Developer membership, and swapping to it changes nothing about which alerts are sent.")
                 .font(SD.Typography.caption)
                 .foregroundStyle(SD.Colors.textTertiary)
                 .fixedSize(horizontal: false, vertical: true)

@@ -17,6 +17,7 @@ struct DiagnosticsView: View {
 
     var body: some View {
         Form {
+            Group {
             Section {
                 Button {
                     Task { await runAll() }
@@ -47,6 +48,9 @@ struct DiagnosticsView: View {
                 }
             }
         }
+            .orynRows()
+        }
+        .orynFormStyle()
         .navigationTitle("Connection doctor")
     }
 
@@ -60,9 +64,9 @@ struct DiagnosticsView: View {
 
     private func color(for passed: Bool?) -> Color {
         switch passed {
-        case .some(true): .green
-        case .some(false): .red
-        case .none: .secondary
+        case .some(true): SD.Colors.success
+        case .some(false): SD.Colors.danger
+        case .none: SD.Colors.textTertiary
         }
     }
 

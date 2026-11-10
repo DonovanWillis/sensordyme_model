@@ -39,7 +39,7 @@ struct SetupWizardView: View {
 
                 if step != .done {
                     Button(action: advance) {
-                        if busy { ProgressView().tint(.white) } else { Text(buttonTitle) }
+                        if busy { ProgressView().tint(SD.Colors.textOnAccent) } else { Text(buttonTitle) }
                     }
                     .buttonStyle(BrandButtonStyle())
                     .disabled(busy || (step == .pair && claimCode.isEmpty && !state.isDemo))
@@ -56,6 +56,8 @@ struct SetupWizardView: View {
             }
             .padding(24)
             .animation(.spring(duration: 0.45), value: step)
+            .frame(maxWidth: .infinity, maxHeight: .infinity)
+            .orynScreen()
             .navigationTitle("Set up device")
             .navigationBarTitleDisplayMode(.inline)
             .toolbar {
@@ -78,7 +80,7 @@ struct SetupWizardView: View {
         HStack(spacing: 6) {
             ForEach(0..<4, id: \.self) { index in
                 Capsule()
-                    .fill(index <= min(step.rawValue, 3) ? AnyShapeStyle(SD.Colors.accent) : AnyShapeStyle(.quaternary))
+                    .fill(index <= min(step.rawValue, 3) ? SD.Colors.accent : SD.Colors.borderStrong)
                     .frame(height: 5)
             }
         }
@@ -187,8 +189,8 @@ struct SetupWizardView: View {
                     .autocapitalization(.allCharacters)
                     .autocorrectionDisabled()
                     .padding(14)
-                    .background(RoundedRectangle(cornerRadius: 14).fill(.background.secondary))
-                    .overlay(RoundedRectangle(cornerRadius: 14).strokeBorder(.quaternary))
+                    .background(RoundedRectangle(cornerRadius: SD.Radius.md, style: .continuous).fill(SD.Colors.field))
+                    .overlay(RoundedRectangle(cornerRadius: SD.Radius.md, style: .continuous).strokeBorder(SD.Colors.borderStrong))
             }
         }
     }
@@ -196,10 +198,11 @@ struct SetupWizardView: View {
     private var doneStep: some View {
         VStack(spacing: 16) {
             ZStack {
-                Circle().fill(SD.Colors.success).frame(width: 130, height: 130)
+                Circle().fill(SD.Colors.successMuted).frame(width: 120, height: 120)
+                Circle().strokeBorder(SD.Colors.success.opacity(0.4), lineWidth: 1).frame(width: 120, height: 120)
                 Image(systemName: "checkmark")
-                    .font(.system(size: 56, weight: .heavy))
-                    .foregroundStyle(.white)
+                    .font(.system(size: 44, weight: .semibold))
+                    .foregroundStyle(SD.Colors.success)
             }
             .transition(.scale.combined(with: .opacity))
             Text("You're live").font(.title.bold())

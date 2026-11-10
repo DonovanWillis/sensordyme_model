@@ -462,8 +462,8 @@ final class BackendLocator: ObservableObject {
         if case let .dns(code) = error {
             // The code iOS returns when Local Network access is denied.
             if code == -65570 || code == kDNSServiceErr_PolicyDenied {
-                return "SensorDyme needs Local Network permission to find your server. "
-                     + "Settings → SensorDyme → Local Network."
+                return "ORYN EDGE needs Local Network permission to find your server. "
+                     + "Settings → ORYN EDGE → Local Network."
             }
             return "Couldn't search this network (DNS error \(code))."
         }

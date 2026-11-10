@@ -119,7 +119,7 @@ enum DevicePresence {
             return "Your account has more than one device. Choose this phone's camera in "
                  + "Settings → Live feed → Find my device."
         case .undetermined:
-            return "SensorDyme can't reach your Mac at the moment, so it can't say "
+            return "ORYN EDGE can't reach your server at the moment, so it can't say "
                  + "whether your device is online. It will keep trying."
         }
     }
