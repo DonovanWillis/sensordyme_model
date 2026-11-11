@@ -404,6 +404,7 @@ struct PresetDetailView: View {
             .buttonStyle(SDButtonStyle(kind: .primary))
             .disabled(sending || availability.blocksSelection || !problems.isEmpty
                       || (isActive && preset.settings.isEmpty))
+            .accessibilityIdentifier("preset.activate")
             if availability.blocksSelection {
                 Text("This preset can't be selected on \(device.name).")
                     .font(SD.Typography.caption)
