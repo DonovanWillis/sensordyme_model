@@ -62,6 +62,7 @@ class Item:
     split: Optional[str] = None
     conditions: dict = field(default_factory=dict)  # lighting, ir, camera, position, eyewear...
     annotations: Optional[str] = None  # relative path of the annotation JSON
+    provenance: dict = field(default_factory=dict)  # per-file source, licence, author, original URL
 
     @property
     def kind(self) -> str:
