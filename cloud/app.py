@@ -1551,13 +1551,23 @@ def set_protection(device_id: int, body: ProtectionBody, uid: int = Depends(curr
     if body.action == "stop" and not body.confirm:
         raise HTTPException(400, "stopping monitoring requires confirm: true")
     with db() as conn:
-        _owned_device(conn, device_id, uid)
+        device = _owned_device(conn, device_id, uid)
+        reported = _monitoring_payload(device["monitoring"])
+        if reported and "protection" not in reported:
+            # Firmware older than M0.1 cannot stop or resume. Answering ok here
+            # made the app believe a device had stopped that never would, and
+            # the request was re-sent on every poll for ever.
+            raise HTTPException(409, "this device's software does not support stop/resume yet; update it first")
+        # Each request has an id the device echoes once it has applied it, so a
+        # stop still in flight cannot be mistaken for a later resume (or the
+        # reverse) by comparing states alone.
+        command_id = secrets.token_hex(6)
         conn.execute(
             "UPDATE devices SET desired_protection = ? WHERE id = ?",
-            (json.dumps({"action": body.action, "confirm": body.confirm, "requested_at": time.time()}),
-             device_id),
+            (json.dumps({"action": body.action, "confirm": body.confirm, "id": command_id,
+                         "requested_at": time.time()}), device_id),
         )
-    return {"ok": True, "desired_protection": body.action}
+    return {"ok": True, "desired_protection": body.action, "command_id": command_id}
 
 
 @app.post("/v1/devices/{device_id}/preset")
@@ -2690,15 +2700,21 @@ def ingest(body: IngestBody, background_tasks: BackgroundTasks, device: sqlite3.
         ).fetchone()
         desired, ai_rules_json, zones_json = row["desired_preset"], row["ai_rules"], row["zones"]
         desired_protection = _loads_dict(row["desired_protection"]) if row["desired_protection"] else {}
-        reported_protection = (
-            ((body.monitoring or {}).get("protection") or {}).get("state")
-            if isinstance((body.monitoring or {}).get("protection"), dict) else None
-        )
+        reported_block = (body.monitoring or {}).get("protection")
+        reported_block = reported_block if isinstance(reported_block, dict) else None
+        reported_protection = reported_block.get("state") if reported_block else None
         protection_action = desired_protection.get("action")
-        protection_done = (
-            (protection_action == "stop" and reported_protection == "stopped")
-            or (protection_action == "resume" and reported_protection not in (None, "stopped"))
-        )
+        if desired_protection.get("id") and reported_block is not None:
+            # Converged when the device says it applied THIS request (by id).
+            protection_done = reported_block.get("last_command_id") == desired_protection["id"]
+        else:
+            protection_done = (
+                (protection_action == "stop" and reported_protection == "stopped")
+                or (protection_action == "resume" and reported_protection not in (None, "stopped"))
+                # A device reporting monitoring without any protection block runs
+                # firmware that cannot do this: stop asking it every poll.
+                or (body.monitoring is not None and reported_block is None)
+            )
         if protection_action and protection_done:
             conn.execute(
                 "UPDATE devices SET desired_protection = NULL WHERE id = ? AND desired_protection = ?",
@@ -2743,6 +2759,16 @@ def ingest(body: IngestBody, background_tasks: BackgroundTasks, device: sqlite3.
             # the WHERE to the value just read makes the clear a no-op
             # instead whenever that's happened, leaving the fresh command
             # alone.
+            conn.execute(
+                "UPDATE devices SET desired_preset = NULL WHERE id = ? AND desired_preset = ?",
+                (device["id"], desired),
+            )
+            desired = None
+        if desired and _role_refusal(device, desired, load_presets()):
+            # A preset the device's role forbids (stored before the device
+            # reported its role, or before the upgrade) would be re-sent and
+            # refused on every poll, for ever (M0.1 review). Drop it; the app
+            # sees the role and the running preset in the device's report.
             conn.execute(
                 "UPDATE devices SET desired_preset = NULL WHERE id = ? AND desired_preset = ?",
                 (device["id"], desired),
@@ -2869,6 +2895,7 @@ def ingest(body: IngestBody, background_tasks: BackgroundTasks, device: sqlite3.
         command = dict(command or {})
         command["set_protection"] = {
             "action": protection_action, "confirm": desired_protection.get("confirm") is True,
+            "id": desired_protection.get("id"),
         }
 
     # The count that actually landed in the database, not the size of the

@@ -43,10 +43,11 @@ from collections import deque
 from collections.abc import Iterable
 from dataclasses import dataclass
 from enum import Enum
-from typing import ClassVar, Optional, Protocol
+from typing import Any, ClassVar, Optional, Protocol
 
 from core.events import Event
 from core.logging_setup import get_logger
+from core.monitoring_state import Actuator
 
 log = get_logger("alerts")
 
@@ -198,8 +199,43 @@ class _PatternPlayer:
                     time.sleep(off_s)
 
 
+class UnavailableSink:
+    """A configured alert output that could not be set up (no GPIO, no Pi, ...).
+
+    It stays in the sink list so health keeps reporting it by name and reason,
+    rather than the output silently vanishing while the config still lists it.
+    """
+
+    def __init__(self, name: str, kind: str, audible: bool, reason: str) -> None:
+        self.name, self.kind, self.audible, self._reason = name, kind, audible, reason
+
+    def readiness(self) -> tuple[bool, str]:
+        return False, self._reason
+
+    def play(self, pattern: AlertPattern, event: Event, category: AlertCategory) -> None:
+        pass
+
+    def emit(self, event: Event, level: AlertLevel) -> None:
+        pass
+
+
+@dataclass
+class _SinkResults:
+    """What happened to the commands sent to one alert output."""
+
+    ok: int = 0
+    failed: int = 0
+    consecutive_failures: int = 0
+    last_error: Optional[str] = None
+
+
 class ConsoleSink:
     """Prints alerts to stdout."""
+
+    name, kind, audible = "console", "console", False
+
+    def readiness(self) -> tuple[bool, str]:
+        return True, "prints to the service log (not an in-cabin signal)"
 
     def emit(self, event: Event, level: AlertLevel) -> None:
         """Print a one-line alert message."""
@@ -220,6 +256,8 @@ class SoundSink:
     if simpleaudio isn't available, and to the terminal bell as a last resort.
     """
 
+    name, kind, audible = "sound", "speaker", True
+
     def __init__(self) -> None:
         """Detect the best available playback backend."""
         try:
@@ -229,6 +267,18 @@ class SoundSink:
         except ImportError:
             self._simpleaudio = None
         self._player = _PatternPlayer(self._play_tone_safe)
+        self._last_error: Optional[str] = None
+
+    def readiness(self) -> tuple[bool, str]:
+        """Software-level only: a backend exists and the last playback did not fail.
+        Nothing here can tell whether a speaker is connected or audible."""
+        if sys.platform == "darwin":
+            return False, "audio output is disabled on macOS (dev machine)"
+        if self._simpleaudio is None and not (sys.platform.startswith("linux") and shutil.which("aplay")):
+            return False, "no audio backend (simpleaudio or aplay) is available"
+        if self._last_error is not None:
+            return False, f"last playback failed: {self._last_error}"
+        return True, "playback commands succeed (not physically verified)"
 
     def play(self, pattern: AlertPattern, event: Event, category: AlertCategory) -> None:
         """Render the pattern as tone bursts on the sound device (never on macOS; see emit)."""
@@ -259,7 +309,9 @@ class SoundSink:
         raises from simpleaudio on every alert — degrade to the terminal bell."""
         try:
             self._play_tone(duration_s)
-        except Exception:  # noqa: BLE001 - audio is best-effort by design
+            self._last_error = None
+        except Exception as exc:  # noqa: BLE001 - audio is best-effort by design
+            self._last_error = str(exc) or type(exc).__name__
             print("\a", end="", flush=True)
 
     def _play_tone(self, duration_s: float) -> None:
@@ -312,6 +364,8 @@ class GPIOBuzzerSink:
         from gpiozero import Buzzer  # lazy import: this line never executes on Mac
 
         self._buzzer = Buzzer(pin)
+        self._pin = pin
+        self._last_error: Optional[str] = None
         # One physical buzzer, many overlapping requests. Each buzz used to own
         # an on/sleep/off thread, so a short buzz that overlapped a longer one
         # switched the buzzer OFF in the middle of it: a soft chime 50ms before
@@ -320,6 +374,15 @@ class GPIOBuzzerSink:
         # owns that moment may turn it off.
         self._lock = threading.Lock()
         self._off_at = 0.0
+
+    name, kind, audible = "gpio_buzzer", "buzzer", True
+
+    def readiness(self) -> tuple[bool, str]:
+        """Software-level only: the pin was claimed and the last write did not fail.
+        A disconnected or dead buzzer is invisible from here (no feedback line)."""
+        if self._last_error is not None:
+            return False, f"GPIO write failed: {self._last_error}"
+        return True, f"GPIO {self._pin} drives succeed (not physically verified)"
 
     def emit(self, event: Event, level: AlertLevel) -> None:
         """Buzz briefly for SOFT alerts, longer for CONTINUOUS ones.
@@ -348,7 +411,9 @@ class GPIOBuzzerSink:
                 # A later or longer request extended _off_at: leave it on.
                 if time.monotonic() >= self._off_at - 1e-3:
                     self._buzzer.off()
+            self._last_error = None
         except Exception as exc:  # noqa: BLE001 - a GPIO fault must never kill anything
+            self._last_error = str(exc) or type(exc).__name__
             log.warning("buzzer failed: %s", exc)
 
 
@@ -424,6 +489,7 @@ class AlertManager:
         self._recent: deque = deque(maxlen=self._RECENT)
         self._next_id = 0
         self._lock = threading.Lock()
+        self._sink_results: dict[int, _SinkResults] = {}  # keyed by id(sink)
 
     # ------------------------------------------------------------------ queries
     def category_for(self, event_type: str, level: Optional[AlertLevel] = None) -> AlertCategory:
@@ -586,14 +652,54 @@ class AlertManager:
 
     def _actuate(self, pattern: AlertPattern, event: Event, category: AlertCategory, level: AlertLevel) -> None:
         for sink in self._sinks:
+            result = self._sink_results.setdefault(id(sink), _SinkResults())
             try:
                 play = getattr(sink, "play", None)
                 if callable(play):
                     play(pattern, event, category)
                 else:
                     sink.emit(event, level)
+                result.ok += 1
+                result.consecutive_failures = 0
             except Exception as exc:  # noqa: BLE001 - one broken sink must not silence the rest
+                result.failed += 1
+                result.consecutive_failures += 1
+                result.last_error = str(exc) or type(exc).__name__
                 log.error("alert sink %s failed: %s", type(sink).__name__, exc)
+
+    def actuators(self) -> list[Actuator]:
+        """Every configured alert output and its SOFTWARE readiness.
+
+        Ready = the output initialised, reports itself ready, and its last command
+        did not raise. "Commanded" is never "heard": physically_verified is False
+        for every output today. An output whose command keeps failing is still
+        commanded on every alert (bounded by the episode policy), never retried
+        in a loop of its own.
+        """
+        out = []
+        for sink in self._sinks:
+            readiness: Any = getattr(sink, "readiness", lambda: (True, ""))
+            ok, detail = readiness()
+            results = self._sink_results.get(id(sink), _SinkResults())
+            if results.consecutive_failures:
+                ok, detail = False, f"last alert command failed: {results.last_error}"
+            out.append(Actuator(
+                name=str(getattr(sink, "name", type(sink).__name__)), kind=str(getattr(sink, "kind", "custom")),
+                audible=bool(getattr(sink, "audible", False)), ready=ok, detail=detail,
+                commands_ok=results.ok, commands_failed=results.failed,
+            ))
+        return out
+
+    def end_source(self, now: float, source: str) -> None:
+        """Close every open episode of one producer (its view of the world went stale)."""
+        with self._lock:
+            for episode in list(self._open.values()):
+                if episode.source == source:
+                    self._end(episode, now)
+
+    def open_keys(self, source: str) -> set[str]:
+        with self._lock:
+            return {e.key for e in self._open.values() if e.source == source}
 
 
 #: The policy's descriptive name; `AlertManager` is kept for existing callers.

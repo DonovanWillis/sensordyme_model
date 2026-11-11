@@ -362,6 +362,7 @@ class CloudUplink:
                     with self._lock:
                         self._pending_protection = {
                             "action": protection["action"], "confirm": protection.get("confirm") is True,
+                            "id": protection.get("id"),
                         }
                 if "set_zones" in command:
                     zones = command.get("set_zones")

@@ -169,7 +169,8 @@ def _policy_health(policy: Policy, caps: Mapping[str, Capability]) -> PolicyHeal
         missing = sorted(n for n in needs if caps.get(n, Capability(IMPAIRED, "not provided")).impaired)
         if missing:
             unavailable.append(event)
-            reasons.append(f"{event}: needs {', '.join(missing)}")
+            why = [f"{n} ({caps[n].reason})" if n in caps and caps[n].reason else n for n in missing]
+            reasons.append(f"{event}: needs {', '.join(why)}")
     total = len(policy.events)
     return PolicyHealth(
         id=policy.id, kind=policy.kind, name=policy.name,
@@ -224,3 +225,54 @@ def evaluate(
     if reasons:
         return Evaluation(MonitoringState.DEGRADED, tuple(reasons), policy_health, caps)
     return Evaluation(MonitoringState.READY, (), policy_health, caps)
+
+
+@dataclass(frozen=True)
+class MonitoringReport:
+    """The public monitoring state: one schema for the dashboard, uplink and app.
+
+    Ages are seconds (None = never happened). Versions are what is actually
+    running. Nothing here is an accuracy or confidence figure.
+    """
+
+    state: MonitoringState
+    reasons: tuple[str, ...]
+    role: str
+    active_preset: Optional[str]
+    module: str
+    mode: str
+    custom_rules: tuple[str, ...]
+    capabilities: Mapping[str, Capability]
+    policies: tuple[PolicyHealth, ...]
+    actuators: tuple[Actuator, ...]
+    last_frame_age_s: Optional[float]
+    last_inference_age_s: Optional[float]
+    model: Mapping[str, object]
+    versions: Mapping[str, Optional[str]]
+
+    @property
+    def monitoring(self) -> bool:
+        """Is anything being watched? READY or DEGRADED; never STARTING/FAILED/STOPPED."""
+        return self.state in (MonitoringState.READY, MonitoringState.DEGRADED)
+
+    def to_dict(self) -> dict:
+        caps = dict(self.capabilities)
+        return {
+            "state": self.state.value,
+            "monitoring": self.monitoring,
+            "reasons": list(self.reasons),
+            "role": self.role,
+            "active_preset": self.active_preset,
+            "module": self.module,
+            "mode": self.mode,
+            "custom_rules": list(self.custom_rules),
+            "capabilities": {name: cap.to_dict() for name, cap in sorted(caps.items())},
+            "available": sorted(n for n, c in caps.items() if c.available),
+            "impaired": sorted(n for n, c in caps.items() if c.impaired),
+            "policies": [p.to_dict() for p in self.policies],
+            "actuators": [a.to_dict() for a in self.actuators],
+            "last_frame_age_s": self.last_frame_age_s,
+            "last_inference_age_s": self.last_inference_age_s,
+            "model": dict(self.model),
+            "versions": dict(self.versions),
+        }

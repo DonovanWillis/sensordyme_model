@@ -24,11 +24,13 @@ from __future__ import annotations
 import copy
 import random
 from pathlib import Path
+from typing import ClassVar
 
 import pytest
 import yaml
 from test_driver_attention_scenarios import _FakeFaceMeshResult, _make_module, make_fake_landmarks
 from test_m01_alert_episodes import RecordingActuator
+from test_phase1_driver_fixes import _FakeBox, _FakeResult
 
 import modules.driver_attention as driver_attention_module
 from core import roles
@@ -153,6 +155,8 @@ class ClockedActuator(RecordingActuator):
 
 
 class FakeUplink:
+    connected = True
+
     def __init__(self) -> None:
         self.rules = None
         self.zones = None
@@ -215,10 +219,31 @@ def isolated_state(tmp_path, monkeypatch):
     return path
 
 
+class _StubDetector:
+    """A working detector (object detection is AVAILABLE) that sees `boxes`."""
+
+    names: ClassVar[dict[int, str]] = {0: "person", 67: "cell phone"}
+
+    def __init__(self) -> None:
+        self.boxes: list = []
+        self.failing = False  # simulate a detector fault (M0.2 fault injection)
+
+    def show_phone(self) -> None:
+        self.boxes = [_FakeBox(67, (100.0, 100.0, 160.0, 220.0), 0.9)]
+
+    def predict(self, frame, **kwargs):
+        if self.failing:
+            raise RuntimeError("HAILO_STREAM_ABORTED_BY_USER (simulated)")
+        return [_FakeResult(list(self.boxes))]
+
+
 def _driver_runtime(tmp_path, clock, monkeypatch, *, closed):
     monkeypatch.setattr(driver_attention_module, "eye_aspect_ratio",
                         lambda *pts: 0.05 if closed["value"] else 0.40)
-    module, frame = _make_module(tmp_path, clock, iris_veto=False)
+    detector = _StubDetector()
+    monkeypatch.setattr(driver_attention_module, "get_yolo_model", lambda weights: detector)
+    module, frame = _make_module(tmp_path, clock, iris_veto=False, yolo_every_n_frames=3)
+    module.stub_detector = detector
     face = make_fake_landmarks()
     module._face_mesh.process = lambda rgb, lm=face: _FakeFaceMeshResult(lm)
     config = _repo_config()
@@ -233,17 +258,23 @@ def _driver_runtime(tmp_path, clock, monkeypatch, *, closed):
     )
     runtime.logger = EventLogger(str(tmp_path / "events.csv"))
     runtime.uplink = FakeUplink()
+    _drive(runtime, module, frame, clock, 0.2)  # a running device: frames seen, detector loaded
     return runtime, module, frame, actuator
 
 
 def _drive(runtime, module, frame, clock, seconds, step=0.05):
-    """The runtime's per-frame production path (dispatch + custom rules), injected time."""
+    """The inference loop's per-frame production path (frame stamp, process,
+    dispatch, custom rules, heartbeat) on an injected clock."""
     for _ in range(round(seconds / step)):
         runtime._apply_pending_commands()
+        runtime.bus.publish(frame)
         if runtime._stopped is None:
+            module.set_frame_time(clock["now"])
             events = module.process(frame)
+            runtime.bus.record_processed()
             runtime._dispatch_module_events(module, events, clock["now"])
             runtime._evaluate_custom_rules(module, frame, clock["now"])
+        runtime._heartbeat = clock["now"]
         clock["now"] = round(clock["now"] + step, 6)
 
 
@@ -280,7 +311,7 @@ def test_custom_rules_add_to_driver_safety_and_keep_its_timeline_identical(
             assert runtime.module_name == "driver_attention", "custom rules swapped driver safety out"
             assert runtime.protection_state()["state"] == "protecting"
             # A phone the (stubbed) detector sees, so the custom rule has something to fire on.
-            module._last_overlay_boxes = [((100.0, 100.0, 160.0, 220.0), "cell phone")]
+            module.stub_detector.show_phone()
             module._last_overlay_confidences = [0.9]
         start = clock["now"]
         _drowsy_script(runtime, module, frame, clock, closed)
@@ -310,7 +341,6 @@ def test_before_m01_custom_rules_replaced_driver_safety_now_they_do_not(
 @pytest.mark.parametrize(("bad_rule", "reason"), [
     ({"target": "person", "predicate": "enters"}, "unsupported condition 'enters'"),
     ({"target": "dog", "predicate": "present"}, "cannot detect 'dog'"),
-    ({"target": "person", "predicate": "present", "zone": "driveway"}, "area 'driveway' is not defined"),
     ({"target": "person", "predicate": "near"}, "needs a second object"),
 ])
 def test_an_unsupported_rule_rejects_the_whole_set_and_keeps_the_previous_rules(
@@ -330,6 +360,23 @@ def test_an_unsupported_rule_rejects_the_whole_set_and_keeps_the_previous_rules(
     rejection = runtime.uplink.monitoring_reports[-1]["last_rejection"]
     assert rejection["kind"] == "rules" and rejection["subject"] == "bad"
     assert any(reason in r for r in rejection["reasons"])
+    runtime.logger.close()
+
+
+def test_a_rule_whose_area_is_not_drawn_yet_waits_for_it_and_is_reported(
+        tmp_path, clock, monkeypatch, isolated_state):
+    """M0.2 (changed from M0.1, which rejected the whole set): the backend proposes
+    rules for areas the owner has not drawn yet, and acknowledges the rules
+    version on delivery, so a rejection lost the rule for good. Now it loads
+    inert and the monitoring state says exactly what it is waiting for."""
+    closed = {"value": False}
+    runtime, _module, _frame, _ = _driver_runtime(tmp_path, clock, monkeypatch, closed=closed)
+    runtime.uplink.rules = [PHONE_RULE, {"target": "person", "predicate": "present", "zone": "driveway"}]
+    runtime.uplink.version = "v2"
+    runtime._apply_pending_commands()
+    assert [r.detection for r in runtime.rule_engine.rules] == ["cell phone", "person"]
+    waiting = [p for p in runtime.monitoring_report().policies if not p.can_evaluate]
+    assert len(waiting) == 1 and "area 'driveway' is not drawn yet" in waiting[0].reasons[0]
     runtime.logger.close()
 
 
@@ -401,7 +448,11 @@ def test_a_confirmed_stop_is_reported_everywhere_and_resume_restores(
     assert runtime.alert_manager.open_episodes() == []
     runtime.uplink.protection = {"action": "resume"}
     _drive(runtime, module, frame, clock, 0.05)
-    assert runtime.protection_state()["state"] == "protecting"
+    # M0.2: at the instant of resume nothing has been analysed yet, so the report
+    # sent then says STARTING; the health tick republishes once frames flow.
+    assert runtime.uplink.monitoring_reports[-1]["protection"]["monitoring_state"] == "starting"
+    assert runtime.protection_state()["state"] == "protecting", runtime.protection_state()
+    runtime._monitoring_check()  # the health monitor's 2 s tick
     assert runtime.uplink.monitoring_reports[-1]["protection"]["state"] == "protecting"
     runtime.logger.close()
 
@@ -446,7 +497,11 @@ def test_a_general_device_keeps_free_preset_switching_and_replacing_custom_rules
     assert runtime.role.name == "general"
     runtime._switch_preset("b")
     assert runtime.module_name == "m01_other_b"
-    assert runtime.protection_state()["state"] == "protecting"
+    # No role floor: nothing role-related stands between it and protecting. (M0.2:
+    # a runtime that has not seen a frame yet is truthfully STARTING, not protecting.)
+    protection = runtime.protection_state()
+    assert protection["monitoring_state"] == "starting"
+    assert not any("requires" in r for r in protection["reasons"])
     assert runtime._resolve_mode("m01_other_b") is MonitoringMode.STANDARD
     runtime.monitoring.save([{"target": "person"}])
     assert runtime._resolve_mode("m01_other_b") is MonitoringMode.AI_CUSTOM  # unchanged behaviour
@@ -506,8 +561,11 @@ def test_backend_stop_needs_confirmation_is_delivered_once_and_visible_to_the_ap
     assert client.post("/v1/devices/1/protection", json={"action": "stop", "confirm": True},
                        headers=headers).status_code == 200
     command = _ingest(client, DRIVER_REPORT)
-    assert command["set_protection"] == {"action": "stop", "confirm": True}
-    stopped = {**DRIVER_REPORT, "protection": {"state": "stopped", "role": "driver_safety", "reasons": []}}
+    sent = command["set_protection"]
+    assert (sent["action"], sent["confirm"]) == ("stop", True)
+    # M0.2: the device echoes the request id once applied; that is what converges.
+    stopped = {**DRIVER_REPORT, "protection": {"state": "stopped", "role": "driver_safety", "reasons": [],
+                                               "last_command_id": sent["id"]}}
     assert (_ingest(client, stopped) or {}).get("set_protection") is None  # converged: cleared
     device = client.get("/v1/devices", headers=headers).json()["devices"][0]
     assert device["monitoring"]["protection"]["state"] == "stopped"
@@ -647,8 +705,7 @@ def test_rule_event_keys_carry_the_rule(tmp_path, clock, monkeypatch, isolated_s
     runtime, module, frame, _actuator = _driver_runtime(tmp_path, clock, monkeypatch, closed=closed)
     runtime.uplink.rules = [PHONE_RULE]
     runtime._apply_pending_commands()
-    module._last_overlay_boxes = [((100.0, 100.0, 160.0, 220.0), "cell phone")]
-    module._last_overlay_confidences = [0.9]
+    module.stub_detector.show_phone()
     _drive(runtime, module, frame, clock, 3.0)
     keys = {e["key"] for e in runtime.alert_manager.recent_episodes() + runtime.alert_manager.open_episodes()}
     assert any(k.startswith("rule0:present:cell phone") for k in keys)

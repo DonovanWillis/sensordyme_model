@@ -12,7 +12,12 @@ import json
 from typing import ClassVar
 
 import pytest
-from test_driver_attention_scenarios import _FakeFaceMeshResult, _feed, _make_module, make_fake_landmarks
+from test_driver_attention_scenarios import (
+    _FakeFaceMeshResult,
+    _feed,
+    _make_module,
+    make_fake_landmarks,
+)
 from test_hailo_lifecycle import hailo  # noqa: F401 - pytest fixture
 from test_health import _drive_checks
 from test_phase1_driver_fixes import _FakeBox, _FakeResult
@@ -132,7 +137,8 @@ def test_face_monitoring_continues_while_object_detection_is_down(tmp_path, cloc
     closed = {"value": False}
     _closed_eyes(monkeypatch, closed)
     module, frame, detector = _detector_module(tmp_path, clock, monkeypatch)
-    module._face_mesh.process = lambda rgb, lm=make_fake_landmarks(): _FakeFaceMeshResult(lm)
+    face = make_fake_landmarks()
+    module._face_mesh.process = lambda rgb, lm=face: _FakeFaceMeshResult(lm)
     module._iris_veto = False
     detector.failing = True
     _step(module, frame, clock, 1.0)

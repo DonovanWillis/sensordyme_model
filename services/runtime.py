@@ -33,6 +33,7 @@ from typing import Any, Optional
 import cv2
 
 from core import accel, device_health, device_state, monitoring_mode, roles, sdnotify
+from core import monitoring_state as ms
 from core.alerts import AlertLevel, AlertManager
 from core.camera import Camera, CameraError
 from core.dataset import CaptureStore
@@ -192,6 +193,19 @@ class DeviceRuntime:
     _stopped: Optional[dict] = None
     _last_rejection: Optional[dict] = None
     _custom_rules_rejected = False
+    # M0.2 monitoring-state defaults (see _evaluate_monitoring).
+    _heartbeat = 0.0
+    _heartbeat_reset_at = 0.0
+    _consecutive_process_failures = 0
+    _last_process_error: Optional[str] = None
+    _detection_degraded: Optional[str] = None
+    _camera_error: Optional[str] = None
+    _camera_stale_after_s = 2.0
+    _camera_grace_until = 0.0
+    _ready_grace_from = 0.0
+    _monitoring_state: Optional[str] = None
+    _last_protection_command: Optional[str] = None
+    _model_identity: Optional[dict] = None
 
     def __init__(
         self,
@@ -320,6 +334,11 @@ class DeviceRuntime:
         #: (claiming to watch something it cannot see).
         self._detection_degraded: Optional[str] = None
         self._last_debug_print = 0.0
+        # Readiness grace: capabilities still coming up read STARTING until this
+        # long after boot or a mode switch, then a capability that never came
+        # up is IMPAIRED. Camera grace mirrors camera_check's.
+        self._ready_grace_from = time.monotonic()
+        self._camera_grace_until = time.monotonic() + 10.0
 
         self.camera: Optional[Camera] = None
         self.capture: Optional[CaptureService] = None
@@ -415,6 +434,7 @@ class DeviceRuntime:
                 "camera unavailable (%s); starting without it — capture keeps retrying "
                 "and /api/health reports it", exc,
             )
+            self._camera_error = str(exc)
             self.camera = Camera(self.config.get("camera", {}), open_now=False)
         self.capture = CaptureService(self.camera, self.bus)
 
@@ -546,6 +566,8 @@ class DeviceRuntime:
         camera_fps = max(self.camera.fps, 1.0)
         stale_after = max(2.0, 5.0 / camera_fps)  # 5 frame intervals, 2s floor
         boot_time = time.monotonic()
+        self._camera_stale_after_s = stale_after
+        self._camera_grace_until = boot_time + 10.0
 
         def camera_check() -> tuple[bool, str]:
             age = self.bus.age_s()
@@ -588,6 +610,15 @@ class DeviceRuntime:
             "accelerator",
             check=self._accelerator_health,
             check_interval_s=10.0,
+        )
+        # The product-level state (READY/DEGRADED/FAILED/...). Evaluated on the
+        # monitor thread, not the inference thread, so a wedged inference loop
+        # is still detected, reported and signalled (impaired alert). Not
+        # critical and no restart: the components it reads have their own.
+        self.health.register(
+            "monitoring",
+            check=self._monitoring_check,
+            check_interval_s=2.0,
         )
         if self.dashboard is not None:
             self.health.register(
@@ -838,12 +869,14 @@ class DeviceRuntime:
     def _collect_health(self, caller: str = "loop") -> dict:
         """This device's real state, for the app's status indicators."""
         report = self._collect_component_health(caller)
-        # The product-level answer next to the component-level one. A stopped
-        # device is not monitoring however healthy its parts are.
-        protection = self.protection_state()
-        report["protection"] = protection
-        if protection["state"] == "stopped":
-            report["monitoring_active"] = False
+        # The product-level answer next to the component-level one: the
+        # monitoring state decides monitoring_active (READY or DEGRADED), not
+        # the components alone -- a stopped, failed or still-starting device is
+        # not monitoring however healthy its parts look.
+        monitoring = self.monitoring_report()
+        report["monitoring"] = monitoring.to_dict()
+        report["monitoring_active"] = monitoring.monitoring
+        report["protection"] = self.protection_state()
         return report
 
     def _collect_component_health(self, caller: str) -> dict:
@@ -855,7 +888,11 @@ class DeviceRuntime:
             heartbeat_age_s=heartbeat_age,
             module_name=self.module_name,
             uplink_connected=self.uplink.connected if self.uplink is not None else None,
-            detection_degraded=self._detection_degraded,
+            # A module that keeps running without its detector (face-based
+            # driver monitoring) is analysing; the monitoring block says what
+            # it cannot do. Reported as "not active" only when nothing runs.
+            detection_degraded=(self._detection_degraded
+                                if not self._module_runs_without_detector() else None),
             caller=caller,
             # Whether the ACTIVE module uses the accelerator at all. Recomputed
             # per call because the active module changes at runtime when the
@@ -1050,11 +1087,14 @@ class DeviceRuntime:
         slow swap within five minutes reached the last-resort reboot.
         """
         self._swap_started = time.monotonic()
+        before = getattr(self, "module", None)
         try:
             yield
         finally:
             self._swap_started = None
             self._heartbeat = time.monotonic()
+            if getattr(self, "module", None) is not before:
+                self._ready_grace_from = time.monotonic()  # a new module: STARTING until it analyses
 
     def _inference_check(self) -> tuple[bool, str]:
         swap_started = getattr(self, "_swap_started", None)
@@ -1307,9 +1347,12 @@ class DeviceRuntime:
 
             def label_ok(label: str) -> bool:
                 return any(c.available for c in reg.providers_of_label(label))
-        zone_names = [z.name for z in (self._app_zones or [])]
-        zone_names += [z.name for z in self._zones_for_module(preset_module or self.module_name)]
-        return validate_rule_set(raw_rules, label_ok=label_ok, zone_names=zone_names)
+        # Areas are not checked here: a rule may name an area the owner has not
+        # drawn yet (the backend's own proposals do). It loads inert, the
+        # monitoring state reports it as waiting for that area, and it runs once
+        # the area arrives. Rejecting it lost it for good (M0.1 review): the
+        # rules_version was already acknowledged, so it was never re-sent.
+        return validate_rule_set(raw_rules, label_ok=label_ok)
 
     def _record_rejection(self, kind: str, subject: Optional[str], reasons: list[str]) -> None:
         self._last_rejection = {
@@ -1322,6 +1365,206 @@ class DeviceRuntime:
         if getattr(self, "uplink", None) is not None:
             self._publish_monitoring()
 
+    # ------------------------------------------------------------------ monitoring state (M0.2)
+    def _module_runs_without_detector(self, module=None) -> bool:
+        """Can the module still raise some event with object detection down?"""
+        module = getattr(self, "module", None) if module is None else module
+        hook: Any = getattr(module, "event_requirements", dict)
+        reqs: dict[str, frozenset[str]] = hook()
+        return any("objects" not in needs for needs in reqs.values())
+
+    def _camera_capability(self, now: float) -> ms.Capability:
+        bus: Optional[FrameBus] = getattr(self, "bus", None)
+        if bus is None:
+            return ms.Capability(ms.IMPAIRED, "camera pipeline not started")
+        age = bus.age_s()
+        if age == float("inf"):
+            if now < self._camera_grace_until:
+                return ms.Capability(ms.STARTING, "waiting for the first frame")
+            why = f": {self._camera_error}" if self._camera_error else ""
+            return ms.Capability(ms.IMPAIRED, f"no frame has been captured{why}")
+        capture = getattr(self, "capture", None)
+        if capture is not None and not capture.is_running:
+            return ms.Capability(ms.IMPAIRED, "capture service stopped")
+        if age > self._camera_stale_after_s:
+            return ms.Capability(ms.IMPAIRED, f"no new frame for {age:.1f}s")
+        return ms.Capability()
+
+    def _inference_capability(self, now: float, camera_ok: bool) -> ms.Capability:
+        swap_started = getattr(self, "_swap_started", None)
+        if swap_started is not None:
+            busy = now - swap_started
+            if busy < _MAX_SWAP_S:
+                return ms.Capability(ms.STARTING, f"switching mode ({busy:.0f}s)")
+            return ms.Capability(ms.IMPAIRED, f"mode switch stuck for {busy:.0f}s")
+        if self._heartbeat == 0.0:
+            if now - self._heartbeat_reset_at < _INFERENCE_STARTING_GRACE_S:
+                return ms.Capability(ms.STARTING, "inference loop starting")
+            return ms.Capability(ms.IMPAIRED, "inference loop has not started")
+        loop_age = now - self._heartbeat
+        if loop_age >= 10.0:
+            return ms.Capability(ms.IMPAIRED, f"inference loop unresponsive for {loop_age:.0f}s")
+        if self._consecutive_process_failures:
+            return ms.Capability(
+                ms.IMPAIRED, f"analysis failing ({self._consecutive_process_failures} frame(s) in a row): "
+                             f"{self._last_process_error}")
+        analysing = self._detection_degraded is None or self._module_runs_without_detector()
+        bus: Optional[FrameBus] = getattr(self, "bus", None)
+        if camera_ok and analysing and bus is not None:
+            processed = bus.processed_age_s()
+            if processed is not None and now - processed < self._ready_grace_from:
+                processed = None  # nothing analysed since this (re)start or resume
+            if processed is None:
+                if now - self._ready_grace_from < _INFERENCE_STARTING_GRACE_S:
+                    return ms.Capability(ms.STARTING, "no frame analysed yet")
+                return ms.Capability(ms.IMPAIRED, "no frame has been analysed")
+            if processed > max(5.0, self._camera_stale_after_s):
+                return ms.Capability(ms.IMPAIRED, f"no frame analysed for {processed:.0f}s")
+        return ms.Capability()
+
+    def _module_capabilities(self, module) -> dict[str, ms.Capability]:
+        hook: Any = getattr(module, "capability_status", dict)
+        caps: dict[str, ms.Capability]
+        try:
+            caps = dict(hook())
+        except Exception as exc:  # noqa: BLE001 - a broken report is itself a fact to report
+            caps = {"module": ms.Capability(ms.IMPAIRED, f"capability report failed: {exc}")}
+        if not caps:
+            # Undeclared: judged only by whether it processes frames (camera,
+            # inference), which is all that can honestly be said about it.
+            caps = {kind: ms.Capability() for kind in ("objects", "pose", "face", "hands")}
+        if self._detection_degraded is not None:
+            caps["objects"] = ms.Capability(ms.IMPAIRED, f"object detection unavailable: {self._detection_degraded}")
+        return caps
+
+    def _capabilities(self, now: float, module) -> dict[str, ms.Capability]:
+        caps = {"camera": self._camera_capability(now)}
+        caps["inference"] = self._inference_capability(now, caps["camera"].available)
+        caps.update(self._module_capabilities(module))
+        if now - self._ready_grace_from >= _INFERENCE_STARTING_GRACE_S:
+            # Bounded: a capability "starting" past the grace never came up.
+            caps = {
+                name: ms.Capability(ms.IMPAIRED, f"not ready after {_INFERENCE_STARTING_GRACE_S:.0f}s"
+                                                 f" ({cap.reason or 'starting'})")
+                if cap.state == ms.STARTING and name != "inference" else cap
+                for name, cap in caps.items()
+            }
+        return caps
+
+    _LABEL_KINDS = frozenset({"objects", "pose", "face", "hands"})
+
+    def _label_needs(self, label: str) -> frozenset[str]:
+        """The perception capability a custom rule's label comes from."""
+        if self.role.additive_custom_rules and self.module_name in self.role.mandatory_modules:
+            return frozenset({"objects"})  # additive rules read the module's own detections
+        from core.capabilities import registry
+
+        kinds = {c.kind for c in registry().providers_of_label(label) if c.available} & self._LABEL_KINDS
+        return frozenset(sorted(kinds)[:1]) if kinds else frozenset({"objects"})
+
+    def _active_policies(self, module) -> list[ms.Policy]:
+        policies: list[ms.Policy] = []
+        if self.mode is not monitoring_mode.MonitoringMode.AI_CUSTOM:
+            hook: Any = getattr(module, "event_requirements", dict)
+            reqs: dict[str, frozenset[str]] = dict(hook())
+            if not reqs:
+                reqs = {self.module_name: frozenset({"objects"}) if self._module_uses_a_detector() else frozenset()}
+            name = self.active_preset or self.module_name
+            policies.append(ms.Policy(
+                id=f"preset:{name}", kind="preset", name=name,
+                events={event: ms.BASE_REQUIREMENTS | needs for event, needs in reqs.items()},
+            ))
+        if self._custom_active():
+            from core.rules import _zone_key
+
+            waiting = {_zone_key(z) for z in self.rule_engine.pending_zones()}
+            for rule in self.rule_engine.rules:
+                needs = self._label_needs(rule.detection)
+                if rule.secondary:
+                    needs |= self._label_needs(rule.secondary)
+                blocked = ({rule.rule_id: f"area '{rule.zone}' is not drawn yet"}
+                           if rule.zone and _zone_key(rule.zone) in waiting else {})
+                policies.append(ms.Policy(
+                    id=f"rule:{rule.rule_id}", kind="rule", name=rule.description or rule.rule_id,
+                    events={rule.rule_id: ms.BASE_REQUIREMENTS | needs}, blocked=blocked,
+                ))
+        return policies
+
+    def _evaluate_monitoring(self) -> ms.Evaluation:
+        """The device's monitoring state from what is observed right now."""
+        now = time.monotonic()
+        module = getattr(self, "module", None)
+        stopped = None if self._stopped is None else f"monitoring stopped by {self._stopped['by']}"
+        return ms.evaluate(
+            stopped=stopped,
+            capabilities=self._capabilities(now, module),
+            policies=self._active_policies(module),
+            role_required=self.role.required_capabilities,
+            actuators=self.alert_manager.actuators() if hasattr(self.alert_manager, "actuators") else (),
+        )
+
+    def monitoring_report(self) -> ms.MonitoringReport:
+        """The public, typed monitoring state (dashboard /api/health, uplink, app)."""
+        evaluation = self._evaluate_monitoring()
+        bus: Optional[FrameBus] = getattr(self, "bus", None)
+        frame_age = None if bus is None or bus.age_s() == float("inf") else round(bus.age_s(), 2)
+        processed = None if bus is None else bus.processed_age_s()
+        identity = self._model_identity or {}
+        return ms.MonitoringReport(
+            state=evaluation.state,
+            reasons=evaluation.reasons,
+            role=self.role.name,
+            active_preset=getattr(self, "active_preset", None),
+            module=getattr(self, "module_name", ""),
+            mode=self.mode.value,
+            custom_rules=tuple(r.rule_id for r in self.rule_engine.rules) if self._custom_active() else (),
+            capabilities=evaluation.capabilities,
+            policies=evaluation.policies,
+            actuators=tuple(self.alert_manager.actuators()) if hasattr(self.alert_manager, "actuators") else (),
+            last_frame_age_s=frame_age,
+            last_inference_age_s=None if processed is None else round(processed, 2),
+            model={"detector": identity.get("detector"), "status": accel.live_status()[1]},
+            versions={"software": _VERSION, "model": self._model_version()},
+        )
+
+    def _monitoring_check(self) -> tuple[bool, str]:
+        """Health-monitor tick: evaluate, act on transitions, drive the impaired alert."""
+        report = self.monitoring_report()
+        state = report.state
+        now = time.monotonic()
+        previous, self._monitoring_state = self._monitoring_state, state.value
+        if previous != state.value:
+            detail = "; ".join(report.reasons) or "all monitoring policies operational"
+            (log.warning if state in (ms.MonitoringState.FAILED, ms.MonitoringState.DEGRADED) else log.info)(
+                "[MONITORING] %s -> %s: %s", previous or "boot", state.value, detail)
+            self._log_system_event(f"monitoring_{state.value}", detail)
+            if state in (ms.MonitoringState.FAILED, ms.MonitoringState.STOPPED):
+                # What the module and rules last believed is stale now: end
+                # their episodes. A condition still live after recovery re-opens
+                # (_reopen_live_episodes), so nothing is lost and nothing doubled.
+                self.alert_manager.end_source(now, "module")
+                self.alert_manager.end_source(now, "rules")
+            self._publish_monitoring()
+        self._signal_impaired(state is ms.MonitoringState.FAILED, report, now)
+        return state in (ms.MonitoringState.READY, ms.MonitoringState.STARTING, ms.MonitoringState.STOPPED), (
+            f"{state.value}: {'; '.join(report.reasons[:3])}" if report.reasons else state.value)
+
+    _IMPAIRED_KEY = "monitoring_impaired"
+
+    def _signal_impaired(self, impaired: bool, report: ms.MonitoringReport, now: float) -> None:
+        """While FAILED (not stopped, not starting), signal "cannot monitor" on any
+        output that still works, with the bounded impaired pattern (every 15 s, at
+        most 20 repeats, then silent until recovery). DEGRADED is reported, not
+        sounded: an unexplained chirp for a lost phone detector would teach a
+        driver to ignore the buzzer."""
+        if impaired and self._IMPAIRED_KEY not in self.alert_manager.open_keys("health"):
+            event = Event.now(self._IMPAIRED_KEY, 0.0, None, "system", "; ".join(report.reasons))
+            self.alert_manager.notify(event, now=now, key=self._IMPAIRED_KEY, category="impaired", source="health")
+            if self.uplink is not None:
+                self.uplink.push_event(event, "loud", model=self._model_identity)
+        self.alert_manager.observe(now, source="health", active={self._IMPAIRED_KEY} if impaired else (),
+                                   tracked={self._IMPAIRED_KEY})
+
     def protection_state(self) -> dict:
         """The truthful answer to "is this device protecting right now?".
 
@@ -1331,17 +1574,22 @@ class DeviceRuntime:
         """
         if self._stopped is not None:
             return {"state": "stopped", "role": self.role.name, "since": self._stopped["since"],
-                    "by": self._stopped["by"], "reasons": ["monitoring was stopped explicitly"]}
+                    "by": self._stopped["by"], "reasons": ["monitoring was stopped explicitly"],
+                    "monitoring_state": ms.MonitoringState.STOPPED.value,
+                    "last_command_id": self._last_protection_command}
+        evaluation = self._evaluate_monitoring()
         reasons: list[str] = []
-        if self._detection_degraded is not None:
-            reasons.append(f"detection unavailable: {self._detection_degraded}")
+        if evaluation.state in (ms.MonitoringState.FAILED, ms.MonitoringState.STARTING):
+            reasons += list(evaluation.reasons)
         if self.role.has_floor and self.module_name not in self.role.mandatory_modules:
             reasons.append(
                 f"role '{self.role.name}' requires {', '.join(sorted(self.role.mandatory_modules))}; "
                 f"running {self.module_name}"
             )
+        degraded = list(evaluation.reasons) if evaluation.state is ms.MonitoringState.DEGRADED else []
         return {"state": "not_protecting" if reasons else "protecting", "role": self.role.name,
-                "reasons": reasons}
+                "reasons": reasons, "degraded": degraded, "monitoring_state": evaluation.state.value,
+                "last_command_id": self._last_protection_command}
 
     def _policy_state(self) -> dict:
         return {
@@ -1356,15 +1604,23 @@ class DeviceRuntime:
         if self.uplink is not None:
             self.uplink.set_monitoring({**self.monitoring.describe(), **self._policy_state(),
                                         "base_monitoring_disabled":
-                                            self.mode is monitoring_mode.MonitoringMode.AI_CUSTOM})
+                                            self.mode is monitoring_mode.MonitoringMode.AI_CUSTOM,
+                                        "state": self._monitoring_state})
         if self.dashboard is not None:
             setter = getattr(self.dashboard, "set_policy_state", None)
             if callable(setter):
                 setter(self._policy_state())
 
     def _apply_protection(self, request: dict, source: str) -> None:
-        """Explicit stop / resume. A stop must be confirmed; it is never implied."""
+        """Explicit stop / resume. A stop must be confirmed; it is never implied.
+
+        A request carrying an id (the backend's) is echoed as last_command_id once
+        handled -- applied or refused -- so the backend converges on THIS request.
+        """
         action = str((request or {}).get("action", "")).lower()
+        command_id = (request or {}).get("id")
+        if command_id:
+            self._last_protection_command = str(command_id)
         if action == "stop":
             if (request or {}).get("confirm") is not True:
                 self._record_rejection("protection", "stop", ["stopping monitoring requires confirm: true"])
@@ -1377,6 +1633,12 @@ class DeviceRuntime:
         elif action == "resume":
             if self._stopped is not None:
                 self._stopped = None
+                self._ready_grace_from = time.monotonic()  # STARTING until frames are analysed again
+                # Re-arm custom rules: a rule still true at resume re-confirms and
+                # alerts, instead of EventEngine treating it as already reported.
+                # Module conditions re-open through _reopen_live_episodes.
+                if self._custom_active():
+                    self.rule_engine.replace_rules(self.monitoring.rules)
                 log.info("[PROTECTION] resumed by %s", source)
                 self._log_system_event("protection_resumed", f"monitoring resumed by {source}")
         else:
@@ -1679,8 +1941,26 @@ class DeviceRuntime:
         # Advance this module's open episodes: repeat/escalate those whose
         # condition is still true, end the ones that cleared.
         tracked, active = _episode_state(module)
+        if self.mode is not monitoring_mode.MonitoringMode.AI_CUSTOM:
+            self._reopen_live_episodes(module, tracked, active, now)
         self.alert_manager.observe(now, source="module", active=active, tracked=tracked)
         return evidence_due
+
+    def _reopen_live_episodes(self, module, tracked, active, now: float) -> None:
+        """Open an episode for a tracked condition that is live but has none.
+
+        Trackers fire once per episode, so after episodes were closed from outside
+        -- an explicit stop and resume, monitoring FAILED and recovered, a mode
+        change -- a driver still asleep produced no new event and no alert (M0.1
+        review). A live alertable condition without an open episode gets one now.
+        In normal operation the module's own event opened it first, so this adds
+        nothing.
+        """
+        missing = (set(active) & set(tracked) & set(self.alert_event_types)) - self.alert_manager.open_keys("module")
+        for event_type in sorted(missing):
+            event = Event.now(event_type, 0.0, None, getattr(module, "name", self.module_name),
+                              "condition still active")
+            self.alert_manager.notify(event, now=now)
 
     def _evaluate_custom_rules(self, module, frame, now: float) -> None:
         """Evaluate custom rules on the module's raw per-frame view; advance rule episodes.
@@ -1733,10 +2013,6 @@ class DeviceRuntime:
                 stop.wait(0.5)
                 continue
             if self._detection_degraded is not None:
-                # No detector, so there is nothing honest to compute. The
-                # heartbeat still ticks -- the loop IS alive, and health must be
-                # able to tell "degraded" from "hung", which are different
-                # failures with different fixes.
                 self._heartbeat = time.monotonic()
                 if time.monotonic() - last_detector_retry >= _DETECTOR_RETRY_S:
                     last_detector_retry = time.monotonic()
@@ -1744,9 +2020,17 @@ class DeviceRuntime:
                         self._retry_detection_backend()
                     except Exception:  # a failed retry must not crash the loop
                         log.exception("detector retry failed; still DEGRADED")
-                stop.wait(0.5)
-                continue
-            frame, seq = self.bus.wait_for_fresh(last_seq, timeout=0.5)
+                if not self._module_runs_without_detector():
+                    # No detector and nothing this module can do without one:
+                    # there is nothing honest to compute. The heartbeat still
+                    # ticks -- the loop IS alive, and health must be able to
+                    # tell "degraded" from "hung".
+                    stop.wait(0.5)
+                    continue
+                # Otherwise keep running what still works (audit F05: a missing
+                # detector used to switch off face-only drowsiness too). The
+                # monitoring state reports object detection as unavailable.
+            frame, seq, captured_at = self.bus.wait_for_fresh_stamped(last_seq, timeout=0.5)
             if seq == last_seq or frame is None:
                 # The heartbeat measures whether THIS LOOP is responsive; frame
                 # availability is the camera component's own check. Without this
@@ -1773,13 +2057,18 @@ class DeviceRuntime:
             # _MAX_CONSECUTIVE_PROCESS_FAILURES in a row this re-raises, handing
             # off to the same recovery ladder a truly wedged module already had.
             try:
+                setter = getattr(module, "set_frame_time", None)
+                if callable(setter):
+                    setter(captured_at)  # decisions rest on when the frame was SEEN
                 events = module.process(frame)
                 self._consecutive_process_failures = 0
+                self._last_process_error = None
                 # Processed-frame cadence, not capture cadence: a stall here is
                 # what makes EventEngine drop in-progress evidence.
                 self.bus.record_processed()
             except Exception as exc:
                 self._consecutive_process_failures += 1
+                self._last_process_error = str(exc) or type(exc).__name__
                 log.error(
                     "module.process() failed (%d/%d consecutive): %s",
                     self._consecutive_process_failures, _MAX_CONSECUTIVE_PROCESS_FAILURES, exc,

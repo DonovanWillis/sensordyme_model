@@ -21,7 +21,7 @@ from typing import Optional, Union
 
 import yaml
 
-from core.alerts import AlertLevel, AlertManager, ConsoleSink, SoundSink
+from core.alerts import AlertLevel, AlertManager, ConsoleSink, SoundSink, UnavailableSink
 from modules import available_modules, get_module_class
 
 # Event types that reach the AlertManager at all, per profile. Anything else (e.g.
@@ -187,10 +187,15 @@ def build_alert_manager(alert_cfg: dict, is_pi: bool) -> AlertManager:
                     sinks.append(GPIOBuzzerSink(int(alert_cfg.get("gpio_buzzer_pin", 17))))
                 except Exception as exc:  # noqa: BLE001 - any failure means "no buzzer"
                     print(f"SensorDyme: 'gpio_buzzer' sink unavailable ({exc}); continuing without it")
+                    # Kept, as unavailable: health must report the missing buzzer
+                    # (a driver_safety device without one is FAILED, not protecting).
+                    sinks.append(UnavailableSink("gpio_buzzer", "buzzer", True, f"could not be set up: {exc}"))
             else:
                 print("SensorDyme: 'gpio_buzzer' sink skipped (not running on a Pi)")
+                sinks.append(UnavailableSink("gpio_buzzer", "buzzer", True, "not running on a Raspberry Pi"))
         else:
             print(f"SensorDyme: unknown alert sink '{sink_name}', skipping")
+            sinks.append(UnavailableSink(str(sink_name), "unknown", False, "unknown alert sink type"))
 
     fixed_levels = {}
     type_categories: dict[str, str] = {}

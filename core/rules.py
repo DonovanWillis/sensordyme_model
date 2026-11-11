@@ -396,7 +396,7 @@ class _StillnessWatcher:
         return False
 
 
-def validate_rule_set(raw_rules, *, label_ok: Callable[[str], bool], zone_names) -> list[str]:
+def validate_rule_set(raw_rules, *, label_ok: Callable[[str], bool], zone_names=None) -> list[str]:
     """Every reason this rule set cannot run as written on THIS device (empty = ok).
 
     Fail-closed and all-or-nothing: the device applies a rule set only when every
@@ -407,11 +407,13 @@ def validate_rule_set(raw_rules, *, label_ok: Callable[[str], bool], zone_names)
         label_ok: Whether this device can currently detect a label (it differs by
             role: an additive driver device can only target what its driver
             module detects; a general device asks the capability registry).
-        zone_names: The areas defined on this device.
+        zone_names: The areas defined on this device, or None to accept rules
+            whose area is not drawn yet (the device runs them once it is, and
+            reports them as waiting until then).
     """
     if not isinstance(raw_rules, list):
         return ["rules must be a list"]
-    zones = {_zone_key(str(z)) for z in zone_names}
+    zones = None if zone_names is None else {_zone_key(str(z)) for z in zone_names}
     errors: list[str] = []
     for index, raw in enumerate(raw_rules, start=1):
         where = f"rule {index}"
@@ -436,7 +438,7 @@ def validate_rule_set(raw_rules, *, label_ok: Callable[[str], bool], zone_names)
             elif not label_ok(secondary):
                 errors.append(f"{where}: this device cannot detect '{secondary}'")
         zone = str(raw.get("zone") or "").strip()
-        if zone and _zone_key(zone) not in zones:
+        if zone and zones is not None and _zone_key(zone) not in zones:
             errors.append(f"{where}: area '{zone}' is not defined on this device; draw it first")
     return errors
 

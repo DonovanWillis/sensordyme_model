@@ -19,6 +19,8 @@ What a role can require:
   requires_audible_sink at least one audible actuator (buzzer / sound) configured
   additive_custom_rules custom rules run BESIDE the mandatory module instead of
                         replacing it
+  required_capabilities perception/alert capabilities (core/monitoring_state.py)
+                        whose loss makes the device FAILED rather than DEGRADED
 
 Enforcement lives at every channel that can change behaviour: config load
 (core/config_schema.py), preset restore (main.py), preset switches and custom
@@ -74,6 +76,9 @@ class Role:
     additive_custom_rules: bool = False
     #: The alert categories that must keep repeating (bounded) for this role.
     repeating_categories: frozenset[str] = field(default_factory=frozenset)
+    #: Capabilities without which this role cannot do its job at all: losing one
+    #: is FAILED. Anything else an active policy needs is DEGRADED when lost.
+    required_capabilities: frozenset[str] = field(default_factory=frozenset)
 
     @property
     def has_floor(self) -> bool:
@@ -88,8 +93,12 @@ class Role:
             "allowed_presets": None if self.allowed_presets is None else sorted(self.allowed_presets),
             "mandatory_alert_types": sorted(self.mandatory_alert_types),
             "additive_custom_rules": self.additive_custom_rules,
+            "required_capabilities": sorted(self.required_capabilities),
         }
 
+
+#: Every role needs frames and a running inference loop.
+_VISION = frozenset({"camera", "inference"})
 
 _DRIVER_FLOORS = tuple(
     ParameterFloor("driver_attention", key, max=limit)
@@ -123,13 +132,19 @@ ROLES: dict[str, Role] = {
             requires_audible_sink=True,
             additive_custom_rules=True,
             repeating_categories=frozenset({"critical", "warning"}),
+            # Face landmarks carry drowsiness, distraction and attention-lost;
+            # without them, or without a way to sound an alert in the cabin,
+            # the device cannot protect a driver. Losing object detection only
+            # loses phone/eating detection: DEGRADED.
+            required_capabilities=_VISION | {"face", "audible_alert"},
         ),
-        # Product roles with no mandatory safeguard defined yet. Each will declare
-        # its own floor when its preset is validated; none inherits driver rules.
-        Role("child_monitoring", "Child monitoring"),
-        Role("occupancy", "Occupancy monitoring"),
-        Role("property", "Property monitoring"),
-        Role("workplace", "Workplace safety"),
+        # Product roles with no preset floor defined yet (none inherits driver
+        # rules). Their health requirements are the minimum each one's purpose
+        # implies; refine them when each role's preset is validated.
+        Role("child_monitoring", "Child monitoring", required_capabilities=_VISION),
+        Role("occupancy", "Occupancy monitoring", required_capabilities=_VISION | {"objects"}),
+        Role("property", "Property monitoring", required_capabilities=_VISION | {"objects"}),
+        Role("workplace", "Workplace safety", required_capabilities=_VISION),
     )
 }
 

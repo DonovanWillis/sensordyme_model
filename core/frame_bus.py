@@ -153,6 +153,26 @@ class FrameBus:
             self._cond.wait_for(lambda: self._seq != last_seq, timeout=timeout)
             return self._frame, self._seq
 
+    def wait_for_fresh_stamped(
+        self, last_seq: int, timeout: float = 1.0
+    ) -> tuple[Optional[np.ndarray], int, float]:
+        """wait_for_fresh(), plus the newest frame's publish (capture) time.
+
+        The timestamp contract for consumers: every frame carries the monotonic
+        time it was published, read under the same lock as the frame itself, so
+        decisions can rest on when a frame was seen rather than when the
+        consumer got to it (and a future replay can feed recorded times).
+        """
+        with self._cond:
+            self._cond.wait_for(lambda: self._seq != last_seq, timeout=timeout)
+            return self._frame, self._seq, self._published_at
+
+    def processed_age_s(self, consumer: str = "inference") -> Optional[float]:
+        """Seconds since `consumer` last finished a frame (None if it never has)."""
+        with self._cond:
+            at = self._processed_at.get(consumer)
+        return None if at is None else time.monotonic() - at
+
     def age_s(self) -> float:
         """Seconds since the last publish (inf before the first frame).
 
