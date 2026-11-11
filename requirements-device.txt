@@ -48,6 +48,11 @@ requests==2.34.2
 # of ultralytics' copyleft.
 onnxruntime==1.27.0
 
+# BLE provisioning proof-of-possession (services/ble_pop.py, M6.5 4B): HKDF, HMAC,
+# PBKDF2 and AES-GCM, imported on use. Apache-2.0 OR BSD-3-Clause; no copyleft.
+# (core/secret_store.py and core/command_auth.py need only the standard library.)
+cryptography==50.0.2
+
 # --- Raspberry Pi only extras ---
 # These are installed separately by setup_pi.sh. picamera2 ships as an apt
 # package on Pi OS (python3-picamera2) and is NOT pip-installable on Mac;

@@ -97,14 +97,19 @@ the state back).
 * `requirements-device.txt` holds only what the device runtime imports. **Moved out**
   to `requirements.txt` (dev + CI, which still includes the device file): `pytest`
   (nothing on the device imports it) and `anthropic` (only `core/vlm_judge.py`, reached
-  only from the `mac_max` profile behind `require_mps`). No pin changed.
+  only from the `mac_max` profile behind `require_mps`). No existing pin changed.
+* **Added** `cryptography==50.0.2` (Apache-2.0 OR BSD-3-Clause) for the BLE proof-of-possession
+  workstream (`services/ble_pop.py`, 4B: HKDF, HMAC, PBKDF2, AES-GCM, imported on use). The
+  security workstream's `core/secret_store.py` and `core/command_auth.py` need only the stdlib.
+  Until `ble_pop.py` is merged the pin is unused (the checker allows an unused pin).
+  The integrator should confirm the BLE agent tested against this version.
 * `scripts/release/check_device_deps.py` checks both directions statically: every
   third-party import in `main.py`, `scripts/preflight.py`, `core/`, `services/`,
   `modules/` and the vendored DashSentinel code it loads is pinned, apt-provided
   (picamera2, libcamera, hailo_platform, gpiozero, dbus, gi) or a listed Mac-only
   import (torch, ultralytics, anthropic, each confined to its file); and no
   test/dev/research package is pinned. `tests/test_device_dependencies.py` enforces it.
-* `requirements-device.lock`: hash-locked for CPython 3.11 aarch64 (Bookworm), 36
+* `requirements-device.lock`: hash-locked for CPython 3.11 aarch64 (Bookworm), 37
   packages, from metadata only. **Not yet used** by `setup_pi.sh` or `make deploy`
   (the least-privilege plan installs it with `--require-hashes`); adopt after one
   install on a real Pi.

@@ -34,6 +34,15 @@ def test_pytest_and_anthropic_left_the_device_but_ci_still_installs_them():
     assert re.search(r"^pytest==", ci, re.M) and re.search(r"^anthropic==", ci, re.M)
 
 
+def test_cryptography_ships_for_ble_proof_of_possession():
+    """services/ble_pop.py (M6.5 4B) runs on the device, so its one dependency is a device pin, locked."""
+    device = deps.requirement_pins(REPO / "requirements-device.txt")
+    assert "cryptography" in device
+    lock = (REPO / "requirements-device.lock").read_text()
+    assert re.search(rf"^cryptography=={re.escape(device['cryptography'])} ", lock, re.M)
+    assert "cryptography" not in deps.FORBIDDEN_ON_DEVICE and "cryptography" not in deps.DEV_ONLY_IMPORTS
+
+
 def test_developer_only_imports_stay_in_their_mac_only_files():
     found = deps.third_party_imports(deps.device_files())
     for top, allowed in DEV_ONLY_FILES.items():

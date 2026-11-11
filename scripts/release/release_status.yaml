@@ -60,7 +60,7 @@ components:
     evidence: "deploy/systemd/sensordyme.service.hardened; systemd-analyze verify clean, exposure 9.0 -> 1.7 (docs/LEAST_PRIVILEGE.md); not installed"
   device_dependencies:
     tiers: [software-ready]
-    evidence: "pytest/anthropic removed from requirements-device.txt (section 4 item 5 closed); scripts/release/check_device_deps.py"
+    evidence: "pytest/anthropic removed from requirements-device.txt (section 4 item 5 closed); cryptography added for BLE PoP; scripts/release/check_device_deps.py"
   device_dependency_lock:
     tiers: [software-ready, hardware-pending]
     evidence: "requirements-device.lock, hashed, CPython 3.11 aarch64; not yet installed on a Pi"
