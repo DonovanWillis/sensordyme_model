@@ -525,6 +525,11 @@ class AttentionCalibrator:
             return
         try:
             data = json.loads(self._path.read_text())
+            if not isinstance(data, dict):
+                # Valid JSON of the wrong shape (a list, null, a number) used to
+                # raise AttributeError out of the module constructor: the device
+                # booted FAILED on every boot until the file was deleted (M6.5).
+                return
             if int(data.get("version", 1)) != self.FORMAT_VERSION:
                 return  # stale format: leave uncalibrated; a fresh window will rewrite it
             if bool(data["gaze_fused"]) != self._gaze_fused:
@@ -558,8 +563,8 @@ class AttentionCalibrator:
             baseline_eye = None if eye is None else (float(eye[0]), float(eye[1]))
             if not (math.isfinite(baseline_ear) and math.isfinite(ear_threshold)):
                 return
-        except (json.JSONDecodeError, KeyError, ValueError, TypeError, IndexError):
-            return
+        except (OSError, json.JSONDecodeError, KeyError, ValueError, TypeError, IndexError):
+            return  # unreadable: recalibrate rather than fail to build the module
         self._baseline_ear = baseline_ear
         self._ear_threshold = ear_threshold
         self._baseline_rotation = baseline_rotation
