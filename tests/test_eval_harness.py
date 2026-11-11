@@ -262,3 +262,15 @@ def test_unlicensed_or_tampered_data_is_refused(tmp_path):
     (tmp_path / "0.avi").write_bytes(b"x")
     with pytest.raises(EvaluationRefusedError, match="changed since"):
         evaluate(m, tmp_path, "val", lambda: SquareModule({}))
+
+
+def test_the_incabin_vocabulary_is_enforced_by_the_parser():
+    vocab = json.loads((Path(__file__).resolve().parent.parent / "evaluation/schemas/incabin_v1.json").read_text())
+    known = set(vocab["events"])
+    ok, problems = ann.parse({"item": "s01", "events": [{"type": "phone_use", "start_s": 3, "end_s": 6}],
+                              "states": {"eyes_closed": [[10, 12]]}}, known_types=known)
+    assert ok is not None and problems == []
+    _, problems = ann.parse({"item": "s01", "events": [{"type": "texting", "start_s": 1, "end_s": 2}]},
+                            known_types=known)
+    assert any("unknown event type 'texting'" in p for p in problems)
+    assert {"glance_mirror_left", "long_closure"} <= known and "eyes_closed" in vocab["states"]
