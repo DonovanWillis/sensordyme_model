@@ -1,5 +1,5 @@
 .PHONY: help dev dev-debug dev-max dev-openpilot dev-skinnemoen dev-dashsentinel \
-        bench accuracy accuracy-dataset accuracy-gate report deploy \
+        bench accuracy accuracy-dataset accuracy-gate report deploy deploy-preflight \
         test test-cov test-ios lint lint-fix fmt-check typecheck audit check mutants \
         setup-dev hooks clean
 
@@ -267,7 +267,21 @@ demo-check: ## run the demo preflight on the device (DEMO READY / NOT READY)
 demo-cycle: ## rehearse every demo mode on the device, with restarts
 	ssh pi@sensordyme.local 'cd ~/sensordyme && bash scripts/demo_cycle.sh'
 
-deploy: ## rsync to pi@sensordyme.local, install deps, migrate config, restart
+# The device's config.yaml is never overwritten (above), so check IT -- not the
+# repo's -- against the code about to land: schema, role floor, what the role
+# needs, and whether the .hef on the device is the build its config pins. A
+# device's role is never changed by a deploy; pass ROLE= to state which role
+# this deployment is for (e.g. `make deploy ROLE=driver_safety`).
+deploy-preflight: ## check the device's own config against this code (ROLE=driver_safety to require it)
+	@tmp=$$(mktemp -d) && trap 'rm -rf "$$tmp"' EXIT && \
+	scp -q pi@sensordyme.local:~/sensordyme/config.yaml "$$tmp/config.yaml" && \
+	hef=$$($(VENV)/python scripts/deploy_preflight.py --config "$$tmp/config.yaml" --print-hef-path) && \
+	if [ -n "$$hef" ]; then \
+		set -- --hef-sha256 "$$(ssh pi@sensordyme.local "cd ~/sensordyme && sha256sum '$$hef' 2>/dev/null | cut -d' ' -f1")"; \
+	else set --; fi && \
+	$(VENV)/python scripts/deploy_preflight.py --config "$$tmp/config.yaml" $(if $(ROLE),--expect-role $(ROLE)) "$$@"
+
+deploy: deploy-preflight ## preflight, rsync to pi@sensordyme.local, install deps, migrate config, restart
 	rsync -av --exclude='.venv' --exclude='data' --exclude='.git' --exclude='__pycache__' \
 		--exclude='config.yaml' --exclude='*.log' --exclude='.secrets' --exclude='*.pt' \
 		--exclude='*.hef' --exclude='*.db' --exclude='*.sqlite3' --exclude='*.csv' \
