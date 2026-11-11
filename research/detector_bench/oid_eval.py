@@ -186,6 +186,8 @@ def operating_point(result: ClassResult, threshold: float) -> dict:
                                              if result.negative_images else None),
         "negative_images": result.negative_images,
         # a false box overlapping a real one (0.1 <= IoU < match) is a localisation/duplicate error
+        "mean_tp_iou": (sum(s.best_iou for s in kept if s.tp and s.matched is not None)
+                        / max(1, sum(1 for s in kept if s.tp and s.matched is not None))),
         "fp_localisation": sum(s.best_iou >= 0.1 for s in false),
         "fp_background": sum(s.best_iou < 0.1 for s in false),
     }

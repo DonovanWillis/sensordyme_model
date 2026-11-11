@@ -79,6 +79,26 @@ RUNS = [
     ("yolox_tiny", "yolox_tiny", {}),
     ("yolox_s", "yolox_s", {}),
 ]
+#: Mission 5: decoder x preprocessing x NMS, all on the shipping DAMO-T weights, decoded by the
+#: PRODUCT's code (core/accel.py) where the name says device_*.
+_T = "damoyolo_tinynasL20_T"
+_S_NODES = ("Mul_239", "Sigmoid_259", "Mul_279", "Sigmoid_299", "Mul_319", "Sigmoid_339")
+M5_RUNS = [
+    ("m5.t.legacy", _T, {"variant": "x", "decoder": "device_legacy"}),
+    ("m5.t.reference", _T, {"variant": "x", "decoder": "device_reference"}),
+    ("m5.t.reference.stretch", _T, {"variant": "x", "decoder": "device_reference", "preprocess": "stretch"}),
+    ("m5.t.reference.topleft0", _T, {"variant": "x", "decoder": "device_reference", "preprocess": "topleft0"}),
+    ("m5.t.reference.nms07", _T, {"variant": "x", "decoder": "device_reference", "nms_iou": 0.7}),
+    ("m5.t.research_multilabel", _T, {"variant": "offset0_multilabel"}),  # carries anchor-argmax metadata
+    ("m5.s.reference", "damoyolo_tinynasL25_S", {"variant": "x", "decoder": "device_reference",
+                                                 "head_nodes": _S_NODES}),
+    ("m5.s.reference.stretch", "damoyolo_tinynasL25_S", {"variant": "x", "decoder": "device_reference",
+                                                         "preprocess": "stretch", "head_nodes": _S_NODES}),
+]
+RUNS = RUNS + M5_RUNS
+SAVE_PREDICTIONS = {"m5.t.legacy", "m5.t.reference", "m5.t.reference.stretch", "m5.s.reference"}
+COCO_NAMES_SHORT = {0: "person", 39: "bottle", 41: "cup", 62: "tv", 63: "laptop", 64: "mouse", 65: "remote",
+                    66: "keyboard", 67: "cell phone", 73: "book", 76: "scissors", 26: "handbag", 24: "backpack"}
 SHIPPED = {"phone": 0.20, "person": 0.50}
 SWEEP = (0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7)
 PHONE, PERSON, HAND = "/m/050k8", "/m/01g317", "/m/0k65p"
@@ -236,6 +256,7 @@ def run(data: Path, models: Path, split: str, provider: str, out: Path, *, max_s
                 model(warm)
             model.timing = dm.Timing()
             preds: dict[str, dict[str, list]] = {"phone": {}, "person": {}}
+            argmax_of: dict[tuple, int] = {}  # (image, score, box) -> class that won the anchor
             t0 = time.perf_counter()
             for n, item in enumerate(items):
                 if n and n % 400 == 0:
@@ -243,8 +264,12 @@ def run(data: Path, models: Path, split: str, provider: str, out: Path, *, max_s
                 td = time.perf_counter()
                 image = _load_image(data / item.path, max_side)
                 decode_ms.append((time.perf_counter() - td) * 1e3)
-                for label, score, x1, y1, x2, y2 in model(image):
+                dets = model(image)
+                for k, (label, score, x1, y1, x2, y2) in enumerate(dets):
                     preds[label].setdefault(item.id, []).append((score, (x1, y1, x2, y2)))
+                    meta = getattr(model, "last_argmax", None)
+                    if meta and meta[k] is not None:
+                        argmax_of[(item.id, score, (x1, y1, x2, y2))] = int(meta[k])
             wall = time.perf_counter() - t0
             gpu = monitor.stop()
             entry: dict[str, Any] = {"checkpoint": ckpt, "max_side": max_side, "session_build_s": round(build_s, 2),
@@ -270,8 +295,19 @@ def run(data: Path, models: Path, split: str, provider: str, out: Path, *, max_s
                      "bootstrap": oe.group_bootstrap(result, SHIPPED[label]) if max_side in (None, 640) else None}
                 if label == "phone" and max_side in (None, 640):
                     c["failures"] = _failures(result, SHIPPED[label], provenance)
+                    if argmax_of:
+                        c["multilabel_analysis"] = _multilabel_analysis(preds["phone"], result, argmax_of)
                 entry["classes"][label] = c
             entry["metrics_s"] = round(time.perf_counter() - t_metrics, 1)
+            if run_name in SAVE_PREDICTIONS:
+                pred_dir = data.parent / "bench_preds"
+                pred_dir.mkdir(exist_ok=True)
+                with (pred_dir / f"{key}_{split}.jsonl").open("w") as f:
+                    for label, per_image in preds.items():
+                        for image_id, rows in per_image.items():
+                            for sc, box in rows:
+                                f.write(json.dumps({"id": image_id, "label": label, "score": sc,
+                                                    "box": list(box)}) + "\n")
             report["runs"][key] = entry
             out.mkdir(parents=True, exist_ok=True)
             (out / f"bench_{split}_{provider}.partial.json").write_text(json.dumps(report, indent=1, default=str))
@@ -285,6 +321,28 @@ def run(data: Path, models: Path, split: str, provider: str, out: Path, *, max_s
     out.mkdir(parents=True, exist_ok=True)
     (out / f"bench_{split}_{provider}.json").write_text(json.dumps(report, indent=1, default=str))
     return report
+
+
+def _multilabel_analysis(phone_preds: dict, result: oe.ClassResult, argmax_of: dict) -> dict:
+    """Why multilabel adds phone boxes on phone-free images: which class won those anchors, at what scores."""
+    rows = []
+    for image_id in result.negative_ids:
+        for score, box in phone_preds.get(image_id, []):
+            winner = argmax_of.get((image_id, score, box))
+            if winner is not None:
+                rows.append((score, winner))
+    extra = [(s, w) for s, w in rows if w != 67]
+    by_winner: dict[str, int] = {}
+    for _, w in extra:
+        name = COCO_NAMES_SHORT.get(w, f"coco{w}")
+        by_winner[name] = by_winner.get(name, 0) + 1
+    bands = {f"{lo:.1f}-{lo + 0.1:.1f}": sum(lo <= s < lo + 0.1 for s, _ in extra) for lo in (0.0, 0.1, 0.2, 0.3, 0.4, 0.5)}
+    return {"phone_boxes_on_phone_free_images": len(rows),
+            "of_which_phone_was_not_the_anchor_argmax": len(extra),
+            "anchor_winner_class": dict(sorted(by_winner.items(), key=lambda kv: -kv[1])),
+            "extra_box_score_bands": bands,
+            "extra_boxes_at_or_above_0.2": sum(s >= 0.2 for s, _ in extra),
+            "extra_boxes_at_or_above_0.4": sum(s >= 0.4 for s, _ in extra)}
 
 
 def _f(x) -> str:
