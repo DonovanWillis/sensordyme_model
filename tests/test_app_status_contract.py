@@ -366,5 +366,9 @@ def test_the_app_decodes_every_status_field(backend):
     status = _status(client, headers)
     swift = (Path(__file__).resolve().parent.parent / "ios" / "Sources" / "DeviceStatus.swift").read_text()
     keys = re.search(r"enum CodingKeys: String, CodingKey \{(.*?)\n    \}", swift, flags=re.DOTALL).group(1)
-    for field in status:
-        assert f'"{field}"' in keys or re.search(rf"\bcase\b[^\n]*\b{field}\b", keys), field
+    decoded = {f for f in status if f'"{f}"' in keys or re.search(rf"\bcase\b[^\n]*\b{f}\b", keys)}
+    # M7 backend fields the iOS stream decodes in parallel (docs/M7_IMPLEMENTATION_MAP.md).
+    # Only these four may be missing from DeviceStatus.swift; integration deletes this
+    # allowance once the app decodes them. Every other field must be decoded.
+    pending_app_decode = {"perception", "nodes_rejection", "policies", "actuators"}
+    assert set(status) - decoded - pending_app_decode == set(), sorted(set(status) - decoded)

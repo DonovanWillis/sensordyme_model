@@ -20,6 +20,7 @@ Create device: .venv/bin/python cloud/manage.py create-device "Car unit"
 from __future__ import annotations
 
 import asyncio
+import dataclasses
 import hashlib
 import hmac
 import ipaddress
@@ -37,6 +38,7 @@ from pathlib import Path
 from typing import Any, Optional
 
 import jwt
+import yaml
 from fastapi import BackgroundTasks, Depends, FastAPI, Header, HTTPException, Request
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
@@ -546,6 +548,20 @@ def init_db() -> None:
             "ALTER TABLE devices ADD COLUMN auth_kid TEXT",
             "ALTER TABLE devices ADD COLUMN previous_device_key TEXT",
             "ALTER TABLE devices ADD COLUMN previous_auth_kid TEXT",
+            # M7 companion monitoring nodes (docs/M7_IMPLEMENTATION_MAP.md): the
+            # node states the owner asked for and the device has not reported yet
+            # (JSON {node: {enabled, settings}}), delivered as `set_nodes` until
+            # the device's perception.nodes agree, then cleared like desired_preset.
+            "ALTER TABLE devices ADD COLUMN desired_nodes TEXT",
+            # The last node request the device refused (JSON: node, code, reasons, at).
+            "ALTER TABLE devices ADD COLUMN nodes_rejection TEXT",
+            # Fingerprints of the device's last_rejection at the moment each kind
+            # of request (preset, nodes) was written, JSON {kind: fingerprint}.
+            # A refusal counts against a request only if it is NEWER than that
+            # baseline: last_rejection persists on the device, and a refusal of
+            # an earlier request for the same name must not cancel a new one.
+            # Compared by content, not by clock -- the device's clock is its own.
+            "ALTER TABLE devices ADD COLUMN rejection_baseline TEXT",
         ):
             try:
                 conn.execute(statement)
@@ -937,15 +953,177 @@ def _capabilities_summary(raw) -> Optional[dict]:
 
 
 def _rejection(raw) -> Optional[dict]:
-    """The device's last refusal (services/runtime.py _record_rejection), cleaned."""
-    if not isinstance(raw, dict) or raw.get("kind") not in ("preset", "rules", "protection"):
+    """The device's last refusal (services/runtime.py _record_rejection), cleaned.
+
+    `subject` is what was refused (a preset name, a rules version, a node id);
+    the M7 wire contract also allows `preset`/`node` and a single `reason`, and
+    an optional machine-readable `code`."""
+    if not isinstance(raw, dict) or raw.get("kind") not in ("preset", "rules", "protection", "nodes"):
         return None
+    subject = raw.get("subject") or raw.get("preset") or raw.get("node") or ""
+    reasons = _strings(raw.get("reasons"))
+    if not reasons and isinstance(raw.get("reason"), str) and raw["reason"]:
+        reasons = [raw["reason"][:500]]
+    code = raw.get("code")
     return {
         "kind": raw["kind"],
-        "subject": str(raw.get("subject") or "")[:200],
-        "reasons": _strings(raw.get("reasons")),
+        "subject": str(subject)[:200],
+        "reasons": reasons,
+        "code": code[:64] if isinstance(code, str) and code else None,
         "at": _reported_at(raw.get("at")),
     }
+
+
+def _rejection_fingerprint(raw) -> str:
+    """Identity of one device refusal, so a refusal already seen is not re-counted."""
+    cleaned = _rejection(raw)
+    if cleaned is None:
+        return ""
+    return hashlib.sha256(json.dumps(cleaned, sort_keys=True).encode()).hexdigest()[:16]
+
+
+def _stored_last_rejection(row: sqlite3.Row):
+    """The device's last refusal as last pushed (the `monitoring` column)."""
+    return (_monitoring_payload(row["monitoring"]) or {}).get("last_rejection")
+
+
+def _baseline_with(row: sqlite3.Row, kind: str) -> str:
+    """rejection_baseline with `kind` set to the refusal the device reports NOW.
+
+    Written together with a new request: only a refusal that differs from this
+    one can be the device's answer to that request."""
+    baseline = _loads_dict(row["rejection_baseline"])
+    baseline[kind] = _rejection_fingerprint(_stored_last_rejection(row))
+    return json.dumps(baseline)
+
+
+def _new_refusal(raw, kind: str, baseline_json: Optional[str]) -> Optional[dict]:
+    """The device's refusal of `kind`, if it is newer than the request's baseline."""
+    cleaned = _rejection(raw)
+    if cleaned is None or cleaned["kind"] != kind:
+        return None
+    if _rejection_fingerprint(raw) == _loads_dict(baseline_json).get(kind):
+        return None
+    return cleaned
+
+
+# ---------------------------------------------------------------- M7 perception (device truth)
+#: docs/M7_IMPLEMENTATION_MAP.md wire contract, `monitoring.perception`.
+_COMPONENT_STATES = ("ok", "stale", "failed", "unavailable", "idle")
+_NODE_STATES = ("active", "degraded", "inactive", "failed")
+#: Which product capability kind each shared perception component provides.
+COMPONENT_CAPABILITY = {
+    "object_detector": "objects", "face_landmarks": "face", "hand_landmarks": "hands", "pose": "pose",
+}
+_MAX_COMPONENTS = 16
+_MAX_NODES = 32
+
+
+def _finite_or_none(value) -> Optional[float]:
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return None
+    value = float(value)
+    return value if math.isfinite(value) else None
+
+
+def _count(value) -> Optional[int]:
+    if isinstance(value, bool) or not isinstance(value, int):
+        return None
+    return max(0, value)
+
+
+def _short(value, limit: int = 200) -> Optional[str]:
+    return value[:limit] if isinstance(value, str) and value else None
+
+
+def _perception(raw) -> Optional[dict]:
+    """The device's perception block, bounded and typed; None if absent or unreadable.
+
+    Forwarded as reported -- never completed with guesses. A component state or
+    node state outside the contract's vocabulary reads "unknown", not "ok"."""
+    if not isinstance(raw, dict):
+        return None
+    components = {}
+    raw_components = raw.get("components")
+    for name, comp in list((raw_components if isinstance(raw_components, dict) else {}).items())[:_MAX_COMPONENTS]:
+        if not isinstance(name, str) or not isinstance(comp, dict):
+            continue
+        model = comp.get("model")
+        state = comp.get("state")
+        components[name[:64]] = {
+            "state": state if state in _COMPONENT_STATES else "unknown",
+            "model": ({k: _short(model.get(k), 128) for k in ("name", "sha256", "version")}
+                      if isinstance(model, dict) else None),
+            "last_run_age_s": _finite_or_none(comp.get("last_run_age_s")),
+            "runs": _count(comp.get("runs")),
+            "errors": _count(comp.get("errors")),
+            "reason": _short(comp.get("reason"), 500),
+            "consumers": _strings(comp.get("consumers"), 32) if isinstance(comp.get("consumers"), list) else [],
+        }
+    nodes = []
+    raw_nodes = raw.get("nodes")
+    for node in (raw_nodes if isinstance(raw_nodes, list) else [])[:_MAX_NODES]:
+        if not isinstance(node, dict) or not isinstance(node.get("id"), str) or not node["id"]:
+            continue
+        state = node.get("state")
+        nodes.append({
+            "id": node["id"][:64],
+            "kind": _short(node.get("kind"), 32),
+            "version": _short(node.get("version"), 64),
+            "preset": _short(node.get("preset"), 64),
+            "state": state if state in _NODE_STATES else "unknown",
+            "required_capabilities": _strings(node.get("required_capabilities"), 16)
+            if isinstance(node.get("required_capabilities"), list) else [],
+            "missing_capabilities": _strings(node.get("missing_capabilities"), 16)
+            if isinstance(node.get("missing_capabilities"), list) else [],
+            "validation": _short(node.get("validation"), 64),
+            "experimental": node.get("experimental") if isinstance(node.get("experimental"), bool) else None,
+            "reason": _short(node.get("reason"), 500),
+        })
+    return {
+        "schema": _short(raw.get("schema"), 64),
+        "simulated": raw.get("simulated") if isinstance(raw.get("simulated"), bool) else None,
+        "components": components,
+        "nodes": nodes,
+    }
+
+
+def _reported_perception(live_health: dict, monitoring: dict) -> Optional[dict]:
+    """Perception from a LIVE report: the health report's monitoring block, the
+    health report itself, or the pushed monitoring block (firmware generations)."""
+    live_monitoring = live_health.get("monitoring") if isinstance(live_health.get("monitoring"), dict) else {}
+    for source in (live_monitoring, live_health, monitoring):
+        if isinstance(source.get("perception"), dict):
+            return _perception(source["perception"])
+    return None
+
+
+def _bounded_dicts(raw, keys: tuple[str, ...], limit: int = 32) -> Optional[list[dict]]:
+    """A list of the device's report dicts reduced to `keys` (policies, actuators)."""
+    if not isinstance(raw, list):
+        return None
+    out = []
+    for item in raw[:limit]:
+        if not isinstance(item, dict):
+            continue
+        clean = {}
+        for key in keys:
+            value = item.get(key)
+            if isinstance(value, list):
+                clean[key] = _strings(value)
+            elif isinstance(value, bool) or value is None:
+                clean[key] = value
+            elif isinstance(value, (int, float)):
+                clean[key] = _finite_or_none(value)
+            else:
+                clean[key] = str(value)[:200]
+        out.append(clean)
+    return out
+
+
+_POLICY_KEYS = ("id", "kind", "name", "can_evaluate", "operational", "unavailable_events", "reasons")
+_ACTUATOR_KEYS = ("name", "kind", "audible", "ready", "detail", "commands_ok", "commands_failed",
+                  "physically_verified")
 
 
 def _device_status(row: sqlite3.Row, now: float) -> dict:
@@ -1033,6 +1211,10 @@ def _device_status(row: sqlite3.Row, now: float) -> dict:
     }
 
     preset_rejection = _loads_dict(row["preset_rejection"]) or None
+    # M7: device truth only, and only while the device is live. None means "not
+    # reported" (stale, or firmware without it) -- never filled in.
+    perception = None if stale else _reported_perception(live, monitoring)
+    last_command_id = reported_protection.get("last_command_id") if not stale else None
     return {
         "monitoring_state": state,
         "monitoring_active": active,
@@ -1047,6 +1229,13 @@ def _device_status(row: sqlite3.Row, now: float) -> dict:
         "rules": rules,
         "last_rejection": last_rejection,
         "preset_rejection": preset_rejection,
+        "nodes_rejection": _loads_dict(row["nodes_rejection"]) or None,
+        "perception": perception,
+        # The id of the last protection command the device applied, so the app
+        # converges on THIS request rather than inferring it from the state.
+        "last_command_id": last_command_id[:64] if isinstance(last_command_id, str) else None,
+        "policies": None if stale else _bounded_dicts(live_monitoring.get("policies"), _POLICY_KEYS),
+        "actuators": None if stale else _bounded_dicts(live_monitoring.get("actuators"), _ACTUATOR_KEYS),
         "stale": stale,
         "reported_at": _reported_at(row["last_seen"]),
     }
@@ -1496,6 +1685,14 @@ class PresetBody(BaseModel):
     # `incompatible_policy` rather than silently dropping the rules. None: keep
     # them exactly when the device can (additive role, mandatory module).
     keep_rules: Optional[bool] = None
+
+
+class NodeBody(BaseModel):
+    """Turn one companion monitoring node on or off (docs/M7_IMPLEMENTATION_MAP.md)."""
+
+    node: str = Field(max_length=64)
+    enabled: bool
+    settings: Optional[dict[str, Any]] = Field(default=None, max_length=MAX_PRESET_SETTINGS)
 
 
 class RuleToggleBody(BaseModel):
@@ -2145,9 +2342,10 @@ def set_preset(device_id: int, body: PresetBody, uid: int = Depends(current_user
         # request to leave custom monitoring in charge, whatever ai_rules
         # still says from a previous configuration.
         conn.execute(
-            "UPDATE devices SET desired_preset = ?, custom_monitoring_wanted = ?, preset_rejection = NULL"
-            " WHERE id = ?",
-            (normalized, 1 if normalized == "" or keep_rules else 0, device_id),
+            "UPDATE devices SET desired_preset = ?, custom_monitoring_wanted = ?, preset_rejection = NULL,"
+            " rejection_baseline = ? WHERE id = ?",
+            (normalized, 1 if normalized == "" or keep_rules else 0, _baseline_with(device, "preset"),
+             device_id),
         )
 
         if normalized != "":
@@ -2196,7 +2394,7 @@ def set_preset(device_id: int, body: PresetBody, uid: int = Depends(current_user
                 "rules": _client_rules(body.rules),
                 "unsupported": [],
             }
-            validated = _validate_proposal(proposal)
+            validated = _validate_proposal(proposal, device=device)
             rejected = list(validated["unsupported"])
             validated["unsupported"] = prior_unsupported + rejected
             promoted = json.dumps(validated)
@@ -2345,8 +2543,75 @@ def capability_tiers(uid: int = Depends(current_user)):
 
     with _CATALOG_LOCK:
         if "tiers" not in _TIERS_CACHE:
-            _TIERS_CACHE["tiers"] = tiers(load_registry())
+            registry = load_registry()
+            served = tiers(registry)
+            served["nodes"] = registry_node_tiers(registry)
+            _TIERS_CACHE["tiers"] = served
         return _TIERS_CACHE["tiers"]
+
+
+def _registry_document() -> dict:
+    """core/model_registry.yaml as data, for sections the typed loader does not model."""
+    from core.model_registry import DEFAULT_PATH
+
+    try:
+        data = yaml.safe_load(Path(DEFAULT_PATH).read_text())
+    except (OSError, yaml.YAMLError):
+        return {}
+    return data if isinstance(data, dict) else {}
+
+
+def registry_node_tiers(registry, document: Optional[dict] = None) -> list[dict]:
+    """Each monitoring node's validation tier, never above the components it uses.
+
+    Reads `monitoring_nodes` from the registry (a map or a list; absent = []). A
+    node's served `tier` is the LOWEST of its declared tier and the claimed tier
+    of every product capability it depends on: a node is only as validated as
+    its weakest input (M7 directive: no node claims stronger evidence than its
+    components). A dependency may name a product capability id or a capability
+    kind (objects, face, hands, pose); a kind counts as its weakest capability."""
+    from core.model_registry import TIERS, tier_rank
+
+    document = _registry_document() if document is None else document
+    raw = document.get("monitoring_nodes")
+    if isinstance(raw, dict):
+        items = [{"id": k, **(v if isinstance(v, dict) else {})} for k, v in raw.items()]
+    elif isinstance(raw, list):
+        items = [n for n in raw if isinstance(n, dict) and isinstance(n.get("id"), str)]
+    else:
+        return []
+    by_id = {c.id: c.claimed_tier for c in registry.capabilities}
+    by_kind: dict[str, list[str]] = {}
+    for cap in registry.capabilities:
+        by_kind.setdefault(cap.kind, []).append(cap.claimed_tier)
+    out = []
+    for node in items:
+        declared = next((node[k] for k in ("claimed_tier", "tier", "validation") if node.get(k) in TIERS),
+                        TIERS[0])
+        deps = next((node[k] for k in ("product_capabilities", "depends_on", "capabilities", "requires")
+                     if isinstance(node.get(k), list)), [])
+        tier, capped_by = declared, []
+        for dep in (d for d in deps if isinstance(d, str)):
+            dep_tiers = [by_id[dep]] if dep in by_id else by_kind.get(dep, [])
+            if not dep_tiers:
+                # A dependency with no evidence entry at all: nothing supports it.
+                dep_tiers = [TIERS[0]]
+            weakest = min(dep_tiers, key=tier_rank)
+            if tier_rank(weakest) < tier_rank(tier):
+                tier = weakest
+            if tier_rank(weakest) < tier_rank(declared):
+                capped_by.append(dep)
+        out.append({
+            "id": node["id"][:64],
+            "declared_tier": declared,
+            "tier": tier,
+            "capped_by": capped_by,
+            "depends_on": [d for d in deps if isinstance(d, str)],
+            "experimental": node.get("experimental") is True,
+            "device_verified": tier_rank(tier) >= tier_rank("device_verified"),
+            "production_validated": tier == "production_permitted",
+        })
+    return out
 
 
 def _reported_preset(row: sqlite3.Row) -> tuple[Optional[str], Optional[str], dict]:
@@ -2364,6 +2629,66 @@ def _reported_preset(row: sqlite3.Row) -> tuple[Optional[str], Optional[str], di
     return base, variant or None, settings
 
 
+#: What each component state means for the capability it provides.
+_COMPONENT_TO_CAPABILITY_STATE = {
+    "ok": "available", "idle": "idle", "stale": "impaired", "failed": "impaired",
+    "unavailable": "unsupported", "unknown": "unknown",
+}
+
+
+def capability_states(status: dict) -> dict[str, dict]:
+    """{capability kind: {state, reason, source}} from what the device REPORTS.
+
+    States: available | idle (the device has it, nothing uses it now) | starting
+    | impaired | unsupported | unknown. A kind the device does not report is
+    `unknown` -- a device reports only what its current mode uses, so silence
+    is not evidence that a preset it is not running would work."""
+    out: dict[str, dict] = {}
+    caps = status.get("capabilities") or {}
+    for name in caps.get("available") or []:
+        out[name] = {"state": "available", "reason": None, "source": "monitoring"}
+    for name in caps.get("starting") or []:
+        out[name] = {"state": "starting", "reason": None, "source": "monitoring"}
+    for item in caps.get("impaired") or []:
+        if isinstance(item, dict) and item.get("name"):
+            reason = item.get("reason")
+            unsupported = bool(reason) and re.search(r"\bnot?\b", str(reason)) and re.search(
+                r"\b(configured|provided)\b", str(reason))
+            out[item["name"]] = {"state": "unsupported" if unsupported else "impaired",
+                                 "reason": reason, "source": "monitoring"}
+    perception = status.get("perception") or {}
+    for component, comp in (perception.get("components") or {}).items():
+        kind = COMPONENT_CAPABILITY.get(component)
+        if kind is None:
+            continue
+        state = _COMPONENT_TO_CAPABILITY_STATE.get(comp.get("state"), "unknown")
+        known = out.get(kind)
+        # The module's own impairment verdict wins over a healthy component: the
+        # component may be fine while the module cannot use it.
+        if known and known["state"] in ("impaired", "unsupported") and state in ("available", "idle"):
+            continue
+        out[kind] = {"state": state, "reason": comp.get("reason"), "source": "perception"}
+    return out
+
+
+def _preset_capabilities(entry: dict, states: dict[str, dict], stale: bool) -> tuple[list[dict], Optional[bool]]:
+    """Per-capability rows for one preset, and whether it is ready (None = unknown)."""
+    rows, ready = [], True
+    required = list(entry.get("required_capabilities") or [])
+    optional = [c for c in entry.get("optional_capabilities") or [] if c not in required]
+    for name, is_required in [(c, True) for c in required] + [(c, False) for c in optional]:
+        state = {"state": "unknown", "reason": None, "source": None} if stale else (
+            states.get(name) or {"state": "unknown", "reason": None, "source": None})
+        rows.append({"name": name, "required": is_required, **state})
+        if not is_required:
+            continue
+        if state["state"] in ("impaired", "unsupported"):
+            ready = False
+        elif state["state"] != "available" and ready is not False:
+            ready = None
+    return rows, ready
+
+
 @app.get("/v1/devices/{device_id}/presets")
 def device_presets(device_id: int, uid: int = Depends(current_user)):
     with db() as conn:
@@ -2377,6 +2702,8 @@ def device_presets(device_id: int, uid: int = Depends(current_user)):
     # whatever its last selected preset was.
     active = base if base in presets and status["mode"] != "ai_custom" else None
     allowed = status["allowed_presets"]
+    states = capability_states(status)
+    reported_nodes = _reported_nodes(status["perception"]) or {}
     entries = []
     for entry in _catalog():
         code, reason = device_availability(
@@ -2384,15 +2711,34 @@ def device_presets(device_id: int, uid: int = Depends(current_user)):
         if code is None and role is None and isinstance(allowed, list) and entry["id"] not in allowed:
             # A role the backend does not know, described by the device itself.
             code, reason = "role_forbids_preset", f"this device's role allows only: {', '.join(allowed)}"
+        if code is None and entry.get("availability") != "planned":
+            # Device truth (M7): a component the device says it does not have at
+            # all cannot be repaired by switching to it.
+            for kind in entry.get("required_capabilities") or []:
+                found = states.get(kind)
+                if found and found["source"] == "perception" and found["state"] == "unsupported":
+                    code = "capability_unsupported"
+                    reason = f"{kind} is not available on this device ({found['reason'] or 'no model'})"
+                    break
         preset = presets.get(entry["id"]) or {}
         is_active = entry["id"] == active
+        capability_rows, ready = _preset_capabilities(entry, states, status["stale"])
+        device_node = reported_nodes.get(entry["id"]) or next(
+            (n for n in reported_nodes.values() if n.get("preset") == entry["id"]), None)
         entries.append({
             "id": entry["id"],
+            # Selectable (not refused); NOT a claim that it would work -- see `ready`.
             "available": code is None,
             "code": code,
             "reason": reason,
             "active": is_active,
+            # True: every required capability reported available. False: one is
+            # impaired or missing. None: not known (not reported, or stale).
+            "ready": ready if code is None else False,
+            "capabilities": capability_rows,
             "validation_status": entry["validation"]["status"],
+            # The device's own node validation claim when it reports one.
+            "device_validation": (device_node or {}).get("validation"),
             "settings": effective_settings(preset, variant if is_active else None,
                                            settings if is_active else None) if preset else {},
         })
@@ -2403,6 +2749,189 @@ def device_presets(device_id: int, uid: int = Depends(current_user)):
         "active_variant": variant if active else None,
         "stale": status["stale"],
         "presets": entries,
+    }
+
+
+# ------------------------------------------------------------------ companion nodes (M7)
+#: Used only when the device catalogue declares no companion nodes yet. Both read
+#: shared person detections and run no model of their own; both are experimental
+#: until the registry binds evidence to them.
+_FALLBACK_NODE_CATALOG = {
+    "occupancy": {
+        "title": "Occupancy",
+        "description": "People count, entries and exits, and presence in drawn areas, "
+                       "from the shared person detections.",
+        "required_capabilities": ["camera", "inference", "objects"],
+        "experimental": True,
+    },
+    "zone_watch": {
+        "title": "Zone watch",
+        "description": "A person inside a drawn restricted area, and for how long.",
+        "required_capabilities": ["camera", "inference", "objects"],
+        "experimental": True,
+    },
+}
+_NODE_ID = re.compile(r"^[a-z][a-z0-9_]{0,63}$")
+
+
+def node_catalog() -> dict[str, dict]:
+    """Companion monitoring nodes a device can run beside its mode.
+
+    From the device catalogue when it declares them (a core.presets loader, or a
+    `nodes`/`companion_nodes` section in presets.yaml), else the fallback above."""
+    try:
+        from core import presets as preset_module
+    except ImportError:
+        return dict(_FALLBACK_NODE_CATALOG)
+    for name in ("load_nodes", "load_companion_nodes"):
+        loader = getattr(preset_module, name, None)
+        if callable(loader):
+            try:
+                nodes = loader()
+            except Exception:
+                log.warning("node catalogue: %s failed; using the fallback", name, exc_info=True)
+                continue
+            if isinstance(nodes, dict) and nodes:
+                return {str(k): (v if isinstance(v, dict) else {}) for k, v in nodes.items()}
+    try:
+        document = preset_module._load(None)
+    except (OSError, yaml.YAMLError):
+        document = {}
+    for key in ("nodes", "companion_nodes"):
+        nodes = document.get(key)
+        if isinstance(nodes, dict) and nodes:
+            return {str(k): (v if isinstance(v, dict) else {}) for k, v in nodes.items()}
+    return dict(_FALLBACK_NODE_CATALOG)
+
+
+def _node_settings(entry: dict, settings: Optional[dict]) -> dict:
+    """Owner settings for one node: scalars only, and only declared keys when declared."""
+    if not settings:
+        return {}
+    declared = entry.get("settings")
+    allowed = None
+    if isinstance(declared, dict):
+        allowed = set(declared)
+    elif isinstance(declared, list):
+        allowed = {s.get("key") for s in declared if isinstance(s, dict)}
+    clean = {}
+    for key, value in settings.items():
+        if not isinstance(key, str) or not _KEY_PATTERN.fullmatch(key):
+            raise CodedError(400, "invalid_setting", f"setting {str(key)[:64]!r} is not a valid name")
+        if allowed is not None and key not in allowed:
+            raise CodedError(400, "invalid_setting", f"node has no setting {key!r}")
+        if isinstance(value, bool) or (isinstance(value, (int, float)) and math.isfinite(value)) or (isinstance(value, str) and len(value) <= 64):
+            clean[key] = value
+        else:
+            raise CodedError(400, "invalid_setting", f"setting {key!r} must be a number, true/false or short text")
+    return clean
+
+
+_KEY_PATTERN = re.compile(r"^[a-z][a-z0-9_]{0,63}$")
+
+
+def _reported_nodes(perception: Optional[dict]) -> Optional[dict[str, dict]]:
+    """{node id: reported node} from a perception block; None when not reported."""
+    if not isinstance(perception, dict):
+        return None
+    return {n["id"]: n for n in perception.get("nodes") or [] if isinstance(n, dict) and n.get("id")}
+
+
+def _node_applied(want: dict, reported: dict[str, dict], node_id: str) -> bool:
+    """Whether the device's report already reflects the wanted on/off state.
+
+    Enabled = reported in any state but `inactive`: a node the device holds but
+    cannot run right now (`failed`, `degraded`) WAS applied -- re-sending would
+    not repair it, and its state is shown from perception. Disabled = absent or
+    `inactive`. Settings are not compared: the contract does not report them."""
+    node = reported.get(node_id)
+    running = node is not None and node.get("state") != "inactive"
+    return running == bool(want.get("enabled"))
+
+
+def _device_reports_perception(row: sqlite3.Row) -> Optional[bool]:
+    """True/False: the device's last health report did/did not carry perception;
+    None when it never reported health at all."""
+    stored = _loads_dict(row["health"]) if row["health"] else None
+    if not stored:
+        return None
+    monitoring = _monitoring_payload(row["monitoring"]) or {}
+    return _reported_perception(stored, monitoring) is not None
+
+
+@app.post("/v1/devices/{device_id}/nodes")
+def set_node(device_id: int, body: NodeBody, uid: int = Depends(current_user)):
+    """Turn a companion monitoring node on or off beside the device's mode.
+
+    Queued like a mode switch: `desired_nodes` is delivered as `set_nodes` until
+    the device's perception.nodes agree, then cleared. The device can still
+    refuse (missing capability, role) -- that lands in status.nodes_rejection.
+    Response: {ok, node, enabled, pending}."""
+    catalog = node_catalog()
+    node_id = body.node.strip()
+    if not _NODE_ID.fullmatch(node_id) or node_id not in catalog:
+        raise CodedError(400, "unknown_node",
+                         f"no companion node {node_id[:64]!r}; known: {', '.join(sorted(catalog))}")
+    entry = catalog[node_id]
+    settings = _node_settings(entry, body.settings)
+    with db() as conn:
+        device = _owned_device(conn, device_id, uid)
+        if _device_reports_perception(device) is False:
+            # It would never acknowledge (no perception.nodes), so the request
+            # would be re-sent on every poll for ever.
+            raise CodedError(409, "firmware_unsupported",
+                             "this device's software does not run companion monitoring nodes")
+        desired = _loads_dict(device["desired_nodes"])
+        desired[node_id] = {"enabled": body.enabled, "settings": settings}
+        reported = _reported_nodes(_device_status(device, time.time())["perception"])
+        if reported is not None and _node_applied(desired[node_id], reported, node_id) and not settings:
+            # Already so on the device: nothing to deliver (idempotent repeat).
+            desired.pop(node_id)
+        rejection = _loads_dict(device["nodes_rejection"])
+        conn.execute(
+            "UPDATE devices SET desired_nodes = ?, nodes_rejection = ?, rejection_baseline = ? WHERE id = ?",
+            (json.dumps(desired) if desired else None,
+             None if not rejection or rejection.get("node") == node_id else device["nodes_rejection"],
+             _baseline_with(device, "nodes"), device_id),
+        )
+    return {"ok": True, "node": node_id, "enabled": body.enabled, "pending": node_id in desired}
+
+
+@app.get("/v1/devices/{device_id}/nodes")
+def device_nodes(device_id: int, uid: int = Depends(current_user)):
+    """Companion nodes: catalogue, what was asked, what the device reports, and tiers."""
+    from core.model_registry import load_registry
+
+    with db() as conn:
+        row = _owned_device(conn, device_id, uid)
+    status = _device_status(row, time.time())
+    reported = _reported_nodes(status["perception"])
+    tiers = {n["id"]: n for n in registry_node_tiers(load_registry())}
+    desired = _loads_dict(row["desired_nodes"])
+    entries = []
+    for node_id, entry in sorted(node_catalog().items()):
+        device_node = (reported or {}).get(node_id)
+        tier = tiers.get(node_id)
+        entries.append({
+            "id": node_id,
+            "title": str(entry.get("title") or node_id)[:64],
+            "description": str(entry.get("description") or "")[:500],
+            "required_capabilities": _strings(entry.get("required_capabilities"), 16)
+            if isinstance(entry.get("required_capabilities"), list) else [],
+            "experimental": entry.get("experimental") is not False,
+            "desired": desired.get(node_id),
+            # What the device runs, as it says; null when not reported (stale or old software).
+            "reported": device_node,
+            # The device's own claim first (it knows its models), then the registry's.
+            "validation": (device_node or {}).get("validation") or (tier or {}).get("tier") or "exists_in_code",
+            "registry_tier": tier,
+        })
+    return {
+        "device_id": device_id,
+        "stale": status["stale"],
+        "reported": reported is not None,
+        "nodes": entries,
+        "rejection": status["nodes_rejection"],
     }
 
 
@@ -2667,6 +3196,52 @@ def _capabilities():
         return None
 
 
+#: Capabilities whose `available` is decided by probing THIS process's
+#: environment (core/capabilities.py `_pose_available()`: is mediapipe importable
+#: here). What the backend has installed says nothing about a device; the device
+#: reports its own. Every other unavailable capability is unavailable everywhere
+#: (no tracker, no eyewear or action model) and a device report cannot enable it.
+_ENVIRONMENT_PROBED_CAPABILITIES = frozenset({"gesture.arm", "state.resting", "pose.body", "activity.gait"})
+
+
+def device_capability_registry(device: Optional[sqlite3.Row], caps=None):
+    """The capability registry as the TARGET DEVICE reports itself (M7), or None.
+
+    None -- an old or never-reporting device, or one that reports no perception
+    components -- means "keep today's behaviour" (the backend's own registry).
+    Otherwise each capability of a kind the device reports a component for is
+    adjusted to the device: a component it reports `unavailable` makes every
+    capability of that kind unavailable, with the device's reason; a component
+    it has makes an environment-probed capability available. Liveness does not
+    matter here: what models a device has is configuration, not a moment."""
+    caps = caps or _capabilities()
+    if caps is None or device is None:
+        return None
+    stored = _loads_dict(device["health"]) if device["health"] else {}
+    perception = _reported_perception(stored, _monitoring_payload(device["monitoring"]) or {})
+    if perception is None:
+        return None
+    kinds = {COMPONENT_CAPABILITY[name]: comp for name, comp in perception["components"].items()
+             if name in COMPONENT_CAPABILITY}
+    if not kinds:
+        return None
+    adjusted = []
+    for cap in caps.registry().capabilities:
+        comp = kinds.get(cap.kind)
+        if comp is None or comp["state"] == "unknown":
+            adjusted.append(cap)
+        elif comp["state"] == "unavailable":
+            why = comp.get("reason") or "it has no model for it"
+            adjusted.append(dataclasses.replace(
+                cap, available=False,
+                requires=f"{cap.requires or cap.summary}; this device reports no {cap.kind} capability ({why})"))
+        elif not cap.available and cap.id in _ENVIRONMENT_PROBED_CAPABILITIES:
+            adjusted.append(dataclasses.replace(cap, available=True))
+        else:
+            adjusted.append(cap)
+    return caps.CapabilityRegistry(adjusted)
+
+
 # Which model interprets custom requests. Jupiter (a local model) is the
 # default, so a fresh install needs no third-party API key to configure a camera
 # its owner already paid for. Anthropic remains selectable as a benchmark.
@@ -2679,7 +3254,7 @@ def _capabilities():
 JUPITER_PROVIDER = os.environ.get("SENSORDYME_AI_PROVIDER", "jupiter").strip().lower()
 
 
-def _ai_configure_llm(prompt: str) -> Optional[dict]:
+def _ai_configure_llm(prompt: str, reg=None) -> Optional[dict]:
     """Interpret a request into a structured proposal, or None to fall through.
 
     Jupiter and Anthropic are interchangeable here on purpose: both return a
@@ -2701,13 +3276,15 @@ def _ai_configure_llm(prompt: str) -> Optional[dict]:
         return None
 
     provider_name, config = role_config("configure")
-    outcome = interpret(prompt, provider_name=provider_name, config=config)
+    # The capability sheet the model is briefed with is the TARGET device's
+    # (reg); its output is data, validated again below -- never executed.
+    outcome = interpret(prompt, provider_name=provider_name, config=config, reg=reg)
 
     fallback = cloud_fallback_config()
     if not outcome.ok and fallback["enabled"] and provider_name != fallback["provider"]:
         # Explicitly enabled, and only after the local path failed.
         outcome = interpret(
-            prompt, provider_name=fallback["provider"], config={"model": fallback["model"]}
+            prompt, provider_name=fallback["provider"], config={"model": fallback["model"]}, reg=reg
         )
 
     if not outcome.ok and not outcome.interpretation.rules:
@@ -2789,7 +3366,7 @@ def _ai_fallback(prompt: str) -> dict:
     }
 
 
-def _validate_proposal(data: dict, role=None) -> dict:
+def _validate_proposal(data: dict, role=None, device: Optional[sqlite3.Row] = None) -> dict:
     """Re-check the model's claims against what the device can actually run.
 
     The model is capable and well-briefed, but it is still the thing being
@@ -2806,7 +3383,9 @@ def _validate_proposal(data: dict, role=None) -> dict:
     if caps is None:
         return _legacy_validate_proposal(data)
 
-    reg = caps.registry()
+    # The target device's own capabilities when it reports them (M7), else the
+    # backend's registry: a rule is checked against the camera that will run it.
+    reg = device_capability_registry(device, caps) or caps.registry()
     preset = _resolve_mode(data.get("preset"))
     valid_rules, unsupported = [], list(data.get("unsupported") or [])
 
@@ -2923,7 +3502,7 @@ def _validate_proposal(data: dict, role=None) -> dict:
                 rule["persist_s"] = rule["dwell_s"]
         # The typed policy schema (jupiter/policy.py) is the last gate, whatever
         # produced the rule: a shape the schema refuses never reaches a device.
-        problem = _policy_problem(rule)
+        problem = _policy_problem(rule, reg)
         if problem:
             unsupported.append({
                 "request": described, "reason": problem, "requires": "a rule the device can evaluate as written",
@@ -2947,14 +3526,14 @@ def _validate_proposal(data: dict, role=None) -> dict:
     return _decodable_proposal(data)
 
 
-def _policy_problem(rule: dict) -> Optional[str]:
+def _policy_problem(rule: dict, reg=None) -> Optional[str]:
     """Why `rule` does not fit the typed policy schema, or None (it does)."""
     try:
         from jupiter.policy import PolicyError, policy_from_rule
     except ImportError:  # backend deployed without jupiter/: the checks above still ran
         return None
     try:
-        policy_from_rule(rule)
+        policy_from_rule(rule, reg=reg)
     except PolicyError as exc:
         return str(exc)
     return None
@@ -3038,7 +3617,7 @@ def _legacy_validate_proposal(data: dict) -> dict:
     return _decodable_proposal(data)
 
 
-def _interpret_request(prompt: str, zone_names: list[str]) -> dict:
+def _interpret_request(prompt: str, zone_names: list[str], reg=None) -> dict:
     """A proposal for `prompt`, from the most trustworthy interpreter that claims it.
 
       1. refusals (jupiter/policy.py refusal_for): identity, intent, emotion,
@@ -3063,10 +3642,12 @@ def _interpret_request(prompt: str, zone_names: list[str]) -> dict:
                 "explanation": "Nothing was set up. " + " ".join(r["reason"] for r in refusals),
                 "source": "policy_guard",
             }
-        parsed = policy_module.parse(prompt, zones=zone_names)
+        parsed = policy_module.parse(prompt, zones=zone_names, reg=reg)
         if parsed is not None:
             return parsed.as_proposal()
-    return _ai_configure_llm(prompt) or _ai_fallback(prompt)
+    # Without device truth the call is exactly as before (reg=None, today's registry).
+    proposal = _ai_configure_llm(prompt, reg=reg) if reg is not None else _ai_configure_llm(prompt)
+    return proposal or _ai_fallback(prompt)
 
 
 @contextmanager
@@ -3106,7 +3687,11 @@ def ai_configure(body: AIConfigureBody, uid: int = Depends(current_user)):
     with _ai_slot(uid) as allowed:
         if not allowed:
             raise HTTPException(429, "too many AI requests at once; try again in a moment")
-        result = _validate_proposal(_interpret_request(body.prompt, zone_names), role=role)
+        # Interpreted and validated against the TARGET device's reported
+        # capabilities (M7), not what this server process happens to have.
+        reg = device_capability_registry(device)
+        result = _validate_proposal(_interpret_request(body.prompt, zone_names, reg=reg), role=role,
+                                    device=device)
     # The typed policy for every rule (docs/PROMPT_POLICIES.md): targets, area
     # and whether it is drawn, timing, capabilities, and plain-language
     # explanation of what is and is NOT monitored -- what the owner confirms.
@@ -3538,7 +4123,7 @@ def ingest(body: IngestBody, background_tasks: BackgroundTasks, request: Request
                 continue
         row = conn.execute(
             "SELECT desired_preset, ai_rules, zones, custom_monitoring_wanted, ai_rules_activation,"
-            " desired_protection FROM devices WHERE id = ?",
+            " desired_protection, desired_nodes, rejection_baseline, monitoring FROM devices WHERE id = ?",
             (device["id"],),
         ).fetchone()
         desired, ai_rules_json, zones_json = row["desired_preset"], row["ai_rules"], row["zones"]
@@ -3616,6 +4201,30 @@ def ingest(body: IngestBody, background_tasks: BackgroundTasks, request: Request
                 (device["id"], desired),
             )
             desired = None
+        # The DEVICE refused the mode (M7): an unknown name, a module that would
+        # not build, a role it enforces itself. It keeps running its previous
+        # mode and says why in last_rejection. Re-sending would be refused again
+        # on every poll, for ever, while the app spun "switching". Drop the
+        # request and record the device's reason, exactly as for a role refusal
+        # the backend finds itself. Only a refusal NEWER than the request counts
+        # (rejection_baseline): the device never clears last_rejection, so an old
+        # refusal of the same name must not cancel a fresh attempt.
+        device_refusal = (
+            _new_refusal(_stored_last_rejection(row), "preset", row["rejection_baseline"])
+            if desired else None
+        )
+        if device_refusal and same_preset(device_refusal["subject"], desired):
+            conn.execute(
+                "UPDATE devices SET desired_preset = NULL, preset_rejection = ?"
+                " WHERE id = ? AND desired_preset = ?",
+                (json.dumps({
+                    "preset": desired,
+                    "code": device_refusal["code"] or "device_refused",
+                    "reason": "; ".join(device_refusal["reasons"]) or "the device refused this mode",
+                    "at": now,
+                }), device["id"], desired),
+            )
+            desired = None
         # The row as THIS request left it: the report that carries the role may
         # be this very one, and `device` was read before it was stored.
         refusal = None
@@ -3635,6 +4244,33 @@ def ingest(body: IngestBody, background_tasks: BackgroundTasks, request: Request
                              "at": now}), device["id"], desired),
             )
             desired = None
+
+        # Companion nodes (M7): converge on what THIS report says the device runs.
+        desired_nodes = _loads_dict(row["desired_nodes"])
+        if desired_nodes:
+            remaining = dict(desired_nodes)
+            node_refusal = _new_refusal(_stored_last_rejection(row), "nodes", row["rejection_baseline"])
+            if node_refusal and node_refusal["subject"] in remaining:
+                remaining.pop(node_refusal["subject"])
+                conn.execute(
+                    "UPDATE devices SET nodes_rejection = ? WHERE id = ?",
+                    (json.dumps({"node": node_refusal["subject"],
+                                 "code": node_refusal["code"] or "device_refused",
+                                 "reasons": node_refusal["reasons"] or ["the device refused this node"],
+                                 "at": now}), device["id"]),
+                )
+            reported_nodes = _reported_nodes(_reported_perception(body.health or {}, body.monitoring or {}))
+            if reported_nodes is not None:
+                remaining = {k: v for k, v in remaining.items()
+                             if not (isinstance(v, dict) and _node_applied(v, reported_nodes, k))}
+            if remaining != desired_nodes:
+                # Compare-and-swap, as for desired_preset: a node request written
+                # since `row` was read is left for the next poll.
+                conn.execute(
+                    "UPDATE devices SET desired_nodes = ? WHERE id = ? AND desired_nodes = ?",
+                    (json.dumps(remaining) if remaining else None, device["id"], row["desired_nodes"]),
+                )
+            desired_nodes = remaining
 
     # Push is the path that works when the app is closed, so it is the path
     # that most needs a filter. It had none: every "loud" event became a push,
@@ -3750,6 +4386,14 @@ def ingest(body: IngestBody, background_tasks: BackgroundTasks, request: Request
             command.pop("set_zones", None)
         else:
             command["zones_version"] = zone_version
+
+    # Companion nodes still to apply: the full wanted state of each, idempotent.
+    if desired_nodes:
+        command = dict(command or {})
+        command["set_nodes"] = {
+            node_id: {"enabled": bool(want.get("enabled")), "settings": want.get("settings") or {}}
+            for node_id, want in sorted(desired_nodes.items()) if isinstance(want, dict)
+        }
 
     # An explicit, confirmed stop/resume, until the device reports it (one-shot).
     if protection_action in ("stop", "resume"):
