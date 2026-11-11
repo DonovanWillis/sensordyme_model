@@ -37,6 +37,20 @@ def _timeline(name: str, *segments: tuple, first: Faults = UP) -> Scenario:
                                  *(Segment(float(t), scene, faults) for t, scene, faults in segments)))
 
 
+def _compose(name: str, scenes: list[tuple[float, float, Scene]], faults: list[tuple[float, float, Faults]],
+             ) -> Scenario:
+    """Scene windows and fault windows, independent of each other (start, end, what).
+
+    A fault window never hides a scene window that overlaps it, which hand-written
+    segments with a fault and a scene each do (the later segment wins outright).
+    """
+    def at(windows, t, default):
+        return next((w for s, e, w in windows if s <= t < e), default)
+
+    cuts = sorted({0.0, *(x for s, e, _ in scenes + faults for x in (s, e))})
+    return _timeline(name, *((t, at(scenes, t, ATTENTIVE), at(faults, t, UP)) for t in cuts if t > 0))
+
+
 @pytest.fixture
 def stack(tmp_path):
     with SimStack(tmp_path) as s:
@@ -395,6 +409,95 @@ def test_a_person_rule_the_driver_role_accepts_sees_the_driver(stack, monitor):
     custom = [e["type"] for e in stack.events() if e["source"] == "custom_rule"]
     assert custom == ["person"], custom
     monitor.assert_clean()
+
+
+# ---------------------------------------------------------------------- restart and persistence
+@pytest.mark.parametrize("damage", ["truncated", "not_json", "wrong_shape", "null", "empty"])
+def test_a_restart_over_damaged_state_files_boots_protecting_without_a_reboot(stack, monitor, damage):
+    device = stack.boot(sc.get("attentive"))
+    stack.claim()
+    device.advance(C)
+    assert stack.set_preset("driver_safety:strict").status_code == 200
+    device.advance(4.0)
+    _activate(stack, [NOBODY])
+    device.advance(6.0)
+    files = ["device_state.json", "monitoring.json", "calibration.json", "reboot_state.json"]
+    for name in files:
+        path = stack.state_dir / name
+        original = path.read_text() if path.exists() else '{"x": 1}'
+        path.write_text({"truncated": original[: len(original) // 2], "not_json": "\x00\xffgarbage",
+                         "wrong_shape": "[1, 2, 3]", "null": "null", "empty": ""}[damage])
+
+    reboots = []
+    device = stack.restart(sc.get("attentive"))
+    device.runtime._issue_reboot = lambda: reboots.append(1) or False
+    device.advance(C + 4)  # a damaged calibration is redone from scratch
+    status = stack.status()
+    assert status["monitoring_state"] == "ready" and status["protection"] == "protecting", status
+    assert device.runtime.module_name == "driver_attention", "the role floor survives lost state"
+    assert reboots == [], "damaged state files must never escalate to a reboot"
+    monitor.assert_clean()
+
+
+def test_a_malformed_config_stops_once_and_never_loops(tmp_path):
+    """main.py exits 78 (EX_CONFIG) for every kind of bad config, and the unit stops on 78."""
+    import configparser
+
+    import main
+    from sim.device import REPO
+
+    unit = configparser.ConfigParser(strict=False, interpolation=None)
+    unit.read(REPO / "sensordyme.service")
+    prevent = {int(x) for x in unit["Service"]["RestartPreventExitStatus"].split()}
+    assert unit["Service"]["Restart"] == "always" and main.CONFIG_ERROR_EXIT in prevent
+    assert unit["Unit"]["StartLimitAction"] == "none", "a start-limit hit must not reboot by itself"
+
+    bad = {"unreadable.yaml": "module: [unclosed\n", "list.yaml": "- 1\n- 2\n",
+           "schema.yaml": "module: driver_attention\nmodules: 7\n", "empty.yaml": ""}
+    for name, text in bad.items():
+        path = tmp_path / name
+        path.write_text(text)
+        starts = 0
+        for _attempt in range(10):  # systemd: Restart=always unless the status is prevented
+            starts += 1
+            with pytest.raises(SystemExit) as exited:
+                main.build_runtime(["--config", str(path), "--no-display"])
+            if exited.value.code in prevent:
+                break
+        assert starts == 1, f"{name}: exit {exited.value.code} would be restarted {starts} times"
+
+
+# ---------------------------------------------------------------------- long-running monitoring
+def test_twenty_minutes_of_monitoring_with_faults_keeps_every_episode(stack, monitor):
+    import gc
+    import threading
+
+    minute = 60.0
+    # An eyes-closed episode every 2.5 min from minute 1; three of them start as a fault
+    # starts (outage at 6:00, detector failure at 11:00) or as one ends (stall to 16:00).
+    asleep = [(minute + k * 150.0, minute + k * 150.0 + 4.5, ASLEEP) for k in range(8)]
+    faults = [(6 * minute, 7 * minute, DOWN), (11 * minute, 12 * minute, Faults(detector_failing=True)),
+              (15 * minute + 30, 16 * minute, Faults(camera="stalled"))]
+    script = _compose("twenty_minutes", asleep, faults)
+    device = stack.boot(script)
+    stack.claim()
+    samples = []
+    for _ in range(20):
+        device.advance(minute)
+        gc.collect()
+        samples.append({"objects": len(gc.get_objects()), "threads": threading.active_count(),
+                        "queue": len(device.runtime.uplink._queue)})
+    drowsy = stack.event_types().count("drowsiness")
+    assert drowsy == 8, f"{drowsy} of 8 episodes stored"
+    assert stack.status()["monitoring_state"] == "ready"
+    growth = samples[-1]["objects"] - samples[4]["objects"]
+    assert growth < 20_000, f"{growth} objects retained over 15 minutes: a leak"
+    assert len({s["threads"] for s in samples}) == 1, samples
+    monitor.assert_clean()
+    print(f"20 min: objects min5={samples[4]['objects']} min20={samples[-1]['objects']} (+{growth}); "
+          f"threads {samples[-1]['threads']}; max backlog {monitor.max_queue}; "
+          f"checks device={monitor.device_checks} app={monitor.backend_checks}; "
+          f"transitions {len(monitor.transitions)}")
 
 
 # ---------------------------------------------------------------------- production reconnection cadence
