@@ -8,6 +8,8 @@ device: configs are text, the device's model hash is a parameter.
 from __future__ import annotations
 
 import re
+import subprocess
+import sys
 from pathlib import Path
 
 import pytest
@@ -96,6 +98,17 @@ def test_the_devices_model_must_be_the_pinned_build(device_hef, ok, reason):
 def test_an_unparseable_config_is_refused():
     assert not preflight.check("module: [unclosed").ok
     assert not preflight.check("- a list").ok
+
+
+def test_the_cli_runs_with_docstrings_stripped(tmp_path):
+    """`python -OO` sets __doc__ to None; the CLI must not depend on it."""
+    path = tmp_path / "config.yaml"
+    path.write_text(REPO_CONFIG)
+    proc = subprocess.run(  # noqa: S603 - fixed test command
+        [sys.executable, "-OO", str(REPO / "scripts" / "deploy_preflight.py"), "--config", str(path)],
+        capture_output=True, text=True, timeout=60, check=False,
+    )
+    assert proc.returncode == 0, proc.stderr
 
 
 def test_make_deploy_runs_the_preflight_first():

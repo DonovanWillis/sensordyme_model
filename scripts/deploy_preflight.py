@@ -144,7 +144,7 @@ def _model_compatibility(config: dict, hef_sha256: Optional[str], role: roles.Ro
 
 
 def main(argv: Optional[list[str]] = None) -> int:
-    parser = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
+    parser = argparse.ArgumentParser(description=(__doc__ or "").split("\n\n")[0])  # -OO strips docstrings
     parser.add_argument("--config", required=True, help="the DEVICE's config.yaml (fetched from it)")
     parser.add_argument("--expect-role", default=None, help="the role this deployment is for")
     parser.add_argument("--hef-sha256", default=None, help="sha256 of the .hef on the device ('' = none)")
