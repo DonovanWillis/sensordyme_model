@@ -293,3 +293,13 @@ it has run on a Pi.
 | M2-6 | A wedged Hailo `infer()` reaches `failed` and the impaired pattern plays from the health thread | UNVERIFIED | No caller-side timeout exists; observe whether HailoRT ever raises or the loop stays wedged |
 | M2-7 | With a reboot suppressed, the process is no longer restarted every `WatchdogSec` | UNVERIFIED | Dead camera with `reboot_max_total` reached; `systemctl status` shows no restarts after the first |
 | M2-8 | `make deploy-preflight ROLE=driver_safety` reads the device config and `.hef` hash over SSH | UNVERIFIED | Run against a device whose config lacks `role:`; expect REFUSED with the migration line |
+
+---
+
+## M5: Hailo hardware validation package (prepared 2026-11-11, NOT executed)
+
+Scripts and a reversible, development-Pi-only procedure for items 4–8, 10 and
+M2-1 above, plus int8-vs-float parity, decoder comparison (production vs DAMO-YOLO
+reference), per-stage latency, camera-to-alert latency, lens intrinsics and a
+file-hash integrity manifest: `docs/HAILO_HARDWARE_VALIDATION.md`,
+`scripts/hw_validation/`. Nothing there has run on hardware yet.
