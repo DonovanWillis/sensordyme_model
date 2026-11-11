@@ -44,7 +44,10 @@ class MonitoringMode(str, Enum):  # noqa: UP042 - StrEnum would change str()/for
 # Chosen because rules target the *things* a detector names — "person",
 # "cell phone", "bottle" — rather than any conclusion a preset draws from them.
 # It implements get_detections(), which is what the rule engine consumes.
-CUSTOM_DETECTOR_MODULE = "occupancy"
+# M7: the model-less shared_perception module, so custom rules read the shared
+# perception engine's detector instead of a module that owns its own inference
+# (it was `occupancy`, which also tracked and zoned on its own).
+CUSTOM_DETECTOR_MODULE = "shared_perception"
 
 # The other module custom rules can run against: MediaPipe Pose, for rules that
 # name a posture or an activity label (lying_down, sitting, running, ...) rather
