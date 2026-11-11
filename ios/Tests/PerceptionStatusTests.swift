@@ -31,7 +31,7 @@ let wire = """
   "nodes": [
     {"id": "driver_safety", "kind": "preset", "state": "degraded", "required_capabilities": ["face", "objects"],
      "missing_capabilities": [], "validation": "synthetic_tests", "experimental": false},
-    {"id": "occupancy", "kind": "companion", "state": "active", "validation": "synthetic_tests", "experimental": true},
+    {"id": "people_counter", "kind": "companion", "state": "active", "validation": "synthetic_tests", "experimental": true},
     {"kind": "no id, dropped"},
     {"id": "future", "state": "something_new", "validation": "a_new_tier"}
   ]}}
@@ -42,7 +42,7 @@ check(st?.perception?.simulated == true, "simulated flag")
 check(st?.perception?.components.count == 4, "a malformed component is skipped, the rest kept")
 check(st?.perception?.components["object_detector"]?.model?.sha256 == "e691", "model identity")
 check(st?.perception?.components["object_detector"]?.consumers == ["driver_safety", "rules"], "consumers")
-check(st?.perception?.nodes.map(\.id) == ["driver_safety", "occupancy", "future"], "a node without id is skipped")
+check(st?.perception?.nodes.map(\.id) == ["driver_safety", "people_counter", "future"], "a node without id is skipped")
 check(decodeStatus("{\"monitoring_state\": \"ready\"}")?.perception == nil, "older backend: no perception")
 check(decodeStatus("{\"perception\": \"garbage\"}") != nil, "a garbage perception never fails the status")
 
@@ -128,8 +128,8 @@ check(DeviceRefusal.forPreset("driver_safety", status: backendRefusal, since: no
 check(DeviceRefusal.forPreset("elderly_monitoring", status: backendRefusal) == nil, "another preset's refusal is not this one's")
 let rulesRefusal = DeviceStatus(lastRejection: .init(kind: "rules", subject: "v3", reasons: ["bad"], at: nil))
 check(DeviceRefusal.forPreset("driver_safety", status: rulesRefusal) == nil, "a rules refusal is not a preset refusal")
-let nodeRefusal = DeviceStatus(lastRejection: .init(kind: "nodes", subject: "occupancy", reasons: ["no objects"], at: nil))
-check(DeviceRefusal.forNode("occupancy", status: nodeRefusal) == "no objects", "node refusal")
+let nodeRefusal = DeviceStatus(lastRejection: .init(kind: "nodes", subject: "people_counter", reasons: ["no objects"], at: nil))
+check(DeviceRefusal.forNode("people_counter", status: nodeRefusal) == "no objects", "node refusal")
 check(DeviceRefusal.forNode("other", status: nodeRefusal) == nil, "another node's refusal")
 
 print("\nnodes never overclaim:")
@@ -137,7 +137,7 @@ let report = st!.perception!
 let driver = NodePresentation.make(report.node("driver_safety")!)
 check(driver.title == "Driver Safety" && driver.tone == .caution, "degraded node")
 check(driver.badge == "Not yet validated · simulated tests", "simulated tests say so")
-check(NodePresentation.make(report.node("occupancy")!).badge == "Experimental", "experimental beats any tier")
+check(NodePresentation.make(report.node("people_counter")!).badge == "Experimental", "experimental beats any tier")
 check(NodePresentation.make(report.node("future")!).badge == "Validation unknown", "unknown tier is unknown")
 check(NodePresentation.make(report.node("future")!).stateText == "State unknown", "unknown state is unknown")
 let experimentalVerified = MonitoringNode(id: "x", state: "active", validation: "production_permitted", experimental: true)
@@ -147,16 +147,16 @@ for tier in CapabilityTier.allCases {
     if badge.lowercased().contains("validated for production") { check(false, "\(tier) overclaims") }
 }
 check(true, "no node badge says validated for production")
-let failedNode = MonitoringNode(id: "occupancy", state: "failed", missingCapabilities: ["objects"])
+let failedNode = MonitoringNode(id: "people_counter", state: "failed", missingCapabilities: ["objects"])
 check(NodePresentation.make(failedNode).stateText == "Not running — missing Objects", "failed names what is missing")
 
 print("\ncompanion toggle follows the device:")
-check(CompanionNodeToggle.isOn("occupancy", report: report, live: true) == true, "running node is on")
+check(CompanionNodeToggle.isOn("people_counter", report: report, live: true) == true, "running node is on")
 check(CompanionNodeToggle.isOn("absent", report: report, live: true) == false, "unreported node is off")
-check(CompanionNodeToggle.isOn("occupancy", report: report, live: false) == nil, "not live: unknown")
-check(CompanionNodeToggle.isOn("occupancy", report: nil, live: true) == nil, "no report: unknown")
-check(CompanionNodeToggle.confirmed("occupancy", wanted: true, report: report, live: true), "on confirmed")
-check(!CompanionNodeToggle.confirmed("occupancy", wanted: false, report: report, live: true), "off not yet")
+check(CompanionNodeToggle.isOn("people_counter", report: report, live: false) == nil, "not live: unknown")
+check(CompanionNodeToggle.isOn("people_counter", report: nil, live: true) == nil, "no report: unknown")
+check(CompanionNodeToggle.confirmed("people_counter", wanted: true, report: report, live: true), "on confirmed")
+check(!CompanionNodeToggle.confirmed("people_counter", wanted: false, report: report, live: true), "off not yet")
 
 print(failures == 0 ? "\nall passed" : "\n\(failures) FAILED")
 exit(failures == 0 ? 0 : 1)

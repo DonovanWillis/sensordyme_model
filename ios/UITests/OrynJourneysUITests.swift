@@ -397,14 +397,14 @@ final class OrynJourneysUITests: XCTestCase {
         launch(["-orynOpenDevice"])
         waitFor(monitoring, label: "All clear", timeout: 90)
         try requirePerception()
-        let toggle = reveal(app.switches["node.toggle.occupancy"])
+        let toggle = reveal(app.switches["node.toggle.people_counter"])
         if (toggle.value as? String) == "1" {  // left on by an earlier run
             toggle.tap()
             waitFor(toggle, value: "0", timeout: 60)
         }
         toggle.tap()
         waitFor(toggle, value: "1", timeout: 60)  // the device reports the node running
-        let node = element("node.occupancy")
+        let node = element("node.people_counter")
         XCTAssertTrue(node.waitForExistence(timeout: 30), "the node is listed as running")
         XCTAssertTrue(node.label.contains("Experimental"), "an experimental node says so: \(node.label)")
         XCTAssertTrue(element("node.driver_safety").exists, "Driver Safety keeps running beside it")

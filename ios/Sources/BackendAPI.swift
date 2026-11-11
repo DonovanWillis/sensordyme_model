@@ -291,7 +291,7 @@ protocol BackendAPI {
     /// echoes once it has applied the request (ProtectionControl).
     func setProtection(deviceID: Int, action: ProtectionAction, confirm: Bool) async throws -> ProtectionCommand
     /// POST /v1/devices/{id}/nodes. Turns a companion monitoring node (e.g.
-    /// `occupancy`) on or off. Accepted means queued: the device confirms by
+    /// `people_counter`) on or off. Accepted means queued: the device confirms by
     /// reporting the node in `status.perception.nodes`, or refuses with
     /// `last_rejection {kind: "nodes"}` (PerceptionStatus.swift).
     func setNode(deviceID: Int, node: String, enabled: Bool) async throws
@@ -599,7 +599,7 @@ final class MockAPI: BackendAPI {
         var nodes = [MonitoringNode(id: active, kind: "preset", state: protectionStopped ? "inactive" : "active",
                                     validation: "synthetic_tests")]
         if occupancyNodeOn {
-            nodes.append(MonitoringNode(id: "occupancy", kind: "companion",
+            nodes.append(MonitoringNode(id: "people_counter", kind: "companion",
                                         state: protectionStopped ? "inactive" : "active",
                                         requiredCapabilities: ["objects"], validation: "synthetic_tests",
                                         experimental: true))
@@ -816,7 +816,7 @@ final class MockAPI: BackendAPI {
     }
 
     func setNode(deviceID: Int, node: String, enabled: Bool) async throws {
-        guard node == "occupancy" else {
+        guard node == "people_counter" else {
             throw APIError(message: "no such node: \(node)", status: 400, code: "unknown_node")
         }
         pendingNode = (enabled, Date())

@@ -416,6 +416,7 @@ struct NodePresentation: Equatable {
         switch id {
         case "driver_safety": "Driver Safety"
         case "occupancy": "Occupancy"
+        case "people_counter": "People counter"
         case "rules": "Custom rules"
         default: CapabilityHealth.title(id)
         }

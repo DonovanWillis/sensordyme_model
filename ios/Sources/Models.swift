@@ -310,6 +310,13 @@ struct Preset: Identifiable, Hashable {
                variants: [.init(name: "home", title: "Home"),
                           .init(name: "away", title: "Away"),
                           .init(name: "package_watch", title: "Package Watch")]),
+        // M7: modes built on the shared perception engine (no model of their own).
+        Preset(name: "occupancy", title: "Occupancy",
+               subtitle: "People count, entries, exits & time in areas", icon: "person.3.fill",
+               variants: []),
+        Preset(name: "workplace_safety", title: "Workplace Safety",
+               subtitle: "Person in a restricted area (no PPE detection)", icon: "exclamationmark.triangle.fill",
+               variants: []),
     ]
 
     /// The built-in list as a catalog, labelled with why it is being shown.

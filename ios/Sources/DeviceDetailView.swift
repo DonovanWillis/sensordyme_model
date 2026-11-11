@@ -788,13 +788,13 @@ struct DeviceDetailView: View {
     /// The occupancy companion runs beside the mode on the same detections
     /// (no extra model). The switch shows what the device reports.
     @ViewBuilder private func occupancyToggle(_ report: PerceptionReport) -> some View {
-        let reported = CompanionNodeToggle.isOn("occupancy", report: report, live: deviceLive) ?? false
-        let pending = nodeRequest.map { $0.id == "occupancy"
-            && !CompanionNodeToggle.confirmed("occupancy", wanted: $0.wanted, report: report, live: deviceLive)
+        let reported = CompanionNodeToggle.isOn("people_counter", report: report, live: deviceLive) ?? false
+        let pending = nodeRequest.map { $0.id == "people_counter"
+            && !CompanionNodeToggle.confirmed("people_counter", wanted: $0.wanted, report: report, live: deviceLive)
             && Date().timeIntervalSince($0.at) < ModeSwitchState.switchTimeout } ?? false
         VStack(alignment: .leading, spacing: SD.Space.xxs) {
             Toggle(isOn: Binding(get: { pending ? (nodeRequest?.wanted ?? reported) : reported },
-                                 set: { setNode("occupancy", enabled: $0) })) {
+                                 set: { setNode("people_counter", enabled: $0) })) {
                 VStack(alignment: .leading, spacing: 1) {
                     Text("Also count people")
                         .font(SD.Typography.body)
@@ -808,14 +808,14 @@ struct DeviceDetailView: View {
             }
             .tint(SD.Colors.accent)
             .disabled(pending || !deviceLive)
-            .accessibilityIdentifier("node.toggle.occupancy")
-            if let message = nodeError ?? DeviceRefusal.forNode("occupancy", status: device.status,
+            .accessibilityIdentifier("node.toggle.people_counter")
+            if let message = nodeError ?? DeviceRefusal.forNode("people_counter", status: device.status,
                                                                 since: nodeRequest?.at) {
                 Text(message)
                     .font(SD.Typography.caption)
                     .foregroundStyle(SD.Colors.danger)
                     .fixedSize(horizontal: false, vertical: true)
-                    .accessibilityIdentifier("node.error.occupancy")
+                    .accessibilityIdentifier("node.error.people_counter")
             }
         }
     }
