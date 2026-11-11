@@ -134,11 +134,11 @@ They need a decision, not a silent pass. Each carries a dated
 - A provider that is unregistered, not `shipping`, or does not provide that kind.
 - Duplicate ids.
 
-## What is registered today (registry_version 2026-11-11.1)
+## What is registered today (registry_version 2026-11-11.2)
 
 | Model | Deployment | Provides | Status | Note |
 |---|---|---|---|---|
-| `damo_yolo_tinynasl20_t_coco80` (Hailo zoo v2.15.0 `.hef`, sha256 `e69136d3…`) | shipping | objects | **benchmarked_offline** | Open Images V7 val (manifest `b878e8429d221f3f`), float ONNX surrogate, as the device decodes it: phone AP50 0.728, person AP50 0.656. Decoder fix (offset 0 + multilabel), not shipped: 0.795 / 0.713. State Farm on the Pi + Hailo: phone recall 0.883 / precision 0.771 at 0.20 (image-level, public data). The 124 fps figure is Hailo's, from an x86 PCIe Gen3x4 host; the measured Pi latency is 22.07 ms. |
+| `damo_yolo_tinynasl20_t_coco80` (Hailo zoo v2.15.0 `.hef`, sha256 `e69136d3…`) | shipping | objects | **benchmarked_offline** | Open Images V7 val (manifest `b878e8429d221f3f`), float ONNX surrogate, as the device decodes it: phone AP50 0.728, person AP50 0.656. Decoder fix (offset 0 + multilabel), not shipped: 0.795 / 0.713. (An earlier State Farm measurement is not evidence: that data is competition-use only.) The 124 fps figure is Hailo's, from an x86 PCIe Gen3x4 host; the measured Pi latency is 22.07 ms. |
 | `mediapipe_face_mesh` (0.10.14) | shipping | face | unevaluated + exception | Model card: Apache-2.0, "not intended for human life-critical decisions". |
 | `mediapipe_hands` (0.10.14) | shipping | hands | unevaluated + exception | |
 | `mediapipe_pose` (0.10.14) | shipping | pose | unevaluated + exception | Used by presets that a driver_safety-role device cannot select. |
@@ -148,6 +148,55 @@ They need a decision, not a silent pass. Each carries a dated
 The MediaPipe hashes come from the copies of the `.tflite` files in the macOS
 arm64 `mediapipe==0.10.14` wheel. The Pi's aarch64 wheel has not been hashed
 yet. Do that before any runtime check enforces these hashes.
+
+## Capability tiers (M6.5)
+
+The evaluation ladder describes a **model**. Product claims are about
+**capabilities** (phone detection, drowsiness), so the same file also carries a
+finer ladder per capability, in `product_capabilities` and `evidence_bindings`:
+
+`exists_in_code < synthetic_tests < image_level_benchmark < video_evidence < device_verified < production_permitted`
+
+**Each evidence binding names exactly what was measured:**
+- the model card and the sha256 of the weights;
+- the decoder (`legacy`, `reference`, or `n/a` for MediaPipe);
+- the test or benchmark id;
+- the dataset manifest (`synthetic:<what>` for synthetic inputs);
+- the hardware target (`sim`, `dev_cpu`, `oryn_gpu_float`, `pi5_cpu` or `hailo8l_int8`);
+- the status: `current`, `experiment_only`, `superseded` or `pending`.
+
+**Rules (`capability_violations`, `binding_violations`):**
+- A claimed tier needs a `current` binding for the same capability, model and decoder, at that tier or higher. Experiment-only, superseded and pending bindings are recorded but support nothing.
+- `image_level_benchmark` and above need real data (not `synthetic:`), metrics, and a weights hash.
+- `device_verified` also needs the capability's deployed hardware target and a sha256 that is one of the model card's pinned artifacts.
+- `production_permitted` needs a `device_verified` binding, a shipping card that is `validated_on_device`, and a recorded approval (by, date, reference). It is never a binding tier, and an approval without that claim is refused.
+- The reference decoder cannot be `device_verified` or above without its own `hailo8l_int8` evidence, because it is unvalidated on the INT8 `.hef` (`docs/DECODER_CANDIDATE.md`).
+- A candidate model's bindings can never be `current`. The EXP-08 pilot checkpoints are `experiment_only`.
+- A binding that cites competition-only data (State Farm, Kaggle) is refused.
+
+**Today** (no capability is `device_verified` or `production_permitted`):
+
+| Capability | Model | Decoder | Tier | Supporting evidence |
+|---|---|---|---|---|
+| person_detection | DAMO-T `.hef` | legacy | image_level_benchmark | OI val, float ONNX surrogate (sha256 `02d7ef7f…`) on the oryn GPU: person AP50 0.656 |
+| phone_detection | DAMO-T `.hef` | legacy | image_level_benchmark | same run: phone AP50 0.728. The reference decoder (0.795) is experiment_only |
+| drowsiness | FaceMesh | n/a | synthetic_tests | `tests/test_drowsiness.py`, sim drowsy scenario |
+| gaze_distraction | FaceMesh | n/a | synthetic_tests | `tests/test_eye_gaze.py`, `tests/test_driver_attention_scenarios.py` |
+| hand_object_association | MediaPipe Hands | n/a | synthetic_tests | `tests/test_hand_perception.py` |
+| fall_detection | MediaPipe Pose | n/a | synthetic_tests | `tests/test_fall_detection.py`, `tests/test_phase1_safety_fall.py` |
+| hand_box_detection | EXP-08 candidate | reference | exists_in_code | 2-epoch pilot hand AP50 0.471 (experiment_only); the 60-epoch slot is `pending` |
+
+**API:** `GET /v1/capability-tiers` (signed in) serves `capability_tiers(registry)`.
+Each entry carries `tier`, `device_verified`, `production_validated`,
+`model_deployment`, the supporting `evidence` ids and the
+`experiment_evidence` ids. The app (`ios/Sources/CapabilityTier.swift`) shows
+"Validated for production" only when `production_validated` is true, the tier
+is `production_permitted` and the model is shipping. A candidate model always
+reads "Research only".
+
+**Filling the 60-epoch slot** (`hand_box_detection.exp08_full60`): set
+`model_sha256` to the hash of the scored `best_ckpt.pth`, the val metrics and the date. Change the
+status from `pending` to `experiment_only`, never `current`.
 
 ## Presets, roles, and custom policies
 

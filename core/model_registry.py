@@ -21,6 +21,21 @@ A capability may be shown to a user as "validated" only at validated_on_device.
 Runtime facts (the model loaded, the capability is AVAILABLE) never move a model
 up the ladder: no function here accepts them as evidence.
 
+Product capabilities and their tiers (M6.5): the ladder above is per MODEL. What
+the product claims about a CAPABILITY (phone detection, drowsiness...) is a
+second, finer ladder, bound to evidence records that each name the exact model
+hash, decoder, test, dataset manifest and hardware target:
+
+    exists_in_code < synthetic_tests < image_level_benchmark < video_evidence
+                   < device_verified < production_permitted
+
+A tier is claimed in core/model_registry.yaml and refused unless a `current`
+evidence binding for the same capability, model and decoder reaches it.
+device_verified also needs the deployed hardware target and a pinned artifact
+hash of the model card; production_permitted also needs device_verified, a
+shipping card that is validated_on_device, and a recorded approval. Experiment
+and pending bindings are kept for the record and support nothing.
+
 Pure: yaml + the standard library + core.roles/core.presets (both pure), so the
 backend can import it exactly as the device does. No clock is read unless the
 caller passes `today`.
@@ -261,6 +276,68 @@ class ModuleUse:
     source: str = ""
 
 
+# ---------------------------------------------------------------------- product capability tiers
+#: The product-capability ladder, lowest first (module docstring).
+TIERS = ("exists_in_code", "synthetic_tests", "image_level_benchmark", "video_evidence",
+         "device_verified", "production_permitted")
+#: Where a measurement ran. Only the deployed target can make a capability device_verified.
+HARDWARE_TARGETS = ("sim", "dev_cpu", "oryn_gpu_float", "pi5_cpu", "hailo8l_int8")
+#: "n/a" is for models without a box decoder (MediaPipe graphs).
+DECODERS = ("legacy", "reference", "n/a")
+#: current: supports claims. experiment_only: a research result (pilot checkpoints, a
+#: candidate decoder) kept for the record. superseded: replaced by a newer record.
+#: pending: a reserved slot (e.g. a run still training) whose values are not known yet.
+BINDING_STATUSES = ("current", "experiment_only", "superseded", "pending")
+#: Data the product may never cite (competition-only licences; Mission 4 dataset audit).
+_FORBIDDEN_DATA = re.compile(r"state[ _-]?farm|kaggle|competition", re.IGNORECASE)
+
+
+def tier_rank(tier: str) -> int:
+    """Position on the ladder; -1 for a value that is not a tier."""
+    return TIERS.index(tier) if tier in TIERS else -1
+
+
+@dataclass(frozen=True)
+class Approval:
+    by: str
+    date: str
+    reference: str
+
+
+@dataclass(frozen=True)
+class ProductCapability:
+    """One capability the product claims, the model behind it, and the tier it claims."""
+
+    id: str
+    model: str
+    kind: str
+    code: str
+    deployed_target: str
+    decoder: str
+    claimed_tier: str
+    approval: Optional[Approval] = None
+    notes: str = ""
+
+
+@dataclass(frozen=True)
+class EvidenceBinding:
+    """One piece of capability evidence, bound to exactly what was measured."""
+
+    id: str
+    capability: str
+    tier: str
+    model: str
+    model_sha256: Optional[str]
+    decoder: str
+    test_id: str
+    dataset_manifest: str
+    hardware_target: str
+    status: str
+    date: str
+    metrics: tuple[tuple[str, Union[float, str]], ...] = ()
+    notes: str = ""
+
+
 @dataclass(frozen=True)
 class ModelRegistry:
     schema_version: int
@@ -268,6 +345,14 @@ class ModelRegistry:
     models: tuple[ModelCard, ...]
     providers: tuple[tuple[str, str], ...]  # (capability kind, model id)
     modules: tuple[tuple[str, ModuleUse], ...]
+    capabilities: tuple[ProductCapability, ...] = ()
+    bindings: tuple[EvidenceBinding, ...] = ()
+
+    def product_capability(self, capability_id: str) -> Optional[ProductCapability]:
+        return next((c for c in self.capabilities if c.id == capability_id), None)
+
+    def bindings_for(self, capability_id: str) -> tuple[EvidenceBinding, ...]:
+        return tuple(b for b in self.bindings if b.capability == capability_id)
 
     def card(self, model_id: str) -> Optional[ModelCard]:
         return next((m for m in self.models if m.id == model_id), None)
@@ -441,11 +526,37 @@ def parse_registry(data: Any) -> ModelRegistry:
             optional=tuple(_text(k) for k in _seq(spec.get("optional"))),
             source=_text(spec.get("source")),
         )))
+    capabilities = []
+    for cap_id, raw_cap in _map(data.get("product_capabilities")).items():
+        cap = _map(raw_cap)
+        approval = None
+        if cap.get("approval") is not None:
+            a = _map(cap.get("approval"))
+            approval = Approval(by=_text(a.get("by")), date=_text(a.get("date")), reference=_text(a.get("reference")))
+        capabilities.append(ProductCapability(
+            id=str(cap_id), model=_text(cap.get("model")), kind=_text(cap.get("kind")),
+            code=_text(cap.get("code")), deployed_target=_text(cap.get("deployed_target")),
+            decoder=_text(cap.get("decoder")), claimed_tier=_text(cap.get("claimed_tier")),
+            approval=approval, notes=_text(cap.get("notes")),
+        ))
+    bindings = []
+    for raw_binding in _seq(data.get("evidence_bindings")):
+        b = _map(raw_binding)
+        sha = _opt_text(b.get("model_sha256"))
+        bindings.append(EvidenceBinding(
+            id=_text(b.get("id")), capability=_text(b.get("capability")), tier=_text(b.get("tier")),
+            model=_text(b.get("model")), model_sha256=sha.lower() if sha else None,
+            decoder=_text(b.get("decoder")), test_id=_text(b.get("test_id")),
+            dataset_manifest=_text(b.get("dataset_manifest")), hardware_target=_text(b.get("hardware_target")),
+            status=_text(b.get("status")), date=_text(b.get("date")), metrics=_metrics(b.get("metrics")),
+            notes=_text(b.get("notes")),
+        ))
     if problems:
         raise RegistryError(problems)
     return ModelRegistry(
         schema_version=1, registry_version=_text(data.get("registry_version")),
         models=models, providers=providers, modules=tuple(modules),
+        capabilities=tuple(capabilities), bindings=tuple(bindings),
     )
 
 
@@ -591,6 +702,110 @@ def card_violations(card: ModelCard, today: Optional[_dt.date] = None) -> list[s
     return errors
 
 
+def binding_violations(registry: ModelRegistry, b: EvidenceBinding) -> list[str]:
+    """Every way one evidence binding is malformed (independent of any claim)."""
+    where = f"evidence_bindings.{b.id or '<no id>'}"
+    errors: list[str] = []
+    if not b.id:
+        errors.append(f"{where}: missing id")
+    if b.status not in BINDING_STATUSES:
+        errors.append(f"{where}: status must be one of {list(BINDING_STATUSES)}, got {b.status!r}")
+    if registry.product_capability(b.capability) is None:
+        errors.append(f"{where}: capability {b.capability!r} is not in product_capabilities")
+    if tier_rank(b.tier) < 0:
+        errors.append(f"{where}: tier must be one of {list(TIERS)}, got {b.tier!r}")
+    elif b.tier == "production_permitted":
+        errors.append(f"{where}: production_permitted is an approval on the capability, not a measurement")
+    card = registry.card(b.model)
+    if card is None:
+        errors.append(f"{where}: model {b.model!r} is not registered")
+    for value in (b.test_id, b.dataset_manifest, b.notes, *(str(v) for _, v in b.metrics)):
+        if _FORBIDDEN_DATA.search(value or ""):
+            errors.append(f"{where}: cites competition-only data ({value!r}); it can support nothing "
+                          f"and must not be recorded as evidence")
+    if b.status == "pending":
+        return errors  # a reserved slot: the values arrive with the run
+    if b.decoder not in DECODERS:
+        errors.append(f"{where}: decoder must be one of {list(DECODERS)}, got {b.decoder!r}")
+    if b.hardware_target not in HARDWARE_TARGETS:
+        errors.append(f"{where}: hardware_target must be one of {list(HARDWARE_TARGETS)}, "
+                      f"got {b.hardware_target!r}")
+    for name in ("test_id", "dataset_manifest"):
+        if not getattr(b, name):
+            errors.append(f"{where}: missing {name}")
+    if _valid_date(b.date) is None:
+        errors.append(f"{where}: date must be YYYY-MM-DD, got {b.date!r}")
+    if b.model_sha256 is not None and not _SHA256.match(b.model_sha256):
+        errors.append(f"{where}: model_sha256 is not 64 lowercase hex characters")
+    if tier_rank(b.tier) >= tier_rank("image_level_benchmark"):
+        if b.model_sha256 is None:
+            errors.append(f"{where}: a {b.tier} measurement must name the sha256 of the weights it measured")
+        if b.dataset_manifest.startswith("synthetic:"):
+            errors.append(f"{where}: {b.tier} needs real data; {b.dataset_manifest!r} is synthetic")
+        if not b.metrics:
+            errors.append(f"{where}: a {b.tier} measurement with no metrics is not evidence")
+    if card is not None and card.deployment == "candidate" and b.status == "current":
+        errors.append(f"{where}: {card.id} is a candidate model; its evidence is experiment_only until "
+                      f"it is promoted")
+    return errors
+
+
+def _supports(registry: ModelRegistry, cap: ProductCapability, b: EvidenceBinding, tier: str) -> bool:
+    """Whether `b` supports claiming `tier` for `cap`."""
+    if b.capability != cap.id or b.status != "current" or b.model != cap.model or b.decoder != cap.decoder:
+        return False
+    if tier_rank(b.tier) < tier_rank(tier):
+        return False
+    if tier_rank(tier) >= tier_rank("device_verified"):
+        card = registry.card(cap.model)
+        return (b.hardware_target == cap.deployed_target and card is not None
+                and card.has_artifact(b.model_sha256))
+    return True
+
+
+def capability_violations(registry: ModelRegistry, cap: ProductCapability) -> list[str]:
+    """Every way one product capability claims more than its evidence."""
+    where = f"product_capabilities.{cap.id}"
+    errors: list[str] = []
+    card = registry.card(cap.model)
+    if card is None:
+        errors.append(f"{where}: model {cap.model!r} is not registered")
+    elif cap.kind not in card.provides_capabilities:
+        errors.append(f"{where}: {card.id} does not provide {cap.kind!r}")
+    if not cap.code:
+        errors.append(f"{where}: missing code (where the capability is implemented)")
+    if cap.deployed_target not in HARDWARE_TARGETS:
+        errors.append(f"{where}: deployed_target must be one of {list(HARDWARE_TARGETS)}, "
+                      f"got {cap.deployed_target!r}")
+    if cap.decoder not in DECODERS:
+        errors.append(f"{where}: decoder must be one of {list(DECODERS)}, got {cap.decoder!r}")
+    rank = tier_rank(cap.claimed_tier)
+    if rank < 0:
+        errors.append(f"{where}: claimed_tier must be one of {list(TIERS)}, got {cap.claimed_tier!r}")
+        return errors
+    if rank > 0:
+        need = "device_verified" if cap.claimed_tier == "production_permitted" else cap.claimed_tier
+        if not any(_supports(registry, cap, b, need) for b in registry.bindings_for(cap.id)):
+            extra = (f" on {cap.deployed_target} with a pinned artifact hash of {cap.model}"
+                     if tier_rank(need) >= tier_rank("device_verified") else "")
+            errors.append(f"{where}: claims {cap.claimed_tier} without a current evidence binding for "
+                          f"model {cap.model}, decoder {cap.decoder}, reaching {need}{extra}")
+    if cap.decoder == "reference" and rank >= tier_rank("device_verified") and not any(
+            b.status == "current" and b.decoder == "reference" and b.hardware_target == "hailo8l_int8"
+            and tier_rank(b.tier) >= tier_rank("device_verified") for b in registry.bindings_for(cap.id)):
+        errors.append(f"{where}: the reference decoder is unvalidated on the INT8 .hef "
+                      f"(docs/DECODER_CANDIDATE.md); it cannot be {cap.claimed_tier}")
+    if cap.claimed_tier == "production_permitted":
+        if card is not None and (card.deployment != "shipping" or not card.validated):
+            errors.append(f"{where}: production_permitted needs a shipping model that is validated_on_device")
+        a = cap.approval
+        if a is None or not a.by or not a.reference or _valid_date(a.date) is None:
+            errors.append(f"{where}: production_permitted needs a recorded approval (by, date, reference)")
+    elif cap.approval is not None:
+        errors.append(f"{where}: an approval is only recorded with a production_permitted claim")
+    return errors
+
+
 def registry_violations(registry: ModelRegistry, today: Optional[_dt.date] = None) -> list[str]:
     """Every reason `registry` must be refused (empty when it is acceptable).
 
@@ -622,6 +837,18 @@ def registry_violations(registry: ModelRegistry, today: Optional[_dt.date] = Non
                 errors.append(f"modules.{name}: unknown capability kind {kind!r}")
             elif kind in PERCEPTION_KINDS and kind not in providers:
                 errors.append(f"modules.{name}: uses {kind}, but no provider is registered for it")
+    seen_caps: set[str] = set()
+    for cap in registry.capabilities:
+        if cap.id in seen_caps:
+            errors.append(f"product_capabilities.{cap.id}: duplicate id")
+        seen_caps.add(cap.id)
+        errors += capability_violations(registry, cap)
+    seen_bindings: set[str] = set()
+    for b in registry.bindings:
+        if b.id in seen_bindings:
+            errors.append(f"evidence_bindings.{b.id}: duplicate id")
+        seen_bindings.add(b.id)
+        errors += binding_violations(registry, b)
     return errors
 
 
@@ -861,6 +1088,34 @@ def capability_evidence(registry: ModelRegistry, *, preset: Optional[str], role:
     }
 
 
+def capability_tiers(registry: ModelRegistry) -> dict:
+    """The product-capability tiers as the API serves them (GET /v1/capability-tiers).
+
+    `production_validated` is true only at production_permitted, and
+    `device_verified` only at device_verified or above: the app reads these two
+    booleans, never the tier string alone, to decide what to call validated.
+    """
+    entries = []
+    for cap in registry.capabilities:
+        card = registry.card(cap.model)
+        bindings = registry.bindings_for(cap.id)
+        rank = tier_rank(cap.claimed_tier)
+        entries.append({
+            "capability": cap.id,
+            "kind": cap.kind,
+            "model": cap.model,
+            "model_deployment": card.deployment if card else None,
+            "decoder": cap.decoder,
+            "deployed_target": cap.deployed_target,
+            "tier": cap.claimed_tier,
+            "device_verified": rank >= tier_rank("device_verified"),
+            "production_validated": cap.claimed_tier == "production_permitted",
+            "evidence": [b.id for b in bindings if _supports(registry, cap, b, cap.claimed_tier)],
+            "experiment_evidence": [b.id for b in bindings if b.status in ("experiment_only", "pending")],
+        })
+    return {"registry_version": registry.registry_version, "tiers": list(TIERS), "capabilities": entries}
+
+
 # ---------------------------------------------------------------------- re-evaluation
 @dataclass(frozen=True)
 class Impact:
@@ -951,10 +1206,12 @@ def as_dict(registry: ModelRegistry) -> dict:
 
 
 __all__ = [
-    "CAPABILITY_KINDS", "DEFAULT_PATH", "EVIDENCE_LEVELS", "LADDER", "PERCEPTION_KINDS",
-    "CapabilityLink", "ChainView", "EvaluationStatus", "Evidence", "Impact", "ModelCard",
-    "ModelRegistry", "RegistryError", "as_dict", "capability_evidence", "capability_link",
-    "card_violations", "chain_for", "display_state", "load_registry", "parse_registry",
-    "policy_view", "preset_view", "preset_views", "presets_using", "reevaluation_impact",
-    "registry_violations", "role_view", "role_views", "roles_using", "weakest",
+    "BINDING_STATUSES", "CAPABILITY_KINDS", "DECODERS", "DEFAULT_PATH", "EVIDENCE_LEVELS",
+    "HARDWARE_TARGETS", "LADDER", "PERCEPTION_KINDS", "TIERS",
+    "Approval", "CapabilityLink", "ChainView", "EvaluationStatus", "Evidence", "EvidenceBinding",
+    "Impact", "ModelCard", "ModelRegistry", "ProductCapability", "RegistryError", "as_dict",
+    "binding_violations", "capability_evidence", "capability_link", "capability_tiers",
+    "capability_violations", "card_violations", "chain_for", "display_state", "load_registry",
+    "parse_registry", "policy_view", "preset_view", "preset_views", "presets_using", "reevaluation_impact",
+    "registry_violations", "role_view", "role_views", "roles_using", "tier_rank", "weakest",
 ]

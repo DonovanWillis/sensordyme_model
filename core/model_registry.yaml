@@ -18,7 +18,7 @@
 # Quote every sha256 and every version: YAML would read some of them as numbers.
 
 schema_version: 1
-registry_version: "2026-11-11.1"
+registry_version: "2026-11-11.2"
 
 # Which registered model supplies each perception capability on a shipped
 # device. Every module shares these: core/detectors.py hands every module the
@@ -365,3 +365,200 @@ models:
       - Hand boxes are not MediaPipe landmarks; consumers of `hands` would need adapting
       - No Hailo compile, no NoIR calibration set, no Pi validation
     deployment: candidate
+
+# ======================================================================
+# Product capabilities and their tiers (M6.5; docs/MODEL_REGISTRY.md
+# "Capability tiers"). The model ladder above says how far a MODEL got; this
+# says how far each thing the PRODUCT claims got:
+#
+#   exists_in_code < synthetic_tests < image_level_benchmark < video_evidence
+#                  < device_verified < production_permitted
+#
+# claimed_tier is refused unless a `current` evidence binding for the same
+# capability, model and decoder reaches it. device_verified also needs the
+# deployed hardware target and a pinned artifact hash of the model card;
+# production_permitted also needs a validated_on_device shipping card and a
+# recorded approval. Nothing is production_permitted today.
+product_capabilities:
+  person_detection:
+    model: damo_yolo_tinynasl20_t_coco80
+    kind: objects
+    code: core/accel.py HailoYOLO, core/detectors.py
+    deployed_target: hailo8l_int8
+    decoder: legacy
+    claimed_tier: image_level_benchmark
+    notes: Float ONNX surrogate on Open Images val; INT8 .hef accuracy unmeasured
+  phone_detection:
+    model: damo_yolo_tinynasl20_t_coco80
+    kind: objects
+    code: core/accel.py HailoYOLO, core/detectors.py
+    deployed_target: hailo8l_int8
+    decoder: legacy
+    claimed_tier: image_level_benchmark
+    notes: >-
+      The reference decoder (docs/DECODER_CANDIDATE.md) measures better but is
+      recorded experiment_only: unvalidated on the INT8 .hef, so it lifts nothing
+  drowsiness:
+    model: mediapipe_face_mesh
+    kind: face
+    code: modules/driver_attention.py PerclosTracker, core/eye_signal.py
+    deployed_target: pi5_cpu
+    decoder: n/a
+    claimed_tier: synthetic_tests
+  gaze_distraction:
+    model: mediapipe_face_mesh
+    kind: face
+    code: modules/driver_attention.py (head pose + eye-in-head gaze)
+    deployed_target: pi5_cpu
+    decoder: n/a
+    claimed_tier: synthetic_tests
+  hand_object_association:
+    model: mediapipe_hands
+    kind: hands
+    code: core/hand_perception.py
+    deployed_target: pi5_cpu
+    decoder: n/a
+    claimed_tier: synthetic_tests
+  fall_detection:
+    model: mediapipe_pose
+    kind: pose
+    code: modules/fall_detection.py
+    deployed_target: pi5_cpu
+    decoder: n/a
+    claimed_tier: synthetic_tests
+  hand_box_detection:
+    model: damo_yolo_t_exp08_person_phone_hand
+    kind: hands
+    code: research/pilot/exp08.sh (research only; not in the device runtime)
+    deployed_target: hailo8l_int8
+    decoder: reference
+    claimed_tier: exists_in_code
+    notes: Fine-tuned DAMO-YOLO-T hand class; every measurement so far is a pilot (experiment_only)
+
+# Every binding names exactly what was measured. hardware_target: sim | dev_cpu
+# | oryn_gpu_float | pi5_cpu | hailo8l_int8. status: current | experiment_only |
+# superseded | pending. Competition-only data (e.g. State Farm) is refused.
+evidence_bindings:
+  - id: person_detection.oi7_val.legacy
+    capability: person_detection
+    tier: image_level_benchmark
+    model: damo_yolo_tinynasl20_t_coco80
+    model_sha256: "02d7ef7f35da6abfecdf2e04505b560451eb2dd9eff1cf335ab8e5370c126657"
+    decoder: legacy
+    test_id: detector_bench/bench_val:damo_t.production
+    dataset_manifest: b878e8429d221f3f
+    hardware_target: oryn_gpu_float
+    status: current
+    date: "2026-11-11"
+    metrics: {person_ap50: 0.656, person_ap50_95: 0.352}
+    notes: Hailo Model Zoo float ONNX (source of the .hef), val split; job 20261111-005821-2ce4f2
+  - id: phone_detection.oi7_val.legacy
+    capability: phone_detection
+    tier: image_level_benchmark
+    model: damo_yolo_tinynasl20_t_coco80
+    model_sha256: "02d7ef7f35da6abfecdf2e04505b560451eb2dd9eff1cf335ab8e5370c126657"
+    decoder: legacy
+    test_id: detector_bench/bench_val:damo_t.production
+    dataset_manifest: b878e8429d221f3f
+    hardware_target: oryn_gpu_float
+    status: current
+    date: "2026-11-11"
+    metrics: {phone_ap50: 0.728, phone_ap50_95: 0.452, phone_free_images_with_false_phone_box_at_0.20: 0.595}
+    notes: Hailo Model Zoo float ONNX (source of the .hef), val split; job 20261111-005821-2ce4f2
+  - id: phone_detection.oi7_val.reference
+    capability: phone_detection
+    tier: image_level_benchmark
+    model: damo_yolo_tinynasl20_t_coco80
+    model_sha256: "02d7ef7f35da6abfecdf2e04505b560451eb2dd9eff1cf335ab8e5370c126657"
+    decoder: reference
+    test_id: detector_bench/bench_val:damo_t.offset0_multilabel
+    dataset_manifest: b878e8429d221f3f
+    hardware_target: oryn_gpu_float
+    status: experiment_only
+    date: "2026-11-11"
+    metrics: {phone_ap50: 0.795, phone_ap50_95: 0.707, person_ap50: 0.713}
+    notes: Candidate decoder, product code; job 20261111-022003-26d0f7. INT8 unvalidated, so not deployed
+  - id: phone_detection.decoder_synthetic_heads
+    capability: phone_detection
+    tier: synthetic_tests
+    model: damo_yolo_tinynasl20_t_coco80
+    model_sha256: null
+    decoder: legacy
+    test_id: tests/test_hailo_decoder.py
+    dataset_manifest: "synthetic:hand-built head tensors"
+    hardware_target: dev_cpu
+    status: current
+    date: "2026-11-11"
+  - id: drowsiness.synthetic
+    capability: drowsiness
+    tier: synthetic_tests
+    model: mediapipe_face_mesh
+    model_sha256: null
+    decoder: n/a
+    test_id: tests/test_drowsiness.py; tests/test_sim_e2e.py::test_driver_asleep_is_one_drowsiness_episode_visible_once
+    dataset_manifest: "synthetic:EAR series and sim scenarios"
+    hardware_target: sim
+    status: current
+    date: "2026-11-11"
+  - id: gaze_distraction.synthetic
+    capability: gaze_distraction
+    tier: synthetic_tests
+    model: mediapipe_face_mesh
+    model_sha256: null
+    decoder: n/a
+    test_id: tests/test_eye_gaze.py; tests/test_driver_attention_scenarios.py
+    dataset_manifest: "synthetic:geometric landmarks"
+    hardware_target: dev_cpu
+    status: current
+    date: "2026-11-11"
+  - id: hand_object_association.synthetic
+    capability: hand_object_association
+    tier: synthetic_tests
+    model: mediapipe_hands
+    model_sha256: null
+    decoder: n/a
+    test_id: tests/test_hand_perception.py
+    dataset_manifest: "synthetic:hand-built landmarks"
+    hardware_target: dev_cpu
+    status: current
+    date: "2026-11-11"
+  - id: fall_detection.synthetic
+    capability: fall_detection
+    tier: synthetic_tests
+    model: mediapipe_pose
+    model_sha256: null
+    decoder: n/a
+    test_id: tests/test_fall_detection.py; tests/test_phase1_safety_fall.py
+    dataset_manifest: "synthetic:pose sequences"
+    hardware_target: dev_cpu
+    status: current
+    date: "2026-11-11"
+  - id: hand_box_detection.exp08a_rerun
+    capability: hand_box_detection
+    tier: image_level_benchmark
+    model: damo_yolo_t_exp08_person_phone_hand
+    model_sha256: "2ce383d04871a7e93ca3a8500e7a77b5a5f00e4b2dffa52e4b733294a1c1a62b"
+    decoder: reference
+    test_id: research/detector_bench score exp08a_rerun (job 20261111-040426-e7b2ef)
+    dataset_manifest: b878e8429d221f3f
+    hardware_target: oryn_gpu_float
+    status: experiment_only
+    date: "2026-11-11"
+    metrics: {hand_ap50: 0.471, phone_ap50: 0.721, person_ap50: 0.638, epochs: 2}
+    notes: 2-epoch pilot, stock labels, seed 1234; docs/research/EXP08_RESULTS.md. Not a production candidate
+  # Reserved for the one authorised 60-epoch run (job 20261111-055506-564ff3,
+  # EXP=exp08_full60). The integrator fills model_sha256 (best_ckpt.pth),
+  # metrics (val only) and date when it finishes, and keeps it experiment_only:
+  # a candidate model's evidence supports no product claim.
+  - id: hand_box_detection.exp08_full60
+    capability: hand_box_detection
+    tier: image_level_benchmark
+    model: damo_yolo_t_exp08_person_phone_hand
+    model_sha256: null
+    decoder: reference
+    test_id: research/detector_bench score exp08_full60 (job 20261111-055506-564ff3)
+    dataset_manifest: b878e8429d221f3f
+    hardware_target: oryn_gpu_float
+    status: pending
+    date: null
+    metrics: {}
