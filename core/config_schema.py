@@ -22,6 +22,9 @@ _KNOWN_TOP_LEVEL = {
     "training",
     # Deployment role and its safety floor (core/roles.py, M0.1).
     "role",
+    # development (default) | production: production refuses insecure fallbacks,
+    # e.g. unauthenticated Bluetooth setup (services/ble_pop.py, M6.5).
+    "deployment",
 }
 
 
@@ -129,6 +132,9 @@ def validate(config: dict) -> tuple[list[str], list[str]]:
            "`module:` must be a non-empty string")
     profile = config.get("profile", "pi")
     _check(errors, profile in ("pi", "mac_max"), f"`profile:` must be 'pi' or 'mac_max', got {profile!r}")
+    deployment = config.get("deployment", "development")
+    _check(errors, deployment in ("development", "production"),
+           f"`deployment:` must be development|production, got {deployment!r}")
 
     camera = config.get("camera", {})
     if isinstance(camera, dict):
@@ -181,6 +187,12 @@ def validate(config: dict) -> tuple[list[str], list[str]]:
             method = prov.get("method", "ble")
             _check(errors, method in ("ble", "hotspot", "off"),
                    f"`network.provisioning.method:` must be ble|hotspot|off, got {method!r}")
+            auth = prov.get("auth", "legacy")
+            _check(errors, auth in ("legacy", "pop"),
+                   f"`network.provisioning.auth:` must be legacy|pop, got {auth!r}")
+            if auth == "legacy" and config.get("deployment") == "production" and method == "ble":
+                errors.append("`network.provisioning.auth: legacy` (unauthenticated Bluetooth setup) is refused "
+                              "with `deployment: production`; set `auth: pop` (services/ble_pop.py)")
         else:
             errors.append("`network.provisioning:` must be a mapping")
     else:

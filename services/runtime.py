@@ -594,7 +594,8 @@ class DeviceRuntime:
         self.wifi = wifi  # also read by the health report the app displays
         network_cfg = self.config.get("network", {})
         self.provisioning = ProvisioningService(
-            wifi, network_cfg.get("provisioning", {}), version=_VERSION
+            wifi, network_cfg.get("provisioning", {}), version=_VERSION,
+            deployment=str(self.config.get("deployment", "development")),
         )
 
         # Hardware HAL: null implementations today; health-visible either way.
