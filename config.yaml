@@ -154,6 +154,15 @@ network:
     # only ever punishes the person standing there trying to set the device up.
     grace_s: 0 # seconds offline before the BLE setup window opens
     poll_s: 10 # how often to re-check connectivity
+    # Who may hand the device a network over Bluetooth:
+    #   legacy -- anyone in range while the window is open (development only; refused
+    #             when a top-level `deployment: production` is set)
+    #   pop    -- only a phone that proves it holds the setup code on the device's
+    #             label/QR (services/ble_pop.py); credentials travel encrypted. Needs
+    #             the code file below (written once by scripts/ble_setup_code.py, 0600)
+    #             and an app build that speaks proof of possession.
+    auth: legacy
+    setup_code_path: /etc/sensordyme/ble_setup_code
 
 # Health monitoring and automatic recovery: every component (camera, inference,
 # accelerator, dashboard, uplink, wifi, provisioning, hardware) is checked

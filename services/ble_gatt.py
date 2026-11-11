@@ -13,6 +13,9 @@ no Wi-Fi:
                                      "ip"|"error", "message"}, "scanning"} -- <= 512 bytes
       char   5d1e0005  write         lightweight commands JSON {"action": "rescan" | "identify"}
       char   5d1e0006  read          networks JSON [{"ssid", "signal", "secured"}] (cached)
+      char   5d1e0007  read/write/   proof-of-possession messages (services/ble_pop.py), present
+                       notify        only with `network.provisioning.auth: pop`; the reply to the
+                                     last write is read (or notified) back
 
 Bluetooth is for setup/config/commands ONLY — frames never move over BLE; the
 live feed always uses Wi-Fi (see core/dashboard.py's /stream).
@@ -21,11 +24,15 @@ Requires BlueZ with dbus-python + PyGObject (`apt install python3-dbus
 python3-gi`, installed by setup_pi.sh). All imports are performed at start()
 so this file is importable (and the rest of the codebase testable) on a Mac.
 
-Security posture (documented, deliberate): pairing is BLE "Just Works", so the
-credential write is unauthenticated. What bounds the exposure is WHEN it is
-served: while the device is offline, and for a few minutes after each boot
-(services/provisioning.py, `reconfigure_window_s`). Setting
-`provisioning.always_available: true` keeps it open permanently.
+Security posture: pairing is BLE "Just Works" at the link layer either way.
+With `network.provisioning.auth: pop` the credential characteristic refuses
+plain writes; credentials arrive only encrypted on the auth characteristic,
+after the phone has proved it holds the device's setup code
+(services/ble_pop.py). With `auth: legacy` (development only; refused when
+`deployment: production`) the credential write is unauthenticated and what
+bounds the exposure is WHEN it is served: while the device is offline, and for
+a few minutes after each boot (services/provisioning.py,
+`reconfigure_window_s`).
 """
 
 from __future__ import annotations
@@ -47,6 +54,7 @@ CHAR_WIFI_CREDS_UUID = "5d1e0003-5344-4d45-b000-536e447a6d65"
 CHAR_STATUS_UUID = "5d1e0004-5344-4d45-b000-536e447a6d65"
 CHAR_COMMAND_UUID = "5d1e0005-5344-4d45-b000-536e447a6d65"
 CHAR_NETWORKS_UUID = "5d1e0006-5344-4d45-b000-536e447a6d65"
+CHAR_AUTH_UUID = "5d1e0007-5344-4d45-b000-536e447a6d65"
 
 BLUEZ_SERVICE = "org.bluez"
 GATT_MANAGER_IFACE = "org.bluez.GattManager1"
@@ -265,6 +273,9 @@ class BLEProvisioningServer:
         device_info: Dict served by the device-info characteristic.
         on_credentials: Called with (ssid, psk) when the app writes credentials.
         on_command: Called with the parsed command dict for lightweight commands.
+        on_auth: Proof-of-possession handler (bytes in, reply bytes out). When
+            given, the auth characteristic is served and the plain credential
+            characteristic refuses every write.
     """
 
     def __init__(
@@ -274,8 +285,13 @@ class BLEProvisioningServer:
         on_credentials: Callable[[str, str], None],
         scan_networks: Optional[Callable[[], list]] = None,
         on_command: Optional[Callable[[dict], None]] = None,
+        on_auth: Optional[Callable[[bytes], bytes]] = None,
     ) -> None:
         self._device_name = device_name
+        self._on_auth = on_auth
+        #: The reply to the last auth write, served by reads of the auth characteristic.
+        self._auth_reply = b"{}"
+        self._auth_chrc = None
         self._device_info = device_info
         # Scanning happens on a worker thread and reads answer from this cache.
         #
@@ -548,6 +564,31 @@ class BLEProvisioningServer:
             except Exception as exc:  # noqa: BLE001
                 log.warning("BLE status notify failed: %s", exc)
 
+    def handle_credentials_write(self, data: bytes) -> bool:
+        """A write on the plain credential characteristic. Refused under proof of possession."""
+        if self._on_auth is not None:
+            log.warning("BLE: plain credential write refused: this device requires proof of the setup code")
+            return False
+        return dispatch_credentials(data, self._on_credentials)
+
+    def handle_auth_write(self, data: bytes) -> bytes:
+        """A write on the auth characteristic: hand it to the protocol, keep the reply for reads."""
+        if self._on_auth is None:
+            return b"{}"
+        try:
+            reply = self._on_auth(data)
+        except Exception as exc:  # noqa: BLE001 - a protocol fault must not kill the GATT loop
+            log.error("BLE: proof-of-possession handler failed: %s", type(exc).__name__)
+            reply = b'{"op":"error","error":"internal"}'
+        self._auth_reply = reply
+        chrc = self._auth_chrc
+        if chrc is not None:
+            try:
+                chrc.push_value(reply)
+            except Exception as exc:  # noqa: BLE001
+                log.warning("BLE auth notify failed: %s", exc)
+        return reply
+
     # ------------------------------------------------------------------ GLib main loop thread
     def _run(self) -> None:
         try:
@@ -586,6 +627,7 @@ class BLEProvisioningServer:
         finally:
             # Teardown must never raise: every step is best effort.
             self._status_chrc = None
+            self._auth_chrc = None
             for manager, method, path in managers:
                 with contextlib.suppress(Exception):
                     getattr(manager, method)(path)
@@ -713,7 +755,14 @@ class BLEProvisioningServer:
 
         class WifiCredsChrc(Characteristic):
             def write_value(self, data):
-                dispatch_credentials(data, server._on_credentials)
+                server.handle_credentials_write(data)
+
+        class AuthChrc(Characteristic):
+            def read_value(self, offset=0):
+                return server._auth_reply
+
+            def write_value(self, data):
+                server.handle_auth_write(data)
 
         class NetworksChrc(Characteristic):
             """Wi-Fi networks the DEVICE can see, so the app can offer a list.
@@ -780,18 +829,23 @@ class BLEProvisioningServer:
         exported.append(service)
         app.add(service)
         status_chrc = None
-        for index, cls, uuid, flags in (
+        characteristics = [
             (0, DeviceInfoChrc, CHAR_DEVICE_INFO_UUID, ["read"]),
             (1, WifiCredsChrc, CHAR_WIFI_CREDS_UUID, ["write"]),
             (2, StatusChrc, CHAR_STATUS_UUID, ["read", "notify"]),
             (3, CommandChrc, CHAR_COMMAND_UUID, ["write"]),
             (4, NetworksChrc, CHAR_NETWORKS_UUID, ["read"]),
-        ):
+        ]
+        if self._on_auth is not None:
+            characteristics.append((5, AuthChrc, CHAR_AUTH_UUID, ["read", "write", "notify"]))
+        for index, cls, uuid, flags in characteristics:
             chrc = cls(bus, index, uuid, flags, service.PATH)
             exported.append(chrc)
             app.add(chrc)
             if uuid == CHAR_STATUS_UUID:
                 status_chrc = chrc
+            if uuid == CHAR_AUTH_UUID:
+                self._auth_chrc = chrc
 
         # The adapter must be powered before anything can be registered on it.
         adapter_props = None

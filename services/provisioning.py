@@ -22,6 +22,16 @@ Method selection (`network.provisioning.method` in config.yaml):
     hotspot  -- legacy scripts/provisioning_hotspot.sh oneshot (kept for
                 installs without BLE); this service stays dormant
     off      -- no provisioning; Wi-Fi is whatever NetworkManager already knows
+
+Who may write credentials (`network.provisioning.auth`):
+    legacy   -- anyone in Bluetooth range while the window is open ("Just Works").
+                Development only: refused outright when the top-level
+                `deployment:` is `production`, and the window then stays shut.
+    pop      -- only a phone that proves it holds this device's setup code (the
+                label / QR code; `setup_code_path`), with the credentials sent
+                encrypted (services/ble_pop.py). A missing or loosely-permissioned
+                code file keeps the window shut and is reported in health; there
+                is no fallback to legacy.
 """
 
 from __future__ import annotations
@@ -33,8 +43,12 @@ from typing import Optional
 from core.identity import device_id, display_name
 from core.logging_setup import get_logger
 from core.network import WifiManager, nmcli_available
+from services.ble_pop import PopAuthenticator, SetupCodeError, load_setup_code, resolve_auth
 
 log = get_logger("provisioning")
+
+#: Where the factory writes the setup code (scripts/ble_setup_code.py), mode 0600.
+DEFAULT_SETUP_CODE_PATH = "/etc/sensordyme/ble_setup_code"
 
 
 def _ble_name() -> str:
@@ -68,9 +82,20 @@ class ProvisioningService:
     # Methods whose in-process loop is dormant BY DESIGN (run() returns at once).
     _DORMANT_METHODS = ("off", "hotspot")
 
-    def __init__(self, wifi: WifiManager, config: dict, version: str = "dev") -> None:
+    def __init__(self, wifi: WifiManager, config: dict, version: str = "dev",
+                 deployment: str = "development") -> None:
         self._wifi = wifi
         self._method = str(config.get("method", "ble"))
+        # Proof of possession (services/ble_pop.py). A refused or unusable policy
+        # is a reason the window cannot open, never a reason to open it unguarded.
+        self._auth_error: Optional[str] = None
+        try:
+            self._auth_mode = resolve_auth(config, deployment)
+        except SetupCodeError as exc:
+            self._auth_mode = "refused"
+            self._auth_error = str(exc)
+        self._setup_code_path = str(config.get("setup_code_path", DEFAULT_SETUP_CODE_PATH))
+        self._pop: Optional[PopAuthenticator] = None
         self._grace_s = float(config.get("grace_s", 0))
         self._poll_s = float(config.get("poll_s", 10))
         # Whether Bluetooth setup is reachable whenever the device is running.
@@ -389,6 +414,11 @@ class ProvisioningService:
     def _may_open_ble(self, now: float) -> bool:
         if self._ble_unavailable:
             return False
+        if self._auth_mode == "refused":
+            if self._ble_failure != self._auth_error:
+                log.error("Bluetooth setup stays closed: %s", self._auth_error)
+                self._ble_failure = self._auth_error
+            return False
         return self._ble_failed_at is None or now - self._ble_failed_at >= self._BLE_RETRY_S
 
     def _reap_dead_ble(self, now: float) -> None:
@@ -410,6 +440,13 @@ class ProvisioningService:
         self._ble_failed_at = now
         self._ble_failure = reason
 
+    def _authenticator(self) -> Optional[PopAuthenticator]:
+        """The proof-of-possession state machine, built once (PBKDF2 runs here, not per phone)."""
+        if self._pop is None:
+            code = load_setup_code(self._setup_code_path)  # SetupCodeError: caller fails closed
+            self._pop = PopAuthenticator(device_id=device_id(), setup_code=code)
+        return self._pop
+
     def _open_ble_window(self) -> None:
         import time
 
@@ -417,6 +454,19 @@ class ProvisioningService:
 
         name = _ble_name()
         ble = None
+        extra = {}
+        if self._auth_mode == "pop":
+            try:
+                pop = self._authenticator()
+            except (SetupCodeError, ImportError) as exc:
+                # Retried like any start failure: a code written later is picked up.
+                self._ble_failed_at = time.monotonic()
+                self._ble_failure = f"setup code unusable: {exc}"
+                log.error("Bluetooth setup stays closed (auth: pop): %s", exc)
+                return
+            pop.stop()
+            pop.start()
+            extra["on_auth"] = self._on_auth
         try:
             ble = BLEProvisioningServer(
                 device_name=name,
@@ -428,10 +478,14 @@ class ProvisioningService:
                     "model": "SensorDyme",
                     "version": self._version,
                     "hostname": socket.gethostname(),
+                    # How this device takes credentials, so the app knows to ask
+                    # for the setup code ("pop") instead of writing them in clear.
+                    "auth": self._auth_mode,
                 },
                 on_credentials=self._on_credentials,
                 scan_networks=lambda: self._wifi.scan(),  # noqa: PLW0108 - late-binds self._wifi
                 on_command=self._on_command,
+                **extra,
             )
             self._ble = ble
             self._last_pushed = None
@@ -455,6 +509,8 @@ class ProvisioningService:
     def _teardown_ble(self) -> None:
         ble, self._ble = self._ble, None
         self._last_pushed = None
+        if self._pop is not None:
+            self._pop.stop()
         if ble is not None:
             ble.stop()
 
@@ -475,6 +531,21 @@ class ProvisioningService:
         ble.set_status(status)
 
     # ------------------------------------------------------------------ app callbacks
+    def _on_auth(self, data: bytes) -> bytes:
+        """A proof-of-possession write. Runs on the BLE event loop; never blocks."""
+        pop = self._pop
+        if pop is None:
+            return b'{"op":"error","error":"unavailable"}'
+        reply = pop.handle(data)
+        if reply.message.get("error") == "wrong_code":
+            log.warning("BLE: a phone failed to prove the setup code")  # never the code or the tag
+        if reply.credentials is not None:
+            if self._join_in_flight():
+                pop.apply_result(False)
+                return b'{"op":"error","error":"busy","message":"a join is already running"}'
+            self._on_credentials(*reply.credentials)
+        return reply.encode()
+
     def _on_credentials(self, ssid: str, psk: str) -> None:
         """The app wrote Wi-Fi credentials: join + save; report the outcome over BLE.
 
@@ -544,6 +615,8 @@ class ProvisioningService:
         self._outcome_at = time.monotonic()
         if ok:
             self._provisioned_this_session = True
+        if self._pop is not None:
+            self._pop.apply_result(ok)
         ble = self._ble
         if ble is not None:
             ble.set_scans_paused(False)
