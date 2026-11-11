@@ -20,6 +20,8 @@ _KNOWN_TOP_LEVEL = {
     # 'training:' (typo?)" on every boot for a section that is real and is read --
     # which is how an operator learns to ignore this validator's output entirely.
     "training",
+    # Deployment role and its safety floor (core/roles.py, M0.1).
+    "role",
 }
 
 
@@ -51,7 +53,14 @@ def _validate_alerts(alerts: dict, where: str, errors: list[str], warnings: list
         value = alerts["escalation_window_s"]
         _check(errors, _is_num(value) and value >= 0,
                f"`{where}.escalation_window_s:` must be a non-negative number, got {value!r}")
-    for key in ("sinks", "loud_types", "soft_types"):
+    if "duplicate_window_s" in alerts:
+        value = alerts["duplicate_window_s"]
+        _check(errors, _is_num(value) and 0 <= value <= 60,
+               f"`{where}.duplicate_window_s:` must be a number in [0, 60], got {value!r}")
+    categories = alerts.get("categories")
+    if categories is not None:
+        _validate_categories(categories, where, errors)
+    for key in ("sinks", "loud_types", "soft_types", "critical_types"):
         if key not in alerts:
             continue
         value = alerts[key]
@@ -79,6 +88,29 @@ def _validate_alerts(alerts: dict, where: str, errors: list[str], warnings: list
         value = alerts["evidence_max_files"]
         _check(errors, isinstance(value, int) and not isinstance(value, bool) and value >= 0,
                f"`{where}.evidence_max_files:` must be a non-negative integer, got {value!r}")
+
+
+def _validate_categories(categories, where: str, errors: list[str]) -> None:
+    """`alerts.categories:` overrides, bounded exactly as AlertCategory bounds them."""
+    from dataclasses import replace
+
+    from core.alerts import DEFAULT_CATEGORIES
+
+    if not isinstance(categories, dict):
+        errors.append(f"`{where}.categories:` must be a mapping of category -> settings")
+        return
+    allowed = {"initial_pattern", "escalated_pattern", "repeat_s", "escalate_after_s", "max_repeats"}
+    for name, override in categories.items():
+        if name not in DEFAULT_CATEGORIES:
+            errors.append(f"`{where}.categories.{name}:` unknown category (known: {sorted(DEFAULT_CATEGORIES)})")
+            continue
+        if not isinstance(override, dict) or set(override) - allowed:
+            errors.append(f"`{where}.categories.{name}:` may only set {sorted(allowed)}")
+            continue
+        try:
+            replace(DEFAULT_CATEGORIES[name], **override)
+        except (TypeError, ValueError) as exc:
+            errors.append(f"`{where}.categories.{name}:` {exc}")
 
 
 def validate(config: dict) -> tuple[list[str], list[str]]:
@@ -241,5 +273,19 @@ def validate(config: dict) -> tuple[list[str], list[str]]:
     if profile != "mac_max" and isinstance(module_name, str) and isinstance(modules_cfg, dict):
         _check(errors, module_name in modules_cfg,
                f"`module: {module_name}` has no `modules.{module_name}:` config section")
+
+    # Deployment role: the safety floor this config must not weaken.
+    from core.roles import ROLES, config_violations
+
+    errors.extend(config_violations(config))
+    role_name = config.get("role")
+    if (
+        isinstance(role_name, str) and role_name in ROLES and ROLES[role_name].has_floor
+        and config.get("profile", "pi") == "mac_max"
+    ):
+        warnings.append(
+            f"role '{role_name}' is not enforced on the mac_max developer profile; "
+            "it never reports protection"
+        )
 
     return errors, warnings

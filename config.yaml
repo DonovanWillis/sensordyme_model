@@ -2,6 +2,14 @@
 # Switch products by changing ONE line: `module`.
 module: driver_attention
 
+# Deployment role (core/roles.py). A role declares the safeguards that must keep
+# running while the device reports it is protecting, and refuses any preset,
+# custom rule, config or remote command that would weaken them. driver_safety:
+# driver_attention always runs; custom rules are added beside it, never instead.
+# Other roles (general, child_monitoring, occupancy, property, workplace) carry
+# none of these restrictions. Omitted = general.
+role: driver_safety
+
 # profile: pi (default) | mac_max
 #   pi      -- the shipping product: nano models, config under `modules:` below.
 #              This is what setup_pi.sh deploys and what runs on the Raspberry Pi.
@@ -225,6 +233,13 @@ alerts:
 
   cooldown_s: 15 # minimum seconds between two alerts of the same type (patient: don't re-alert too soon)
   escalation_window_s: 60 # repeat within this window -> continuous tone (event types not in loud/soft_types below)
+  # The most urgent, distinct alert pattern, repeated while the condition lasts
+  # (core/alerts.py "critical" category): falling asleep and the driver no longer
+  # visible. Also listed in loud_types; the driver_safety role requires both here.
+  critical_types: [drowsiness, attention_lost]
+  # Alert episodes (M0.1): every new episode alerts immediately; a sustained one
+  # repeats and escalates within the bounds in core/alerts.py DEFAULT_CATEGORIES.
+  # cooldown_s below now de-duplicates only the rolling-window notices (soft_types).
   loud_types: [drowsiness, phone_use, eyes_down, eyes_up, attention_lost, high_risk, # always the loud/continuous tone
                distraction, # sustained sideways head turn (3s+). Was in NEITHER list: locally it
                # escalated by repetition (a deliberate mechanism), but its severity tag fell back to

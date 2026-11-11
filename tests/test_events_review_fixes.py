@@ -632,7 +632,10 @@ def test_mac_max_alerts_are_checked_too():
 
 def test_an_unknown_sink_is_a_warning():
     config = _repo_config()
-    config["alerts"]["sinks"] = ["console", "siren"]
+    # Keep an audible sink: the repo config is a driver_safety device, whose role
+    # (M0.1) makes "no audible sink at all" an error -- tested in
+    # tests/test_m01_role_floors.py. This test is about the unknown name only.
+    config["alerts"]["sinks"] = ["console", "gpio_buzzer", "siren"]
     errors, warnings = validate(config)
     assert not errors
     assert any("siren" in w for w in warnings)
