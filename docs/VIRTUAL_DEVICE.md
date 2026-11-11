@@ -104,8 +104,38 @@ exercised (it is also not simulated on the device side). The backend stores
 only ids shaped exactly `SD-XXXXXXXX`, so for a virtual device `GET
 /v1/devices` reports `hardware_id: null` (the `SD-SIM-` id is in its health
 report); the app's feed linking therefore cannot match the camera by id and
-falls back to what it does for an unidentified one. Not exercised by this
-work: the actual iOS UI (no Simulator run was part of it).
+falls back to what it does for an unidentified one. The iOS UI itself is
+exercised by the UI tests below.
+
+### iOS UI tests (XCUITest)
+
+```bash
+scripts/sim/ios_uitest.sh OUT_DIR [SIMULATOR_UDID] [-only-testing:SensorDymeUITests/OrynJourneysUITests/test05_Stop]
+```
+
+One command: `scripts/sim/uitest_control.py` starts the backend (port 8797),
+an unclaimed virtual device and a proxy on `localhost:8787` (the Simulator
+build's default address), then the `SensorDymeUITests` target
+(`ios/UITests`) runs 20 journeys and an accessibility audit. Launch, sign-in,
+discovery (claim through Add device), ready, stop, resume, preset browse,
+activate and reject, the Jupiter prompt, policy preview, zone requirement,
+rule disable/enable, monitoring status, offline, stale, recovery, alert
+history, invalid responses and error messages. The tests fault the stack
+through the controller's control port (127.0.0.1:8790):
+- `mode=down` stops the app's server address;
+- `mode=garbage` answers invalid JSON;
+- the device can be killed, or restarted with any scenario.
+
+The device always reports to the real backend, so a proxy fault is seen only
+by the app. Outputs:
+- `OUT_DIR/summary.md`: pass/fail per journey;
+- `OUT_DIR/shots/`: a PNG per step, plus `audit_*.txt`;
+- `OUT_DIR/xcodebuild.log`;
+- the result bundle.
+
+Needs about 1.5 GB free; the build products are deleted afterwards. Sign-in is typed for real, and
+every other launch uses a token from a real `/v1/login` (`-orynSession`). The DEBUG-only
+`-orynSignOut` starts each launch signed out.
 
 From a **real phone** on the same Wi-Fi: run the backend with `--host 0.0.0.0`,
 the device with `--dashboard-host 0.0.0.0 --mdns`, and point the app at
