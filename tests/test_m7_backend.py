@@ -176,7 +176,9 @@ def test_a_node_is_delivered_until_the_device_reports_it_then_cleared(backend):
     listing = client.get("/v1/devices/1/nodes", headers=headers).json()
     counter = next(n for n in listing["nodes"] if n["id"] == "people_counter")
     assert counter["desired"] is None and counter["reported"]["state"] == "active"
-    assert counter["validation"] == "synthetic_tests" and counter["experimental"] is True
+    # From the device catalogue (core.presets.load_companion_nodes): counted on shared person
+    # boxes, evidence at synthetic_tests, and not one of the experimental behaviours.
+    assert counter["validation"] == "synthetic_tests" and counter["experimental"] is False
     # Asking again for what already runs is a no-op: nothing pending, nothing sent.
     again = client.post("/v1/devices/1/nodes", json={"node": "people_counter", "enabled": True}, headers=headers)
     assert again.json()["pending"] is False

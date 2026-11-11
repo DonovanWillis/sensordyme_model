@@ -115,7 +115,9 @@ def test_disabling_one_node_leaves_the_others_running(stack):
     device.advance(2.0)
     runtime = device.runtime
     assert set(runtime._companions) == {"people_counter"}, "only the named node was disabled"
-    assert {d.consumer for d in runtime.perception.demands()} == {"people_counter"}
+    # The counter still asks for the detector, and so do the active custom rules (their own
+    # demand); the disabled zone_watch no longer does.
+    assert {d.consumer for d in runtime.perception.demands()} == {"people_counter", "rules"}
     observed = runtime._companions["people_counter"].observations
     rules_alerts = stack.event_types().count("person")
     device.advance(5.0)
