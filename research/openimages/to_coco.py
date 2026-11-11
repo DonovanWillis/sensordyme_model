@@ -8,7 +8,9 @@ only for human-verified classes, so an image where a class was never verified
 may contain unboxed instances. Training on it would teach "that is background".
 ``--require-verified`` keeps only images where every class is verified
 (positive or negative); otherwise the count of such images is reported, so the
-label-noise exposure is known. The ``test`` split is never exported.
+label-noise exposure is known. Each image also lists ``sd_unverified_categories``,
+which the partial-label training patch turns into a per-class loss mask. The
+``test`` split is never exported.
 """
 
 from __future__ import annotations
@@ -45,8 +47,11 @@ def export(data: Path, out: Path, *, require_verified: bool) -> dict:
                     continue
             image_id = len(images) + 1
             w, h = row["width"], row["height"]
+            # Categories nobody verified on this image: unboxed instances may exist, so a
+            # partial-label-aware loss must not treat them as background (research/pilot/partial_labels_patch.py).
+            unverified = [c for c, _, _, key in CLASSES if key not in verified]
             images.append({"id": image_id, "file_name": f"images/{row['id']}.jpg", "width": w, "height": h,
-                           "oi_id": row["id"]})
+                           "oi_id": row["id"], "sd_unverified_categories": unverified})
             for b in row["boxes"]:
                 cat = next((c for c, _, mids, _ in CLASSES if b["mid"] in mids), None)
                 if cat is None:
