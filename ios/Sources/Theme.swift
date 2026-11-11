@@ -91,9 +91,12 @@ enum SD {
         static let callout = Font.system(.callout)
         static let label = Font.system(.subheadline).weight(.medium)
         static let caption = Font.system(.caption)
-        /// Uppercase section labels and tags. Pair with `.kerning(SD.Typography.eyebrowKerning)`
+        /// Uppercase section labels and tags. Pair with `.tracking(SD.Typography.eyebrowKerning)`
         /// — or use `SDEyebrow`, which does both.
-        static let eyebrow = Font.system(size: 11, weight: .medium, design: .monospaced)
+        /// A text style, not a point size: caption2 is 11 pt at the default size, the
+        /// design value, and follows Dynamic Type from there. A fixed size never scaled,
+        /// and a ScaledMetric size was flagged by the accessibility audit as partial.
+        static let eyebrow = Font.system(.caption2, design: .monospaced).weight(.medium)
         static let eyebrowKerning: CGFloat = 1.4
         /// Small machine values: addresses, ids, timings.
         static let mono = Font.system(.caption, design: .monospaced)
@@ -208,11 +211,15 @@ struct SDEyebrow: View {
     }
 
     var body: some View {
+        // Tracking, not kerning: kerning also adds space after the last letter,
+        // outside the measured width, which the audit reported as clipped text.
+        // Two lines, not one, so a long label wraps rather than truncating.
         Text(text.uppercased())
             .sdEyebrowFont()
-            .kerning(SD.Typography.eyebrowKerning)
+            .tracking(SD.Typography.eyebrowKerning)
             .foregroundStyle(color)
-            .lineLimit(1)
+            .lineLimit(2)
+            .fixedSize(horizontal: false, vertical: true)
     }
 }
 
@@ -244,9 +251,9 @@ extension View {
         modifier(SDScaledFont(size: size, relativeTo: style, weight: weight, design: design))
     }
 
-    /// `SD.Typography.eyebrow`, scaled.
+    /// `SD.Typography.eyebrow` (already a Dynamic Type style).
     func sdEyebrowFont() -> some View {
-        sdScaledFont(11, relativeTo: .caption2, weight: .medium, design: .monospaced)
+        font(SD.Typography.eyebrow)
     }
 }
 
@@ -425,7 +432,7 @@ struct SDStatusPill: View {
             .frame(width: 12, height: 12)
             Text((text ?? status.label).uppercased())
                 .sdEyebrowFont()
-                .kerning(1)
+                .tracking(1)
                 .foregroundStyle(status == .offline ? SD.Colors.textTertiary : status.tint)
                 .lineLimit(1)
         }

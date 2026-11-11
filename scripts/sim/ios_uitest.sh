@@ -7,8 +7,11 @@
 # OUT_DIR gets summary.md (pass/fail per journey), shots/ (a PNG per journey
 # step and the accessibility audit reports), xcodebuild.log, the stack's logs
 # and the result bundle. Build products go in OUT_DIR/dd and are deleted at the
-# end (KEEP_DD=1 keeps them). Needs ~1.5 GB free. Simulated device; no camera,
-# no network beyond 127.0.0.1.
+# end (KEEP_DD=1 keeps them; REUSE_BUILD=1 then skips the build on the next run).
+# Each xcodebuild starts only with more than 1.8 GB free. Diagnostics collection
+# is off: XCTest's own accessibility tracing otherwise wrote ~600 MB into the
+# result bundle and filled the disk. Simulated device; no camera, no network
+# beyond 127.0.0.1.
 #
 # Ad-hoc signed ("sign to run locally"): an unsigned Simulator build has no
 # Keychain, and the app keeps its session there.
@@ -21,10 +24,13 @@ PY="${SIM_PY:-$HOME/.venvs/sensordyme-m01/bin/python}"
 mkdir -p "$OUT/shots"
 OUT="$(cd "$OUT" && pwd)"
 
-free_kb=$(df -k / | awk 'NR==2 {print $4}')
-if [ "$free_kb" -lt 1572864 ]; then
-  echo "only $((free_kb / 1024)) MB free; this needs ~1.5 GB. Not building."; exit 3
-fi
+need_space() {
+  local free_kb; free_kb=$(df -k / | awk 'NR==2 {print $4}')
+  if [ "$free_kb" -lt 1887437 ]; then
+    echo "only $((free_kb / 1024)) MB free; $1 needs more than 1.8 GB. Stopping."; exit 3
+  fi
+}
+need_space "this run"
 for port in 8787 8790 8797; do
   if lsof -nP -iTCP:$port -sTCP:LISTEN >/dev/null 2>&1; then echo "port $port is in use"; exit 3; fi
 done
@@ -50,13 +56,19 @@ xcrun simctl boot "$SIM" 2>/dev/null || true
 xcrun simctl bootstatus "$SIM" -b >/dev/null
 COMMON=(-project ios/SensorDyme.xcodeproj -scheme SensorDyme -destination "id=$SIM" -derivedDataPath "$OUT/dd"
         CODE_SIGN_IDENTITY=- CODE_SIGN_STYLE=Manual DEVELOPMENT_TEAM=)
-xcodebuild "${COMMON[@]}" build-for-testing > "$OUT/build.log" 2>&1 || { tail -40 "$OUT/build.log"; exit 1; }
+if [ "${REUSE_BUILD:-0}" = 1 ] && ls "$OUT"/dd/Build/Products/*.xctestrun >/dev/null 2>&1; then
+  echo "   (reusing the build in $OUT/dd)"
+else
+  need_space "the build"
+  xcodebuild "${COMMON[@]}" build-for-testing > "$OUT/build.log" 2>&1 || { tail -40 "$OUT/build.log"; exit 1; }
+fi
 
 echo "== journeys"
 rm -rf "$OUT/result.xcresult"
+need_space "the test run"
 set +e
 TEST_RUNNER_ORYN_UITEST_SHOTS="$OUT/shots" TEST_RUNNER_ORYN_UITEST_ARGS="${ORYN_UITEST_ARGS:-}" \
-  xcodebuild "${COMMON[@]}" test-without-building -resultBundlePath "$OUT/result.xcresult" ${ONLY[@]+"${ONLY[@]}"} \
+  xcodebuild "${COMMON[@]}" test-without-building -collect-test-diagnostics never -resultBundlePath "$OUT/result.xcresult" ${ONLY[@]+"${ONLY[@]}"} \
   > "$OUT/xcodebuild.log" 2>&1
 rc=$?
 set -e

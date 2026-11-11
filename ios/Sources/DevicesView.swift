@@ -325,7 +325,7 @@ struct DeviceCard: View {
                     Text(device.name)
                         .font(SD.Typography.headline)
                         .foregroundStyle(SD.Colors.textPrimary)
-                        .lineLimit(1)
+                        .lineLimit(2)
                     Text(subtitle)
                         .font(SD.Typography.caption)
                         .foregroundStyle(SD.Colors.textTertiary)
@@ -374,7 +374,9 @@ struct DeviceCard: View {
                     if let id = device.hardwareId {
                         Text(id)
                             .font(SD.Typography.mono)
-                            .foregroundStyle(SD.Colors.textDisabled)
+                            .foregroundStyle(SD.Colors.textTertiary)
+                            .lineLimit(1)
+                            .minimumScaleFactor(0.6)
                     }
                 }
                 Spacer()

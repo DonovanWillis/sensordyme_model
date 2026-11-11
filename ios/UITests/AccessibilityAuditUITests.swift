@@ -13,6 +13,12 @@ final class AccessibilityAuditUITests: XCTestCase {
 
     /// Accepted audit findings: (screen, audit type, element label prefix) and why.
     private let knownIssues: [(screen: String, type: XCUIAccessibilityAuditType, label: String, why: String)] = [
+        ("signin", .dynamicType, "EDGE", "logotype (the ORYN EDGE lockup); WCAG 1.4.3/1.4.4 exempt logos"),
+        ("signin", .contrast, "EDGE", "logotype; WCAG 1.4.3 exempts logos"),
+        ("devices", .dynamicType, "ORYN EDGE", "logotype in the header"),
+        ("devices", .hitRegion, "ORYN EDGE", "logotype; not interactive"),
+        ("detail", .textClipped, "Virtual SensorDyme", "system navigation-bar title, truncated by UIKit; the full name is on screen"),
+        ("jupiter", .dynamicType, "Done", "system bar button; UIKit caps bar text and offers the Large Content Viewer"),
     ]
 
     override func setUpWithError() throws {

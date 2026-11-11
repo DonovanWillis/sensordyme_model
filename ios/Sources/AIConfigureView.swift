@@ -92,7 +92,7 @@ struct AIConfigureView: View {
                     HStack(spacing: 8) {
                         OrynMark(height: 14)
                         Text("Ask Jupiter")
-                            .sdScaledFont(16, relativeTo: .headline, weight: .semibold)
+                            .font(.system(.callout).weight(.semibold))  // 16 pt by default, as designed
                             .foregroundStyle(SD.Colors.textPrimary)
                     }
                     .accessibilityElement(children: .combine)

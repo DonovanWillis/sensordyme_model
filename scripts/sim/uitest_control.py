@@ -18,7 +18,8 @@ The UI tests drive scenarios through the control port (127.0.0.1 only):
     POST /device/start?scenario=NAME  (re)start it with a scenario from sim/scenario.py
     POST /claim                       claim the device for the demo account (what "Add device" does)
     POST /protection?action=stop|resume
-    POST /reset                       mode pass, device running "attentive", protection resumed
+    POST /reset                       server answering, custom rules off, plain driver_safety mode,
+                                      device running "attentive", protection resumed
 
 Every request is answered with JSON. Nothing leaves the machine; no camera is used.
 """
@@ -134,6 +135,18 @@ class Stack:
         devices = answer.get("devices") if isinstance(answer, dict) else None
         return devices[0]["id"] if status == 200 and devices else None
 
+    def reset_device(self, device_id: int) -> None:
+        """Undo what a journey may have left behind. On an additive role, choosing the
+        mode again does not turn custom rules off, so each rule is disabled the way the
+        app's switch does it (PATCH .../rules/{id})."""
+        status, answer = self.api("GET", f"/v1/devices/{device_id}/rules")
+        rules = answer.get("rules", []) if status == 200 and isinstance(answer, dict) else []
+        for rule in rules:
+            if rule.get("enabled"):
+                self.api("PATCH", f"/v1/devices/{device_id}/rules/{rule['id']}", {"enabled": False})
+        self.api("POST", f"/v1/devices/{device_id}/preset", {"preset": "driver_safety"})
+        self.api("POST", f"/v1/devices/{device_id}/protection", {"action": "resume"})
+
     def session(self) -> dict:
         # A fresh token per app launch: the app's -orynSignOut revokes the token it
         # held, so one shared token would be revoked by the next launch.
@@ -226,6 +239,9 @@ def control_handler(stack: Stack, app_port: AppPort, stop: threading.Event):
             self.send_response(status)
             self.send_header("Content-Type", "application/json")
             self.send_header("Content-Length", str(len(data)))
+            # One request per connection: a reused idle connection that this
+            # server had already closed reached the test as -1005.
+            self.send_header("Connection", "close")
             self.end_headers()
             self.wfile.write(data)
 
@@ -272,8 +288,9 @@ def control_handler(stack: Stack, app_port: AppPort, stop: threading.Event):
                 app_port.up()
                 if not (stack.device and stack.device.poll() is None and stack.scenario == "attentive"):
                     stack.start_device("attentive")
-                if stack.device_id() is not None:
-                    stack.api("POST", f"/v1/devices/{stack.device_id()}/protection", {"action": "resume"})
+                device_id = stack.device_id()
+                if device_id is not None:
+                    stack.reset_device(device_id)
             elif path == "/shutdown":
                 stop.set()
             else:

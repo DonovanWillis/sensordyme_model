@@ -21,6 +21,10 @@ final class OrynJourneysUITests: XCTestCase {
     }
 
     override func tearDownWithError() throws {
+        // What was on screen when it failed, named after the journey.
+        if testRun?.hasSucceeded == false, let app, app.state == .runningForeground {
+            shot("FAIL_\(name.split(separator: " ").last?.dropLast() ?? "")")
+        }
         app?.terminate()
     }
 
@@ -136,7 +140,7 @@ final class OrynJourneysUITests: XCTestCase {
         waitFor(strict, selected: true, timeout: 60)  // from what the device reports, not the tap
         XCTAssertFalse(app.buttons["preset.variant.standard"].isSelected)
         shot("08_preset_strict")
-        let standard = app.buttons["preset.variant.standard"]
+        let standard = reveal(app.buttons["preset.variant.standard"])
         standard.tap()
         waitFor(standard, selected: true, timeout: 60)
     }
@@ -161,7 +165,8 @@ final class OrynJourneysUITests: XCTestCase {
         XCTAssertTrue(input.waitForExistence(timeout: 10))
         input.tap()
         input.typeText(Self.dwellPrompt)
-        app.buttons["jupiter.send"].firstMatch.tap()
+        XCTAssertTrue(app.buttons["jupiter.send"].firstMatch.isEnabled, "a typed request can be sent")
+        input.typeText("\n")  // the keyboard's Send key
         let explanation = app.staticTexts["jupiter.explanation"]
         XCTAssertTrue(explanation.waitForExistence(timeout: 45), "Jupiter answers")
         XCTAssertTrue(explanation.label.contains("marked area"), explanation.label)
@@ -216,7 +221,9 @@ final class OrynJourneysUITests: XCTestCase {
         launch(["-orynOpenDevice"])
         waitFor(monitoring, label: "Degraded", timeout: 120)
         shot("14a_degraded")
-        waitFor(monitoring, label: "All clear", timeout: 120)
+        // The fault lasts 40 s, but the device retries the detector with backoff
+        // capped at 60 s (modules/driver_attention.py), so recovery can take ~100 s.
+        waitFor(monitoring, label: "All clear", timeout: 180)
         shot("14b_ready_again")
     }
 
@@ -361,12 +368,15 @@ final class OrynJourneysUITests: XCTestCase {
         submit.tap()
     }
 
-    /// Scroll until the element is on screen (bounded), and return it.
+    /// Scroll until the element is on screen and clear of the floating tab bar
+    /// (bounded), and return it. `isHittable` alone passed for a chip lying under
+    /// the tab bar, and the tap landed on the tab bar.
     @discardableResult
     private func reveal(_ element: XCUIElement, timeout: TimeInterval = 15) -> XCUIElement {
         XCTAssertTrue(element.waitForExistence(timeout: timeout), "\(element) exists")
+        let limit = app.frame.maxY * 0.78
         var swipes = 0
-        while !element.isHittable && swipes < 10 {
+        while (!element.isHittable || element.frame.maxY > limit) && swipes < 10 {
             app.swipeUp(velocity: .slow)
             swipes += 1
         }

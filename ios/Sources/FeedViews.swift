@@ -58,6 +58,9 @@ struct FeedCard: View {
                     .font(SD.Typography.caption)
                     .multilineTextAlignment(.center)
                     .foregroundStyle(SD.Colors.textTertiary)
+                    // The feed keeps its camera shape at every text size; the
+                    // sentence shrinks to fit it rather than being cut off.
+                    .minimumScaleFactor(0.5)
                     .padding(.horizontal, SD.Space.xl)
             }
         }
@@ -152,7 +155,7 @@ struct FeedTag: View {
     var body: some View {
         Text(text.uppercased())
             .sdEyebrowFont()
-            .kerning(1)
+            .tracking(1)
             .foregroundStyle(SD.Colors.textSecondary)
             .lineLimit(1)
             .padding(.horizontal, 9)

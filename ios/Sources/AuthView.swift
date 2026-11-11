@@ -209,12 +209,14 @@ struct AuthView: View {
                         .foregroundStyle(SD.Colors.textPrimary)
                 }
                 .font(SD.Typography.callout)
+                .frame(minHeight: 44)
+                .contentShape(Rectangle())
             }
             .buttonStyle(.plain)
 
             HStack(spacing: SD.Space.sm) {
                 Rectangle().fill(SD.Colors.border).frame(height: 1)
-                SDEyebrow("or", color: SD.Colors.textDisabled)
+                SDEyebrow("or", color: SD.Colors.textTertiary)
                 Rectangle().fill(SD.Colors.border).frame(height: 1)
             }
 
@@ -239,11 +241,13 @@ struct AuthView: View {
                 Label("Server settings", systemImage: "server.rack")
                     .font(SD.Typography.caption)
                     .foregroundStyle(SD.Colors.textTertiary)
+                    .frame(minHeight: 44)
+                    .contentShape(Rectangle())
             }
             Text("ORYN · SENSORDYME")
                 .sdEyebrowFont()
-                .kerning(SD.Typography.eyebrowKerning)
-                .foregroundStyle(SD.Colors.textDisabled)
+                .tracking(SD.Typography.eyebrowKerning)
+                .foregroundStyle(SD.Colors.textTertiary)
         }
     }
 

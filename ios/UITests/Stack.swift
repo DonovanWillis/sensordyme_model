@@ -52,13 +52,26 @@ enum Stack {
         }
     }
 
+    /// Up to three attempts on a fresh connection each: one dropped connection
+    /// (-1005) once launched the app with no session and failed two journeys.
     private static func request(_ method: String, _ path: String) throws -> [String: Any] {
+        var lastError: Error = URLError(.unknown)
+        for _ in 0..<3 {
+            do { return try attempt(method, path) } catch { lastError = error }
+        }
+        throw lastError
+    }
+
+    private static let session = URLSession(configuration: .ephemeral)
+
+    private static func attempt(_ method: String, _ path: String) throws -> [String: Any] {
         var request = URLRequest(url: URL(string: path, relativeTo: control)!)
         request.httpMethod = method
         request.timeoutInterval = 20
+        request.setValue("close", forHTTPHeaderField: "Connection")
         var result: Result<Data, Error> = .failure(URLError(.timedOut))
         let done = DispatchSemaphore(value: 0)
-        URLSession.shared.dataTask(with: request) { data, response, error in
+        session.dataTask(with: request) { data, response, error in
             if let error {
                 result = .failure(error)
             } else if let http = response as? HTTPURLResponse, http.statusCode == 200, let data {
