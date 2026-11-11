@@ -59,11 +59,13 @@ class BehaviorReasoner:
             coast_s=c.face_loss_coast_s, max_gap_s=c.max_frame_gap_s,
         )
         self.eye_state: Assessment = unknown("no frame yet")
+        self.eyes_occluded = 0
 
     def update(self, frame: BehaviorFrame) -> list[BehaviorEvent]:
         events: list[BehaviorEvent] = []
 
         self.eye_state = classify_eye_state(frame.eye, self.config.eye)
+        self.eyes_occluded = sum(bool(e.occluded) for e in frame.eye.eyes)
         fired = self.drowsiness.update(frame.t, self.eye_state)
         if fired is not None:
             events.append(BehaviorEvent(DROWSINESS, fired, f"eye closure {fired:.1f}s ({self.eye_state.reason})"))
@@ -99,6 +101,7 @@ class BehaviorReasoner:
         """Flat per-frame fields for telemetry/debug (prefixed, CSV-friendly)."""
         return {
             "behavior_eye_state": self.eye_state.state,
+            "behavior_eyes_occluded": self.eyes_occluded,
             "behavior_drowsy_state": self.drowsiness.assessment.state,
             "behavior_drowsy_closed_s": round(self.drowsiness.closed_s, 2),
             "behavior_gaze_zone": self.glance.assessment.state,

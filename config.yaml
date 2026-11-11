@@ -556,6 +556,16 @@ modules:
     risk_high_threshold: 0.75 # composite score above this, sustained, fires the loud "high_risk" event
     risk_confirm_seconds: 1.0 # composite score must stay above risk_high_threshold this long to fire "high_risk"
 
+    # --- behaviour reasoning v2 (core/behavior/; EXPERIMENTAL, NOT VALIDATED) ---
+    # false = the shipped logic above, byte-for-byte the same events. true = drowsiness,
+    # phone_use, phone_detected and frequent_glancing are decided by core/behavior/
+    # (closure vs downward glance, hand-held + gaze-to-phone, cabin glance zones, face-loss
+    # coasting, explicit "unknown" when inputs are missing) and long_glance /
+    # glance_budget_exceeded are logged (not alerted). Tested on synthetic scenarios only:
+    # read docs/BEHAVIOUR_REASONING.md before turning it on. Optional parameters go in a
+    # nested `behavior:` mapping (validated by core/config_schema.py; not preset-overridable).
+    behavior_v2: false
+
   driver_attention_openpilot:
     # comma.ai openpilot's driver monitoring, verbatim (model + policy from openpilot
     # v0.9.7). Run with: make dev-openpilot. See modules/driver_attention_openpilot.py.
