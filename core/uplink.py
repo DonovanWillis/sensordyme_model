@@ -12,13 +12,17 @@ local alerts are never affected.
 
 from __future__ import annotations
 
+import json
 import math
 import random
 import threading
+import time
 import uuid
 from collections import deque
 from typing import Optional
 from urllib.parse import urlsplit
+
+from core import command_auth as auth
 
 #: Upper bound on the backlog. It must not exceed the backend's MAX_INGEST_EVENTS
 #: (cloud/app.py): the whole backlog goes up in one POST, so a queue larger than
@@ -71,6 +75,11 @@ BACKOFF_CAP_S = 30.0
 _COMMAND_ID_MEMORY = 64
 #: Longest preset name / command id accepted from the backend.
 _MAX_COMMAND_TEXT = 128
+#: Signed-envelope command ids remembered (sd-auth-v1 `cid`), for duplicate refusal.
+_ENVELOPE_ID_MEMORY = 256
+#: The logical path a signed ingest request covers (docs/DEVICE_AUTH_CONTRACT.md):
+#: never the URL's own path, so a reverse proxy's prefix does not break the tag.
+_INGEST_PATH = "/v1/ingest"
 
 
 def backoff_delay(failures: int, base_s: float, cap_s: float = BACKOFF_CAP_S,
@@ -168,6 +177,7 @@ class CloudUplink:
         #: Protection command ids already accepted (bounded), so a re-delivered
         #: or replayed stop/resume is not applied a second time.
         self._seen_command_ids: deque[str] = deque(maxlen=_COMMAND_ID_MEMORY)
+        self._init_command_auth(config)
         import requests  # already a dependency (VLM judge backends)
 
         self._requests = requests
@@ -202,6 +212,103 @@ class CloudUplink:
                 "and every remote command travel unauthenticated. Use https:// outside "
                 "development (docs/SECURITY_REVIEW_M6.md)."
             )
+
+    def _init_command_auth(self, config: dict) -> None:
+        """Device side of sd-auth-v1 (core/command_auth.py, docs/DEVICE_AUTH_CONTRACT.md).
+
+        `cloud.command_auth`:
+          off        -- exactly the pre-M6.5 behaviour: bearer key, unsigned commands obeyed.
+          permissive -- (default) bearer key as before, plus a request nonce so a v1 backend
+                        signs its commands; a signed command that fails verification is never
+                        applied. A backend that does not sign is still obeyed (said once).
+          required   -- the key itself never leaves the device: every request is signed, and
+                        a command without a valid envelope is refused.
+        An unknown mode is treated as `required` (fail closed).
+        """
+        mode = str(config.get("command_auth", auth.DEFAULT_MODE) or auth.DEFAULT_MODE).strip().lower()
+        if mode not in auth.MODES:
+            print(f"cloud_uplink: unknown cloud.command_auth {mode[:32]!r}; using 'required' (fail closed)")
+            mode = "required"
+        self._auth_mode = mode
+        self._keyring: Optional[auth.Keyring] = None
+        if mode != "off":
+            try:
+                self._keyring = auth.Keyring.from_config(config)
+            except ValueError:
+                # Too short to derive keys from. Only legacy bearer auth can work;
+                # in `required` mode nothing is sent at all (see sync_once).
+                print(f"cloud_uplink: the device key cannot be used for signed commands "
+                      f"(cloud.command_auth: {mode}); it is shorter than 16 bytes. Re-issue it "
+                      f"with `python cloud/manage.py create-device`.")
+        #: Seconds added to the local clock for request timestamps only, learned
+        #: from the backend's clock_skew answer (a Pi has no RTC). Never applied
+        #: to the system clock, and never used to judge a command's freshness.
+        self._clock_offset_s = 0.0
+        self._seen_envelope_ids: deque[str] = deque(maxlen=_ENVELOPE_ID_MEMORY)
+        self._unsigned_announced = False
+        self._last_rejection: Optional[str] = None
+        #: Commands refused by sd-auth-v1 verification since start (health / tests).
+        self.command_auth_rejections = 0
+
+    @property
+    def command_auth_mode(self) -> str:
+        return self._auth_mode
+
+    def _refuse_command(self, reason: str) -> None:
+        self.command_auth_rejections += 1
+        if reason != self._last_rejection:
+            # Reason code and nothing else: no key, tag or command body in the log.
+            self._last_rejection = reason
+            print(f"cloud_uplink: refused a remote command ({reason}); it was not applied")
+
+    def _authenticated_command(self, data: dict, command: dict, nonce: Optional[str], health) -> dict:
+        """`command` if it may be applied under the configured mode, else {}."""
+        if not command or self._auth_mode == "off":
+            return command
+        envelope = data.get("command_auth")
+        if envelope is None:
+            if self._auth_mode == "required":
+                self._refuse_command("missing_signature")
+                return {}
+            if not self._unsigned_announced:
+                self._unsigned_announced = True
+                print("cloud_uplink: the backend does not sign its commands (sd-auth-v1); they are "
+                      "applied as before. Set cloud.command_auth: required once it does.")
+            return command
+        if self._keyring is None or nonce is None:
+            self._refuse_command("no_usable_key")
+            return {}
+        devices = {f"kid:{k.kid}" for k in (self._keyring.current, self._keyring.previous) if k is not None}
+        hardware_id = health.get("device_id") if isinstance(health, dict) else None
+        if isinstance(hardware_id, str):
+            devices.add(hardware_id)
+        try:
+            verified = auth.verify_command(self._keyring, command, envelope, devices=devices,
+                                           request_nonce=nonce)
+        except auth.AuthError as exc:
+            self._refuse_command(exc.reason)
+            return {}
+        with self._lock:
+            duplicate = verified["cid"] in self._seen_envelope_ids
+            if not duplicate:
+                self._seen_envelope_ids.append(verified["cid"])
+        if duplicate:
+            self._refuse_command("duplicate_command")
+            return {}
+        self._last_rejection = None
+        return command
+
+    def _learn_clock_offset(self, exc) -> None:
+        """Adopt the backend's clock for request timestamps after a clock_skew refusal."""
+        try:
+            body = exc.response.json()
+            server_time = float(body.get("server_time"))
+        except Exception:  # noqa: BLE001 - any unreadable answer: keep the current offset
+            return
+        if body.get("code") == "clock_skew" and math.isfinite(server_time):
+            self._clock_offset_s = server_time - time.time()
+            print(f"cloud_uplink: device clock differs from the backend's by "
+                  f"{self._clock_offset_s:+.0f} s; signing with the backend's time")
 
     def start(self) -> None:
         threading.Thread(target=self._run, daemon=True, name="cloud-uplink").start()
@@ -388,7 +495,6 @@ class CloudUplink:
         Returns True when a full batch went up and more is waiting, i.e. the
         next cycle should run now rather than after poll_interval_s.
         """
-        headers = {"X-Device-Key": self._device_key}
         # Bound OUTSIDE the try. The except handler below re-queues `batch`, so if
         # anything raised before it was assigned the handler itself would raise
         # NameError -- and since this loop has no outer try, that kills the uplink
@@ -407,17 +513,32 @@ class CloudUplink:
                 health = self._health
                 monitoring = self._monitoring
             # 1) push events (an empty batch doubles as the online heartbeat)
+            payload = _json_safe({
+                "events": batch,
+                "active_preset": active,
+                "rules_version": rules_version,
+                "zones_version": zones_version,
+                "health": health,
+                "monitoring": monitoring,
+            })
+            nonce = auth.new_nonce() if self._keyring is not None else None
+            if self._auth_mode == "required":
+                if self._keyring is None or nonce is None:
+                    raise RuntimeError("cloud.command_auth is required but the device key is unusable")
+                # The exact bytes are signed, so they are serialised here, not by requests.
+                body = json.dumps(payload, allow_nan=False).encode()
+                signed = auth.sign_request(self._keyring.current, "POST", _INGEST_PATH, body, nonce=nonce,
+                                           issued_at=int(time.time() + self._clock_offset_s))
+                transport: dict = {"data": body,
+                                   "headers": {"Content-Type": "application/json", "X-SD-Auth": signed}}
+            else:
+                headers = {"X-Device-Key": self._device_key}
+                if nonce is not None:
+                    headers["X-SD-Nonce"] = nonce
+                transport = {"json": payload, "headers": headers}
             resp = self._requests.post(
                 f"{self._base_url}/v1/ingest",
-                json=_json_safe({
-                    "events": batch,
-                    "active_preset": active,
-                    "rules_version": rules_version,
-                    "zones_version": zones_version,
-                    "health": health,
-                    "monitoring": monitoring,
-                }),
-                headers=headers,
+                **transport,
                 timeout=10,
                 verify=self._verify,
                 # Never follow: see _RedirectedError. A redirect is a base_url to
@@ -428,9 +549,11 @@ class CloudUplink:
                 raise _RedirectedError(resp)
             resp.raise_for_status()
             # 2) the ingest response carries any pending command
-            command = resp.json().get("command") or {}
+            data = resp.json()
+            command = data.get("command") or {}
             if not isinstance(command, dict):
                 command = {}
+            command = self._authenticated_command(data, command, nonce, health)
             preset = command.get("set_preset")
             if isinstance(preset, str) and 0 < len(preset) <= _MAX_COMMAND_TEXT:
                 with self._lock:
@@ -504,6 +627,8 @@ class CloudUplink:
             self._connected = False
             self._failures += 1
             status = getattr(getattr(exc, "response", None), "status_code", None)
+            if status == 401 and self._auth_mode == "required":
+                self._learn_clock_offset(exc)
             if status == 413 and len(batch) > 1:
                 # Too big, not wrong: send less next time rather than lose it.
                 self._batch_max = max(1, len(batch) // 2)
