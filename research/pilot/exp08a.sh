@@ -7,7 +7,11 @@ O="$SDJOB_OUT"; DATA="$SDJOB_DATA"; SRC="$SDJOB_SRC"
 UV=/home/sdjob/.local/bin/uv; BASE=/home/sdjob/envs/sdgpu/.venv/bin/python
 export UV_PYTHON_PREFERENCE=only-managed UV_CACHE_DIR=/home/sdjob/.cache/uv PYTHONDONTWRITEBYTECODE=1
 COMMIT=319572eef367340267ab6ab8ae253527a71d7c3a
-CKPT_URL=https://idstcv.oss-cn-zhangjiakou.aliyuncs.com/DAMO-YOLO/release_model/clean_model_0317/damoyolo_tinynasL20_T_420.pth
+# The README's Alibaba OSS links are dead (NoSuchBucket, checked 2026-11-11). The same README's
+# Google Drive mirror of DAMO-YOLO-T (41.8 mAP release, Apache-2.0) is used, pinned by sha256.
+CKPT_URL="https://drive.usercontent.google.com/download?id=1-9NzCRKJZs3ea_n35seEYSpq3M_RkhcT&export=download&confirm=t"
+CKPT_SHA=a5ee63820e0e02a8a0779704c3ba477aefd66927e2e38900bb6cec0168005f95
+CKPT="$DATA/models/drive/damoyolo_tinynasL20_T_418.pth"
 OI="$DATA/openimages/oi7-sd-v1"; WORK="$DATA/exp08a"; DAMO="$DATA/src/DAMO-YOLO-$COMMIT"; VENV="$DATA/venvs/damo-pilot"
 mkdir -p "$WORK" "$DATA/src" "$DATA/models"
 
@@ -31,9 +35,11 @@ $UV pip freeze --python "$VENV/bin/python" > "$O/pilot_freeze.txt"
 P="$VENV/bin/python"
 "$P" -c "import torch, timm, cv2, pycocotools; print('torch', torch.__version__, 'cuda', torch.cuda.is_available(), 'timm', timm.__version__)"
 
-echo "== checkpoint"
-[ -f "$DATA/models/damoyolo_tinynasL20_T_420.pth" ] || curl -sSL --max-time 600 -o "$DATA/models/damoyolo_tinynasL20_T_420.pth" "$CKPT_URL"
-sha256sum "$DATA/models/damoyolo_tinynasL20_T_420.pth" | tee "$O/checkpoint.sha256"
+echo "== checkpoint (must be the pinned zip, loadable with weights_only=True)"
+mkdir -p "$(dirname "$CKPT")"
+[ -s "$CKPT" ] || curl -sSL --max-time 600 -o "$CKPT" "$CKPT_URL"
+echo "$CKPT_SHA  $CKPT" | sha256sum -c - | tee "$O/checkpoint.sha256"
+"$P" -c "import sys, zipfile, torch; f=sys.argv[1]; assert zipfile.is_zipfile(f), 'not a checkpoint archive'; ck=torch.load(f, map_location='cpu', weights_only=True); print('checkpoint ok:', len(ck['model']), 'tensors')" "$CKPT"
 
 echo "== data (train/val only; test is never exported)"
 (cd "$SRC" && "$P" -m research.openimages.to_coco --data "$OI" --out "$WORK/coco") | tee "$O/coco_summary.json"
@@ -58,7 +64,7 @@ c = c.replace("self.train.no_aug_epochs = 16", "self.train.no_aug_epochs = 0")
 c = c.replace("self.train.warmup_epochs = 5", "self.train.warmup_epochs = 1")
 c = c.replace("self.miscs.eval_interval_epochs = 10", "self.miscs.eval_interval_epochs = 1")
 c = c.replace("self.miscs.ckpt_interval_epochs = 10", "self.miscs.ckpt_interval_epochs = 1")
-c = c.replace("        # optimizer\n", f"        self.train.total_epochs = 2\n        self.train.finetune_path = '{work}/../models/damoyolo_tinynasL20_T_420.pth'\n"
+c = c.replace("        # optimizer\n", f"        self.train.total_epochs = 2\n        self.train.finetune_path = '{work}/../models/drive/damoyolo_tinynasL20_T_418.pth'\n"
               f"        self.miscs.output_dir = '{work}/workdirs'\n        self.test.batch_size = 8\n        # optimizer\n", 1)
 open(f"{damo}/configs/exp08a.py", "w").write(c)
 print(c[c.index("exp_name"):c.index("# augment")])
