@@ -209,11 +209,17 @@ class DashboardServer:
                     # who has not.
                     return not dashboard._network_reachable
                 sent = self.headers.get("X-Device-Token", "")
-                if not sent:
+                if not sent and self.command == "GET" and urlsplit(self.path).path.startswith("/stream"):
                     # Kept for the MJPEG <img> case, which cannot set a header. It is
                     # a real leak -- a token in a URL lands in proxy logs, browser
                     # history and Referer -- so it stays the fallback, never the
                     # documented path, and the app itself uses the header.
+                    #
+                    # M6: ONLY for GET /stream. It used to be accepted on every
+                    # path, POST included, so a link or a history entry carrying
+                    # ?token= could change the preset, stop monitoring or move the
+                    # device to another Wi-Fi network. The page, the iOS app and
+                    # every script send the header on /api and on every POST.
                     #
                     # Parsed, not split: the page sends encodeURIComponent(TOKEN),
                     # so a token containing + / = & or a space only matches once

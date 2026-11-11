@@ -179,13 +179,19 @@ def test_the_device_local_api_says_simulated(tmp_path):
         device = stack.boot(sc.get("attentive"), dashboard_port=0)
         device.advance(3.0)
         url = device.runtime.dashboard.url  # the sim binds 127.0.0.1
-        with urllib.request.urlopen(f"{url}/api/health?token={device.dashboard_token}", timeout=5) as r:  # noqa: S310
+        # The token goes in the X-Device-Token header, as the app sends it: since the M6
+        # hardening a ?token= query string only opens GET /stream (docs/SECURITY_REVIEW_M6.md S1).
+        request = urllib.request.Request(f"{url}/api/health", headers={"X-Device-Token": device.dashboard_token})  # noqa: S310
+        with urllib.request.urlopen(request, timeout=5) as r:  # noqa: S310
             health = json.loads(r.read())
         assert health["device"]["simulated"] is True
         assert health["device"]["device_id"] == device.identity.hardware_id
         assert "camera sensor" in health["device"]["simulation"]["not_simulated"]
         with pytest.raises(urllib.error.HTTPError):
-            urllib.request.urlopen(f"{url}/api/health?token=wrong", timeout=5)  # noqa: S310
+            urllib.request.urlopen(urllib.request.Request(  # noqa: S310
+                f"{url}/api/health", headers={"X-Device-Token": "wrong"}), timeout=5)
+        with pytest.raises(urllib.error.HTTPError):  # the query token no longer opens the API
+            urllib.request.urlopen(f"{url}/api/health?token={device.dashboard_token}", timeout=5)  # noqa: S310
 
 
 # ---------------------------------------------------------------------- CLI

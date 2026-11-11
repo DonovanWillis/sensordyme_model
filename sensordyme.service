@@ -21,7 +21,19 @@ StartLimitBurst=5
 #
 # 120s still catches every real crash loop with 8x margin, and stops ordinary
 # operator restarts from escalating into a device reboot mid-demo.
-StartLimitAction=reboot
+#
+# M6: the reboot is now BOUNDED ACROSS BOOTS. This used to be
+# `StartLimitAction=reboot`, and systemd's start-limit counter resets on every
+# boot -- so a failure that is deterministic at startup (an import error after a
+# bad deploy, a corrupt presets.yaml, a broken venv) rebooted the Pi every ~30 s
+# for ever. Now the start limit only FAILS the unit, and OnFailure= runs
+# sensordyme-recover.service (deploy/systemd/), which reboots only when the
+# failure was `start-limit-hit` (never for an exit-78 config refusal) and fewer
+# than 3 such reboots happened in the last 6 hours (persisted in
+# /var/lib/sensordyme-recover). Past that the unit stays failed and the device
+# stays up and reachable. See scripts/start_limit_guard.py.
+StartLimitAction=none
+OnFailure=sensordyme-recover.service
 
 [Service]
 Type=notify

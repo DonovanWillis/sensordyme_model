@@ -99,7 +99,66 @@ def check(
 
     report.errors += _role_requirements(config, role)
     report.errors += _model_compatibility(config, hef_sha256, role)
+    profile_errors, exposure_warnings = _device_profile_and_exposure(config)
+    report.errors += profile_errors
+    report.warnings += exposure_warnings
     return report
+
+
+#: Shorter dashboard tokens are guessable over a LAN in practice (M6 warning).
+MIN_DASHBOARD_TOKEN_CHARS = 16
+
+
+def _device_profile_and_exposure(config: dict) -> tuple[list[str], list[str]]:
+    """(errors, warnings) about what this device would run and expose (M6).
+
+    Refused: any profile but `pi`. `mac_max` is the Mac-only developer profile;
+    it is the one path that sends camera frames off the device (its VLM judge,
+    Gemini by default), and on a Pi it cannot even start (it needs torch + MPS,
+    which the device image does not have) -- so it would crash-loop the unit.
+
+    Warned, never refused (a LAN development device legitimately has some of
+    these; the operator has to see them): a network-reachable dashboard with no
+    or a short token, a plain-http or unverified uplink, and on-disk frame capture.
+    """
+    errors: list[str] = []
+    warnings: list[str] = []
+    profile = config.get("profile", "pi")
+    if profile != "pi":
+        errors.append(
+            f"profile {profile!r} is not a device profile: only 'pi' runs on the device. 'mac_max' is "
+            "Mac-only, cannot start without torch+MPS, and its VLM judge uploads camera frames. "
+            "Set `profile: pi` in the device's config.yaml."
+        )
+    dash = config.get("dashboard") if isinstance(config.get("dashboard"), dict) else {}
+    if dash.get("enabled", False) and str(dash.get("host", "127.0.0.1")) not in ("127.0.0.1", "localhost", "::1"):
+        token = dash.get("token")
+        if token in (None, ""):
+            warnings.append("dashboard is LAN-reachable with no token: every /api and /stream request is "
+                            "refused (live feed off). Set a per-device token: `openssl rand -hex 16`.")
+        elif len(str(token)) < MIN_DASHBOARD_TOKEN_CHARS:
+            warnings.append(f"dashboard token is shorter than {MIN_DASHBOARD_TOKEN_CHARS} characters; it guards "
+                            "the live camera on the LAN. Use `openssl rand -hex 16` (and re-enter it in the app).")
+    cloud = config.get("cloud") if isinstance(config.get("cloud"), dict) else {}
+    if cloud.get("enabled", False):
+        from core.uplink import cleartext_remote
+
+        if cleartext_remote(str(cloud.get("base_url", ""))):
+            warnings.append("cloud.base_url is plain http:// to a network host: the device key and every remote "
+                            "command (preset, rules, stop/resume) travel unauthenticated. Development only.")
+        if cloud.get("tls_insecure_skip_verify", False):
+            warnings.append("cloud.tls_insecure_skip_verify is true: the backend's certificate is not checked, so "
+                            "anyone on the path can impersonate it and send commands. Development only.")
+    alerts = config.get("alerts") if isinstance(config.get("alerts"), dict) else {}
+    training = config.get("training") if isinstance(config.get("training"), dict) else {}
+    capture = training.get("capture") if isinstance(training.get("capture"), dict) else {}
+    on_disk = [name for name, on in (("alerts.save_evidence", alerts.get("save_evidence", False)),
+                                     ("training.capture.enabled", capture.get("enabled", False)))
+               if on]
+    if on_disk:
+        warnings.append(f"camera frames are written to the SD card ({', '.join(on_disk)}): needs the consent of "
+                        "everyone on camera; they are never uploaded.")
+    return errors, warnings
 
 
 def _role_requirements(config: dict, role: roles.Role) -> list[str]:

@@ -13,10 +13,12 @@ local alerts are never affected.
 from __future__ import annotations
 
 import math
+import random
 import threading
 import uuid
 from collections import deque
 from typing import Optional
+from urllib.parse import urlsplit
 
 #: Upper bound on the backlog. It must not exceed the backend's MAX_INGEST_EVENTS
 #: (cloud/app.py): the whole backlog goes up in one POST, so a queue larger than
@@ -54,6 +56,46 @@ class _RedirectedError(Exception):
 #: slices also keeps each request short on a weak link. The rest stays queued
 #: and goes on the following polls.
 BATCH_MAX = 100
+
+#: Longest wait between attempts while the backend is unreachable (M6).
+#:
+#: The worker used to retry at the fixed poll interval (2 s) for as long as an
+#: outage lasted: a device with no network ran a DNS lookup + TCP connect every
+#: two seconds indefinitely, and every device behind one backend outage came
+#: back in lock-step. The wait now doubles per consecutive failure up to this
+#: cap, with jitter, and drops back to the poll interval on the first success --
+#: so once the network returns, events flow again within at most this long.
+BACKOFF_CAP_S = 30.0
+
+#: Protection command ids remembered for duplicate suppression (M6).
+_COMMAND_ID_MEMORY = 64
+#: Longest preset name / command id accepted from the backend.
+_MAX_COMMAND_TEXT = 128
+
+
+def backoff_delay(failures: int, base_s: float, cap_s: float = BACKOFF_CAP_S,
+                  rand=random.random) -> float:
+    """Seconds to wait after `failures` consecutive failed syncs.
+
+    0 failures -> the normal poll interval. Otherwise exponential growth from
+    the poll interval, bounded by `cap_s`, with "equal jitter": half the
+    ceiling is fixed (a retry is never immediate) and half random (a fleet does
+    not reconnect in lock-step). A base of 0 (tests) stays 0.
+    """
+    base = max(0.0, float(base_s))
+    if failures <= 0:
+        return base
+    ceiling = min(max(float(cap_s), base), base * (2 ** min(int(failures), 16)))
+    return ceiling / 2 + rand() * ceiling / 2
+
+
+def cleartext_remote(base_url: str) -> bool:
+    """Whether `base_url` sends the device key and receives commands in cleartext
+    over a network: plain http:// to anything but loopback."""
+    parts = urlsplit(base_url or "")
+    if parts.scheme.lower() != "http":
+        return False
+    return (parts.hostname or "").lower() not in ("localhost", "127.0.0.1", "::1")
 
 
 def _json_safe(value):
@@ -120,6 +162,12 @@ class CloudUplink:
         self._stop = threading.Event()
         self._connected = False
         self._explained_failure = False
+        #: Consecutive failed syncs; drives the reconnection backoff.
+        self._failures = 0
+        self._backoff_cap_s = float(config.get("max_backoff_s") or BACKOFF_CAP_S)
+        #: Protection command ids already accepted (bounded), so a re-delivered
+        #: or replayed stop/resume is not applied a second time.
+        self._seen_command_ids: deque[str] = deque(maxlen=_COMMAND_ID_MEMORY)
         import requests  # already a dependency (VLM judge backends)
 
         self._requests = requests
@@ -144,6 +192,16 @@ class CloudUplink:
             )
         else:
             self._verify = True
+        if cleartext_remote(self._base_url):
+            # Said once. Over plain HTTP the device key is readable by anyone on
+            # the path, and the commands in the ingest response (preset, rules,
+            # stop/resume) cannot be told apart from an attacker's. Kept working
+            # -- LAN development backends are http:// -- but never silently.
+            print(
+                "cloud_uplink: base_url is plain http:// to a network host — the device key "
+                "and every remote command travel unauthenticated. Use https:// outside "
+                "development (docs/SECURITY_REVIEW_M6.md)."
+            )
 
     def start(self) -> None:
         threading.Thread(target=self._run, daemon=True, name="cloud-uplink").start()
@@ -305,7 +363,7 @@ class CloudUplink:
     def _run(self) -> None:
         while not self._stop.is_set():
             more_waiting = self.sync_once()
-            self._stop.wait(0 if more_waiting else self._poll_interval_s)
+            self._stop.wait(0 if more_waiting else self.next_delay())
 
     def sync_once(self) -> bool:
         """One sync cycle: push queued events + health, apply any command answered.
@@ -358,9 +416,14 @@ class CloudUplink:
             resp.raise_for_status()
             # 2) the ingest response carries any pending command
             command = resp.json().get("command") or {}
-            if command.get("set_preset"):
+            if not isinstance(command, dict):
+                command = {}
+            preset = command.get("set_preset")
+            if isinstance(preset, str) and 0 < len(preset) <= _MAX_COMMAND_TEXT:
                 with self._lock:
-                    self._pending_preset = command["set_preset"]
+                    self._pending_preset = preset
+            elif preset:
+                print("cloud_uplink: ignored a malformed set_preset command")
             if "set_rules" in command:
                 rules = command.get("set_rules")
                 with self._lock:
@@ -372,11 +435,7 @@ class CloudUplink:
                     self._rules_instruction = str(command.get("rules_instruction") or "")
             protection = command.get("set_protection")
             if isinstance(protection, dict) and protection.get("action") in ("stop", "resume"):
-                with self._lock:
-                    self._pending_protection = {
-                        "action": protection["action"], "confirm": protection.get("confirm") is True,
-                        "id": protection.get("id"),
-                    }
+                self._accept_protection(protection)
             if "set_zones" in command:
                 zones = command.get("set_zones")
                 with self._lock:
@@ -385,6 +444,7 @@ class CloudUplink:
             # A full batch that went through means a backlog: send the next
             # slice now rather than one per poll interval.
             more_waiting = bool(batch) and len(batch) >= self._batch_max
+            self._failures = 0
             if not self._connected:
                 self._connected = True
                 self._explained_failure = False
@@ -429,6 +489,7 @@ class CloudUplink:
                         "networks. See docs/NETWORKING.md."
                     )
             self._connected = False
+            self._failures += 1
             status = getattr(getattr(exc, "response", None), "status_code", None)
             if status == 413 and len(batch) > 1:
                 # Too big, not wrong: send less next time rather than lose it.
@@ -470,3 +531,28 @@ class CloudUplink:
                         f"newer ones kept"
                     )
         return more_waiting
+
+    def next_delay(self) -> float:
+        """How long the worker waits before its next sync (see backoff_delay)."""
+        return backoff_delay(self._failures, self._poll_interval_s, self._backoff_cap_s)
+
+    def _accept_protection(self, protection: dict) -> None:
+        """Queue a stop/resume for the main loop, at most once per command id.
+
+        The backend re-sends a protection command until the device reports its
+        id back, and a lost response -- or a replayed one -- delivers the same
+        id again. Applying it twice is not harmless: a stop the owner has since
+        resumed locally would silently stop monitoring again. A command without
+        an id (an older backend) is accepted as before.
+        """
+        raw_id = protection.get("id")
+        command_id = None if raw_id in (None, "") else str(raw_id)[:_MAX_COMMAND_TEXT]
+        with self._lock:
+            if command_id is not None:
+                if command_id in self._seen_command_ids:
+                    return
+                self._seen_command_ids.append(command_id)
+            self._pending_protection = {
+                "action": protection["action"], "confirm": protection.get("confirm") is True,
+                "id": command_id,
+            }
