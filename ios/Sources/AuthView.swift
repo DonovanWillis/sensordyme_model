@@ -90,6 +90,10 @@ struct AuthView: View {
                     .focused($focus, equals: .email)
                     .submitLabel(.next)
                     .onSubmit { focus = .password }
+                    // The title is empty (the prompt is the visible label), which
+                    // left VoiceOver reading the field as just "text field".
+                    .accessibilityLabel("Email")
+                    .accessibilityIdentifier("auth.email")
             }
 
             OrynFieldChrome(icon: "lock", focused: focus == .password) {
@@ -107,6 +111,8 @@ struct AuthView: View {
                     .focused($focus, equals: .password)
                     .submitLabel(.go)
                     .onSubmit(submit)
+                    .accessibilityLabel("Password")
+                    .accessibilityIdentifier("auth.password")
 
                     Button {
                         let wasFocused = focus == .password
@@ -144,6 +150,9 @@ struct AuthView: View {
                 .frame(maxWidth: .infinity, alignment: .leading)
                 .padding(.top, SD.Space.xxs)
                 .transition(.opacity)
+                .accessibilityElement(children: .combine)
+                .accessibilityLabel("Error: \(errorMessage)")
+                .accessibilityIdentifier("auth.error")
             }
 
             Button(action: submit) {
@@ -158,6 +167,11 @@ struct AuthView: View {
             .buttonStyle(SDButtonStyle(kind: .primary))
             .disabled(!canSubmit)
             .padding(.top, SD.Space.sm)
+            // While busy the button shows only a spinner; say what it is doing.
+            .accessibilityLabel(busy ? (isSignup ? "Creating account" : "Signing in")
+                                : (isSignup ? "Create account" : "Sign in"))
+            .accessibilityHint(canSubmit || busy ? "" : "Enter an email and a password of at least 8 characters")
+            .accessibilityIdentifier("auth.submit")
 
             // The address is found on the network, not typed in, so say so while
             // it happens — otherwise the first seconds on a new phone look like
@@ -170,6 +184,7 @@ struct AuthView: View {
                         .foregroundStyle(SD.Colors.textTertiary)
                 }
                 .frame(maxWidth: .infinity)
+                .accessibilityElement(children: .combine)
                 .padding(.top, SD.Space.xs)
             }
         }
@@ -226,7 +241,7 @@ struct AuthView: View {
                     .foregroundStyle(SD.Colors.textTertiary)
             }
             Text("ORYN · SENSORDYME")
-                .font(SD.Typography.eyebrow)
+                .sdEyebrowFont()
                 .kerning(SD.Typography.eyebrowKerning)
                 .foregroundStyle(SD.Colors.textDisabled)
         }

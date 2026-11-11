@@ -204,5 +204,13 @@ check(state(for: "driver_safety", active: "driver_safety", custom: false) == .ac
 check(state(for: "driver_safety", active: "driver_safety", custom: true) == .inactive,
       "replacing: the mode row is not active")
 
+print("\nevery row state is spoken, not only drawn:")
+check(ModeRowState.active.spokenValue == "Active", "active says Active")
+check(ModeRowState.switching.spokenValue == "Switching", "switching says so")
+check(ModeRowState.failed("x").spokenValue == "Switch failed", "a failure says so")
+check(ModeRowState.unavailable("role").spokenValue == "Not available on this device", "unavailable says so")
+check(ModeRowState.queuedOffline.spokenValue.contains("reconnect"), "queued says it waits for the device")
+check(ModeRowState.inactive.spokenValue.isEmpty, "an idle row adds nothing")
+
 print("\n\(failures == 0 ? "PASSED" : "\(failures) FAILED")")
 exit(failures == 0 ? 0 : 1)

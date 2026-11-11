@@ -83,7 +83,7 @@ struct EventDetailView: View {
                 }
             }
             Text(explanation?.headline ?? event.title)
-                .font(SD.Typography.display)
+                .sdScaledFont(30, relativeTo: .title, weight: .semibold)
                 .foregroundStyle(SD.Colors.textPrimary)
             Text(device.name)
                 .font(SD.Typography.callout)

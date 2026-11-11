@@ -92,7 +92,7 @@ struct AIConfigureView: View {
                     HStack(spacing: 8) {
                         OrynMark(height: 14)
                         Text("Ask Jupiter")
-                            .font(.system(size: 16, weight: .semibold))
+                            .sdScaledFont(16, relativeTo: .headline, weight: .semibold)
                             .foregroundStyle(SD.Colors.textPrimary)
                     }
                     .accessibilityElement(children: .combine)
@@ -100,6 +100,7 @@ struct AIConfigureView: View {
                 }
                 ToolbarItem(placement: .cancellationAction) {
                     Button("Done") { dismiss() }
+                        .accessibilityIdentifier("jupiter.done")
                 }
             }
         }
@@ -146,6 +147,8 @@ struct AIConfigureView: View {
                         .foregroundStyle(SD.Colors.textTertiary)
                     SDProgress(phase: thinkingProgress.phase)
                 }
+                .accessibilityElement(children: .combine)
+                .accessibilityIdentifier("jupiter.thinking")
                 .padding(.horizontal, SD.Space.xxs)
                 .transition(.opacity)
             } else if proposal == nil {
@@ -215,6 +218,7 @@ struct AIConfigureView: View {
                     .font(SD.Typography.body)
                     .foregroundStyle(SD.Colors.textPrimary)
                     .fixedSize(horizontal: false, vertical: true)
+                    .accessibilityIdentifier("jupiter.explanation")
 
                 if !proposal.isCustom {
                     Label("Also switches to \(Preset.title(for: proposal.preset))",
@@ -287,6 +291,7 @@ struct AIConfigureView: View {
                             .font(SD.Typography.caption)
                             .foregroundStyle(SD.Colors.textSecondary)
                             .fixedSize(horizontal: false, vertical: true)
+                            .accessibilityIdentifier("jupiter.zoneRequirement")
                     }
 
                     Divider().overlay(SD.Colors.border)
@@ -354,6 +359,7 @@ struct AIConfigureView: View {
         SDCard {
             VStack(alignment: .leading, spacing: SD.Space.sm) {
                 SDSectionHeader(title: "Not yet possible")
+                    .accessibilityIdentifier("jupiter.limitations")
                 ForEach(items) { item in
                     VStack(alignment: .leading, spacing: 3) {
                         HStack(alignment: .firstTextBaseline, spacing: SD.Space.xs) {
@@ -440,6 +446,8 @@ struct AIConfigureView: View {
             }
             .frame(maxWidth: .infinity)
             .padding(.vertical, SD.Space.xs)
+            .accessibilityElement(children: .combine)
+            .accessibilityIdentifier("jupiter.applied")
         } else {
             Button { confirmActivate = true } label: {
                 if activating {
@@ -453,6 +461,7 @@ struct AIConfigureView: View {
             }
             .buttonStyle(SDButtonStyle(kind: .primary))
             .disabled(activating)
+            .accessibilityIdentifier("jupiter.activate")
             .confirmationDialog(
                 proposal.isCustom ? "Turn these rules on?" : "Switch to \(Preset.title(for: proposal.preset))?",
                 isPresented: $confirmActivate, titleVisibility: .visible
@@ -505,6 +514,7 @@ struct AIConfigureView: View {
         return SDCard {
             VStack(alignment: .leading, spacing: SD.Space.sm) {
                 SDSectionHeader(title: "If you activate this")
+                    .accessibilityIdentifier("jupiter.preview")
                 previewGroup("Will watch for", icon: "eye", color: SD.Colors.success, items: preview.will)
                 if !preview.wont.isEmpty {
                     previewGroup("Won't watch for", icon: "eye.slash", color: SD.Colors.warning, items: preview.wont)

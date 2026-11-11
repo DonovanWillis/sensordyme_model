@@ -311,7 +311,9 @@ struct DeviceDetailView: View {
                 status: device.online ? .online : .offline,
                 pulses: device.online
             )
+            .accessibilityIdentifier("detail.online")
             SDStatusPill(status: pill.tone.sdStatus, text: pill.text)
+                .accessibilityIdentifier("detail.monitoring")
             Spacer(minLength: SD.Space.xs)
             HStack(spacing: 5) {
                 if customMonitoringActive {
@@ -505,6 +507,8 @@ struct DeviceDetailView: View {
                         .foregroundStyle(SD.Colors.textSecondary)
                 }
                 .buttonStyle(.plain)
+                .accessibilityLabel("Jupiter examples")
+                .accessibilityIdentifier("detail.examples")
             }
             .padding(.horizontal, SD.Space.xxs)
         }
@@ -529,6 +533,7 @@ struct DeviceDetailView: View {
                         )
                     }
                     .buttonStyle(SDRowButtonStyle(minHeight: 60))
+                    .accessibilityIdentifier("detail.history")
 
                     OrynRowDivider()
 
@@ -540,6 +545,7 @@ struct DeviceDetailView: View {
                         )
                     }
                     .buttonStyle(SDRowButtonStyle(minHeight: 60))
+                    .accessibilityIdentifier("detail.zones")
 
                     OrynRowDivider()
 
@@ -769,6 +775,10 @@ struct DeviceDetailView: View {
             // The backend would refuse it (role_forbids_preset, a capability
             // the device lacks, planned): nothing to tap.
             .disabled(isUnavailable)
+            // The row's state was a checkmark or spinner alone: said here too.
+            .accessibilityValue(rowState.spokenValue)
+            .accessibilityAddTraits(isActive ? .isSelected : [])
+            .accessibilityIdentifier("preset.row.\(preset.id)")
 
             // Details, settings and validation. Enabled even when the preset
             // can't be picked, so the reason can be read in full.
@@ -781,6 +791,7 @@ struct DeviceDetailView: View {
             }
             .buttonStyle(.plain)
             .accessibilityLabel("\(preset.title) details and settings")
+            .accessibilityIdentifier("preset.info.\(preset.id)")
             }
 
             // Tuning variants, shown only for the mode currently running.
@@ -809,6 +820,10 @@ struct DeviceDetailView: View {
                                     )
                             }
                             .buttonStyle(.plain)
+                            // Selection was shown by colour only.
+                            .accessibilityAddTraits(selected ? .isSelected : [])
+                            .accessibilityLabel("\(preset.title): \(variant.title)")
+                            .accessibilityIdentifier("preset.variant.\(variant.id)")
                         }
                     }
                     .padding(.leading, 26 + SD.Space.sm)
@@ -976,6 +991,7 @@ struct DeviceDetailView: View {
         }
         .buttonStyle(SDRowButtonStyle(minHeight: 60))
         .disabled(busy || protectionUnsupported != nil || device.status == nil)
+        .accessibilityIdentifier("detail.protection")
 
         if let note {
             Text(note.text)
@@ -1213,6 +1229,17 @@ struct EventRow: View {
             }
         }
         .padding(.vertical, SD.Space.xxs)
-        .accessibilityElement(children: .combine)
+        // The dot's colour is the severity; say it.
+        .accessibilityElement(children: .ignore)
+        .accessibilityLabel(EventAccessibility.label(
+            title: title, severity: event.severity, signals: event.signals,
+            when: event.date.map { Self.spokenAge.localizedString(for: $0, relativeTo: .now) }))
+        .accessibilityIdentifier("event.row")
     }
+
+    private static let spokenAge: RelativeDateTimeFormatter = {
+        let formatter = RelativeDateTimeFormatter()
+        formatter.unitsStyle = .full
+        return formatter
+    }()
 }

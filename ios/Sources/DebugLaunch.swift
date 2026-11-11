@@ -27,6 +27,9 @@ enum DebugLaunch {
     static var jupiterPrompt: String? { value(after: "-orynPrompt") }
     /// Don't ask for notification permission (the prompt would cover the screen).
     static var noPermissionPrompt: Bool { args.contains("-orynNoPrompt") }
+    /// Start signed out, so a UI test can begin at the sign-in screen. It calls the
+    /// ordinary sign-out (the token is revoked and forgotten); it signs no one in.
+    static var signOut: Bool { args.contains("-orynSignOut") }
     /// Sign in with an existing backend session (`-orynSession <token> <email>`), so the
     /// app can be driven against a local backend + virtual device (docs/VIRTUAL_DEVICE.md)
     /// without typing. The token comes from a real /v1/login; nothing is bypassed.
@@ -49,5 +52,6 @@ enum DebugLaunch {
     static let jupiterPrompt: String? = nil
     static let session: (token: String, email: String)? = nil
     static let noPermissionPrompt = false
+    static let signOut = false
     #endif
 }

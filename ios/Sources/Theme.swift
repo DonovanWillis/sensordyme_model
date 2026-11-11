@@ -209,10 +209,44 @@ struct SDEyebrow: View {
 
     var body: some View {
         Text(text.uppercased())
-            .font(SD.Typography.eyebrow)
+            .sdEyebrowFont()
             .kerning(SD.Typography.eyebrowKerning)
             .foregroundStyle(color)
             .lineLimit(1)
+    }
+}
+
+// MARK: - Dynamic Type
+
+/// One of ORYN's fixed design sizes that still follows the reader's text size:
+/// the design value is the default and scales with the nearest text style.
+/// `Font.system(size:)` alone never scales, so an 11 pt label stayed 11 pt at
+/// the largest accessibility sizes.
+struct SDScaledFont: ViewModifier {
+    @ScaledMetric private var size: CGFloat
+    private let weight: Font.Weight
+    private let design: Font.Design
+
+    init(size: CGFloat, relativeTo style: Font.TextStyle, weight: Font.Weight, design: Font.Design) {
+        _size = ScaledMetric(wrappedValue: size, relativeTo: style)
+        self.weight = weight
+        self.design = design
+    }
+
+    func body(content: Content) -> some View {
+        content.font(.system(size: size, weight: weight, design: design))
+    }
+}
+
+extension View {
+    func sdScaledFont(_ size: CGFloat, relativeTo style: Font.TextStyle,
+                      weight: Font.Weight = .regular, design: Font.Design = .default) -> some View {
+        modifier(SDScaledFont(size: size, relativeTo: style, weight: weight, design: design))
+    }
+
+    /// `SD.Typography.eyebrow`, scaled.
+    func sdEyebrowFont() -> some View {
+        sdScaledFont(11, relativeTo: .caption2, weight: .medium, design: .monospaced)
     }
 }
 
@@ -368,11 +402,12 @@ struct SDStatusPill: View {
     var pulses = false
 
     @State private var pulse = false
+    @Environment(\.accessibilityReduceMotion) private var reduceMotion
 
     var body: some View {
         HStack(spacing: 6) {
             ZStack {
-                if pulses {
+                if MotionPolicy.animates(pulses, reduceMotion: reduceMotion) {
                     Circle()
                         .fill(status.tint.opacity(0.35))
                         .frame(width: 12, height: 12)
@@ -389,7 +424,7 @@ struct SDStatusPill: View {
             }
             .frame(width: 12, height: 12)
             Text((text ?? status.label).uppercased())
-                .font(SD.Typography.eyebrow)
+                .sdEyebrowFont()
                 .kerning(1)
                 .foregroundStyle(status == .offline ? SD.Colors.textTertiary : status.tint)
                 .lineLimit(1)
@@ -399,7 +434,7 @@ struct SDStatusPill: View {
         .padding(.vertical, 5)
         .background(Capsule().fill(status.wash))
         .overlay(Capsule().strokeBorder(status.tint.opacity(status == .offline ? 0.25 : 0.22), lineWidth: 1))
-        .onAppear { if pulses { pulse = true } }
+        .onAppear { if MotionPolicy.animates(pulses, reduceMotion: reduceMotion) { pulse = true } }
         .accessibilityElement(children: .combine)
         .accessibilityLabel(text ?? status.label)
     }
@@ -422,6 +457,12 @@ struct SDLoadingState: View {
         }
         .frame(maxWidth: .infinity)
         .padding(.vertical, SD.Space.xl)
+        // One element that says what is loading, rather than an unlabelled
+        // spinner followed by the text.
+        .accessibilityElement(children: .ignore)
+        .accessibilityLabel(message)
+        .accessibilityAddTraits(.updatesFrequently)
+        .accessibilityIdentifier("state.loading")
     }
 }
 
@@ -447,14 +488,20 @@ struct SDEmptyState: View {
                         .strokeBorder(SD.Colors.border, lineWidth: 1)
                 )
                 .padding(.bottom, SD.Space.xxs)
-            Text(title)
-                .font(SD.Typography.headline)
-                .foregroundStyle(SD.Colors.textPrimary)
-            Text(message)
-                .font(SD.Typography.callout)
-                .foregroundStyle(SD.Colors.textTertiary)
-                .multilineTextAlignment(.center)
-                .fixedSize(horizontal: false, vertical: true)
+                .accessibilityHidden(true)  // decorative; the title says it
+            VStack(spacing: SD.Space.sm) {
+                Text(title)
+                    .font(SD.Typography.headline)
+                    .foregroundStyle(SD.Colors.textPrimary)
+                    .accessibilityAddTraits(.isHeader)
+                Text(message)
+                    .font(SD.Typography.callout)
+                    .foregroundStyle(SD.Colors.textTertiary)
+                    .multilineTextAlignment(.center)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+            .accessibilityElement(children: .combine)
+            .accessibilityIdentifier("state.empty")
             if let actionTitle, let action {
                 Button(actionTitle, action: action)
                     .buttonStyle(SDButtonStyle(kind: .secondary, fullWidth: false))
@@ -530,13 +577,20 @@ struct ConnectionBanner: View {
                 .frame(width: 2)
                 .clipShape(Capsule())
             VStack(alignment: .leading, spacing: SD.Space.xxs + 2) {
-                Text(title)
-                    .font(SD.Typography.label)
-                    .foregroundStyle(SD.Colors.textPrimary)
-                Text(message)
-                    .font(SD.Typography.caption)
-                    .foregroundStyle(SD.Colors.textSecondary)
-                    .fixedSize(horizontal: false, vertical: true)
+                VStack(alignment: .leading, spacing: SD.Space.xxs + 2) {
+                    Text(title)
+                        .font(SD.Typography.label)
+                        .foregroundStyle(SD.Colors.textPrimary)
+                    Text(message)
+                        .font(SD.Typography.caption)
+                        .foregroundStyle(SD.Colors.textSecondary)
+                        .fixedSize(horizontal: false, vertical: true)
+                }
+                // Read as one sentence; the retry button below stays a separate,
+                // activatable element. Combining the whole banner folded the button
+                // into a static description that VoiceOver could not press.
+                .accessibilityElement(children: .combine)
+                .accessibilityIdentifier("banner.message")
                 if let retry {
                     Button {
                         retrying = true
@@ -552,6 +606,8 @@ struct ConnectionBanner: View {
                     }
                     .disabled(retrying)
                     .padding(.top, 2)
+                    .accessibilityLabel(retrying ? "Trying again" : "Try again")
+                    .accessibilityIdentifier("banner.retry")
                 }
             }
             Spacer(minLength: 0)
@@ -565,7 +621,8 @@ struct ConnectionBanner: View {
             RoundedRectangle(cornerRadius: SD.Radius.md, style: .continuous)
                 .strokeBorder(SD.Colors.warning.opacity(0.22), lineWidth: 1)
         )
-        .accessibilityElement(children: .combine)
+        .accessibilityElement(children: .contain)
+        .accessibilityIdentifier("banner.connection")
     }
 }
 

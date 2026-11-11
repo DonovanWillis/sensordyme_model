@@ -41,6 +41,8 @@ struct SetupWizardView: View {
                     Button(action: advance) {
                         if busy { ProgressView().tint(SD.Colors.textOnAccent) } else { Text(buttonTitle) }
                     }
+                    .accessibilityLabel(busy ? "Pairing" : buttonTitle)
+                    .accessibilityIdentifier("wizard.next")
                     .buttonStyle(BrandButtonStyle())
                     .disabled(busy || (step == .pair && claimCode.isEmpty && !state.isDemo))
                 } else {
@@ -48,10 +50,13 @@ struct SetupWizardView: View {
                         dismiss()
                     }
                     .buttonStyle(BrandButtonStyle())
+                    .accessibilityIdentifier("wizard.done")
                 }
 
                 if let errorMessage {
                     Text(errorMessage).font(.callout).foregroundStyle(SD.Colors.danger)
+                        .accessibilityLabel("Error: \(errorMessage)")
+                        .accessibilityIdentifier("wizard.error")
                 }
             }
             .padding(24)
@@ -191,6 +196,9 @@ struct SetupWizardView: View {
                     .padding(14)
                     .background(RoundedRectangle(cornerRadius: SD.Radius.md, style: .continuous).fill(SD.Colors.field))
                     .overlay(RoundedRectangle(cornerRadius: SD.Radius.md, style: .continuous).strokeBorder(SD.Colors.borderStrong))
+                    // Its placeholder is an example code, which VoiceOver read as the field's name.
+                    .accessibilityLabel("Claim code")
+                    .accessibilityIdentifier("wizard.claimCode")
             }
         }
     }

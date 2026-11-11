@@ -56,7 +56,7 @@ struct ShopView: View {
                         .font(SD.Typography.title)
                         .foregroundStyle(SD.Colors.textPrimary)
                     Text("IR night vision · edge AI · every mode")
-                        .font(SD.Typography.eyebrow)
+                        .sdEyebrowFont()
                         .kerning(1)
                         .multilineTextAlignment(.center)
                         .foregroundStyle(SD.Colors.textTertiary)
