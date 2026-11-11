@@ -1,7 +1,7 @@
 .PHONY: help dev dev-debug dev-max dev-openpilot dev-skinnemoen dev-dashsentinel \
         bench accuracy accuracy-dataset accuracy-gate report deploy deploy-preflight \
         test test-cov test-ios lint lint-fix fmt-check typecheck audit check mutants \
-        setup-dev hooks clean
+        setup-dev hooks clean sim sim-backend sim-device sim-scenarios sim-e2e
 
 VENV := .venv/bin
 
@@ -38,6 +38,35 @@ dev-skinnemoen: ## Comparison: erlendskinnemoen's MediaPipe FaceMesh DMS, verbat
 
 dev-dashsentinel: ## Comparison: DashSentinel (vendored under third_party/)
 	$(VENV)/python main.py --module driver_attention_dashsentinel --debug
+
+# =============================================================================
+# Virtual device: the real runtime + real backend on this Mac, scripted
+# perception, clearly SIMULATED (docs/VIRTUAL_DEVICE.md). Point the iOS
+# Simulator at http://localhost:8787 (its default) and claim with the printed
+# code. Override the interpreter with SIM_PY=..., e.g.
+#   make sim SIM_PY=~/.venvs/sensordyme-m01/bin/python SCENARIO=drowsy
+# =============================================================================
+
+SIM_PY     ?= $(VENV)/python
+SCENARIO   ?= tour
+SIM_BACKEND ?= http://127.0.0.1:8787
+
+sim: ## Virtual device + local backend in one go (SCENARIO=tour; --list-scenarios via sim-scenarios)
+	$(SIM_PY) -m sim.virtual_device --with-backend --backend $(SIM_BACKEND) --scenario $(SCENARIO)
+
+sim-backend: ## The real backend locally on :8787, throwaway data, demo account, factory.json
+	$(SIM_PY) -m sim.backend --port $(lastword $(subst :, ,$(SIM_BACKEND)))
+
+sim-device: ## A virtual device against a running backend (FACTORY=path/to/factory.json)
+	$(SIM_PY) -m sim.virtual_device --backend $(SIM_BACKEND) --scenario $(SCENARIO) \
+		$(if $(FACTORY),--factory $(FACTORY),)
+
+sim-scenarios: ## List the virtual device's scenarios
+	$(SIM_PY) -m sim.virtual_device --list-scenarios
+
+sim-e2e: ## Deterministic end-to-end tests: virtual device x real backend (seconds, no sleeps)
+	PYTHONDONTWRITEBYTECODE=1 $(SIM_PY) -m pytest -p no:cacheprovider -q \
+		tests/test_sim_e2e.py tests/test_sim_units.py tests/test_sim_seams.py
 
 # =============================================================================
 # Benchmarks and reports

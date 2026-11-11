@@ -14,12 +14,11 @@ from sim import scenario as sc
 from sim.camera import BANNER, SimCamera, in_stall_gap, render
 from sim.clock import SimClock
 from sim.perception import (
+    Scene,
     ScriptedDetector,
     ScriptedFaceMesh,
     ScriptedHands,
-    Scene,
     decode_scene,
-    encode_scene,
     face_landmarks,
 )
 from sim.scenario import Faults, Scenario, ScenarioClock, ScenarioState, Segment
@@ -116,7 +115,7 @@ def test_camera_faults():
     script = Scenario("t", "t", (Segment(0.0), Segment(10.0, faults=Faults(camera="frozen")),
                                  Segment(20.0, faults=Faults(camera="dropping")),
                                  Segment(30.0, faults=Faults(camera="stalled"))))
-    camera = SimCamera(_state(script, clock), width=64, height=48, sleep=lambda s: clock.advance(s))
+    camera = SimCamera(_state(script, clock), width=64, height=48, sleep=clock.advance)
     assert camera.read() is not None and camera.is_open()
     clock.advance(10.0)
     with pytest.raises(CameraError, match="SIMULATED camera fault: frozen"):
@@ -156,7 +155,7 @@ def test_scenario_clock_and_overrides():
     assert state.current().network_down is True
     state.fault_overrides = {"network_down": False}
     assert state.current().network_down is False
-    with pytest.raises(ValueError):
+    with pytest.raises(ValueError, match="speed must be"):
         ScenarioClock(clock.monotonic, speed=0)
 
 
@@ -179,7 +178,7 @@ def test_the_device_local_api_says_simulated(tmp_path):
     with SimStack(tmp_path) as stack:
         device = stack.boot(sc.get("attentive"), dashboard_port=0)
         device.advance(3.0)
-        url = device.runtime.dashboard.url.replace("0.0.0.0", "127.0.0.1")
+        url = device.runtime.dashboard.url  # the sim binds 127.0.0.1
         with urllib.request.urlopen(f"{url}/api/health?token={device.dashboard_token}", timeout=5) as r:  # noqa: S310
             health = json.loads(r.read())
         assert health["device"]["simulated"] is True

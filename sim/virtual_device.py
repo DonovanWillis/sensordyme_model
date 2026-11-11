@@ -114,8 +114,13 @@ def _auto_claim(backend: str, email: str, password: str, claim_code: str) -> Non
     print(f"sim: auto-claim as {email}: HTTP {claim.status_code} {claim.text[:120]}")
 
 
-def _advertise(identity, port: int):
-    """_sensordyme._tcp, as deploy/avahi + scripts/publish_mdns.py do on the Pi."""
+def _advertise(identity, port: int, host: str):
+    """_sensordyme._tcp, as deploy/avahi + scripts/publish_mdns.py do on the Pi.
+
+    The address is 127.0.0.1 for a loopback-bound local API (the iOS Simulator
+    shares the Mac's network stack, so that is the Mac), else this Mac's LAN
+    address (from cloud/mdns.py, the backend's own advertiser).
+    """
     try:
         import socket
 
@@ -123,13 +128,20 @@ def _advertise(identity, port: int):
     except ImportError:
         print("sim: --mdns needs python-zeroconf; not advertising")
         return None
+    address = "127.0.0.1"
+    if host not in ("127.0.0.1", "localhost"):
+        from cloud.mdns import lan_ip
+
+        address = lan_ip() or address
+    suffix = identity.hardware_id.removeprefix("SD-SIM-").lower()
     zc = Zeroconf()
     info = ServiceInfo(
         "_sensordyme._tcp.local.", f"SensorDyme SIMULATED {identity.hardware_id}._sensordyme._tcp.local.",
-        addresses=[socket.inet_aton("127.0.0.1")], port=port,
+        addresses=[socket.inet_aton(address)], port=port, server=f"sensordyme-sim-{suffix}.local.",
         properties={"path": "/stream", "version": "0.2", "id": identity.hardware_id, "simulated": "1"},
     )
     zc.register_service(info)
+    print(f"sim: advertising _sensordyme._tcp at {address}:{port} (id {identity.hardware_id})")
     return zc, info
 
 
@@ -188,7 +200,8 @@ def main(argv: Optional[list[str]] = None) -> int:
                 raise SystemExit("sim: --auto-claim needs --factory or --with-backend (the demo account)")
             _auto_claim(args.backend, account[0], account[1], identity.claim_code)
 
-        advert = _advertise(identity, args.dashboard_port) if args.mdns and not args.no_dashboard else None
+        advert = (_advertise(identity, args.dashboard_port, args.dashboard_host)
+                  if args.mdns and not args.no_dashboard else None)
         try:
             device.run()
         finally:
