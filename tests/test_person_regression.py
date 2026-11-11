@@ -54,6 +54,18 @@ def test_duplicates_are_separated_from_misplaced_boxes():
     assert fp["count"] == 2 and fp["duplicate"] == 0.5 and fp["misplaced"] == 0.5 and fp["background"] == 0.0
 
 
+def test_renms_suppresses_within_class_only(tmp_path):
+    shifted = (0.1, 0.15, 0.3, 0.35)  # IoU 0.6 with A: survives NMS 0.7, not 0.5
+    rows = [("person", 0.9, A), ("person", 0.8, shifted), ("hand", 0.7, shifted), ("person", 0.6, B)]
+    src = tmp_path / "p.jsonl"
+    src.write_text("".join(json.dumps({"id": "i", "label": l, "score": s, "box": list(b)}) + "\n"
+                           for l, s, b in rows))  # noqa: E741
+    assert pr.renms(src, tmp_path / "o.jsonl", 0.7) == (4, 4)
+    assert pr.renms(src, tmp_path / "o.jsonl", 0.5) == (3, 4)
+    kept = pr.load_preds(tmp_path / "o.jsonl")
+    assert sorted(s for s, _ in kept["person"]["i"]) == [0.6, 0.9] and kept["hand"]["i"] == [(0.7, shifted)]
+
+
 def test_merge_takes_each_class_from_its_source(tmp_path):
     a, b = tmp_path / "a.jsonl", tmp_path / "b.jsonl"
     rows = lambda label: [json.dumps({"id": "i", "label": l, "score": 0.5, "box": list(A)}) for l in label]  # noqa: E731, E741

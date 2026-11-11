@@ -219,6 +219,27 @@ def merge(takes: list[str], out: Path) -> int:
     return n
 
 
+def renms(src: Path, out: Path, iou: float) -> tuple[int, int]:
+    """Re-run greedy per-image, per-class NMS at ``iou`` over an already-suppressed prediction file.
+    Used to put a DAMO-postprocessed file (NMS 0.7) on the bench's NMS (0.5); on top of a looser pass
+    it approximates, not reproduces, NMS at ``iou`` over the raw outputs."""
+    from core.accel import _nms
+
+    preds = load_preds(src)
+    kept = total = 0
+    with out.open("w") as f:
+        for label, per_image in preds.items():
+            for image_id, rows in per_image.items():
+                total += len(rows)
+                scores = np.array([s for s, _ in rows], dtype=float)
+                boxes = np.array([b for _, b in rows], dtype=float).reshape(-1, 4)
+                for i in _nms(boxes, scores, iou):
+                    f.write(json.dumps({"id": image_id, "label": label, "score": rows[i][0],
+                                        "box": list(rows[i][1])}) + "\n")
+                    kept += 1
+    return kept, total
+
+
 def main(argv: Optional[list[str]] = None) -> int:
     p = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     sub = p.add_subparsers(dest="cmd", required=True)
@@ -229,7 +250,15 @@ def main(argv: Optional[list[str]] = None) -> int:
     m = sub.add_parser("merge")
     m.add_argument("--take", action="append", required=True, help="label[,label]=path")
     m.add_argument("--out", required=True)
+    n = sub.add_parser("renms")
+    n.add_argument("--preds", required=True)
+    n.add_argument("--iou", type=float, default=0.5)
+    n.add_argument("--out", required=True)
     args = p.parse_args(argv)
+    if args.cmd == "renms":
+        kept, total = renms(Path(args.preds), Path(args.out), args.iou)
+        print(f"kept {kept} of {total} predictions at NMS IoU {args.iou} -> {args.out}")
+        return 0
     if args.cmd == "merge":
         print(f"merged {merge(args.take, Path(args.out))} predictions into {args.out}")
         return 0
