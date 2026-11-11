@@ -71,3 +71,27 @@ b538feb Integrate chore/redact-audit-identifiers into the M6 release candidate
 - Full suite on oryn at the merge head: **2,330 passed, 5 skipped, 0 failed** (job 20261111-032119-cc88f3); ruff clean.
 - `git diff 50e9441 HEAD -- ios`: only app-status-contract additions and the redaction fixture; the collaborator's files are otherwise unchanged.
 - Every source branch tip is an ancestor of this branch (no dropped commits).
+
+## Mission 6 (2026-11-11): merged on top of `c01e43b`
+
+| Branch | Tip | Merge | Notes |
+|---|---|---|---|
+| `m6/behaviour-reasoning` | `5903986` | `5e23261` | flag `behavior_v2: false` (default unchanged) |
+| `m6/ios-app` | `35be53f` | `b73e34f` | collaborator's ORYN EDGE components reused, not redesigned |
+| `m6/presets-policies` | `89489a4` | clean | preset catalogue, rules API, typed prompt policies, dwell-in-zone |
+| `m6/virtual-device` | `da9ea4d` | clean | `sim/` + seams with production defaults pinned by tests |
+| `m6/autonomy-security-runbook` | `bc6ce7a` | `d0b77f9` | **conflict in `core/uplink.py`, resolved**: kept the virtual device's `sync_once()` structure and re-applied the autonomy changes inside it (backoff + `next_delay()`, malformed-command refusal, once-only protection ids, failure counter). The sim test that used `?token=` on `/api/health` now uses the header (S1 hardening). |
+| `m6/cv-labels` | `90ce5a5` | `27be8aa` | label audit, partial-label patch (research only), EXP-08 results |
+
+Integration fixes made on this branch (each with a test):
+- `2516577` structural uplink test inspects `sync_once` (the body moved there).
+- `bb61fec` the app parses `preset[:variant][@settings]` (presets backend names modes with settings).
+- `02079b7` monitoring changes reach the app immediately (device refreshes the monitoring part of
+  its cached health on every monitoring publish; a backend precedence rule was tried and rejected);
+  backend keeps `SD-SIM-` hardware ids.
+- `3428d41` DEBUG-only launch args + `scripts/sim/ios_e2e.sh` (real app vs real backend + virtual device).
+
+Final verification at `27be8aa`: oryn job `20261111-045454-2b68b1` **2,676 passed, 5 skipped, 0 failed**,
+ruff clean; `ios/Tests/run.sh` 715 checks, 0 failures; `swiftc -typecheck` clean; iOS Simulator
+end-to-end run with screenshots in `~/sensordyme-audit/2026-11-10/m6-evidence/ios-e2e/`.
+Not pushed; `integration/all` untouched.
