@@ -273,6 +273,13 @@ def validate(config: dict) -> tuple[list[str], list[str]]:
         for name, section in modules_cfg.items():
             if not isinstance(section, dict):
                 errors.append(f"`modules.{name}:` must be a mapping, got {section!r}")
+        driver = modules_cfg.get("driver_attention")
+        if isinstance(driver, dict):
+            # Experimental behaviour reasoning (core/behavior/, off by default):
+            # a typo'd or wrong-typed key there must fail loudly, not run defaults.
+            from core.behavior.config import validate_behavior
+
+            errors.extend(validate_behavior(driver))
     if profile != "mac_max" and isinstance(module_name, str) and isinstance(modules_cfg, dict):
         _check(errors, module_name in modules_cfg,
                f"`module: {module_name}` has no `modules.{module_name}:` config section")
