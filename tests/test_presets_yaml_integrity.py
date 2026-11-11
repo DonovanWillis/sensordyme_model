@@ -69,7 +69,9 @@ def test_parses_with_no_duplicate_keys_anywhere():
 
 def test_top_level_shape():
     data = _load_strict()
-    assert set(data.keys()) == {"aliases", "presets"}
+    # catalog_version and planned: the M6 preset catalogue (docs/PRESET_LIBRARY.md).
+    assert {"aliases", "presets"} <= set(data.keys()) <= {"aliases", "presets", "catalog_version", "planned"}
+    assert isinstance(data.get("planned", {}), dict)
     assert isinstance(data["aliases"], dict)
     assert isinstance(data["presets"], dict)
     # The exact defect that shipped: a stray line turned `presets:` into a

@@ -10,6 +10,30 @@
 # "<preset>:<variant>" (e.g. driver_distraction:teen). A variant's `overrides` are
 # merged over the module's config.yaml block at switch time.
 #
+# CATALOGUE FIELDS (docs/PRESET_LIBRARY.md, served by GET /v1/presets). Readers
+# that predate them ignore them; core/presets.py validates them and
+# tests/test_m6_preset_catalog.py pins them against the model registry:
+#   version                 bumped whenever what the preset watches for changes
+#   product_mode            which of the five product modes this preset serves
+#   required_capabilities   core/monitoring_state.py kinds the preset cannot run
+#                           without; optional_capabilities degrade it when lost.
+#                           Together (minus alert outputs) they must equal what
+#                           core/model_registry.yaml says the module consumes.
+#   hardware                what the preset needs physically
+#   temporal_policies       each alert, and how long its condition must hold
+#   alert_patterns          how each alert sounds (config.yaml alerts:)
+#   settings                owner-tunable values, each mapped 1:1 onto an existing
+#                           module config key, with a validated range. Role
+#                           floors (core/roles.py) still win over any setting.
+#   compatibility           one vision module runs at a time, so every preset is
+#                           in the "vision_module" exclusive group
+#   limitations, evidence   honest caveats, and the documents behind them
+# There is NO validation-status field, on purpose: it is derived from
+# core/model_registry.py (the weakest model along the preset's capability chain),
+# so a preset can never claim more than its weakest model has earned.
+
+catalog_version: "2026-11-11.m6"
+
 # Preset names that have been superseded. A deployed device, or a `desired_preset`
 # already sitting in the backend, can still be holding one of these — and an
 # unknown preset name is a device stuck in a mode it cannot switch out of.
@@ -43,6 +67,49 @@ presets:
       long_haul:
         title: Long Haul
         overrides: { perclos_threshold: 0.12, perclos_window_s: 45.0 }
+    version: 2
+    product_mode: driver_safety
+    # Face landmarks carry drowsiness, distraction and attention-lost, and a
+    # driver alert nobody in the cabin hears protects no one. Objects (phone,
+    # eating/drinking) and hands (phone-in-hand confidence) degrade it when lost.
+    required_capabilities: [camera, inference, face, audible_alert]
+    optional_capabilities: [objects, hands]
+    hardware:
+      camera: Camera Module 3 Wide (NoIR for night), mounted facing the driver
+      accelerator: Hailo-8L for object detection (phone, food, drink); face/hands run on the Pi CPU
+      audible_output: required (gpio_buzzer or sound)
+    temporal_policies:
+      - { event: drowsiness, description: eyes closed continuously, sustain_s: 2.0, setting: drowsy_seconds }
+      - { event: distraction, description: head turned away from the road, sustain_s: 3.0, setting: distraction_seconds }
+      - { event: eyes_down, description: looking down (phone in lap), sustain_s: 2.5, setting: eyes_down_seconds }
+      - { event: phone_use, description: phone visible while the gaze is off the road, sustain_s: 2.0, setting: phone_use_seconds }
+      - { event: attention_lost, description: face lost and no person detected, sustain_s: 2.5 }
+      - { event: fatigue_warning, description: eyes closed for more than the PERCLOS share of a rolling window, window_s: 60.0 }
+      - { event: frequent_glancing, description: repeated off-road glances within a rolling window, window_s: 45.0 }
+    alert_patterns:
+      - { tone: critical, events: [drowsiness, attention_lost], description: "continuous alarm; repeats while the condition lasts (bounded)" }
+      - { tone: loud, events: [distraction, eyes_down, eyes_up, phone_use, high_risk], description: "loud tone; repeats while the condition lasts (bounded)" }
+      - { tone: soft, events: [fatigue_warning, frequent_glancing, elevated_risk, erratic_hand_movement], description: "soft chime, once per episode" }
+    settings:
+      - { key: drowsy_seconds, title: Eyes-closed time before alert, type: number, default: 2.0, min: 1.0, max: 3.0, step: 0.1, unit: s }
+      - { key: distraction_seconds, title: Looking-away time before alert, type: number, default: 3.0, min: 1.0, max: 5.0, step: 0.1, unit: s }
+      - { key: eyes_down_seconds, title: Looking-down time before alert, type: number, default: 2.5, min: 1.0, max: 4.0, step: 0.1, unit: s }
+      - { key: phone_use_seconds, title: Phone-use time before alert, type: number, default: 2.0, min: 0.5, max: 4.0, step: 0.1, unit: s }
+      - { key: glance_min_count, title: Glances that count as frequent, type: number, default: 5, min: 2, max: 10, step: 1, unit: glances }
+      - { key: perclos_threshold, title: Eyes-closed share for a fatigue warning, type: number, default: 0.15, min: 0.08, max: 0.3, step: 0.01, unit: fraction }
+      - { key: enable_hands, title: Use hand tracking for phone use, type: bool, default: true }
+    compatibility:
+      # On a driver_safety-role device custom rules run BESIDE this preset
+      # (additive, core/roles.py); on any other role they replace it.
+      custom_rules: additive_on_driver_safety_role
+    limitations:
+      - Face landmarks (MediaPipe Face Mesh) are unevaluated on in-cabin NoIR footage; the model card excludes life-critical use
+      - The object detector gives a false phone box on about 60% of phone-free public validation images at the shipped threshold
+      - Cannot tell texting from reading, or see the road; sunglasses and night driving are untested
+    evidence:
+      - docs/MODEL_REGISTRY.md
+      - docs/DETECTION_THRESHOLDS.md
+      - docs/PHASE5_DEMO_READINESS.md
 
   elderly_monitoring:
     title: Elderly Monitoring
@@ -57,6 +124,33 @@ presets:
       active_senior:
         title: Active Senior
         overrides: { drop_velocity_threshold: 0.75, stillness_duration_s: 2.0 }
+    version: 2
+    # Not one of the five product modes; kept for existing installations.
+    product_mode: null
+    required_capabilities: [camera, inference, pose, alert_output]
+    optional_capabilities: []
+    hardware:
+      camera: Camera Module 3 Wide, room view with the floor visible
+      accelerator: none required (MediaPipe Pose on the Pi CPU)
+      audible_output: recommended
+    temporal_policies:
+      - { event: fall, description: rapid drop followed by stillness, sustain_s: 1.5, setting: stillness_duration_s }
+      - { event: unusual_stillness, description: no significant movement for a long window, sustain_s: 600.0 }
+      - { event: zone_violation, description: feet inside a user-drawn restricted area, sustain_s: 2.0 }
+      - { event: safe_zone_exit, description: leaving a user-drawn safe area (e.g. bed) }
+    alert_patterns:
+      - { tone: loud, events: [fall, zone_violation, unusual_stillness, safe_zone_exit], description: loud tone and push }
+    settings:
+      - { key: drop_velocity_threshold, title: Drop speed that counts as a fall, type: number, default: 0.6, min: 0.3, max: 1.0, step: 0.05, unit: frame heights/s }
+      - { key: stillness_duration_s, title: Stillness after a drop before alert, type: number, default: 1.5, min: 0.5, max: 5.0, step: 0.1, unit: s }
+    compatibility:
+      custom_rules: replace
+    limitations:
+      - MediaPipe Pose is unevaluated on consented footage for falls, stillness or flailing
+      - Tuned for adults; sitting or lying down deliberately does not trigger a fall
+    evidence:
+      - docs/MODEL_REGISTRY.md
+      - docs/DETECTIONS.md
 
   security_monitoring:
     title: Security Monitoring
@@ -78,6 +172,36 @@ presets:
       package_watch:
         title: Package Watch
         overrides: { confidence_threshold: 0.35, confirm_frames: 2 }
+    version: 2
+    product_mode: property_monitoring
+    required_capabilities: [camera, inference, objects, alert_output]
+    optional_capabilities: [pose]
+    hardware:
+      camera: Camera Module 3 Wide (NoIR for night), covering the area to protect
+      accelerator: Hailo-8L for object detection
+      audible_output: optional
+    temporal_policies:
+      - { event: zone_violation, description: a person's feet inside a user-drawn restricted area, sustain_s: 2.0, setting: zone_confirm_s }
+      - { event: person_lingering, description: a person inside a user-drawn area for a long time, sustain_s: 30.0, setting: linger_s }
+      - { event: vehicle_in_zone, description: a vehicle inside a user-drawn area, sustain_s: 2.0, setting: zone_confirm_s }
+      - { event: animal_in_zone, description: an animal inside a user-drawn area, sustain_s: 2.0, setting: zone_confirm_s }
+      - { event: crowd, description: at least the crowd threshold of people on screen, sustain_s: 5.0 }
+    alert_patterns:
+      - { tone: loud, events: [zone_violation, person_lingering, vehicle_in_zone, animal_in_zone, crowd], description: loud tone and push }
+    settings:
+      - { key: confidence_threshold, title: Person detection confidence, type: number, default: 0.5, min: 0.25, max: 0.9, step: 0.05 }
+      - { key: zone_confirm_s, title: Time in an area before alert, type: number, default: 2.0, min: 0.5, max: 10.0, step: 0.5, unit: s }
+      - { key: linger_s, title: Time in an area that counts as lingering, type: number, default: 30.0, min: 5.0, max: 600.0, step: 5.0, unit: s }
+      - { key: crowd_threshold, title: People on screen that count as a crowd, type: number, default: 4, min: 2, max: 50, step: 1, unit: people }
+    compatibility:
+      custom_rules: replace
+    limitations:
+      - Area alerts need areas drawn in the app; the camera cannot know what a door or driveway is
+      - Cannot tell known people from strangers (no face recognition, by design), or detect packages
+      - The detector is benchmarked offline on public data only; no in-domain or on-device event evaluation
+    evidence:
+      - docs/MODEL_REGISTRY.md
+      - docs/DETECTION_THRESHOLDS.md
 
   baby_monitoring:
     title: Baby Monitoring
@@ -97,6 +221,78 @@ presets:
       play_area:
         title: Play Area
         overrides: { still_warning_s: 60, zone_confirm_s: 1.5 }
+    version: 2
+    product_mode: child_monitoring
+    required_capabilities: [camera, inference, objects, alert_output]
+    # Pose carries flailing and choking-hazard scoring; presence, zones and
+    # stillness keep working without it.
+    optional_capabilities: [pose]
+    hardware:
+      camera: Camera Module 3 Wide (NoIR for night), overlooking the crib or play area
+      accelerator: Hailo-8L for object detection; pose on the Pi CPU
+      audible_output: recommended
+    temporal_policies:
+      - { event: unusual_stillness, description: little motion inside the child's box, sustain_s: 120.0, setting: still_warning_s }
+      - { event: person_absent, description: nobody visible (when presence is expected), sustain_s: 30.0, setting: absence_warning_s }
+      - { event: safe_zone_exit, description: leaving the user-drawn safe area, sustain_s: 2.0, setting: zone_confirm_s }
+      - { event: zone_violation, description: entering a user-drawn danger area, sustain_s: 2.0, setting: zone_confirm_s }
+      - { event: flailing, description: frantic arm movement over about 1.2 s }
+      - { event: choking_hazard, description: a hand-held small object closing on the mouth region }
+    alert_patterns:
+      - { tone: loud, events: [zone_violation, safe_zone_exit, unusual_stillness, person_absent, flailing, choking_hazard, infant_unidentified], description: loud tone and push }
+    settings:
+      - { key: still_warning_s, title: Stillness time before alert, type: number, default: 120, min: 30, max: 900, step: 10, unit: s }
+      - { key: absence_warning_s, title: Out-of-view time before alert, type: number, default: 30, min: 5, max: 300, step: 5, unit: s }
+      - { key: expect_presence, title: Alert when nobody is visible, type: bool, default: true }
+      - { key: zone_confirm_s, title: Time outside/inside an area before alert, type: number, default: 2.0, min: 0.5, max: 10.0, step: 0.5, unit: s }
+    compatibility:
+      custom_rules: replace
+    limitations:
+      - Cannot hear crying (no microphone) or tell sleeping from awake
+      - Will not claim a covered face; adult face and pose models are not reliable on infants
+      - Pose-based flailing and choking-hazard scoring are unevaluated on consented footage
+    evidence:
+      - docs/MODEL_REGISTRY.md
+      - docs/DETECTIONS.md
 
-  # Planned presets (modules not yet written; the app shows them as coming soon):
-  #   exam_proctoring:   gaze-off-screen, second person, phone detection
+# Product modes no device can run yet. Listed so the app can show them honestly
+# ("planned", and why) instead of either hiding them or faking them. Never
+# returned by load_presets(), so no command path can select one.
+planned:
+  occupancy:
+    title: Occupancy
+    description: Room occupancy counts and capacity alerts.
+    module: occupancy
+    version: 1
+    product_mode: occupancy
+    reason: >-
+      There is no standalone Occupancy mode yet. The occupancy module (person
+      counting, crowd threshold, presence in drawn areas) runs today inside
+      Security Monitoring; a dedicated mode needs its own alert set (capacity,
+      room empty) and an entry in the app.
+    served_by: [security_monitoring]
+    required_capabilities: [camera, inference, objects, alert_output]
+    optional_capabilities: [pose]
+    limitations:
+      - Counts are per frame from the object detector; people hidden behind others are not counted
+    evidence:
+      - docs/MODEL_REGISTRY.md
+
+  workplace_safety:
+    title: Workplace Safety
+    description: PPE compliance and hazard-area monitoring for work sites.
+    module: null
+    version: 1
+    product_mode: workplace_safety
+    reason: >-
+      No PPE, hard-hat, hi-vis or forklift detector exists: COCO-80 has no such
+      classes and core/capabilities.py declares headwear detection unavailable.
+      The workplace-relevant capabilities that do exist are fall detection
+      (Elderly Monitoring) and restricted areas (Security Monitoring).
+    served_by: [elderly_monitoring, security_monitoring]
+    required_capabilities: [camera, inference, objects]
+    optional_capabilities: []
+    limitations:
+      - Needs a PPE detection model, a licence review, and in-domain evaluation before it can exist
+    evidence:
+      - docs/MODEL_REGISTRY.md
