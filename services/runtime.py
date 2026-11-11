@@ -67,6 +67,11 @@ _CAMERA_OPEN_RETRIES = 5
 _CAMERA_OPEN_BACKOFF_S = 2.0
 _CAMERA_VERIFY_TIMEOUT_S = 10.0
 _VERSION = "0.2"
+#: The custom rules' consumer id on the shared perception engine (the rules node's id), and
+#: how often their detector demand is due: 0.2 s, which the driver module's every-3rd-frame
+#: pass usually serves from the same run, so it costs no extra inference there.
+RULES_CONSUMER = "rules"
+RULES_DEMAND_INTERVAL_S = 0.2
 # A module.process() call that keeps failing this many frames IN A ROW is not
 # a transient hiccup -- propagate so the existing recovery ladder (in-thread
 # restart headless, process exit under --display) can recover a genuinely
@@ -754,6 +759,15 @@ class DeviceRuntime:
         with self._module_lock:
             module = self.module
         module.set_requested_labels(labels)
+        # M7: the rules are a perception consumer in their own right. Their demand
+        # makes the shared detector look for exactly the labels they name, on the
+        # same per-frame run the module triggers when one happens (a module such as
+        # driver_attention asks only for its own classes), and lists "rules" among
+        # the detector's consumers in the device's perception report.
+        self.perception.withdraw(RULES_CONSUMER)
+        if labels:
+            self.perception.demand(pc.Demand(consumer=RULES_CONSUMER, component=pc.OBJECT_DETECTOR,
+                                             labels=frozenset(labels), min_interval_s=RULES_DEMAND_INTERVAL_S))
         if labels and module.get_detections() is None:
             # The module cannot report per-frame detections at all, so these
             # rules will never be evaluated. Say so rather than fail silently.
@@ -774,7 +788,12 @@ class DeviceRuntime:
             from core.capabilities import registry as capability_registry
 
             reg = capability_registry()
-            covered = monitoring_mode.capabilities_covered_by(self.module_name)
+            covered = set(monitoring_mode.capabilities_covered_by(self.module_name))
+            if self.perception.component(pc.OBJECT_DETECTOR).state != pc.UNAVAILABLE:
+                # The rules' own demand (above) has the shared detector serve COCO
+                # labels whatever module runs; only labels no component can give
+                # (a posture under a module that runs no pose) stay uncovered.
+                covered.add("objects.coco")
             uncovered = {
                 label for label in labels
                 if not ({c.id for c in reg.providers_of_label(label) if c.available} & covered)

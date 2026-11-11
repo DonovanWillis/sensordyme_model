@@ -159,37 +159,37 @@ def test_a_refusal_of_another_mode_does_not_cancel_this_one(backend):
 def test_a_node_is_delivered_until_the_device_reports_it_then_cleared(backend):
     client, headers, _ = backend
     _report(client)
-    resp = client.post("/v1/devices/1/nodes", json={"node": "occupancy", "enabled": True}, headers=headers)
+    resp = client.post("/v1/devices/1/nodes", json={"node": "people_counter", "enabled": True}, headers=headers)
     assert resp.status_code == 200, resp.text
-    assert resp.json() == {"ok": True, "node": "occupancy", "enabled": True, "pending": True}
+    assert resp.json() == {"ok": True, "node": "people_counter", "enabled": True, "pending": True}
     command = _report(client)
-    assert command == {"set_nodes": {"occupancy": {"enabled": True, "settings": {}}}}
+    assert command == {"set_nodes": {"people_counter": {"enabled": True, "settings": {}}}}
     # Re-sent while the device has not reported it.
-    assert _report(client)["set_nodes"]["occupancy"]["enabled"] is True
+    assert _report(client)["set_nodes"]["people_counter"]["enabled"] is True
 
     running = _perception(nodes=[
         {"id": "driver_safety", "kind": "preset", "state": "active"},
-        {"id": "occupancy", "kind": "companion", "state": "active", "validation": "synthetic_tests",
+        {"id": "people_counter", "kind": "companion", "state": "active", "validation": "synthetic_tests",
          "experimental": True},
     ])
     assert not (_report(client, perception=running) or {}).get("set_nodes"), "acknowledged: cleared"
     listing = client.get("/v1/devices/1/nodes", headers=headers).json()
-    occupancy = next(n for n in listing["nodes"] if n["id"] == "occupancy")
-    assert occupancy["desired"] is None and occupancy["reported"]["state"] == "active"
-    assert occupancy["validation"] == "synthetic_tests" and occupancy["experimental"] is True
+    counter = next(n for n in listing["nodes"] if n["id"] == "people_counter")
+    assert counter["desired"] is None and counter["reported"]["state"] == "active"
+    assert counter["validation"] == "synthetic_tests" and counter["experimental"] is True
     # Asking again for what already runs is a no-op: nothing pending, nothing sent.
-    again = client.post("/v1/devices/1/nodes", json={"node": "occupancy", "enabled": True}, headers=headers)
+    again = client.post("/v1/devices/1/nodes", json={"node": "people_counter", "enabled": True}, headers=headers)
     assert again.json()["pending"] is False
     assert not (_report(client, perception=running) or {}).get("set_nodes")
 
 
 def test_turning_a_node_off_converges_on_inactive_or_absent(backend):
     client, headers, _ = backend
-    running = _perception(nodes=[{"id": "occupancy", "kind": "companion", "state": "active"}])
+    running = _perception(nodes=[{"id": "people_counter", "kind": "companion", "state": "active"}])
     _report(client, perception=running)
-    client.post("/v1/devices/1/nodes", json={"node": "occupancy", "enabled": False}, headers=headers)
-    assert _report(client, perception=running) == {"set_nodes": {"occupancy": {"enabled": False, "settings": {}}}}
-    stopped = _perception(nodes=[{"id": "occupancy", "kind": "companion", "state": "inactive"}])
+    client.post("/v1/devices/1/nodes", json={"node": "people_counter", "enabled": False}, headers=headers)
+    assert _report(client, perception=running) == {"set_nodes": {"people_counter": {"enabled": False, "settings": {}}}}
+    stopped = _perception(nodes=[{"id": "people_counter", "kind": "companion", "state": "inactive"}])
     assert not (_report(client, perception=stopped) or {}).get("set_nodes")
 
 
@@ -198,7 +198,7 @@ def test_node_requests_are_validated(backend):
     _report(client)
     unknown = client.post("/v1/devices/1/nodes", json={"node": "mind_reader", "enabled": True}, headers=headers)
     assert unknown.status_code == 400 and unknown.json()["code"] == "unknown_node"
-    bad = client.post("/v1/devices/1/nodes", json={"node": "occupancy", "enabled": True,
+    bad = client.post("/v1/devices/1/nodes", json={"node": "people_counter", "enabled": True,
                                                     "settings": {"Bad-Key": 1}}, headers=headers)
     assert bad.status_code == 400 and bad.json()["code"] == "invalid_setting"
 
@@ -206,7 +206,7 @@ def test_node_requests_are_validated(backend):
 def test_firmware_without_perception_is_refused_rather_than_asked_for_ever(backend):
     client, headers, _ = backend
     _report(client, with_perception=False)
-    resp = client.post("/v1/devices/1/nodes", json={"node": "occupancy", "enabled": True}, headers=headers)
+    resp = client.post("/v1/devices/1/nodes", json={"node": "people_counter", "enabled": True}, headers=headers)
     assert resp.status_code == 409 and resp.json()["code"] == "firmware_unsupported"
 
 
@@ -228,13 +228,13 @@ def test_a_node_the_device_refuses_is_recorded_and_not_resent(backend):
 
 def test_a_set_nodes_command_is_signed_like_every_other():
     key = sd_auth.DeviceKey("dk_" + "x" * 32)
-    command = {"set_nodes": {"occupancy": {"enabled": True, "settings": {}}}}
+    command = {"set_nodes": {"people_counter": {"enabled": True, "settings": {}}}}
     envelope = sd_auth.sign_command(key, command, device="SD-0A1B2C3D", request_nonce="a" * 32)
     assert envelope["types"] == ["set_nodes"]
     sd_auth.verify_command(sd_auth.Keyring(key), command, envelope, devices=["SD-0A1B2C3D"],
                            request_nonce="a" * 32)
     with pytest.raises(sd_auth.AuthError):
-        sd_auth.verify_command(sd_auth.Keyring(key), {"set_nodes": {"occupancy": {"enabled": False}}}, envelope,
+        sd_auth.verify_command(sd_auth.Keyring(key), {"set_nodes": {"people_counter": {"enabled": False}}}, envelope,
                                devices=["SD-0A1B2C3D"], request_nonce="a" * 32)
 
 

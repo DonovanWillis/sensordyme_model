@@ -88,7 +88,7 @@ def test_driver_safety_a_custom_rule_and_a_companion_share_one_detector_run_per_
 
     report = _perception(device)
     detector = report["components"]["object_detector"]
-    assert detector["state"] == "ok" and set(detector["consumers"]) >= {"driver_attention", "people_counter"}
+    assert detector["state"] == "ok" and set(detector["consumers"]) >= {"driver_attention", "people_counter", "rules"}
     assert {n["id"]: n["kind"] for n in report["nodes"]} == {
         "driver_safety": "preset", "rules": "rules", "people_counter": "companion"}
     # All three consumers got the same observations:

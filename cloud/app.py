@@ -2757,8 +2757,8 @@ def device_presets(device_id: int, uid: int = Depends(current_user)):
 #: shared person detections and run no model of their own; both are experimental
 #: until the registry binds evidence to them.
 _FALLBACK_NODE_CATALOG = {
-    "occupancy": {
-        "title": "Occupancy",
+    "people_counter": {
+        "title": "People counter",
         "description": "People count, entries and exits, and presence in drawn areas, "
                        "from the shared person detections.",
         "required_capabilities": ["camera", "inference", "objects"],
@@ -2772,6 +2772,16 @@ _FALLBACK_NODE_CATALOG = {
     },
 }
 _NODE_ID = re.compile(r"^[a-z][a-z0-9_]{0,63}$")
+
+
+def _as_node_catalog(nodes) -> dict[str, dict]:
+    """{id: spec} from either shape a loader returns: a dict keyed by id, or the
+    device's list of specs each carrying its own `id` (core.presets.load_companion_nodes)."""
+    if isinstance(nodes, dict):
+        return {str(k): (v if isinstance(v, dict) else {}) for k, v in nodes.items()}
+    if isinstance(nodes, list):
+        return {str(v["id"]): v for v in nodes if isinstance(v, dict) and v.get("id")}
+    return {}
 
 
 def node_catalog() -> dict[str, dict]:
@@ -2791,8 +2801,9 @@ def node_catalog() -> dict[str, dict]:
             except Exception:
                 log.warning("node catalogue: %s failed; using the fallback", name, exc_info=True)
                 continue
-            if isinstance(nodes, dict) and nodes:
-                return {str(k): (v if isinstance(v, dict) else {}) for k, v in nodes.items()}
+            catalog = _as_node_catalog(nodes)
+            if catalog:
+                return catalog
     try:
         document = preset_module._load(None)
     except (OSError, yaml.YAMLError):
