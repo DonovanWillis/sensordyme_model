@@ -19,7 +19,10 @@ sed -i "s/torch.load(pretrain_model, map_location='cpu')/torch.load(pretrain_mod
   "$DAMO/damo/detectors/detector.py"
 
 echo "== venv (system site packages: the fleet's torch $("$BASE" -c 'import torch;print(torch.__version__)'))"
-[ -x "$VENV/bin/python" ] || $UV venv -q --system-site-packages -p "$BASE" "$VENV"
+[ -x "$VENV/bin/python" ] || $UV venv -q -p "$BASE" "$VENV"
+# sdgpu is itself a venv, so --system-site-packages would expose the bare interpreter, not
+# sdgpu's torch. Layer sdgpu's site-packages underneath instead (read-only use; sdgpu unchanged).
+"$BASE" -c 'import site; print(site.getsitepackages()[0])' > "$("$VENV/bin/python" -c 'import site; print(site.getsitepackages()[0])')/sdgpu.pth"
 $UV pip freeze --python "$BASE" > "$O/base_freeze.txt"
 $UV pip install -q --python "$VENV/bin/python" -c "$O/base_freeze.txt" \
   omegaconf loguru tqdm tabulate easydict opencv-python-headless pycocotools scikit-image pyyaml huggingface_hub safetensors
