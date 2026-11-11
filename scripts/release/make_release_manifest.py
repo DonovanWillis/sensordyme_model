@@ -10,6 +10,13 @@ check that a device holds exactly that.
           Python requirements, the systemd units, and test-run references.
           Writes JSON (machine) and Markdown (people).
 
+  check   (Mac/worker) the release gates over a built manifest -- model pins
+          consistent; decoder `legacy` (the reference decoder is never part of
+          a known-good release); every /v1 route the device and the iOS app
+          call exists in the backend; the hashed device lock agrees with the
+          device pins; the repo config.yaml passes core.config_schema; the
+          status-tier file is well formed. Exit 0 = all gates pass.
+
   verify  (Mac/worker) compare a DEVICE SNAPSHOT -- produced on the Pi, read-only,
           by `scripts/hw_validation/integrity_manifest.py snapshot` -- against a
           manifest: deployed files, model hash vs the pins, the device config's
@@ -18,6 +25,7 @@ check that a device holds exactly that.
 
     python scripts/release/make_release_manifest.py build --ref m6/autonomy-security-runbook \\
         --out-json rc.json --out-md rc.md --test-ref "pytest tests/test_m6_*.py: 120 passed"
+    python scripts/release/make_release_manifest.py check --manifest rc.json
     python scripts/release/make_release_manifest.py verify --manifest rc.json --snapshot snap.json
 
 Reads git objects only (never the working tree), so uncommitted edits can never
@@ -53,7 +61,12 @@ _CONFIG = "config.yaml"
 _SETUP = "setup_pi.sh"
 _REGISTRY = "core/model_registry.yaml"
 _DEVICE_REQUIREMENTS = "requirements-device.txt"
-_UNITS = ("sensordyme.service", "deploy/systemd/sensordyme-recover.service")
+_DEVICE_LOCK = "requirements-device.lock"
+_STATUS = "scripts/release/release_status.yaml"
+_UNITS = ("sensordyme.service", "deploy/systemd/sensordyme-recover.service",
+          "deploy/systemd/sensordyme.service.hardened",
+          "deploy/systemd/sensordyme.service.d/btmgmt-advertising.conf")
+TIERS = ("software-ready", "simulator-verified", "hardware-pending", "experiment-only", "production-blocked")
 #: Files the device itself writes next to the code: scripts/migrate_config.py's
 #: config backups. Reported, never counted as drift. Deliberately narrow.
 DEVICE_STATE_GLOBS = ("config.yaml.bak-*",)
@@ -131,6 +144,148 @@ def _norm(name: str) -> str:
     return re.sub(r"[-_.]+", "-", name.strip().lower())
 
 
+# ------------------------------------------------------------------ release facts
+def _text(everything: dict[str, bytes], path: str) -> str:
+    return everything.get(path, b"").decode("utf-8", "replace")
+
+
+def _first(pattern: str, text: str) -> Optional[str]:
+    match = re.search(pattern, text, re.MULTILINE | re.DOTALL)
+    return match.group(1) if match else None
+
+
+def route_key(path: str) -> str:
+    r"""`/v1/devices/{device_id}/rules` (backend) and `v1/devices/\(id)/rules` (Swift) -> `v1/devices/{}/rules`."""
+    path = re.sub(r"\\\([^)]*\)", "{}", path.strip().lstrip("/"))
+    return re.sub(r"\{[^}]*\}", "{}", path).split("?", 1)[0].rstrip("/")
+
+
+def versions_and_protocol(everything: dict[str, bytes]) -> dict:
+    """App <-> backend <-> device: declared versions, and whether every /v1 route a
+    client calls exists in the backend. A side whose source is absent is reported, not failed."""
+    backend_src = _text(everything, "cloud/app.py")
+    backend = {route_key(p) for p in re.findall(r'@app\.(?:get|post|put|patch|delete)\("(/v1/[^"]+)"', backend_src)}
+    device = {route_key(p) for p in re.findall(r"(/v1/[A-Za-z0-9_{}/.-]+)", _text(everything, "core/uplink.py"))}
+    app: set[str] = set()
+    for path, data in everything.items():
+        if path.startswith("ios/Sources/") and path.endswith(".swift"):
+            app.update(route_key(p) for p in re.findall(r'"(/?v1/[^"\s]*)"', data.decode("utf-8", "replace")))
+    device_missing = sorted(device - backend) if backend else []
+    app_missing = sorted(app - backend) if backend else []
+    return {
+        "versions": {
+            "device_runtime": _first(r'^_VERSION = "([^"]+)"', _text(everything, "services/runtime.py")),
+            "backend_api": _first(r'FastAPI\([^)]*?version="([^"]+)"', backend_src),
+            "ios_app": _first(r'MARKETING_VERSION: "([^"]+)"', _text(everything, "ios/project.yml")),
+            "api_prefix": "/v1" if backend else None,
+        },
+        "backend_routes": len(backend),
+        "device_routes": sorted(device),
+        "app_routes": len(app),
+        "device_missing_in_backend": device_missing,
+        "app_missing_in_backend": app_missing,
+        "compatible": (not device_missing and not app_missing) if backend else None,
+    }
+
+
+def lock_status(everything: dict[str, bytes]) -> Optional[dict]:
+    """The hashed device lock: does it pin what requirements-device.txt pins, with a hash for every package?"""
+    if _DEVICE_LOCK not in everything:
+        return None
+    lock = _text(everything, _DEVICE_LOCK)
+    locked = {_norm(k): v for k, v in re.findall(r"^([A-Za-z0-9][A-Za-z0-9._-]*)==([^\s\\]+)", lock, re.MULTILINE)}
+    pins = requirement_pins(_text(everything, _DEVICE_REQUIREMENTS))["pins"]
+    mismatched = {k: [v, locked.get(k)] for k, v in pins.items() if locked.get(k) != v}
+    blocks = [b for b in re.split(r"\n(?=[A-Za-z0-9])", lock) if re.match(r"[A-Za-z0-9][A-Za-z0-9._-]*==", b)]
+    unhashed = [b.split("==", 1)[0] for b in blocks if "--hash=sha256:" not in b]
+    return {"path": _DEVICE_LOCK, "sha256": _sha(everything[_DEVICE_LOCK]), "packages": len(locked),
+            "pins_mismatched": mismatched, "unhashed": unhashed, "consistent": not mismatched and not unhashed}
+
+
+def config_schema_status(config: dict) -> dict:
+    """core.config_schema.validate on the release's default config.yaml (the validator is this checkout's)."""
+    if not config:
+        return {"checked": False, "errors": [], "warnings": [], "note": "no config.yaml"}
+    if str(REPO_ROOT) not in sys.path:
+        sys.path.insert(0, str(REPO_ROOT))
+    try:
+        from core.config_schema import validate
+    except Exception as exc:  # noqa: BLE001 - report it; never crash a manifest build
+        return {"checked": False, "errors": [], "warnings": [], "note": f"validator unavailable: {exc}"}
+    errors, warnings = validate(config)
+    return {"checked": True, "errors": list(errors), "warnings": list(warnings)}
+
+
+def status_tiers(everything: dict[str, bytes]) -> Optional[dict]:
+    """scripts/release/release_status.yaml at the ref, validated: known tiers, evidence, no hardware claim."""
+    if _STATUS not in everything:
+        return None
+    try:
+        data = yaml.safe_load(_text(everything, _STATUS)) or {}
+    except yaml.YAMLError as exc:
+        return {"path": _STATUS, "sha256": _sha(everything[_STATUS]), "as_of": None, "components": {},
+                "problems": [f"unparseable: {exc}"]}
+    problems: list[str] = []
+    components = {}
+    for name, raw in (data.get("components") or {}).items():
+        entry = raw or {}
+        tiers = list(entry.get("tiers") or [])
+        evidence = str(entry.get("evidence") or "")
+        if not tiers or any(t not in TIERS for t in tiers):
+            problems.append(f"{name}: tiers {tiers} not within {list(TIERS)}")
+        if not evidence:
+            problems.append(f"{name}: no evidence")
+        if re.search(r"\b(hardware|device|physically)[- ]validated\b", evidence, re.IGNORECASE):
+            problems.append(f"{name}: claims hardware validation")
+        components[name] = {"tiers": tiers, "evidence": evidence,
+                            "pending_integration": bool(entry.get("pending_integration"))}
+    return {"path": _STATUS, "sha256": _sha(everything[_STATUS]), "as_of": data.get("as_of"),
+            "components": components, "problems": problems}
+
+
+def release_gates(manifest: dict) -> list[dict]:
+    """What a release must pass before it may go to a device. An input absent at the
+    ref (an older release without a lock or status file) is INFO, never a silent PASS."""
+    gates: list[dict] = []
+
+    def gate(name: str, ok: Optional[bool], detail: str) -> None:
+        gates.append({"gate": name, "result": "PASS" if ok else ("INFO" if ok is None else "FAIL"),
+                      "detail": detail})
+
+    pins = manifest["model_pins"]
+    gate("model pins consistent (config = setup_pi.sh = registry)", pins["consistent"],
+         f".hef {pins['config_yolo_hef']} sha256 {pins['config_yolo_hef_sha256']}")
+    decoder = manifest["decoder"]["yolo_decoder"]
+    gate("decoder is legacy (the reference decoder is not enabled)", decoder == "legacy", f"yolo_decoder: {decoder}")
+    proto = manifest.get("protocol")
+    if proto:
+        gate("protocol: every /v1 route the device and app call exists in the backend", proto["compatible"],
+             f"versions {proto['versions']}; device missing {proto['device_missing_in_backend']}; "
+             f"app missing {proto['app_missing_in_backend']}")
+    else:
+        gate("protocol", None, "no protocol section (manifest predates M6.5)")
+    lock = manifest.get("dependency_lock")
+    if lock:
+        gate("device lock agrees with the device pins, every package hashed", lock["consistent"],
+             f"{lock['packages']} packages, sha256 {lock['sha256'][:16]}; mismatched {lock['pins_mismatched']}; "
+             f"unhashed {lock['unhashed']}")
+    else:
+        gate("device lock", None, "no requirements-device.lock at this ref")
+    schema = manifest.get("config_schema") or {}
+    if schema.get("checked"):
+        gate("repo config.yaml passes core.config_schema", not schema["errors"],
+             f"{len(schema['errors'])} error(s), {len(schema['warnings'])} warning(s) {schema['errors'][:3]}")
+    else:
+        gate("repo config.yaml schema", None, schema.get("note", "not checked"))
+    tiers = manifest.get("status_tiers")
+    if tiers:
+        gate("status tiers well formed, no hardware-validation claim", not tiers["problems"],
+             f"{len(tiers['components'])} components; problems {tiers['problems']}")
+    else:
+        gate("status tiers", None, "no scripts/release/release_status.yaml at this ref")
+    return gates
+
+
 def build(repo: Path, ref: str, test_refs: list[str], branch: Optional[str] = None) -> dict:
     commit = _git(repo, "rev-parse", f"{ref}^{{commit}}")
     if branch is None:
@@ -183,6 +338,27 @@ def build(repo: Path, ref: str, test_refs: list[str], branch: Optional[str] = No
                     "note": "reference decoder is opt-in; INT8 parity unvalidated (docs/DECODER_CANDIDATE.md)"},
         "requirements": requirements,
         "systemd_units": {u: _sha(everything[u]) for u in _UNITS if u in everything},
+        "dependency_lock": lock_status(everything),
+        "protocol": versions_and_protocol(everything),
+        "config_schema": config_schema_status(config),
+        "status_tiers": status_tiers(everything),
+        "known_good": {
+            "note": "the configuration this release was checked with; a device's own config.yaml is never overwritten",
+            "config_sha256": _sha(everything[_CONFIG]) if _CONFIG in everything else None,
+            "role": config.get("role"), "module": config.get("module"), "profile": config.get("profile"),
+            "yolo_decoder": accel.get("yolo_decoder", "legacy"),
+            "yolo_hef": hef_path, "yolo_hef_sha256": config_pin or None,
+            "requirements_device_sha256": (requirements.get(_DEVICE_REQUIREMENTS) or {}).get("sha256"),
+            "service_unit": "sensordyme.service (stock); the least-privilege unit is hardware-pending",
+        },
+        "procedures": {
+            "rollback": "docs/MONDAY_RUNBOOK.md section O (O1 previous release, O2 pre-Monday state, "
+                        "O3 SD image, O4 least-privilege unit)",
+            "identity_migration": "none in this release: device id, device key and claim code carry over "
+                                  "unchanged (runbook F1 copies config.yaml and data/); no key is rotated",
+            "least_privilege_migration": "scripts/release/least_privilege_plan.sh (prints only; "
+                                         "docs/LEAST_PRIVILEGE.md)",
+        },
         "test_runs": list(test_refs),
     }
 
@@ -221,6 +397,28 @@ def to_markdown(manifest: dict) -> str:
         lines += [f"  - {pkg}=={ver}" for pkg, ver in sorted(req["pins"].items())]
     lines += ["", "## systemd units (templates)", ""]
     lines += [f"- `{unit}` `{sha}`" for unit, sha in manifest["systemd_units"].items()]
+    proto = manifest.get("protocol") or {}
+    if proto:
+        lines += ["", "## Versions and protocol", ""]
+        lines += [f"- {k}: `{v}`" for k, v in (proto.get("versions") or {}).items()]
+        lines += [(f"- backend /v1 routes: {proto.get('backend_routes')}; device calls {proto.get('device_routes')}; "
+                   f"app calls {proto.get('app_routes')} routes"),
+                  f"- **compatible: {proto.get('compatible')}**"]
+    lock = manifest.get("dependency_lock")
+    if lock:
+        lines += ["", "## Device dependency lock", "",
+                  (f"- `{lock['path']}` sha256 `{lock['sha256']}`, {lock['packages']} packages, "
+                   f"consistent with the pins: **{lock['consistent']}**")]
+    tiers = manifest.get("status_tiers")
+    if tiers:
+        lines += ["", f"## Status tiers (as of {tiers.get('as_of')})", "",
+                  "| Component | Tiers | Evidence |", "|---|---|---|"]
+        for name, entry in tiers["components"].items():
+            flag = " *(pending integration)*" if entry["pending_integration"] else ""
+            lines.append(f"| {name}{flag} | {', '.join(entry['tiers'])} | {entry['evidence']} |")
+    lines += ["", "## Release gates", ""]
+    lines += [f"- [{g['result']}] {g['gate']}: {g['detail']}" for g in release_gates(manifest)]
+    lines += ["", "## Procedures", ""] + [f"- {k}: {v}" for k, v in (manifest.get("procedures") or {}).items()]
     lines += ["", "## Test runs", ""]
     lines += [f"- {ref}" for ref in manifest["test_runs"]] or ["- (none recorded)"]
     lines += ["", "Per-file sha256 for every deployed file: the JSON manifest, `deploy_set.files`.", ""]
@@ -317,6 +515,8 @@ def main(argv: Optional[list[str]] = None) -> int:
     b.add_argument("--test-ref", action="append", default=[], help="a test run backing this release (repeatable)")
     b.add_argument("--out-json", required=True)
     b.add_argument("--out-md", default=None)
+    c = sub.add_parser("check", help="release gates over a built manifest")
+    c.add_argument("--manifest", required=True)
     v = sub.add_parser("verify")
     v.add_argument("--manifest", required=True)
     v.add_argument("--snapshot", required=True, help="from integrity_manifest.py snapshot, run on the device")
@@ -335,6 +535,13 @@ def main(argv: Optional[list[str]] = None) -> int:
         return 0 if manifest["model_pins"]["consistent"] else 1
 
     manifest = json.loads(Path(args.manifest).read_text())
+    if args.cmd == "check":
+        gates = release_gates(manifest)
+        for g in gates:
+            print(f"  [{g['result']}] {g['gate']}: {g['detail']}")
+        failed = [g for g in gates if g["result"] == "FAIL"]
+        print(f"GATES: {'FAIL' if failed else 'PASS'} for {manifest['commit'][:12]}")
+        return 1 if failed else 0
     snapshot = json.loads(Path(args.snapshot).read_text())
     template = None
     try:
