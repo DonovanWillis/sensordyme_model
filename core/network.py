@@ -120,6 +120,43 @@ def explain_connect_failure(raw: str, ssid: str) -> str:
     return raw
 
 
+#: 802.11 caps an SSID at 32 octets.
+MAX_SSID_BYTES = 32
+#: WPA2 passphrases are 8-63 characters (or 64 hex digits); WPA3-SAE allows
+#: longer. Generous on purpose: this refuses absurd input, not real passwords.
+MAX_PASSWORD_BYTES = 128
+
+
+def _has_control_chars(text: str) -> bool:
+    return any(ord(ch) < 0x20 or ord(ch) == 0x7F for ch in text)
+
+
+def credential_problem(ssid, password) -> Optional[str]:
+    """Why (ssid, password) cannot be a Wi-Fi network to join, or None (M6).
+
+    Both arrive from an unauthenticated BLE write or the dashboard and go to
+    nmcli as argv and into the journal. Before this, a NUL raised out of
+    subprocess, a newline in an SSID forged extra journal lines, and a 400-byte
+    "SSID" was handed to NetworkManager to reject with an opaque message. The
+    reason is returned to the app as the provisioning error.
+    """
+    if not isinstance(ssid, str) or not ssid:
+        return "network name required"
+    if len(ssid.encode("utf-8")) > MAX_SSID_BYTES:
+        return f"network name is longer than {MAX_SSID_BYTES} bytes, the Wi-Fi maximum"
+    if _has_control_chars(ssid):
+        return "network name contains control characters"
+    if password is None:
+        password = ""  # an open network
+    if not isinstance(password, str):
+        return "password must be text"
+    if len(password.encode("utf-8")) > MAX_PASSWORD_BYTES:
+        return f"password is longer than {MAX_PASSWORD_BYTES} bytes"
+    if _has_control_chars(password):
+        return "password contains control characters"
+    return None
+
+
 def nmcli_available() -> bool:
     """True when NetworkManager's CLI exists (any Pi OS Bookworm; not macOS)."""
     return shutil.which("nmcli") is not None
@@ -249,8 +286,9 @@ class WifiManager:
     def connect(self, ssid: str, password: str) -> tuple[bool, str]:
         """Join `ssid`, saving the profile so NetworkManager auto-reconnects on
         every future boot. Returns (ok, human-readable message)."""
-        if not ssid:
-            return False, "network name required"
+        problem = credential_problem(ssid, password)
+        if problem:
+            return False, problem
         if not nmcli_available():
             return True, f"dry-run (no nmcli on this platform): would join '{ssid}'"
         # Read BEFORE the attempt and outside the try, so every failure path below
@@ -392,8 +430,9 @@ class WifiManager:
         profile is deleted and the previous one brought back, so a failed attempt
         costs a few seconds of downtime rather than the device.
         """
-        if not ssid:
-            return False, "network name required"
+        problem = credential_problem(ssid, password)
+        if problem:
+            return False, problem
         if not nmcli_available():
             return True, f"dry-run (no nmcli on this platform): would join '{ssid}'"
 

@@ -330,14 +330,17 @@ def test_a_non_ascii_token_header_is_refused_not_crashed():
 
 
 def test_the_query_token_is_url_decoded():
-    """The page sends encodeURIComponent(TOKEN); a token with + / = must match."""
+    """The page sends encodeURIComponent(TOKEN); a token with + / = must match.
+
+    M6: the query token is accepted on GET /stream only (the <img> that cannot
+    set a header), so this is exercised there."""
     import urllib.parse
 
     token = "ab+c/d= e"
     server = DashboardServer(host="127.0.0.1", port=0, token=token)
     url = server.start()
     try:
-        assert _status(url + "/api/state?token=" + urllib.parse.quote(token, safe="")) == 200
+        assert _status(url + "/stream?token=" + urllib.parse.quote(token, safe="")) == 200
     finally:
         server.close()
 

@@ -177,6 +177,26 @@ def parse_credentials(data: bytes) -> Optional[tuple[str, str]]:
     return ssid, psk
 
 
+def dispatch_credentials(data: bytes, on_credentials: Callable[[str, str], None]) -> bool:
+    """Handle one credential write: parse, log safely, hand to provisioning.
+
+    The SSID is logged with %r and clipped: it comes from an unauthenticated
+    write, and a raw newline in it used to forge whole journal lines. The
+    passphrase is never logged. Content validation (length, control
+    characters) happens in WifiManager.provision -- core.network.credential_problem
+    -- so the refusal reaches the app as the provisioning error instead of
+    being dropped silently here.
+    """
+    credentials = parse_credentials(data)
+    if credentials is None:
+        log.warning("BLE: malformed credential write ignored")
+        return False
+    ssid, psk = credentials
+    log.info("BLE: received Wi-Fi credentials for %r", ssid[:64])
+    on_credentials(ssid, psk)
+    return True
+
+
 def parse_command(data: bytes) -> Optional[dict]:
     """The command object from a command write, or None when it is not one."""
     try:
@@ -693,14 +713,7 @@ class BLEProvisioningServer:
 
         class WifiCredsChrc(Characteristic):
             def write_value(self, data):
-                credentials = parse_credentials(data)
-                if credentials is None:
-                    log.warning("BLE: malformed credential write ignored")
-                    return
-                ssid, psk = credentials
-                # Log the SSID only — never the passphrase.
-                log.info("BLE: received Wi-Fi credentials for '%s'", ssid)
-                server._on_credentials(ssid, psk)
+                dispatch_credentials(data, server._on_credentials)
 
         class NetworksChrc(Characteristic):
             """Wi-Fi networks the DEVICE can see, so the app can offer a list.
