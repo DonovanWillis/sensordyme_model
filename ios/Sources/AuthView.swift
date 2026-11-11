@@ -248,6 +248,8 @@ struct AuthView: View {
                 .sdEyebrowFont()
                 .tracking(SD.Typography.eyebrowKerning)
                 .foregroundStyle(SD.Colors.textTertiary)
+                .multilineTextAlignment(.center)
+                .fixedSize(horizontal: false, vertical: true)
         }
     }
 

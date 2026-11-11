@@ -29,6 +29,9 @@ check(response?.capabilities.count == 3, "three entries")
 check(response?.capabilities[0].tier == .imageLevelBenchmark, "known tier")
 check(response?.capabilities[2].tier == .unknown, "unknown tier is .unknown")
 check(response?.capabilities[2].productionValidated == false, "a malformed flag decodes as false")
+check(response?.capabilities[0].kind == "objects", "kind decodes")
+check(response?.entries(forKinds: ["objects"]).map(\.capability) == ["phone_detection"], "filtered by kind")
+check(response?.entries(forKinds: ["face"]).isEmpty == true, "no entries for an unrelated kind")
 
 print("\nonly a shipping, production_permitted, production_validated capability is validated:")
 for tier in CapabilityTier.allCases {

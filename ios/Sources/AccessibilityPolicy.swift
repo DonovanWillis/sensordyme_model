@@ -22,6 +22,24 @@ enum ReplyError {
     static func message(for error: Error) -> String? {
         error is DecodingError ? unreadable : nil
     }
+
+    /// The banner's headline for a failed refresh. "Can't reach the server"
+    /// was shown for every failure, including a reply the server DID send but
+    /// this build could not read — contradicting the body underneath.
+    static func bannerTitle(for message: String) -> String {
+        message == unreadable ? "The server's reply couldn't be read" : "Can't reach the server"
+    }
+}
+
+/// What the app may say about a device's connection. `online` is from the last
+/// reply that could be read; once a refresh fails, the app no longer knows.
+enum ConnectionTruth {
+    enum Presence: Equatable { case online, offline, unknown }
+
+    static func presence(online: Bool, lastRefreshFailed: Bool) -> Presence {
+        if lastRefreshFailed { return .unknown }
+        return online ? .online : .offline
+    }
 }
 
 /// Spoken descriptions where the screen relies on colour.

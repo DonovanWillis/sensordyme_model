@@ -74,10 +74,16 @@ final class SetupFlow: ObservableObject {
         ble.connect(id: device.id)
     }
 
-    func send(ssid: String, password: String) {
+    /// - Parameter label: the setup code, for a device that requires proof of
+    ///   possession (`ble.requiresSetupCode`). nil uses the legacy plain write.
+    func send(ssid: String, password: String, label: BLEProofOfPossession.SetupLabel? = nil) {
         targetSSID = ssid
         phase = .sending(ssid: ssid)
-        ble.send(ssid: ssid, password: password)
+        if let label {
+            ble.sendSecure(label: label, ssid: ssid, password: password.isEmpty ? nil : password)
+        } else {
+            ble.send(ssid: ssid, password: password)
+        }
     }
 
     /// Start over from discovery, keeping nothing.

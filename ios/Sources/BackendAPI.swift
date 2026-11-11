@@ -290,6 +290,14 @@ protocol BackendAPI {
     /// POST /v1/devices/{id}/protection. The returned id is what the device
     /// echoes once it has applied the request (ProtectionControl).
     func setProtection(deviceID: Int, action: ProtectionAction, confirm: Bool) async throws -> ProtectionCommand
+    /// POST /v1/devices/{id}/nodes. Turns a companion monitoring node (e.g.
+    /// `occupancy`) on or off. Accepted means queued: the device confirms by
+    /// reporting the node in `status.perception.nodes`, or refuses with
+    /// `last_rejection {kind: "nodes"}` (PerceptionStatus.swift).
+    func setNode(deviceID: Int, node: String, enabled: Bool) async throws
+    /// GET /v1/capability-tiers: how far each product capability has been
+    /// validated, from the model registry (CapabilityTier.swift).
+    func capabilityTiers() async throws -> CapabilityTiersResponse
 }
 
 /// A rehearsable demo event. Waiting ~20s for a synthesised alert is not a
@@ -443,6 +451,9 @@ final class MockAPI: BackendAPI {
     private var protectionStopped = false
     private var lastCommandID: String?
     private var pendingProtection: (action: ProtectionAction, id: String, at: Date)?
+    /// The companion occupancy node, and a change waiting to "land" like a real poll.
+    private var occupancyNodeOn = false
+    private var pendingNode: (enabled: Bool, at: Date)?
 
     private init() {
         seedHistory()
@@ -544,6 +555,7 @@ final class MockAPI: BackendAPI {
     func devices() async throws -> [Device] {
         settleModeSwitch()
         settleProtection()
+        settleNode()
         let running = customRules.filter { $0.enabled && $0.status == "running" }
         let customActive = !customRules.isEmpty
         return [
@@ -575,8 +587,33 @@ final class MockAPI: BackendAPI {
             capabilities: .init(available: ["camera", "inference", "alert_output"], impaired: [], starting: []),
             rules: .init(active: running, additive: false, rejected: nil),
             stale: false, reportedAt: Date().timeIntervalSince1970,
-            lastCommandID: lastCommandID
+            lastCommandID: lastCommandID,
+            perception: demoPerception()
         )
+    }
+
+    /// The shared perception engine as the walkthrough device reports it:
+    /// marked simulated, and every node at "simulated tests" at best.
+    private func demoPerception() -> PerceptionReport {
+        let active = Preset.split(activePreset).base
+        var nodes = [MonitoringNode(id: active, kind: "preset", state: protectionStopped ? "inactive" : "active",
+                                    validation: "synthetic_tests")]
+        if occupancyNodeOn {
+            nodes.append(MonitoringNode(id: "occupancy", kind: "companion",
+                                        state: protectionStopped ? "inactive" : "active",
+                                        requiredCapabilities: ["objects"], validation: "synthetic_tests",
+                                        experimental: true))
+        }
+        return PerceptionReport(simulated: true, components: [
+            "object_detector": PerceptionComponent(state: "ok", lastRunAgeS: 0.2, reason: "simulated"),
+            "face_landmarks": PerceptionComponent(state: "ok", lastRunAgeS: 0.1, reason: "simulated"),
+        ], nodes: nodes)
+    }
+
+    private func settleNode() {
+        guard let pending = pendingNode, Date().timeIntervalSince(pending.at) > 2.5 else { return }
+        occupancyNodeOn = pending.enabled
+        pendingNode = nil
     }
 
     /// A stop/resume lands after a short delay, like a real device's poll.
@@ -776,6 +813,23 @@ final class MockAPI: BackendAPI {
         } else {
             customRules[index].status = "disabled"
         }
+    }
+
+    func setNode(deviceID: Int, node: String, enabled: Bool) async throws {
+        guard node == "occupancy" else {
+            throw APIError(message: "no such node: \(node)", status: 400, code: "unknown_node")
+        }
+        pendingNode = (enabled, Date())
+    }
+
+    func capabilityTiers() async throws -> CapabilityTiersResponse {
+        // The walkthrough device is simulated: nothing it shows is validated.
+        CapabilityTiersResponse(capabilities: [
+            CapabilityTierEntry(capability: "phone_detection", tier: .imageLevelBenchmark, modelDeployment: "shipping"),
+            CapabilityTierEntry(capability: "person_detection", tier: .imageLevelBenchmark, modelDeployment: "shipping"),
+            CapabilityTierEntry(capability: "drowsiness", tier: .syntheticTests, modelDeployment: "shipping"),
+            CapabilityTierEntry(capability: "gaze_distraction", tier: .syntheticTests, modelDeployment: "shipping"),
+        ])
     }
 
     func setProtection(deviceID: Int, action: ProtectionAction, confirm: Bool) async throws -> ProtectionCommand {

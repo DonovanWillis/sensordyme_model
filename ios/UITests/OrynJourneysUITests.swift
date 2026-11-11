@@ -160,9 +160,13 @@ final class OrynJourneysUITests: XCTestCase {
         waitFor(monitoring, label: "All clear", timeout: 90)
         let security = reveal(app.buttons["preset.row.security_monitoring"])
         waitFor(security, value: "Not available on this device", timeout: 30)
-        XCTAssertFalse(security.isEnabled, "a preset the role forbids can't be picked")
-        XCTAssertTrue(app.buttons["preset.info.security_monitoring"].isEnabled, "its reason can still be read")
+        // The row opens the details (one activation path); Activate is what is off.
+        security.tap()
+        let activate = app.buttons["preset.activate"]
+        XCTAssertTrue(activate.waitForExistence(timeout: 10), "the details open")
+        XCTAssertFalse(activate.isEnabled, "a preset the role forbids can't be activated")
         shot("09_preset_rejected")
+        app.navigationBars.buttons["Done"].firstMatch.tap()
         XCTAssertEqual(app.buttons["preset.row.driver_safety"].value as? String, "Active", "the mode is unchanged")
     }
 
@@ -303,7 +307,10 @@ final class OrynJourneysUITests: XCTestCase {
         let banner = element("banner.message")
         waitFor(banner, labelContains: "couldn't read its reply", timeout: 45)
         XCTAssertFalse(banner.label.contains("correct format"), "no raw decoder text: \(banner.label)")
+        XCTAssertFalse(banner.label.contains("Can't reach the server"),
+                       "the server answered: the headline must not say it is unreachable: \(banner.label)")
         XCTAssertTrue(card.exists, "the last good list stays on screen")
+        waitFor(card, labelContains: "Unknown", timeout: 15)  // not a stale "Online"
         shot("19a_invalid_reply")
         Stack.post("/mode?m=pass")
         app.buttons["banner.retry"].tap()
@@ -335,7 +342,110 @@ final class OrynJourneysUITests: XCTestCase {
         shot("20c_server_back")
     }
 
+    // MARK: Mission 7: the Driver Safety ("Distracted Driving") card, end to end
+
+    /// Tap the card, read what it detects on THIS device and how far it is
+    /// validated, activate, see the device's own confirmation, trigger a
+    /// distraction, find it in history, break the detector, see degraded, recover.
+    /// (The failed component named under the status is journey 25.)
+    func test23_DriverSafetyCard() throws {
+        Stack.prepare()
+        launch(["-orynOpenDevice"])
+        waitFor(monitoring, label: "All clear", timeout: 90)
+
+        reveal(app.buttons["preset.row.driver_safety"]).tap()
+        XCTAssertTrue(app.navigationBars["Driver Safety"].waitForExistence(timeout: 10), "the card opens its details")
+        let face = element("preset.capability.face")
+        XCTAssertTrue(face.waitForExistence(timeout: 10), "what it needs, checked on this device")
+        XCTAssertTrue(face.label.contains("Working"), "face, as the device reports it: \(face.label)")
+        waitFor(element("preset.monitoring"), label: "All clear", timeout: 30)
+        XCTAssertFalse(app.staticTexts.containing(NSPredicate(format: "label CONTAINS[c] %@",
+                                                              "validated for production")).firstMatch.exists,
+                       "nothing on the card claims production validation")
+        shot("23a_card_details")
+
+        let activate = reveal(app.buttons["preset.activate"])
+        activate.tap()  // "Save settings": the running preset, re-applied with its settings
+        let confirmed = element("preset.outcome.confirmed")
+        XCTAssertTrue(confirmed.waitForExistence(timeout: 60), "the DEVICE confirms, not the tap")
+        XCTAssertTrue(confirmed.label.contains("monitoring"), confirmed.label)
+        shot("23b_activated")
+        app.navigationBars["Driver Safety"].buttons["Done"].tap()
+
+        let before = Stack.state()["events"] as? Int ?? 0
+        Stack.post("/device/start?scenario=phone")
+        XCTAssertTrue(Stack.waitUntil(timeout: 120) { (Stack.state()["events"] as? Int ?? 0) > before },
+                      "the scripted distraction produced an event on the backend")
+        waitFor(monitoring, label: "All clear", timeout: 90)
+        reveal(app.buttons["detail.history"]).tap()
+        let row = app.descendants(matching: .any)["event.row"].firstMatch
+        XCTAssertTrue(row.waitForExistence(timeout: 30), "the distraction is in the history")
+        shot("23c_history")
+        app.navigationBars.buttons.element(boundBy: 0).tap()
+
+        Stack.post("/device/start?scenario=detector_failure")
+        waitFor(monitoring, label: "Degraded", timeout: 120)
+        shot("23d_degraded")
+        waitFor(monitoring, label: "All clear", timeout: 180)
+        shot("23e_recovered")
+    }
+
+    /// The occupancy companion runs beside Driver Safety on the same detections:
+    /// the switch follows the device's report, both ways.
+    func test24_CompanionNode() throws {
+        Stack.prepare()
+        launch(["-orynOpenDevice"])
+        waitFor(monitoring, label: "All clear", timeout: 90)
+        try requirePerception()
+        let toggle = reveal(app.switches["node.toggle.occupancy"])
+        if (toggle.value as? String) == "1" {  // left on by an earlier run
+            toggle.tap()
+            waitFor(toggle, value: "0", timeout: 60)
+        }
+        toggle.tap()
+        waitFor(toggle, value: "1", timeout: 60)  // the device reports the node running
+        let node = element("node.occupancy")
+        XCTAssertTrue(node.waitForExistence(timeout: 30), "the node is listed as running")
+        XCTAssertTrue(node.label.contains("Experimental"), "an experimental node says so: \(node.label)")
+        XCTAssertTrue(element("node.driver_safety").exists, "Driver Safety keeps running beside it")
+        waitFor(monitoring, label: "All clear", timeout: 30)
+        shot("24a_companion_on")
+        toggle.tap()
+        waitFor(toggle, value: "0", timeout: 60)
+        waitForAbsence(node, timeout: 30)
+        shot("24b_companion_off")
+    }
+
+    /// A failing perception component is named under the status, in the
+    /// device's words, and disappears when it recovers.
+    func test25_PerceptionDegraded() throws {
+        Stack.prepare()
+        launch(["-orynOpenDevice"])
+        waitFor(monitoring, label: "All clear", timeout: 90)
+        try requirePerception()
+        Stack.post("/device/start?scenario=detector_failure")
+        waitFor(monitoring, label: "Degraded", timeout: 120)
+        let impaired = element("perception.degraded")
+        XCTAssertTrue(impaired.waitForExistence(timeout: 30), "the failed component is named under the status")
+        XCTAssertTrue(impaired.label.contains("Object detection"), impaired.label)
+        shot("25a_component_failed")
+        waitFor(monitoring, label: "All clear", timeout: 180)
+        waitForAbsence(impaired, timeout: 30)
+        shot("25b_component_recovered")
+    }
+
     // MARK: Helpers
+
+    /// Skips, saying why, when the stack does not report `status.perception`
+    /// (sd-perception/1) yet: that needs the M7 device and backend streams.
+    /// A skip is reported as a skip, never as a pass.
+    private func requirePerception() throws {
+        let section = element("nodes.section")
+        if !section.waitForExistence(timeout: 20) {
+            throw XCTSkip("the device/backend don't report status.perception yet (M7 device + backend streams)")
+        }
+        _ = reveal(section)
+    }
 
     static let dwellPrompt = "Alert me if someone stays inside the marked area for longer than 10 seconds"
 

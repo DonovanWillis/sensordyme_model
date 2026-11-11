@@ -15,6 +15,9 @@ private let bleDeviceInfoUUID = CBUUID(string: "5d1e0002-5344-4d45-b000-536e447a
 private let bleWifiCredsUUID = CBUUID(string: "5d1e0003-5344-4d45-b000-536e447a6d65")
 private let bleStatusUUID = CBUUID(string: "5d1e0004-5344-4d45-b000-536e447a6d65")
 private let bleNetworksUUID = CBUUID(string: "5d1e0006-5344-4d45-b000-536e447a6d65")
+/// Proof of possession (BLEProofOfPossession, BLEPoPFlow): present only on a
+/// device configured `network.provisioning.auth: pop`.
+private let bleAuthUUID = CBUUID(string: BLEProofOfPossession.authCharacteristicUUID)
 
 /// One physical device seen over Bluetooth.
 ///
@@ -114,6 +117,13 @@ final class BLEProvisioner: NSObject, ObservableObject {
     /// device on Wi-Fi afterwards, rather than whichever camera was linked
     /// before or happened to answer first.
     @Published private(set) var deviceID: String?
+    /// How the connected device accepts Wi-Fi credentials, from its device
+    /// info: "pop" needs the setup code (BLEPoPFlow); "legacy" or nil is the
+    /// plain write. A `pop` device refuses plain writes.
+    @Published private(set) var deviceAuth: String?
+    private var authCharacteristic: CBCharacteristic?
+    /// The proof-of-possession exchange in flight, if any.
+    private var popFlow: BLEPoPFlow?
     private var networksCharacteristic: CBCharacteristic?
     private var deviceInfoCharacteristic: CBCharacteristic?
     private var sendTimeout: Task<Void, Never>?
@@ -196,6 +206,9 @@ final class BLEProvisioner: NSObject, ObservableObject {
         statusCharacteristic = nil
         networksCharacteristic = nil
         deviceInfoCharacteristic = nil
+        authCharacteristic = nil
+        popFlow = nil
+        deviceAuth = nil
         connectTimeout?.cancel(); connectTimeout = nil
         sendTimeout?.cancel(); sendTimeout = nil
         statusPoll?.cancel(); statusPoll = nil
@@ -300,6 +313,54 @@ final class BLEProvisioner: NSObject, ObservableObject {
     private func readNetworks() {
         guard let peripheral, let characteristic = networksCharacteristic else { return }
         peripheral.readValue(for: characteristic)
+    }
+
+    /// Whether the connected device needs the setup code before credentials.
+    var requiresSetupCode: Bool { deviceAuth == "pop" }
+
+    /// Hand the device its credentials after proving the setup code
+    /// (docs/BLE_PROOF_OF_POSSESSION.md). The key derivation runs off the main
+    /// thread; every write and reply then goes through `BLEPoPFlow`, and the
+    /// join outcome follows on the status characteristic exactly as `send`.
+    func sendSecure(label: BLEProofOfPossession.SetupLabel, ssid: String, password: String?) {
+        guard let peripheral, let authCharacteristic else {
+            fail("This SensorDyme didn't offer secure setup over Bluetooth. It may need a software update.")
+            return
+        }
+        state = .sending
+        attempts.beginWrite(ssid: ssid)
+        startSendTimeout()
+        Task { @MainActor in
+            let session: BLEProofOfPossession.Session
+            do {
+                session = try await Task.detached(priority: .userInitiated) {
+                    try BLEProofOfPossession.Session(label: label)
+                }.value
+            } catch let failure as BLEProofOfPossession.Failure {
+                self.fail(BLEPoPFlow.message(failure))
+                return
+            } catch {
+                self.fail("This phone couldn't prepare the secure setup. Try again.")
+                return
+            }
+            guard self.isCurrent(peripheral) else { return }
+            let flow = BLEPoPFlow(session: session, ssid: ssid, psk: password)
+            self.popFlow = flow
+            self.perform(flow.start(), on: peripheral, characteristic: authCharacteristic)
+        }
+    }
+
+    private func perform(_ action: BLEPoPFlow.Action, on peripheral: CBPeripheral, characteristic: CBCharacteristic) {
+        switch action {
+        case .write(let data):
+            peripheral.writeValue(data, for: characteristic, type: .withResponse)
+        case .accepted:
+            popFlow = nil
+            startStatusPolling()
+        case .failed(let message):
+            popFlow = nil
+            fail(message)
+        }
     }
 
     func send(ssid: String, password: String) {
@@ -535,6 +596,10 @@ extension BLEProvisioner: CBCentralManagerDelegate, CBPeripheralDelegate {
                 case bleDeviceInfoUUID:
                     self.deviceInfoCharacteristic = characteristic
                     peripheral.readValue(for: characteristic)
+                case bleAuthUUID:
+                    self.authCharacteristic = characteristic
+                    // Replies to each write are notified back.
+                    peripheral.setNotifyValue(true, for: characteristic)
                 default:
                     break
                 }
@@ -572,9 +637,20 @@ extension BLEProvisioner: CBCentralManagerDelegate, CBPeripheralDelegate {
         if characteristic.uuid == bleDeviceInfoUUID {
             let info = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any]
             let id = (info?["id"] as? String).flatMap { $0.uppercased().hasPrefix("SD-") ? $0 : nil }
+            let auth = info?["auth"] as? String
             Task { @MainActor in
-                guard self.isCurrent(peripheral), let id else { return }
-                self.deviceID = id
+                guard self.isCurrent(peripheral) else { return }
+                if let id { self.deviceID = id }
+                self.deviceAuth = auth
+            }
+            return
+        }
+
+        if characteristic.uuid == bleAuthUUID {
+            Task { @MainActor in
+                guard self.isCurrent(peripheral), let flow = self.popFlow,
+                      let authCharacteristic = self.authCharacteristic else { return }
+                self.perform(flow.handle(reply: data), on: peripheral, characteristic: authCharacteristic)
             }
             return
         }
