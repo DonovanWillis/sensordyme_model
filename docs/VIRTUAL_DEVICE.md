@@ -252,3 +252,28 @@ Added for the virtual device; every default is the previous code, pinned by
 - For a module that cannot be built, the top-level `status.reasons` name the
   lost capability (`face: not provided by this device`); the cause is on
   `status.capabilities.impaired[name=module]`.
+
+## The real iPhone app against the virtual device (verified 2026-11-11)
+
+`scripts/sim/ios_e2e.sh [OUT_DIR] [SIMULATOR_UDID]` (with `SIM_PY` pointing at a Python
+that has the repo's requirements) reproduces the end-to-end run: real backend
+(`sim.backend`), virtual device, a real `/v1/login` + claim, a Debug build of the app,
+and six screenshots driven by DEBUG-only launch arguments
+(`ios/Sources/DebugLaunch.swift`: `-orynSession <token> <email>` signs in with that
+session, `-orynNoPrompt` skips the notification-permission prompt; Release builds
+compile both out). Observed in the Simulator:
+
+| Step | What the app showed |
+|---|---|
+| ready | ONLINE · ALL CLEAR · Driver Safety active · "NOT YET VALIDATED" · forbidden presets disabled with the backend's role reason |
+| stop via `/protection` | ONLINE · STOPPED (amber) |
+| "stays inside the marked area for longer than 10 seconds" | typed dwell policy (person, area, 10 s), "Draw the area on the device to activate this" |
+| "a stranger I don't recognize" | refused: identity recognition not possible (face recognition deliberately not shipped) |
+| device process killed, 30 s+ | "isn't reporting … status is unknown" · OFFLINE · STATUS UNKNOWN, nothing green |
+| device restarted (same state dir) | same hardware id, ONLINE · ALL CLEAR |
+
+Build note: an unsigned Simulator build (`CODE_SIGNING_ALLOWED=NO`) has no Keychain, so
+the session token is silently dropped ("missing bearer token"); build ad-hoc signed
+(`CODE_SIGN_IDENTITY=-`). Not covered by this run: tapping UI controls (there is no
+XCUITest target), BLE, the live MJPEG feed (needs `--mdns` + device token), push
+notifications.

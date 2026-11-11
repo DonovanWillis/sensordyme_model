@@ -45,6 +45,9 @@ struct RootView: View {
         content
             .background(SD.Colors.background.ignoresSafeArea())
             .task {
+                if let session = DebugLaunch.session, !state.isSignedIn {
+                    state.signIn(AuthResponse(token: session.token, email: session.email))
+                }
                 if DebugLaunch.demo && !state.isSignedIn { state.enterDemo() }
                 if let requested = DebugLaunch.tab.flatMap(Tab.init(rawValue:)) { tab = requested }
             }
