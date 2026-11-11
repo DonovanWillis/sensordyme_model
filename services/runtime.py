@@ -26,6 +26,7 @@ import subprocess
 import threading
 import time
 from contextlib import contextmanager, suppress
+from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any, Optional
@@ -96,6 +97,18 @@ _PROCESS_RESTART_WINDOW_S = 900.0
 _INFERENCE_STARTING_GRACE_S = 30.0
 #: While DEGRADED (no detector), how often to try loading it again.
 _DETECTOR_RETRY_S = 60.0
+
+
+@dataclass
+class _InferenceLoopState:
+    """What one generation of the inference loop carries from pass to pass."""
+
+    last_seq: int
+    last_detector_retry: float
+    stream_interval: float
+    #: How long a pass waits for a fresh frame. 0.5 s in production; a caller
+    #: stepping the loop on its own clock (sim/) uses 0 so a pass never sleeps.
+    frame_timeout_s: float = 0.5
 
 
 class _InferenceService(Service):
@@ -206,6 +219,10 @@ class DeviceRuntime:
     _monitoring_state: Optional[str] = None
     _last_protection_command: Optional[str] = None
     _model_identity: Optional[dict] = None
+    #: Where saved custom rules live; None = core.monitoring_config's default
+    #: (SENSORDYME_MONITORING_PATH or data/monitoring.json). A seam for sim/,
+    #: which keeps each virtual device's state in its own directory.
+    monitoring_path: Optional[str] = None
 
     def __init__(
         self,
@@ -287,7 +304,7 @@ class DeviceRuntime:
         self._stopped: Optional[dict] = None
         #: The last policy change this device refused, and why (reported upstream).
         self._last_rejection: Optional[dict] = None
-        self.monitoring = load_or_empty()
+        self.monitoring = load_or_empty(self.monitoring_path) if self.monitoring_path else load_or_empty()
         # Restored rules are validated exactly like delivered ones: a rule set
         # saved by an older version that this device cannot run is not loaded.
         self._custom_rules_rejected = False
@@ -353,6 +370,17 @@ class DeviceRuntime:
         self.hardware = None
 
     # ------------------------------------------------------------------ build
+    def _build_module(self, module_name: str, module_config: dict):
+        """Construct a module for a mode switch. A seam: sim/ substitutes its
+        scripted perception here; production builds the registered class."""
+        return get_module_class(module_name)(module_config)
+
+    def _make_uplink(self, cloud_cfg: dict):
+        """Construct the cloud uplink. A seam: sim/ steps it on its own clock."""
+        from core.uplink import CloudUplink
+
+        return CloudUplink(cloud_cfg)
+
     def _open_camera(self) -> Camera:
         """Open the camera with retries — transient 'device busy' at boot must not
         burn a whole systemd restart cycle (and model reload) per attempt."""
@@ -519,9 +547,7 @@ class DeviceRuntime:
 
         cloud_cfg = self.config.get("cloud", {})
         if bool(cloud_cfg.get("enabled", False)) and cloud_cfg.get("device_key"):
-            from core.uplink import CloudUplink
-
-            self.uplink = CloudUplink(cloud_cfg)
+            self.uplink = self._make_uplink(cloud_cfg)
             self.uplink.set_active_preset(self.active_preset)
             # Report the restored configuration at startup too, not only when a
             # new one arrives — otherwise a device that rebooted into a custom
@@ -976,7 +1002,7 @@ class DeviceRuntime:
 
         try:
             module_cfg = self.config.get("modules", {}).get(wanted, {}) or {}
-            new_module = get_module_class(wanted)({**module_cfg, "recalibrate": False})
+            new_module = self._build_module(wanted, {**module_cfg, "recalibrate": False})
         except Exception as exc:  # noqa: BLE001 - a bad switch must not kill the device
             log.error("could not switch to '%s' for %s: %s", wanted, mode.value, exc)
             return
@@ -1736,8 +1762,8 @@ class DeviceRuntime:
             overrides = variant.get("overrides") or {}
         new_module_name = preset["module"]
         try:
-            new_module = get_module_class(new_module_name)(
-                {**self.config["modules"][new_module_name], **overrides, "recalibrate": False}
+            new_module = self._build_module(
+                new_module_name, {**self.config["modules"][new_module_name], **overrides, "recalibrate": False}
             )
         except Exception as exc:  # noqa: BLE001 - a bad preset must not kill the device
             print(f"SensorDyme: preset switch to '{name}' failed: {exc}")
@@ -1985,220 +2011,236 @@ class DeviceRuntime:
 
     # ------------------------------------------------------------------ the inference loop
     def _inference_loop(self, stop: threading.Event) -> None:
-        last_seq = 0
         # Each generation of the loop gets its own failure budget. Carried over,
         # a loop restarted after escalating raised on its very first bad frame.
         self._consecutive_process_failures = 0
-        last_detector_retry = time.monotonic()  # see _retry_detection_backend
-        stream_interval = (
-            self.dashboard.stream_interval if self.dashboard is not None else 0.0
-        )
+        loop = self._new_inference_loop_state()
         while not (stop.is_set() or self.shutdown.is_set()):
-            # Commands first, and on EVERY pass -- not only after a fresh frame.
-            # They used to be read further down, past the degraded short-circuit
-            # and the no-frame `continue`, so a device whose detector was missing
-            # (or whose camera was down) could not be switched to a mode that
-            # would work: the app's command sat pending for ever.
-            try:
-                self._apply_pending_commands()
-            except Exception:  # one bad command must not stop detection
-                # A switch that raised part-way (a module that would not build,
-                # a close() that threw) is logged and dropped; the loop -- and
-                # the module still installed -- carries on.
-                log.exception("applying a mode/rule/zone command failed; continuing")
-            if self._stopped is not None:
-                # Explicitly stopped: nothing is analysed and nothing alerts, and
-                # every report says "stopped". The loop stays alive for commands.
-                self._heartbeat = time.monotonic()
-                stop.wait(0.5)
-                continue
-            if self._detection_degraded is not None:
-                self._heartbeat = time.monotonic()
-                if time.monotonic() - last_detector_retry >= _DETECTOR_RETRY_S:
-                    last_detector_retry = time.monotonic()
-                    try:
-                        self._retry_detection_backend()
-                    except Exception:  # a failed retry must not crash the loop
-                        log.exception("detector retry failed; still DEGRADED")
-                if not self._module_runs_without_detector():
-                    # No detector and nothing this module can do without one:
-                    # there is nothing honest to compute. The heartbeat still
-                    # ticks -- the loop IS alive, and health must be able to
-                    # tell "degraded" from "hung".
-                    stop.wait(0.5)
-                    continue
-                # Otherwise keep running what still works (audit F05: a missing
-                # detector used to switch off face-only drowsiness too). The
-                # monitoring state reports object detection as unavailable.
-            frame, seq, captured_at = self.bus.wait_for_fresh_stamped(last_seq, timeout=0.5)
-            if seq == last_seq or frame is None:
-                # The heartbeat measures whether THIS LOOP is responsive; frame
-                # availability is the camera component's own check. Without this
-                # stamp, a camera outage >10s read as "inference dead", burned
-                # the inference restart budget on a healthy thread, and could
-                # escalate all the way to a mid-drive Pi reboot for a camera
-                # problem the camera check was already recovering.
-                self._heartbeat = time.monotonic()
-                continue  # timeout: no fresh frame — health watches bus.age_s()
-            last_seq = seq
+            if not self._inference_pass(loop, stop):
+                break
 
-            with self._module_lock:
-                module = self.module
-            # A single bad frame must never crash the process -- found in a repo-
-            # wide audit: previously this call was unguarded, so in --display mode
-            # (a documented, first-class runtime mode, not dev-only) an exception
-            # here took down the entire process instead of the graceful in-place
-            # recovery headless mode already got from Service._guarded_run. Even
-            # in headless mode, letting ONE bad frame propagate meant restarting
-            # the whole inference loop (reopening everything, a visible pause)
-            # rather than just skipping that frame — the finer-grained recovery
-            # here is strictly better for both. A module that keeps failing is
-            # NOT silently tolerated forever, though: past
-            # _MAX_CONSECUTIVE_PROCESS_FAILURES in a row this re-raises, handing
-            # off to the same recovery ladder a truly wedged module already had.
-            try:
-                setter = getattr(module, "set_frame_time", None)
-                if callable(setter):
-                    setter(captured_at)  # decisions rest on when the frame was SEEN
-                events = module.process(frame)
-                self._consecutive_process_failures = 0
-                self._last_process_error = None
-                # Processed-frame cadence, not capture cadence: a stall here is
-                # what makes EventEngine drop in-progress evidence.
-                self.bus.record_processed()
-            except Exception as exc:
-                self._consecutive_process_failures += 1
-                self._last_process_error = str(exc) or type(exc).__name__
-                log.error(
-                    "module.process() failed (%d/%d consecutive): %s",
-                    self._consecutive_process_failures, _MAX_CONSECUTIVE_PROCESS_FAILURES, exc,
-                    exc_info=True,
-                )
-                if self._consecutive_process_failures >= _MAX_CONSECUTIVE_PROCESS_FAILURES:
-                    log.critical(
-                        "module.process() failed %d times in a row; propagating "
-                        "for a full restart instead of dropping frames forever",
-                        self._consecutive_process_failures,
-                    )
-                    raise
-                # The inference LOOP is alive and responsive; only the module call
-                # failed, so the heartbeat should say so rather than let a string
-                # of caught failures look like a wedged/dead loop to health checks.
-                self._heartbeat = time.monotonic()
-                continue
+    def _new_inference_loop_state(self) -> _InferenceLoopState:
+        """The state one generation of the inference loop carries between passes."""
+        return _InferenceLoopState(
+            last_seq=0,
+            last_detector_retry=time.monotonic(),  # see _retry_detection_backend
+            stream_interval=self.dashboard.stream_interval if self.dashboard is not None else 0.0,
+        )
 
-            alert_now = time.monotonic()
-            evidence_due = self._dispatch_module_events(module, events, alert_now)
+    def _inference_pass(self, loop: _InferenceLoopState, stop: threading.Event) -> bool:
+        """One pass of the inference loop; False when the loop must end (quit key).
 
-            # Evidence snapshots: OPT-IN (alerts.save_evidence), local-disk only,
-            # bounded count — the single, deliberate exception to "frames are never
-            # written to disk", captured only at the moment of a loud alert.
-            if evidence_due and self._evidence_dir is not None:
-                self._save_evidence(module, frame, events)
-
-            self._evaluate_custom_rules(module, frame, alert_now)
-
-            # A periodic frame with nothing happening. Negatives are what stop a
-            # detector learning to answer yes to everything, and they are gated
-            # behind their own opt-in because they are footage of ordinary life.
-            if self.capture_store.should_capture(negative=True):
-                self.capture_store.capture(
-                    frame, module=self.module_name,
-                    model_version=self._model_version(),
-                )
-
-            # Health for the uplink is sampled by _HealthReportService on its own
-            # thread, so it keeps reporting while this loop is not producing.
-
-            snapshot = module.get_telemetry_snapshot()
-            if snapshot is not None:
-                self.telemetry.log_if_due(
-                    time.monotonic(), datetime.now(UTC).isoformat(), self.module_name, snapshot
-                )
-
-            # Developer-only: "why did/didn't that alert" as a readable block,
-            # not a re-read of this module's source. --debug only, throttled
-            # (every frame would be unreadable), and never sent anywhere off
-            # this machine -- get_debug_state() is opt-in per module (most
-            # return None) and deliberately more detailed than the telemetry
-            # snapshot above, which IS logged and IS product data.
-            if self.debug:
-                now_dbg = time.monotonic()
-                if now_dbg - self._last_debug_print >= 1.0:
-                    state = module.get_debug_state()
-                    if state is not None:
-                        self._last_debug_print = now_dbg
-                        print(f"{self.module_name.upper()} STATE")
-                        for key, value in state.items():
-                            print(f"  {key}: {value}")
-            if self.dashboard is not None:
-                # Either source can raise the alert state. A configured rule is
-                # someone explicitly asking to be alerted, so it must drive the
-                # red screen exactly as a preset's own detection does — the
-                # module's own opinion is not the only one that counts.
-                alert_active = module.is_alert_active() or self.rule_engine.is_alert_active()
-                self.dashboard.push_status(alert_active, snapshot)
-
-            # Annotate + encode only when someone is watching, and never faster than
-            # stream_fps — inference cadence and stream cadence are decoupled, so a
-            # phone at 12fps costs nothing at 30fps detection.
-            now = time.monotonic()
-            want_stream = (
-                self.dashboard is not None
-                and self.dashboard.has_viewers()
-                and now - self._last_stream_push >= stream_interval
-            )
-            view = None
-            if self.display or want_stream:
-                # Guarded exactly like module.process() above, and for a sharper
-                # reason: this call happens ONLY while someone is watching the
-                # live feed (see `want_stream`). Unguarded, a module that drew
-                # badly took the whole inference loop down at the precise moment
-                # the app opened the camera -- and at no other time. The device
-                # looked healthy right up until a user looked at it, and the
-                # supervisor's restart then rebuilt the module, zeroing every
-                # timer, PERCLOS window and risk EMA, so nothing needing
-                # sustained evidence could fire while the feed was open.
-                #
-                # Unlike process(), a persistent failure here is never escalated
-                # into a restart: annotation is presentation, detection is the
-                # product. Losing the picture must not cost the monitoring.
-                try:
-                    view = module.annotate_debug(frame.copy()) if self.debug else module.annotate(frame.copy())
-                    self._consecutive_annotate_failures = 0
-                except Exception as exc:
-                    self._consecutive_annotate_failures += 1
-                    # First failure loudly, then throttled: this runs at stream
-                    # cadence, so an unthrottled log would bury everything else.
-                    if self._consecutive_annotate_failures == 1 or (
-                        self._consecutive_annotate_failures % _ANNOTATE_FAILURE_LOG_EVERY == 0
-                    ):
-                        log.error(
-                            "module.annotate() failed (%d consecutive); the live feed will "
-                            "hold its last frame, detection is unaffected: %s",
-                            self._consecutive_annotate_failures, exc, exc_info=True,
-                        )
-                    view = None
-                if view is not None:
-                    # Event-driven, not level-driven: flashes once per new event
-                    # (see push_event/_emit_rule_alert above), not continuously for
-                    # as long as module.is_alert_active() stays true -- an object
-                    # that remains visible must not keep the screen flashing.
-                    if now < self._flash_until:
-                        view = _apply_alert_overlay(view)
-                    if want_stream:
-                        self.dashboard.push_frame(view)
-                        self._last_stream_push = now
-            if self.display and view is not None:
-                cv2.imshow(self.window_name, view)
-                key = cv2.waitKey(1) & 0xFF
-                if key == ord("q"):
-                    self.shutdown.set()
-                    break
-                if key != 255 and hasattr(module, "handle_key"):
-                    module.handle_key(key)  # module-specific controls (e.g. openpilot wheel touch)
-
+        The loop body, unchanged, as a method so a caller with its own clock can
+        drive the exact production path one pass at a time (sim/, the virtual
+        device's deterministic end-to-end tests). `stop.wait` is the only pause
+        besides the frame wait, which is bounded by `loop.frame_timeout_s`.
+        """
+        # Commands first, and on EVERY pass -- not only after a fresh frame.
+        # They used to be read further down, past the degraded short-circuit
+        # and the no-frame `continue`, so a device whose detector was missing
+        # (or whose camera was down) could not be switched to a mode that
+        # would work: the app's command sat pending for ever.
+        try:
+            self._apply_pending_commands()
+        except Exception:  # one bad command must not stop detection
+            # A switch that raised part-way (a module that would not build,
+            # a close() that threw) is logged and dropped; the loop -- and
+            # the module still installed -- carries on.
+            log.exception("applying a mode/rule/zone command failed; continuing")
+        if self._stopped is not None:
+            # Explicitly stopped: nothing is analysed and nothing alerts, and
+            # every report says "stopped". The loop stays alive for commands.
             self._heartbeat = time.monotonic()
+            stop.wait(0.5)
+            return True
+        if self._detection_degraded is not None:
+            self._heartbeat = time.monotonic()
+            if time.monotonic() - loop.last_detector_retry >= _DETECTOR_RETRY_S:
+                loop.last_detector_retry = time.monotonic()
+                try:
+                    self._retry_detection_backend()
+                except Exception:  # a failed retry must not crash the loop
+                    log.exception("detector retry failed; still DEGRADED")
+            if not self._module_runs_without_detector():
+                # No detector and nothing this module can do without one:
+                # there is nothing honest to compute. The heartbeat still
+                # ticks -- the loop IS alive, and health must be able to
+                # tell "degraded" from "hung".
+                stop.wait(0.5)
+                return True
+            # Otherwise keep running what still works (audit F05: a missing
+            # detector used to switch off face-only drowsiness too). The
+            # monitoring state reports object detection as unavailable.
+        frame, seq, captured_at = self.bus.wait_for_fresh_stamped(loop.last_seq, timeout=loop.frame_timeout_s)
+        if seq == loop.last_seq or frame is None:
+            # The heartbeat measures whether THIS LOOP is responsive; frame
+            # availability is the camera component's own check. Without this
+            # stamp, a camera outage >10s read as "inference dead", burned
+            # the inference restart budget on a healthy thread, and could
+            # escalate all the way to a mid-drive Pi reboot for a camera
+            # problem the camera check was already recovering.
+            self._heartbeat = time.monotonic()
+            return True  # timeout: no fresh frame — health watches bus.age_s()
+        loop.last_seq = seq
+
+        with self._module_lock:
+            module = self.module
+        # A single bad frame must never crash the process -- found in a repo-
+        # wide audit: previously this call was unguarded, so in --display mode
+        # (a documented, first-class runtime mode, not dev-only) an exception
+        # here took down the entire process instead of the graceful in-place
+        # recovery headless mode already got from Service._guarded_run. Even
+        # in headless mode, letting ONE bad frame propagate meant restarting
+        # the whole inference loop (reopening everything, a visible pause)
+        # rather than just skipping that frame — the finer-grained recovery
+        # here is strictly better for both. A module that keeps failing is
+        # NOT silently tolerated forever, though: past
+        # _MAX_CONSECUTIVE_PROCESS_FAILURES in a row this re-raises, handing
+        # off to the same recovery ladder a truly wedged module already had.
+        try:
+            setter = getattr(module, "set_frame_time", None)
+            if callable(setter):
+                setter(captured_at)  # decisions rest on when the frame was SEEN
+            events = module.process(frame)
+            self._consecutive_process_failures = 0
+            self._last_process_error = None
+            # Processed-frame cadence, not capture cadence: a stall here is
+            # what makes EventEngine drop in-progress evidence.
+            self.bus.record_processed()
+        except Exception as exc:
+            self._consecutive_process_failures += 1
+            self._last_process_error = str(exc) or type(exc).__name__
+            log.error(
+                "module.process() failed (%d/%d consecutive): %s",
+                self._consecutive_process_failures, _MAX_CONSECUTIVE_PROCESS_FAILURES, exc,
+                exc_info=True,
+            )
+            if self._consecutive_process_failures >= _MAX_CONSECUTIVE_PROCESS_FAILURES:
+                log.critical(
+                    "module.process() failed %d times in a row; propagating "
+                    "for a full restart instead of dropping frames forever",
+                    self._consecutive_process_failures,
+                )
+                raise
+            # The inference LOOP is alive and responsive; only the module call
+            # failed, so the heartbeat should say so rather than let a string
+            # of caught failures look like a wedged/dead loop to health checks.
+            self._heartbeat = time.monotonic()
+            return True
+
+        alert_now = time.monotonic()
+        evidence_due = self._dispatch_module_events(module, events, alert_now)
+
+        # Evidence snapshots: OPT-IN (alerts.save_evidence), local-disk only,
+        # bounded count — the single, deliberate exception to "frames are never
+        # written to disk", captured only at the moment of a loud alert.
+        if evidence_due and self._evidence_dir is not None:
+            self._save_evidence(module, frame, events)
+
+        self._evaluate_custom_rules(module, frame, alert_now)
+
+        # A periodic frame with nothing happening. Negatives are what stop a
+        # detector learning to answer yes to everything, and they are gated
+        # behind their own opt-in because they are footage of ordinary life.
+        if self.capture_store.should_capture(negative=True):
+            self.capture_store.capture(
+                frame, module=self.module_name,
+                model_version=self._model_version(),
+            )
+
+        # Health for the uplink is sampled by _HealthReportService on its own
+        # thread, so it keeps reporting while this loop is not producing.
+
+        snapshot = module.get_telemetry_snapshot()
+        if snapshot is not None:
+            self.telemetry.log_if_due(
+                time.monotonic(), datetime.now(UTC).isoformat(), self.module_name, snapshot
+            )
+
+        # Developer-only: "why did/didn't that alert" as a readable block,
+        # not a re-read of this module's source. --debug only, throttled
+        # (every frame would be unreadable), and never sent anywhere off
+        # this machine -- get_debug_state() is opt-in per module (most
+        # return None) and deliberately more detailed than the telemetry
+        # snapshot above, which IS logged and IS product data.
+        if self.debug:
+            now_dbg = time.monotonic()
+            if now_dbg - self._last_debug_print >= 1.0:
+                state = module.get_debug_state()
+                if state is not None:
+                    self._last_debug_print = now_dbg
+                    print(f"{self.module_name.upper()} STATE")
+                    for key, value in state.items():
+                        print(f"  {key}: {value}")
+        if self.dashboard is not None:
+            # Either source can raise the alert state. A configured rule is
+            # someone explicitly asking to be alerted, so it must drive the
+            # red screen exactly as a preset's own detection does — the
+            # module's own opinion is not the only one that counts.
+            alert_active = module.is_alert_active() or self.rule_engine.is_alert_active()
+            self.dashboard.push_status(alert_active, snapshot)
+
+        # Annotate + encode only when someone is watching, and never faster than
+        # stream_fps — inference cadence and stream cadence are decoupled, so a
+        # phone at 12fps costs nothing at 30fps detection.
+        now = time.monotonic()
+        want_stream = (
+            self.dashboard is not None
+            and self.dashboard.has_viewers()
+            and now - self._last_stream_push >= loop.stream_interval
+        )
+        view = None
+        if self.display or want_stream:
+            # Guarded exactly like module.process() above, and for a sharper
+            # reason: this call happens ONLY while someone is watching the
+            # live feed (see `want_stream`). Unguarded, a module that drew
+            # badly took the whole inference loop down at the precise moment
+            # the app opened the camera -- and at no other time. The device
+            # looked healthy right up until a user looked at it, and the
+            # supervisor's restart then rebuilt the module, zeroing every
+            # timer, PERCLOS window and risk EMA, so nothing needing
+            # sustained evidence could fire while the feed was open.
+            #
+            # Unlike process(), a persistent failure here is never escalated
+            # into a restart: annotation is presentation, detection is the
+            # product. Losing the picture must not cost the monitoring.
+            try:
+                view = module.annotate_debug(frame.copy()) if self.debug else module.annotate(frame.copy())
+                self._consecutive_annotate_failures = 0
+            except Exception as exc:
+                self._consecutive_annotate_failures += 1
+                # First failure loudly, then throttled: this runs at stream
+                # cadence, so an unthrottled log would bury everything else.
+                if self._consecutive_annotate_failures == 1 or (
+                    self._consecutive_annotate_failures % _ANNOTATE_FAILURE_LOG_EVERY == 0
+                ):
+                    log.error(
+                        "module.annotate() failed (%d consecutive); the live feed will "
+                        "hold its last frame, detection is unaffected: %s",
+                        self._consecutive_annotate_failures, exc, exc_info=True,
+                    )
+                view = None
+            if view is not None:
+                # Event-driven, not level-driven: flashes once per new event
+                # (see push_event/_emit_rule_alert above), not continuously for
+                # as long as module.is_alert_active() stays true -- an object
+                # that remains visible must not keep the screen flashing.
+                if now < self._flash_until:
+                    view = _apply_alert_overlay(view)
+                if want_stream:
+                    self.dashboard.push_frame(view)
+                    self._last_stream_push = now
+        if self.display and view is not None:
+            cv2.imshow(self.window_name, view)
+            key = cv2.waitKey(1) & 0xFF
+            if key == ord("q"):
+                self.shutdown.set()
+                return False
+            if key != 255 and hasattr(module, "handle_key"):
+                module.handle_key(key)  # module-specific controls (e.g. openpilot wheel touch)
+
+        self._heartbeat = time.monotonic()
+        return True
 
     # ------------------------------------------------------------------ evidence
     def _save_evidence(self, module, frame, events) -> None:
