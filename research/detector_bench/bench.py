@@ -72,7 +72,9 @@ RUNS = [
     ("damo_t.production", "damoyolo_tinynasL20_T", {"variant": "production"}),
     ("damo_t.offset0", "damoyolo_tinynasL20_T", {"variant": "offset0"}),
     ("damo_t.offset0_multilabel", "damoyolo_tinynasL20_T", {"variant": "offset0_multilabel"}),
-    ("damo_s.offset0_multilabel", "damoyolo_tinynasL25_S", {"variant": "offset0_multilabel"}),
+    ("damo_s.offset0_multilabel", "damoyolo_tinynasL25_S",
+     {"variant": "offset0_multilabel",  # head nodes from the zoo's damoyolo_tinynasL25_S.yaml
+      "head_nodes": ("Mul_239", "Sigmoid_259", "Mul_279", "Sigmoid_299", "Mul_319", "Sigmoid_339")}),
     ("yolox_nano", "yolox_nano", {}),
     ("yolox_tiny", "yolox_tiny", {}),
     ("yolox_s", "yolox_s", {}),
@@ -316,8 +318,9 @@ def parity(data: Path, models: Path, provider: str, out: Path, n: int = 40) -> d
     items = sorted(manifest.split("val"), key=lambda i: i.id)[:n]
     result = {}
     for ckpt in CHECKPOINTS:
-        a = _build({"variant": "offset0"} if ckpt.startswith("damoyolo") else {}, ckpt, models, provider)
-        b = _build({"variant": "offset0"} if ckpt.startswith("damoyolo") else {}, ckpt, models, "cpu")
+        kw = next((dict(k, variant="offset0") for _, c, k in RUNS if c == ckpt), {}) if ckpt.startswith("damo") else {}
+        a = _build(kw, ckpt, models, provider)
+        b = _build(kw, ckpt, models, "cpu")
         worst, agree, total = 0.0, 0, 0
         for item in items:
             image = _load_image(data / item.path, None)
