@@ -11,6 +11,8 @@ This patch threads a per-image class mask from the COCO export
 (`sd_unverified_categories`, research/openimages/to_coco.py) to the
 classification loss, which then ignores, per (anchor, class), the classes that
 were never verified on that image. Positives and box regression are unchanged.
+SD_UNVERIFIED_WEIGHT (default 0) scales those terms instead of zeroing them:
+0 ignores unverified classes, 1 reproduces stock COCO training.
 
 Carrier: the mask rides as extra per-box columns through pull_item / mosaic /
 random_affine / mixup (which keep rows), and as a per-box BoxList field; the
@@ -119,8 +121,10 @@ EDITS: dict[str, list[tuple[str, str]]] = {
             "        sd_masks = getattr(self, '_sd_unverified', None)\n"
             "        if sd_masks is not None and any(m is not None for m in sd_masks):\n"
             "            n_img = len(sd_masks)\n"
+            "            import os as _os\n"
+            "            _w = float(_os.environ.get('SD_UNVERIFIED_WEIGHT', '0'))  # 0 = ignore; 1 = stock COCO\n"
             "            per_img = torch.stack([\n"
-            "                (1.0 - m.to(cls_scores.device)) if m is not None\n"
+            "                (1.0 - m.to(cls_scores.device) * (1.0 - _w)) if m is not None\n"
             "                else cls_scores.new_ones(self.cls_out_channels) for m in sd_masks])\n"
             "            class_mask = per_img[:, None, :].expand(n_img, cls_scores.shape[0] // n_img,\n"
             "                                                    self.cls_out_channels).reshape(-1, self.cls_out_channels)\n"
