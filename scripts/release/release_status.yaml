@@ -73,26 +73,20 @@ components:
 
 # --- M6.5 integration slots: filled by the integrator from each workstream's report.
   m65_device_auth_signed_commands:
-    tiers: [production-blocked]
-    pending_integration: true
-    evidence: "PLACEHOLDER: security workstream (4A/4C) result, tests, remaining blocker"
+    tiers: [software-ready, simulator-verified, hardware-pending, production-blocked]
+    evidence: "sd-auth-v1 (core/command_auth.py, docs/DEVICE_AUTH_CONTRACT.md): HKDF-derived keys from the existing device key, HMAC-SHA256 over device/command/body/nonce, request-bound replay defence, key rotation and revocation; config cloud.command_auth off|permissive|required (default permissive, so existing devices keep working). Secret store 0600, atomic, checksummed (core/secret_store.py, docs/CREDENTIAL_STORAGE.md); migration script dry-run only. Oryn job 20261111-061442-e529e8: 618 passed. Blocked for production until devices and backend run `required`, keys leave plaintext on the backend, and the nonce cache is shared"
   m65_ble_proof_of_possession:
-    tiers: [production-blocked]
-    pending_integration: true
-    evidence: "PLACEHOLDER: BLE PoP workstream (4B) result; physical validation still required"
+    tiers: [software-ready, hardware-pending, production-blocked]
+    evidence: "services/ble_pop.py + ios/Sources/BLEProofOfPossession.swift (docs/BLE_PROOF_OF_POSSESSION.md): setup code (QR/label), PBKDF2+HKDF+HMAC proofs, AES-GCM credentials, explicit state machine, lockout; config network.provisioning.auth legacy|pop (default legacy); Python/Swift vectors match. Mac: 109 passed; Swift tests pass. Not validated on BLE hardware; the app has no setup screen for it yet; offline guessing from a recorded session needs a PAKE"
   m65_xcuitest_journeys:
-    tiers: [software-ready]
-    pending_integration: true
-    evidence: "PLACEHOLDER: iOS UI automation workstream result (journeys passing, limitations)"
+    tiers: [simulator-verified]
+    evidence: "ios/UITests + scripts/sim/ios_uitest.sh against the real backend and virtual device: 19/20 journeys pass. Journey 10 (inline Ask Jupiter bar) fails: the field does not take keyboard focus (open defect; the stale-sheet fix b8fcff5 did not resolve it). Post-fix accessibility audit: 40 new issues (Dynamic Type on mono labels, clipping, 8 contrast); report in the M6.5 evidence folder"
   m65_reliability_fault_scenarios:
-    tiers: [software-ready]
-    pending_integration: true
-    evidence: "PLACEHOLDER: deep reliability workstream result (invariants held, observed failures)"
+    tiers: [simulator-verified]
+    evidence: "sim/invariants.py monitor + tests/test_sim_reliability.py (21) + tests/test_sim_stress.py (12): every invariant held across multi-stage faults, 20 min with faults, queue overflow, retry storm, concurrent threads. Found and fixed: person boxes never reached custom rules; a non-object calibration.json failed the driver module on every boot. Oryn job 20261111-070356-5152a8: 14/15 files, the 15th (role-floor fuzz OOM) pre-existing and fixed in 73ba319"
   m65_model_registry_evidence_binding:
     tiers: [software-ready]
-    pending_integration: true
-    evidence: "PLACEHOLDER: registry evidence-binding workstream result"
+    evidence: "core/model_registry.yaml product_capabilities + evidence_bindings; tiers exists_in_code < synthetic_tests < image_level_benchmark < video_evidence < device_verified < production_permitted, each claim bound to model hash, decoder, test, dataset manifest, hardware target. Highest held: image_level_benchmark (person, phone). GET /v1/capability-tiers reports production_validated false for all. Oryn job 20261111-060504-35b84a: 335 passed"
   m65_training_run_exp08_full60:
     tiers: [experiment-only]
-    pending_integration: true
-    evidence: "PLACEHOLDER: oryn job 20261111-055506-564ff3 outcome, best epoch, val metrics, checkpoint sha256"
+    evidence: "oryn job 20261111-055506-564ff3: 60/60 epochs, no early stop, best epoch 60, best_ckpt sha256 baad3842943b6ebc4cd58ecb6eff0a6615e9238d92d115cee50ddca94f4ef37b. Val: hand AP50 0.706, phone 0.798, person 0.690 (misses the person criterion by 0.003). Not compiled for Hailo; replaces nothing (docs/research/EXP08_FULL_RESULTS.md)"
