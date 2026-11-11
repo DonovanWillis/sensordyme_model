@@ -235,7 +235,9 @@ def run(data: Path, models: Path, split: str, provider: str, out: Path, *, max_s
             model.timing = dm.Timing()
             preds: dict[str, dict[str, list]] = {"phone": {}, "person": {}}
             t0 = time.perf_counter()
-            for item in items:
+            for n, item in enumerate(items):
+                if n and n % 400 == 0:
+                    print(f"  {key}: {n}/{len(items)} images, {time.perf_counter() - t0:.1f}s", flush=True)
                 td = time.perf_counter()
                 image = _load_image(data / item.path, max_side)
                 decode_ms.append((time.perf_counter() - td) * 1e3)
@@ -249,6 +251,7 @@ def run(data: Path, models: Path, split: str, provider: str, out: Path, *, max_s
             for name, attr in (("pre_ms", "pre_ms"), ("infer_ms", "infer_ms"), ("post_ms", "post_ms")):
                 xs = getattr(model.timing, attr)
                 entry[name] = {"p50": dm.percentile(xs, 0.5), "p90": dm.percentile(xs, 0.9)}
+            t_metrics = time.perf_counter()
             for label in ("phone", "person"):
                 result = oe.evaluate_class(preds[label], truths[label])
                 ap50 = oe.average_precision(result.scored, result.npos)
@@ -266,12 +269,15 @@ def run(data: Path, models: Path, split: str, provider: str, out: Path, *, max_s
                 if label == "phone" and max_side in (None, 640):
                     c["failures"] = _failures(result, SHIPPED[label], provenance)
                 entry["classes"][label] = c
+            entry["metrics_s"] = round(time.perf_counter() - t_metrics, 1)
             report["runs"][key] = entry
+            out.mkdir(parents=True, exist_ok=True)
+            (out / f"bench_{split}_{provider}.partial.json").write_text(json.dumps(report, indent=1, default=str))
             print(f"{key:40s} phone AP50 {_f(entry['classes']['phone']['ap50'])} "
                   f"R@.20 {_f(entry['classes']['phone']['shipped']['recall'])} "
                   f"P@.20 {_f(entry['classes']['phone']['shipped']['precision'])} | person AP50 "
                   f"{_f(entry['classes']['person']['ap50'])} | infer p50 {_f(entry['infer_ms']['p50'])} ms "
-                  f"| gpu {gpu.get('memory_used_mb')}", flush=True)
+                  f"| gpu {gpu.get('memory_used_mb')} | wall {entry['wall_s']}s metrics {entry['metrics_s']}s", flush=True)
             del model
     report["jpeg_decode_ms"] = {"p50": dm.percentile(decode_ms, 0.5), "p90": dm.percentile(decode_ms, 0.9)}
     out.mkdir(parents=True, exist_ok=True)
