@@ -137,28 +137,10 @@ models:
             person_ap50: 0.713
           date: "2026-11-11"
           notes: decode fix not yet validated on the Pi; recorded so the gap is visible
-        - kind: offline_benchmark
-          report_id: benchmarks/accuracy_state_farm.py:phase5_demo_binary
-          manifest_id: state-farm-val-subject-disjoint-seed0-600
-          split: val
-          protocol: >-
-            State Farm Distracted Driver val split, subject-disjoint, seed 0, 600
-            images (60/class); phone recall/precision at the shipped 0.20
-            threshold, person availability at 0.50
-          backend: hailo (the pinned .hef on the device)
-          device: pi5+hailo8l
-          artifact_sha256: "e69136d3ebf3cc8ebaf3da5417a59962b139f3d3d67d715e9a9b1ae10963960e"
-          granularity: image
-          metrics:
-            phone_recall_at_0.20: 0.883
-            phone_precision_at_0.20: 0.771
-            person_availability_at_0.50: 1.0
-            spurious_extra_person_box_rate_at_0.50: 0.04
-          date: "2026-08-29"
-          notes: >-
-            docs/DETECTION_THRESHOLDS.md section 0. Public staged dataset,
-            image-level, daylight RGB -- on device, but not in-domain and not
-            event-level, so it supports benchmarked_offline only
+        # The 2026-08-29 State Farm measurement (docs/DETECTION_THRESHOLDS.md) is NOT evidence:
+        # State Farm is Kaggle competition-use only (Mission 4 dataset audit), so it cannot
+        # support any product status claim.
+
     known_limitations:
       - Host decoder has an anchor-offset defect and an argmax (single-label) defect under investigation; fixing both is worth +0.067 phone / +0.057 person AP50 offline but is not validated on the Pi
       - COCO has no hand class; hands come from MediaPipe Hands on the Pi CPU
