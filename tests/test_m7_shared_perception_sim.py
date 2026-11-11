@@ -20,7 +20,6 @@ from core import nodes as monitoring_nodes
 from core import perception as pc
 from sim import scenario as sc
 from sim.harness import SimStack
-from sim.perception import Scene
 from sim.scenario import ABSENT, ASLEEP, ATTENTIVE, CALIBRATION_S, Faults, Scenario, Segment
 
 pytest.importorskip("fastapi")

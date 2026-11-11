@@ -7,7 +7,7 @@ import dataclasses
 import pytest
 
 from core import model_registry as mr
-from core import nodes as N
+from core import nodes as cn
 from core import perception as pc
 from core.monitoring_state import IMPAIRED, Capability
 from core.presets import PresetError, load_companion_nodes
