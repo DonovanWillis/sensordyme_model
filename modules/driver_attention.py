@@ -110,14 +110,23 @@ from core.detections import Detection, DetectionFrame
 from core.detectors import Box, get_yolo_model, iou, upper_region
 from core.events import Event
 from core.eye_signal import AdaptiveBaseline, SignalSmoother, eye_gaze_offset_deg, iris_openness
+from core.monitoring_state import IMPAIRED, STARTING, Capability
 from core.tracking import MAX_MATCH_DISTANCE_DIAGONAL_HAND, BoxTracker
 from modules.base import (
     CorroboratedGraceTracker,
+    EvidenceClock,
     GracedConditionTracker,
     SustainedConditionTracker,
     VisionModule,
     register_module,
 )
+
+#: Object-detection retry after a failure: 1 s, doubling to at most 60 s.
+#: Retrying never stops (a reseated HAT or a cleared transient comes back by
+#: itself) but its rate is bounded, and a failed load holds no model, so the
+#: retries cannot pile models up in memory.
+_DETECTOR_RETRY_INITIAL_S = 1.0
+_DETECTOR_RETRY_MAX_S = 60.0
 
 # MediaPipe Face Mesh landmark indices for the 6-point EAR eye model.
 LEFT_EYE = [362, 385, 387, 263, 373, 380]
@@ -1230,6 +1239,10 @@ class DriverAttentionModule(VisionModule):
         self._hands = None
         self._object_detection_ready = False
         self._object_detection_error: Optional[str] = None
+        self._object_detection_failures = 0  # consecutive, reset by a success
+        self._object_detection_retry_at: Optional[float] = None
+        # A gap between frames longer than this is a stall, not evidence (F4).
+        self._evidence_clock = EvidenceClock(float(config.get("max_evidence_gap_s", 0.5)))
         self._frame_index = 0
         self._last_phone_boxes: list[Box] = []
         self._last_eating_boxes: list[Box] = []
@@ -1324,16 +1337,25 @@ class DriverAttentionModule(VisionModule):
     def _update_object_detections(self, frame: np.ndarray) -> None:
         """Run YOLO (+ optional Hands) on `frame` and refresh cached box state.
 
-        Any failure here (bad weights, a broken MediaPipe Hands install, ...) is caught,
-        printed once, and disables further attempts for this run rather than crashing the
-        whole live-video loop or failing silently.
+        Any failure here (a detector fault, bad weights, a broken MediaPipe Hands
+        install, ...) is caught -- it must never crash the video loop -- and
+        object detection is reported IMPAIRED and retried with bounded backoff
+        (_DETECTOR_RETRY_*). It used to stay disabled for the rest of the run
+        after one exception (audit F6), while face-based monitoring carried on
+        and nothing said phone detection had stopped.
         """
-        if self._object_detection_error is not None:
+        wall = time.monotonic()  # backoff runs on real time, not evidence time
+        if self._object_detection_retry_at is not None and wall < self._object_detection_retry_at:
             return
         try:
             self._ensure_object_detectors_loaded()
             self._run_object_detections(frame)
         except Exception as exc:  # noqa: BLE001 - intentionally broad: never crash the video loop
+            self._object_detection_failures += 1
+            backoff = min(_DETECTOR_RETRY_INITIAL_S * 2 ** (self._object_detection_failures - 1),
+                          _DETECTOR_RETRY_MAX_S)
+            self._object_detection_retry_at = wall + backoff
+            first = self._object_detection_error is None
             self._object_detection_error = str(exc)
             # Clear the cached boxes along with disabling: a phone box frozen
             # from the tick before the error would otherwise keep phone_visible
@@ -1356,7 +1378,16 @@ class DriverAttentionModule(VisionModule):
             # No detector running to corroborate anything -- fail toward the
             # tighter face-lost threshold, not the more patient one.
             self._last_person_visible = False
-            print(f"driver_attention: object detection disabled after an error: {exc}")
+            if first:
+                print(f"driver_attention: object detection unavailable after an error "
+                      f"(retrying, backoff up to {_DETECTOR_RETRY_MAX_S:.0f}s): {exc}")
+            return
+        if self._object_detection_error is not None:
+            print(f"driver_attention: object detection recovered after "
+                  f"{self._object_detection_failures} failed attempt(s)")
+        self._object_detection_error = None
+        self._object_detection_failures = 0
+        self._object_detection_retry_at = None
 
     def _eating_boxes_near_face(
         self, eating_boxes: list[Box], person_boxes: list[Box]
@@ -1503,7 +1534,8 @@ class DriverAttentionModule(VisionModule):
 
     def process(self, frame: np.ndarray) -> list[Event]:
         """Run face mesh, head pose, and (strided) object detection; return fired events."""
-        now = time.monotonic()
+        # Evidence time: the frame's capture time with stalls clamped (F4).
+        now = self._evidence_clock.advance(self.frame_time())
         events: list[Event] = []
         h, w = frame.shape[:2]
         # From the ACTUAL frame, every frame -- not only on an object-detector
@@ -2066,7 +2098,7 @@ class DriverAttentionModule(VisionModule):
         anywhere (not to the cloud, not to end-user notification text) --
         wire it into a local-only view if one is added.
         """
-        now = time.monotonic()
+        now = self._evidence_clock.now  # the trackers' clock
         phone_confidence = None
         if self._last_phone_boxes and self._last_overlay_confidences:
             phone_confidences = [
@@ -2170,7 +2202,7 @@ class DriverAttentionModule(VisionModule):
             )
         if self._object_detection_error is not None:
             cv2.putText(
-                frame, "object detection: OFF (see terminal)", (10, frame.shape[0] - 15),
+                frame, "object detection: RETRYING (see terminal)", (10, frame.shape[0] - 15),
                 cv2.FONT_HERSHEY_SIMPLEX, 0.55, (0, 0, 255), 2,
             )
         return frame
@@ -2262,6 +2294,40 @@ class DriverAttentionModule(VisionModule):
         if self._risk_fusion.is_high_risk_active:
             active.add("high_risk")
         return active
+
+    #: What each event this module raises depends on (core/monitoring_state.py).
+    _FACE = frozenset({"face"})
+    _OBJECTS = frozenset({"objects"})
+    _EVENT_REQUIREMENTS: ClassVar[dict[str, frozenset[str]]] = {
+        **dict.fromkeys(("drowsiness", "fatigue_warning", "distraction", "frequent_glancing",
+                         "eyes_down", "eyes_up", "attention_lost", "elevated_risk", "high_risk"), _FACE),
+        "phone_detected": _OBJECTS,
+        "eating_drinking": _OBJECTS,
+        "phone_use": _FACE | _OBJECTS,
+        "erratic_hand_movement": frozenset({"hands", "objects"}),
+    }
+
+    def event_requirements(self) -> dict[str, frozenset[str]]:
+        reqs = dict(self._EVENT_REQUIREMENTS)
+        if not self._enable_hands:
+            reqs.pop("erratic_hand_movement")
+        return reqs
+
+    def capability_status(self) -> dict[str, Capability]:
+        """Face landmarks run on every frame (a FaceMesh failure raises out of
+        process(), which the runtime reports); the detector is reported as it is."""
+        if self._object_detection_error is not None:
+            wait = max(0.0, (self._object_detection_retry_at or 0.0) - time.monotonic())
+            objects = Capability(IMPAIRED, f"object detection failed {self._object_detection_failures}x "
+                                           f"({self._object_detection_error}); retrying in {wait:.0f}s")
+        elif not self._object_detection_ready:
+            objects = Capability(STARTING, "object detector loads on the first detection frame")
+        else:
+            objects = Capability()
+        status = {"face": Capability(), "objects": objects}
+        if self._enable_hands:
+            status["hands"] = objects
+        return status
 
     def available_labels(self) -> frozenset[str]:
         """The detector class names this module asks for (hands are not detections).

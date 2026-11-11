@@ -12,6 +12,7 @@ To add a new product module you only need to:
 
 from __future__ import annotations
 
+import time
 from abc import ABC, abstractmethod
 from typing import Optional
 
@@ -19,6 +20,7 @@ import numpy as np
 
 from core.detections import DetectionFrame
 from core.events import Event
+from core.monitoring_state import IMPAIRED, Capability
 
 _REGISTRY: dict[str, type["VisionModule"]] = {}
 
@@ -57,6 +59,24 @@ class VisionModule(ABC):
     def __init__(self, config: dict) -> None:
         """Store this module's config section (its `modules.<name>` block from config.yaml)."""
         self.config = config
+
+    #: Capture time of the frame about to be processed (set by the runtime).
+    _frame_time: Optional[float] = None
+
+    def set_frame_time(self, t: float) -> None:
+        """The monotonic time the next frame was captured (FrameBus publish time).
+
+        The runtime calls this before each process(); the module reads it once
+        through frame_time(). Decisions then rest on when the frame was SEEN,
+        not when the loop got round to it, which is also the seam a
+        deterministic replay feeds recorded timestamps through.
+        """
+        self._frame_time = t
+
+    def frame_time(self) -> float:
+        """The current frame's capture time, consumed once; the clock if none was given."""
+        t, self._frame_time = self._frame_time, None
+        return t if t is not None else time.monotonic()
 
     @abstractmethod
     def process(self, frame: np.ndarray) -> list[Event]:
@@ -109,6 +129,26 @@ class VisionModule(ABC):
         module cannot host additive custom rules.
         """
         return None
+
+    def capability_status(self) -> dict[str, Capability]:
+        """This module's perception capabilities and their live state, keyed by
+        core/capabilities.py kind ("face", "objects", "hands", "pose").
+
+        Report only what is true now: a detector that failed and is waiting to
+        retry is IMPAIRED with its reason, not AVAILABLE. Default: nothing
+        declared, so health judges the module only by whether it processes frames.
+        """
+        return {}
+
+    def event_requirements(self) -> dict[str, frozenset[str]]:
+        """The capabilities each event type this module can raise depends on.
+
+        Health uses this to say which events still work when a capability is
+        impaired (e.g. drowsiness needs "face"; phone use also needs "objects"),
+        and the runtime keeps running a module that has at least one event whose
+        requirements do not include a failed detector. Default: not declared.
+        """
+        return {}
 
     def set_requested_labels(self, labels: set[str]) -> None:  # noqa: B027 - optional hook, no-op by default
         """Widen what this module asks the detector for, for AI-configured rules.
@@ -452,3 +492,70 @@ class CorroboratedGraceTracker:
         evidence the whole way through -- for callers that want to vary an
         event's reported confidence/severity by which threshold applied."""
         return self._corroborated
+
+
+class EvidenceClock:
+    """Turns frame timestamps into evidence time, which never runs during a stall.
+
+    Every sustain tracker measures "how long has this been true" as a difference
+    of timestamps, so a gap with no frames (camera freeze, a blocked inference
+    loop, a dropped stride) used to count in full: two closed-eye frames 2.2 s
+    apart fired `drowsiness` (audit F4). Here a gap longer than `max_gap_s`
+    advances evidence time by only `max_gap_s`: what was not observed is not
+    evidence, while ordinary frame-to-frame jitter passes through unchanged.
+    Same idea as driver_attention_openpilot's tick clamp, for any module.
+    """
+
+    def __init__(self, max_gap_s: float = 0.5) -> None:
+        self._max_gap_s = float(max_gap_s)
+        self._last_frame: Optional[float] = None
+        self._evidence = 0.0
+        self.gaps = 0  # stalls clamped so far, for health and debugging
+        self.unobserved_s = 0.0  # frame time NOT credited as evidence
+
+    def advance(self, frame_time: float) -> float:
+        """Evidence time for a frame observed at `frame_time` (monotonic seconds)."""
+        if self._last_frame is None:
+            self._evidence = frame_time
+        else:
+            gap = frame_time - self._last_frame
+            if gap > self._max_gap_s:
+                self.gaps += 1
+                self.unobserved_s += gap - self._max_gap_s
+                gap = self._max_gap_s
+            self._evidence += max(gap, 0.0)
+        self._last_frame = frame_time
+        return self._evidence
+
+    @property
+    def now(self) -> float:
+        """Evidence time of the latest frame (0.0 before the first)."""
+        return self._evidence
+
+
+class UnavailableModule(VisionModule):
+    """Stands in for a module that could not be built, so the device still boots.
+
+    Raising out of main.py was exit 1, which Restart=always and
+    StartLimitAction=reboot turned into a reboot loop that took health, the
+    dashboard, the app link and BLE setup down with it. With this in place the
+    device runs, analyses nothing, and reports FAILED with the reason.
+    """
+
+    def __init__(self, name: str, reason: str) -> None:
+        super().__init__({})
+        self.name = name
+        self.reason = reason
+
+    def process(self, frame: np.ndarray) -> list[Event]:
+        return []
+
+    def annotate(self, frame: np.ndarray) -> np.ndarray:
+        return frame
+
+    def capability_status(self) -> dict[str, Capability]:
+        return {"module": Capability(IMPAIRED, f"module '{self.name}' could not be built: {self.reason}")}
+
+    def event_requirements(self) -> dict[str, frozenset[str]]:
+        return {self.name: frozenset({"module"})}
+

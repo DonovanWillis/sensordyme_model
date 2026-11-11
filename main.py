@@ -272,7 +272,17 @@ def run(argv: Optional[list[str]] = None) -> None:
     pieces to services.runtime.DeviceRuntime, which owns the process lifetime
     (camera capture, inference, dashboard, uplink, provisioning, health, shutdown)."""
     args = parse_args(argv)
-    config = load_config(args.config)
+    try:
+        config = load_config(args.config)
+    except (OSError, yaml.YAMLError) as exc:
+        # Before the guard below existed for these, an unreadable or malformed
+        # file raised straight out (exit 1), which Restart=always and
+        # StartLimitAction=reboot turned into a reboot loop (audit D12).
+        print(f"SensorDyme: config ERROR: cannot read {args.config}: {exc}")
+        raise SystemExit(CONFIG_ERROR_EXIT) from exc
+    if not isinstance(config, dict):
+        print(f"SensorDyme: config ERROR: {args.config} must be a YAML mapping, got {type(config).__name__}")
+        raise SystemExit(CONFIG_ERROR_EXIT)
 
     from core.config_schema import validate
 
@@ -368,7 +378,19 @@ def run(argv: Optional[list[str]] = None) -> None:
 
     _accel.configure(config.get("accelerator", {}))
 
-    module = module_cls(module_config)
+    try:
+        module = module_cls(module_config)
+    except Exception as exc:  # noqa: BLE001 - any failure: boot FAILED with the reason, never crash
+        # Raising here was exit 1 -> Restart=always -> StartLimitAction=reboot:
+        # a reboot loop over a missing model or a broken install (audit D12),
+        # with health, the dashboard, the app link and BLE setup all dark.
+        # The placeholder analyses nothing and the device reports FAILED, why,
+        # and stays reachable so a person (or a preset switch) can fix it.
+        from modules.base import UnavailableModule
+
+        print(f"SensorDyme: module '{module_name}' could not be built ({exc}); "
+              "starting FAILED so the device stays reachable")
+        module = UnavailableModule(module_name, str(exc))
     print(f"SensorDyme: profile '{profile}', running module '{module_name}' (available: {available_modules()})")
 
     debug = args.debug

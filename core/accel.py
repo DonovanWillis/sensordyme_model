@@ -172,6 +172,23 @@ def configure(accel_cfg: dict, info: Optional[AcceleratorInfo] = None) -> Accele
     return _accel_info
 
 
+def _fresh_info() -> AcceleratorInfo:
+    """The probe result, re-probed when the cached one says "not usable".
+
+    The boot probe used to be reused for every later load (audit, accel.py:286):
+    a HAT that enumerated late, or was reseated, stayed "absent" until the
+    service restarted, and every detector retry failed against a stale answer.
+    A usable result is kept (re-probing it would race an open device for
+    nothing); an unusable one is cheap to re-check (a path test and an import),
+    and callers already rate-limit loads (driver_attention's backoff, the
+    runtime's degraded retry).
+    """
+    global _accel_info  # noqa: PLW0603 - process-wide accelerator state
+    if _accel_info is None or not _accel_info.usable:
+        _accel_info = detect()
+    return _accel_info
+
+
 def status() -> tuple[bool, str]:
     """(healthy, detail) for the health monitor's `accelerator` component.
 
@@ -283,7 +300,7 @@ def maybe_hailo_yolo(weights: str):
     hef_path = _accel_cfg.get("yolo_hef")
     if not hef_path:
         return None
-    info = _accel_info or detect()
+    info = _fresh_info()
     if not info.usable:
         return None
     if not os.path.exists(hef_path):

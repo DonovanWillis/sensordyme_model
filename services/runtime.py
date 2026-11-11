@@ -1112,14 +1112,7 @@ class DeviceRuntime:
         safe direction.
         """
         health_cfg = self.config.get("health", {})
-        if not bool(health_cfg.get("allow_reboot", False)) or not nmcli_available():
-            log.critical(
-                "%s is down and unrecoverable; reboot disabled (health.allow_reboot) — "
-                "leaving recovery to systemd's Restart/StartLimitAction",
-                component,
-            )
-            return
-
+        reboot_allowed = bool(health_cfg.get("allow_reboot", False)) and nmcli_available()
         min_interval = float(health_cfg.get("reboot_min_interval_s", 1800))
         max_total = int(health_cfg.get("reboot_max_total", 5))
         state = self._reboot_state()
@@ -1146,6 +1139,7 @@ class DeviceRuntime:
                         "be written to %s; staying up degraded.",
                         component, self._REBOOT_STATE_PATH,
                     )
+                    self._stay_up_degraded(component)
                     return
                 log.critical(
                     "'%s' is down and its restarts are spent; the systemd watchdog will now "
@@ -1154,6 +1148,17 @@ class DeviceRuntime:
                 )
                 return
 
+        if not reboot_allowed:
+            # This used to return with the ping still withheld whenever reboot
+            # was disabled: systemd then restarted the process every
+            # WatchdogSec, for ever (StartLimitBurst never trips at that rate).
+            log.critical(
+                "%s is down and unrecoverable; reboot disabled (health.allow_reboot) — "
+                "staying up degraded and reporting it", component,
+            )
+            self._stay_up_degraded(component)
+            return
+
         if state["count"] >= max_total > 0:
             log.critical(
                 "reboot suppressed: %d reboot(s) already requested (health.reboot_max_total=%d) "
@@ -1161,12 +1166,14 @@ class DeviceRuntime:
                 "another. Staying up degraded; see /api/health.",
                 state["count"], max_total, component,
             )
+            self._stay_up_degraded(component)
             return
         if state["last_at"] and now - state["last_at"] < min_interval:
             log.critical(
                 "reboot suppressed: last one was %.0fs ago (<%.0fs)",
                 now - state["last_at"], min_interval,
             )
+            self._stay_up_degraded(component)
             return
 
         if not self._record_reboot_request(state, now):
@@ -1177,6 +1184,7 @@ class DeviceRuntime:
                 "indefinitely. Staying up degraded instead ('%s' remains down).",
                 self._REBOOT_STATE_PATH, component,
             )
+            self._stay_up_degraded(component)
             return
 
         log.critical(
@@ -1187,6 +1195,15 @@ class DeviceRuntime:
             # Nothing rebooted (a missing sudoers rule, say), so the attempt must
             # not spend the bound: put the record back as it was.
             self._write_reboot_state(state)
+            self._stay_up_degraded(component)
+
+    def _stay_up_degraded(self, component: str) -> None:
+        """Every "staying up degraded" decision above: stop withholding the watchdog
+        ping for this outage, or systemd restarts the process regardless (see
+        HealthMonitor.release_watchdog_hold). The monitoring state reports why."""
+        health = getattr(self, "health", None)
+        if health is not None:
+            health.release_watchdog_hold(component)
 
     def _issue_reboot(self) -> bool:
         """Run the reboot command. False when it could not be issued."""
