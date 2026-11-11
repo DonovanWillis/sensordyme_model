@@ -113,7 +113,9 @@ def test_the_catalogue_endpoint(backend):
     assert driver["validation"]["status"] == "unevaluated"
     assert presets["security_monitoring"]["validation"]["status"] == "benchmarked_offline"
     assert presets["security_monitoring"]["validation"]["evidence"]
-    assert presets["workplace_safety"]["availability"] == "planned"
+    # M7: node-backed (module shared_perception), runnable, honest about PPE.
+    assert presets["workplace_safety"]["availability"] == "available"
+    assert presets["workplace_safety"]["nodes"] == ["zone_watch"]
     keys = {s["key"] for s in driver["settings"]}
     assert {"drowsy_seconds", "phone_use_seconds", "enable_hands"} <= keys
 
@@ -125,7 +127,7 @@ def test_a_device_that_never_reported_is_stale(backend):
     assert body["stale"] is True and body["active_preset"] is None
     presets = by_id(body)
     assert presets["driver_safety"] == {**presets["driver_safety"], "available": False, "code": "device_stale"}
-    assert presets["occupancy"]["code"] == "planned" and presets["occupancy"]["reason"]
+    assert presets["occupancy"]["code"] == "device_stale" and presets["occupancy"]["reason"]
 
 
 def test_role_forbids_and_active_preset_with_its_settings(backend):
@@ -140,7 +142,7 @@ def test_role_forbids_and_active_preset_with_its_settings(backend):
     assert presets["driver_safety"]["settings"]["phone_use_seconds"] == 0.8   # the owner's setting
     for other in ("baby_monitoring", "security_monitoring", "elderly_monitoring"):
         assert presets[other]["code"] == "role_forbids_preset" and not presets[other]["available"]
-    assert presets["workplace_safety"]["code"] == "planned"
+    assert presets["workplace_safety"]["code"] == "role_forbids_preset"
     assert presets["driver_safety"]["validation_status"] == "unevaluated"
 
 
@@ -222,10 +224,9 @@ def test_incompatible_combinations_are_refused_with_a_code(backend):
     resp = client.post("/v1/devices/1/preset", json={"preset": "security_monitoring", "keep_rules": True},
                        headers=headers)
     assert resp.status_code == 409 and resp.json()["code"] == "incompatible_policy"
-    # A planned mode is not selectable at all.
-    resp = client.post("/v1/devices/1/preset", json={"preset": "occupancy"}, headers=headers)
+    # A mode this software does not have is not selectable at all.
+    resp = client.post("/v1/devices/1/preset", json={"preset": "teleportation"}, headers=headers)
     assert resp.status_code == 400 and resp.json()["code"] == "unknown_preset"
-    assert "planned" in resp.json()["detail"]
 
 
 def test_an_additive_device_keeps_its_rules_through_a_settings_change(backend):
