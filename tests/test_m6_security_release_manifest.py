@@ -173,6 +173,17 @@ def test_a_stale_extra_file_fails(manifest):
     assert _failed(_verify(manifest, snap)) == {"deployed files"}
 
 
+def test_migrate_config_backups_are_device_state_not_drift(manifest):
+    """scripts/migrate_config.py writes config.yaml.bak-<stamp> beside the code."""
+    snap = _snapshot(manifest)
+    snap["files"]["config.yaml.bak-20261116-101500"] = {"sha256": "2" * 64, "sha256_lf": "2" * 64}
+    result = _verify(manifest, snap)
+    assert result["verdict"] == "PASS"
+    assert any(c["check"].startswith("device state files") for c in result["checks"])
+    snap["files"]["core/config.yaml.bak-1"] = {"sha256": "3" * 64, "sha256_lf": "3" * 64}
+    assert _failed(_verify(manifest, snap)) == {"deployed files"}, "only the root config backups are exempt"
+
+
 def test_a_missing_file_fails(manifest):
     snap = _snapshot(manifest)
     del snap["files"]["main.py"]

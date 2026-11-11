@@ -27,6 +27,7 @@ leak into a manifest. Contents are never copied: paths and hashes only.
 from __future__ import annotations
 
 import argparse
+import fnmatch
 import hashlib
 import io
 import json
@@ -53,6 +54,9 @@ _SETUP = "setup_pi.sh"
 _REGISTRY = "core/model_registry.yaml"
 _DEVICE_REQUIREMENTS = "requirements-device.txt"
 _UNITS = ("sensordyme.service", "deploy/systemd/sensordyme-recover.service")
+#: Files the device itself writes next to the code: scripts/migrate_config.py's
+#: config backups. Reported, never counted as drift. Deliberately narrow.
+DEVICE_STATE_GLOBS = ("config.yaml.bak-*",)
 
 
 def _git(repo: Path, *args: str) -> str:
@@ -249,11 +253,18 @@ def verify(manifest: dict, snapshot: dict, unit_template: Optional[bytes] = None
         checks.append({"check": name, "result": "PASS" if ok else ("INFO" if ok is None else "FAIL"),
                        "detail": detail})
 
-    diff = im.diff_manifests(snapshot.get("files") or {}, manifest["deploy_set"]["files"])
+    device_files = dict(snapshot.get("files") or {})
+    # Device state the release legitimately leaves beside the code (not code drift).
+    state = sorted(p for p in device_files if any(fnmatch.fnmatch(p, g) for g in DEVICE_STATE_GLOBS))
+    for path in state:
+        device_files.pop(path)
+    diff = im.diff_manifests(device_files, manifest["deploy_set"]["files"])
     add("deployed files", diff["exact_match"],
         f"{diff['identical']} identical; differ {diff['differ'][:20]}; line-endings-only "
         f"{diff['differ_only_line_endings'][:20]}; only on device {diff['only_on_device'][:20]}; "
         f"missing on device {diff['only_in_revision'][:20]}")
+    if state:
+        add("device state files (informational)", None, f"not code, ignored: {state[:20]}")
 
     pins = manifest["model_pins"]
     pinned = (pins.get("config_yolo_hef_sha256") or "").lower()
