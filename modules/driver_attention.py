@@ -525,6 +525,11 @@ class AttentionCalibrator:
             return
         try:
             data = json.loads(self._path.read_text())
+            if not isinstance(data, dict):
+                # Valid JSON of the wrong shape (a list, null, a number) used to
+                # raise AttributeError out of the module constructor: the device
+                # booted FAILED on every boot until the file was deleted (M6.5).
+                return
             if int(data.get("version", 1)) != self.FORMAT_VERSION:
                 return  # stale format: leave uncalibrated; a fresh window will rewrite it
             if bool(data["gaze_fused"]) != self._gaze_fused:
@@ -558,8 +563,8 @@ class AttentionCalibrator:
             baseline_eye = None if eye is None else (float(eye[0]), float(eye[1]))
             if not (math.isfinite(baseline_ear) and math.isfinite(ear_threshold)):
                 return
-        except (json.JSONDecodeError, KeyError, ValueError, TypeError, IndexError):
-            return
+        except (OSError, json.JSONDecodeError, KeyError, ValueError, TypeError, IndexError):
+            return  # unreadable: recalibrate rather than fail to build the module
         self._baseline_ear = baseline_ear
         self._ear_threshold = ear_threshold
         self._baseline_rotation = baseline_rotation
@@ -1283,6 +1288,9 @@ class DriverAttentionModule(VisionModule):
         self._detection_tick = 0  # successful detector runs: "a fresh result exists"
         self._behavior_tick_seen = 0
         self._last_person_boxes: list[Box] = []
+        # Parallel to _last_person_boxes: reported by get_detections() so a custom
+        # rule on `person` (available_labels declares it) sees the driver.
+        self._last_person_confidences: list[float] = []
         self._frame_index = 0
         self._last_phone_boxes: list[Box] = []
         self._last_eating_boxes: list[Box] = []
@@ -1418,6 +1426,8 @@ class DriverAttentionModule(VisionModule):
             # No detector running to corroborate anything -- fail toward the
             # tighter face-lost threshold, not the more patient one.
             self._last_person_visible = False
+            self._last_person_boxes = []
+            self._last_person_confidences = []
             if first:
                 print(f"driver_attention: object detection unavailable after an error "
                       f"(retrying, backoff up to {_DETECTOR_RETRY_MAX_S:.0f}s): {exc}")
@@ -1488,6 +1498,7 @@ class DriverAttentionModule(VisionModule):
         overlay_boxes: list[tuple[Box, str]] = []
         overlay_confidences: list[float] = []
         person_boxes: list[Box] = []
+        person_confidences: list[float] = []
         box_scores: dict[tuple[int, ...], float] = {}
         for result in results:
             for box in result.boxes:
@@ -1497,6 +1508,7 @@ class DriverAttentionModule(VisionModule):
                 if (class_id == _PERSON_CLASS
                         and float(box.conf[0]) >= self._person_confidence_threshold):
                     person_boxes.append(tuple(int(v) for v in box.xyxy[0].tolist()))
+                    person_confidences.append(float(box.conf[0]))
                 event_type = self._yolo_class_ids.get(class_id)
                 if event_type is None:
                     continue
@@ -1510,6 +1522,7 @@ class DriverAttentionModule(VisionModule):
                     eating_boxes.append(xyxy)
         self._last_person_visible = bool(person_boxes)
         self._last_person_boxes = person_boxes
+        self._last_person_confidences = person_confidences
         eating_boxes = self._eating_boxes_near_face(eating_boxes, person_boxes)
 
         hand_boxes: list[Box] = []
@@ -2210,23 +2223,29 @@ class DriverAttentionModule(VisionModule):
         Hands are excluded: they come from MediaPipe landmarks rather than a
         detector with a comparable confidence, and a hand box means something
         quite different from an object box.
+
+        Person boxes are included: available_labels() declares `person`, so the
+        device accepts person rules beside driver safety, and without them here
+        "nobody in the seat" fired with the driver seated and "person present"
+        never could (M6.5, tests/test_sim_reliability.py).
         """
         width, height = self._last_frame_size
-        return DetectionFrame(
-            width=width,
-            height=height,
-            detections=tuple(
-                Detection(
-                    label=label,
-                    confidence=(
-                        self._last_overlay_confidences[i]
-                        if i < len(self._last_overlay_confidences) else 1.0
-                    ),
-                    box=tuple(float(v) for v in box),
-                )
-                for i, (box, label) in enumerate(self._last_overlay_boxes)
-            ),
+        objects = tuple(
+            Detection(
+                label=label,
+                confidence=(
+                    self._last_overlay_confidences[i]
+                    if i < len(self._last_overlay_confidences) else 1.0
+                ),
+                box=tuple(float(v) for v in box),
+            )
+            for i, (box, label) in enumerate(self._last_overlay_boxes)
         )
+        people = () if any(d.label == "person" for d in objects) else tuple(
+            Detection(label="person", confidence=conf, box=tuple(float(v) for v in box))
+            for box, conf in zip(self._last_person_boxes, self._last_person_confidences, strict=False)
+        )
+        return DetectionFrame(width=width, height=height, detections=objects + people)
 
     def get_telemetry_snapshot(self) -> Optional[dict]:
         """Raw per-frame signal snapshot for telemetry logging (future model-training data)."""

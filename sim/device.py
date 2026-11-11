@@ -98,6 +98,7 @@ class VirtualDevice:
         poll_interval_s: float = 2.0,
         echo_alerts: bool = False,
         log_level: str = "info",
+        honour_backoff: bool = False,
     ) -> None:
         self.state_dir = Path(state_dir).resolve()
         self.state_dir.mkdir(parents=True, exist_ok=True)
@@ -111,6 +112,9 @@ class VirtualDevice:
         self.dashboard_host = dashboard_host
         self.width, self.height, self.fps = int(width), int(height), float(fps)
         self.poll_interval_s = float(poll_interval_s)
+        #: advance() waits CloudUplink.next_delay() between syncs (the production
+        #: worker's jittered reconnection backoff) instead of the fixed poll interval.
+        self.honour_backoff = bool(honour_backoff)
         self.log_level = log_level
         self.buzzer = SimBuzzerSink(echo=echo_alerts)
         monotonic = clock.monotonic if clock is not None else time.monotonic
@@ -241,7 +245,8 @@ class VirtualDevice:
                 self._next_check = now + MONITORING_CHECK_S
             if self.runtime.uplink is not None and now >= self._next_sync:
                 self.sync()
-                self._next_sync = now + self.poll_interval_s
+                delay = self.runtime.uplink.next_delay() if self.honour_backoff else self.poll_interval_s
+                self._next_sync = now + delay
 
     def sync(self) -> None:
         """One uplink cycle, with a fresh health sample (as _HealthReportService does)."""
