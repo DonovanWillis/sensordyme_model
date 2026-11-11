@@ -46,6 +46,7 @@ from core.logging_setup import get_logger, setup_logging
 from core.monitoring_config import load_or_empty
 from core.network import WifiManager, nmcli_available
 from core.presets import DEVICE_POLICY_FEATURES
+from core.privilege import privileged
 from core.rules import RuleEngine, validate_rule_set
 from core.telemetry import TelemetryLogger
 from core.zones import load_zones
@@ -1275,8 +1276,8 @@ class DeviceRuntime:
     def _issue_reboot(self) -> bool:
         """Run the reboot command. False when it could not be issued."""
         try:
-            result = subprocess.run(
-                ["sudo", "-n", "systemctl", "reboot"],  # noqa: S607 - fixed argv; sudoers-whitelisted
+            result = subprocess.run(  # noqa: S603 - fixed argv; sudoers- or polkit-authorised (core/privilege.py)
+                privileged(["systemctl", "reboot"]),
                 check=False, timeout=30,
             )
         except (OSError, subprocess.SubprocessError) as exc:
@@ -1285,7 +1286,8 @@ class DeviceRuntime:
         if result.returncode != 0:
             log.critical(
                 "reboot command failed (exit %s) — check the sudoers rule from "
-                "setup_pi.sh; staying up degraded", result.returncode,
+                "setup_pi.sh (or, under the hardened unit, the polkit rule); staying up degraded",
+                result.returncode,
             )
             return False
         return True

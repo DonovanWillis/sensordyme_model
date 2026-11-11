@@ -445,18 +445,19 @@ class BLEProvisioningServer:
         """Advertise through the kernel mgmt API (bypasses bluetoothd's broken path)."""
         import subprocess
 
+        from core.privilege import privileged
+
         commands = [
-            ["sudo", "-n", "btmgmt", "connectable", "on"],
-            ["sudo", "-n", "btmgmt", "rm-adv", self._BTMGMT_INSTANCE],  # clear any stale instance
+            ["btmgmt", "connectable", "on"],
+            ["btmgmt", "rm-adv", self._BTMGMT_INSTANCE],  # clear any stale instance
             # -c connectable, -g general-discoverable, -n local name in scan response
-            ["sudo", "-n", "btmgmt", "add-adv", "-u", SERVICE_UUID, "-c", "-g", "-n",
-             self._BTMGMT_INSTANCE],
+            ["btmgmt", "add-adv", "-u", SERVICE_UUID, "-c", "-g", "-n", self._BTMGMT_INSTANCE],
         ]
         for command in commands:
-            subcommand = command[3]  # ["sudo", "-n", "btmgmt", <subcommand>, ...]
+            subcommand = command[1]  # ["btmgmt", <subcommand>, ...]
             try:
                 result = subprocess.run(  # noqa: S603 - fixed btmgmt argv built above
-                    command, capture_output=True, text=True, timeout=10, check=False
+                    privileged(command), capture_output=True, text=True, timeout=10, check=False
                 )
             except Exception as exc:  # noqa: BLE001
                 log.error("btmgmt fallback failed (%s): %s", subcommand, exc)
@@ -496,9 +497,11 @@ class BLEProvisioningServer:
         """
         import subprocess
 
+        from core.privilege import privileged
+
         try:
             subprocess.run(  # noqa: S603 - fixed argv
-                ["sudo", "-n", "btmgmt", "rm-adv", self._BTMGMT_INSTANCE],  # noqa: S607 - sudo from PATH
+                privileged(["btmgmt", "rm-adv", self._BTMGMT_INSTANCE]),
                 capture_output=True, timeout=10, check=False,
             )
         except Exception as exc:  # noqa: BLE001 - teardown must never raise
@@ -520,9 +523,11 @@ class BLEProvisioningServer:
         """
         import subprocess
 
+        from core.privilege import privileged
+
         try:
-            result = subprocess.run(
-                ["sudo", "-n", "btmgmt", "advinfo"],  # noqa: S607 - fixed argv; sudo from PATH
+            result = subprocess.run(  # noqa: S603 - fixed argv
+                privileged(["btmgmt", "advinfo"]),
                 capture_output=True, text=True, timeout=10, check=False,
             )
         except Exception:  # noqa: BLE001

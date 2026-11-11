@@ -1,0 +1,21 @@
+// PREPARED, NOT INSTALLED. For deploy/systemd/sensordyme.service.hardened only.
+//
+// Under the hardened unit (NoNewPrivileges) `sudo -n systemctl reboot` cannot
+// gain root, so the health monitor's last-resort reboot (services/runtime.py,
+// rate-limited and config-gated) runs `systemctl reboot` as the service user
+// (SENSORDYME_PRIVILEGE=direct, core/privilege.py). systemctl asks logind over
+// D-Bus, and logind asks polkit -- this rule is that grant, and it is the same
+// grant deploy/sudoers/sensordyme-reboot makes today: reboot, nothing else.
+// Power-off, suspend and every other login1 action stay denied.
+//
+// Install to /etc/polkit-1/rules.d/20-sensordyme-reboot.rules (0644, root).
+polkit.addRule(function (action, subject) {
+    var reboot = [
+        "org.freedesktop.login1.reboot",
+        "org.freedesktop.login1.reboot-multiple-sessions",
+        "org.freedesktop.login1.reboot-ignore-inhibit"
+    ];
+    if (reboot.indexOf(action.id) !== -1 && subject.user === "sensordyme") {
+        return polkit.Result.YES;
+    }
+});
