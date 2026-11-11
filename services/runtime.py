@@ -158,6 +158,21 @@ class _NullEventLog:
         return None
 
 
+#: Custom-rule severity -> alert category (core/alerts.py).
+_RULE_CATEGORY = {"critical": "critical", "warning": "warning", "info": "notice"}
+
+
+def _episode_state(module) -> tuple[frozenset, set]:
+    """(tracked, active) alert conditions of a module; empty for modules that
+    predate the hooks (test doubles not derived from VisionModule)."""
+    tracked = getattr(module, "alert_episode_types", None)
+    active = getattr(module, "active_alert_conditions", None)
+    return (
+        tracked() if callable(tracked) else frozenset(),
+        active() if callable(active) else set(),
+    )
+
+
 def _zones_from_app(raw) -> list:
     """core.zones.Zone objects from the uplink's zone dicts {name, polygon, kind}."""
     return load_zones({
@@ -968,6 +983,8 @@ class DeviceRuntime:
             event,
             key=alert.rule_id,
             level=AlertLevel.CONTINUOUS if alert.severity == "critical" else AlertLevel.SOFT,
+            category=_RULE_CATEGORY.get(alert.severity, "warning"),
+            source="rules",
         )
         self.logger.log(event)
         severity = "loud" if alert.severity == "critical" else "soft"
@@ -1527,12 +1544,15 @@ class DeviceRuntime:
             if self.monitoring.active:
                 events = []
             evidence_due = False
+            alert_now = time.monotonic()
             for event in events:
                 # Alert first, then record. The alert is the product; a log
                 # write that fails (full or read-only SD card) must never be
                 # what stands between a confirmed event and the buzzer.
+                # Each event starts an alert EPISODE; it is never dropped
+                # because an earlier episode alerted recently (M0.1).
                 if event.type in self.alert_event_types:
-                    self.alert_manager.notify(event)
+                    self.alert_manager.notify(event, now=alert_now)
                 self.logger.log(event)
                 severity = (
                     "loud" if event.type in self.loud_types
@@ -1550,6 +1570,11 @@ class DeviceRuntime:
                 if self.uplink is not None and event.type in self.alert_event_types:
                     self.uplink.push_event(event, severity, model=self._model_identity)
 
+            # Advance this module's open episodes: repeat/escalate those whose
+            # condition is still true, end the ones that cleared.
+            tracked, active = _episode_state(module)
+            self.alert_manager.observe(alert_now, source="module", active=active, tracked=tracked)
+
             # Evidence snapshots: OPT-IN (alerts.save_evidence), local-disk only,
             # bounded count — the single, deliberate exception to "frames are never
             # written to disk", captured only at the moment of a loud alert.
@@ -1564,6 +1589,14 @@ class DeviceRuntime:
                 for alert in self.rule_engine.observe_frame(detection_frame):
                     self._emit_rule_alert(alert)
                     self._capture_training_sample(frame, alert, detection_frame)
+            # Custom-rule episodes: a critical rule repeats while it stays
+            # confirmed; every other rule alert is a one-off episode.
+            self.alert_manager.observe(
+                time.monotonic(), source="rules",
+                active=self.rule_engine.active_alerts(),
+                tracked={r.rule_id for r in self.rule_engine.rules
+                         if r.severity == "critical" and r.notify != "silent"},
+            )
 
             # A periodic frame with nothing happening. Negatives are what stop a
             # detector learning to answer yes to everything, and they are gated

@@ -87,6 +87,29 @@ class VisionModule(ABC):
         """
         return False
 
+    def alert_episode_types(self) -> frozenset[str]:
+        """Event types whose condition this module tracks as a live episode.
+
+        For these, the alert policy (core/alerts.py) keeps the episode open while
+        `active_alert_conditions()` reports it, repeating and escalating the alert,
+        and ends it when the condition clears. Types not listed are one-off
+        episodes. Default: none (every event is a one-off).
+        """
+        return frozenset()
+
+    def active_alert_conditions(self) -> set[str]:
+        """The subset of `alert_episode_types()` whose condition is true right now."""
+        return set()
+
+    def available_labels(self) -> Optional[frozenset[str]]:
+        """Detection labels this module puts in `get_detections()` frames.
+
+        Custom rules evaluated beside this module (additive composition, see
+        core/roles.py) can only target these. None means "not declared": such a
+        module cannot host additive custom rules.
+        """
+        return None
+
     def set_requested_labels(self, labels: set[str]) -> None:  # noqa: B027 - optional hook, no-op by default
         """Widen what this module asks the detector for, for AI-configured rules.
 

@@ -2241,6 +2241,36 @@ class DriverAttentionModule(VisionModule):
         )
         return frame
 
+    #: Conditions tracked as live episodes, and the flag that says each is active.
+    _EPISODE_FLAGS = {
+        "drowsiness": "_drowsy_active",
+        "distraction": "_distracted_active",
+        "eyes_down": "_eyes_down_active",
+        "eyes_up": "_eyes_up_active",
+        "phone_use": "_phone_use_active",
+        "attention_lost": "_face_lost_active",
+        "erratic_hand_movement": "_erratic_hands_active",
+    }
+
+    def alert_episode_types(self) -> frozenset[str]:
+        """Every condition with a sustained tracker, plus sustained high risk."""
+        return frozenset({*self._EPISODE_FLAGS, "high_risk"})
+
+    def active_alert_conditions(self) -> set[str]:
+        """The tracked conditions that are active now (the same flags is_alert_active reads)."""
+        active = {etype for etype, flag in self._EPISODE_FLAGS.items() if getattr(self, flag, False)}
+        if self._risk_fusion.is_high_risk_active:
+            active.add("high_risk")
+        return active
+
+    def available_labels(self) -> frozenset[str]:
+        """The detector class names this module asks for (hands are not detections).
+
+        `yolo_classes` names are the detector's own labels, which is what
+        get_detections() reports; person is always requested (face-loss fallback).
+        """
+        return frozenset({*self._yolo_class_map, "person"})
+
     def is_alert_active(self) -> bool:
         """True while any currently-active condition warrants the full-screen alert flash."""
         return (

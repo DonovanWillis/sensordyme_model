@@ -79,13 +79,17 @@ def test_alert_manager_first_alert_is_soft():
     assert sink.calls == [("drowsiness", AlertLevel.SOFT)]
 
 
-def test_alert_manager_suppresses_within_cooldown():
+def test_alert_manager_merges_a_duplicate_but_never_drops_a_new_episode():
+    """M0.1 (D1): this test used to assert that a second alert 5 s after the first
+    was SUPPRESSED by cooldown_s. Trackers fire once per episode, so that second
+    event IS a new episode and the old behaviour silenced it entirely. Only a
+    duplicate inside the still-open episode is merged now."""
     sink = _RecordingSink()
     manager = AlertManager([sink], cooldown_s=10.0, escalation_window_s=60.0)
     manager.notify(_make_event(), now=0.0)
-    level = manager.notify(_make_event(), now=5.0)
-    assert level == AlertLevel.SUPPRESSED
-    assert len(sink.calls) == 1
+    assert manager.notify(_make_event(), now=1.0) == AlertLevel.SUPPRESSED  # same episode
+    assert manager.notify(_make_event(), now=5.0) != AlertLevel.SUPPRESSED  # new episode
+    assert len(sink.calls) == 2
 
 
 def test_alert_manager_escalates_to_continuous_within_window():
@@ -134,11 +138,14 @@ def test_fixed_soft_level_never_escalates_on_repeat():
     assert level == AlertLevel.SOFT
 
 
-def test_fixed_levels_still_respect_cooldown():
+def test_a_fixed_loud_type_alerts_for_every_new_episode():
+    """M0.1 (D1): previously asserted SUPPRESSED at 5 s ("fixed levels still respect
+    cooldown"). A new eyes_down episode 5 s after the last alert must alert."""
     sink = _RecordingSink()
     manager = AlertManager(
         [sink], cooldown_s=10.0, escalation_window_s=60.0, fixed_levels={"eyes_down": AlertLevel.CONTINUOUS}
     )
     manager.notify(_make_event("eyes_down"), now=0.0)
+    assert manager.notify(_make_event("eyes_down"), now=0.5) == AlertLevel.SUPPRESSED  # duplicate
     level = manager.notify(_make_event("eyes_down"), now=5.0)
-    assert level == AlertLevel.SUPPRESSED
+    assert level == AlertLevel.CONTINUOUS

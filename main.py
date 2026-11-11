@@ -193,17 +193,46 @@ def build_alert_manager(alert_cfg: dict, is_pi: bool) -> AlertManager:
             print(f"SensorDyme: unknown alert sink '{sink_name}', skipping")
 
     fixed_levels = {}
+    type_categories: dict[str, str] = {}
     for event_type in alert_cfg.get("loud_types", []):
         fixed_levels[event_type] = AlertLevel.CONTINUOUS
+        type_categories[event_type] = "warning"
     for event_type in alert_cfg.get("soft_types", []):
         fixed_levels[event_type] = AlertLevel.SOFT
+        type_categories[event_type] = "notice"
+    # The most urgent, distinct pattern (sleep / unresponsive). A critical type
+    # is always loud.
+    for event_type in alert_cfg.get("critical_types", []):
+        fixed_levels[event_type] = AlertLevel.CONTINUOUS
+        type_categories[event_type] = "critical"
 
     return AlertManager(
         sinks=sinks,
         cooldown_s=float(alert_cfg.get("cooldown_s", 10.0)),
         escalation_window_s=float(alert_cfg.get("escalation_window_s", 60.0)),
         fixed_levels=fixed_levels,
+        categories=alert_categories(alert_cfg),
+        type_categories=type_categories,
+        duplicate_window_s=float(alert_cfg.get("duplicate_window_s", 2.0)),
     )
+
+
+def alert_categories(alert_cfg: dict) -> dict:
+    """DEFAULT_CATEGORIES with any `alerts.categories:` overrides applied.
+
+    Overrides are bounded by AlertCategory itself (known patterns, repeat leaves
+    room for the pattern, max 120 repeats); config_schema reports violations as
+    errors before this runs.
+    """
+    from dataclasses import replace
+
+    from core.alerts import DEFAULT_CATEGORIES
+
+    categories = dict(DEFAULT_CATEGORIES)
+    for name, override in (alert_cfg.get("categories") or {}).items():
+        if name in categories and isinstance(override, dict):
+            categories[name] = replace(categories[name], **override)
+    return categories
 
 
 def parse_args(argv: Optional[list[str]] = None) -> argparse.Namespace:
