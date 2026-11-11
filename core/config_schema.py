@@ -168,6 +168,9 @@ def validate(config: dict) -> tuple[list[str], list[str]]:
         hef = accel_cfg.get("yolo_hef")
         _check(errors, hef is None or isinstance(hef, str),
                f"`accelerator.yolo_hef:` must be a path string or null, got {hef!r}")
+        decoder = accel_cfg.get("yolo_decoder", "legacy")
+        _check(errors, decoder in ("legacy", "reference"),
+               f"`accelerator.yolo_decoder:` must be legacy|reference, got {decoder!r}")
     else:
         errors.append("`accelerator:` must be a mapping")
 
