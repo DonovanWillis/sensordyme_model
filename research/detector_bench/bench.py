@@ -118,11 +118,11 @@ class GpuMonitor(threading.Thread):
     def __init__(self) -> None:
         super().__init__(daemon=True)
         self.samples: list[tuple[float, float, float, float]] = []
-        self._stop = threading.Event()
+        self._halt = threading.Event()
         self.available = os.path.exists(self.SMI)
 
     def run(self) -> None:
-        while self.available and not self._stop.is_set():
+        while self.available and not self._halt.is_set():
             try:
                 line = subprocess.run(  # noqa: S603 - fixed binary
                     [self.SMI, "--query-gpu=memory.used,utilization.gpu,temperature.gpu,power.draw",
@@ -132,10 +132,10 @@ class GpuMonitor(threading.Thread):
                 self.samples.append(tuple(vals))  # type: ignore[arg-type]
             except (OSError, ValueError, IndexError, subprocess.SubprocessError):
                 pass
-            self._stop.wait(0.5)
+            self._halt.wait(0.5)
 
     def stop(self) -> dict:
-        self._stop.set()
+        self._halt.set()
         self.join(timeout=5)
         if not self.samples:
             return {"available": self.available}
@@ -220,6 +220,10 @@ def run(data: Path, models: Path, split: str, provider: str, out: Path, *, max_s
             continue
         for max_side in max_sides:
             key = f"{run_name}@{max_side or 'native'}"
+            idle = GpuMonitor()  # what else is on the GPU right before this run (shared worker)
+            idle.start()
+            time.sleep(1.2)
+            gpu_before = idle.stop()
             monitor = GpuMonitor()
             monitor.start()
             t_build = time.perf_counter()
@@ -241,7 +245,7 @@ def run(data: Path, models: Path, split: str, provider: str, out: Path, *, max_s
             gpu = monitor.stop()
             entry: dict[str, Any] = {"checkpoint": ckpt, "max_side": max_side, "session_build_s": round(build_s, 2),
                                      "wall_s": round(wall, 1), "images_per_s": round(len(items) / wall, 1),
-                                     "gpu": gpu, "classes": {}}
+                                     "gpu": gpu, "gpu_before_run": gpu_before, "classes": {}}
             for name, attr in (("pre_ms", "pre_ms"), ("infer_ms", "infer_ms"), ("post_ms", "post_ms")):
                 xs = getattr(model.timing, attr)
                 entry[name] = {"p50": dm.percentile(xs, 0.5), "p90": dm.percentile(xs, 0.9)}
