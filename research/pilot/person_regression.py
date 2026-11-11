@@ -112,17 +112,20 @@ def describe_misses(result: oe.ClassResult, keys: set[tuple[str, int]], hands: d
 
 def describe_false_positives(result: oe.ClassResult, threshold: float, hands: dict[str, list[tuple]],
                              boxes: dict[str, list[tuple[float, tuple]]]) -> dict:
-    """False positives at ``threshold``: localisation (IoU 0.1-0.5 with a person) vs background, and
-    whether background ones sit on a hand box."""
+    """False positives at ``threshold``: localisation (IoU >= 0.1 with a person) vs background, and
+    whether background ones sit on a hand box. Localisation splits into duplicates (IoU >= 0.5 with a
+    person already matched: an NMS problem) and misplaced boxes (IoU 0.1-0.5: a regression problem)."""
     fps = [s for s in result.scored if not s.tp and s.score >= threshold]
     n = max(len(fps), 1)
     loc = [s for s in fps if s.best_iou >= 0.1]
+    dup = [s for s in loc if s.best_iou >= 0.5]
     bg = [s for s in fps if s.best_iou < 0.1]
     # The matcher does not keep the box; recover it from the prediction list by score.
     def box_of(s: oe.Scored) -> Optional[tuple]:
         return next((b for sc, b in boxes.get(s.image_id, []) if abs(sc - s.score) < 1e-9), None)
     bg_on_hand = sum(1 for s in bg if (b := box_of(s)) is not None and _overlap(b, hands.get(s.image_id, [])))
-    return {"count": len(fps), "localisation": round(len(loc) / n, 3), "background": round(len(bg) / n, 3),
+    return {"count": len(fps), "localisation": round(len(loc) / n, 3), "duplicate": round(len(dup) / n, 3),
+            "misplaced": round((len(loc) - len(dup)) / n, 3), "background": round(len(bg) / n, 3),
             "background_on_a_hand_box": round(bg_on_hand / max(len(bg), 1), 3),
             "on_negative_images": sum(s.image_id in result.negative_ids for s in fps)}
 

@@ -42,8 +42,16 @@ def test_failure_attribution():
     d = pr.describe_misses(r, missed, hands={"i1": [B]})
     assert d["count"] == 1 and d["occluded"] == 1.0 and d["overlaps_a_hand_box"] == 1.0
     fp = pr.describe_false_positives(r, 0.5, hands={"i3": [C]}, boxes={"i3": [(0.6, C)]})
-    assert fp == {"count": 1, "localisation": 0.0, "background": 1.0, "background_on_a_hand_box": 1.0,
-                  "on_negative_images": 1}
+    assert fp == {"count": 1, "localisation": 0.0, "duplicate": 0.0, "misplaced": 0.0, "background": 1.0,
+                  "background_on_a_hand_box": 1.0, "on_negative_images": 1}
+
+
+def test_duplicates_are_separated_from_misplaced_boxes():
+    shifted = (0.1, 0.15, 0.3, 0.35)  # IoU 0.6 with A
+    off = (0.2, 0.2, 0.4, 0.4)  # IoU ~0.14 with A
+    r = oe.evaluate_class({"i2": [(0.9, A), (0.8, shifted), (0.7, off)]}, _truths()[1:2])
+    fp = pr.describe_false_positives(r, 0.5, hands={}, boxes={})
+    assert fp["count"] == 2 and fp["duplicate"] == 0.5 and fp["misplaced"] == 0.5 and fp["background"] == 0.0
 
 
 def test_merge_takes_each_class_from_its_source(tmp_path):
