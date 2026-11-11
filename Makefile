@@ -1,5 +1,6 @@
 .PHONY: help dev dev-debug dev-max dev-openpilot dev-skinnemoen dev-dashsentinel \
         bench accuracy accuracy-dataset accuracy-gate report deploy deploy-preflight \
+        release-manifest release-verify \
         test test-cov test-ios lint lint-fix fmt-check typecheck audit check mutants \
         setup-dev hooks clean
 
@@ -292,4 +293,29 @@ deploy: deploy-preflight ## preflight, rsync to pi@sensordyme.local, install dep
 		./ pi@sensordyme.local:~/sensordyme/
 	ssh pi@sensordyme.local 'cd ~/sensordyme && .venv/bin/pip install -q -r requirements-device.txt'
 	ssh pi@sensordyme.local 'cd ~/sensordyme && python3 scripts/migrate_config.py config.yaml'
+	@# M6: rsync never touched /etc/systemd/system, so a release that changed the
+	@# unit (bounded start-limit reboots) landed with the OLD unit still in force.
+	ssh pi@sensordyme.local 'cd ~/sensordyme && sudo bash scripts/release/install_units.sh --user "$$(id -un)"'
 	ssh pi@sensordyme.local 'cd ~/sensordyme && sudo systemctl restart sensordyme.service'
+
+# =============================================================================
+# Release candidates (M6). A manifest pins exactly what a ref puts on a device;
+# `release-verify` compares a device snapshot (scripts/hw_validation/
+# integrity_manifest.py snapshot, run read-only ON the Pi) against it.
+# See docs/RELEASE_MANIFEST.md and docs/MONDAY_RUNBOOK.md.
+# =============================================================================
+REF ?= HEAD
+# Outside the checkout on purpose: `make deploy` rsyncs the working tree, and a
+# manifest left inside it would land on the device as an unexplained extra file.
+RELEASE_DIR ?= $(HOME)/sensordyme-release
+
+release-manifest: ## write $(RELEASE_DIR)/manifest.{json,md} for REF= (default HEAD); TESTS="..." records a test run
+	@mkdir -p $(RELEASE_DIR)
+	$(VENV)/python scripts/release/make_release_manifest.py build --ref $(REF) \
+		--out-json $(RELEASE_DIR)/manifest.json --out-md $(RELEASE_DIR)/manifest.md \
+		$(if $(TESTS),--test-ref "$(TESTS)")
+
+release-verify: ## compare SNAPSHOT= (device snapshot JSON) against $(RELEASE_DIR)/manifest.json
+	@test -n "$(SNAPSHOT)" || { echo "usage: make release-verify SNAPSHOT=path/to/snapshot.json"; exit 2; }
+	$(VENV)/python scripts/release/make_release_manifest.py verify \
+		--manifest $(RELEASE_DIR)/manifest.json --snapshot $(SNAPSHOT) --out $(RELEASE_DIR)/verify.json

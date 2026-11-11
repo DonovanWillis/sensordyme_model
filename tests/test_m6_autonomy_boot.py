@@ -196,3 +196,12 @@ def test_install_units_refuses_root(tmp_path):
     result = subprocess.run([BASH, str(REPO / "scripts/release/install_units.sh"), "--render-only",  # noqa: S603
                              str(tmp_path), "--user", "root"], capture_output=True, text=True, check=False)
     assert result.returncode == 1 and "root" in result.stderr
+
+
+def test_make_deploy_installs_the_units_before_restarting():
+    makefile = (REPO / "Makefile").read_text()
+    recipe = makefile.split("\ndeploy: ", 1)[1].split("\n\n", 1)[0]
+    assert "scripts/release/install_units.sh" in recipe
+    assert recipe.index("install_units.sh") < recipe.index("systemctl restart sensordyme.service")
+    assert "release-manifest:" in makefile and "release-verify:" in makefile
+    assert "RELEASE_DIR ?= $(HOME)/" in makefile, "a manifest inside the checkout would be rsynced to the device"
