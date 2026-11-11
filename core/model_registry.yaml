@@ -1,0 +1,367 @@
+# SensorDyme model registry: every model the product runs, or might run, with
+# what it is, where its bytes come from, who may use it, and what has actually
+# been measured about it.
+#
+# Read by core/model_registry.py (pure: yaml + stdlib, importable by the device
+# and the backend alike). docs/MODEL_REGISTRY.md explains the design.
+#
+# THE ONE RULE THIS FILE EXISTS TO ENFORCE: a model loading, running, or
+# producing boxes is never evidence that it is right. `evaluation.status` moves
+# up the ladder only with a recorded evidence item, and the app may call a
+# capability "validated" only at validated_on_device with event-level evidence
+# measured on the exact pinned artifact.
+#
+#   unevaluated < benchmarked_offline < evaluated_in_domain < validated_on_device
+#
+# Hand-edited. `tests/test_model_registry.py` parses this file and runs the full
+# validation over it, so a dishonest edit fails CI instead of reaching the app.
+# Quote every sha256 and every version: YAML would read some of them as numbers.
+
+schema_version: 1
+registry_version: "2026-11-11.1"
+
+# Which registered model supplies each perception capability on a shipped
+# device. Every module shares these: core/detectors.py hands every module the
+# one detector, and every module that uses MediaPipe uses the same bundled
+# solution graphs. Only `shipping` models may appear here.
+providers:
+  objects: damo_yolo_tinynasl20_t_coco80
+  face: mediapipe_face_mesh
+  hands: mediapipe_hands
+  pose: mediapipe_pose
+
+# The perception capabilities each module consumes in its default
+# configuration (camera + inference are implied for every module).
+# `optional` ones run only when a config switch turns them on.
+modules:
+  driver_attention:
+    uses: [face, objects, hands]          # modules/driver_attention.py _EVENT_REQUIREMENTS; hands: enable_hands
+    source: modules/driver_attention.py event_requirements()
+  fall_detection:
+    uses: [pose]
+    source: modules/fall_detection.py (MediaPipe Pose on every frame)
+  baby_monitoring:
+    uses: [objects, pose]                 # pose: enable_pose (default true) -- flailing, choking_hazard
+    source: modules/baby_monitoring.py
+  occupancy:
+    uses: [objects]
+    optional: [pose]                      # verify_new_tracks_with_pose (default false)
+    source: modules/occupancy.py
+
+models:
+  # ---------------------------------------------------------------- objects
+  - id: damo_yolo_tinynasl20_t_coco80
+    version: "hailo-model-zoo-v2.15.0-hailo8l"
+    family: damo-yolo
+    task: object_detection
+    artifacts:
+      - path: models/damoyolo_tinynasL20_T.hef
+        sha256: "e69136d3ebf3cc8ebaf3da5417a59962b139f3d3d67d715e9a9b1ae10963960e"
+        url: https://hailo-model-zoo.s3.eu-west-2.amazonaws.com/ModelZoo/Compiled/v2.15.0/hailo8l/damoyolo_tinynasL20_T.hef
+        size: 18554430
+        format: hef
+        notes: pinned in setup_pi.sh (install refuses a mismatch) and config.yaml accelerator.yolo_hef_sha256
+    vocabulary:
+      name: coco80
+      size: 80
+      source: core/accel.py COCO_NAMES
+    # The classes the product's own rules and presets depend on. The rest of
+    # COCO-80 is reachable by custom rules (core/capabilities.py objects.coco).
+    classes:
+      - {source: person, index: 0, label: person, capability: objects}
+      - {source: cell phone, index: 67, label: cell phone, capability: objects}
+      - {source: bottle, index: 39, label: bottle, capability: objects}
+      - {source: cup, index: 41, label: cup, capability: objects}
+      - {source: car, index: 2, label: car, capability: objects}
+      - {source: dog, index: 16, label: dog, capability: objects}
+    provides_capabilities: [objects]
+    compute:
+      targets: [hailo8l]
+      published_fps:
+        - value: 124
+          hardware: hailo8l
+          conditions: batch 1, x86 host over PCIe Gen3x4 -- NOT a Raspberry Pi 5 host
+          source: Hailo Model Zoo v2.15.0 hailo8l performance table
+      measured:
+        - device: pi5+hailo8l
+          metric: inference_latency_ms_mean
+          value: 22.07
+          evidence: docs/PHASE5_DEMO_READINESS.md section 4 (300 samples, warm-up excluded, sha256 e69136d3, 2026-08-29)
+        - device: pi5+hailo8l
+          metric: pipeline_fps_driver_attention
+          value: 29.5
+          evidence: docs/PHASE5_DEMO_READINESS.md section 4 (live /api/health, 29.5-29.9 fps across 8 restarts)
+    licence:
+      code: Apache-2.0
+      weights: Apache-2.0
+      training_data: >-
+        COCO train2017 (annotations CC BY 4.0; images under individual Flickr
+        terms). Dataset-terms encumbrance of COCO-trained weights is an open
+        counsel question (docs/LICENSING.md item 8)
+      commercial_status: cleared_with_caveats
+      notes: >-
+        DAMO-YOLO upstream is Apache-2.0 with a NOTICE file (Apache-2.0 section
+        4(d) attribution is owed); the Hailo Model Zoo cfg names
+        tinyvision/DAMO-YOLO as upstream and adds no copyleft. Never vendor
+        DAMO-YOLO's tools/onnx_inference.py (CC BY-NC 4.0). See
+        docs/LICENSING.md and docs/THIRD_PARTY_NOTICES.md.
+    evaluation:
+      status: benchmarked_offline
+      evidence:
+        - kind: offline_benchmark
+          report_id: detector_bench/bench_val:damo_t.production
+          manifest_id: b878e8429d221f3f
+          split: val
+          protocol: >-
+            Open Images V7 subset oi7-sd-v1 (licence-filtered, author-grouped
+            splits), AP50 per class under the Open Images protocol, decoded the
+            way the device decodes (legacy anchor offset, argmax class)
+          backend: onnx-fp32 surrogate of the .hef (not the INT8 Hailo binary)
+          granularity: image
+          metrics:
+            phone_ap50: 0.728
+            person_ap50: 0.656
+            phone_free_images_with_false_phone_box_at_0.20: 0.595
+          date: "2026-11-11"
+          notes: research/detector_bench on branch feat/m4-detector-baseline; report JSON lives on the fleet worker
+        - kind: offline_benchmark
+          report_id: detector_bench/bench_val:damo_t.offset0_multilabel
+          manifest_id: b878e8429d221f3f
+          split: val
+          protocol: same as damo_t.production, decoder with anchor offset 0 and multilabel scoring
+          backend: onnx-fp32 surrogate of the .hef
+          granularity: image
+          shipped_config: false   # the device does NOT decode this way yet; counts for nothing
+          metrics:
+            phone_ap50: 0.795
+            person_ap50: 0.713
+          date: "2026-11-11"
+          notes: decode fix not yet validated on the Pi; recorded so the gap is visible
+        # The 2026-08-29 State Farm measurement (docs/DETECTION_THRESHOLDS.md) is NOT evidence:
+        # State Farm is Kaggle competition-use only (Mission 4 dataset audit), so it cannot
+        # support any product status claim.
+
+    known_limitations:
+      - Host decoder has an anchor-offset defect and an argmax (single-label) defect under investigation; fixing both is worth +0.067 phone / +0.057 person AP50 offline but is not validated on the Pi
+      - COCO has no hand class; hands come from MediaPipe Hands on the Pi CPU
+      - No NoIR or in-cabin evaluation; every accuracy number is on public RGB data
+      - About 60% (59.5%) of verified phone-free Open Images val images get a false phone box at the shipped 0.20 threshold
+      - Open Images evidence is on the float ONNX export; INT8 quantisation loss on the .hef is unmeasured on that data
+      - Published 124 fps is from an x86 PCIe Gen3x4 host; Pi 5 throughput is host-CPU bound (see measured)
+    deployment: shipping
+
+  # ---------------------------------------------------------------- face
+  - id: mediapipe_face_mesh
+    version: "mediapipe-0.10.14"
+    family: mediapipe-face-mesh
+    task: face_landmarks
+    artifacts:
+      # Bundled inside the mediapipe==0.10.14 wheel; refine_landmarks=True
+      # selects the attention model. Hashes are of the macOS arm64 wheel's
+      # copies (2026-11-11); the Pi's aarch64 wheel copies are not yet hashed.
+      - path: mediapipe/modules/face_detection/face_detection_short_range.tflite
+        sha256: "bbff11cebd1eb27a1e004cae0b0e63ec8c551cbf34a4451148b4908b8db3eca8"
+        size: 229714
+        format: tflite
+      - path: mediapipe/modules/face_landmark/face_landmark_with_attention.tflite
+        sha256: "e06a804e0144f9929eda782122916b35d60c697c3c9344013ca2bbe76a6ce2b4"
+        size: 2495106
+        format: tflite
+    classes:
+      - {source: face_landmarks_478, label: face_landmarks, capability: face}
+    provides_capabilities: [face]
+    compute:
+      targets: [pi5-cpu, dev-cpu]
+      published_fps: []
+      measured: []
+    licence:
+      code: Apache-2.0
+      weights: Apache-2.0
+      training_data: Google-collected dataset described in the model card; not available to SensorDyme
+      commercial_status: cleared_with_caveats
+      notes: >-
+        The model card's out-of-scope clause says the model is not intended for
+        human life-critical decisions. Driver safety relies on it for
+        drowsiness and attention, so SensorDyme must carry its own evidence and
+        must not cite the model card as validation.
+    evaluation:
+      status: unevaluated
+      evidence: []
+      shipping_exception:
+        reason: >-
+          Shipped before the registry existed (the driver_safety role requires
+          `face`). No in-domain NoIR in-cabin evaluation exists; the in-cabin
+          pilot protocol (docs/research/INCABIN_PILOT_PROTOCOL.md on
+          feat/m4-detector-baseline) is not yet approved.
+        recorded: "2026-11-11"
+        review_by: "2027-02-28"
+    known_limitations:
+      - Model card excludes human life-critical decisions
+      - No evaluation on NoIR / IR-lit in-cabin footage, sunglasses, or night driving
+      - Adult face model; not reliable on infants (docs/DETECTIONS.md face_covered)
+    deployment: shipping
+
+  # ---------------------------------------------------------------- hands
+  - id: mediapipe_hands
+    version: "mediapipe-0.10.14"
+    family: mediapipe-hands
+    task: hand_landmarks
+    artifacts:
+      # model_complexity=1 (the default driver_attention uses): full models.
+      - path: mediapipe/modules/palm_detection/palm_detection_full.tflite
+        sha256: "1b14e9422c6ad006cde6581a46c8b90dd573c07ab7f3934b5589e7cea3f89a54"
+        size: 2339846
+        format: tflite
+      - path: mediapipe/modules/hand_landmark/hand_landmark_full.tflite
+        sha256: "11c272b891e1a99ab034208e23937a8008388cf11ed2a9d776ed3d01d0ba00e3"
+        size: 5478917
+        format: tflite
+    classes:
+      - {source: hand_landmarks_21, label: hand_landmarks, capability: hands}
+    provides_capabilities: [hands]
+    compute:
+      targets: [pi5-cpu, dev-cpu]
+      published_fps: []
+      measured: []
+    licence:
+      code: Apache-2.0
+      weights: Apache-2.0
+      training_data: Google-collected dataset described in the model card; not available to SensorDyme
+      commercial_status: cleared_with_caveats
+      notes: Model card intended-use limits not yet transcribed into this registry; review before relying on them
+    evaluation:
+      status: unevaluated
+      evidence: []
+      shipping_exception:
+        reason: >-
+          Shipped before the registry existed, as a confidence booster for
+          phone_use and for erratic_hand_movement in driver_attention. Never
+          measured on in-cabin footage.
+        recorded: "2026-11-11"
+        review_by: "2027-02-28"
+    known_limitations:
+      - Never evaluated in-cabin or under NoIR illumination
+      - Runs on the Pi CPU, competing with FaceMesh for the host budget
+    deployment: shipping
+
+  # ---------------------------------------------------------------- pose
+  - id: mediapipe_pose
+    version: "mediapipe-0.10.14"
+    family: mediapipe-pose
+    task: pose_landmarks
+    artifacts:
+      # model_complexity=1 (the default every module uses): full landmark model.
+      - path: mediapipe/modules/pose_detection/pose_detection.tflite
+        sha256: "9ba9dd3d42efaaba86b4ff0122b06f29c4122e756b329d89dca1e297fd8f866c"
+        size: 2959046
+        format: tflite
+      - path: mediapipe/modules/pose_landmark/pose_landmark_full.tflite
+        sha256: "e9a5c5cb17f736fafd4c2ec1da3b3d331d6edbe8a0d32395855aeb2cdfd64b9f"
+        size: 6440512
+        format: tflite
+    classes:
+      - {source: pose_landmarks_33, label: pose_landmarks, capability: pose}
+    provides_capabilities: [pose]
+    compute:
+      targets: [pi5-cpu, dev-cpu]
+      published_fps: []
+      measured:
+        - device: pi5+hailo8l
+          metric: pipeline_fps_baby_monitoring
+          value: 25.7
+          evidence: docs/PHASE5_DEMO_READINESS.md section 4 (pose every frame; 25.7-25.9 fps)
+    licence:
+      code: Apache-2.0
+      weights: Apache-2.0
+      training_data: Google-collected dataset described in the model card; not available to SensorDyme
+      commercial_status: cleared_with_caveats
+      notes: Model card intended-use limits not yet transcribed into this registry; review before relying on them
+    evaluation:
+      status: unevaluated
+      evidence: []
+      shipping_exception:
+        reason: >-
+          Shipped before the registry existed, in the elderly, baby and
+          (optionally) security presets. A driver_safety-role device cannot
+          select any of them (core/roles.py allowed_presets).
+        recorded: "2026-11-11"
+        review_by: "2027-02-28"
+    known_limitations:
+      - Adult body model; the fall detector is tuned for adults, not infants
+      - No evaluation of fall, stillness or flailing events on consented footage
+    deployment: shipping
+
+  # ---------------------------------------------------------------- dev only
+  - id: ultralytics_yolo11n_coco80
+    version: "ultralytics-8.3.28-yolo11n"
+    family: ultralytics-yolo11
+    task: object_detection
+    artifacts:
+      - path: yolo11n.pt
+        url: https://github.com/ultralytics/assets/releases/download/v8.3.0/yolo11n.pt
+        format: pt
+        notes: auto-downloaded by ultralytics on first use; never provisioned to a device, not hashed
+    vocabulary:
+      name: coco80
+      size: 80
+      source: core/accel.py COCO_NAMES
+    classes:
+      - {source: person, index: 0, label: person, capability: objects}
+      - {source: cell phone, index: 67, label: cell phone, capability: objects}
+    provides_capabilities: [objects]
+    compute:
+      targets: [dev-mps, dev-cpu]
+      published_fps: []
+      measured:
+        - device: pi5-cpu
+          metric: inference_latency_ms_mean
+          value: 293.1
+          evidence: docs/PERFORMANCE_BUDGET.md (CPU column; why the device moved to the NPU)
+    licence:
+      code: AGPL-3.0
+      weights: AGPL-3.0
+      training_data: COCO train2017
+      commercial_status: restricted
+      notes: >-
+        AGPL-3.0 (Ultralytics' own position covers models and weights). Kept in
+        requirements.txt for developer machines only; absent from
+        requirements-device.txt. Must never be `shipping` -- validation refuses it.
+    evaluation:
+      status: unevaluated
+      evidence: []
+    known_limitations:
+      - Development and CI fallback only; numbers measured on it do not describe the shipped detector
+    deployment: dev_only
+
+  # ---------------------------------------------------------------- candidate
+  - id: damo_yolo_t_exp08_person_phone_hand
+    version: "exp08-unreleased"
+    family: damo-yolo
+    task: object_detection
+    artifacts: []
+    classes:
+      - {source: person, index: 0, label: person, capability: objects}
+      - {source: phone, index: 1, label: cell phone, capability: objects}
+      - {source: hand, index: 2, label: hand, capability: hands}
+    provides_capabilities: [objects, hands]
+    compute:
+      targets: [hailo8l]
+      published_fps: []
+      measured: []
+    licence:
+      code: Apache-2.0
+      weights: Apache-2.0 base checkpoint (damoyolo_tinynasL20_T_420.pth); fine-tuned weights not yet produced
+      training_data: >-
+        Open Images V7 subset oi7-sd-v1 train split (manifest b878e8429d221f3f;
+        annotations CC BY 4.0, images CC BY 2.0 verified per file) on top of the
+        COCO-trained base checkpoint
+      commercial_status: unreviewed
+      notes: Licence review of the fine-tuned weights is required before this can move past candidate
+    evaluation:
+      status: unevaluated
+      evidence: []
+    known_limitations:
+      - EXP-08a pilot authorised (docs/research/FINETUNE_EXP08_SPEC.md on feat/m4-detector-baseline); full campaign EXP-08b not approved
+      - Hand boxes are not MediaPipe landmarks; consumers of `hands` would need adapting
+      - No Hailo compile, no NoIR calibration set, no Pi validation
+    deployment: candidate
