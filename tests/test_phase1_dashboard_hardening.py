@@ -161,7 +161,8 @@ def test_uplink_binds_batch_before_the_try_so_the_handler_cannot_raise_nameerror
 
     from core.uplink import CloudUplink
 
-    source = inspect.getsource(CloudUplink._run)
+    # The loop body lives in sync_once() since the M6 virtual-device seam (_run loops it).
+    source = inspect.getsource(getattr(CloudUplink, "sync_once", CloudUplink._run))
     batch_init = source.index("batch")
     try_index = source.index("try:")
     assert batch_init < try_index, (
