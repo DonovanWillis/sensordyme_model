@@ -30,7 +30,6 @@ struct DeviceDetailView: View {
     /// taken over the UI.
     @State private var setModeGuard = LatestRequestGuard()
     @State private var errorMessage: String?
-    @State private var showAI = false
     @State private var showZones = false
     @State private var selectedEvent: EventItem?
     @State private var showDemoTrigger = false
@@ -40,9 +39,12 @@ struct DeviceDetailView: View {
     @State private var hasLoaded = false
     /// What is being typed into the inline Ask Jupiter bar.
     @State private var jupiterDraft = ""
-    /// The request handed to the Ask Jupiter screen when it opens (and sent
-    /// straight away when non-empty).
-    @State private var jupiterRequest = ""
+    /// The open Ask Jupiter screen and the request it starts with (sent straight
+    /// away when non-empty). One value, so the sheet is built with the request it
+    /// was opened for: a separate request string read only inside
+    /// `.sheet(isPresented:)` could be captured stale, opening the screen with an
+    /// empty prompt that never got an answer (XCUITest journey 10).
+    @State private var jupiterSheet: JupiterSheet?
     @State private var showHistory = false
     @State private var renameError: String?
 
@@ -117,7 +119,7 @@ struct DeviceDetailView: View {
                 CustomRulesCard(
                     load: rulesLoad, deviceLive: deviceLive, busy: rulesBusy, toggleError: ruleToggleError,
                     onToggle: { rule, enabled in toggleRule(rule, enabled: enabled) },
-                    onAskJupiter: { jupiterRequest = ""; showAI = true })
+                    onAskJupiter: { jupiterSheet = JupiterSheet(prompt: "") })
                 manageCard
 
                 // Last on purpose: detail for someone who went looking for it,
@@ -213,8 +215,8 @@ struct DeviceDetailView: View {
                     : nil
             ) { await reload() }
         }
-        .sheet(isPresented: $showAI, onDismiss: { jupiterRequest = "" }) {
-            AIConfigureView(device: device, initialPrompt: jupiterRequest) { await reload() }
+        .sheet(item: $jupiterSheet) { sheet in
+            AIConfigureView(device: device, initialPrompt: sheet.prompt) { await reload() }
         }
         .sheet(isPresented: $showZones) {
             ZoneEditorView(device: device)
@@ -278,8 +280,7 @@ struct DeviceDetailView: View {
         .task {
             await reload()
             if DebugLaunch.openJupiter {
-                jupiterRequest = DebugLaunch.jupiterPrompt ?? ""
-                showAI = true
+                jupiterSheet = JupiterSheet(prompt: DebugLaunch.jupiterPrompt ?? "")
             } else if DebugLaunch.openHistory {
                 showHistory = true
             }
@@ -489,9 +490,8 @@ struct DeviceDetailView: View {
         VStack(alignment: .leading, spacing: SD.Space.xs) {
             AskJupiterBar(text: $jupiterDraft) {
                 guard let request = JupiterPrompt.normalized(jupiterDraft) else { return }
-                jupiterRequest = request
                 jupiterDraft = ""
-                showAI = true
+                jupiterSheet = JupiterSheet(prompt: request)
             }
             HStack(spacing: SD.Space.xxs) {
                 Text("Tell \(device.name) what to watch for. You review it before anything changes.")
@@ -500,8 +500,7 @@ struct DeviceDetailView: View {
                     .fixedSize(horizontal: false, vertical: true)
                 Spacer(minLength: SD.Space.xs)
                 Button {
-                    jupiterRequest = ""
-                    showAI = true
+                    jupiterSheet = JupiterSheet(prompt: "")
                 } label: {
                     Text("Examples")
                         .font(SD.Typography.caption.weight(.semibold))
@@ -1250,4 +1249,10 @@ struct EventRow: View {
         formatter.unitsStyle = .full
         return formatter
     }()
+}
+
+/// An Ask Jupiter screen to present, with the request it opens with.
+private struct JupiterSheet: Identifiable {
+    let id = UUID()
+    let prompt: String
 }
