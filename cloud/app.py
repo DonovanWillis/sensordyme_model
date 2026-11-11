@@ -2195,6 +2195,7 @@ def set_zones(device_id: int, body: ZonesBody, uid: int = Depends(current_user))
 
 _CATALOG_CACHE: dict[str, list[dict]] = {}
 _CATALOG_LOCK = threading.Lock()
+_TIERS_CACHE: dict[str, dict] = {}
 
 
 def _catalog() -> list[dict]:
@@ -2208,6 +2209,20 @@ def _catalog() -> list[dict]:
 @app.get("/v1/presets")
 def list_presets(uid: int = Depends(current_user)):
     return {"catalog_version": catalog_version(), "presets": _catalog()}
+
+
+@app.get("/v1/capability-tiers")
+def capability_tiers(uid: int = Depends(current_user)):
+    """How far each product capability has been shown to work (core/model_registry.py).
+    `production_validated` is the only field that may make the app say "validated"
+    for production; it is derived, never stored, and false for every capability today."""
+    from core.model_registry import capability_tiers as tiers
+    from core.model_registry import load_registry
+
+    with _CATALOG_LOCK:
+        if "tiers" not in _TIERS_CACHE:
+            _TIERS_CACHE["tiers"] = tiers(load_registry())
+        return _TIERS_CACHE["tiers"]
 
 
 def _reported_preset(row: sqlite3.Row) -> tuple[Optional[str], Optional[str], dict]:
