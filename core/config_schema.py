@@ -277,9 +277,14 @@ def validate(config: dict) -> tuple[list[str], list[str]]:
         if isinstance(driver, dict):
             # Experimental behaviour reasoning (core/behavior/, off by default):
             # a typo'd or wrong-typed key there must fail loudly, not run defaults.
+            from core.behavior.camera_model import validate_intrinsics
             from core.behavior.config import validate_behavior
 
             errors.extend(validate_behavior(driver))
+            errors.extend(validate_intrinsics(driver.get("camera_intrinsics")))
+            if driver.get("camera_intrinsics") is not None and driver.get("camera_hfov_deg") is not None:
+                errors.append("`modules.driver_attention:` set camera_hfov_deg OR camera_intrinsics, not both "
+                              "(calibrated intrinsics already fix the field of view)")
     if profile != "mac_max" and isinstance(module_name, str) and isinstance(modules_cfg, dict):
         _check(errors, module_name in modules_cfg,
                f"`module: {module_name}` has no `modules.{module_name}:` config section")

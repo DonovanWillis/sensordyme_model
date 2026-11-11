@@ -100,6 +100,7 @@ import mediapipe as mp
 import numpy as np
 
 from core.behavior import BehaviorFrame, BehaviorReasoner, parse_behavior
+from core.behavior.camera_model import CameraIntrinsics
 from core.behavior.eye_state import CLOSED as EYE_CLOSED
 from core.behavior.eye_state import EyeFrame, EyeObservation, classify_eye_state, eye_patch_occluded
 from core.behavior.phone import DETECTOR_FAILED, DETECTOR_NOT_STARTED, DETECTOR_OK, PhoneDetection
@@ -273,14 +274,22 @@ def _saturating_ratio(value: float, threshold: float) -> float:
     return min(1.0, value / threshold)
 
 
-def _camera_matrix(image_size: tuple[int, int], hfov_deg: Optional[float] = None) -> np.ndarray:
+def _camera_matrix(
+    image_size: tuple[int, int], hfov_deg: Optional[float] = None,
+    intrinsics: Optional[CameraIntrinsics] = None,
+) -> np.ndarray:
     """Pinhole intrinsics for an (h, w) frame.
+
+    Calibrated `intrinsics` (config camera_intrinsics, from a hardware
+    calibration run) take precedence over everything below; None keeps it.
 
     With `hfov_deg` None the focal length is the image width -- the historical
     assumption, a ~53 degree horizontal field of view. Given the lens's real
     horizontal FOV, fx = (w/2) / tan(hfov/2): Camera Module 3 Wide is ~102
     degrees (fx ~ 0.4 w), the standard Camera Module 3 ~66 degrees.
     """
+    if intrinsics is not None:
+        return intrinsics.matrix(image_size)
     h, w = image_size
     if hfov_deg is not None and 0.0 < float(hfov_deg) < 180.0:
         focal_length = (w / 2.0) / math.tan(math.radians(float(hfov_deg)) / 2.0)
@@ -293,12 +302,16 @@ def _camera_matrix(image_size: tuple[int, int], hfov_deg: Optional[float] = None
 
 
 def estimate_head_rotation(
-    image_points: np.ndarray, image_size: tuple[int, int], hfov_deg: Optional[float] = None
+    image_points: np.ndarray, image_size: tuple[int, int], hfov_deg: Optional[float] = None,
+    intrinsics: Optional[CameraIntrinsics] = None,
 ) -> Optional[np.ndarray]:
     """The face model's rotation into the camera frame (3x3), via solvePnP on
-    the 6 canonical landmarks, or None if pose estimation fails."""
+    the 6 canonical landmarks, or None if pose estimation fails.
+
+    Lens distortion is zero unless calibrated `intrinsics` supply it."""
+    distortion = intrinsics.distortion_coefficients() if intrinsics is not None else np.zeros((4, 1))
     success, rotation_vec, _ = cv2.solvePnP(
-        _MODEL_POINTS_3D, image_points, _camera_matrix(image_size, hfov_deg), np.zeros((4, 1)),
+        _MODEL_POINTS_3D, image_points, _camera_matrix(image_size, hfov_deg, intrinsics), distortion,
         flags=cv2.SOLVEPNP_ITERATIVE,
     )
     if not success:
@@ -372,7 +385,8 @@ def head_rotation_from_yaw_pitch_deg(yaw: float, pitch: float) -> np.ndarray:
 
 
 def estimate_head_pose_deg(
-    image_points: np.ndarray, image_size: tuple[int, int], hfov_deg: Optional[float] = None
+    image_points: np.ndarray, image_size: tuple[int, int], hfov_deg: Optional[float] = None,
+    intrinsics: Optional[CameraIntrinsics] = None,
 ) -> Optional[tuple[float, float]]:
     """Estimate (yaw, pitch) in degrees from 6 canonical facial landmarks via solvePnP.
 
@@ -400,7 +414,7 @@ def estimate_head_pose_deg(
     relative_yaw_pitch_deg -- but the convention is kept unchanged here for
     display/telemetry and for the mac_max profile, which still uses it.
     """
-    rotation_mat = estimate_head_rotation(image_points, image_size, hfov_deg)
+    rotation_mat = estimate_head_rotation(image_points, image_size, hfov_deg, intrinsics)
     if rotation_mat is None:
         return None
     return rotation_to_yaw_pitch_deg(rotation_mat)
@@ -466,6 +480,7 @@ class AttentionCalibrator:
         gaze_fused: bool = True,
         eye_gaze_scale_deg: float = 40.0,
         camera_hfov_deg: Optional[float] = None,
+        camera_intrinsics: Optional[CameraIntrinsics] = None,
     ) -> None:
         self._path = calibration_path
         self._duration_s = duration_s
@@ -476,6 +491,9 @@ class AttentionCalibrator:
         self._gaze_fused = bool(gaze_fused)
         self._eye_gaze_scale_deg = float(eye_gaze_scale_deg)
         self._camera_hfov_deg = None if camera_hfov_deg is None else float(camera_hfov_deg)
+        # Calibrated lens intrinsics, if any. Stored in the file ONLY when set, so
+        # a file written without them is unchanged and still loads (absent == None).
+        self._intrinsics_fp = None if camera_intrinsics is None else camera_intrinsics.fingerprint()
         # (t, ear, rotation or None, eye offset or None), trailing window only.
         self._samples: deque[tuple[float, float, Optional[np.ndarray], Optional[tuple[float, float]]]] = deque()
         self._start_time: Optional[float] = None
@@ -518,6 +536,12 @@ class AttentionCalibrator:
                 stored_hfov is not None and not math.isclose(float(stored_hfov), self._camera_hfov_deg)
             ):
                 return
+            stored_fp = data.get("camera_intrinsics")
+            if (stored_fp is None) != (self._intrinsics_fp is None) or (
+                stored_fp is not None and not np.allclose(np.asarray(stored_fp, dtype=float),
+                                                          np.asarray(self._intrinsics_fp, dtype=float))
+            ):
+                return  # learned under different intrinsics: recalibrate
             baseline_ear = float(data["baseline_ear"])
             ear_threshold = float(data["ear_threshold"])
             rotation = data["baseline_rotation"]
@@ -657,25 +681,23 @@ class AttentionCalibrator:
         self._baseline_eye = mean_eye
         self._samples.clear()
         self._path.parent.mkdir(parents=True, exist_ok=True)
-        self._path.write_text(
-            json.dumps(
-                {
-                    "version": self.FORMAT_VERSION,
-                    "baseline_ear": self._baseline_ear,
-                    "ear_threshold": self._ear_threshold,
-                    "baseline_rotation": None if neutral is None else [float(v) for v in neutral.ravel()],
-                    "baseline_eye_offset": None if mean_eye is None else [mean_eye[0], mean_eye[1]],
-                    # Informational only (estimate_head_pose_deg's raw Euler
-                    # convention), so the file is still human-readable.
-                    "baseline_yaw": self.baseline_yaw,
-                    "baseline_pitch": self.baseline_pitch,
-                    "gaze_fused": self._gaze_fused,
-                    "eye_gaze_scale_deg": self._eye_gaze_scale_deg,
-                    "camera_hfov_deg": self._camera_hfov_deg,
-                },
-                indent=2,
-            )
-        )
+        record = {
+            "version": self.FORMAT_VERSION,
+            "baseline_ear": self._baseline_ear,
+            "ear_threshold": self._ear_threshold,
+            "baseline_rotation": None if neutral is None else [float(v) for v in neutral.ravel()],
+            "baseline_eye_offset": None if mean_eye is None else [mean_eye[0], mean_eye[1]],
+            # Informational only (estimate_head_pose_deg's raw Euler
+            # convention), so the file is still human-readable.
+            "baseline_yaw": self.baseline_yaw,
+            "baseline_pitch": self.baseline_pitch,
+            "gaze_fused": self._gaze_fused,
+            "eye_gaze_scale_deg": self._eye_gaze_scale_deg,
+            "camera_hfov_deg": self._camera_hfov_deg,
+        }
+        if self._intrinsics_fp is not None:
+            record["camera_intrinsics"] = self._intrinsics_fp
+        self._path.write_text(json.dumps(record, indent=2))
 
 
 #: How much observed time PERCLOS needs before it will report a number at all.
@@ -1018,6 +1040,7 @@ class DriverAttentionModule(VisionModule):
         self._gaze_scale_deg = float(config.get("eye_gaze_scale_deg", 40.0))
         hfov = config.get("camera_hfov_deg")
         self._camera_hfov_deg: Optional[float] = None if hfov is None else float(hfov)
+        self._camera_intrinsics = CameraIntrinsics.from_config(config.get("camera_intrinsics"))
         self._calibrator = AttentionCalibrator(
             calibration_path=Path(config.get("calibration_path", "data/calibration.json")),
             duration_s=float(config.get("calibration_duration_s", 10.0)),
@@ -1029,6 +1052,7 @@ class DriverAttentionModule(VisionModule):
             gaze_fused=self._enable_gaze,
             eye_gaze_scale_deg=self._gaze_scale_deg,
             camera_hfov_deg=self._camera_hfov_deg,
+            camera_intrinsics=self._camera_intrinsics,
         )
 
         # --- signal conditioning: raw landmark-derived measurements are NOISY,
@@ -1872,7 +1896,7 @@ class DriverAttentionModule(VisionModule):
             ],
             dtype=np.float64,
         )
-        rotation = estimate_head_rotation(image_points, (h, w), self._camera_hfov_deg)
+        rotation = estimate_head_rotation(image_points, (h, w), self._camera_hfov_deg, self._camera_intrinsics)
         if rotation is not None:
             # Raw Euler angles (estimate_head_pose_deg's convention): display
             # and telemetry only -- thresholds use the rotation relative to the
