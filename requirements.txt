@@ -13,6 +13,12 @@
 # Python 3.11+ required (mediapipe does not yet support 3.13+).
 -r requirements-device.txt
 
+# --- Developer machines and CI ONLY (moved out of requirements-device.txt, M6.5) ---
+# The test runner; requirements-dev.txt pins the same version for the toolchain.
+pytest==8.3.3
+# The mac_max VLM judge (core/vlm_judge.py, provider: anthropic). Never on a device.
+anthropic==0.116.0
+
 # --- Developer machines and CI ONLY. NOT installed on a device. --------------
 # ultralytics is AGPL-3.0 (confirmed in the installed dist-info METADATA), and
 # SensorDyme both conveys software on hardware and serves inference over a

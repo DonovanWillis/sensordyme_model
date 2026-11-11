@@ -1,6 +1,6 @@
 .PHONY: help dev dev-debug dev-max dev-openpilot dev-skinnemoen dev-dashsentinel \
         bench accuracy accuracy-dataset accuracy-gate report deploy deploy-preflight \
-        release-manifest release-verify \
+        release-manifest release-verify verify-release \
         test test-cov test-ios lint lint-fix fmt-check typecheck audit check mutants \
         setup-dev hooks clean sim sim-backend sim-device sim-scenarios sim-e2e
 
@@ -348,3 +348,8 @@ release-verify: ## compare SNAPSHOT= (device snapshot JSON) against $(RELEASE_DI
 	@test -n "$(SNAPSHOT)" || { echo "usage: make release-verify SNAPSHOT=path/to/snapshot.json"; exit 2; }
 	$(VENV)/python scripts/release/make_release_manifest.py verify \
 		--manifest $(RELEASE_DIR)/manifest.json --snapshot $(SNAPSHOT) --out $(RELEASE_DIR)/verify.json
+
+# M6.5: the one offline release check (device deps, manifest + release gates, systemd
+# units, focused tests). Seconds on the Mac; changes nothing. See docs/RELEASE_MANIFEST.md.
+verify-release: ## offline release verification of REF= (default HEAD): deps, gates, units, focused tests
+	bash scripts/release/verify.sh $(REF)

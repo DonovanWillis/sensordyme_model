@@ -44,6 +44,19 @@ Rules:
 
 ## A. Before Monday (Mac; no device needed)
 
+**A0. One-command offline release verification** (read-only; M6.5; ~15 s on the Mac):
+```bash
+make verify-release REF=$RC        # = bash scripts/release/verify.sh $RC
+```
+Expect `RELEASE VERIFICATION: PASS`. It checks the device dependencies (no test/dev packages,
+every device import pinned), builds the manifest from git objects and runs the release gates
+(model pins consistent, decoder `legacy`, every `/v1` route the device and app call exists in the
+backend, `requirements-device.lock` agrees with the pins, `config.yaml` passes the schema, the
+status tiers in `scripts/release/release_status.yaml` are well formed), validates the systemd
+units where `systemd-analyze` exists (SKIP on macOS; run it on a worker), and runs the focused
+release tests. **FAIL:** do not take this ref to the device. The status-tier table in
+`manifest.md` (A2) is what this release may and may not claim; nothing in it is hardware-validated.
+
 **A1. Tests on the release candidate** (read-only):
 ```bash
 git switch --detach $RC && git status --short            # expect: nothing
@@ -274,6 +287,14 @@ sha256sum $D/models/*.hef                                 # expect: e69136d3…9
 ```
 **FAIL:** a pip error (no network? see §K3, or restore the venv from `$PREV/.venv`); a model hash that is not the pin.
 
+> M6.5 notes for F2. `requirements-device.txt` no longer contains `pytest` or `anthropic`; pip
+> does not uninstall them, so an existing venv keeps them (harmless; `release-verify` compares
+> only the pins). Do not switch to `requirements-device.lock` (`--require-hashes`) or to the
+> least-privilege unit (`deploy/systemd/sensordyme.service.hardened`) on Monday: both are
+> hardware-pending and are a separate, later session (`docs/LEAST_PRIVILEGE.md`). F2 installs
+> the **stock** unit, as before. No identity changes: device id, device key and claim code are
+> carried over by F1 unchanged, and no key is rotated.
+
 **F3. Verify the installed tree against the manifest before starting** (read-only):
 ```bash
 $PY $V/integrity_manifest.py snapshot --root $D --expect-role driver_safety --out $EV/integrity_rc.json
@@ -455,12 +476,18 @@ The previous unit has no `OnFailure=`, so the recovery unit stays installed and 
 
 **O3. Total:** write the E5 image back to the card. On the Mac: `diskutil unmountDisk /dev/diskN && sudo dd if=$REL/pi-sd-<date>.img of=/dev/rdiskN bs=4m status=progress`. Check the disk number twice.
 
+**O4. Least-privilege unit** (only if a later session adopted it; not part of Monday): run the
+ROLLBACK block printed by `bash scripts/release/least_privilege_plan.sh --from-dir $D`. It
+reinstalls the stock unit with `install_units.sh`, removes the drop-in, and copies
+`/var/lib/sensordyme` back into `$D/data`.
+
 ---
 
 ## P. Acceptance checklist
 
 All items are **NOT EXECUTED — requires the physical device**. Tick only with evidence in `$EV/LOG.md`.
 
+- [ ] A0 `make verify-release REF=$RC` PASS (Mac), and the systemd step PASS on a worker
 - [ ] B2 power: `throttled=0x0` at idle and after the J soak; 27 W PSU
 - [ ] B3 storage: no I/O errors; ≥4 GB free; cooling present
 - [ ] C1–C5 baseline recorded: OS, firmware, packages, service user/dir, device id, installed-code revision, health

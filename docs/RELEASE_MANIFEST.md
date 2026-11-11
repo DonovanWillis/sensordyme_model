@@ -34,6 +34,30 @@ uncommitted edit can never enter a manifest. It records:
 | `systemd_units` | sha256 of the `sensordyme.service` template and `deploy/systemd/sensordyme-recover.service` |
 | `test_runs` | Free-text references to the test runs that back this release (`--test-ref`, repeatable) |
 
+## M6.5 additions: release facts, gates, and one verification command
+
+`build` now also records:
+
+| Field | Meaning |
+|---|---|
+| `protocol` | Declared versions (device runtime `_VERSION`, backend FastAPI `version`, iOS `MARKETING_VERSION`, API prefix `/v1`) and every `/v1` route the device (`core/uplink.py`) and the iOS app (`ios/Sources/*.swift`) call, matched against the backend's routes (`cloud/app.py`). `compatible` is false when a client calls a route the backend lacks |
+| `dependency_lock` | `requirements-device.lock` sha256, package count, pins that disagree with `requirements-device.txt`, packages without a hash |
+| `config_schema` | `core.config_schema.validate` on the repo `config.yaml` (errors and warnings) |
+| `status_tiers` | `scripts/release/release_status.yaml`: per component, one or more of software-ready / simulator-verified / hardware-pending / experiment-only / production-blocked, with evidence. Six `pending_integration` slots wait for the other M6.5 workstreams (device auth, BLE PoP, XCUITest, reliability, registry binding, the EXP-08 training run) |
+| `known_good` | The configuration the release was checked with: config hash, role/module/profile, decoder, `.hef` path and pin, device-requirements hash, which unit |
+| `procedures` | Where rollback, identity migration (none in this release) and the least-privilege migration are documented |
+| `systemd_units` | Now also the least-privilege unit and its optional drop-in |
+
+`check --manifest m.json` runs the **release gates** (exit 1 on any FAIL): model pins
+consistent; decoder is `legacy`; protocol compatible; lock consistent and fully hashed; config
+passes the schema; status tiers valid and free of hardware-validation claims. An input that does
+not exist at an older ref is INFO, never a silent PASS.
+
+**One command** for all offline checks: `make verify-release [REF=…]`
+(`scripts/release/verify.sh`): device dependencies → manifest build → gates → systemd units
+(`systemd-analyze verify` + offline exposure score; SKIP on macOS) → focused release tests.
+About 15 s on the Mac, no downloads, changes nothing. `KEEP_MANIFEST=<dir>` keeps the manifest.
+
 ## verify (device snapshot → Mac)
 
 On the Pi, read-only, with the M5 integrity script (it never copies contents;

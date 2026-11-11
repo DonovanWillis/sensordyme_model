@@ -1,0 +1,119 @@
+# SensorDyme edge vision service -- LEAST-PRIVILEGE variant. PREPARED, NOT INSTALLED.
+#
+# Status: software-ready, hardware-pending. Not enabled on any device. The stock
+# ../../sensordyme.service stays the installed unit until this one has been run on
+# a real Pi (camera, AI HAT, GPIO buzzer, BLE provisioning, Wi-Fi join, watchdog)
+# by the procedure in docs/LEAST_PRIVILEGE.md. Every grant below is derived from
+# what the code opens; the access matrix there says which line serves which file.
+#
+# Differences from the stock unit, in one place:
+#   * a dedicated system user `sensordyme`, not the installing admin user;
+#   * the code is root-owned and read-only under /opt/sensordyme; all mutable
+#     state is /var/lib/sensordyme, bind-mounted onto the data/ path the code uses;
+#   * no sudo: NoNewPrivileges, so the two privileged actions use
+#     SENSORDYME_PRIVILEGE=direct (core/privilege.py) -- reboot through polkit,
+#     btmgmt only via the optional btmgmt-advertising.conf drop-in;
+#   * no capabilities, closed device policy, filtered syscalls and socket families.
+# The start-limit, recovery, watchdog and exit-78 semantics are IDENTICAL to the
+# stock unit (tests/test_least_privilege_unit.py compares them key by key).
+
+[Unit]
+Description=SensorDyme edge vision service (least privilege)
+After=multi-user.target bluetooth.service
+Wants=bluetooth.service
+StartLimitIntervalSec=120
+StartLimitBurst=5
+StartLimitAction=none
+OnFailure=sensordyme-recover.service
+
+[Service]
+Type=notify
+NotifyAccess=main
+User=sensordyme
+Group=sensordyme
+# video: /dev/video*, /dev/media*, /dev/v4l-subdev*, /dev/dma_heap/* (libcamera), /dev/vcio (vcgencmd)
+# gpio: /dev/gpiochip*, /dev/gpiomem* (gpiozero/lgpio buzzer)    audio: /dev/snd/* (simpleaudio, aplay)
+# netdev: NetworkManager polkit grant (deploy/polkit/10-sensordyme-network.rules)
+# bluetooth: BlueZ D-Bus policy for the GATT server    hailo: /dev/hailo0 (deploy/udev/60-sensordyme-hailo.rules)
+# A group that does not exist stops the unit from starting: create them first (docs/LEAST_PRIVILEGE.md).
+SupplementaryGroups=video gpio audio netdev bluetooth hailo
+WorkingDirectory=/opt/sensordyme
+Environment=SENSORDYME_PRIVILEGE=direct
+Environment=HOME=/var/lib/sensordyme
+Environment=MPLCONFIGDIR=/var/cache/sensordyme/matplotlib
+Environment=XDG_CACHE_HOME=/var/cache/sensordyme
+Environment=HAILORT_LOGGER_PATH=/var/log/sensordyme
+Environment=PYTHONDONTWRITEBYTECODE=1
+ExecStartPre=-/opt/sensordyme/.venv/bin/python /opt/sensordyme/scripts/preflight.py
+ExecStart=/opt/sensordyme/.venv/bin/python /opt/sensordyme/main.py --no-display
+WatchdogSec=45
+Restart=always
+RestartSec=3
+RestartPreventExitStatus=78
+TimeoutStartSec=180
+
+# --- filesystem: everything read-only except the service's own state, cache and logs
+StateDirectory=sensordyme
+StateDirectoryMode=0750
+CacheDirectory=sensordyme
+CacheDirectoryMode=0750
+LogsDirectory=sensordyme
+LogsDirectoryMode=0750
+# The code writes relative data/... paths (events.csv, telemetry.csv, device_state.json,
+# monitoring.json, preflight.json, .reboot_state.json, evidence/, training/).
+BindPaths=/var/lib/sensordyme:/opt/sensordyme/data
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+UMask=0027
+RemoveIPC=yes
+KeyringMode=private
+
+# --- privilege
+NoNewPrivileges=yes
+CapabilityBoundingSet=
+AmbientCapabilities=
+RestrictSUIDSGID=yes
+LockPersonality=yes
+RestrictRealtime=yes
+RestrictNamespaces=yes
+# PrivateUsers= stays off: in a user namespace the supplementary groups above are
+# unmapped and every group-owned device node (camera, GPIO, audio, Hailo) is lost.
+# MemoryDenyWriteExecute= stays off until verified on a Pi: XNNPACK (mediapipe) and
+# onnxruntime may generate code at run time.
+
+# --- kernel surfaces
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectKernelLogs=yes
+ProtectControlGroups=yes
+ProtectClock=yes
+ProtectHostname=yes
+ProtectProc=invisible
+SystemCallArchitectures=native
+SystemCallFilter=@system-service
+SystemCallErrorNumber=EPERM
+
+# --- devices: closed policy (/dev/null, zero, full, random, urandom, tty stay available)
+DevicePolicy=closed
+DeviceAllow=char-video4linux rw
+DeviceAllow=char-media rw
+DeviceAllow=char-dma_heap rw
+DeviceAllow=/dev/vcio rw
+DeviceAllow=/dev/hailo0 rw
+DeviceAllow=char-gpiochip rw
+DeviceAllow=char-rpi-gpiomem rw
+DeviceAllow=char-alsa rw
+
+# --- network: D-Bus/journal/sd_notify (unix), uplink + dashboard (inet), interface queries (netlink).
+# AF_BLUETOOTH is added only by btmgmt-advertising.conf; the GATT server talks to bluetoothd over D-Bus.
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6 AF_NETLINK
+
+# --- resources: generous first bounds, NOT measured on a Pi yet (hardware-pending)
+MemoryHigh=1200M
+MemoryMax=1600M
+TasksMax=512
+LimitNOFILE=4096
+
+[Install]
+WantedBy=multi-user.target
