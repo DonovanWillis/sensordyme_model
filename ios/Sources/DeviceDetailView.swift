@@ -311,7 +311,9 @@ struct DeviceDetailView: View {
                 status: device.online ? .online : .offline,
                 pulses: device.online
             )
+            .accessibilityIdentifier("detail.online")
             SDStatusPill(status: pill.tone.sdStatus, text: pill.text)
+                .accessibilityIdentifier("detail.monitoring")
             Spacer(minLength: SD.Space.xs)
             HStack(spacing: 5) {
                 if customMonitoringActive {
@@ -324,7 +326,8 @@ struct DeviceDetailView: View {
                      ? (device.monitoring?.title ?? "AI Custom Monitoring")
                      : presetTitle(device.activePreset))
                     .font(SD.Typography.caption.weight(.medium))
-                    .lineLimit(1)
+                    .lineLimit(2)
+                    .multilineTextAlignment(.trailing)
             }
             .foregroundStyle(customMonitoringActive ? SD.Colors.textPrimary : SD.Colors.textTertiary)
         }
@@ -503,8 +506,12 @@ struct DeviceDetailView: View {
                     Text("Examples")
                         .font(SD.Typography.caption.weight(.semibold))
                         .foregroundStyle(SD.Colors.textSecondary)
+                        .frame(minHeight: 44)  // the minimum touch target
+                        .contentShape(Rectangle())
                 }
                 .buttonStyle(.plain)
+                .accessibilityLabel("Jupiter examples")
+                .accessibilityIdentifier("detail.examples")
             }
             .padding(.horizontal, SD.Space.xxs)
         }
@@ -529,6 +536,7 @@ struct DeviceDetailView: View {
                         )
                     }
                     .buttonStyle(SDRowButtonStyle(minHeight: 60))
+                    .accessibilityIdentifier("detail.history")
 
                     OrynRowDivider()
 
@@ -540,6 +548,7 @@ struct DeviceDetailView: View {
                         )
                     }
                     .buttonStyle(SDRowButtonStyle(minHeight: 60))
+                    .accessibilityIdentifier("detail.zones")
 
                     OrynRowDivider()
 
@@ -640,9 +649,12 @@ struct DeviceDetailView: View {
                     }
                     .padding(.vertical, SD.Space.xxs)
 
+                    // Alongside a mode, picking the mode again leaves the rules on
+                    // (measured against the backend: rules_active stays 1); their
+                    // own switches under Custom rules are what turn them off.
                     Text(customReplacesModes
                          ? "Pick a mode below to go back to standard monitoring."
-                         : "Pick the mode below again to turn these rules off.")
+                         : "Turn these rules off with their switches under Custom rules.")
                         .font(SD.Typography.caption)
                         .foregroundStyle(SD.Colors.textTertiary)
 
@@ -716,9 +728,11 @@ struct DeviceDetailView: View {
                         .frame(width: 26)
                         .foregroundStyle(isActive ? SD.Colors.textPrimary : SD.Colors.textDisabled)
                     VStack(alignment: .leading, spacing: 1) {
+                        // Unavailable reads quieter than the others, at a contrast
+                        // that can still be read (textDisabled is 3.9:1).
                         Text(preset.title)
                             .font(SD.Typography.body)
-                            .foregroundStyle(isUnavailable ? SD.Colors.textDisabled : SD.Colors.textPrimary)
+                            .foregroundStyle(isUnavailable ? SD.Colors.textTertiary : SD.Colors.textPrimary)
                         switch rowState {
                         case .failed(let message):
                             Text(message)
@@ -736,7 +750,7 @@ struct DeviceDetailView: View {
                             Text(preset.description)
                                 .font(SD.Typography.caption)
                                 .foregroundStyle(SD.Colors.textTertiary)
-                                .lineLimit(2)
+                                .fixedSize(horizontal: false, vertical: true)
                         }
                         // How far it has been validated, from the catalog. Only
                         // "validated on device" is ever green.
@@ -765,10 +779,14 @@ struct DeviceDetailView: View {
                 }
                 .contentShape(Rectangle())
             }
-            .buttonStyle(.plain)
+            .buttonStyle(SDUndimmedButtonStyle())
             // The backend would refuse it (role_forbids_preset, a capability
             // the device lacks, planned): nothing to tap.
             .disabled(isUnavailable)
+            // The row's state was a checkmark or spinner alone: said here too.
+            .accessibilityValue(rowState.spokenValue)
+            .accessibilityAddTraits(isActive ? .isSelected : [])
+            .accessibilityIdentifier("preset.row.\(preset.id)")
 
             // Details, settings and validation. Enabled even when the preset
             // can't be picked, so the reason can be read in full.
@@ -781,6 +799,7 @@ struct DeviceDetailView: View {
             }
             .buttonStyle(.plain)
             .accessibilityLabel("\(preset.title) details and settings")
+            .accessibilityIdentifier("preset.info.\(preset.id)")
             }
 
             // Tuning variants, shown only for the mode currently running.
@@ -809,6 +828,10 @@ struct DeviceDetailView: View {
                                     )
                             }
                             .buttonStyle(.plain)
+                            // Selection was shown by colour only.
+                            .accessibilityAddTraits(selected ? .isSelected : [])
+                            .accessibilityLabel("\(preset.title): \(variant.title)")
+                            .accessibilityIdentifier("preset.variant.\(variant.id)")
                         }
                     }
                     .padding(.leading, 26 + SD.Space.sm)
@@ -976,6 +999,7 @@ struct DeviceDetailView: View {
         }
         .buttonStyle(SDRowButtonStyle(minHeight: 60))
         .disabled(busy || protectionUnsupported != nil || device.status == nil)
+        .accessibilityIdentifier("detail.protection")
 
         if let note {
             Text(note.text)
@@ -1213,6 +1237,17 @@ struct EventRow: View {
             }
         }
         .padding(.vertical, SD.Space.xxs)
-        .accessibilityElement(children: .combine)
+        // The dot's colour is the severity; say it.
+        .accessibilityElement(children: .ignore)
+        .accessibilityLabel(EventAccessibility.label(
+            title: title, severity: event.severity, signals: event.signals,
+            when: event.date.map { Self.spokenAge.localizedString(for: $0, relativeTo: .now) }))
+        .accessibilityIdentifier("event.row")
     }
+
+    private static let spokenAge: RelativeDateTimeFormatter = {
+        let formatter = RelativeDateTimeFormatter()
+        formatter.unitsStyle = .full
+        return formatter
+    }()
 }

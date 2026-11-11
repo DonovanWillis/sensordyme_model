@@ -73,3 +73,36 @@ targets:
         # survives a DHCP move. Set this only to a real deployed HTTPS URL.
         SENSORDYME_API_BASE_URL: ""
         ASSETCATALOG_COMPILER_APPICON_NAME: AppIcon
+  # XCUITest journeys against the virtual device and a local backend
+  # (scripts/sim/ios_uitest.sh starts both and runs these). Test-only: nothing
+  # here is linked into the app, and the DEBUG launch hooks the tests use
+  # (DebugLaunch.swift) compile to constants in Release.
+  SensorDymeUITests:
+    type: bundle.ui-testing
+    platform: iOS
+    sources:
+      - UITests
+    dependencies:
+      - target: SensorDyme
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: com.sensordyme.app.uitests
+        GENERATE_INFOPLIST_FILE: YES
+        SWIFT_VERSION: "5.9"
+        TEST_TARGET_NAME: SensorDyme
+        CODE_SIGN_STYLE: Automatic
+        DEVELOPMENT_TEAM: D6ZR59ZR7Q
+schemes:
+  SensorDyme:
+    build:
+      targets:
+        SensorDyme: all
+        SensorDymeUITests: [test]
+    run:
+      config: Debug
+    test:
+      config: Debug
+      targets:
+        - SensorDymeUITests
+    archive:
+      config: Release

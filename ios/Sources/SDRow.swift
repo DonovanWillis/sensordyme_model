@@ -14,6 +14,17 @@ import SwiftUI
 ///     44pt guidance and misses are invisible to the person missing
 ///   - a pressed state, so a tap is acknowledged before whatever it triggers
 ///     has had time to appear
+/// A plain button that does not fade when disabled. `.plain` drew a disabled
+/// label at half opacity, which put the one line explaining why a choice is
+/// unavailable at 2.4:1 contrast. The disabled state is still exposed to
+/// VoiceOver ("dimmed") and the label's own colours say it.
+struct SDUndimmedButtonStyle: ButtonStyle {
+    func makeBody(configuration: Configuration) -> some View {
+        configuration.label
+            .opacity(configuration.isPressed ? 0.6 : 1)
+    }
+}
+
 struct SDRowButtonStyle: ButtonStyle {
     var minHeight: CGFloat = 56
 

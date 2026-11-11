@@ -72,6 +72,8 @@ struct DevicesView: View {
                             DeviceCard(device: device)
                         }
                         .buttonStyle(.plain)
+                        .accessibilityIdentifier("device.card")
+                        .accessibilityHint("Opens the live view and controls")
                     }
 
                     if devices.isEmpty {
@@ -161,23 +163,24 @@ struct DevicesView: View {
                 // Beside the actions so a background refresh is visible
                 // without occupying a row of its own.
                 SDProgress(phase: refreshing.phase)
-                headerButton("dot.radiowaves.left.and.right", label: "Connect over Bluetooth") {
+                headerButton("dot.radiowaves.left.and.right", label: "Connect over Bluetooth", id: "devices.bluetooth") {
                     showSetup = true
                 }
-                headerButton("plus", label: "Add device") { showClaim = true }
+                headerButton("plus", label: "Add device", id: "devices.add") { showClaim = true }
             }
             .padding(.top, SD.Space.xs)
 
             Text("Your Devices")
-                .font(.system(size: 32, weight: .semibold))
+                .sdScaledFont(32, relativeTo: .largeTitle, weight: .semibold)
                 .kerning(-0.6)
                 .foregroundStyle(SD.Colors.textPrimary)
                 .accessibilityAddTraits(.isHeader)
+                .accessibilityIdentifier("devices.title")
         }
         .frame(maxWidth: .infinity, alignment: .leading)
     }
 
-    private func headerButton(_ icon: String, label: String, action: @escaping () -> Void) -> some View {
+    private func headerButton(_ icon: String, label: String, id: String, action: @escaping () -> Void) -> some View {
         Button(action: action) {
             Image(systemName: icon)
                 .font(.system(size: 14, weight: .medium))
@@ -189,6 +192,7 @@ struct DevicesView: View {
         }
         .buttonStyle(.plain)
         .accessibilityLabel(label)
+        .accessibilityIdentifier(id)
     }
 
     /// One line under the title: how many devices, how many are up. Counted
@@ -321,7 +325,7 @@ struct DeviceCard: View {
                     Text(device.name)
                         .font(SD.Typography.headline)
                         .foregroundStyle(SD.Colors.textPrimary)
-                        .lineLimit(1)
+                        .lineLimit(2)
                     Text(subtitle)
                         .font(SD.Typography.caption)
                         .foregroundStyle(SD.Colors.textTertiary)
@@ -370,7 +374,9 @@ struct DeviceCard: View {
                     if let id = device.hardwareId {
                         Text(id)
                             .font(SD.Typography.mono)
-                            .foregroundStyle(SD.Colors.textDisabled)
+                            .foregroundStyle(SD.Colors.textTertiary)
+                            .lineLimit(1)
+                            .minimumScaleFactor(0.6)
                     }
                 }
                 Spacer()

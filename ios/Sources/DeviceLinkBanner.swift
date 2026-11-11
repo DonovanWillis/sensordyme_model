@@ -78,15 +78,20 @@ struct DeviceLinkBanner: View {
                     .font(SD.Typography.headline)
                     .foregroundStyle(tint)
                 VStack(alignment: .leading, spacing: SD.Space.xxs) {
-                    Text(title)
-                        .font(SD.Typography.label)
-                        .foregroundStyle(SD.Colors.textPrimary)
-                    if let detail {
-                        Text(detail)
-                            .font(SD.Typography.caption)
-                            .foregroundStyle(SD.Colors.textSecondary)
-                            .fixedSize(horizontal: false, vertical: true)
+                    // The words as one element; the action stays its own button
+                    // (combining the whole card made the button unpressable).
+                    VStack(alignment: .leading, spacing: SD.Space.xxs) {
+                        Text(title)
+                            .font(SD.Typography.label)
+                            .foregroundStyle(SD.Colors.textPrimary)
+                        if let detail {
+                            Text(detail)
+                                .font(SD.Typography.caption)
+                                .foregroundStyle(SD.Colors.textSecondary)
+                                .fixedSize(horizontal: false, vertical: true)
+                        }
                     }
+                    .accessibilityElement(children: .combine)
                     if let action {
                         Button(action) { Task { await link.resolve(force: true) } }
                             .font(SD.Typography.caption.weight(.semibold))
@@ -97,6 +102,6 @@ struct DeviceLinkBanner: View {
                 Spacer(minLength: 0)
             }
         }
-        .accessibilityElement(children: .combine)
+        .accessibilityElement(children: .contain)
     }
 }

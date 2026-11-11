@@ -45,6 +45,7 @@ struct RootView: View {
         content
             .background(SD.Colors.background.ignoresSafeArea())
             .task {
+                if DebugLaunch.signOut, state.isSignedIn { state.signOut() }
                 if let session = DebugLaunch.session, !state.isSignedIn {
                     state.signIn(AuthResponse(token: session.token, email: session.email))
                 }

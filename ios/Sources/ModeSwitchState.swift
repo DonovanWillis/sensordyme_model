@@ -35,6 +35,19 @@ enum ModeRowState: Equatable {
         if case .unavailable = self { return true }
         return false
     }
+
+    /// The row's state for VoiceOver. On screen it is a checkmark, a spinner or
+    /// an icon; the reason texts are already read as part of the row's label.
+    var spokenValue: String {
+        switch self {
+        case .inactive: ""
+        case .switching: "Switching"
+        case .queuedOffline: "Waiting for the device to reconnect"
+        case .active: "Active"
+        case .failed: "Switch failed"
+        case .unavailable: "Not available on this device"
+        }
+    }
 }
 
 enum ModeSwitchState {

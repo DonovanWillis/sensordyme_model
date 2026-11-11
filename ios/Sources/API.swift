@@ -162,7 +162,17 @@ struct APIClient {
     }
 
     private func decode<T: Decodable>(_ type: T.Type, from data: Data) throws -> T {
-        try JSONDecoder().decode(type, from: data)
+        try Self.decodeReply(type, from: data)
+    }
+
+    /// Decode a reply, turning a malformed one into a message a person can act on
+    /// (ReplyError) instead of Foundation's "isn't in the correct format".
+    static func decodeReply<T: Decodable>(_ type: T.Type, from data: Data) throws -> T {
+        do {
+            return try JSONDecoder().decode(type, from: data)
+        } catch let error as DecodingError {
+            throw APIError(message: ReplyError.message(for: error) ?? ReplyError.unreadable)
+        }
     }
 
     // MARK: auth

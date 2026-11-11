@@ -90,7 +90,10 @@ struct CustomRulesCard: View {
             } else {
                 Toggle("", isOn: Binding(get: { rule.enabled }, set: { onToggle(rule, $0) }))
                     .labelsHidden()
-                    .accessibilityLabel(rule.enabled ? "Turn off \(rule.summary)" : "Turn on \(rule.summary)")
+                    // The rule is the label; the switch's own value says on or off.
+                    // "Turn off X, switch, on" said the action and the state at once.
+                    .accessibilityLabel(rule.summary)
+                    .accessibilityIdentifier("rule.toggle")
             }
         }
         .padding(.vertical, 2)

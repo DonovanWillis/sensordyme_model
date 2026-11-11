@@ -955,7 +955,7 @@ extension APIClient {
         if let error = Self.httpError(status: status, data: data, sentToken: token != nil) {
             throw error
         }
-        return try JSONDecoder().decode(T.self, from: data)
+        return try Self.decodeReply(T.self, from: data)
     }
 
     func postJSON<T: Decodable>(_ path: String, body: [String: Any]) async throws -> T {
@@ -980,6 +980,6 @@ extension APIClient {
         if let error = Self.httpError(status: status, data: data, sentToken: token != nil) {
             throw error
         }
-        return try JSONDecoder().decode(T.self, from: data)
+        return try Self.decodeReply(T.self, from: data)
     }
 }
