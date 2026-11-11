@@ -227,7 +227,8 @@ def test_a_role_incompatible_preset_delivered_anyway_is_refused_by_the_device(st
 
 
 def test_an_invalid_policy_is_refused_whole_and_the_running_rules_are_kept(stack, monitor):
-    script = _timeline("rules_then_phone", (C + 30, PHONE_VISIBLE, Faults()), (C + 36, ATTENTIVE, Faults()))
+    script = _timeline("rules_then_phone", (C + 30, PHONE_VISIBLE, Faults()), (C + 36, ATTENTIVE, Faults()),
+                       (C + 45, SEAT_EMPTY, Faults()), (C + 55, ATTENTIVE, Faults()))
     tap = _CommandTap(stack.transport)
     device = stack.boot(script, transport=tap)
     stack.claim()
@@ -257,6 +258,10 @@ def test_an_invalid_policy_is_refused_whole_and_the_running_rules_are_kept(stack
     device.advance(20.0)  # C+38: the phone was on the dash from C+30, the kept rule fired
     custom = [e["type"] for e in stack.events() if e["source"] == "custom_rule"]
     assert custom == ["cell phone"], "only the phone rule's condition was ever true: " + repr(custom)
+    device.advance(18.0)  # C+56: the seat was empty from C+45: the second kept rule fires too
+    custom = [e["type"] for e in stack.events() if e["source"] == "custom_rule"]
+    assert custom == ["cell phone", "person"], custom
+    assert stack.event_types().count("drowsiness") == 0
     monitor.assert_clean()
 
 

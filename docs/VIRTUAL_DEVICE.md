@@ -193,6 +193,34 @@ draft_superseded`) → running additively beside driver safety → fires;
 unsupported prompt refused; a rule the device cannot run reported in
 `status.rules.rejected` with the previous rule kept.
 
+### Reliability invariants and stress (M6.5)
+
+`sim/invariants.py` `InvariantMonitor(stack)` hooks every device the stack boots and
+checks, after every monitoring check, command application and uplink cycle (device
+side) and every uplink cycle (app side, `GET /v1/devices`):
+
+| Invariant | Holds when |
+|---|---|
+| `failed_not_protecting` | FAILED never reports `protecting` or `monitoring_active: true` |
+| `stopped_not_ready` | an explicit stop always reports `stopped`/`stopped`, never `ready` |
+| `stale_not_healthy` | a stale device is `unknown`/`unknown`/`null`, offline, health withheld |
+| `rejected_rule_inactive` | the running rule set is always one the device accepts |
+| `no_duplicate_effect` | one protection command id = one state change; one alert = one stored row |
+| `driver_floor` | a protecting driver_safety device runs driver_attention; never `ai_custom` |
+| `queue_bounded` | the uplink backlog never exceeds its capacity |
+
+`tests/test_sim_reliability.py` (multi-stage scenarios: offline boot, replayed /
+overwritten / lost / malformed commands, an old backend's role-forbidden preset,
+invalid policies, two rules, network flapping, close episodes, detector → camera →
+actuator faults, damaged state files, malformed config, 20 min with faults, the
+production backoff) and `tests/test_sim_stress.py` (backlog, retry storm,
+producer/consumer race, the three production threads together, restart leaks, a
+misbehaving link) assert it, each capped in iterations and wall time.
+`VirtualDevice(honour_backoff=True)` syncs on the production reconnection backoff
+(`CloudUplink.next_delay`) instead of the fixed poll interval: with the fixed
+cadence a flap period equal to the poll interval phase-locks every sync into a
+down window, which production's jitter does not.
+
 ---
 
 ## Simulated vs real
