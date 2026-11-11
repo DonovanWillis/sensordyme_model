@@ -303,157 +303,170 @@ class CloudUplink:
 
     # ------------------------------------------------------------------ worker
     def _run(self) -> None:
-        headers = {"X-Device-Key": self._device_key}
         while not self._stop.is_set():
-            # Bound OUTSIDE the try. The except handler below re-queues `batch`, so if
-            # anything raised before it was assigned the handler itself would raise
-            # NameError -- and since this loop has no outer try, that kills the uplink
-            # thread outright. The device would then keep detecting and alerting
-            # locally while silently never reaching the backend again, which is the
-            # worst failure shape available: no events, no error, no reconnect.
-            batch: list = []
-            more_waiting = False
-            try:
-                with self._lock:
-                    take = min(len(self._queue), self._batch_max)
-                    batch = [self._queue.popleft() for _ in range(take)]
-                    active = self._active_preset
-                    rules_version = self._rules_version
-                    zones_version = self._zones_version
-                    health = self._health
-                    monitoring = self._monitoring
-                # 1) push events (an empty batch doubles as the online heartbeat)
-                resp = self._requests.post(
-                    f"{self._base_url}/v1/ingest",
-                    json=_json_safe({
-                        "events": batch,
-                        "active_preset": active,
-                        "rules_version": rules_version,
-                        "zones_version": zones_version,
-                        "health": health,
-                        "monitoring": monitoring,
-                    }),
-                    headers=headers,
-                    timeout=10,
-                    verify=self._verify,
-                    # Never follow: see _RedirectedError. A redirect is a base_url to
-                    # fix, reported below, with every event kept meanwhile.
-                    allow_redirects=False,
-                )
-                if 300 <= int(getattr(resp, "status_code", 200) or 200) < 400:
-                    raise _RedirectedError(resp)
-                resp.raise_for_status()
-                # 2) the ingest response carries any pending command
-                command = resp.json().get("command") or {}
-                if command.get("set_preset"):
-                    with self._lock:
-                        self._pending_preset = command["set_preset"]
-                if "set_rules" in command:
-                    rules = command.get("set_rules")
-                    with self._lock:
-                        self._pending_rules = rules if isinstance(rules, list) else []
-                        # Acknowledge immediately: the main loop applies these on
-                        # its next tick, and re-sending every poll until then
-                        # would restart in-flight rule tracking each time.
-                        self._rules_version = str(command.get("rules_version") or "")
-                        self._rules_instruction = str(command.get("rules_instruction") or "")
-                protection = command.get("set_protection")
-                if isinstance(protection, dict) and protection.get("action") in ("stop", "resume"):
-                    with self._lock:
-                        self._pending_protection = {
-                            "action": protection["action"], "confirm": protection.get("confirm") is True,
-                            "id": protection.get("id"),
-                        }
-                if "set_zones" in command:
-                    zones = command.get("set_zones")
-                    with self._lock:
-                        self._pending_zones = zones if isinstance(zones, list) else []
-                        self._zones_version = str(command.get("zones_version") or "")
-                # A full batch that went through means a backlog: send the next
-                # slice now rather than one per poll interval.
-                more_waiting = bool(batch) and len(batch) >= self._batch_max
-                if not self._connected:
-                    self._connected = True
-                    self._explained_failure = False
-                    print(f"cloud_uplink: connected to {self._base_url}")
-            except Exception as exc:  # noqa: BLE001 - the device must keep working offline
-                if self._connected:
-                    print(f"cloud_uplink: connection lost ({exc}); device continues standalone")
-                elif not self._explained_failure:
-                    # Said once, not every five seconds. A bare IP in base_url is
-                    # the commonest cause of a device that looks broken and is
-                    # not: the address was correct on the network where it was
-                    # configured, and means nothing on any other one.
-                    self._explained_failure = True
-                    # An HTTP error is not a reachability problem. The backend
-                    # answered — it refused. Reporting "cannot reach" for a
-                    # rejected device key sends someone to debug a network that
-                    # is working perfectly.
-                    status = getattr(getattr(exc, "response", None), "status_code", None)
-                    if isinstance(exc, _RedirectedError):
-                        print(
-                            f"cloud_uplink: {self._base_url} answered HTTP {status}, redirecting "
-                            f"to {exc.location or '(no Location)'}. Redirects are not followed "
-                            f"(the device key would go with them): set cloud.base_url to the "
-                            f"final address. Events are kept until then."
-                        )
-                    elif status in (401, 403):
-                        print(
-                            f"cloud_uplink: {self._base_url} rejected this device's key "
-                            f"(HTTP {status}). The backend is reachable; the key is wrong or "
-                            f"unknown to it — re-issue with `python cloud/manage.py`."
-                        )
-                    elif status is not None:
-                        print(f"cloud_uplink: {self._base_url} returned HTTP {status}")
-                    else:
-                        print(f"cloud_uplink: cannot reach {self._base_url} ({exc})")
-                    if status is None and self._looks_like_bare_ip():
-                        print(
-                            "cloud_uplink: base_url is a fixed IP address. If this device or "
-                            "the backend has moved to a different network, that address now "
-                            "points at nothing. Use the backend host's mDNS name instead — "
-                            "e.g. http://your-macbook.local:8787 — which follows it between "
-                            "networks. See docs/NETWORKING.md."
-                        )
-                self._connected = False
-                status = getattr(getattr(exc, "response", None), "status_code", None)
-                if status == 413 and len(batch) > 1:
-                    # Too big, not wrong: send less next time rather than lose it.
-                    self._batch_max = max(1, len(batch) // 2)
-                    print(
-                        f"cloud_uplink: batch of {len(batch)} too large for the backend; "
-                        f"retrying in batches of {self._batch_max}"
-                    )
-                elif batch and (status in _BODY_REJECTED_4XX or (status == 413 and len(batch) == 1)):
-                    # The backend read this batch and refused it; it will refuse
-                    # it again. Re-queuing it at the front is what used to block
-                    # every newer alert behind it forever.
-                    print(
-                        f"cloud_uplink: backend refused {len(batch)} event(s) with HTTP "
-                        f"{status}; dropping them so newer events are not blocked"
-                    )
-                    batch = []
-                with self._lock:
-                    # Put the batch back in front of anything recorded since,
-                    # but never at the cost of those newer events.
-                    #
-                    # `appendleft` on a full deque evicts from the RIGHT — the
-                    # newest end. So re-queuing a failed batch used to discard
-                    # the most recent alerts in favour of the ones that had just
-                    # failed to send, which is backwards for a safety product:
-                    # during a long outage the device threw away what was
-                    # happening now to preserve what happened an hour ago. The
-                    # comment here claimed it dropped the oldest.
-                    capacity = self._queue.maxlen
-                    space = len(batch) if capacity is None else capacity - len(self._queue)
-                    if space > 0:
-                        # Keep the newest of the failed batch when it cannot all fit.
-                        for item in reversed(batch[-space:]):
-                            self._queue.appendleft(item)
-                    dropped = len(batch) - max(space, 0)
-                    if dropped > 0:
-                        print(
-                            f"cloud_uplink: backlog full — {dropped} older event(s) dropped; "
-                            f"newer ones kept"
-                        )
+            more_waiting = self.sync_once()
             self._stop.wait(0 if more_waiting else self._poll_interval_s)
+
+    def sync_once(self) -> bool:
+        """One sync cycle: push queued events + health, apply any command answered.
+
+        The body of the worker loop, unchanged, as a method so a caller with its
+        own clock can drive it one cycle at a time (sim/, the virtual device's
+        deterministic end-to-end tests). Never raises: a failure is handled
+        exactly as it always was (batch kept or dropped, offline reported).
+        Returns True when a full batch went up and more is waiting, i.e. the
+        next cycle should run now rather than after poll_interval_s.
+        """
+        headers = {"X-Device-Key": self._device_key}
+        # Bound OUTSIDE the try. The except handler below re-queues `batch`, so if
+        # anything raised before it was assigned the handler itself would raise
+        # NameError -- and since this loop has no outer try, that kills the uplink
+        # thread outright. The device would then keep detecting and alerting
+        # locally while silently never reaching the backend again, which is the
+        # worst failure shape available: no events, no error, no reconnect.
+        batch: list = []
+        more_waiting = False
+        try:
+            with self._lock:
+                take = min(len(self._queue), self._batch_max)
+                batch = [self._queue.popleft() for _ in range(take)]
+                active = self._active_preset
+                rules_version = self._rules_version
+                zones_version = self._zones_version
+                health = self._health
+                monitoring = self._monitoring
+            # 1) push events (an empty batch doubles as the online heartbeat)
+            resp = self._requests.post(
+                f"{self._base_url}/v1/ingest",
+                json=_json_safe({
+                    "events": batch,
+                    "active_preset": active,
+                    "rules_version": rules_version,
+                    "zones_version": zones_version,
+                    "health": health,
+                    "monitoring": monitoring,
+                }),
+                headers=headers,
+                timeout=10,
+                verify=self._verify,
+                # Never follow: see _RedirectedError. A redirect is a base_url to
+                # fix, reported below, with every event kept meanwhile.
+                allow_redirects=False,
+            )
+            if 300 <= int(getattr(resp, "status_code", 200) or 200) < 400:
+                raise _RedirectedError(resp)
+            resp.raise_for_status()
+            # 2) the ingest response carries any pending command
+            command = resp.json().get("command") or {}
+            if command.get("set_preset"):
+                with self._lock:
+                    self._pending_preset = command["set_preset"]
+            if "set_rules" in command:
+                rules = command.get("set_rules")
+                with self._lock:
+                    self._pending_rules = rules if isinstance(rules, list) else []
+                    # Acknowledge immediately: the main loop applies these on
+                    # its next tick, and re-sending every poll until then
+                    # would restart in-flight rule tracking each time.
+                    self._rules_version = str(command.get("rules_version") or "")
+                    self._rules_instruction = str(command.get("rules_instruction") or "")
+            protection = command.get("set_protection")
+            if isinstance(protection, dict) and protection.get("action") in ("stop", "resume"):
+                with self._lock:
+                    self._pending_protection = {
+                        "action": protection["action"], "confirm": protection.get("confirm") is True,
+                        "id": protection.get("id"),
+                    }
+            if "set_zones" in command:
+                zones = command.get("set_zones")
+                with self._lock:
+                    self._pending_zones = zones if isinstance(zones, list) else []
+                    self._zones_version = str(command.get("zones_version") or "")
+            # A full batch that went through means a backlog: send the next
+            # slice now rather than one per poll interval.
+            more_waiting = bool(batch) and len(batch) >= self._batch_max
+            if not self._connected:
+                self._connected = True
+                self._explained_failure = False
+                print(f"cloud_uplink: connected to {self._base_url}")
+        except Exception as exc:  # noqa: BLE001 - the device must keep working offline
+            if self._connected:
+                print(f"cloud_uplink: connection lost ({exc}); device continues standalone")
+            elif not self._explained_failure:
+                # Said once, not every five seconds. A bare IP in base_url is
+                # the commonest cause of a device that looks broken and is
+                # not: the address was correct on the network where it was
+                # configured, and means nothing on any other one.
+                self._explained_failure = True
+                # An HTTP error is not a reachability problem. The backend
+                # answered — it refused. Reporting "cannot reach" for a
+                # rejected device key sends someone to debug a network that
+                # is working perfectly.
+                status = getattr(getattr(exc, "response", None), "status_code", None)
+                if isinstance(exc, _RedirectedError):
+                    print(
+                        f"cloud_uplink: {self._base_url} answered HTTP {status}, redirecting "
+                        f"to {exc.location or '(no Location)'}. Redirects are not followed "
+                        f"(the device key would go with them): set cloud.base_url to the "
+                        f"final address. Events are kept until then."
+                    )
+                elif status in (401, 403):
+                    print(
+                        f"cloud_uplink: {self._base_url} rejected this device's key "
+                        f"(HTTP {status}). The backend is reachable; the key is wrong or "
+                        f"unknown to it — re-issue with `python cloud/manage.py`."
+                    )
+                elif status is not None:
+                    print(f"cloud_uplink: {self._base_url} returned HTTP {status}")
+                else:
+                    print(f"cloud_uplink: cannot reach {self._base_url} ({exc})")
+                if status is None and self._looks_like_bare_ip():
+                    print(
+                        "cloud_uplink: base_url is a fixed IP address. If this device or "
+                        "the backend has moved to a different network, that address now "
+                        "points at nothing. Use the backend host's mDNS name instead — "
+                        "e.g. http://your-macbook.local:8787 — which follows it between "
+                        "networks. See docs/NETWORKING.md."
+                    )
+            self._connected = False
+            status = getattr(getattr(exc, "response", None), "status_code", None)
+            if status == 413 and len(batch) > 1:
+                # Too big, not wrong: send less next time rather than lose it.
+                self._batch_max = max(1, len(batch) // 2)
+                print(
+                    f"cloud_uplink: batch of {len(batch)} too large for the backend; "
+                    f"retrying in batches of {self._batch_max}"
+                )
+            elif batch and (status in _BODY_REJECTED_4XX or (status == 413 and len(batch) == 1)):
+                # The backend read this batch and refused it; it will refuse
+                # it again. Re-queuing it at the front is what used to block
+                # every newer alert behind it forever.
+                print(
+                    f"cloud_uplink: backend refused {len(batch)} event(s) with HTTP "
+                    f"{status}; dropping them so newer events are not blocked"
+                )
+                batch = []
+            with self._lock:
+                # Put the batch back in front of anything recorded since,
+                # but never at the cost of those newer events.
+                #
+                # `appendleft` on a full deque evicts from the RIGHT — the
+                # newest end. So re-queuing a failed batch used to discard
+                # the most recent alerts in favour of the ones that had just
+                # failed to send, which is backwards for a safety product:
+                # during a long outage the device threw away what was
+                # happening now to preserve what happened an hour ago. The
+                # comment here claimed it dropped the oldest.
+                capacity = self._queue.maxlen
+                space = len(batch) if capacity is None else capacity - len(self._queue)
+                if space > 0:
+                    # Keep the newest of the failed batch when it cannot all fit.
+                    for item in reversed(batch[-space:]):
+                        self._queue.appendleft(item)
+                dropped = len(batch) - max(space, 0)
+                if dropped > 0:
+                    print(
+                        f"cloud_uplink: backlog full — {dropped} older event(s) dropped; "
+                        f"newer ones kept"
+                    )
+        return more_waiting
