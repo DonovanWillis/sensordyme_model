@@ -67,8 +67,8 @@ def test_first_boot_unclaimed_then_claimed_reaches_ready(stack):
     actuators = row["health"]["monitoring"]["actuators"]
     assert [a["name"] for a in actuators if a["audible"]] == ["sim_buzzer"]
     assert "SIMULATED" in actuators[0]["detail"]
-    # The backend stores only SD-XXXXXXXX ids, so a virtual device has none there.
-    assert row["hardware_id"] is None
+    # The backend keeps SD-SIM- ids (M6 integration), so the app can link the simulated feed.
+    assert row["hardware_id"] == row["health"]["device_id"]
 
 
 # ---------------------------------------------------------------------- (2) drowsiness
@@ -392,3 +392,16 @@ def test_the_status_block_never_claims_more_than_the_device_reported(stack):
     for name in row["status"]["capabilities"]["available"]:
         assert reported[name]["state"] == "available", (name, reported[name])
     assert json.dumps(row).count("SD-SIM-") >= 1
+
+
+def test_a_stop_reaches_the_app_before_the_next_health_sample(stack):
+    """M6 integration: the monitoring block is pushed at the transition, and the health
+    snapshot's monitoring part is refreshed with it, so the app does not show the old
+    state for up to one health interval (5 s)."""
+    device = stack.boot(_timeline("prompt_stop", (C + 30, ATTENTIVE, Faults())))
+    stack.claim()
+    device.advance(C)
+    assert stack.protection("stop", confirm=True).status_code == 200
+    device.advance(2.5)  # under the 5 s health interval: the command, then one more sync
+    status = stack.status()
+    assert status["protection"] == "stopped" and status["monitoring_state"] == "stopped"

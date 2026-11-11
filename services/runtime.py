@@ -1637,6 +1637,12 @@ class DeviceRuntime:
                                         "base_monitoring_disabled":
                                             self.mode is monitoring_mode.MonitoringMode.AI_CUSTOM,
                                         "state": self._monitoring_state})
+            refresh = getattr(self.uplink, "refresh_health_monitoring", None)
+            if callable(refresh):
+                # Same moment, same facts: without this the 5 s health sample still
+                # carried the previous state and the app saw a stop or a failure late.
+                report = self.monitoring_report()
+                refresh(report.to_dict(), report.monitoring, self.protection_state())
         if self.dashboard is not None:
             setter = getattr(self.dashboard, "set_policy_state", None)
             if callable(setter):

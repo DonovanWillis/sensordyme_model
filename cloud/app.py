@@ -3104,7 +3104,9 @@ def _model_identity(raw) -> Optional[dict]:
     return out if out["module"] or out["detector"] else None
 
 
-_HARDWARE_ID = re.compile(r"^SD-[0-9A-F]{8}$")
+#: A device's hardware id. `SD-SIM-` marks the virtual device (sim/); it is kept so
+#: the app can link a simulated device's feed the same way, and is visibly simulated.
+_HARDWARE_ID = re.compile(r"^SD-(SIM-)?[0-9A-F]{8}$")
 
 
 def _hardware_id(health) -> Optional[str]:

@@ -288,6 +288,19 @@ class CloudUplink:
         with self._lock:
             self._active_preset = name
 
+    def refresh_health_monitoring(self, monitoring: dict, monitoring_active: bool, protection: dict) -> None:
+        """Bring the monitoring part of the last health sample up to date now.
+
+        The full health sample is taken every few seconds (it runs nmcli and
+        vcgencmd); a stop, a resume or a monitoring failure must not wait for the
+        next one, or the app shows the old state beside a newer pushed one. Only
+        the three monitoring keys change; the rest of the sample is kept.
+        """
+        with self._lock:
+            if isinstance(self._health, dict):
+                self._health = {**self._health, "monitoring": monitoring,
+                                "monitoring_active": monitoring_active, "protection": protection}
+
     def set_health(self, report: Optional[dict]) -> None:
         """Latest device health, sent with the next sync.
 
