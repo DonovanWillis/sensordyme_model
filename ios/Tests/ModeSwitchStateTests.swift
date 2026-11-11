@@ -212,5 +212,18 @@ check(ModeRowState.unavailable("role").spokenValue == "Not available on this dev
 check(ModeRowState.queuedOffline.spokenValue.contains("reconnect"), "queued says it waits for the device")
 check(ModeRowState.inactive.spokenValue.isEmpty, "an idle row adds nothing")
 
+print("\nselected is not the same as monitoring:")
+let notMonitoring = ModeSwitchState.state(for: "driver_safety", activeBase: "driver_safety", customMonitoringActive: false,
+                                          pending: nil, deviceOnline: true, failure: nil, now: t0,
+                                          notMonitoring: "Not monitoring — face model missing")
+check(notMonitoring == .activeNotMonitoring("Not monitoring — face model missing"),
+      "a failed device's mode is never plain active")
+check(notMonitoring.isSelected && !(notMonitoring == .active), "it is still the selected mode")
+check(ModeRowState.active.isSelected && !ModeRowState.inactive.isSelected, "isSelected")
+check(ModeSwitchState.state(for: "elderly_monitoring", activeBase: "driver_safety", customMonitoringActive: false,
+                            pending: nil, deviceOnline: true, failure: nil, now: t0,
+                            notMonitoring: "x") == .inactive, "only the running mode carries it")
+check(notMonitoring.spokenValue == "Selected, not monitoring", "spoken")
+
 print("\n\(failures == 0 ? "PASSED" : "\(failures) FAILED")")
 exit(failures == 0 ? 0 : 1)

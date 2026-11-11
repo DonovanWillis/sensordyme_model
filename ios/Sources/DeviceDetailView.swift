@@ -308,10 +308,7 @@ struct DeviceDetailView: View {
     private var statusRow: some View {
         let pill = MonitoringStatusPresentation.pill(device.monitoringPresentation, alertActive: alertActive)
         return HStack(spacing: SD.Space.xs) {
-            SDStatusPill(
-                status: device.online ? .online : .offline,
-                pulses: device.online
-            )
+            SDStatusPill(status: presenceStatus, pulses: presenceStatus == .online)
             .accessibilityIdentifier("detail.online")
             SDStatusPill(status: pill.tone.sdStatus, text: pill.text)
                 .accessibilityIdentifier("detail.monitoring")
@@ -331,6 +328,15 @@ struct DeviceDetailView: View {
                     .multilineTextAlignment(.trailing)
             }
             .foregroundStyle(customMonitoringActive ? SD.Colors.textPrimary : SD.Colors.textTertiary)
+        }
+    }
+
+    /// ONLINE only while the latest refresh succeeded (ConnectionTruth).
+    private var presenceStatus: SDStatus {
+        switch ConnectionTruth.presence(online: device.online, lastRefreshFailed: errorMessage != nil) {
+        case .online: .online
+        case .offline: .offline
+        case .unknown: .unknown
         }
     }
 

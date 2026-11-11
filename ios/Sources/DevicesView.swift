@@ -69,7 +69,7 @@ struct DevicesView: View {
 
                     ForEach(devices) { device in
                         NavigationLink(value: device) {
-                            DeviceCard(device: device)
+                            DeviceCard(device: device, lastRefreshFailed: errorMessage != nil)
                         }
                         .buttonStyle(.plain)
                         .accessibilityIdentifier("device.card")
@@ -268,8 +268,17 @@ struct DevicesView: View {
 
 struct DeviceCard: View {
     let device: Device
+    /// The latest refresh failed: `online` is from an older reply, so the card
+    /// says Unknown instead of a stale ONLINE (ConnectionTruth).
+    var lastRefreshFailed = false
 
-    private var status: SDStatus { device.online ? .online : .offline }
+    private var status: SDStatus {
+        switch ConnectionTruth.presence(online: device.online, lastRefreshFailed: lastRefreshFailed) {
+        case .online: .online
+        case .offline: .offline
+        case .unknown: .unknown
+        }
+    }
 
     /// "Offline" alone leaves people wondering whether it just happened or has
     /// been down all week, which is the first thing anyone wants to know.
@@ -369,7 +378,7 @@ struct DeviceCard: View {
                 .foregroundStyle(device.online ? SD.Colors.textSecondary : SD.Colors.textDisabled)
             VStack {
                 HStack {
-                    SDStatusPill(status: status, pulses: device.online)
+                    SDStatusPill(status: status, pulses: status == .online)
                     Spacer()
                     if let id = device.hardwareId {
                         Text(id)

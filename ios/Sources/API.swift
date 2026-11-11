@@ -241,6 +241,14 @@ struct APIClient {
                                      body: ["action": action.rawValue, "confirm": confirm])
         return (try? decode(ProtectionCommand.self, from: data)) ?? ProtectionCommand(commandID: nil)
     }
+
+    func setNode(deviceID: Int, node: String, enabled: Bool) async throws {
+        _ = try await request("POST", "v1/devices/\(deviceID)/nodes", body: ["node": node, "enabled": enabled])
+    }
+
+    func capabilityTiers() async throws -> CapabilityTiersResponse {
+        try decode(CapabilityTiersResponse.self, from: try await request("GET", "v1/capability-tiers"))
+    }
 }
 
 /// App-wide session: backend URL, auth token, and a configured client.

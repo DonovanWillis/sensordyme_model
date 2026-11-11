@@ -359,12 +359,15 @@ struct SDButtonStyle: ButtonStyle {
 /// on every screen.
 enum SDStatus {
     case online, connecting, offline, warning, alert
+    /// The app can't tell (the latest refresh failed): neither online nor offline.
+    case unknown
 
     var label: String {
         switch self {
         case .online: "Online"
         case .connecting: "Connecting"
         case .offline: "Offline"
+        case .unknown: "Unknown"
         case .warning: "Needs attention"
         case .alert: "Alert"
         }
@@ -375,6 +378,7 @@ enum SDStatus {
         case .online: SD.Colors.success
         case .connecting: SD.Colors.warning
         case .offline: SD.Colors.offline
+        case .unknown: SD.Colors.textTertiary
         case .warning: SD.Colors.warning
         case .alert: SD.Colors.danger
         }
@@ -384,7 +388,7 @@ enum SDStatus {
         switch self {
         case .online: SD.Colors.successMuted
         case .connecting, .warning: SD.Colors.warningMuted
-        case .offline: SD.Colors.surfaceRaised
+        case .offline, .unknown: SD.Colors.surfaceRaised
         case .alert: SD.Colors.dangerMuted
         }
     }
@@ -394,6 +398,7 @@ enum SDStatus {
         case .online: "checkmark.circle.fill"
         case .connecting: "arrow.triangle.2.circlepath"
         case .offline: "moon.zzz.fill"
+        case .unknown: "questionmark.circle"
         case .warning: "exclamationmark.triangle.fill"
         case .alert: "bell.badge.fill"
         }
@@ -433,7 +438,7 @@ struct SDStatusPill: View {
             Text((text ?? status.label).uppercased())
                 .sdEyebrowFont()
                 .tracking(1)
-                .foregroundStyle(status == .offline ? SD.Colors.textTertiary : status.tint)
+                .foregroundStyle(status == .offline || status == .unknown ? SD.Colors.textTertiary : status.tint)
                 .lineLimit(1)
         }
         .padding(.leading, 6)
@@ -572,7 +577,9 @@ struct SDErrorState: View {
 /// one — the screen just quietly stops changing.
 struct ConnectionBanner: View {
     let message: String
-    var title = "Can't reach the server"
+    /// nil: from the message (ReplyError.bannerTitle), so an unreadable reply
+    /// is never headed "Can't reach the server".
+    var title: String? = nil
     var retry: (() async -> Void)?
 
     @State private var retrying = false
@@ -585,7 +592,7 @@ struct ConnectionBanner: View {
                 .clipShape(Capsule())
             VStack(alignment: .leading, spacing: SD.Space.xxs + 2) {
                 VStack(alignment: .leading, spacing: SD.Space.xxs + 2) {
-                    Text(title)
+                    Text(title ?? ReplyError.bannerTitle(for: message))
                         .font(SD.Typography.label)
                         .foregroundStyle(SD.Colors.textPrimary)
                     Text(message)
