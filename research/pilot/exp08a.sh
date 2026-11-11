@@ -70,7 +70,7 @@ MON=$!
 cd "$DAMO"
 t0=$(date +%s)
 set +e
-PYTHONPATH="$DAMO" "$VENV/bin/torchrun" --nproc_per_node=1 --master_port 29517 tools/train.py -f configs/exp08a.py > "$O/train.log" 2>&1
+PYTHONPATH="$DAMO" "$P" -m torch.distributed.run --nproc_per_node=1 --master_port 29517 tools/train.py -f configs/exp08a.py > "$O/train.log" 2>&1
 rc=$?
 set -e
 kill $MON 2>/dev/null || true
