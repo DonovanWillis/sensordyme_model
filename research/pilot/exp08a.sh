@@ -25,7 +25,7 @@ echo "== venv (system site packages: the fleet's torch $("$BASE" -c 'import torc
 "$BASE" -c 'import site; print(site.getsitepackages()[0])' > "$("$VENV/bin/python" -c 'import site; print(site.getsitepackages()[0])')/sdgpu.pth"
 $UV pip freeze --python "$BASE" > "$O/base_freeze.txt"
 $UV pip install -q --python "$VENV/bin/python" -c "$O/base_freeze.txt" \
-  omegaconf loguru tqdm tabulate easydict opencv-python-headless pycocotools scikit-image pyyaml huggingface_hub safetensors
+  omegaconf loguru tqdm tabulate easydict opencv-python-headless pycocotools scikit-image pyyaml huggingface_hub safetensors setuptools
 $UV pip install -q --python "$VENV/bin/python" --no-deps timm thop
 $UV pip freeze --python "$VENV/bin/python" > "$O/pilot_freeze.txt"
 P="$VENV/bin/python"
