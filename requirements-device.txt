@@ -28,8 +28,12 @@ pyyaml==6.0.2
 matplotlib==3.9.2
 reportlab==4.2.5
 simpleaudio==1.0.4
-pytest==8.3.3
-anthropic==0.116.0 # mac_max VLM judge (provider: anthropic); harmless (unused) on the Pi
+# M6.5 (4E): pytest and anthropic moved to requirements.txt (developer + CI). Nothing
+# the device runs imports pytest, and anthropic is reached only by core/vlm_judge.py
+# from the mac_max profile (require_mps), so on a device it was dead weight and an
+# unused path to an external API. scripts/release/check_device_deps.py enforces both
+# directions: every device import is pinned here (or apt-provided), and no test,
+# dev or research package is.
 
 # Direct pin, not incidental. requirements.txt used to note this was "already a
 # transitive dep of ultralytics" — with ultralytics gone from the device that
