@@ -54,14 +54,23 @@ machine-readable `code` sits next to it:
 |---|---|---|---|
 | `role_forbids_preset` | 409 | `POST /v1/devices/{id}/preset` | The device's role does not allow this mode. Checked before `draft_superseded`. |
 | `draft_superseded` | 409 | `POST /v1/devices/{id}/preset` | The proposal being activated was replaced by a newer preview. Review it again. |
-| `unknown_preset` | 400 | `POST /v1/devices/{id}/preset` | No such mode or variant. |
+| `unknown_preset` | 400 | `POST /v1/devices/{id}/preset` | No such mode or variant. A planned mode (`GET /v1/presets`, `availability: "planned"`) is refused with this code too, and `detail` says it is planned. |
 | `firmware_unsupported` | 409 | `POST /v1/devices/{id}/protection` | The device's software cannot stop or resume. |
 | `confirmation_required` | 400 | `POST /v1/devices/{id}/protection` | A stop request must carry `confirm: true`. |
+| `firmware_unsupported` | 409 | `POST /v1/devices/{id}/preset` | The request carries mode `settings`, and the device's software has not reported the `preset_settings` feature. The same mode without settings still works. |
+| `invalid_setting` | 400 | `POST /v1/devices/{id}/preset` | A setting is unknown for that mode, of the wrong type, out of range or off its step. `detail` names the key. |
+| `incompatible_policy` | 409 | `POST /v1/devices/{id}/preset` | The request asks for policies that cannot run together: `settings` with no mode (`preset: ""`), or `keep_rules: true` on a device whose custom rules replace the mode. Nothing was changed. |
+| `rule_not_found` | 404 | `PATCH /v1/devices/{id}/rules/{rule_id}` | No custom rule with that id on this device. |
+| `draft_superseded` | 409 | `PATCH /v1/devices/{id}/rules/{rule_id}` | The stored rules changed while the toggle was being saved. Reload them. |
 | `device_not_found` | 404 | any `/v1/devices/{id}/...` | No such device on this account. |
 | `device_already_claimed` | 409 | `POST /v1/devices/claim` | Another account owns the device. |
 | `account_exists` | 409 | `POST /v1/signup` | The email is already registered. |
 
 Other errors (401, 422, 429, 503) carry no `code`.
+
+Per-preset availability codes (`role_forbids_preset`, `capability_impaired`,
+`capability_unsupported`, `device_stale`, `planned`) are not refusals; they
+are fields of `GET /v1/devices/{id}/presets`. See docs/PRESET_LIBRARY.md.
 
 ## Known limits
 

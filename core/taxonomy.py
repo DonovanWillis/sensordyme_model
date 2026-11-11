@@ -250,6 +250,31 @@ TAXONOMY: dict[str, list[Detection]] = {
 }
 
 
+#: Requests no mode can serve, whatever they are phrased as. Configure-with-AI
+#: refuses them up front with these reasons (jupiter/policy.py refusal_for)
+#: instead of letting any interpreter approximate them: "a stranger at the
+#: door" must never quietly become "a person at the door".
+REFUSALS: dict[str, Detection] = {
+    "identity": _d("identity", "Recognising who someone is (known / unknown / a named person)", UNSUPPORTED,
+                   requires="face recognition — deliberately not shipped (privacy). SensorDyme can tell "
+                            "that a person is present, never who it is"),
+    "intent": _d("intent", "Intent, purpose or suspicion", UNSUPPORTED,
+                 requires="never claimed from appearance by policy; ask for an observable action instead "
+                          "(someone entering or staying in an area you draw)"),
+    "emotion": _d("emotion", "Emotions or mood", UNSUPPORTED,
+                  requires="not determinable reliably from a camera image, and never claimed by policy"),
+    "audio": _d("audio", "Sounds (crying, shouting, barking, alarms, voices)", UNSUPPORTED,
+                requires="a microphone and an audio classifier; this device has no microphone"),
+    "intoxication": _d("intoxication", "Intoxication", UNSUPPORTED,
+                       requires="never claimed from appearance by policy"),
+    "medical": _d("medical", "Medical conditions (breathing, seizures, heart problems)", UNSUPPORTED,
+                  requires="out of scope by policy — the system reports observable safety conditions only"),
+    "repetition_window": _d("repetition_window", "Counting repeated occurrences in a time window", UNSUPPORTED,
+                            requires="a rule that counts episodes over a window; the device evaluates one "
+                                     "sustained condition per rule"),
+}
+
+
 def find(mode: str, detection_id: str) -> Detection | None:
     for det in TAXONOMY.get(mode, []):
         if det.id == detection_id:

@@ -227,7 +227,13 @@ def preset_violation(role: Role, name: str, presets: dict) -> Optional[str]:
     """Why selecting preset `name` ("preset" or "preset:variant") would weaken `role`, or None."""
     if not role.has_floor or name == "":
         return None
-    base, _, variant_name = name.partition(":")
+    from core.presets import PresetError, parse_settings, split_settings
+
+    try:
+        head = split_settings(name)[0]
+    except PresetError as exc:
+        return f"preset '{name}': {exc.reason}"
+    base, _, variant_name = head.partition(":")
     if role.allowed_presets is not None and base not in role.allowed_presets:
         return (
             f"this device's role is '{role.name}': preset '{base}' would stop "
@@ -236,7 +242,14 @@ def preset_violation(role: Role, name: str, presets: dict) -> Optional[str]:
     preset = presets.get(base) or {}
     if preset.get("module") not in role.mandatory_modules:
         return f"preset '{base}' does not run the module role '{role.name}' requires"
-    overrides = ((preset.get("variants") or {}).get(variant_name) or {}).get("overrides") or {}
+    overrides = dict(((preset.get("variants") or {}).get(variant_name) or {}).get("overrides") or {})
+    # Owner settings ("preset@key=value", core/presets.py) are checked exactly
+    # like a variant's overrides: a floor cannot be loosened by either. Settings
+    # that cannot be read are refused here too -- fail closed, never unchecked.
+    try:
+        overrides.update(parse_settings(name, presets))
+    except PresetError as exc:
+        return f"preset '{name}': {exc.reason}"
     for floor in role.parameter_floors:
         if floor.key in overrides:
             reason = floor.violation(overrides[floor.key])

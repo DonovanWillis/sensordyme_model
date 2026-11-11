@@ -55,7 +55,21 @@ from cloud.ratelimit import (
     LOGIN_LIMITER,
     SIGNUP_LIMITER,
 )
-from core.presets import load_presets, resolve_preset, same_preset
+from core.presets import (
+    SETTINGS_SEPARATOR,
+    PresetError,
+    catalog_entries,
+    catalog_version,
+    device_availability,
+    effective_settings,
+    encode_settings,
+    load_planned,
+    load_presets,
+    parse_settings,
+    resolve_preset,
+    same_preset,
+    validate_settings,
+)
 
 DB_PATH = os.environ.get("SENSORDYME_DB", str(Path(__file__).parent / "sensordyme.db"))
 JWT_TTL_S = 30 * 24 * 3600
@@ -757,13 +771,43 @@ def _monitoring_payload(monitoring_json: Optional[str]) -> Optional[dict]:
     }
 
 
-def _rules_payload(ai_rules_json: Optional[str]) -> list[dict]:
-    """The `rules` list out of a stored proposal, tolerant of anything malformed."""
+def _stored_rules(ai_rules_json: Optional[str]) -> list[dict]:
+    """Every rule in a stored proposal (disabled ones included), tolerant of anything malformed."""
     try:
         rules = json.loads(ai_rules_json or "{}").get("rules")
     except (ValueError, TypeError, AttributeError):
         return []
     return [r for r in rules if isinstance(r, dict)] if isinstance(rules, list) else []
+
+
+def _rules_payload(ai_rules_json: Optional[str]) -> list[dict]:
+    """The rules the device should RUN: the stored set without the ones the
+    owner turned off (PATCH /v1/devices/{id}/rules/{rule_id}). A disabled rule
+    is never delivered; the device runs the rest exactly as before."""
+    return [r for r in _stored_rules(ai_rules_json) if r.get("enabled") is not False]
+
+
+_RULE_ID = re.compile(r"^[A-Za-z0-9_-]{1,40}$")
+
+
+def _with_rule_ids(rules: list[dict]) -> list[dict]:
+    """`rules` with a stable, unique `id` on each, keeping ids already given.
+
+    A rule's id is what the app toggles it by. It is derived from the rule's
+    content and position, so a row stored before ids existed reads the same
+    ids every time until they are written down (the first PATCH does that).
+    """
+    seen: set[str] = set()
+    out = []
+    for index, rule in enumerate(rules):
+        rule_id = rule.get("id")
+        if not (isinstance(rule_id, str) and _RULE_ID.match(rule_id)) or rule_id in seen:
+            material = json.dumps({k: v for k, v in rule.items() if k not in ("id", "enabled")},
+                                  sort_keys=True, default=str)
+            rule_id = "r" + hashlib.sha256(f"{index}\n{material}".encode()).hexdigest()[:10]
+        seen.add(rule_id)
+        out.append({**rule, "id": rule_id})
+    return out
 
 
 # ------------------------------------------------------------------ app status contract
@@ -1293,6 +1337,8 @@ class ClaimBody(BaseModel):
 #: Rules one Activate may carry. A proposal's rules come from one sentence; a
 #: few is normal, and each is evaluated on the device every frame.
 MAX_ACTIVATED_RULES = 32
+#: Settings one mode request may carry (a preset defines a handful).
+MAX_PRESET_SETTINGS = 32
 
 
 class ProtectionBody(BaseModel):
@@ -1317,6 +1363,19 @@ class PresetBody(BaseModel):
     # sensitivity, Push/Silent, "confirm for" and "then wait". Re-validated
     # server-side exactly like a model's proposal; never trusted as sent.
     rules: Optional[list[dict]] = Field(default=None, max_length=MAX_ACTIVATED_RULES)
+    # settings: owner-tuned values for the named mode, validated against its
+    # catalogue schema (presets.yaml `settings:`, docs/PRESET_LIBRARY.md) and
+    # delivered as the "mode:variant@key=value" name the device applies.
+    settings: Optional[dict[str, Any]] = Field(default=None, max_length=MAX_PRESET_SETTINGS)
+    # keep_rules: keep the custom rules running beside the new mode. Only an
+    # additive role (core/roles.py) can; anywhere else it is refused with
+    # `incompatible_policy` rather than silently dropping the rules. None: keep
+    # them exactly when the device can (additive role, mandatory module).
+    keep_rules: Optional[bool] = None
+
+
+class RuleToggleBody(BaseModel):
+    enabled: bool
 
 
 class NtfyBody(BaseModel):
@@ -1703,7 +1762,7 @@ def _rules_run_beside(role, preset: str) -> bool:
     """Would custom rules run BESIDE `preset` on a device with `role` (additive)?"""
     if role is None or not role.additive_custom_rules:
         return False
-    base = (preset or "").partition(":")[0]
+    base = (preset or "").partition(SETTINGS_SEPARATOR)[0].partition(":")[0]
     module = (load_presets().get(base) or {}).get("module")
     return module in role.mandatory_modules
 
@@ -1738,6 +1797,8 @@ _ACTIVATED_RULE_KEYS = (
     "target", "detection", "predicate", "secondary", "description", "zone",
     "persist_s", "min_count", "confidence", "severity", "cooldown_s",
     "schedule", "notify", "timezone",
+    # M6: per-subject dwell, and the rule's identity / on-off state.
+    "dwell_s", "id", "enabled",
 )
 
 #: An IANA zone name as the device's RuleEngine reads it ("Europe/London",
@@ -1768,6 +1829,10 @@ def _client_rules(rules: list) -> list[dict]:
             kept[key] = _clean_text(value)[:500] if isinstance(value, str) else value
         if "timezone" in kept and _valid_timezone(kept["timezone"]) is None:
             del kept["timezone"]
+        if "enabled" in kept and not isinstance(kept["enabled"], bool):
+            del kept["enabled"]
+        if "id" in kept and not (isinstance(kept["id"], str) and _RULE_ID.match(kept["id"])):
+            del kept["id"]
         cleaned.append(kept)
     return cleaned
 
@@ -1798,6 +1863,24 @@ def _reported_role(device: sqlite3.Row):
     protection = reported.get("protection") if isinstance(reported.get("protection"), dict) else {}
     name = _role_name(reported.get("role"), health_monitoring.get("role"), protection.get("role"))
     return ROLES.get(name) if name is not None else None
+
+
+def _device_supports(device: sqlite3.Row, feature: str) -> bool:
+    """Whether the device's software reported `feature` (core/presets.py
+    DEVICE_POLICY_FEATURES). Firmware that predates the list reports none."""
+    features = (_monitoring_payload(device["monitoring"]) or {}).get("features")
+    return isinstance(features, list) and feature in features
+
+
+def _zone_names(device: sqlite3.Row) -> list[str]:
+    """The names of the areas drawn for this device (POST .../zones)."""
+    try:
+        zones = json.loads(device["zones"] or "[]")
+    except (ValueError, TypeError):
+        return []
+    if not isinstance(zones, list):
+        return []
+    return [str(z.get("name")) for z in zones if isinstance(z, dict) and z.get("name")]
 
 
 def _role_refusal(device: sqlite3.Row, preset: str, presets: dict) -> Optional[str]:
@@ -1854,22 +1937,65 @@ def set_preset(device_id: int, body: PresetBody, uid: int = Depends(current_user
         # will apply and report the current name, so a stored alias could never
         # match on convergence and would re-send on every poll for ever.
         normalized = resolve_preset(body.preset.strip().rstrip(":"))
+        if body.settings and not normalized:
+            raise CodedError(
+                409, "incompatible_policy",
+                "settings belong to a monitoring mode; name the mode they are for "
+                "(activating custom rules takes no mode settings)",
+            )
         # Only a mode that exists. The device ignores an unknown name ("ignoring
         # unknown preset") and never reports it back, so storing one made ingest
         # re-send it on every poll, for ever, with the app showing the switch as
         # pending indefinitely.
         if normalized:
             presets = load_presets()
-            base, _, variant = normalized.partition(":")
+            head = normalized.partition(SETTINGS_SEPARATOR)[0]
+            base, _, variant = head.partition(":")
             if base not in presets or (
                 variant and variant not in (presets[base].get("variants") or {})
             ):
+                planned = load_planned().get(base)
+                if planned is not None:
+                    raise CodedError(400, "unknown_preset",
+                                     f"'{base}' is planned, not available yet: {planned.get('reason') or ''}".strip())
                 raise CodedError(400, "unknown_preset", f"unknown mode '{body.preset}'")
             # The device's role (as the device last reported it) may forbid this
             # mode. Refuse here with the reason; the device would refuse it too.
+            refusal = _role_refusal(device, head, presets)
+            if refusal:
+                raise CodedError(409, "role_forbids_preset", refusal)
+            # Owner settings: checked against the mode's schema, then carried in
+            # the name the device applies ("mode:variant@key=value"). `settings`
+            # in the body replaces any suffix the name already had.
+            try:
+                settings = (validate_settings(presets[base], body.settings) if body.settings is not None
+                            else parse_settings(normalized, presets))
+            except PresetError as exc:
+                raise CodedError(400, "invalid_setting", exc.reason) from None
+            normalized = encode_settings(head, settings)
+            if settings and not _device_supports(device, "preset_settings"):
+                # Older firmware reads "mode@key=value" as an unknown variant and
+                # never converges; refuse instead of re-sending it for ever.
+                raise CodedError(409, "firmware_unsupported",
+                                 "this device's software cannot apply mode settings yet; update it first")
+            # Role floors win over any setting (core/roles.py parameter floors).
             refusal = _role_refusal(device, normalized, presets)
             if refusal:
                 raise CodedError(409, "role_forbids_preset", refusal)
+
+        # Custom rules beside the new mode: only where the role runs them
+        # additively beside this mode's module (core/roles.py). Asked for
+        # anywhere else, it is a conflict -- one vision module runs at a time,
+        # and on this device custom rules replace the mode -- never a silent drop.
+        beside = bool(normalized) and _rules_run_beside(_reported_role(device), normalized)
+        if body.keep_rules is True and normalized and not beside:
+            raise CodedError(
+                409, "incompatible_policy",
+                f"custom rules cannot run beside '{normalized.partition(SETTINGS_SEPARATOR)[0]}' on this "
+                "device: here they replace the mode. Choose the mode or the custom rules.",
+            )
+        keep_rules = (beside and body.keep_rules is not False
+                      and bool(device["custom_monitoring_wanted"]) and bool(device["ai_rules"]))
 
         draft_json = device["ai_rules_draft"]
         # The proposal on screen must still be the one stored. A newer preview
@@ -1897,7 +2023,7 @@ def set_preset(device_id: int, body: PresetBody, uid: int = Depends(current_user
         conn.execute(
             "UPDATE devices SET desired_preset = ?, custom_monitoring_wanted = ?, preset_rejection = NULL"
             " WHERE id = ?",
-            (normalized, 1 if normalized == "" else 0, device_id),
+            (normalized, 1 if normalized == "" or keep_rules else 0, device_id),
         )
 
         if normalized != "":
@@ -1905,11 +2031,27 @@ def set_preset(device_id: int, body: PresetBody, uid: int = Depends(current_user
             # pre-existing contract: reopening Configure-with-AI still shows what
             # was last configured), and never runs rules -- see
             # _NOT_BESIDE_A_MODE. Rules that came with it are reported back.
+            unsupported = _beside_a_mode_unsupported(body.rules or [], additive=beside)
+            if not keep_rules:
+                return {
+                    "ok": True, "desired_preset": normalized, "rules_active": 0,
+                    "rules_version": "", "unsupported": unsupported,
+                }
+            # The rules already running beside the mode stay: a new activation
+            # re-delivers them with the switch, because a device that switches
+            # mode exits custom monitoring before re-applying them.
+            conn.execute(
+                "UPDATE devices SET ai_rules_activation = COALESCE(ai_rules_activation, 0) + 1 WHERE id = ?",
+                (device_id,),
+            )
+            kept = conn.execute(
+                "SELECT ai_rules, ai_rules_activation FROM devices WHERE id = ?", (device_id,)
+            ).fetchone()
             return {
-                "ok": True, "desired_preset": normalized, "rules_active": 0,
-                "rules_version": "",
-                "unsupported": _beside_a_mode_unsupported(
-                    body.rules or [], additive=_rules_run_beside(_reported_role(device), normalized)),
+                "ok": True, "desired_preset": normalized,
+                "rules_active": len(_rules_payload(kept["ai_rules"])),
+                "rules_version": _rules_version(kept["ai_rules"], kept["ai_rules_activation"] or 0),
+                "unsupported": unsupported,
             }
 
         # AI Custom. This is the ONLY act of acceptance anywhere in the flow,
@@ -1944,6 +2086,11 @@ def set_preset(device_id: int, body: PresetBody, uid: int = Depends(current_user
             promoted_from = _rules_version(draft_json)
 
         if promoted is not None:
+            # Each rule gets the id the app toggles it by (PATCH .../rules/{id}).
+            stored = _loads_dict(promoted)
+            if isinstance(stored.get("rules"), list):
+                stored["rules"] = _with_rule_ids([r for r in stored["rules"] if isinstance(r, dict)])
+                promoted = json.dumps(stored)
             conn.execute(
                 "UPDATE devices SET ai_rules = ?, ai_rules_draft = NULL, ai_rules_promoted_from = ?,"
                 " ai_rules_activation = COALESCE(ai_rules_activation, 0) + 1 WHERE id = ?",
@@ -2038,6 +2185,201 @@ def set_zones(device_id: int, body: ZonesBody, uid: int = Depends(current_user))
         _owned_device(conn, device_id, uid)
         conn.execute("UPDATE devices SET zones = ? WHERE id = ?", (json.dumps(zones), device_id))
     return {"ok": True, "zones": zones, "rejected": rejected}
+
+
+# ------------------------------------------------------------------------- preset library (M6)
+# The catalogue (presets.yaml, core/presets.py), what each preset needs and how
+# far its models have been validated (derived from core/model_registry.py), and
+# per device: which presets it can run right now, and the custom rules it runs.
+# Field-by-field contract: docs/PRESET_LIBRARY.md.
+
+_CATALOG_CACHE: dict[str, list[dict]] = {}
+_CATALOG_LOCK = threading.Lock()
+
+
+def _catalog() -> list[dict]:
+    """The catalogue entries, built once per process (files ship with the image)."""
+    with _CATALOG_LOCK:
+        if "entries" not in _CATALOG_CACHE:
+            _CATALOG_CACHE["entries"] = catalog_entries()
+        return _CATALOG_CACHE["entries"]
+
+
+@app.get("/v1/presets")
+def list_presets(uid: int = Depends(current_user)):
+    return {"catalog_version": catalog_version(), "presets": _catalog()}
+
+
+def _reported_preset(row: sqlite3.Row) -> tuple[Optional[str], Optional[str], dict]:
+    """(base, variant, settings) of the preset the device last reported."""
+    name = row["active_preset"]
+    if not name:
+        return None, None, {}
+    resolved = resolve_preset(str(name))
+    head = resolved.partition(SETTINGS_SEPARATOR)[0]
+    base, _, variant = head.partition(":")
+    try:
+        settings = parse_settings(resolved)
+    except PresetError:
+        settings = {}
+    return base, variant or None, settings
+
+
+@app.get("/v1/devices/{device_id}/presets")
+def device_presets(device_id: int, uid: int = Depends(current_user)):
+    with db() as conn:
+        row = _owned_device(conn, device_id, uid)
+    now = time.time()
+    status = _device_status(row, now)
+    role = _reported_role(row)
+    presets = load_presets()
+    base, variant, settings = _reported_preset(row)
+    # A device in AI Custom (custom rules REPLACING the mode) runs no preset,
+    # whatever its last selected preset was.
+    active = base if base in presets and status["mode"] != "ai_custom" else None
+    allowed = status["allowed_presets"]
+    entries = []
+    for entry in _catalog():
+        code, reason = device_availability(
+            entry, role=role, capabilities=status["capabilities"], stale=status["stale"], presets=presets)
+        if code is None and role is None and isinstance(allowed, list) and entry["id"] not in allowed:
+            # A role the backend does not know, described by the device itself.
+            code, reason = "role_forbids_preset", f"this device's role allows only: {', '.join(allowed)}"
+        preset = presets.get(entry["id"]) or {}
+        is_active = entry["id"] == active
+        entries.append({
+            "id": entry["id"],
+            "available": code is None,
+            "code": code,
+            "reason": reason,
+            "active": is_active,
+            "validation_status": entry["validation"]["status"],
+            "settings": effective_settings(preset, variant if is_active else None,
+                                           settings if is_active else None) if preset else {},
+        })
+    return {
+        "device_id": device_id,
+        "catalog_version": catalog_version(),
+        "active_preset": active,
+        "active_variant": variant if active else None,
+        "stale": status["stale"],
+        "presets": entries,
+    }
+
+
+def _rule_view(rule: dict, *, index: Optional[int], status: str, reason: Optional[str]) -> dict:
+    """One stored rule as GET /v1/devices/{id}/rules shows it."""
+    from core.capabilities import registry
+
+    target = str(rule.get("target") or rule.get("detection") or "").strip().lower()
+    secondary = str(rule.get("secondary") or "").strip().lower()
+    targets = [t for t in (target, secondary) if t]
+    kinds: set[str] = set()
+    reg = registry()
+    for label in targets:
+        found = {c.kind for c in reg.providers_of_label(label) if c.available} & {"objects", "pose", "face", "hands"}
+        kinds |= found or {"objects"}
+    view = {
+        "id": rule.get("id"),
+        "enabled": rule.get("enabled") is not False,
+        "summary": str(rule.get("description") or f"{rule.get('predicate') or 'present'} {target}".strip()),
+        "targets": targets,
+        "zone": str(rule.get("zone") or "") or None,
+        "required_capabilities": ["camera", "inference", *sorted(kinds)],
+        "status": status,
+        "reason": reason,
+    }
+    if rule.get("dwell_s") not in (None, ""):
+        view["dwell_s"] = rule.get("dwell_s")
+    return view
+
+
+def _rules_overview(row: sqlite3.Row, now: float) -> dict:
+    """The stored rules with what the DEVICE says about each (never inferred
+    from what the backend accepted). Status precedence: disabled > waiting
+    (area not drawn) > unknown (stale) > rejected > running | unknown."""
+    from core.rules import _zone_key
+
+    status = _device_status(row, now)
+    wanted = bool(row["custom_monitoring_wanted"])
+    version = _rules_version(row["ai_rules"], row["ai_rules_activation"] or 0)
+    reported = _monitoring_payload(row["monitoring"]) or {}
+    device_version = reported.get("version")
+    running = status["rules"]["active"]
+    rejected = status["rules"]["rejected"]
+    drawn = {_zone_key(z) for z in _zone_names(row)}
+    rules = _with_rule_ids(_stored_rules(row["ai_rules"]))
+    out, delivered_index = [], 0
+    for rule in rules:
+        enabled = rule.get("enabled") is not False
+        index = delivered_index if enabled else None
+        if enabled:
+            delivered_index += 1
+        zone = str(rule.get("zone") or "").strip()
+        if not enabled:
+            state, reason = "disabled", "turned off in the app; not sent to the device"
+        elif not wanted:
+            state, reason = "disabled", ("custom rules are not active on this device (a monitoring mode was "
+                                         "selected instead); activate them to run")
+        elif zone and _zone_key(zone) not in drawn:
+            state, reason = "waiting", f"area '{zone}' is not drawn yet; draw it in the app"
+        elif status["stale"]:
+            state, reason = "unknown", (status["reasons"] or ["the device is not reporting"])[0]
+        elif rejected:
+            state, reason = "rejected", "; ".join(rejected["reasons"]) or "the device refused this rule set"
+        elif device_version != version or running is None:
+            state, reason = "unknown", "not yet confirmed by the device"
+        elif any(str(r).startswith(f"rule{index}:") for r in running):
+            state, reason = "running", None
+        else:
+            state, reason = "unknown", "the device does not report this rule running"
+        out.append(_rule_view(rule, index=index, status=state, reason=reason))
+    return {
+        "device_id": row["id"],
+        "rules_version": version if wanted else "",
+        "additive": bool(status["rules"]["additive"]),
+        "custom_monitoring_wanted": wanted,
+        "rules": out,
+    }
+
+
+@app.get("/v1/devices/{device_id}/rules")
+def device_rules(device_id: int, uid: int = Depends(current_user)):
+    with db() as conn:
+        row = _owned_device(conn, device_id, uid)
+    return _rules_overview(row, time.time())
+
+
+@app.patch("/v1/devices/{device_id}/rules/{rule_id}")
+def toggle_rule(device_id: int, rule_id: str, body: RuleToggleBody, uid: int = Depends(current_user)):
+    """Turn one custom rule on or off. The stored set changes, so its version
+    does too, and ingest delivers the enabled rules on the next poll (when
+    custom rules are active); a disabled rule is never delivered."""
+    with db() as conn:
+        row = _owned_device(conn, device_id, uid)
+        proposal = _loads_dict(row["ai_rules"])
+        rules = _with_rule_ids(_stored_rules(row["ai_rules"]))
+        match = next((r for r in rules if r["id"] == rule_id), None)
+        if match is None:
+            raise CodedError(404, "rule_not_found", f"no custom rule '{rule_id[:64]}' on this device")
+        match["enabled"] = body.enabled
+        proposal["rules"] = rules
+        updated = conn.execute(
+            "UPDATE devices SET ai_rules = ?, ai_rules_activation = COALESCE(ai_rules_activation, 0) + 1"
+            " WHERE id = ? AND ai_rules IS ?",
+            (json.dumps(proposal), device_id, row["ai_rules"]),
+        ).rowcount
+        if not updated:
+            # Activated or toggled in the same instant; never overwrite that.
+            raise CodedError(409, "draft_superseded", "the rules changed while this was being saved; reload them")
+        row = conn.execute("SELECT * FROM devices WHERE id = ?", (device_id,)).fetchone()
+    overview = _rules_overview(row, time.time())
+    return {
+        "ok": True,
+        "rule": next(r for r in overview["rules"] if r["id"] == rule_id),
+        "rules_version": overview["rules_version"],
+        "rules_active": len(_rules_payload(row["ai_rules"])) if row["custom_monitoring_wanted"] else 0,
+    }
 
 
 # ------------------------------------------------------------------------- AI configuration
@@ -2430,6 +2772,25 @@ def _validate_proposal(data: dict, role=None) -> dict:
             # The user is told the rule is an approximation, on the rule itself,
             # so the caveat survives into the review screen and the rule list.
             rule["caveat"] = verdict.reason
+        if rule.get("dwell_s") not in (None, ""):
+            # Per-subject dwell (core/rules.py): an area is mandatory, and
+            # persist_s mirrors it so firmware without dwell runs the nearest
+            # honest equivalent ("the area occupied that long") instead of
+            # refusing the set.
+            # An unreadable value is left for the schema below to refuse.
+            dwell = _number(rule.get("dwell_s"), -1.0)
+            if dwell > 0:
+                rule["dwell_s"] = max(1.0, min(3600.0, dwell))
+                rule["persist_s"] = rule["dwell_s"]
+        # The typed policy schema (jupiter/policy.py) is the last gate, whatever
+        # produced the rule: a shape the schema refuses never reaches a device.
+        problem = _policy_problem(rule)
+        if problem:
+            unsupported.append({
+                "request": described, "reason": problem, "requires": "a rule the device can evaluate as written",
+                "support": "unsupported", "alternatives": [],
+            })
+            continue
         valid_rules.append(rule)
 
     if preset and valid_rules:
@@ -2445,6 +2806,34 @@ def _validate_proposal(data: dict, role=None) -> dict:
     data["rules"] = valid_rules
     data["unsupported"] = unsupported
     return _decodable_proposal(data)
+
+
+def _policy_problem(rule: dict) -> Optional[str]:
+    """Why `rule` does not fit the typed policy schema, or None (it does)."""
+    try:
+        from jupiter.policy import PolicyError, policy_from_rule
+    except ImportError:  # backend deployed without jupiter/: the checks above still ran
+        return None
+    try:
+        policy_from_rule(rule)
+    except PolicyError as exc:
+        return str(exc)
+    return None
+
+
+def _policies_for(rules: list, zone_names: list[str]) -> list[dict]:
+    """The typed policy (jupiter/policy.py) for each validated rule, in order."""
+    try:
+        from jupiter.policy import PolicyError, policy_from_rule
+    except ImportError:
+        return []
+    out = []
+    for rule in rules:
+        try:
+            out.append({"rule_id": rule.get("id"), **policy_from_rule(rule, zones=zone_names).as_dict()})
+        except PolicyError:
+            continue  # cannot happen after _validate_proposal; never invent one
+    return out
 
 
 def _number(value, default: float) -> float:
@@ -2510,6 +2899,37 @@ def _legacy_validate_proposal(data: dict) -> dict:
     return _decodable_proposal(data)
 
 
+def _interpret_request(prompt: str, zone_names: list[str]) -> dict:
+    """A proposal for `prompt`, from the most trustworthy interpreter that claims it.
+
+      1. refusals (jupiter/policy.py refusal_for): identity, intent, emotion,
+         sound, ... are refused with core/taxonomy.py's reason BEFORE any model
+         sees them, so none can approximate "a stranger" as "a person";
+      2. the deterministic policy parser, for the area/duration requests it
+         reads completely ("someone stays inside this marked area for longer
+         than 10 seconds") -- exact, and no model involved;
+      3. the language model (Jupiter / Anthropic), whose output is validated
+         like everything else;
+      4. the keyword fallback.
+    """
+    try:
+        from jupiter import policy as policy_module
+    except ImportError:
+        policy_module = None
+    if policy_module is not None:
+        refusals = policy_module.refusal_for(prompt)
+        if refusals:
+            return {
+                "preset": "", "variant": "", "rules": [], "settings": {}, "unsupported": refusals,
+                "explanation": "Nothing was set up. " + " ".join(r["reason"] for r in refusals),
+                "source": "policy_guard",
+            }
+        parsed = policy_module.parse(prompt, zones=zone_names)
+        if parsed is not None:
+            return parsed.as_proposal()
+    return _ai_configure_llm(prompt) or _ai_fallback(prompt)
+
+
 @contextmanager
 def _ai_slot(uid: int):
     """Yield whether this account may make a model call right now.
@@ -2541,11 +2961,20 @@ def _ai_slot(uid: int):
 @app.post("/v1/ai/configure")
 def ai_configure(body: AIConfigureBody, uid: int = Depends(current_user)):
     with db() as conn:
-        role = _reported_role(_owned_device(conn, body.device_id, uid))
+        device = _owned_device(conn, body.device_id, uid)
+        role = _reported_role(device)
+        zone_names = _zone_names(device)
     with _ai_slot(uid) as allowed:
         if not allowed:
             raise HTTPException(429, "too many AI requests at once; try again in a moment")
-        result = _validate_proposal(_ai_configure_llm(body.prompt) or _ai_fallback(body.prompt), role=role)
+        result = _validate_proposal(_interpret_request(body.prompt, zone_names), role=role)
+    # The typed policy for every rule (docs/PROMPT_POLICIES.md): targets, area
+    # and whether it is drawn, timing, capabilities, and plain-language
+    # explanation of what is and is NOT monitored -- what the owner confirms.
+    # Ids now, at preview, so the rules the owner reviews are the rules they
+    # later toggle (Activate keeps ids it is given).
+    result["rules"] = _with_rule_ids(result.get("rules") or [])
+    result["policies"] = _policies_for(result["rules"], zone_names)
     # Persist the validated proposal as a DRAFT, so the app's Activate
     # (set_preset) has it to promote.
     #
@@ -3001,7 +3430,16 @@ def ingest(body: IngestBody, background_tasks: BackgroundTasks, device: sqlite3.
         # whatever preset was selected before. A desired_preset equal to that
         # name is genuinely NOT fulfilled yet in that case: the device still has
         # to exit custom monitoring, which is real work "same string" hides.
-        device_reports_custom_active = bool((body.monitoring or {}).get("active"))
+        #
+        # Except when the rules run BESIDE the mode (standard_plus_custom, an
+        # additive role) and are still wanted (kept with the switch, M6): the
+        # mode IS running, so the request is fulfilled. Counting it as
+        # unfulfilled re-sent the mode every poll, and each re-send made the
+        # device exit (and drop) the rules kept beside it. Rules no longer
+        # wanted still have to be exited, so that case is unchanged.
+        device_reports_custom_active = bool((body.monitoring or {}).get("active")) and not (
+            (body.monitoring or {}).get("mode") == "standard_plus_custom" and custom_monitoring_wanted
+        )
         # Convergence: once the device reports the desired preset as active AND
         # not layered under custom monitoring, the command is fulfilled — clear
         # it. Without the first half, a stale desired_preset keeps re-delivering

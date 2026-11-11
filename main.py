@@ -140,17 +140,16 @@ def restored_preset(config_module: Optional[str], modules_cfg: dict,
     name = device_state.saved_preset(config_module)
     if not name:
         return None
-    name = resolve_preset(name, presets)
-    base, _, variant_name = name.partition(":")
-    preset = presets.get(base)
-    if preset is None or preset.get("module") not in (modules_cfg or {}):
+    from core.presets import PresetError, preset_overrides
+
+    # Variant overrides plus any owner settings the saved name carries
+    # ("preset:variant@key=value"); a name this build cannot apply is not restored.
+    try:
+        name, preset, overrides = preset_overrides(name, presets)
+    except PresetError:
         return None
-    overrides: dict = {}
-    if variant_name:
-        variant = (preset.get("variants") or {}).get(variant_name)
-        if variant is None:
-            return None
-        overrides = variant.get("overrides") or {}
+    if preset.get("module") not in (modules_cfg or {}):
+        return None
     return name, preset, overrides
 
 
