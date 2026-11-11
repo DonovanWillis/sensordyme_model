@@ -1,0 +1,54 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Millisecond Clock</title>
+<!--
+  On-screen clock for the camera-to-alert latency procedure
+  (docs/HAILO_HARDWARE_VALIDATION.md, section 5). Open it full-screen on a laptop
+  or tablet placed in view of BOTH the Pi camera and the phone filming at high
+  frame rate. Fully offline: no network, no external resources.
+
+  - Big digits: wall-clock ms of this machine (Date.now()), redrawn every
+    display frame. Note this machine's NTP offset if you compare with Pi logs.
+  - Frame counter and the alternating square: each display refresh flips the
+    square, so the phone video shows whether a refresh was missed. A display
+    refresh is ~16.7 ms at 60 Hz: that is the resolution of any reading.
+-->
+<style>
+  :root { --bg: #ffffff; --fg: #000000; --muted: #555555; }
+  @media (prefers-color-scheme: dark) {
+    :root:not([data-theme="light"]) { --bg: #000000; --fg: #ffffff; --muted: #aaaaaa; }
+  }
+  :root[data-theme="dark"] { --bg: #000000; --fg: #ffffff; --muted: #aaaaaa; }
+  html, body { margin: 0; height: 100%; background: var(--bg); color: var(--fg); }
+  body { display: flex; flex-direction: column; align-items: center; justify-content: center;
+         font-family: ui-monospace, Menlo, Consolas, monospace; gap: 2vh; padding: 0 16px;
+         box-sizing: border-box; overflow: hidden; }
+  #ms { font-size: min(14vw, 22vh); font-weight: 700; letter-spacing: 0.02em; }
+  #meta { font-size: min(4vw, 5vh); color: var(--muted); }
+  #flip { width: min(20vw, 20vh); height: min(20vw, 20vh); border: 4px solid var(--fg); }
+</style>
+</head>
+<body>
+  <div id="ms">0</div>
+  <div id="meta">frame 0</div>
+  <div id="flip"></div>
+<script>
+  const ms = document.getElementById("ms");
+  const meta = document.getElementById("meta");
+  const flip = document.getElementById("flip");
+  let frame = 0;
+  function tick() {
+    const now = Date.now();
+    frame += 1;
+    ms.textContent = String(now % 1000000).padStart(6, "0");
+    meta.textContent = "frame " + frame + "  |  epoch " + now;
+    flip.style.background = frame % 2 ? "var(--fg)" : "var(--bg)";
+    requestAnimationFrame(tick);
+  }
+  requestAnimationFrame(tick);
+</script>
+</body>
+</html>
