@@ -74,7 +74,7 @@ struct CustomRulesCard: View {
             VStack(alignment: .leading, spacing: SD.Space.xxs) {
                 Text(rule.summary)
                     .font(SD.Typography.body)
-                    .foregroundStyle(rule.enabled ? SD.Colors.textPrimary : SD.Colors.textDisabled)
+                    .foregroundStyle(rule.enabled ? SD.Colors.textPrimary : SD.Colors.textTertiary)
                     .fixedSize(horizontal: false, vertical: true)
                 SDStatusPill(status: presentation.tone.sdStatus, text: presentation.chip)
                 if let detail = presentation.detail {

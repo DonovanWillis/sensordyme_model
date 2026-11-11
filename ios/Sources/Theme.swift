@@ -213,12 +213,12 @@ struct SDEyebrow: View {
     var body: some View {
         // Tracking, not kerning: kerning also adds space after the last letter,
         // outside the measured width, which the audit reported as clipped text.
-        // Two lines, not one, so a long label wraps rather than truncating.
+        // No line limit: a long label (a device name in a Jupiter header) wraps
+        // as far as the reader's text size needs; two lines clipped it (audit).
         Text(text.uppercased())
             .sdEyebrowFont()
             .tracking(SD.Typography.eyebrowKerning)
             .foregroundStyle(color)
-            .lineLimit(2)
             .fixedSize(horizontal: false, vertical: true)
     }
 }

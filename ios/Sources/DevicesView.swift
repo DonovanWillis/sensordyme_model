@@ -13,6 +13,7 @@ struct DevicesView: View {
     @EnvironmentObject private var state: AppState
     @State private var devices: [Device] = []
     @State private var errorMessage: String?
+    @Environment(\.dynamicTypeSize) private var typeSize
     @State private var showClaim = false
     @State private var showSetup = false
     @State private var hasLoaded = false
@@ -198,17 +199,25 @@ struct DevicesView: View {
     /// One line under the title: how many devices, how many are up. Counted
     /// from the same `online` flag the cards show, so the two always agree.
     private var fleetSummary: some View {
-        HStack(spacing: SD.Space.sm) {
+        // Side by side normally; stacked at accessibility text sizes, where the
+        // one-line row clipped both labels (audit).
+        let layout = typeSize.isAccessibilitySize
+            ? AnyLayout(VStackLayout(alignment: .leading, spacing: SD.Space.xxs))
+            : AnyLayout(HStackLayout(spacing: SD.Space.sm))
+        return layout {
             SDEyebrow("\(devices.count) \(devices.count == 1 ? "device" : "devices")")
-            Rectangle().fill(SD.Colors.borderStrong).frame(width: 1, height: 10)
+            if !typeSize.isAccessibilitySize {
+                Rectangle().fill(SD.Colors.borderStrong).frame(width: 1, height: 10)
+            }
             HStack(spacing: 6) {
                 Circle()
                     .fill(onlineCount > 0 ? SD.Colors.success : SD.Colors.offline)
                     .frame(width: 6, height: 6)
                 SDEyebrow("\(onlineCount) online", color: onlineCount > 0 ? SD.Colors.textSecondary : SD.Colors.textTertiary)
             }
-            Spacer()
+            if !typeSize.isAccessibilitySize { Spacer() }
         }
+        .frame(maxWidth: .infinity, alignment: .leading)
         .accessibilityElement(children: .combine)
     }
 
@@ -331,14 +340,16 @@ struct DeviceCard: View {
             preview
             HStack(alignment: .center, spacing: SD.Space.sm) {
                 VStack(alignment: .leading, spacing: 3) {
+                    // Wraps instead of truncating: at the largest text sizes a
+                    // one- or two-line limit cut the name off (audit: clipped).
                     Text(device.name)
                         .font(SD.Typography.headline)
                         .foregroundStyle(SD.Colors.textPrimary)
-                        .lineLimit(2)
+                        .fixedSize(horizontal: false, vertical: true)
                     Text(subtitle)
                         .font(SD.Typography.caption)
-                        .foregroundStyle(SD.Colors.textTertiary)
-                        .lineLimit(1)
+                        .foregroundStyle(SD.Colors.textSecondary)
+                        .fixedSize(horizontal: false, vertical: true)
                 }
                 Spacer(minLength: SD.Space.xs)
                 Image(systemName: "arrow.up.right")
@@ -381,18 +392,22 @@ struct DeviceCard: View {
                     SDStatusPill(status: status, pulses: status == .online)
                     Spacer()
                     if let id = device.hardwareId {
+                        // No shrink-to-fit: minimumScaleFactor stops the id following
+                        // the reader's text size (audit: Dynamic Type partially
+                        // unsupported); it wraps at large sizes instead.
                         Text(id)
                             .font(SD.Typography.mono)
-                            .foregroundStyle(SD.Colors.textTertiary)
-                            .lineLimit(1)
-                            .minimumScaleFactor(0.6)
+                            .foregroundStyle(SD.Colors.textSecondary)
+                            .multilineTextAlignment(.trailing)
+                            .fixedSize(horizontal: false, vertical: true)
                     }
                 }
                 Spacer()
             }
             .padding(SD.Space.sm)
         }
-        .frame(height: 132)
+        // A floor, not a fixed height: the pill and id grow with Dynamic Type.
+        .frame(minHeight: 132)
         .overlay(alignment: .bottom) {
             Rectangle().fill(SD.Colors.border).frame(height: 1)
         }
