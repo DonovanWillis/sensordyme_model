@@ -274,6 +274,27 @@ async def _validation_error(_request: Request, exc: RequestValidationError) -> J
     return JSONResponse(status_code=422, content={"detail": errors})
 
 
+class CodedError(HTTPException):
+    """An HTTP refusal the app must tell apart from others with the same status.
+
+    Answered as {"detail": "<human sentence>", "code": "<machine code>"}:
+    `detail` stays the plain string every client already shows, and `code` is
+    what a client branches on (docs/APP_STATUS_CONTRACT.md lists the codes).
+    Several different refusals share 409 -- a role forbidding a mode, a
+    superseded proposal, firmware that cannot stop -- and the app used to treat
+    every 409 as "the proposal changed".
+    """
+
+    def __init__(self, status_code: int, code: str, detail: str) -> None:
+        super().__init__(status_code, detail)
+        self.code = code
+
+
+@app.exception_handler(CodedError)
+async def _coded_error(_request: Request, exc: CodedError) -> JSONResponse:
+    return JSONResponse(status_code=exc.status_code, content={"detail": exc.detail, "code": exc.code})
+
+
 @app.exception_handler(OverflowError)
 async def _overflow(_request: Request, _exc: OverflowError) -> JSONResponse:
     """An integer too large for SQLite (a 30-digit device id or limit) is a bad
@@ -486,6 +507,11 @@ def init_db() -> None:
             # retried Activate of the proposal already running is recognised
             # rather than refused as stale (see set_preset).
             "ALTER TABLE devices ADD COLUMN ai_rules_promoted_from TEXT",
+            # The last mode request the backend itself dropped, and why (JSON:
+            # preset, code, reason, at). Ingest drops a stored desired_preset
+            # the device's role forbids; without a record the app's switch just
+            # vanished. Cleared by the next accepted mode request.
+            "ALTER TABLE devices ADD COLUMN preset_rejection TEXT",
         ):
             try:
                 conn.execute(statement)
@@ -738,6 +764,206 @@ def _rules_payload(ai_rules_json: Optional[str]) -> list[dict]:
     except (ValueError, TypeError, AttributeError):
         return []
     return [r for r in rules if isinstance(r, dict)] if isinstance(rules, list) else []
+
+
+# ------------------------------------------------------------------ app status contract
+# The one answer to "is this device watching right now, and for what?", computed
+# here from what the device itself reported. docs/APP_STATUS_CONTRACT.md is the
+# field-by-field contract; tests/test_app_status_contract.py pins it.
+
+_MONITORING_STATES = frozenset({"starting", "ready", "degraded", "stopped", "failed"})
+_PROTECTION_STATES = frozenset({"protecting", "not_protecting", "stopped"})
+_RUN_MODES = frozenset({"off", "standard", "ai_custom", "standard_plus_custom"})
+_MAX_REASONS = 20
+
+
+def _strings(value, limit: int = _MAX_REASONS) -> list[str]:
+    """A device-reported list as bounded strings (anything else: empty)."""
+    if not isinstance(value, list):
+        return []
+    return [str(item)[:500] for item in value[:limit] if isinstance(item, (str, int, float))]
+
+
+def _reported_at(value) -> Optional[float]:
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return None
+    return float(value) if math.isfinite(value) else None
+
+
+def _role_name(*sources) -> Optional[str]:
+    """The role name from whichever report carries one.
+
+    The device sends it in two shapes: `monitoring.role` is core/roles.py's
+    describe() dict, `health.monitoring.role` and `protection.role` are the bare
+    name. Reading only the dict made a device that had sent the string look
+    role-less, i.e. unrestricted.
+    """
+    for source in sources:
+        name = source.get("name") if isinstance(source, dict) else source
+        if isinstance(name, str) and name.strip():
+            return name.strip()[:64]
+    return None
+
+
+def _role_facts(monitoring: dict, health_monitoring: dict, protection: dict):
+    """(name, title, allowed_presets, additive) as the device reported its role.
+
+    The backend's own role table (core/roles.py, the table set_preset enforces)
+    wins for a role it knows; the device's describe() dict covers one it does
+    not. allowed_presets None = every preset.
+    """
+    from core.roles import ROLES
+
+    reported = monitoring.get("role")
+    pushed_protection = monitoring.get("protection")
+    pushed_protection = pushed_protection if isinstance(pushed_protection, dict) else {}
+    name = _role_name(reported, health_monitoring.get("role"), protection.get("role"),
+                      pushed_protection.get("role"))
+    if name is None:
+        return None, None, None, None
+    role = ROLES.get(name)
+    if role is not None:
+        allowed = None if role.allowed_presets is None else sorted(role.allowed_presets)
+        return name, role.title, allowed, role.additive_custom_rules
+    described = reported if isinstance(reported, dict) else {}
+    allowed_raw = described.get("allowed_presets")
+    allowed = _strings(allowed_raw, 64) if isinstance(allowed_raw, list) else None
+    additive = described.get("additive_custom_rules")
+    title = described.get("title")
+    return (name, str(title)[:64] if isinstance(title, str) else None, allowed,
+            additive if isinstance(additive, bool) else None)
+
+
+def _capabilities_summary(raw) -> Optional[dict]:
+    """{available, impaired: [{name, reason}], starting} from the device's map."""
+    if not isinstance(raw, dict):
+        return None
+    available, impaired, starting = [], [], []
+    for name, cap in sorted(raw.items()):
+        if not isinstance(name, str) or not isinstance(cap, dict):
+            continue
+        state = cap.get("state")
+        if state == "available":
+            available.append(name)
+        elif state == "impaired":
+            reason = cap.get("reason")
+            impaired.append({"name": name, "reason": str(reason)[:500] if reason else None})
+        elif state == "starting":
+            starting.append(name)
+    return {"available": available, "impaired": impaired, "starting": starting}
+
+
+def _rejection(raw) -> Optional[dict]:
+    """The device's last refusal (services/runtime.py _record_rejection), cleaned."""
+    if not isinstance(raw, dict) or raw.get("kind") not in ("preset", "rules", "protection"):
+        return None
+    return {
+        "kind": raw["kind"],
+        "subject": str(raw.get("subject") or "")[:200],
+        "reasons": _strings(raw.get("reasons")),
+        "at": _reported_at(raw.get("at")),
+    }
+
+
+def _device_status(row: sqlite3.Row, now: float) -> dict:
+    """The typed status the app renders (docs/APP_STATUS_CONTRACT.md).
+
+    Liveness first: with no report in the last _HEALTH_STALE_S seconds (or
+    none ever), monitoring_state and protection are "unknown" and
+    monitoring_active is None. An old "ready" is never echoed: the last report
+    is a photograph of a moment that has passed.
+    """
+    health = _health_payload(row, now)
+    stale = health is None
+    monitoring = _monitoring_payload(row["monitoring"]) or {}
+    try:
+        stored_health = json.loads(row["health"] or "null")
+    except (ValueError, TypeError):
+        stored_health = None
+    stored_health = stored_health if isinstance(stored_health, dict) else {}
+    # Role and capability facts read from the LAST report even when stale: they
+    # describe configuration, not liveness. State and protection never do.
+    stored_monitoring = stored_health.get("monitoring")
+    stored_monitoring = stored_monitoring if isinstance(stored_monitoring, dict) else {}
+    stored_protection = stored_health.get("protection")
+    stored_protection = stored_protection if isinstance(stored_protection, dict) else {}
+    role, role_title, allowed_presets, additive = _role_facts(monitoring, stored_monitoring, stored_protection)
+
+    live = health or {}
+    live_monitoring = live.get("monitoring") if isinstance(live.get("monitoring"), dict) else {}
+    reported_protection = live.get("protection")
+    if not isinstance(reported_protection, dict):
+        # Firmware that sends protection only in the monitoring block.
+        reported_protection = monitoring.get("protection") if isinstance(monitoring.get("protection"), dict) else {}
+
+    reasons: list[str] = []
+    protection_reasons: list[str] = []
+    if stale:
+        state, protection, active = "unknown", "unknown", None
+        reasons = [
+            "the device has not reported yet" if not row["last_seen"]
+            else f"no report from the device in the last {_HEALTH_STALE_S} s"
+        ]
+    else:
+        state = live_monitoring.get("state")
+        if state not in _MONITORING_STATES:
+            # The state the device pushed with its monitoring report (same firmware
+            # generation), else nothing this backend can trust.
+            state = monitoring.get("state") if monitoring.get("state") in _MONITORING_STATES else "unknown"
+        if state == "unknown":
+            reasons = ["this device's software does not report its monitoring state"]
+            active = None
+        else:
+            reasons = _strings(live_monitoring.get("reasons"))
+            # Exactly the device's own definition (MonitoringReport.monitoring),
+            # derived rather than read so it can never disagree with the state.
+            active = state in ("ready", "degraded")
+        protection = reported_protection.get("state")
+        if protection not in _PROTECTION_STATES:
+            protection = "unknown"
+        protection_reasons = _strings(reported_protection.get("reasons"))
+
+    mode = live_monitoring.get("mode") or monitoring.get("mode")
+    mode = mode if mode in _RUN_MODES else None
+
+    # Rules: what the DEVICE runs, never what the backend validated. A rule set the
+    # device refused (all or nothing, services/runtime.py) is acknowledged by the
+    # uplink all the same, so "delivered" is not "running".
+    last_rejection = _rejection(monitoring.get("last_rejection"))
+    wanted_version = (
+        _rules_version(row["ai_rules"], row["ai_rules_activation"] or 0)
+        if row["custom_monitoring_wanted"] else ""
+    )
+    rules_rejected = None
+    if (last_rejection and last_rejection["kind"] == "rules" and wanted_version
+            and last_rejection["subject"] == wanted_version):
+        rules_rejected = {"version": wanted_version, "reasons": last_rejection["reasons"],
+                          "at": last_rejection["at"]}
+    running = live_monitoring.get("custom_rules") if not stale else None
+    rules = {
+        "active": _strings(running, 200) if isinstance(running, list) else None,
+        "additive": additive,
+        "rejected": rules_rejected,
+    }
+
+    preset_rejection = _loads_dict(row["preset_rejection"]) or None
+    return {
+        "monitoring_state": state,
+        "monitoring_active": active,
+        "protection": protection,
+        "reasons": reasons,
+        "protection_reasons": protection_reasons,
+        "mode": mode,
+        "role": role,
+        "role_title": role_title,
+        "allowed_presets": allowed_presets,
+        "capabilities": None if stale else _capabilities_summary(live_monitoring.get("capabilities")),
+        "rules": rules,
+        "last_rejection": last_rejection,
+        "preset_rejection": preset_rejection,
+        "stale": stale,
+        "reported_at": _reported_at(row["last_seen"]),
+    }
 
 
 def current_device(x_device_key: str = Header(default="")) -> sqlite3.Row:
@@ -1242,7 +1468,7 @@ def signup(body: Credentials, request: Request):
                 (email, _hash_pw(body.password, salt), salt, time.time()),
             )
         except sqlite3.IntegrityError:
-            raise HTTPException(409, "an account with this email already exists") from None
+            raise CodedError(409, "account_exists", "an account with this email already exists") from None
     return {"token": _issue_token(cur.lastrowid, email), "email": email}
 
 
@@ -1368,7 +1594,7 @@ def claim_device(body: ClaimBody, request: Request, uid: int = Depends(current_u
         if row is None:
             raise HTTPException(404, "unknown claim code")
         if row["owner_id"] is not None and row["owner_id"] != uid:
-            raise HTTPException(409, "device already claimed by another account")
+            raise CodedError(409, "device_already_claimed", "device already claimed by another account")
         # Conditional, not a blind overwrite: two accounts holding the same code
         # could both pass the check above before either wrote, and both got a
         # 200 while the last writer silently took the device.
@@ -1377,14 +1603,14 @@ def claim_device(body: ClaimBody, request: Request, uid: int = Depends(current_u
             (uid, row["id"], uid),
         )
         if claimed.rowcount == 0:
-            raise HTTPException(409, "device already claimed by another account")
+            raise CodedError(409, "device_already_claimed", "device already claimed by another account")
     return {"ok": True, "device_id": row["id"], "name": row["name"]}
 
 
 def _owned_device(conn: sqlite3.Connection, device_id: int, uid: int) -> sqlite3.Row:
     row = conn.execute("SELECT * FROM devices WHERE id = ? AND owner_id = ?", (device_id, uid)).fetchone()
     if row is None:
-        raise HTTPException(404, "no such device on this account")
+        raise CodedError(404, "device_not_found", "no such device on this account")
     return row
 
 
@@ -1410,6 +1636,9 @@ def list_devices(uid: int = Depends(current_user)):
                 # Kept even when health is withheld as stale: it identifies the
                 # camera, it does not claim it is healthy.
                 "hardware_id": r["hardware_id"],
+                # What the app renders as "is it watching": the typed contract in
+                # docs/APP_STATUS_CONTRACT.md, "unknown" once the device goes quiet.
+                "status": _device_status(r, now),
             }
             for r in rows
         ]
@@ -1456,9 +1685,32 @@ _NOT_BESIDE_A_MODE = (
     "without this rule."
 )
 
+#: The same refusal on a device whose role runs custom rules BESIDE its mode
+#: (core/roles.py additive_custom_rules, M0.1). There "running them replaces the
+#: mode's own detection" is false: activated on their own, rules run alongside
+#: the mode, which keeps running. Only a rule sent WITH a mode switch is not run.
+_BESIDE_A_MODE_ON_ITS_OWN = (
+    "This device runs custom rules alongside its monitoring mode, but a rule sent "
+    "together with a mode switch is not turned on. The mode was turned on without "
+    "this rule; activate the rule on its own to add it beside the mode."
+)
 
-def _beside_a_mode_unsupported(rules: list) -> list[dict]:
-    """`unsupported` entries for rules that came with a named mode."""
+
+def _rules_run_beside(role, preset: str) -> bool:
+    """Would custom rules run BESIDE `preset` on a device with `role` (additive)?"""
+    if role is None or not role.additive_custom_rules:
+        return False
+    base = (preset or "").partition(":")[0]
+    module = (load_presets().get(base) or {}).get("module")
+    return module in role.mandatory_modules
+
+
+def _beside_a_mode_unsupported(rules: list, additive: bool = False) -> list[dict]:
+    """`unsupported` entries for rules that came with a named mode.
+
+    `additive`: the device runs rules beside this mode when they are activated
+    on their own (see _BESIDE_A_MODE_ON_ITS_OWN), so the reason says that.
+    """
     entries = []
     for rule in rules or []:
         if not isinstance(rule, dict):
@@ -1467,8 +1719,9 @@ def _beside_a_mode_unsupported(rules: list) -> list[dict]:
         predicate = str(rule.get("predicate") or "").strip()
         entries.append({
             "request": str(rule.get("description") or f"{predicate} {target}".strip())[:500],
-            "reason": _NOT_BESIDE_A_MODE,
-            "requires": "activate it on its own as a custom configuration (no mode), "
+            "reason": _BESIDE_A_MODE_ON_ITS_OWN if additive else _NOT_BESIDE_A_MODE,
+            "requires": "activate it on its own; it then runs beside the mode" if additive else
+                        "activate it on its own as a custom configuration (no mode), "
                         "or device support for rules beside a mode",
             "support": "unsupported",
             "alternatives": [],
@@ -1525,12 +1778,23 @@ def _loads_dict(raw: Optional[str]) -> dict:
 
 
 def _reported_role(device: sqlite3.Row):
-    """The role the device last reported (core/roles.py), or None."""
+    """The role the device last reported (core/roles.py), or None.
+
+    Either shape: the describe() dict in the monitoring report, or the bare name
+    the health report and the protection block carry (see _role_name).
+    """
     from core.roles import ROLES
 
     reported = _monitoring_payload(device["monitoring"]) or {}
-    name = (reported.get("role") or {}).get("name") if isinstance(reported.get("role"), dict) else None
-    return ROLES.get(name) if isinstance(name, str) else None
+    try:
+        health = json.loads(device["health"] or "null")
+    except (ValueError, TypeError):
+        health = None
+    health = health if isinstance(health, dict) else {}
+    health_monitoring = health.get("monitoring") if isinstance(health.get("monitoring"), dict) else {}
+    protection = reported.get("protection") if isinstance(reported.get("protection"), dict) else {}
+    name = _role_name(reported.get("role"), health_monitoring.get("role"), protection.get("role"))
+    return ROLES.get(name) if name is not None else None
 
 
 def _role_refusal(device: sqlite3.Row, preset: str, presets: dict) -> Optional[str]:
@@ -1549,7 +1813,7 @@ def set_protection(device_id: int, body: ProtectionBody, uid: int = Depends(curr
     restarted; the request is delivered once and cleared on convergence.
     """
     if body.action == "stop" and not body.confirm:
-        raise HTTPException(400, "stopping monitoring requires confirm: true")
+        raise CodedError(400, "confirmation_required", "stopping monitoring requires confirm: true")
     with db() as conn:
         device = _owned_device(conn, device_id, uid)
         reported = _monitoring_payload(device["monitoring"])
@@ -1557,7 +1821,8 @@ def set_protection(device_id: int, body: ProtectionBody, uid: int = Depends(curr
             # Firmware older than M0.1 cannot stop or resume. Answering ok here
             # made the app believe a device had stopped that never would, and
             # the request was re-sent on every poll for ever.
-            raise HTTPException(409, "this device's software does not support stop/resume yet; update it first")
+            raise CodedError(409, "firmware_unsupported",
+                             "this device's software does not support stop/resume yet; update it first")
         # Each request has an id the device echoes once it has applied it, so a
         # stop still in flight cannot be mistaken for a later resume (or the
         # reverse) by comparing states alone.
@@ -1596,12 +1861,12 @@ def set_preset(device_id: int, body: PresetBody, uid: int = Depends(current_user
             if base not in presets or (
                 variant and variant not in (presets[base].get("variants") or {})
             ):
-                raise HTTPException(400, f"unknown mode '{body.preset}'")
+                raise CodedError(400, "unknown_preset", f"unknown mode '{body.preset}'")
             # The device's role (as the device last reported it) may forbid this
             # mode. Refuse here with the reason; the device would refuse it too.
             refusal = _role_refusal(device, normalized, presets)
             if refusal:
-                raise HTTPException(409, refusal)
+                raise CodedError(409, "role_forbids_preset", refusal)
 
         draft_json = device["ai_rules_draft"]
         # The proposal on screen must still be the one stored. A newer preview
@@ -1617,8 +1882,9 @@ def set_preset(device_id: int, body: PresetBody, uid: int = Depends(current_user
             # Plain equality: the version is not a secret, and compare_digest
             # raises TypeError on non-ASCII text (a 500 for a bad request).
             if not expected or body.draft_version != expected:
-                raise HTTPException(
-                    409, "this proposal was replaced by a newer one; review it again before activating"
+                raise CodedError(
+                    409, "draft_superseded",
+                    "this proposal was replaced by a newer one; review it again before activating",
                 )
 
         # An empty preset IS the app's request for AI Custom (AIConfigureView's
@@ -1626,7 +1892,8 @@ def set_preset(device_id: int, body: PresetBody, uid: int = Depends(current_user
         # request to leave custom monitoring in charge, whatever ai_rules
         # still says from a previous configuration.
         conn.execute(
-            "UPDATE devices SET desired_preset = ?, custom_monitoring_wanted = ? WHERE id = ?",
+            "UPDATE devices SET desired_preset = ?, custom_monitoring_wanted = ?, preset_rejection = NULL"
+            " WHERE id = ?",
             (normalized, 1 if normalized == "" else 0, device_id),
         )
 
@@ -1637,7 +1904,9 @@ def set_preset(device_id: int, body: PresetBody, uid: int = Depends(current_user
             # _NOT_BESIDE_A_MODE. Rules that came with it are reported back.
             return {
                 "ok": True, "desired_preset": normalized, "rules_active": 0,
-                "rules_version": "", "unsupported": _beside_a_mode_unsupported(body.rules or []),
+                "rules_version": "",
+                "unsupported": _beside_a_mode_unsupported(
+                    body.rules or [], additive=_rules_run_beside(_reported_role(device), normalized)),
             }
 
         # AI Custom. This is the ONLY act of acceptance anywhere in the flow,
@@ -2036,7 +2305,7 @@ def _ai_fallback(prompt: str) -> dict:
     }
 
 
-def _validate_proposal(data: dict) -> dict:
+def _validate_proposal(data: dict, role=None) -> dict:
     """Re-check the model's claims against what the device can actually run.
 
     The model is capable and well-briefed, but it is still the thing being
@@ -2165,7 +2434,7 @@ def _validate_proposal(data: dict) -> dict:
         # _NOT_BESIDE_A_MODE. Said here, at preview, rather than discovered
         # after Activate -- the review screen must not offer "Activate 1 rule"
         # for a rule that will never run.
-        unsupported.extend(_beside_a_mode_unsupported(valid_rules))
+        unsupported.extend(_beside_a_mode_unsupported(valid_rules, additive=_rules_run_beside(role, preset)))
         valid_rules = []
 
     data["preset"] = preset
@@ -2269,11 +2538,11 @@ def _ai_slot(uid: int):
 @app.post("/v1/ai/configure")
 def ai_configure(body: AIConfigureBody, uid: int = Depends(current_user)):
     with db() as conn:
-        _owned_device(conn, body.device_id, uid)
+        role = _reported_role(_owned_device(conn, body.device_id, uid))
     with _ai_slot(uid) as allowed:
         if not allowed:
             raise HTTPException(429, "too many AI requests at once; try again in a moment")
-        result = _validate_proposal(_ai_configure_llm(body.prompt) or _ai_fallback(body.prompt))
+        result = _validate_proposal(_ai_configure_llm(body.prompt) or _ai_fallback(body.prompt), role=role)
     # Persist the validated proposal as a DRAFT, so the app's Activate
     # (set_preset) has it to promote.
     #
@@ -2764,14 +3033,23 @@ def ingest(body: IngestBody, background_tasks: BackgroundTasks, device: sqlite3.
                 (device["id"], desired),
             )
             desired = None
-        if desired and _role_refusal(device, desired, load_presets()):
+        # The row as THIS request left it: the report that carries the role may
+        # be this very one, and `device` was read before it was stored.
+        refusal = None
+        if desired:
+            current = conn.execute("SELECT * FROM devices WHERE id = ?", (device["id"],)).fetchone()
+            refusal = _role_refusal(current, desired, load_presets())
+        if refusal:
             # A preset the device's role forbids (stored before the device
             # reported its role, or before the upgrade) would be re-sent and
-            # refused on every poll, for ever (M0.1 review). Drop it; the app
-            # sees the role and the running preset in the device's report.
+            # refused on every poll, for ever (M0.1 review). Drop it, and record
+            # why: the app shows status.preset_rejection rather than a switch
+            # that silently vanished.
             conn.execute(
-                "UPDATE devices SET desired_preset = NULL WHERE id = ? AND desired_preset = ?",
-                (device["id"], desired),
+                "UPDATE devices SET desired_preset = NULL, preset_rejection = ?"
+                " WHERE id = ? AND desired_preset = ?",
+                (json.dumps({"preset": desired, "code": "role_forbids_preset", "reason": refusal,
+                             "at": now}), device["id"], desired),
             )
             desired = None
 
