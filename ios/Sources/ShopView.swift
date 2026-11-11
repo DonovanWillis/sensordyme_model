@@ -1,6 +1,10 @@
 import SwiftUI
 
-// MARK: - Shop: order more devices, track orders.
+// MARK: - Shop: request more devices, track requests.
+//
+// There is no payment in the app. Placing an order records an ORDER REQUEST on
+// the server (POST /v1/orders); nothing is charged and nothing ships until
+// someone follows up. The screen says exactly that.
 
 struct ShopView: View {
     @EnvironmentObject private var state: AppState
@@ -63,7 +67,7 @@ struct ShopView: View {
             HStack {
                 VStack(alignment: .leading, spacing: 2) {
                     Text("$\(unitPrice)").font(.title2.weight(.heavy))
-                    Text("free shipping · 30-day returns").font(.caption).foregroundStyle(SD.Colors.textSecondary)
+                    Text("No payment in the app").font(.caption).foregroundStyle(SD.Colors.textSecondary)
                 }
                 Spacer()
                 Stepper(value: $quantity, in: 1...25) {
@@ -90,15 +94,20 @@ struct ShopView: View {
                 if placing {
                     ProgressView().tint(SD.Colors.textOnAccent)
                 } else {
-                    Text("Place order — $\(unitPrice * quantity)")
+                    Text("Send order request · est. $\(unitPrice * quantity)")
                 }
             }
             .buttonStyle(BrandButtonStyle())
             .disabled(placing || address.trimmingCharacters(in: .whitespaces).count < 10)
 
+            Text("This sends an order request. You won't be charged here; we'll contact you to confirm the order and arrange payment before anything ships.")
+                .font(.caption)
+                .foregroundStyle(SD.Colors.textTertiary)
+                .fixedSize(horizontal: false, vertical: true)
+
             if let placedOrderID {
-                Label("Order #\(placedOrderID) placed — \(quantity) unit\(quantity > 1 ? "s" : "") on the way",
-                      systemImage: "shippingbox.fill")
+                Label("Request #\(placedOrderID) received — not yet confirmed or charged",
+                      systemImage: "checkmark.circle")
                     .font(.subheadline.bold())
                     .foregroundStyle(SD.Colors.success)
             }
@@ -111,7 +120,7 @@ struct ShopView: View {
 
     private var ordersCard: some View {
         VStack(alignment: .leading, spacing: 10) {
-            Text("Your orders").font(.headline)
+            Text("Your order requests").font(.headline)
             ForEach(orderHistory) { order in
                 HStack {
                     Image(systemName: "shippingbox.fill").foregroundStyle(SD.Colors.accent)
@@ -121,7 +130,7 @@ struct ShopView: View {
                         Text(order.address).font(.caption).foregroundStyle(SD.Colors.textSecondary).lineLimit(1)
                     }
                     Spacer()
-                    Text(order.status.capitalized)
+                    Text(Self.statusLabel(order.status))
                         .font(.caption.bold())
                         .padding(.horizontal, 10).padding(.vertical, 5)
                         .background(Capsule().fill(.thinMaterial))
@@ -130,6 +139,11 @@ struct ShopView: View {
             }
         }
         .brandCard()
+    }
+
+    /// "placed" is the server's word for a request nobody has acted on yet.
+    static func statusLabel(_ status: String) -> String {
+        status == "placed" ? "Requested" : status.replacingOccurrences(of: "_", with: " ").capitalized
     }
 
     private func placeOrder() {

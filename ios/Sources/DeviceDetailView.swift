@@ -44,6 +44,34 @@ struct DeviceDetailView: View {
     /// straight away when non-empty).
     @State private var jupiterRequest = ""
     @State private var showHistory = false
+    @State private var renameError: String?
+
+    // Preset library (PresetLibrary.swift). The catalog is the server's when it
+    // publishes one, else the built-in list, labelled.
+    @State private var catalog: PresetCatalog?
+    @State private var devicePresets: DevicePresets?
+    /// This server has no per-device presets endpoint; availability then
+    /// comes from `status.allowed_presets` as before.
+    @State private var devicePresetsMissing = false
+    /// This server has no catalog endpoint; the built-in list is shown, labelled.
+    @State private var catalogMissing = false
+    @State private var presetSheet: CatalogPreset?
+
+    // Custom rules (DeviceRules.swift).
+    @State private var rulesLoad: CustomRulesCard.Load = .loading
+    @State private var rulesBusy: Set<String> = []
+    @State private var ruleToggleError: String?
+
+    // Stop / resume (ProtectionControl.swift).
+    @State private var protectionRequest: ProtectionRequest?
+    @State private var protectionSending = false
+    @State private var protectionError: String?
+    /// The device's software or this server can't stop/resume; said instead
+    /// of offering a control that cannot work.
+    @State private var protectionUnsupported: String?
+    /// What the device confirmed, shown for a while after it converged.
+    @State private var protectionNotice: (text: String, at: Date)?
+    @State private var confirmStop = false
 
     private let refreshTimer = Timer.publish(every: 4, on: .main, in: .common).autoconnect()
     @State private var timedReloadInFlight = false
@@ -70,6 +98,13 @@ struct DeviceDetailView: View {
                 // keeps showing the last frame and event list when a refresh fails.
                 if let errorMessage {
                     ConnectionBanner(message: errorMessage) { await reload() }
+                } else if hasLoaded && !deviceLive {
+                    // The server answers but the device doesn't: everything
+                    // below is the last thing it said, and changes wait for it.
+                    ConnectionBanner(
+                        message: staleDeviceMessage,
+                        title: "\(device.name) isn't reporting"
+                    ) { await reload() }
                 }
 
                 // The camera is the centrepiece and always comes first.
@@ -79,6 +114,10 @@ struct DeviceDetailView: View {
 
                 askJupiterSection
                 modeCard
+                CustomRulesCard(
+                    load: rulesLoad, deviceLive: deviceLive, busy: rulesBusy, toggleError: ruleToggleError,
+                    onToggle: { rule, enabled in toggleRule(rule, enabled: enabled) },
+                    onAskJupiter: { jupiterRequest = ""; showAI = true })
                 manageCard
 
                 // Last on purpose: detail for someone who went looking for it,
@@ -138,11 +177,41 @@ struct DeviceDetailView: View {
             TextField("Name", text: $newName)
             Button("Save") {
                 Task {
-                    try? await state.backend.renameDevice(deviceID: device.id, name: newName)
+                    // Was `try?`: a refused or failed rename closed the alert
+                    // and left the old name with no word of why.
+                    do {
+                        try await state.backend.renameDevice(deviceID: device.id, name: newName)
+                        renameError = nil
+                    } catch let error as APIError where error.isAuthFailure {
+                        state.expireSession(error.message)
+                    } catch {
+                        renameError = "Couldn't rename the device: \(error.localizedDescription)"
+                    }
                     await reload()
                 }
             }
             Button("Cancel", role: .cancel) {}
+        }
+        .alert("Rename failed", isPresented: Binding(get: { renameError != nil }, set: { if !$0 { renameError = nil } })) {
+            Button("OK", role: .cancel) { renameError = nil }
+        } message: {
+            Text(renameError ?? "")
+        }
+        .confirmationDialog(ProtectionControl.stopConfirmationTitle, isPresented: $confirmStop, titleVisibility: .visible) {
+            Button("Stop monitoring", role: .destructive) { sendProtection(.stop) }
+            Button("Keep monitoring", role: .cancel) {}
+        } message: {
+            Text(ProtectionControl.stopConfirmationMessage)
+        }
+        .sheet(item: $presetSheet) { preset in
+            PresetDetailView(
+                device: device, preset: preset,
+                catalogSource: catalog?.source ?? .builtIn(reason: PresetCatalog.builtInBecauseUnreachable),
+                deviceState: devicePresets?.state(for: preset.id),
+                legacyUnavailableReason: devicePresets == nil
+                    ? MonitoringStatusPresentation.presetUnavailableReason(preset.id, status: device.status)
+                    : nil
+            ) { await reload() }
         }
         .sheet(isPresented: $showAI, onDismiss: { jupiterRequest = "" }) {
             AIConfigureView(device: device, initialPrompt: jupiterRequest) { await reload() }
@@ -253,7 +322,7 @@ struct DeviceDetailView: View {
                 // the mode is what this line names.
                 Text(customReplacesModes
                      ? (device.monitoring?.title ?? "AI Custom Monitoring")
-                     : Preset.title(for: device.activePreset))
+                     : presetTitle(device.activePreset))
                     .font(SD.Typography.caption.weight(.medium))
                     .lineLimit(1)
             }
@@ -300,6 +369,54 @@ struct DeviceDetailView: View {
                     }
                 }
             }
+
+            capabilitiesCard
+        }
+    }
+
+    /// What the device can detect right now, from `status.capabilities`:
+    /// available, starting, or impaired with the device's reason, plus how far
+    /// each has been evaluated when the backend says. Empty, with a sentence,
+    /// whenever the device isn't reporting: an old list is never shown green.
+    @ViewBuilder private var capabilitiesCard: some View {
+        let health = CapabilityHealth.rows(status: device.status, online: device.online)
+        SDSectionHeader(title: "Detection capabilities")
+            .padding(.horizontal, SD.Space.xxs)
+            .padding(.top, SD.Space.xs)
+        SDCard {
+            VStack(alignment: .leading, spacing: SD.Space.sm) {
+                if let notice = health.notice {
+                    HStack(alignment: .top, spacing: SD.Space.sm) {
+                        Image(systemName: "questionmark.circle")
+                            .foregroundStyle(SD.Colors.textTertiary)
+                        Text(notice)
+                            .font(SD.Typography.caption)
+                            .foregroundStyle(SD.Colors.textTertiary)
+                            .fixedSize(horizontal: false, vertical: true)
+                    }
+                }
+                ForEach(Array(health.rows.enumerated()), id: \.element.id) { index, row in
+                    healthRow(row.title, systemImage: capabilityIcon(row.state),
+                              HealthComponent(state: row.tone.healthState, detail: row.detail, metrics: nil))
+                    if index < health.rows.count - 1 {
+                        OrynRowDivider(inset: 22 + SD.Space.sm)
+                    }
+                }
+                if !health.rows.isEmpty {
+                    Text("“Producing results” means the capability is running, not that its results are accurate.")
+                        .font(SD.Typography.caption)
+                        .foregroundStyle(SD.Colors.textTertiary)
+                        .fixedSize(horizontal: false, vertical: true)
+                }
+            }
+        }
+    }
+
+    private func capabilityIcon(_ state: CapabilityHealthRow.State) -> String {
+        switch state {
+        case .available: "waveform.path.ecg"
+        case .starting: "hourglass"
+        case .impaired: "exclamationmark.triangle"
         }
     }
 
@@ -432,10 +549,13 @@ struct DeviceDetailView: View {
                         OrynNavRow(
                             icon: "chart.bar",
                             title: "Report",
-                            detail: "Patterns across recent events"
+                            detail: "Estimates from recent events"
                         )
                     }
                     .buttonStyle(SDRowButtonStyle(minHeight: 60))
+
+                    OrynRowDivider()
+                    protectionRow
 
                     if state.isDemo {
                         OrynRowDivider()
@@ -547,9 +667,18 @@ struct DeviceDetailView: View {
                     Rectangle().fill(SD.Colors.border).frame(height: 1)
                 }
 
-                ForEach(Preset.catalog) { preset in
+                // The built-in list says so: it knows names, not what this
+                // device can run or how far anything has been validated.
+                if case .builtIn(let reason) = libraryCatalog.source {
+                    Label(reason, systemImage: "info.circle")
+                        .font(SD.Typography.caption)
+                        .foregroundStyle(SD.Colors.textTertiary)
+                        .fixedSize(horizontal: false, vertical: true)
+                }
+
+                ForEach(libraryCatalog.presets) { preset in
                     modeRow(preset)
-                    if preset.id != Preset.catalog.last?.id {
+                    if preset.id != libraryCatalog.presets.last?.id {
                         Rectangle().fill(SD.Colors.border).frame(height: 1)
                     }
                 }
@@ -559,7 +688,7 @@ struct DeviceDetailView: View {
     }
 
     @ViewBuilder
-    private func modeRow(_ preset: Preset) -> some View {
+    private func modeRow(_ preset: CatalogPreset) -> some View {
         // The single source of truth for this row's state — see
         // ModeSwitchState.swift for why "active"/"switching" alone weren't
         // enough: no distinct failure state, no offline state, no timeout.
@@ -569,17 +698,20 @@ struct DeviceDetailView: View {
         // Only custom rules that REPLACE the modes stop a mode row reading active;
         // rules running alongside (an additive role) leave the mode running.
         let rowState = ModeSwitchState.state(
-            for: preset.name, activeBase: activeBase, customMonitoringActive: customReplacesModes,
+            for: preset.id, activeBase: activeBase, customMonitoringActive: customReplacesModes,
             pending: pendingSwitch, deviceOnline: device.online, failure: failedSwitch, now: .now,
-            unavailable: MonitoringStatusPresentation.presetUnavailableReason(preset.name, status: device.status)
+            unavailable: unavailableReason(preset.id)
         )
         let isActive = rowState == .active
         let isUnavailable = rowState.isUnavailable
+        let validation = libraryCatalog.isBuiltIn ? nil
+            : ValidationPresentation.make(devicePresets?.state(for: preset.id)?.validationStatus ?? preset.validation.status)
 
         VStack(alignment: .leading, spacing: SD.Space.xs) {
-            Button { setMode(preset.name) } label: {
+            HStack(spacing: SD.Space.xs) {
+            Button { setMode(preset.id) } label: {
                 HStack(spacing: SD.Space.sm) {
-                    Image(systemName: preset.icon)
+                    Image(systemName: Preset.icon(for: preset.id))
                         .font(.system(size: 15))
                         .frame(width: 26)
                         .foregroundStyle(isActive ? SD.Colors.textPrimary : SD.Colors.textDisabled)
@@ -601,9 +733,17 @@ struct DeviceDetailView: View {
                                 .font(SD.Typography.caption)
                                 .foregroundStyle(SD.Colors.warning)
                         case .inactive, .switching, .active:
-                            Text(preset.subtitle)
+                            Text(preset.description)
                                 .font(SD.Typography.caption)
                                 .foregroundStyle(SD.Colors.textTertiary)
+                                .lineLimit(2)
+                        }
+                        // How far it has been validated, from the catalog. Only
+                        // "validated on device" is ever green.
+                        if let validation {
+                            SDEyebrow(validation.chip,
+                                      color: validation.isValidated ? SD.Colors.success : SD.Colors.warning)
+                                .padding(.top, 2)
                         }
                     }
                     Spacer(minLength: SD.Space.xxs)
@@ -626,17 +766,31 @@ struct DeviceDetailView: View {
                 .contentShape(Rectangle())
             }
             .buttonStyle(.plain)
-            // The backend would refuse it (role_forbids_preset): nothing to tap.
+            // The backend would refuse it (role_forbids_preset, a capability
+            // the device lacks, planned): nothing to tap.
             .disabled(isUnavailable)
+
+            // Details, settings and validation. Enabled even when the preset
+            // can't be picked, so the reason can be read in full.
+            Button { presetSheet = preset } label: {
+                Image(systemName: "info.circle")
+                    .font(.system(size: 15))
+                    .foregroundStyle(SD.Colors.textSecondary)
+                    .frame(width: 32, height: 32)
+                    .contentShape(Rectangle())
+            }
+            .buttonStyle(.plain)
+            .accessibilityLabel("\(preset.title) details and settings")
+            }
 
             // Tuning variants, shown only for the mode currently running.
             if isActive && !preset.variants.isEmpty {
                 ScrollView(.horizontal, showsIndicators: false) {
                     HStack(spacing: SD.Space.xs) {
                         ForEach(preset.variants) { variant in
-                            let selected = (activeVariant ?? preset.variants.first?.name) == variant.name
+                            let selected = (activeVariant ?? preset.variants.first?.id) == variant.id
                             Button {
-                                setMode("\(preset.name):\(variant.name)")
+                                setMode("\(preset.id):\(variant.id)")
                             } label: {
                                 Text(variant.title)
                                     .font(SD.Typography.caption.weight(.semibold))
@@ -663,6 +817,214 @@ struct DeviceDetailView: View {
             }
         }
         .padding(.vertical, SD.Space.xxs)
+    }
+
+    // MARK: Preset library
+
+    /// The server's catalog once loaded; until then (and when it has none) the
+    /// built-in list, labelled as such.
+    private var libraryCatalog: PresetCatalog {
+        catalog ?? Preset.builtInCatalog(reason: PresetCatalog.builtInBecauseUnreachable)
+    }
+
+    private func presetTitle(_ name: String?) -> String {
+        catalog?.title(for: name) ?? Preset.title(for: name)
+    }
+
+    /// Why a preset can't be picked here: the device's own answer when the
+    /// server has GET /v1/devices/{id}/presets, else the role in `status`.
+    private func unavailableReason(_ id: String) -> String? {
+        if let devicePresets {
+            let availability = PresetAvailability.make(devicePresets.state(for: id))
+            return availability.blocksSelection ? (availability.note ?? "Not available on this device") : nil
+        }
+        return MonitoringStatusPresentation.presetUnavailableReason(id, status: device.status)
+    }
+
+    private func loadPresetLibrary() async {
+        if catalog == nil || (catalog?.isBuiltIn == true && !catalogMissing) {
+            do {
+                catalog = try await state.backend.presetCatalog()
+            } catch let error as APIError where error.endpointMissing {
+                catalogMissing = true
+                catalog = Preset.builtInCatalog(reason: PresetCatalog.builtInBecauseOldServer)
+            } catch {
+                if catalog == nil { catalog = Preset.builtInCatalog(reason: PresetCatalog.builtInBecauseUnreachable) }
+            }
+        }
+        guard !devicePresetsMissing else { return }
+        do {
+            devicePresets = try await state.backend.devicePresets(deviceID: device.id)
+        } catch let error as APIError where error.endpointMissing {
+            devicePresetsMissing = true
+            devicePresets = nil
+        } catch {
+            // Not kept: an old "available" must not outlive the answer. The
+            // role in `status` stands in until the next load succeeds.
+            devicePresets = nil
+        }
+    }
+
+    /// What an unreported device means for the person: when it was last
+    /// heard from, and that changes are kept until it is back.
+    private var staleDeviceMessage: String {
+        var text = "Its status is unknown"
+        if let lastSeen = device.lastSeen {
+            let date = Date(timeIntervalSince1970: lastSeen)
+            text += " — last heard from \(Self.relative.localizedString(for: date, relativeTo: .now))"
+        } else {
+            text += " — it hasn't reported yet"
+        }
+        return text + ". Check it has power and Wi-Fi. Changes you make are saved and apply when it reconnects."
+    }
+
+    // MARK: Custom rules
+
+    /// Online and reporting. Nothing is shown as running otherwise.
+    private var deviceLive: Bool { device.status?.isLive(online: device.online) ?? device.online }
+
+    private func loadRules() async {
+        if rulesLoad == .unsupported { return }
+        do {
+            rulesLoad = .loaded(try await state.backend.deviceRules(deviceID: device.id))
+        } catch let error as APIError where error.endpointMissing {
+            rulesLoad = .unsupported
+        } catch {
+            if case .loaded = rulesLoad { return }  // keep the list; the banner says the server is unreachable
+            rulesLoad = .failed(error.localizedDescription)
+        }
+    }
+
+    /// PATCH the rule, then re-read the list: the toggle shows what the
+    /// server answered, never an optimistic flip.
+    private func toggleRule(_ rule: DeviceRule, enabled: Bool) {
+        rulesBusy.insert(rule.id)
+        ruleToggleError = nil
+        Task {
+            defer { rulesBusy.remove(rule.id) }
+            do {
+                try await state.backend.setRuleEnabled(deviceID: device.id, ruleID: rule.id, enabled: enabled)
+            } catch let error as APIError where error.isAuthFailure {
+                state.expireSession(error.message)
+                return
+            } catch let error as APIError {
+                ruleToggleError = RuleToggleError.message(code: error.code, detail: error.message,
+                                                          endpointMissing: error.endpointMissing)
+            } catch {
+                ruleToggleError = error.localizedDescription
+            }
+            await loadRules()
+        }
+    }
+
+    // MARK: Stop / resume
+
+    private var protectionReport: ProtectionReport {
+        ProtectionReport(protection: device.status?.protection, monitoringState: device.status?.monitoringState,
+                         lastCommandID: device.status?.lastCommandID, live: deviceLive)
+    }
+
+    /// One row in Manage: the action the device's state calls for, what is in
+    /// flight, and what the device confirmed. Never "Stopped" before the
+    /// device says so.
+    @ViewBuilder private var protectionRow: some View {
+        let report = protectionReport
+        let phase = ProtectionControl.phase(protectionRequest, report: report, now: .now)
+        let action = protectionRequest?.action ?? ProtectionControl.offeredAction(report)
+        let pending: Bool = { if case .pending = phase { return true }; return false }()
+        let busy = protectionSending || pending
+        let detail: String = {
+            switch phase {
+            case .pending: return "Waiting for \(device.name) to confirm"
+            case .overdue: return "Not confirmed yet — tap to send again"
+            case .confirmed(let text): return text
+            case .idle: break
+            }
+            if let notice = protectionNotice, Date().timeIntervalSince(notice.at) < 20 { return notice.text }
+            if device.status == nil { return "Not supported by this server" }
+            switch ProtectionControl.isStopped(report) {
+            case true?: return "Stopped — nothing is being watched"
+            case false?: return "Pause all monitoring and alerts"
+            case nil: return "Status unknown — the device isn't reporting"
+            }
+        }()
+        let note: (text: String, color: Color)? = {
+            if let protectionUnsupported { return (protectionUnsupported, SD.Colors.textTertiary) }
+            if let protectionError { return (protectionError, SD.Colors.danger) }
+            switch phase {
+            case .pending(let text): return (text, SD.Colors.textSecondary)
+            case .overdue(let text): return (text, SD.Colors.warning)
+            default: break
+            }
+            if device.status == nil {
+                return ("This server doesn't report monitoring state, so a stop or resume couldn't be confirmed.",
+                        SD.Colors.textTertiary)
+            }
+            return nil
+        }()
+
+        Button {
+            if action == .stop { confirmStop = true } else { sendProtection(.resume) }
+        } label: {
+            OrynNavRow(
+                icon: action == .stop ? "pause.circle" : "play.circle",
+                title: busy ? "\(action.progressive)…" : action.verb,
+                detail: detail,
+                trailing: nil,
+                showsChevron: false
+            )
+        }
+        .buttonStyle(SDRowButtonStyle(minHeight: 60))
+        .disabled(busy || protectionUnsupported != nil || device.status == nil)
+
+        if let note {
+            Text(note.text)
+                .font(SD.Typography.caption)
+                .foregroundStyle(note.color)
+                .fixedSize(horizontal: false, vertical: true)
+                .padding(.horizontal, SD.Space.sm)
+                .padding(.bottom, SD.Space.xs)
+                .frame(maxWidth: .infinity, alignment: .leading)
+        }
+    }
+
+    private func sendProtection(_ action: ProtectionAction) {
+        protectionSending = true
+        protectionError = nil
+        protectionNotice = nil
+        Task {
+            defer { protectionSending = false }
+            do {
+                // `confirm` is true only for a stop, and only after the dialog.
+                let command = try await state.backend.setProtection(
+                    deviceID: device.id, action: action, confirm: action == .stop)
+                protectionRequest = ProtectionRequest(action: action, commandID: command.commandID, requestedAt: Date())
+                await reload()
+            } catch let error as APIError where error.isAuthFailure {
+                state.expireSession(error.message)
+            } catch let error as APIError {
+                let message = ProtectionControl.refusal(code: error.code, detail: error.message,
+                                                        endpointMissing: error.endpointMissing)
+                if error.code == "firmware_unsupported" || error.endpointMissing {
+                    protectionUnsupported = message
+                } else {
+                    protectionError = message
+                }
+            } catch {
+                protectionError = error.localizedDescription
+            }
+        }
+    }
+
+    /// Once the device applied the request, say so for a while and stop
+    /// tracking it: a later stop or resume from elsewhere must not be read
+    /// against this one.
+    private func settleProtection() {
+        guard let request = protectionRequest,
+              case .confirmed(let text) = ProtectionControl.phase(request, report: protectionReport, now: Date())
+        else { return }
+        protectionRequest = nil
+        protectionNotice = (text, Date())
     }
 
     // Recent activity moved to EventHistoryView (Manage → Event history). The
@@ -743,10 +1105,16 @@ struct DeviceDetailView: View {
                 guard reloadGuard.isLatest(token) else { return }
                 device = fresh
                 syncPendingSwitch(from: fresh, reloadStartedAt: reloadStartedAt)
+                settleProtection()
             }
             let fetchedEvents = try await state.backend.events(deviceID: device.id, limit: 200)
             guard reloadGuard.isLatest(token) else { return }
             events = fetchedEvents
+            // The library, the device's availability and its rules. Each says
+            // "not supported by this server" on its own when the endpoint is
+            // missing, and none of them fails the screen.
+            await loadPresetLibrary()
+            await loadRules()
             // The notifier dedupes by event id, so calling this on every poll
             // announces each alert exactly once.
             // AlertWatcher owns notifications now, from the app root, so it

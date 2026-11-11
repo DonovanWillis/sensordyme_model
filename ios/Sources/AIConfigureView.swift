@@ -31,6 +31,10 @@ struct AIConfigureView: View {
     /// an activation succeeds.
     @State private var appliedSummary: ActivationSummary?
     @State private var activating = false
+    @State private var confirmActivate = false
+    /// What the DEVICE reported after activation (ActivationFollowUp). The
+    /// server accepting a change is "sent", not "active".
+    @State private var followUp: ActivationFollowUp?
     @State private var errorMessage: String?
     /// Not an error: why the screen is showing a fresh proposal (the one being
     /// reviewed was replaced on the server before it could be activated).
@@ -70,6 +74,9 @@ struct AIConfigureView: View {
                         }
                         if !proposal.unsupported.isEmpty {
                             limitationsCard(proposal.unsupported)
+                        }
+                        if !proposal.isEmpty && !applied {
+                            previewCard(proposal)
                         }
                         activateSection(proposal)
                     }
@@ -197,8 +204,11 @@ struct AIConfigureView: View {
                         OrynMark(height: 11, color: SD.Colors.textTertiary)
                         SDSectionHeader(title: "Jupiter understood")
                     }
-                    if applied {
-                        SDStatusPill(status: .online, text: "Active")
+                    switch followUp {
+                    case .confirmed?: SDStatusPill(status: .online, text: "Active")
+                    case .refused?: SDStatusPill(status: .alert, text: "Refused")
+                    case .waiting?: SDStatusPill(status: .connecting, text: "Sent")
+                    case nil: EmptyView()
                     }
                 }
                 Text(proposal.explanation)
@@ -390,14 +400,35 @@ struct AIConfigureView: View {
             )
         } else if applied {
             VStack(spacing: SD.Space.xxs) {
-                if appliedSummary?.kind == .modeSwitched {
-                    Label("Switched to \(Preset.title(for: proposal.preset))", systemImage: "checkmark.circle.fill")
+                // Said from what the device reported, not from the server
+                // accepting the request (ActivationFollowUp).
+                switch followUp {
+                case .confirmed?:
+                    Label(appliedSummary?.kind == .modeSwitched
+                          ? "Switched to \(Preset.title(for: proposal.preset))"
+                          : "Active on \(device.name)", systemImage: "checkmark.circle.fill")
                         .font(SD.Typography.headline)
                         .foregroundStyle(SD.Colors.success)
-                } else {
-                    Label("Active on \(device.name)", systemImage: "checkmark.circle.fill")
+                case .refused?:
+                    Label("Not running on \(device.name)", systemImage: "xmark.octagon.fill")
                         .font(SD.Typography.headline)
-                        .foregroundStyle(SD.Colors.success)
+                        .foregroundStyle(SD.Colors.danger)
+                case .waiting?, nil:
+                    Label("Sent to \(device.name)", systemImage: "paperplane")
+                        .font(SD.Typography.headline)
+                        .foregroundStyle(SD.Colors.textPrimary)
+                }
+                if let followUp {
+                    HStack(alignment: .firstTextBaseline, spacing: SD.Space.xs) {
+                        if case .waiting = followUp, waitingForDevice {
+                            ProgressView().controlSize(.small).tint(SD.Colors.textSecondary)
+                        }
+                        Text(followUp.text)
+                            .font(SD.Typography.caption)
+                            .foregroundStyle(followUpColor(followUp))
+                            .multilineTextAlignment(.center)
+                            .fixedSize(horizontal: false, vertical: true)
+                    }
                 }
                 if let appliedNote = appliedSummary?.note {
                     Text(appliedNote)
@@ -410,7 +441,7 @@ struct AIConfigureView: View {
             .frame(maxWidth: .infinity)
             .padding(.vertical, SD.Space.xs)
         } else {
-            Button { apply(proposal) } label: {
+            Button { confirmActivate = true } label: {
                 if activating {
                     ProgressView().tint(SD.Colors.textOnAccent)
                 } else if !proposal.isCustom {
@@ -422,7 +453,124 @@ struct AIConfigureView: View {
             }
             .buttonStyle(SDButtonStyle(kind: .primary))
             .disabled(activating)
+            .confirmationDialog(
+                proposal.isCustom ? "Turn these rules on?" : "Switch to \(Preset.title(for: proposal.preset))?",
+                isPresented: $confirmActivate, titleVisibility: .visible
+            ) {
+                Button(proposal.isCustom ? "Activate" : "Switch") { apply(proposal) }
+                Button("Cancel", role: .cancel) {}
+            } message: {
+                let preview = PolicyPreview(proposal: proposal, device: device)
+                Text("\(preview.will.count) watched, \(preview.wont.count) not watched. "
+                     + "Nothing changes until \(device.name) confirms it.")
+            }
         }
+    }
+
+    // MARK: What will and won't be monitored
+
+    /// The proposal as a before-and-after, from its own fields: the rules (or
+    /// the mode) it turns on, everything in `unsupported`, rules that won't be
+    /// turned on with a mode switch, and the mode custom rules would replace.
+    struct PolicyPreview {
+        var will: [String] = []
+        var wont: [String] = []
+        var notes: [String] = []
+
+        init(proposal: AIProposal, device: Device) {
+            let additive = MonitoringStatusPresentation.rulesAdditive(device.status)
+            if proposal.isCustom {
+                will = proposal.rules.map { rule in
+                    rule.zone.isEmpty ? rule.headline
+                        : "\(rule.headline) — once the \u{201C}\(rule.zone)\u{201D} area is drawn"
+                }
+                if additive {
+                    notes.append("Runs alongside \(Preset.title(for: device.activePreset)), which keeps running.")
+                } else if device.activePreset != nil, device.customRules != .replacing {
+                    wont.append("\(Preset.title(for: device.activePreset)) — custom rules replace the current mode")
+                }
+            } else {
+                will = ["Everything \(Preset.title(for: proposal.preset)) watches for"]
+                wont += proposal.rules.map { "\($0.headline) — rules aren't turned on with a mode switch" }
+            }
+            wont += proposal.unsupported.map { "\($0.request) — \($0.reason)" }
+            if !(device.status?.isLive(online: device.online) ?? device.online) {
+                notes.append("\(device.name) isn't reporting right now. This applies when it reconnects.")
+            }
+        }
+    }
+
+    private func previewCard(_ proposal: AIProposal) -> some View {
+        let preview = PolicyPreview(proposal: proposal, device: device)
+        return SDCard {
+            VStack(alignment: .leading, spacing: SD.Space.sm) {
+                SDSectionHeader(title: "If you activate this")
+                previewGroup("Will watch for", icon: "eye", color: SD.Colors.success, items: preview.will)
+                if !preview.wont.isEmpty {
+                    previewGroup("Won't watch for", icon: "eye.slash", color: SD.Colors.warning, items: preview.wont)
+                }
+                ForEach(preview.notes, id: \.self) { note in
+                    Text(note)
+                        .font(SD.Typography.caption)
+                        .foregroundStyle(SD.Colors.textTertiary)
+                        .fixedSize(horizontal: false, vertical: true)
+                }
+            }
+        }
+    }
+
+    private func previewGroup(_ title: String, icon: String, color: Color, items: [String]) -> some View {
+        VStack(alignment: .leading, spacing: SD.Space.xxs) {
+            Label(title, systemImage: icon)
+                .font(SD.Typography.label)
+                .foregroundStyle(color)
+            ForEach(items, id: \.self) { item in
+                Text("• \(item)")
+                    .font(SD.Typography.caption)
+                    .foregroundStyle(SD.Colors.textSecondary)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+        }
+    }
+
+    private func followUpColor(_ followUp: ActivationFollowUp) -> Color {
+        switch followUp {
+        case .confirmed: SD.Colors.success
+        case .refused: SD.Colors.danger
+        case .waiting: SD.Colors.textSecondary
+        }
+    }
+
+    @State private var waitingForDevice = false
+
+    /// Ask the device, not the server, whether it runs what was activated:
+    /// the device list's status (and the rules list when the server has it)
+    /// every 2 s for up to 20 s.
+    private func followDevice(proposal: AIProposal, rulesExpected: Int) async {
+        let modeTitle = proposal.isCustom ? nil : Preset.title(for: proposal.preset)
+        var last = ActivationFollowUp.waiting("Waiting for \(device.name) to confirm…")
+        followUp = last
+        waitingForDevice = true
+        defer { waitingForDevice = false }
+        let deadline = Date().addingTimeInterval(20)
+        while Date() < deadline {
+            try? await Task.sleep(for: .seconds(2))
+            guard let fresh = try? await state.backend.devices().first(where: { $0.id == device.id }) else { continue }
+            var rules: [DeviceRule]?
+            if rulesExpected > 0 { rules = try? await state.backend.deviceRules(deviceID: device.id).rules }
+            let rejected = fresh.status?.rules?.rejected
+            last = ActivationFollowUp.evaluate(
+                rulesExpected: rulesExpected, modeTitle: modeTitle,
+                modePending: !proposal.isCustom && fresh.desiredPreset != nil,
+                deviceLive: fresh.status?.isLive(online: fresh.online) ?? fresh.online,
+                rejectedReasons: rejected.map { $0.reasons ?? [] },
+                runningRuleIDs: fresh.status?.rules?.active, rules: rules)
+            followUp = last
+            if case .waiting = last { continue }
+            await onApplied()
+            return
+        }
+        followUp = ActivationFollowUp.timedOut(last)
     }
 
     // MARK: Editing plumbing
@@ -475,6 +623,7 @@ struct AIConfigureView: View {
         self.notice = notice
         applied = false
         appliedSummary = nil
+        followUp = nil
         // The same text the backend will accept: trimmed, and refused rather
         // than truncated when over its limit (the bar already won't send it).
         guard JupiterPrompt.canSubmit(prompt), let request = JupiterPrompt.normalized(prompt) else {
@@ -526,6 +675,10 @@ struct AIConfigureView: View {
                     if summary.kind == .nothingRunning { errorMessage = summary.note }
                 }
                 await onApplied()
+                if summary.kind != .nothingRunning {
+                    let expected = proposal.isCustom ? (result.rulesActive ?? proposal.rules.count) : 0
+                    await followDevice(proposal: proposal, rulesExpected: expected)
+                }
             } catch let error as APIError where error.code == "draft_superseded" {
                 // The draft this proposal came from was replaced (another
                 // preview, from this phone or another). Activating it would

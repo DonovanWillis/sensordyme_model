@@ -70,6 +70,33 @@ struct DiagnosticsView: View {
         }
     }
 
+    /// One device's monitoring state and capability health as a check row.
+    static func monitoringResult(_ device: Device) -> StageResult {
+        let name = "Monitoring — \(device.name)"
+        guard let presentation = device.monitoringPresentation else {
+            return .init(name: name, passed: nil,
+                         detail: "this server doesn't report whether the device is monitoring (older backend)")
+        }
+        let capabilities = CapabilityHealth.rows(status: device.status, online: device.online)
+        let impaired = capabilities.rows.filter { $0.state == .impaired }
+        var detail = presentation.detail
+        if !impaired.isEmpty {
+            detail += ". Impaired: " + impaired.map { "\($0.title) (\($0.detail))" }.joined(separator: "; ")
+        } else if let notice = capabilities.notice {
+            detail += ". Capabilities: \(notice)"
+        } else {
+            let available = capabilities.rows.filter { $0.state == .available }.map(\.title)
+            if !available.isEmpty { detail += ". Producing results: " + available.joined(separator: ", ") }
+        }
+        let passed: Bool?
+        switch presentation.phase {
+        case .ready: passed = impaired.isEmpty ? true : false
+        case .unknown, .starting: passed = nil
+        case .degraded, .stopped, .failed: passed = false
+        }
+        return .init(name: name, passed: passed, detail: detail)
+    }
+
     // ------------------------------------------------------------------ checks
     private func runAll() async {
         running = true
@@ -154,6 +181,22 @@ struct DiagnosticsView: View {
             }
         } else if !state.isDemo {
             results.append(.init(name: "Account & session", passed: nil, detail: "not signed in"))
+        }
+
+        // 3b. what each device says about its own monitoring and capabilities
+        //
+        // From `status` on the device list (DeviceStatus.swift): green only
+        // when the device itself reports `ready` and nothing is impaired; a
+        // device that is not reporting is "unknown", never a pass.
+        if state.isSignedIn {
+            do {
+                for device in try await state.backend.devices() {
+                    results.append(Self.monitoringResult(device))
+                }
+            } catch {
+                results.append(.init(name: "Device monitoring", passed: false,
+                                     detail: "couldn't read the device list: \(error.localizedDescription)"))
+            }
         }
 
         // 4. device address configured

@@ -1,7 +1,9 @@
 import Charts
 import SwiftUI
 
-// MARK: - Reports: safety score, alerts per hour, breakdown by type — computed from history.
+// MARK: - Reports: an activity estimate, alerts per hour, breakdown by type — computed
+// on the phone from the loaded history. Not a validated safety measure, and labelled
+// as an estimate everywhere it appears (screen and shared text).
 
 struct DeviceReport {
     let safetyScore: Int
@@ -28,7 +30,8 @@ struct DeviceReport {
             typeCounts[event.type, default: 0] += 1
         }
 
-        // simple demo-grade score: start at 100, loud alerts cost 6, soft cost 2
+        // Demo-grade arithmetic, not a model: start at 100, loud alerts cost
+        // 6, soft cost 2. Shown only as an estimate.
         let soft = alerts.count - loud
         let score = max(0, 100 - loud * 6 - soft * 2)
 
@@ -46,6 +49,9 @@ struct ReportsView: View {
     @EnvironmentObject private var state: AppState
     let device: Device
     @State private var report: DeviceReport?
+    /// Why the history couldn't be loaded. Was `try?`: a failure left the
+    /// spinner up for ever.
+    @State private var loadError: String?
 
     var body: some View {
         ScrollView {
@@ -54,6 +60,8 @@ struct ReportsView: View {
                     scoreCard(report)
                     hourlyCard(report)
                     typeCard(report)
+                } else if let loadError {
+                    SDErrorState(title: "Couldn't build the report", message: loadError) { await load() }
                 } else {
                     ProgressView().padding(60)
                 }
@@ -70,10 +78,18 @@ struct ReportsView: View {
                 }
             }
         }
-        .task {
-            if let events = try? await state.backend.events(deviceID: device.id, limit: 1000) {
-                report = DeviceReport.compute(from: events)
-            }
+        .task { await load() }
+    }
+
+    private func load() async {
+        do {
+            let events = try await state.backend.events(deviceID: device.id, limit: 1000)
+            report = DeviceReport.compute(from: events)
+            loadError = nil
+        } catch let error as APIError where error.isAuthFailure {
+            state.expireSession(error.message)
+        } catch {
+            loadError = error.localizedDescription
         }
     }
 
@@ -81,7 +97,7 @@ struct ReportsView: View {
         let top = report.byType.prefix(3).map { "\($0.type) ×\($0.count)" }.joined(separator: ", ")
         return """
         SensorDyme report — \(device.name)
-        Safety score: \(report.safetyScore)/100
+        Activity score (estimate, not a validated safety measure): \(report.safetyScore)/100
         \(report.totalAlerts) alerts (\(report.loudAlerts) serious)\(top.isEmpty ? "" : "\nMost frequent: \(top)")
         """
     }
@@ -100,10 +116,15 @@ struct ReportsView: View {
             .frame(width: 110, height: 110)
 
             VStack(alignment: .leading, spacing: 6) {
-                Text("Safety score").font(.headline)
-                Text("\(report.totalAlerts) alerts in this session window — \(report.loudAlerts) serious.")
+                Text("Activity score").font(.headline)
+                SDEyebrow("Estimate", color: SD.Colors.warning)
+                Text("\(report.totalAlerts) alerts in the loaded history — \(report.loudAlerts) serious.")
                     .font(.subheadline)
                     .foregroundStyle(SD.Colors.textSecondary)
+                Text("Worked out on this phone from alert counts. Not a validated measure of safety.")
+                    .font(.caption)
+                    .foregroundStyle(SD.Colors.textTertiary)
+                    .fixedSize(horizontal: false, vertical: true)
             }
             Spacer()
         }
