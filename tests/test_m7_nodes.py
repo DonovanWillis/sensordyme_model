@@ -40,14 +40,14 @@ def _run(node, plan, step=0.25):
 
 
 def test_people_counter_settles_counts_then_reports_entry_and_exit():
-    node = N.OccupancyNode({"settle_s": 1.0})
+    node = cn.OccupancyNode({"settle_s": 1.0})
     events = _run(node, [(2.0, 1), (0.5, 2), (0.5, 1), (2.0, 2), (2.0, 0)])
     assert events == ["person_entered", "person_exited"], "a half-second flicker is not a change"
     assert node.count == 0
 
 
 def test_capacity_and_dwell_alerts_fire_once():
-    node = N.OccupancyNode({"settle_s": 0.5, "capacity": 1, "dwell_s": 5})
+    node = cn.OccupancyNode({"settle_s": 0.5, "capacity": 1, "dwell_s": 5})
     node.set_zones([ROOM_FLOOR])
     events = _run(node, [(2.0, 1), (8.0, 2)])
     assert events.count("capacity_exceeded") == 1
@@ -56,7 +56,7 @@ def test_capacity_and_dwell_alerts_fire_once():
 
 
 def test_unavailable_detections_are_never_counted_as_an_empty_room():
-    node = N.OccupancyNode({"settle_s": 0.5})
+    node = cn.OccupancyNode({"settle_s": 0.5})
     _run(node, [(1.0, 1)])
     for t in range(20):
         assert node.consume(_obs(0, available=False), 10.0 + t) == []
@@ -65,7 +65,7 @@ def test_unavailable_detections_are_never_counted_as_an_empty_room():
 
 
 def test_zone_watch_is_a_typed_rule_bundle_on_the_rule_engine():
-    node = N.ZoneWatchNode({"persist_s": 0.5})
+    node = cn.ZoneWatchNode({"persist_s": 0.5})
     node.set_zones([ROOM_FLOOR, Zone("door", ROOM_FLOOR.polygon, "safe")])
     assert [r["zone"] for r in node.rules()] == ["floor"], "only restricted areas are watched"
     assert node.problems == []
@@ -78,22 +78,22 @@ def test_zone_watch_is_a_typed_rule_bundle_on_the_rule_engine():
 
 def test_settings_are_validated_against_the_node_schema():
     with pytest.raises(PresetError, match="settle_s"):
-        N.OccupancyNode({"settle_s": 99})
+        cn.OccupancyNode({"settle_s": 99})
     with pytest.raises(PresetError, match="not a setting"):
-        N.OccupancyNode({"nope": 1})
-    assert N.ZoneWatchNode({"severity": "critical"}).settings["severity"] == "critical"
+        cn.OccupancyNode({"nope": 1})
+    assert cn.ZoneWatchNode({"severity": "critical"}).settings["severity"] == "critical"
     with pytest.raises(KeyError):
-        N.build_companion("driver_off")
+        cn.build_companion("driver_off")
 
 
 def test_node_state_from_capabilities():
-    spec = N.OccupancyNode.spec
+    spec = cn.OccupancyNode.spec
     ok = {"camera": Capability(), "inference": Capability(), "objects": Capability()}
-    assert N.node_state(spec, ok) == (N.ACTIVE, [], None)
+    assert cn.node_state(spec, ok) == (cn.ACTIVE, [], None)
     lost = {**ok, "objects": Capability(IMPAIRED, "stale")}
-    state, missing, reason = N.node_state(spec, lost)
-    assert state == N.FAILED and missing == ["objects"] and "stale" in reason
-    assert N.node_state(spec, ok, stopped=True)[0] == N.INACTIVE
+    state, missing, reason = cn.node_state(spec, lost)
+    assert state == cn.FAILED and missing == ["objects"] and "stale" in reason
+    assert cn.node_state(spec, ok, stopped=True)[0] == cn.INACTIVE
 
 
 def test_the_catalogue_the_backend_reads():
