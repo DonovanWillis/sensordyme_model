@@ -99,6 +99,11 @@ import cv2
 import mediapipe as mp
 import numpy as np
 
+from core.behavior import BehaviorFrame, BehaviorReasoner, parse_behavior
+from core.behavior.camera_model import CameraIntrinsics
+from core.behavior.eye_state import CLOSED as EYE_CLOSED
+from core.behavior.eye_state import EyeFrame, EyeObservation, classify_eye_state, eye_patch_occluded
+from core.behavior.phone import DETECTOR_FAILED, DETECTOR_NOT_STARTED, DETECTOR_OK, PhoneDetection
 from core.confidence import (
     NoiseEstimator,
     clamp_unit,
@@ -269,14 +274,22 @@ def _saturating_ratio(value: float, threshold: float) -> float:
     return min(1.0, value / threshold)
 
 
-def _camera_matrix(image_size: tuple[int, int], hfov_deg: Optional[float] = None) -> np.ndarray:
+def _camera_matrix(
+    image_size: tuple[int, int], hfov_deg: Optional[float] = None,
+    intrinsics: Optional[CameraIntrinsics] = None,
+) -> np.ndarray:
     """Pinhole intrinsics for an (h, w) frame.
+
+    Calibrated `intrinsics` (config camera_intrinsics, from a hardware
+    calibration run) take precedence over everything below; None keeps it.
 
     With `hfov_deg` None the focal length is the image width -- the historical
     assumption, a ~53 degree horizontal field of view. Given the lens's real
     horizontal FOV, fx = (w/2) / tan(hfov/2): Camera Module 3 Wide is ~102
     degrees (fx ~ 0.4 w), the standard Camera Module 3 ~66 degrees.
     """
+    if intrinsics is not None:
+        return intrinsics.matrix(image_size)
     h, w = image_size
     if hfov_deg is not None and 0.0 < float(hfov_deg) < 180.0:
         focal_length = (w / 2.0) / math.tan(math.radians(float(hfov_deg)) / 2.0)
@@ -289,12 +302,16 @@ def _camera_matrix(image_size: tuple[int, int], hfov_deg: Optional[float] = None
 
 
 def estimate_head_rotation(
-    image_points: np.ndarray, image_size: tuple[int, int], hfov_deg: Optional[float] = None
+    image_points: np.ndarray, image_size: tuple[int, int], hfov_deg: Optional[float] = None,
+    intrinsics: Optional[CameraIntrinsics] = None,
 ) -> Optional[np.ndarray]:
     """The face model's rotation into the camera frame (3x3), via solvePnP on
-    the 6 canonical landmarks, or None if pose estimation fails."""
+    the 6 canonical landmarks, or None if pose estimation fails.
+
+    Lens distortion is zero unless calibrated `intrinsics` supply it."""
+    distortion = intrinsics.distortion_coefficients() if intrinsics is not None else np.zeros((4, 1))
     success, rotation_vec, _ = cv2.solvePnP(
-        _MODEL_POINTS_3D, image_points, _camera_matrix(image_size, hfov_deg), np.zeros((4, 1)),
+        _MODEL_POINTS_3D, image_points, _camera_matrix(image_size, hfov_deg, intrinsics), distortion,
         flags=cv2.SOLVEPNP_ITERATIVE,
     )
     if not success:
@@ -368,7 +385,8 @@ def head_rotation_from_yaw_pitch_deg(yaw: float, pitch: float) -> np.ndarray:
 
 
 def estimate_head_pose_deg(
-    image_points: np.ndarray, image_size: tuple[int, int], hfov_deg: Optional[float] = None
+    image_points: np.ndarray, image_size: tuple[int, int], hfov_deg: Optional[float] = None,
+    intrinsics: Optional[CameraIntrinsics] = None,
 ) -> Optional[tuple[float, float]]:
     """Estimate (yaw, pitch) in degrees from 6 canonical facial landmarks via solvePnP.
 
@@ -396,7 +414,7 @@ def estimate_head_pose_deg(
     relative_yaw_pitch_deg -- but the convention is kept unchanged here for
     display/telemetry and for the mac_max profile, which still uses it.
     """
-    rotation_mat = estimate_head_rotation(image_points, image_size, hfov_deg)
+    rotation_mat = estimate_head_rotation(image_points, image_size, hfov_deg, intrinsics)
     if rotation_mat is None:
         return None
     return rotation_to_yaw_pitch_deg(rotation_mat)
@@ -462,6 +480,7 @@ class AttentionCalibrator:
         gaze_fused: bool = True,
         eye_gaze_scale_deg: float = 40.0,
         camera_hfov_deg: Optional[float] = None,
+        camera_intrinsics: Optional[CameraIntrinsics] = None,
     ) -> None:
         self._path = calibration_path
         self._duration_s = duration_s
@@ -472,6 +491,9 @@ class AttentionCalibrator:
         self._gaze_fused = bool(gaze_fused)
         self._eye_gaze_scale_deg = float(eye_gaze_scale_deg)
         self._camera_hfov_deg = None if camera_hfov_deg is None else float(camera_hfov_deg)
+        # Calibrated lens intrinsics, if any. Stored in the file ONLY when set, so
+        # a file written without them is unchanged and still loads (absent == None).
+        self._intrinsics_fp = None if camera_intrinsics is None else camera_intrinsics.fingerprint()
         # (t, ear, rotation or None, eye offset or None), trailing window only.
         self._samples: deque[tuple[float, float, Optional[np.ndarray], Optional[tuple[float, float]]]] = deque()
         self._start_time: Optional[float] = None
@@ -514,6 +536,12 @@ class AttentionCalibrator:
                 stored_hfov is not None and not math.isclose(float(stored_hfov), self._camera_hfov_deg)
             ):
                 return
+            stored_fp = data.get("camera_intrinsics")
+            if (stored_fp is None) != (self._intrinsics_fp is None) or (
+                stored_fp is not None and not np.allclose(np.asarray(stored_fp, dtype=float),
+                                                          np.asarray(self._intrinsics_fp, dtype=float))
+            ):
+                return  # learned under different intrinsics: recalibrate
             baseline_ear = float(data["baseline_ear"])
             ear_threshold = float(data["ear_threshold"])
             rotation = data["baseline_rotation"]
@@ -653,25 +681,23 @@ class AttentionCalibrator:
         self._baseline_eye = mean_eye
         self._samples.clear()
         self._path.parent.mkdir(parents=True, exist_ok=True)
-        self._path.write_text(
-            json.dumps(
-                {
-                    "version": self.FORMAT_VERSION,
-                    "baseline_ear": self._baseline_ear,
-                    "ear_threshold": self._ear_threshold,
-                    "baseline_rotation": None if neutral is None else [float(v) for v in neutral.ravel()],
-                    "baseline_eye_offset": None if mean_eye is None else [mean_eye[0], mean_eye[1]],
-                    # Informational only (estimate_head_pose_deg's raw Euler
-                    # convention), so the file is still human-readable.
-                    "baseline_yaw": self.baseline_yaw,
-                    "baseline_pitch": self.baseline_pitch,
-                    "gaze_fused": self._gaze_fused,
-                    "eye_gaze_scale_deg": self._eye_gaze_scale_deg,
-                    "camera_hfov_deg": self._camera_hfov_deg,
-                },
-                indent=2,
-            )
-        )
+        record = {
+            "version": self.FORMAT_VERSION,
+            "baseline_ear": self._baseline_ear,
+            "ear_threshold": self._ear_threshold,
+            "baseline_rotation": None if neutral is None else [float(v) for v in neutral.ravel()],
+            "baseline_eye_offset": None if mean_eye is None else [mean_eye[0], mean_eye[1]],
+            # Informational only (estimate_head_pose_deg's raw Euler
+            # convention), so the file is still human-readable.
+            "baseline_yaw": self.baseline_yaw,
+            "baseline_pitch": self.baseline_pitch,
+            "gaze_fused": self._gaze_fused,
+            "eye_gaze_scale_deg": self._eye_gaze_scale_deg,
+            "camera_hfov_deg": self._camera_hfov_deg,
+        }
+        if self._intrinsics_fp is not None:
+            record["camera_intrinsics"] = self._intrinsics_fp
+        self._path.write_text(json.dumps(record, indent=2))
 
 
 #: How much observed time PERCLOS needs before it will report a number at all.
@@ -1014,6 +1040,7 @@ class DriverAttentionModule(VisionModule):
         self._gaze_scale_deg = float(config.get("eye_gaze_scale_deg", 40.0))
         hfov = config.get("camera_hfov_deg")
         self._camera_hfov_deg: Optional[float] = None if hfov is None else float(hfov)
+        self._camera_intrinsics = CameraIntrinsics.from_config(config.get("camera_intrinsics"))
         self._calibrator = AttentionCalibrator(
             calibration_path=Path(config.get("calibration_path", "data/calibration.json")),
             duration_s=float(config.get("calibration_duration_s", 10.0)),
@@ -1025,6 +1052,7 @@ class DriverAttentionModule(VisionModule):
             gaze_fused=self._enable_gaze,
             eye_gaze_scale_deg=self._gaze_scale_deg,
             camera_hfov_deg=self._camera_hfov_deg,
+            camera_intrinsics=self._camera_intrinsics,
         )
 
         # --- signal conditioning: raw landmark-derived measurements are NOISY,
@@ -1243,6 +1271,18 @@ class DriverAttentionModule(VisionModule):
         self._object_detection_retry_at: Optional[float] = None
         # A gap between frames longer than this is a stall, not evidence (F4).
         self._evidence_clock = EvidenceClock(float(config.get("max_evidence_gap_s", 0.5)))
+        # --- behaviour reasoning v2 (core/behavior/): EXPERIMENTAL, OFF by default ---
+        # With behavior_v2 false nothing below changes a single event or flag;
+        # with it true, drowsiness / phone_use / phone_detected / frequent_glancing
+        # come from the v2 components and long_glance / glance_budget_exceeded are
+        # added (log-only). See docs/BEHAVIOUR_REASONING.md.
+        self._behavior_v2 = bool(config.get("behavior_v2", False))
+        self._behavior: Optional[BehaviorReasoner] = (
+            BehaviorReasoner(parse_behavior(config)) if self._behavior_v2 else None
+        )
+        self._detection_tick = 0  # successful detector runs: "a fresh result exists"
+        self._behavior_tick_seen = 0
+        self._last_person_boxes: list[Box] = []
         self._frame_index = 0
         self._last_phone_boxes: list[Box] = []
         self._last_eating_boxes: list[Box] = []
@@ -1388,6 +1428,7 @@ class DriverAttentionModule(VisionModule):
         self._object_detection_error = None
         self._object_detection_failures = 0
         self._object_detection_retry_at = None
+        self._detection_tick += 1
 
     def _eating_boxes_near_face(
         self, eating_boxes: list[Box], person_boxes: list[Box]
@@ -1468,6 +1509,7 @@ class DriverAttentionModule(VisionModule):
                 else:
                     eating_boxes.append(xyxy)
         self._last_person_visible = bool(person_boxes)
+        self._last_person_boxes = person_boxes
         eating_boxes = self._eating_boxes_near_face(eating_boxes, person_boxes)
 
         hand_boxes: list[Box] = []
@@ -1505,7 +1547,11 @@ class DriverAttentionModule(VisionModule):
         # by w/h (1.33x at 640x480).
         aspect = 1.0
         hand_detections = [("hand", box, 1.0) for box in hand_boxes]
-        matched_hands = self._hand_tracker.update(hand_detections, time.monotonic(), aspect)
+        # Shipped: wall time, while every other tracker here runs on evidence
+        # time (EvidenceClock). behavior_v2 puts the hand tracker on the same
+        # evidence clock, so a stall cannot read as a fast hand.
+        hand_t = self._evidence_clock.now if self._behavior_v2 else time.monotonic()
+        matched_hands = self._hand_tracker.update(hand_detections, hand_t, aspect)
         erratic = False
         for track in matched_hands:
             # PEAK instantaneous speed, not net displacement over the trail:
@@ -1532,10 +1578,111 @@ class DriverAttentionModule(VisionModule):
             self._pending_eating_detected_edge = True
         self._eating_visible_prev = eating_now_visible
 
+    # ------------------------------------------------------------------ behaviour reasoning v2
+    #: Shipped events whose decision moves to core/behavior/ when behavior_v2 is on.
+    _BEHAVIOR_V2_REPLACES: ClassVar[frozenset[str]] = frozenset(
+        {"drowsiness", "phone_use", "phone_detected", "frequent_glancing"}
+    )
+    #: Events only v2 raises. Log-only: main.ALERT_EVENT_TYPES_PI does not list
+    #: them, and must not until they are validated (docs/BEHAVIOUR_REASONING.md).
+    _BEHAVIOR_V2_EVENTS: ClassVar[frozenset[str]] = frozenset({"long_glance", "glance_budget_exceeded"})
+
+    def _eye_patch_occluded(self, gray: np.ndarray, points: list[Point], indices: list[int]) -> Optional[bool]:
+        xs = [points[i][0] for i in indices]
+        ys = [points[i][1] for i in indices]
+        pad = 0.25 * (max(xs) - min(xs))
+        h, w = gray.shape[:2]
+        x1, x2 = int(max(0.0, min(xs) - pad)), int(min(float(w), max(xs) + pad))
+        y1, y2 = int(max(0.0, min(ys) - pad)), int(min(float(h), max(ys) + pad))
+        assert self._behavior is not None
+        eye_cfg = self._behavior.config.eye
+        return eye_patch_occluded(gray[y1:y2, x1:x2], eye_cfg.occlusion_max_mean, eye_cfg.occlusion_max_std)
+
+    def _behavior_eye_frame(
+        self, frame: np.ndarray, points: list[Point], *, left_ear: float, right_ear: float, ear: float,
+        threshold: float, iris_ratio: Optional[float], iris_veto: bool,
+        head_pitch: Optional[float], eye_pitch: Optional[float],
+    ) -> EyeFrame:
+        """This frame's eye evidence for core/behavior/eye_state.
+
+        With both eyes readable the smoothed max EAR is used, exactly as the
+        shipped drowsiness path reads it. With one eye occluded only the other
+        eye's (raw) EAR speaks; with both occluded the state is unknown.
+        """
+        assert self._behavior is not None
+        occluded: tuple[Optional[bool], Optional[bool]] = (None, None)
+        if self._behavior.config.eye_occlusion_check:
+            gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+            occluded = (self._eye_patch_occluded(gray, points, LEFT_EYE),
+                        self._eye_patch_occluded(gray, points, RIGHT_EYE))
+        if not any(occluded):
+            eyes: tuple[EyeObservation, ...] = (EyeObservation(ear, False),)
+        else:
+            eyes = (EyeObservation(left_ear, occluded[0]), EyeObservation(right_ear, occluded[1]))
+        deep = threshold * self._perclos_closure_ratio / max(self._ear_threshold_ratio, 1e-6)
+        return EyeFrame(
+            face_present=True, eyes=eyes, closure_threshold=threshold, deep_threshold=deep,
+            iris_openness=iris_ratio, iris_vetoes_closure=iris_veto,
+            head_pitch_deg=head_pitch, eye_pitch_deg=eye_pitch,
+        )
+
+    def _behavior_step(
+        self, frame: np.ndarray, frame_t: float, events: list[Event], *,
+        points: Optional[list[Point]], gaze: Optional[tuple[float, float]], gaze_reason: str,
+        eye_frame: Optional[EyeFrame], drowsy_confidence: Optional[float],
+    ) -> list[Event]:
+        """Run the v2 reasoner for this frame and swap its events in for the ones it replaces."""
+        assert self._behavior is not None
+        h, w = frame.shape[:2]
+        face_box = None
+        if points:
+            xs = [p[0] for p in points]
+            ys = [p[1] for p in points]
+            face_box = (min(xs), min(ys), max(xs), max(ys))
+        detection = None
+        if self._detection_tick != self._behavior_tick_seen:
+            self._behavior_tick_seen = self._detection_tick
+            detection = PhoneDetection(
+                t=frame_t, phone_boxes=tuple(self._last_phone_boxes), hand_boxes=tuple(self._last_hand_boxes),
+                hands_available=self._enable_hands and self._hands is not None, phone_score=self._last_phone_score,
+            )
+        if self._object_detection_error is not None:
+            detector, detector_reason = DETECTOR_FAILED, f"object detection failed: {self._object_detection_error}"
+        elif not self._object_detection_ready:
+            detector, detector_reason = DETECTOR_NOT_STARTED, "object detector not started"
+        else:
+            detector, detector_reason = DETECTOR_OK, ""
+        region = self._behavior.config.driver_region
+        region_px = None if region is None else (region[0] * w, region[1] * h, region[2] * w, region[3] * h)
+        produced = self._behavior.update(BehaviorFrame(
+            t=frame_t, face_present=points is not None, face_box=face_box, gaze=gaze,
+            gaze_unknown_reason=gaze_reason, eye=eye_frame or EyeFrame(face_present=points is not None),
+            detector=detector, detector_reason=detector_reason, detection=detection, driver_region=region_px,
+        ))
+        kept = [e for e in events if e.type not in self._BEHAVIOR_V2_REPLACES]
+        for item in produced:
+            if item.type == "drowsiness":
+                confidence = drowsy_confidence
+            elif item.type in ("phone_use", "phone_detected"):
+                confidence = clamp_unit(self._last_phone_score)
+            else:
+                confidence = None  # duration/count rules: no graded evidence to report
+            kept.append(Event.now(item.type, item.duration_s, confidence, self.name, f"behavior_v2: {item.detail}"))
+        self._drowsy_active = self._behavior.drowsiness.active
+        self._phone_use_active = self._behavior.phone.in_use_active
+        return kept
+
+    def behavior_uncertainty(self) -> dict[str, str]:
+        """v2 components that currently cannot make a claim, with why ({} when v2 is off)."""
+        return self._behavior.uncertainty() if self._behavior is not None else {}
+
     def process(self, frame: np.ndarray) -> list[Event]:
         """Run face mesh, head pose, and (strided) object detection; return fired events."""
         # Evidence time: the frame's capture time with stalls clamped (F4).
-        now = self._evidence_clock.advance(self.frame_time())
+        # The raw capture time is kept for behaviour reasoning v2, which must SEE
+        # stalls (it credits nothing across them) rather than receive them clamped.
+        frame_t = self.frame_time()
+        now = self._evidence_clock.advance(frame_t)
         events: list[Event] = []
         h, w = frame.shape[:2]
         # From the ACTUAL frame, every frame -- not only on an object-detector
@@ -1666,6 +1813,12 @@ class DriverAttentionModule(VisionModule):
                 detail = "" if not self._face_lost_tracker.corroborated else "person still in frame; face turned away"
                 events.append(Event.now("attention_lost", fired, None, self.name, detail))
 
+            if self._behavior is not None:
+                events = self._behavior_step(
+                    frame, frame_t, events, points=None, gaze=None, gaze_reason="face not detected",
+                    eye_frame=None, drowsy_confidence=None,
+                )
+
             # Can't confirm eyes-off-road without a face reading, so a visible phone here
             # gets partial (not full) phone_risk credit -- it might just be sitting in a
             # mount while the driver's head is turned for an unrelated reason. Same idea
@@ -1743,7 +1896,7 @@ class DriverAttentionModule(VisionModule):
             ],
             dtype=np.float64,
         )
-        rotation = estimate_head_rotation(image_points, (h, w), self._camera_hfov_deg)
+        rotation = estimate_head_rotation(image_points, (h, w), self._camera_hfov_deg, self._camera_intrinsics)
         if rotation is not None:
             # Raw Euler angles (estimate_head_pose_deg's convention): display
             # and telemetry only -- thresholds use the rotation relative to the
@@ -1807,6 +1960,25 @@ class DriverAttentionModule(VisionModule):
                 min(1.0, self._ear_threshold_ratio + _IRIS_VETO_MARGIN) * iris_reference,
             )
         )
+        behavior_eye: Optional[EyeFrame] = None
+        if self._behavior is not None:
+            # v2 needs the head's own pitch (not the fused gaze) and the iris's,
+            # each against the calibrated neutral, to tell looking down from closing.
+            head_pitch_delta: Optional[float] = None
+            eye_pitch_delta: Optional[float] = None
+            if rotation is not None and self._calibrator.is_calibrated:
+                head_pitch_delta = relative_yaw_pitch_deg(self._calibrator.baseline_rotation, rotation)[1]
+                if abs(head_pitch_delta) > MAX_PLAUSIBLE_GAZE_DEG:
+                    head_pitch_delta = None
+                eye_baseline = self._calibrator.baseline_eye_offset
+                if gaze_offset is not None and eye_baseline is not None:
+                    eye_pitch_delta = gaze_offset[1] - eye_baseline[1]
+            behavior_eye = self._behavior_eye_frame(
+                frame, points, left_ear=left_ear, right_ear=right_ear, ear=ear, threshold=effective_threshold,
+                iris_ratio=iris_ratio, iris_veto=iris_vetoes_closure,
+                head_pitch=head_pitch_delta, eye_pitch=eye_pitch_delta,
+            )
+
         drowsy_condition = ear < effective_threshold and not iris_vetoes_closure
         fired = self._drowsy_tracker.update(drowsy_condition, now)
         # is_active (not the raw per-frame drowsy_condition) drives the live alert: a
@@ -1827,7 +1999,14 @@ class DriverAttentionModule(VisionModule):
             ear < effective_threshold * self._perclos_closure_ratio / max(self._ear_threshold_ratio, 1e-6)
             and not iris_vetoes_closure
         )
-        perclos = self._perclos_tracker.update(perclos_closed, now)
+        if behavior_eye is not None and self._behavior is not None:
+            # v2: a downward look is not closure, and an unreadable eye is not
+            # a sample at all (neither open nor closed time).
+            eye_state = classify_eye_state(behavior_eye, self._behavior.config.eye)
+            perclos_closed = perclos_closed and eye_state.state == EYE_CLOSED
+            perclos = self._perclos_tracker.update(perclos_closed, now) if eye_state.known else self._last_perclos
+        else:
+            perclos = self._perclos_tracker.update(perclos_closed, now)
         self._last_perclos = perclos
         if perclos > self._perclos_threshold and not self._fatigue_warned:
             events.append(Event.now(
@@ -1964,6 +2143,20 @@ class DriverAttentionModule(VisionModule):
             self._pending_eating_detected_edge = False
             events.append(Event.now("eating_drinking", 0.0, clamp_unit(self._last_eating_score), self.name))
 
+        if self._behavior is not None:
+            if not self._calibrator.is_calibrated:
+                gaze_reason = "calibration not complete"
+            elif rotation is None:
+                gaze_reason = "head pose fit failed"
+            else:
+                gaze_reason = "implausible head pose fit"
+            events = self._behavior_step(
+                frame, frame_t, events, points=points,
+                gaze=(self._last_yaw, self._last_pitch) if gaze_delta is not None else None,
+                gaze_reason=gaze_reason, eye_frame=behavior_eye,
+                drowsy_confidence=margin_confidence(effective_threshold - ear, self._ear_noise.sigma),
+            )
+
         # --- risk fusion: reason about the signals above *together*, not just individually ---
         # Both of these turn a raw count into "how far along toward the
         # threshold" for partial credit, and both divide by a number that comes
@@ -2051,6 +2244,7 @@ class DriverAttentionModule(VisionModule):
             "hand_count": len(self._last_hand_boxes),
             "eating_visible": bool(self._last_eating_boxes),
             "erratic_hands": self._erratic_hands_active,
+            **(self._behavior.snapshot() if self._behavior is not None else {}),
         }
 
     def _gaze_label(self) -> str:
@@ -2109,7 +2303,7 @@ class DriverAttentionModule(VisionModule):
             ]
             if phone_confidences:
                 phone_confidence = max(phone_confidences)
-        return {
+        state = {
             "face_detected": self._last_face_proto is not None and not self._face_lost_active,
             "focused": not (
                 self._distracted_active or self._eyes_down_active or self._eyes_up_active
@@ -2145,6 +2339,14 @@ class DriverAttentionModule(VisionModule):
             "alert_active": self.is_alert_active(),
             "events_fired_this_frame": list(self._last_fired_event_types),
         }
+        if self._behavior is not None:
+            state["behavior"] = {
+                **self._behavior.snapshot(),
+                "assessments": {k: a.to_dict() for k, a in self._behavior.assessments().items()},
+                "uncertain": self._behavior.uncertainty(),
+                "last_glance": self._behavior.glance.last_glance,
+            }
+        return state
 
     def _state_label(self) -> str:
         """A short human-readable label of the current dominant state, for the debug overlay."""
@@ -2309,6 +2511,8 @@ class DriverAttentionModule(VisionModule):
 
     def event_requirements(self) -> dict[str, frozenset[str]]:
         reqs = dict(self._EVENT_REQUIREMENTS)
+        if self._behavior is not None:
+            reqs.update(dict.fromkeys(self._BEHAVIOR_V2_EVENTS, self._FACE))
         if not self._enable_hands:
             reqs.pop("erratic_hand_movement")
         return reqs

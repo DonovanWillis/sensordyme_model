@@ -327,6 +327,11 @@ modules:
     # (standard): 66. With the Wide lens and the face 20-30 deg off-axis, the default
     # mis-reads a 35 deg turn as 29-38 deg depending on direction, and a 25 deg nod as
     # up to 31. Changing it invalidates the stored calibration (the device recalibrates).
+    camera_intrinsics: null # calibrated lens intrinsics from a hardware calibration run
+    # (cv2.calibrateCamera): {width, height, fx, fy, cx, cy, distortion: [k1, k2, p1, p2, k3]},
+    # rescaled to the processed frame. null = the camera_hfov_deg / zero-distortion assumption
+    # above, unchanged. Use this OR camera_hfov_deg, not both. Changing it invalidates the
+    # stored calibration. See core/behavior/camera_model.py.
 
     # --- signal conditioning (glasses/glare robustness; see core/eye_signal.py) ---
     # Raw EAR and head-pose readings are noisy measurements, and glasses make
@@ -555,6 +560,16 @@ modules:
     risk_elevated_threshold: 0.4 # composite score above this fires the soft "elevated_risk" event
     risk_high_threshold: 0.75 # composite score above this, sustained, fires the loud "high_risk" event
     risk_confirm_seconds: 1.0 # composite score must stay above risk_high_threshold this long to fire "high_risk"
+
+    # --- behaviour reasoning v2 (core/behavior/; EXPERIMENTAL, NOT VALIDATED) ---
+    # false = the shipped logic above, byte-for-byte the same events. true = drowsiness,
+    # phone_use, phone_detected and frequent_glancing are decided by core/behavior/
+    # (closure vs downward glance, hand-held + gaze-to-phone, cabin glance zones, face-loss
+    # coasting, explicit "unknown" when inputs are missing) and long_glance /
+    # glance_budget_exceeded are logged (not alerted). Tested on synthetic scenarios only:
+    # read docs/BEHAVIOUR_REASONING.md before turning it on. Optional parameters go in a
+    # nested `behavior:` mapping (validated by core/config_schema.py; not preset-overridable).
+    behavior_v2: false
 
   driver_attention_openpilot:
     # comma.ai openpilot's driver monitoring, verbatim (model + policy from openpilot
