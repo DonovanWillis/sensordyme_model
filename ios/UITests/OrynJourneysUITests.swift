@@ -20,9 +20,18 @@ final class OrynJourneysUITests: XCTestCase {
         try XCTSkipUnless(Stack.reachable, "the scenario controller is not running (scripts/sim/ios_uitest.sh)")
     }
 
+    /// Set by `record(_:)`. `testRun.hasSucceeded` is not final during tearDown, so it
+    /// read false for passing journeys too and every one got a FAIL_ screenshot.
+    private var failed = false
+
+    override func record(_ issue: XCTIssue) {
+        failed = true
+        super.record(issue)
+    }
+
     override func tearDownWithError() throws {
         // What was on screen when it failed, named after the journey.
-        if testRun?.hasSucceeded == false, let app, app.state == .runningForeground {
+        if failed, let app, app.state == .runningForeground {
             shot("FAIL_\(name.split(separator: " ").last?.dropLast() ?? "")")
         }
         app?.terminate()
