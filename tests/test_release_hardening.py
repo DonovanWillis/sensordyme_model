@@ -150,10 +150,13 @@ def test_the_repository_status_file_is_valid_and_claims_no_hardware_validation()
     for name, entry in status["components"].items():
         assert entry["tiers"] and set(entry["tiers"]) <= set(rm.TIERS), name
         assert entry["evidence"], name
-    pending = {n for n, e in status["components"].items() if e.get("pending_integration")}
-    assert {"m65_device_auth_signed_commands", "m65_ble_proof_of_possession", "m65_xcuitest_journeys",
-            "m65_reliability_fault_scenarios", "m65_model_registry_evidence_binding",
-            "m65_training_run_exp08_full60"} <= pending
+    m65 = {"m65_device_auth_signed_commands", "m65_ble_proof_of_possession", "m65_xcuitest_journeys",
+           "m65_reliability_fault_scenarios", "m65_model_registry_evidence_binding",
+           "m65_training_run_exp08_full60"}
+    assert m65 <= set(status["components"]), "every M6.5 workstream has a status entry"
+    for name in m65:  # integrated: evidence filled in, no placeholder left
+        entry = status["components"][name]
+        assert not entry.get("pending_integration") and "PLACEHOLDER" not in entry["evidence"], name
     assert status["components"]["yolo_decoder_reference"]["tiers"] == ["experiment-only"]
 
 
