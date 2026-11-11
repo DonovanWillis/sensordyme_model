@@ -88,5 +88,20 @@ check(switched.note?.contains("AI Custom") == true, "and says the rules need AI 
 check(summary(custom: false, sent: 0, active: 0) == ActivationSummary(kind: .modeSwitched, note: nil),
       "a keyword-fallback proposal (a mode, no rules) just switches, with nothing to qualify")
 
+print("\nan additive role (rules run beside the mode) is never told rules can't:")
+let additiveSwitch = ActivationSummary.summarize(isCustom: false, rulesSent: 1, rulesActive: 0, additive: true)
+check(additiveSwitch.kind == .modeSwitched, "a mode with its rules not turned on is still a mode switch")
+check(additiveSwitch.note?.contains("can't run alongside") == false,
+      "and does not claim rules can't run alongside a mode")
+check(additiveSwitch.note?.contains("alongside the mode") == true
+      && additiveSwitch.note?.contains("on its own") == true,
+      "it says how to run the rule alongside the mode (got \(additiveSwitch.note ?? "nil"))")
+check(ActivationSummary.summarize(isCustom: false, rulesSent: 2, rulesActive: 0, additive: true)
+      .note?.contains("These rules weren't") == true, "plural")
+check(ActivationSummary.summarize(isCustom: true, rulesSent: 2, rulesActive: 2, additive: true).note
+      == "2 rules running alongside the monitoring mode.", "running custom rules are said to run alongside")
+check(ActivationSummary.summarize(isCustom: true, rulesSent: 2, rulesActive: 2, additive: false).note
+      == "2 rules running.", "a replacing role keeps the plain wording")
+
 print("\n\(failures == 0 ? "PASSED" : "\(failures) FAILED")")
 exit(failures == 0 ? 0 : 1)

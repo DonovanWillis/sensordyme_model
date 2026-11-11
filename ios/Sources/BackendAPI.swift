@@ -548,8 +548,23 @@ final class MockAPI: BackendAPI {
                    health: Self.demoHealth,
                    // Demo runs a standard mode; a custom configuration in the
                    // demo would claim a capability nobody had configured.
-                   monitoring: nil)
+                   monitoring: nil,
+                   status: Self.demoStatus())
         ]
+    }
+
+    /// The status contract for the walkthrough device: a general-purpose role
+    /// (every mode can be picked), monitoring normally, nothing refused. The
+    /// capabilities are what the simulated health above claims, no more.
+    private static func demoStatus() -> DeviceStatus {
+        DeviceStatus(
+            monitoringState: "ready", monitoringActive: true, protection: "protecting",
+            reasons: [], protectionReasons: [], mode: "standard",
+            role: "general", roleTitle: "General purpose", allowedPresets: nil,
+            capabilities: .init(available: ["camera", "inference", "alert_output"], impaired: [], starting: []),
+            rules: .init(active: [], additive: false, rejected: nil),
+            stale: false, reportedAt: Date().timeIntervalSince1970
+        )
     }
 
     /// Health for the walkthrough device. Every line says "simulated" — a demo

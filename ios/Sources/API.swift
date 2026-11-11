@@ -13,6 +13,11 @@ struct APIError: LocalizedError {
     var isUnreachable = false
     /// The HTTP status, when a server answered. 0 for transport failures.
     var status: Int = 0
+    /// The backend's machine-readable refusal code ("role_forbids_preset",
+    /// "draft_superseded", ...; docs/APP_STATUS_CONTRACT.md). nil when the
+    /// server sent none. Branch on this, never on the status alone: several
+    /// different refusals share 409.
+    var code: String? = nil
     var errorDescription: String? { message }
 }
 
@@ -104,13 +109,16 @@ struct APIClient {
     /// used to report as an expired session, on the sign-in screen itself.
     static func httpError(status: Int, data: Data, sentToken: Bool) -> APIError? {
         if (200..<300).contains(status) { return nil }
-        // FastAPI errors arrive as {"detail": "..."}
-        let detail = (try? JSONSerialization.jsonObject(with: data) as? [String: Any])?["detail"] as? String
+        // FastAPI errors arrive as {"detail": "..."}, and refusals the app must
+        // tell apart also carry {"code": "..."} beside it.
+        let body = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any]
+        let detail = body?["detail"] as? String
+        let code = body?["code"] as? String
         if status == 401 && sentToken {
             return APIError(message: "Your session has expired. Please sign in again.",
-                            isAuthFailure: true, status: status)
+                            isAuthFailure: true, status: status, code: code)
         }
-        return APIError(message: detail ?? "request failed (\(status))", status: status)
+        return APIError(message: detail ?? "request failed (\(status))", status: status, code: code)
     }
 
     /// Did this fail to reach a server at all, rather than reach one that refused?

@@ -347,3 +347,15 @@ def test_every_status_field_is_documented(backend):
     codes = set(re.findall(r"^\| `([a-z_]+)` \| \d{3}", doc, flags=re.MULTILINE))
     assert {"role_forbids_preset", "draft_superseded", "firmware_unsupported"} <= codes
     json.dumps(status)  # plain JSON all the way down
+
+
+def test_the_app_decodes_every_status_field(backend):
+    """ios/Sources/DeviceStatus.swift and _device_status are two halves of one
+    contract; a field the app does not decode is a field it cannot show."""
+    client, headers, _ = backend
+    _report_ready(client)
+    status = _status(client, headers)
+    swift = (Path(__file__).resolve().parent.parent / "ios" / "Sources" / "DeviceStatus.swift").read_text()
+    keys = re.search(r"enum CodingKeys: String, CodingKey \{(.*?)\n    \}", swift, flags=re.DOTALL).group(1)
+    for field in status:
+        assert f'"{field}"' in keys or re.search(rf"\bcase\b[^\n]*\b{field}\b", keys), field

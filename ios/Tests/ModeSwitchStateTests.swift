@@ -170,5 +170,39 @@ do {
           "a reload that started just before the tap landing on AI Custom must not revert it")
 }
 
+print("\na refusal the backend explained is shown, not \"Didn't switch\":")
+do {
+    let refused = ModeSwitchState.PendingSwitch(
+        targetBase: "baby_monitoring", requestedAt: t0,
+        reason: "this device's role is 'driver_safety': preset 'baby_monitoring' would stop driver_attention")
+    check(state(for: "baby_monitoring", active: "driver_safety", failure: refused)
+          == .failed("this device's role is 'driver_safety': preset 'baby_monitoring' would stop driver_attention"),
+          "the backend's detail is the row's message")
+    let unexplained = ModeSwitchState.PendingSwitch(targetBase: "baby_monitoring", requestedAt: t0)
+    check(state(for: "baby_monitoring", active: "driver_safety", failure: unexplained)
+          == .failed("Didn't switch — tap to try again"),
+          "a failure with no explanation keeps the generic message")
+}
+
+print("\na mode this device's role forbids is shown unavailable, with why:")
+func roleState(_ name: String, active: String = "driver_safety", custom: Bool = false,
+               unavailable: String?) -> ModeRowState {
+    ModeSwitchState.state(for: name, activeBase: active, customMonitoringActive: custom,
+                          pending: nil, deviceOnline: true, failure: nil, now: t0, unavailable: unavailable)
+}
+check(roleState("baby_monitoring", unavailable: "Not available for this device's role (Driver safety)")
+      == .unavailable("Not available for this device's role (Driver safety)"), "unavailable carries its reason")
+check(roleState("driver_safety", unavailable: "stale table") == .active,
+      "a mode the device reports running is active, whatever the role table says")
+check(roleState("baby_monitoring", unavailable: nil) == .inactive, "an allowed mode is just inactive")
+
+print("\ncustom rules running ALONGSIDE the mode leave the mode active:")
+// DeviceDetailView passes customMonitoringActive = true only when custom rules
+// REPLACE the modes (AI Custom); on an additive role the mode keeps running.
+check(state(for: "driver_safety", active: "driver_safety", custom: false) == .active,
+      "additive: the driver mode row stays active beside the rules")
+check(state(for: "driver_safety", active: "driver_safety", custom: true) == .inactive,
+      "replacing: the mode row is not active")
+
 print("\n\(failures == 0 ? "PASSED" : "\(failures) FAILED")")
 exit(failures == 0 ? 0 : 1)

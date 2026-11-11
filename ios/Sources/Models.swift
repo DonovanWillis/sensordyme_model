@@ -28,9 +28,13 @@ struct Device: Codable, Identifiable, Hashable {
     /// The camera's own id (`SD-XXXXXXXX`, the same one it advertises over
     /// Bonjour). Nil from firmware or a backend that predates it. See FeedLink.
     var hardwareId: String? = nil
+    /// The backend's typed answer to "is it watching, and for what"
+    /// (DeviceStatus.swift, docs/APP_STATUS_CONTRACT.md). nil from a backend
+    /// that predates it. Every monitoring indicator reads this, not `health`.
+    var status: DeviceStatus? = nil
 
     enum CodingKeys: String, CodingKey {
-        case id, name, online, health, monitoring
+        case id, name, online, health, monitoring, status
         case hardwareId = "hardware_id"
         case activePreset = "active_preset"
         case desiredPreset = "desired_preset"
@@ -142,6 +146,33 @@ struct DeviceHealthReport: Codable, Hashable {
 }
 
 struct DevicesResponse: Codable { let devices: [Device] }
+
+extension StatusTone {
+    /// The design system's status for a tone (DeviceStatus.swift stays
+    /// Foundation-only, so the mapping lives here).
+    var sdStatus: SDStatus {
+        switch self {
+        case .ok: .online
+        case .caution: .warning
+        case .critical: .alert
+        case .neutral: .offline
+        }
+    }
+}
+
+extension Device {
+    /// The monitoring state in words, from `status`. nil only for an online
+    /// device behind a backend that predates the status contract.
+    var monitoringPresentation: MonitoringStatusPresentation? {
+        MonitoringStatusPresentation.make(status: status, online: online)
+    }
+
+    /// What custom rules do on the device right now: nothing, replace the
+    /// mode (AI Custom), or run beside it (an additive role).
+    var customRules: CustomRulesRole {
+        MonitoringStatusPresentation.customRules(status: status, legacyActive: monitoring?.active == true)
+    }
+}
 
 /// A named area drawn over the camera view, in normalised 0..1 coordinates so
 /// one drawing survives any change of capture resolution or phone screen size.

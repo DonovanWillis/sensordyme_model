@@ -231,25 +231,27 @@ struct DeviceDetailView: View {
 
     // MARK: Status
 
-    /// Online, alert state and what it is watching for — the same three facts
-    /// as before, from the same sources, in one quiet line under the picture.
+    /// Online, alert state and what it is watching for, in one quiet line under
+    /// the picture. The second pill is the device's own monitoring state
+    /// (DeviceStatus): "All clear" only when the device reports `ready`, never
+    /// for a failed, stopped, starting or silent one.
     private var statusRow: some View {
-        HStack(spacing: SD.Space.xs) {
+        let pill = MonitoringStatusPresentation.pill(device.monitoringPresentation, alertActive: alertActive)
+        return HStack(spacing: SD.Space.xs) {
             SDStatusPill(
                 status: device.online ? .online : .offline,
                 pulses: device.online
             )
-            SDStatusPill(
-                status: alertActive ? .alert : .online,
-                text: alertActive ? "Alert" : "All clear"
-            )
+            SDStatusPill(status: pill.tone.sdStatus, text: pill.text)
             Spacer(minLength: SD.Space.xs)
             HStack(spacing: 5) {
                 if customMonitoringActive {
                     Image(systemName: "sparkles")
                         .font(.system(size: 10, weight: .semibold))
                 }
-                Text(customMonitoringActive
+                // Rules running ALONGSIDE the mode leave the mode in charge, so
+                // the mode is what this line names.
+                Text(customReplacesModes
                      ? (device.monitoring?.title ?? "AI Custom Monitoring")
                      : Preset.title(for: device.activePreset))
                     .font(SD.Typography.caption.weight(.medium))
@@ -276,7 +278,7 @@ struct DeviceDetailView: View {
                         OrynRowDivider(inset: 22 + SD.Space.sm)
                         healthRow("AI", systemImage: "cpu", health.accelerator)
                         OrynRowDivider(inset: 22 + SD.Space.sm)
-                        healthRow("Monitoring", systemImage: "eye", health.inference)
+                        healthRow("Monitoring", systemImage: "eye", monitoringComponent(health))
                         OrynRowDivider(inset: 22 + SD.Space.sm)
                         healthRow("Network", systemImage: "wifi", health.network)
                     }
@@ -299,6 +301,16 @@ struct DeviceDetailView: View {
                 }
             }
         }
+    }
+
+    /// The "Monitoring" row: the device's monitoring state (DeviceStatus), in
+    /// the health card's own row format. It used to show the inference loop's
+    /// health, which reads "ok" on a device that is stopped, or failed because
+    /// the face model is gone. The inference component remains the fallback
+    /// for a backend that predates the status contract.
+    private func monitoringComponent(_ health: DeviceHealthReport) -> HealthComponent? {
+        guard let presentation = device.monitoringPresentation else { return health.inference }
+        return HealthComponent(state: presentation.tone.healthState, detail: presentation.detail, metrics: nil)
     }
 
     @ViewBuilder
@@ -460,8 +472,13 @@ struct DeviceDetailView: View {
 
     // MARK: Mode
 
-    /// Whether a custom AI configuration has replaced the base mode.
-    private var customMonitoringActive: Bool { device.monitoring?.active == true }
+    /// Whether custom rules run on the device at all (replacing the mode, or
+    /// beside it on an additive role). From the mode the device reports.
+    private var customMonitoringActive: Bool { device.customRules != .none }
+
+    /// Whether custom rules have REPLACED the base mode (AI Custom). False on an
+    /// additive role, where they run alongside the mode and the mode stays on.
+    private var customReplacesModes: Bool { device.customRules == .replacing }
 
     private var activeBase: String { Preset.split(device.activePreset).base }
     private var activeVariant: String? { Preset.split(device.activePreset).variant }
@@ -484,7 +501,9 @@ struct DeviceDetailView: View {
                                 Text(custom.title)
                                     .font(SD.Typography.body)
                                     .foregroundStyle(SD.Colors.textPrimary)
-                                Text("Set by Jupiter · replaces the modes below")
+                                Text(customReplacesModes
+                                     ? "Set by Jupiter · replaces the modes below"
+                                     : "Set by Jupiter · runs alongside the mode below")
                                     .font(SD.Typography.caption)
                                     .foregroundStyle(SD.Colors.textSecondary)
                             }
@@ -501,9 +520,29 @@ struct DeviceDetailView: View {
                     }
                     .padding(.vertical, SD.Space.xxs)
 
-                    Text("Pick a mode below to go back to standard monitoring.")
+                    Text(customReplacesModes
+                         ? "Pick a mode below to go back to standard monitoring."
+                         : "Pick the mode below again to turn these rules off.")
                         .font(SD.Typography.caption)
                         .foregroundStyle(SD.Colors.textTertiary)
+
+                    Rectangle().fill(SD.Colors.border).frame(height: 1)
+                }
+
+                // The device refused the latest rules (all or nothing) and kept
+                // what it was running. They are not shown as running anywhere.
+                if let notice = MonitoringStatusPresentation.rejectedRulesNotice(device.status) {
+                    HStack(alignment: .top, spacing: SD.Space.sm) {
+                        Image(systemName: "exclamationmark.triangle.fill")
+                            .font(.system(size: 13))
+                            .frame(width: 26)
+                            .foregroundStyle(SD.Colors.danger)
+                        Text(notice)
+                            .font(SD.Typography.caption)
+                            .foregroundStyle(SD.Colors.danger)
+                            .fixedSize(horizontal: false, vertical: true)
+                    }
+                    .padding(.vertical, SD.Space.xxs)
 
                     Rectangle().fill(SD.Colors.border).frame(height: 1)
                 }
@@ -527,11 +566,15 @@ struct DeviceDetailView: View {
         // `now: .now` is what lets a stuck switch age past switchTimeout and
         // flip to failed on the app's own 4s refresh cycle, with no separate
         // timer needed.
+        // Only custom rules that REPLACE the modes stop a mode row reading active;
+        // rules running alongside (an additive role) leave the mode running.
         let rowState = ModeSwitchState.state(
-            for: preset.name, activeBase: activeBase, customMonitoringActive: customMonitoringActive,
-            pending: pendingSwitch, deviceOnline: device.online, failure: failedSwitch, now: .now
+            for: preset.name, activeBase: activeBase, customMonitoringActive: customReplacesModes,
+            pending: pendingSwitch, deviceOnline: device.online, failure: failedSwitch, now: .now,
+            unavailable: MonitoringStatusPresentation.presetUnavailableReason(preset.name, status: device.status)
         )
         let isActive = rowState == .active
+        let isUnavailable = rowState.isUnavailable
 
         VStack(alignment: .leading, spacing: SD.Space.xs) {
             Button { setMode(preset.name) } label: {
@@ -543,12 +586,16 @@ struct DeviceDetailView: View {
                     VStack(alignment: .leading, spacing: 1) {
                         Text(preset.title)
                             .font(SD.Typography.body)
-                            .foregroundStyle(SD.Colors.textPrimary)
+                            .foregroundStyle(isUnavailable ? SD.Colors.textDisabled : SD.Colors.textPrimary)
                         switch rowState {
                         case .failed(let message):
                             Text(message)
                                 .font(SD.Typography.caption)
                                 .foregroundStyle(SD.Colors.danger)
+                        case .unavailable(let reason):
+                            Text(reason)
+                                .font(SD.Typography.caption)
+                                .foregroundStyle(SD.Colors.textTertiary)
                         case .queuedOffline:
                             Text("Device offline — will apply when it reconnects")
                                 .font(SD.Typography.caption)
@@ -572,13 +619,15 @@ struct DeviceDetailView: View {
                     case .failed:
                         Image(systemName: "exclamationmark.triangle.fill")
                             .foregroundStyle(SD.Colors.danger)
-                    case .inactive:
+                    case .inactive, .unavailable:
                         EmptyView()
                     }
                 }
                 .contentShape(Rectangle())
             }
             .buttonStyle(.plain)
+            // The backend would refuse it (role_forbids_preset): nothing to tap.
+            .disabled(isUnavailable)
 
             // Tuning variants, shown only for the mode currently running.
             if isActive && !preset.variants.isEmpty {
@@ -672,7 +721,12 @@ struct DeviceDetailView: View {
             } catch {
                 guard setModeGuard.isLatest(token) else { return }
                 if pendingSwitch?.targetBase == base { pendingSwitch = nil }
-                failedSwitch = ModeSwitchState.PendingSwitch(targetBase: base, requestedAt: requestedAt)
+                // A refusal the backend explained (a coded error: the role
+                // forbids this mode, an unknown variant) is shown as said. A
+                // transport failure keeps the generic "Didn't switch".
+                let explained = (error as? APIError).flatMap { $0.code != nil ? $0.message : nil }
+                failedSwitch = ModeSwitchState.PendingSwitch(
+                    targetBase: base, requestedAt: requestedAt, reason: explained)
             }
         }
     }

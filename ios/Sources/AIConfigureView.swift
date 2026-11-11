@@ -509,7 +509,8 @@ struct AIConfigureView: View {
                 let result = try await state.backend.activate(deviceID: device.id, proposal: proposal)
                 let summary = ActivationSummary.summarize(
                     isCustom: proposal.isCustom, rulesSent: proposal.rules.count,
-                    rulesActive: result.rulesActive
+                    rulesActive: result.rulesActive,
+                    additive: MonitoringStatusPresentation.rulesAdditive(device.status)
                 )
                 withAnimation(SD.Motion.standard) {
                     // Every rule the backend could not run goes under "Not yet
@@ -525,10 +526,14 @@ struct AIConfigureView: View {
                     if summary.kind == .nothingRunning { errorMessage = summary.note }
                 }
                 await onApplied()
-            } catch let error as APIError where error.status == 409 {
+            } catch let error as APIError where error.code == "draft_superseded" {
                 // The draft this proposal came from was replaced (another
                 // preview, from this phone or another). Activating it would
                 // run something nobody reviewed, so fetch it again.
+                //
+                // Only this code. Other refusals share 409 (the device's role
+                // forbids the mode, role_forbids_preset), and re-running Jupiter
+                // for those hid the reason behind "the proposal changed".
                 configure(notice: "The proposal changed — review it again before activating it.")
             } catch {
                 errorMessage = error.localizedDescription

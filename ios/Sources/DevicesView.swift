@@ -270,7 +270,8 @@ struct DeviceCard: View {
     /// "Offline" alone leaves people wondering whether it just happened or has
     /// been down all week, which is the first thing anyone wants to know.
     ///
-    /// Checks `device.monitoring?.active`, same as DeviceDetailView one tap
+    /// Checks what custom rules are doing (`device.customRules`: the device's
+    /// reported mode, else `monitoring.active`), same as DeviceDetailView one tap
     /// away — Models.swift's own doc comment on `CustomMonitoring` names the
     /// exact bug this guards against: showing the base mode as selected while
     /// a custom configuration is what the device is really doing, so someone
@@ -278,12 +279,20 @@ struct DeviceCard: View {
     /// watching for driver distraction. That was fixed on the device screen;
     /// this card had the identical unconditional read of `activePreset` and
     /// wasn't.
+    ///
+    /// Online, the mode is prefixed with the device's monitoring state whenever
+    /// it is not simply watching ("Stopped · Driver Safety", "Not monitoring ·
+    /// ..."), from the backend's status contract (DeviceStatus.swift). The card
+    /// used to read like a healthy device whatever the device reported.
     private var subtitle: String {
         if device.online {
-            if device.monitoring?.active == true {
-                return device.monitoring?.title ?? "AI Custom Monitoring"
-            }
-            return Preset.title(for: device.activePreset)
+            // Rules running alongside the mode (an additive role) leave the
+            // mode in charge, so the mode is what is named.
+            let modeTitle = device.customRules == .replacing
+                ? (device.monitoring?.title ?? "AI Custom Monitoring")
+                : Preset.title(for: device.activePreset)
+            return MonitoringStatusPresentation.cardSubtitle(
+                modeTitle: modeTitle, presentation: device.monitoringPresentation)
         }
         guard let lastSeen = device.lastSeen else { return "Not seen yet" }
         let elapsed = Date().timeIntervalSince(Date(timeIntervalSince1970: lastSeen))
@@ -299,7 +308,7 @@ struct DeviceCard: View {
     /// The mode glyph shown in the preview tile — what the camera is doing,
     /// not a generic camera icon.
     private var modeIcon: String {
-        if device.monitoring?.active == true { return "sparkles" }
+        if device.customRules == .replacing { return "sparkles" }
         let base = Preset.split(device.activePreset).base
         return Preset.catalog.first(where: { $0.name == base })?.icon ?? "video"
     }
