@@ -64,6 +64,11 @@ struct DeviceDetailView: View {
     @State private var rulesBusy: Set<String> = []
     @State private var ruleToggleError: String?
 
+    // Companion monitoring nodes (PerceptionStatus.swift): what was asked, and
+    // when; the toggle shows the device's report, never the tap.
+    @State private var nodeRequest: (id: String, wanted: Bool, at: Date)?
+    @State private var nodeError: String?
+
     // Stop / resume (ProtectionControl.swift).
     @State private var protectionRequest: ProtectionRequest?
     @State private var protectionSending = false
@@ -113,6 +118,17 @@ struct DeviceDetailView: View {
                 FeedCard(device: device, alertActive: alertActive)
 
                 statusRow
+
+                // A component the modes rely on isn't working: said up here,
+                // in the device's words, not only in the health card below.
+                if let impaired = PerceptionPresentation.degradedSummary(device.status?.perception, live: deviceLive) {
+                    Label(impaired, systemImage: "exclamationmark.triangle.fill")
+                        .font(SD.Typography.caption)
+                        .foregroundStyle(SD.Colors.warning)
+                        .fixedSize(horizontal: false, vertical: true)
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                        .accessibilityIdentifier("perception.degraded")
+                }
 
                 askJupiterSection
                 modeCard
@@ -405,6 +421,15 @@ struct DeviceDetailView: View {
                             .fixedSize(horizontal: false, vertical: true)
                     }
                 }
+                // The shared perception engine's components, as the device
+                // reports them: one model run feeds every mode that needs it.
+                let components = PerceptionPresentation.componentRows(device.status?.perception, live: deviceLive)
+                ForEach(components) { row in
+                    healthRow(row.title, systemImage: "cpu",
+                              HealthComponent(state: row.tone.healthState, detail: row.detail, metrics: nil))
+                        .accessibilityIdentifier("perception.\(row.name)")
+                    OrynRowDivider(inset: 22 + SD.Space.sm)
+                }
                 ForEach(Array(health.rows.enumerated()), id: \.element.id) { index, row in
                     healthRow(row.title, systemImage: capabilityIcon(row.state),
                               HealthComponent(state: row.tone.healthState, detail: row.detail, metrics: nil))
@@ -615,6 +640,17 @@ struct DeviceDetailView: View {
     private var customReplacesModes: Bool { device.customRules == .replacing }
 
     private var activeBase: String { Preset.split(device.activePreset).base }
+
+    /// What the running mode's row says when the device is NOT monitoring
+    /// (failed or stopped); nil when it is (or when there is no status).
+    private var notMonitoringReason: String? {
+        guard let presentation = device.monitoringPresentation else { return nil }
+        switch presentation.phase {
+        case .failed: return presentation.detail
+        case .stopped: return "Stopped — nothing is monitored until it's resumed"
+        default: return nil
+        }
+    }
     private var activeVariant: String? { Preset.split(device.activePreset).variant }
 
     private var modeCard: some View {
@@ -699,8 +735,107 @@ struct DeviceDetailView: View {
                         Rectangle().fill(SD.Colors.border).frame(height: 1)
                     }
                 }
+
+                nodesSection
             }
         }
+        }
+    }
+
+    // MARK: Monitoring nodes
+
+    private var perceptionReport: PerceptionReport? { deviceLive ? device.status?.perception : nil }
+
+    /// What the device reports running on its shared perception engine (the
+    /// mode, companion nodes, custom rules), and the occupancy companion's
+    /// switch. Only shown when the device reports nodes at all.
+    @ViewBuilder private var nodesSection: some View {
+        if let report = perceptionReport {
+            Rectangle().fill(SD.Colors.border).frame(height: 1)
+            VStack(alignment: .leading, spacing: SD.Space.xs) {
+                SDEyebrow(report.simulated == true ? "Running on this device · simulated" : "Running on this device")
+                ForEach(report.nodes.filter { $0.isRunning || $0.state == "failed" }) { node in
+                    nodeRow(node)
+                }
+                occupancyToggle(report)
+            }
+            .accessibilityIdentifier("nodes.section")
+        }
+    }
+
+    private func nodeRow(_ node: MonitoringNode) -> some View {
+        let shown = NodePresentation.make(node)
+        return HStack(alignment: .firstTextBaseline, spacing: SD.Space.sm) {
+            Circle().fill(shown.tone.sdStatus.tint).frame(width: 7, height: 7)
+            VStack(alignment: .leading, spacing: 1) {
+                Text(shown.title)
+                    .font(SD.Typography.body)
+                    .foregroundStyle(SD.Colors.textPrimary)
+                Text(shown.stateText)
+                    .font(SD.Typography.caption)
+                    .foregroundStyle(SD.Colors.textSecondary)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+            Spacer(minLength: SD.Space.xs)
+            SDEyebrow(shown.badge, color: SD.Colors.warning)
+                .multilineTextAlignment(.trailing)
+        }
+        .accessibilityElement(children: .combine)
+        .accessibilityLabel("\(shown.title): \(shown.stateText). \(shown.badge)")
+        .accessibilityIdentifier("node.\(node.id)")
+    }
+
+    /// The occupancy companion runs beside the mode on the same detections
+    /// (no extra model). The switch shows what the device reports.
+    @ViewBuilder private func occupancyToggle(_ report: PerceptionReport) -> some View {
+        let reported = CompanionNodeToggle.isOn("occupancy", report: report, live: deviceLive) ?? false
+        let pending = nodeRequest.map { $0.id == "occupancy"
+            && !CompanionNodeToggle.confirmed("occupancy", wanted: $0.wanted, report: report, live: deviceLive)
+            && Date().timeIntervalSince($0.at) < ModeSwitchState.switchTimeout } ?? false
+        VStack(alignment: .leading, spacing: SD.Space.xxs) {
+            Toggle(isOn: Binding(get: { pending ? (nodeRequest?.wanted ?? reported) : reported },
+                                 set: { setNode("occupancy", enabled: $0) })) {
+                VStack(alignment: .leading, spacing: 1) {
+                    Text("Also count people")
+                        .font(SD.Typography.body)
+                        .foregroundStyle(SD.Colors.textPrimary)
+                    Text(pending ? "Waiting for \(device.name) to confirm…"
+                         : "Occupancy, from the same detections. Experimental.")
+                        .font(SD.Typography.caption)
+                        .foregroundStyle(SD.Colors.textSecondary)
+                        .fixedSize(horizontal: false, vertical: true)
+                }
+            }
+            .tint(SD.Colors.accent)
+            .disabled(pending || !deviceLive)
+            .accessibilityIdentifier("node.toggle.occupancy")
+            if let message = nodeError ?? DeviceRefusal.forNode("occupancy", status: device.status,
+                                                                since: nodeRequest?.at) {
+                Text(message)
+                    .font(SD.Typography.caption)
+                    .foregroundStyle(SD.Colors.danger)
+                    .fixedSize(horizontal: false, vertical: true)
+                    .accessibilityIdentifier("node.error.occupancy")
+            }
+        }
+    }
+
+    private func setNode(_ id: String, enabled: Bool) {
+        nodeError = nil
+        nodeRequest = (id, enabled, Date())
+        Task {
+            do {
+                try await state.backend.setNode(deviceID: device.id, node: id, enabled: enabled)
+                await reload()
+            } catch let error as APIError where error.isAuthFailure {
+                state.expireSession(error.message)
+            } catch let error as APIError {
+                nodeRequest = nil
+                nodeError = error.endpointMissing ? ServerSupport.notSupported : error.message
+            } catch {
+                nodeRequest = nil
+                nodeError = error.localizedDescription
+            }
         }
     }
 
@@ -717,16 +852,21 @@ struct DeviceDetailView: View {
         let rowState = ModeSwitchState.state(
             for: preset.id, activeBase: activeBase, customMonitoringActive: customReplacesModes,
             pending: pendingSwitch, deviceOnline: device.online, failure: failedSwitch, now: .now,
-            unavailable: unavailableReason(preset.id)
+            unavailable: unavailableReason(preset.id), notMonitoring: notMonitoringReason
         )
-        let isActive = rowState == .active
+        let isActive = rowState.isSelected
         let isUnavailable = rowState.isUnavailable
         let validation = libraryCatalog.isBuiltIn ? nil
             : ValidationPresentation.make(devicePresets?.state(for: preset.id)?.validationStatus ?? preset.validation.status)
 
         VStack(alignment: .leading, spacing: SD.Space.xs) {
             HStack(spacing: SD.Space.xs) {
-            Button { setMode(preset.id) } label: {
+            // One activation path: the row opens the preset's details, where
+            // its capabilities (from the device), validation and settings are
+            // shown and Activate waits for the device's own confirmation. A
+            // bare tap used to switch at once, sending the base name and so
+            // dropping a running variant.
+            Button { presetSheet = preset } label: {
                 HStack(spacing: SD.Space.sm) {
                     Image(systemName: Preset.icon(for: preset.id))
                         .font(.system(size: 15))
@@ -751,6 +891,11 @@ struct DeviceDetailView: View {
                             Text("Device offline — will apply when it reconnects")
                                 .font(SD.Typography.caption)
                                 .foregroundStyle(SD.Colors.warning)
+                        case .activeNotMonitoring(let message):
+                            Text(message)
+                                .font(SD.Typography.caption)
+                                .foregroundStyle(SD.Colors.danger)
+                                .fixedSize(horizontal: false, vertical: true)
                         case .inactive, .switching, .active:
                             Text(preset.description)
                                 .font(SD.Typography.caption)
@@ -778,6 +923,10 @@ struct DeviceDetailView: View {
                     case .failed:
                         Image(systemName: "exclamationmark.triangle.fill")
                             .foregroundStyle(SD.Colors.danger)
+                    case .activeNotMonitoring:
+                        // Selected, not protecting: never the green check.
+                        Image(systemName: "exclamationmark.circle.fill")
+                            .foregroundStyle(SD.Colors.danger)
                     case .inactive, .unavailable:
                         EmptyView()
                     }
@@ -785,11 +934,11 @@ struct DeviceDetailView: View {
                 .contentShape(Rectangle())
             }
             .buttonStyle(SDUndimmedButtonStyle())
-            // The backend would refuse it (role_forbids_preset, a capability
-            // the device lacks, planned): nothing to tap.
-            .disabled(isUnavailable)
+            // Opens even when the preset can't be picked, so the reason can be
+            // read in full; the sheet's Activate is what is disabled.
             // The row's state was a checkmark or spinner alone: said here too.
             .accessibilityValue(rowState.spokenValue)
+            .accessibilityHint("Opens what it detects, its settings and Activate")
             .accessibilityAddTraits(isActive ? .isSelected : [])
             .accessibilityIdentifier("preset.row.\(preset.id)")
 
@@ -1172,6 +1321,15 @@ struct DeviceDetailView: View {
     private func syncPendingSwitch(from fresh: Device, reloadStartedAt: Date) {
         guard ModeSwitchState.shouldSyncPendingSwitch(current: pendingSwitch, reloadStartedAt: reloadStartedAt) else {
             return  // a newer optimistic tap exists; this fetch predates it and must not touch it
+        }
+        // The device (or the backend for it) refused the switch: show its
+        // reason now, instead of a spinner that ends in a generic timeout.
+        if let pending = pendingSwitch,
+           let reason = DeviceRefusal.forPreset(pending.targetBase, status: fresh.status, since: pending.requestedAt) {
+            failedSwitch = ModeSwitchState.PendingSwitch(targetBase: pending.targetBase,
+                                                         requestedAt: pending.requestedAt, reason: reason)
+            pendingSwitch = nil
+            return
         }
         guard let desired = fresh.desiredPreset else {
             pendingSwitch = nil  // nothing outstanding server-side

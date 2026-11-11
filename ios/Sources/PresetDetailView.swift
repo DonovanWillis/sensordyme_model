@@ -28,9 +28,22 @@ struct PresetDetailView: View {
     @State private var errorMessage: String?
     /// What happened after the server accepted the change.
     @State private var outcome: Outcome?
+    /// How far each related product capability has been validated
+    /// (GET /v1/capability-tiers); nil until loaded or when unsupported.
+    @State private var tiers: CapabilityTiersResponse?
 
     private enum Outcome: Equatable {
-        case waiting(String), confirmed(String), unconfirmed(String)
+        case waiting(String), confirmed(String, StatusTone), notMonitoring(String, StatusTone),
+             refused(String), unconfirmed(String)
+    }
+
+    /// The node the device reports for this preset, when it runs one.
+    private var node: MonitoringNode? { device.status?.perception?.node(preset.id) }
+
+    /// Each capability this preset needs, judged from what the DEVICE reports.
+    private var checks: [CapabilityCheck] {
+        CapabilityChecks.make(required: preset.requiredCapabilities, optional: preset.optionalCapabilities,
+                              status: device.status, online: device.online, node: node)
     }
 
     private var availability: PresetAvailability {
@@ -61,6 +74,7 @@ struct PresetDetailView: View {
                         notice(note, icon: availability.blocksSelection ? "nosign" : "wifi.slash",
                                color: availability.blocksSelection ? SD.Colors.textSecondary : SD.Colors.warning)
                     }
+                    if isActive { monitoringCard }
                     validationCard
                     if !preset.requiredCapabilities.isEmpty || !preset.optionalCapabilities.isEmpty
                         || !preset.hardware.isEmpty {
@@ -86,6 +100,7 @@ struct PresetDetailView: View {
         .onAppear {
             values = PresetSettingsForm.initialValues(preset.settings, current: deviceState?.settings ?? [:])
         }
+        .task { tiers = try? await state.backend.capabilityTiers() }
     }
 
     // MARK: Sections
@@ -130,25 +145,98 @@ struct PresetDetailView: View {
                         .foregroundStyle(SD.Colors.textTertiary)
                         .fixedSize(horizontal: false, vertical: true)
                 }
+                // What the device itself says about the node running this preset.
+                if let node {
+                    line("On \(device.name)", NodePresentation.badge(node))
+                        .accessibilityIdentifier("preset.node.validation")
+                }
+                // How far each capability it rests on has been checked, from the
+                // model registry. Never "validated" short of production approval.
+                ForEach(relatedTiers, id: \.capability) { entry in
+                    line(CapabilityHealth.title(entry.capability), CapabilityTierPresentation.make(entry).chip)
+                        .accessibilityIdentifier("preset.tier.\(entry.capability)")
+                }
             }
         }
     }
 
+    private var relatedTiers: [CapabilityTierEntry] {
+        tiers?.entries(forKinds: preset.requiredCapabilities + preset.optionalCapabilities) ?? []
+    }
+
+    /// What the device is doing now with this preset: its own monitoring state.
+    private var monitoringCard: some View {
+        let presentation = MonitoringStatusPresentation.make(status: device.status, online: device.online)
+        let impaired = PerceptionPresentation.degradedSummary(
+            device.status?.perception, live: device.status?.isLive(online: device.online) ?? false)
+        return SDCard {
+            VStack(alignment: .leading, spacing: SD.Space.xs) {
+                HStack {
+                    SDSectionHeader(title: "Now")
+                    SDStatusPill(status: (presentation?.tone ?? .neutral).sdStatus,
+                                 text: presentation?.label ?? "Status unknown")
+                        .accessibilityIdentifier("preset.monitoring")
+                }
+                Text(presentation?.detail ?? "This server doesn't report the device's monitoring state.")
+                    .font(SD.Typography.callout)
+                    .foregroundStyle(SD.Colors.textSecondary)
+                    .fixedSize(horizontal: false, vertical: true)
+                if let impaired {
+                    Text(impaired)
+                        .font(SD.Typography.caption)
+                        .foregroundStyle(SD.Colors.warning)
+                        .fixedSize(horizontal: false, vertical: true)
+                }
+            }
+        }
+    }
+
+    /// What it needs, each checked against what THIS device reports: working,
+    /// not working (with the device's reason), or unknown. Never assumed.
     private var requirementsCard: some View {
         SDCard {
             VStack(alignment: .leading, spacing: SD.Space.xs) {
-                SDSectionHeader(title: "Needs")
-                if !preset.requiredCapabilities.isEmpty {
-                    line("Required", preset.requiredCapabilities.map(CapabilityHealth.title).joined(separator: ", "))
-                }
-                if !preset.optionalCapabilities.isEmpty {
-                    line("Uses if available", preset.optionalCapabilities.map(CapabilityHealth.title).joined(separator: ", "))
+                SDSectionHeader(title: "What it needs on \(device.name)")
+                ForEach(checks) { check in
+                    capabilityLine(check)
                 }
                 if !preset.hardware.isEmpty {
                     line("Hardware", preset.hardware.joined(separator: ", "))
                 }
+                if let blocking = CapabilityChecks.blockingSummary(checks) {
+                    Text(blocking)
+                        .font(SD.Typography.caption)
+                        .foregroundStyle(SD.Colors.danger)
+                        .fixedSize(horizontal: false, vertical: true)
+                }
             }
         }
+    }
+
+    private func capabilityLine(_ check: CapabilityCheck) -> some View {
+        let shown: (text: String, color: Color, icon: String) = {
+            switch check.verdict {
+            case .available: return ("Working", SD.Colors.success, "checkmark.circle.fill")
+            case .unavailable(let why): return ("Not working — \(why)", SD.Colors.danger, "xmark.octagon.fill")
+            case .unknown(let why): return ("Unknown — \(why)", SD.Colors.textTertiary, "questionmark.circle")
+            }
+        }()
+        return HStack(alignment: .firstTextBaseline, spacing: SD.Space.xs) {
+            Image(systemName: shown.icon)
+                .font(.caption)
+                .foregroundStyle(shown.color)
+            VStack(alignment: .leading, spacing: 1) {
+                Text(check.title + (check.required ? "" : " (optional)"))
+                    .font(SD.Typography.body)
+                    .foregroundStyle(SD.Colors.textPrimary)
+                Text(shown.text)
+                    .font(SD.Typography.caption)
+                    .foregroundStyle(SD.Colors.textSecondary)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+        }
+        .accessibilityElement(children: .combine)
+        .accessibilityIdentifier("preset.capability.\(check.name)")
     }
 
     private var policiesCard: some View {
@@ -279,10 +367,24 @@ struct PresetDetailView: View {
                     ProgressView().controlSize(.small).tint(SD.Colors.textSecondary)
                     Text(text).font(SD.Typography.caption).foregroundStyle(SD.Colors.textSecondary)
                 }
-            case .confirmed(let text):
-                Label(text, systemImage: "checkmark.circle.fill")
+            case .confirmed(let text, let tone):
+                Label(text, systemImage: tone == .ok ? "checkmark.circle.fill" : "exclamationmark.circle.fill")
                     .font(SD.Typography.callout)
-                    .foregroundStyle(SD.Colors.success)
+                    .foregroundStyle(tone == .ok ? SD.Colors.success : SD.Colors.warning)
+                    .fixedSize(horizontal: false, vertical: true)
+                    .accessibilityIdentifier("preset.outcome.confirmed")
+            case .notMonitoring(let text, let tone):
+                Label(text, systemImage: "exclamationmark.triangle.fill")
+                    .font(SD.Typography.callout)
+                    .foregroundStyle(tone == .critical ? SD.Colors.danger : SD.Colors.warning)
+                    .fixedSize(horizontal: false, vertical: true)
+                    .accessibilityIdentifier("preset.outcome.notMonitoring")
+            case .refused(let text):
+                Label(text, systemImage: "nosign")
+                    .font(SD.Typography.callout)
+                    .foregroundStyle(SD.Colors.danger)
+                    .fixedSize(horizontal: false, vertical: true)
+                    .accessibilityIdentifier("preset.outcome.refused")
             case .unconfirmed(let text):
                 Label(text, systemImage: "clock")
                     .font(SD.Typography.caption)
@@ -323,13 +425,14 @@ struct PresetDetailView: View {
         let active = Preset.split(device.activePreset)
         let name = isActive && active.base == preset.id ? (device.activePreset ?? preset.id) : preset.id
         let payload = PresetSettingsForm.payload(preset.settings, values: values)
+        let requestedAt = Date()
         Task {
             defer { sending = false }
             do {
                 _ = try await state.backend.activatePreset(deviceID: device.id, preset: name, settings: payload)
                 outcome = .waiting("Sent. Waiting for \(device.name) to confirm…")
                 await onApplied()
-                await confirm(payload: payload)
+                await confirm(payload: payload, since: requestedAt)
             } catch let error as APIError where error.isAuthFailure {
                 state.expireSession(error.message)
             } catch let error as APIError {
@@ -342,29 +445,36 @@ struct PresetDetailView: View {
         }
     }
 
-    /// Poll the device's own answer until it reports this preset (and these
-    /// settings) as active, for up to ModeSwitchState.switchTimeout.
-    private func confirm(payload: [String: JSONValue]) async {
+    /// Follow the DEVICE until it runs this preset (and these settings) and
+    /// says whether it is monitoring, or refuses, for up to
+    /// ModeSwitchState.switchTimeout. Running but failed is never "confirmed".
+    private func confirm(payload: [String: JSONValue], since: Date) async {
         let deadline = Date().addingTimeInterval(ModeSwitchState.switchTimeout)
         while Date() < deadline {
             try? await Task.sleep(for: .seconds(2))
-            let confirmed: Bool
-            if let fresh = try? await state.backend.devicePresets(deviceID: device.id),
-               let mine = fresh.state(for: preset.id) {
-                confirmed = mine.active
-                    && (payload.isEmpty || PresetSettingsForm.confirmed(sent: payload, reported: mine.settings))
-            } else if payload.isEmpty,
-                      let fresh = try? await state.backend.devices().first(where: { $0.id == device.id }) {
-                // An older server: the device list's own convergence.
-                confirmed = fresh.desiredPreset == nil && Preset.split(fresh.activePreset).base == preset.id
-            } else {
+            guard let fresh = try? await state.backend.devices().first(where: { $0.id == device.id }) else { continue }
+            var settingsConfirmed = true
+            if !payload.isEmpty {
+                let mine = (try? await state.backend.devicePresets(deviceID: device.id))?.state(for: preset.id)
+                settingsConfirmed = mine.map { PresetSettingsForm.confirmed(sent: payload, reported: $0.settings) } ?? false
+            }
+            let status = ActivationStatus.evaluate(
+                base: preset.id, deviceName: device.name, title: preset.title, reportedPreset: fresh.activePreset,
+                customReplacing: fresh.customRules == .replacing, status: fresh.status, online: fresh.online,
+                settingsConfirmed: settingsConfirmed, since: since)
+            switch status.phase {
+            case .waiting:
+                outcome = .waiting(status.text)
                 continue
+            case .confirmed:
+                outcome = .confirmed(status.text, status.tone)
+            case .notMonitoring:
+                outcome = .notMonitoring(status.text, status.tone)
+            case .refused:
+                outcome = .refused(status.text)
             }
-            if confirmed {
-                outcome = .confirmed("\(device.name) is running \(preset.title)\(payload.isEmpty ? "" : " with these settings").")
-                await onApplied()
-                return
-            }
+            await onApplied()
+            return
         }
         outcome = .unconfirmed("Saved on the server, but \(device.name) hasn't confirmed yet. It applies the change on its next check-in.")
     }
