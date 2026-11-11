@@ -72,5 +72,30 @@ rc=$?
 set -e
 kill $MON 2>/dev/null || true
 echo "train rc=$rc in $(( $(date +%s)-t0 ))s"
-grep -E "epoch|Epoch|iter|AP|loss|Error|error|Traceback" "$O/train.log" | tail -40
-exit $rc
+grep -E "Error|error|Traceback" "$O/train.log" | tail -15 || true
+grep -E "epoch|iter_time|AP" "$O/train.log" | tail -25 || true
+[ "$rc" -eq 0 ] || exit $rc
+
+echo "== checkpoint and validation scoring (val only)"
+CK=$(find "$WORK/workdirs" -name 'latest_ckpt.pth' | head -1)
+ls -l "$CK" | tee "$O/checkpoint_size.txt"
+( while true; do /usr/lib/wsl/lib/nvidia-smi --query-gpu=timestamp,memory.used,utilization.gpu,temperature.gpu --format=csv,noheader >> "$O/gpu_predict.csv" 2>/dev/null; sleep 5; done ) &
+MON=$!
+"$P" "$SRC/research/pilot/predict_val.py" --damo "$DAMO" --config configs/exp08a.py --ckpt "$CK" --data "$OI" --out "$WORK/preds_val.jsonl"
+kill $MON 2>/dev/null || true
+(cd "$SRC" && "$P" -m research.detector_bench.bench score --data "$OI" --models "$DATA/models" --preds "$WORK/preds_val.jsonl" --split val --name exp08a --out "$O")
+"$P" - "$O/train.log" "$O/gpu.csv" <<'PY'
+import re, statistics, sys
+log = open(sys.argv[1]).read()
+it = [float(x) for x in re.findall(r"iter_time:\s*([0-9.]+)", log)]
+dt = [float(x) for x in re.findall(r"data_time:\s*([0-9.]+)", log)]
+mem = [int(x) for x in re.findall(r"mem:\s*([0-9]+)", log)]
+loss = re.findall(r"(?:total_loss|loss):\s*([0-9.]+)", log)
+print({"iter_time_median_s": statistics.median(it) if it else None, "data_time_median_s": statistics.median(dt) if dt else None,
+       "torch_mem_max_mb": max(mem) if mem else None, "loss_first": loss[:3], "loss_last": loss[-3:], "loss_points": len(loss)})
+rows = [r.split(",") for r in open(sys.argv[2]).read().splitlines() if r.count(",") >= 3]
+used = [int(r[1].split()[0]) for r in rows]; util = [int(r[2].split()[0]) for r in rows]; temp = [int(r[3]) for r in rows]
+print({"gpu_samples": len(rows), "gpu_mem_used_max_mb": max(used, default=None), "gpu_util_mean": round(statistics.mean(util), 1) if util else None,
+       "gpu_util_max": max(util, default=None), "gpu_temp_max": max(temp, default=None)})
+PY
+exit 0

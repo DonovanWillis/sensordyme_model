@@ -81,7 +81,7 @@ RUNS = [
 ]
 SHIPPED = {"phone": 0.20, "person": 0.50}
 SWEEP = (0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7)
-PHONE, PERSON = "/m/050k8", "/m/01g317"
+PHONE, PERSON, HAND = "/m/050k8", "/m/01g317", "/m/0k65p"
 PERSON_TREE = {PERSON, "/m/04yx4", "/m/03bt1vf", "/m/01bl7v", "/m/05r655"}
 
 
@@ -152,10 +152,10 @@ class GpuMonitor(threading.Thread):
 
 
 def _truths(rows: list[dict], groups: dict[str, str]) -> dict[str, list[oe.ImageTruth]]:
-    out: dict[str, list[oe.ImageTruth]] = {"phone": [], "person": []}
+    out: dict[str, list[oe.ImageTruth]] = {"phone": [], "person": [], "hand": []}
     for row in rows:
         pos, neg = set(row["verified_positive"]), set(row["verified_negative"])
-        for label, mids, key in (("phone", {PHONE}, PHONE), ("person", PERSON_TREE, PERSON)):
+        for label, mids, key in (("phone", {PHONE}, PHONE), ("person", PERSON_TREE, PERSON), ("hand", {HAND}, HAND)):
             gts = [oe.GroundTruth((b["xmin"], b["ymin"], b["xmax"], b["ymax"]), b["group_of"] == 1,
                                  b["occluded"] == 1, b["truncated"] == 1, b["depiction"] == 1)
                    for b in row["boxes"] if b["mid"] in mids]
@@ -310,6 +310,45 @@ def _failures(result: oe.ClassResult, threshold: float, provenance: dict) -> dic
             "missed_phones_largest_first": missed[:12], "missed_total": len(missed)}
 
 
+def score(data: Path, preds_path: Path, split: str, out: Path, *, frozen_test: bool, name: str) -> dict:
+    """Score a predictions file ({id, label, score, box}) with the same rules as ``run``."""
+    if split == "test" and not frozen_test:
+        raise SystemExit("the test split is held out: pass --frozen-test for the final measurement")
+    manifest = mf.load(data / "manifest.json")
+    items = manifest.split(split)
+    wanted = {i.id for i in items}
+    groups = {i.id: i.subject for i in items}
+    rows = [r for r in (json.loads(x) for x in (data / "boxes.jsonl").read_text().splitlines() if x)
+            if r["id"] in wanted]
+    truths = _truths(rows, groups)
+    preds: dict[str, dict[str, list]] = {k: {} for k in truths}
+    for line in preds_path.read_text().splitlines():
+        if line:
+            d = json.loads(line)
+            if d["id"] in wanted and d["label"] in preds:
+                preds[d["label"]].setdefault(d["id"], []).append((d["score"], tuple(d["box"])))
+    report: dict[str, Any] = {"manifest_id": manifest.id, "split": split, "name": name, "classes": {}}
+    for label, truth in truths.items():
+        result = oe.evaluate_class(preds[label], truth)
+        ap_range = [oe.average_precision(oe.evaluate_class(preds[label], truth, iou=t).scored, result.npos)
+                    for t in (0.5, 0.55, 0.6, 0.65, 0.7, 0.75, 0.8, 0.85, 0.9, 0.95)]
+        report["classes"][label] = {
+            "npos": result.npos, "verified_images": result.images, "negative_images": result.negative_images,
+            "ap50": oe.average_precision(result.scored, result.npos),
+            "ap50_95": (sum(a for a in ap_range if a is not None) / len(ap_range)) if result.npos else None,
+            "sweep": [{k: v for k, v in oe.operating_point(result, t).items() if k != "recall_by_attribute"}
+                      for t in SWEEP],
+            "calibration": oe.calibration(result),
+            "bootstrap": oe.group_bootstrap(result, SHIPPED.get(label, 0.3)),
+        }
+        c = report["classes"][label]
+        print(f"{name} {label:6s} npos {c['npos']:5d} AP50 {_f(c['ap50'])} AP50:95 {_f(c['ap50_95'])} "
+              f"CI {c['bootstrap'].get('ap50_ci95') if c['bootstrap'] else None}", flush=True)
+    out.mkdir(parents=True, exist_ok=True)
+    (out / f"score_{name}_{split}.json").write_text(json.dumps(report, indent=1, default=str))
+    return report
+
+
 def parity(data: Path, models: Path, provider: str, out: Path, n: int = 40) -> dict:
     """Raw-output agreement of ``provider`` against CPU on the same inputs (numerical parity)."""
     import numpy as np
@@ -346,7 +385,9 @@ def parity(data: Path, models: Path, provider: str, out: Path, n: int = 40) -> d
 
 def main(argv: Optional[list[str]] = None) -> int:
     p = argparse.ArgumentParser(description="Detector baselines on the Open Images subset")
-    p.add_argument("cmd", choices=("fetch", "run", "parity"))
+    p.add_argument("cmd", choices=("fetch", "run", "parity", "score"))
+    p.add_argument("--preds", help="score: predictions JSON lines {id, label, score, box}")
+    p.add_argument("--name", default="model", help="score: a name for the report")
     p.add_argument("--data")
     p.add_argument("--models", required=True)
     p.add_argument("--split", default="val", choices=mf.SPLITS)
@@ -359,6 +400,10 @@ def main(argv: Optional[list[str]] = None) -> int:
     args = p.parse_args(argv)
     if args.cmd == "fetch":
         print(json.dumps(fetch(Path(args.models)), indent=1))
+        return 0
+    if args.cmd == "score":
+        score(Path(args.data), Path(args.preds), args.split, Path(args.out), frozen_test=args.frozen_test,
+              name=args.name)
         return 0
     if args.cmd == "parity":
         parity(Path(args.data), Path(args.models), args.provider, Path(args.out))
