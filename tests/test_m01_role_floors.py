@@ -33,6 +33,7 @@ from test_m01_alert_episodes import RecordingActuator
 from test_phase1_driver_fixes import _FakeBox, _FakeResult
 
 import modules.driver_attention as driver_attention_module
+from core import detectors as detectors_module
 from core import roles
 from core.alerts import AlertManager
 from core.config_schema import validate
@@ -242,6 +243,10 @@ def _driver_runtime(tmp_path, clock, monkeypatch, *, closed):
                         lambda *pts: 0.05 if closed["value"] else 0.40)
     detector = _StubDetector()
     monkeypatch.setattr(driver_attention_module, "get_yolo_model", lambda weights: detector)
+    # The runtime preflights the backend on every preset switch (core.detectors.require_backend).
+    # Unstubbed, a host with ultralytics installed loads real weights each switch, and the
+    # fuzz test runs out of memory there (oryn, 1-2 GiB); a host without it never reaches this.
+    monkeypatch.setattr(detectors_module, "require_backend", lambda weights, device=None: "ultralytics")
     module, frame = _make_module(tmp_path, clock, iris_veto=False, yolo_every_n_frames=3)
     module.stub_detector = detector
     face = make_fake_landmarks()
