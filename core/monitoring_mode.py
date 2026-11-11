@@ -32,6 +32,11 @@ class MonitoringMode(str, Enum):  # noqa: UP042 - StrEnum would change str()/for
     OFF = "off"
     STANDARD = "standard"
     AI_CUSTOM = "ai_custom"
+    #: Custom rules evaluated BESIDE the preset's module, which keeps running and
+    #: alerting. Chosen when the device's role requires that module (M0.1,
+    #: core/roles.py): custom rules may add to a mandatory safeguard, never
+    #: replace it.
+    ADDITIVE = "standard_plus_custom"
 
 
 # The module that serves custom rules: general object detection, no MediaPipe.
@@ -61,9 +66,17 @@ _MODULE_CAPABILITIES: dict[str, frozenset[str]] = {
 }
 
 
-def resolve(*, monitoring_active: bool, preset_module: Optional[str]) -> MonitoringMode:
-    """The one place the active mode is decided."""
+def resolve(
+    *, monitoring_active: bool, preset_module: Optional[str], additive: bool = False
+) -> MonitoringMode:
+    """The one place the active mode is decided.
+
+    `additive` is the role's verdict that the preset module is mandatory, so custom
+    rules must run beside it instead of replacing it.
+    """
     if monitoring_active:
+        if additive and preset_module:
+            return MonitoringMode.ADDITIVE
         return MonitoringMode.AI_CUSTOM
     if preset_module:
         return MonitoringMode.STANDARD
@@ -127,7 +140,7 @@ def module_for(
         if requested_labels is not None:
             return select_custom_module(requested_labels, reg=reg)
         return CUSTOM_DETECTOR_MODULE
-    return preset_module
+    return preset_module  # STANDARD and ADDITIVE both run the preset's module
 
 
 def describe(mode: MonitoringMode, module: Optional[str], instruction: str = "") -> dict:

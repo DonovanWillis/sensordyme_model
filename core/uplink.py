@@ -115,6 +115,8 @@ class CloudUplink:
         self._health: Optional[dict] = None
         self._zones_version: str = ""
         self._pending_zones: Optional[list[dict]] = None
+        #: Explicit stop/resume from the backend (M0.1); applied by the main loop.
+        self._pending_protection: Optional[dict] = None
         self._stop = threading.Event()
         self._connected = False
         self._explained_failure = False
@@ -244,6 +246,12 @@ class CloudUplink:
             pending, self._pending_preset = self._pending_preset, None
             return pending
 
+    def pop_pending_protection(self) -> Optional[dict]:
+        """A remote stop/resume awaiting the main loop, if any."""
+        with self._lock:
+            pending, self._pending_protection = self._pending_protection, None
+            return pending
+
     def pop_pending_zones(self) -> Optional[list[dict]]:
         """Zones drawn in the app, awaiting the main loop.
 
@@ -349,6 +357,12 @@ class CloudUplink:
                         # would restart in-flight rule tracking each time.
                         self._rules_version = str(command.get("rules_version") or "")
                         self._rules_instruction = str(command.get("rules_instruction") or "")
+                protection = command.get("set_protection")
+                if isinstance(protection, dict) and protection.get("action") in ("stop", "resume"):
+                    with self._lock:
+                        self._pending_protection = {
+                            "action": protection["action"], "confirm": protection.get("confirm") is True,
+                        }
                 if "set_zones" in command:
                     zones = command.get("set_zones")
                     with self._lock:

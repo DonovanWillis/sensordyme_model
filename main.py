@@ -305,6 +305,15 @@ def run(argv: Optional[list[str]] = None) -> None:
     if profile != "mac_max" and args.module is None:
         restored = restored_preset(config.get("module"), config.get("modules", {}), presets)
     if restored is not None:
+        # A saved preset the device's role forbids (saved before the role was set,
+        # or under another role) is not restored: the role's own module runs.
+        from core.roles import preset_violation, role_for_config
+
+        refusal = preset_violation(role_for_config(config), restored[0], presets)
+        if refusal:
+            print(f"SensorDyme: not restoring saved mode '{restored[0]}': {refusal}")
+            restored = None
+    if restored is not None:
         module_name = restored[1]["module"]
 
     if profile == "mac_max":

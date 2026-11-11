@@ -32,7 +32,7 @@ from typing import Optional
 
 import cv2
 
-from core import accel, device_health, device_state, monitoring_mode, sdnotify
+from core import accel, device_health, device_state, monitoring_mode, roles, sdnotify
 from core.alerts import AlertLevel, AlertManager
 from core.camera import Camera, CameraError
 from core.dataset import CaptureStore
@@ -43,7 +43,7 @@ from core.logger import EventLogger
 from core.logging_setup import get_logger, setup_logging
 from core.monitoring_config import load_or_empty
 from core.network import WifiManager, nmcli_available
-from core.rules import RuleEngine
+from core.rules import RuleEngine, validate_rule_set
 from core.telemetry import TelemetryLogger
 from core.zones import load_zones
 from modules import get_module_class
@@ -189,6 +189,13 @@ def _systemd_watchdog_armed() -> bool:
 class DeviceRuntime:
     """Owns every long-running piece of the device for one process lifetime."""
 
+    # Safe defaults for the M0.1 policy state, so a runtime assembled without
+    # __init__ (several tests do) is a general-role device that is not stopped.
+    role = roles.ROLES[roles.DEFAULT_ROLE]
+    _stopped: Optional[dict] = None
+    _last_rejection: Optional[dict] = None
+    _custom_rules_rejected = False
+
     def __init__(
         self,
         *,
@@ -260,16 +267,32 @@ class DeviceRuntime:
         # reboot silently emptied them and a device with no Wi-Fi could never be
         # configured at all. Restoring here means the device wakes up watching
         # what it was asked to watch, with or without a network.
+        # The deployment role (core/roles.py): which safeguards must keep running
+        # while this device reports that it is protecting. Configs without one
+        # are "general" and carry no floor.
+        self.role = roles.role_for_config(config)
+        #: Set only by the explicit, confirmed stop command; never persisted, so a
+        #: reboot always comes back protecting. See _apply_protection.
+        self._stopped: Optional[dict] = None
+        #: The last policy change this device refused, and why (reported upstream).
+        self._last_rejection: Optional[dict] = None
         self.monitoring = load_or_empty()
+        # Restored rules are validated exactly like delivered ones: a rule set
+        # saved by an older version that this device cannot run is not loaded.
+        self._custom_rules_rejected = False
         if self.monitoring.rules:
-            self.rule_engine.replace_rules(self.monitoring.rules)
+            problems = self._rule_problems(self.monitoring.rules, module, module_name)
+            if problems:
+                self._custom_rules_rejected = True
+                self._record_rejection("rules", self.monitoring.version, problems)
+                log.error("[POLICY] saved custom rules NOT loaded: %s", "; ".join(problems))
+            else:
+                self.rule_engine.replace_rules(self.monitoring.rules)
         # What the selected preset wants to run, remembered separately from what
         # is running now — AI_CUSTOM swaps the module out and must be able to
         # hand it back when the custom configuration is cleared.
         self._preset_module = module_name
-        self.mode = monitoring_mode.resolve(
-            monitoring_active=self.monitoring.active, preset_module=module_name
-        )
+        self.mode = self._resolve_mode(module_name)
 
         # Opt-in training capture. Disabled unless config says otherwise, and
         # local-only either way — nothing here can upload.
@@ -450,6 +473,13 @@ class DeviceRuntime:
                 health_provider=lambda: {**self.health.snapshot(),
                                          "device": self._collect_health("dashboard")},
             )
+            # Refuse a role-violating preset at the request, with the reason, rather
+            # than accept it and silently drop it in the inference loop.
+            from main import resolve_preset
+
+            self.dashboard.preset_guard = lambda name: roles.preset_violation(
+                self.role, resolve_preset(name, self.presets), self.presets)
+            self.dashboard.set_policy_state(self._policy_state())
             try:
                 dashboard_url = self.dashboard.start()
             except OSError as exc:
@@ -479,7 +509,7 @@ class DeviceRuntime:
             # Report the restored configuration at startup too, not only when a
             # new one arrives — otherwise a device that rebooted into a custom
             # configuration shows the base mode until the next change.
-            self.uplink.set_monitoring(self.monitoring.describe())
+            self._publish_monitoring()
             self.uplink.start()
             print(
                 f"SensorDyme: cloud uplink -> {cloud_cfg.get('base_url')} "
@@ -810,6 +840,16 @@ class DeviceRuntime:
     # ------------------------------------------------------------------ health reporting
     def _collect_health(self, caller: str = "loop") -> dict:
         """This device's real state, for the app's status indicators."""
+        report = self._collect_component_health(caller)
+        # The product-level answer next to the component-level one. A stopped
+        # device is not monitoring however healthy its parts are.
+        protection = self.protection_state()
+        report["protection"] = protection
+        if protection["state"] == "stopped":
+            report["monitoring_active"] = False
+        return report
+
+    def _collect_component_health(self, caller: str) -> dict:
         heartbeat_age = None if self._heartbeat == 0.0 else time.monotonic() - self._heartbeat
         return device_health.collect(
             bus=self.bus,
@@ -888,10 +928,7 @@ class DeviceRuntime:
         cost 85% of one core on this device, computing drowsiness and gaze for
         a person who asked about phones. Switching the module stops the work.
         """
-        mode = monitoring_mode.resolve(
-            monitoring_active=self.monitoring.active,
-            preset_module=self._preset_module or self.module_name,
-        )
+        mode = self._resolve_mode(self._preset_module or self.module_name)
         requested_labels = None
         if mode is monitoring_mode.MonitoringMode.AI_CUSTOM:
             requested_labels = {rule.detection for rule in self.rule_engine.rules if rule.detection}
@@ -1222,6 +1259,123 @@ class DeviceRuntime:
             log.critical("could not persist reboot state: %s", exc)
             return False
 
+    # ------------------------------------------------------------------ roles and protection
+    def _custom_active(self) -> bool:
+        return self.monitoring.active and not self._custom_rules_rejected
+
+    def _resolve_mode(self, preset_module: Optional[str]) -> "monitoring_mode.MonitoringMode":
+        """The mode for `preset_module`: custom rules are ADDITIVE when the role
+        requires that module, and replace it (AI_CUSTOM) otherwise."""
+        return monitoring_mode.resolve(
+            monitoring_active=self._custom_active(),
+            preset_module=preset_module,
+            additive=self.role.additive_custom_rules and preset_module in self.role.mandatory_modules,
+        )
+
+    def _rule_problems(self, raw_rules, module, preset_module: Optional[str]) -> list[str]:
+        """Why this device cannot run `raw_rules` (empty = it can), all or nothing.
+
+        On an additive role the rules run beside the mandatory module, so they may
+        only target what that module detects. Otherwise the capability registry
+        answers, as the backend's own validation does.
+        """
+        if self.role.additive_custom_rules and preset_module in self.role.mandatory_modules:
+            declared = module.available_labels() if hasattr(module, "available_labels") else None
+            labels = frozenset(declared or ())
+
+            def label_ok(label: str) -> bool:
+                return label in labels
+        else:
+            from core.capabilities import registry
+
+            reg = registry()
+
+            def label_ok(label: str) -> bool:
+                return any(c.available for c in reg.providers_of_label(label))
+        zone_names = [z.name for z in (self._app_zones or [])]
+        zone_names += [z.name for z in self._zones_for_module(preset_module or self.module_name)]
+        return validate_rule_set(raw_rules, label_ok=label_ok, zone_names=zone_names)
+
+    def _record_rejection(self, kind: str, subject: Optional[str], reasons: list[str]) -> None:
+        self._last_rejection = {
+            "kind": kind, "subject": subject or "", "reasons": list(reasons), "at": time.time(),
+        }
+        if getattr(self, "dashboard", None) is not None:
+            setter = getattr(self.dashboard, "set_policy_state", None)
+            if callable(setter):
+                setter(self._policy_state())
+        if getattr(self, "uplink", None) is not None:
+            self._publish_monitoring()
+
+    def protection_state(self) -> dict:
+        """The truthful answer to "is this device protecting right now?".
+
+        stopped        an explicit, confirmed stop is in force
+        protecting     every safeguard the role requires is running
+        not_protecting something required is not running; `reasons` says what
+        """
+        if self._stopped is not None:
+            return {"state": "stopped", "role": self.role.name, "since": self._stopped["since"],
+                    "by": self._stopped["by"], "reasons": ["monitoring was stopped explicitly"]}
+        reasons: list[str] = []
+        if self._detection_degraded is not None:
+            reasons.append(f"detection unavailable: {self._detection_degraded}")
+        if self.role.has_floor and self.module_name not in self.role.mandatory_modules:
+            reasons.append(
+                f"role '{self.role.name}' requires {', '.join(sorted(self.role.mandatory_modules))}; "
+                f"running {self.module_name}"
+            )
+        return {"state": "not_protecting" if reasons else "protecting", "role": self.role.name,
+                "reasons": reasons}
+
+    def _policy_state(self) -> dict:
+        return {
+            "role": self.role.describe(),
+            "protection": self.protection_state(),
+            "mode": self.mode.value,
+            "last_rejection": self._last_rejection,
+        }
+
+    def _publish_monitoring(self) -> None:
+        """Tell the backend what runs, the role, the protection state and the last refusal."""
+        if self.uplink is not None:
+            self.uplink.set_monitoring({**self.monitoring.describe(), **self._policy_state(),
+                                        "base_monitoring_disabled":
+                                            self.mode is monitoring_mode.MonitoringMode.AI_CUSTOM})
+        if self.dashboard is not None:
+            setter = getattr(self.dashboard, "set_policy_state", None)
+            if callable(setter):
+                setter(self._policy_state())
+
+    def _apply_protection(self, request: dict, source: str) -> None:
+        """Explicit stop / resume. A stop must be confirmed; it is never implied."""
+        action = str((request or {}).get("action", "")).lower()
+        if action == "stop":
+            if (request or {}).get("confirm") is not True:
+                self._record_rejection("protection", "stop", ["stopping monitoring requires confirm: true"])
+                return
+            if self._stopped is None:
+                self._stopped = {"since": time.time(), "by": source}
+                self.alert_manager.end_all(time.monotonic())
+                log.warning("[PROTECTION] STOPPED by %s: nothing is monitored until resumed", source)
+                self._log_system_event("protection_stopped", f"monitoring stopped by {source}")
+        elif action == "resume":
+            if self._stopped is not None:
+                self._stopped = None
+                log.info("[PROTECTION] resumed by %s", source)
+                self._log_system_event("protection_resumed", f"monitoring resumed by {source}")
+        else:
+            self._record_rejection("protection", action, [f"unknown protection action {action!r}"])
+            return
+        self._publish_monitoring()
+
+    def _log_system_event(self, kind: str, detail: str) -> None:
+        event = Event.now(kind, 0.0, None, "system", detail)
+        if self.logger is not None:
+            self.logger.log(event)
+        if self.dashboard is not None:
+            self.dashboard.push_event(event, "log")
+
     # ------------------------------------------------------------------ preset switching
     def _exit_custom_monitoring(self) -> None:
         """Someone explicitly picked a mode: that always wins over custom rules.
@@ -1250,7 +1404,7 @@ class DeviceRuntime:
         self.rule_engine.replace_rules([])
         self.rule_engine.set_zones(self._effective_zones(self.module_name))
         if self.uplink is not None:
-            self.uplink.set_monitoring(self.monitoring.describe())
+            self._publish_monitoring()
         log.info("[MONITORING] custom monitoring exited: explicit mode switch")
 
     def _switch_preset(self, name: str) -> None:
@@ -1283,6 +1437,11 @@ class DeviceRuntime:
         # teardown and every accumulated timer/window, which is never worth it
         # for a command that changes nothing.
         if name == self.active_preset and not self.monitoring.active:
+            return
+        violation = roles.preset_violation(self.role, name, self.presets)
+        if violation:
+            self._record_rejection("preset", name, [violation])
+            log.warning("[POLICY] preset '%s' refused: %s", name, violation)
             return
         base_name, _, variant_name = name.partition(":")
         preset = self.presets.get(base_name)
@@ -1339,9 +1498,7 @@ class DeviceRuntime:
         # actively wrong if left alone: resolve it the same way the mode
         # decision is made everywhere else, so self.mode can never disagree
         # with self.module_name.
-        self.mode = monitoring_mode.resolve(
-            monitoring_active=self.monitoring.active, preset_module=new_module_name
-        )
+        self.mode = self._resolve_mode(new_module_name)
         # Re-point custom rules at the zones in force for the new module: the
         # app's when it has sent any, otherwise the new module's config.yaml.
         self.rule_engine.set_zones(self._effective_zones(new_module_name))
@@ -1371,6 +1528,11 @@ class DeviceRuntime:
     # ------------------------------------------------------------------ the inference loop
     def _apply_pending_commands(self) -> None:
         """Apply any mode, zone or rule change the app or dashboard has sent."""
+        for producer, name in ((self.dashboard, "dashboard"), (self.uplink, "uplink")):
+            pop = getattr(producer, "pop_pending_protection", None) if producer is not None else None
+            request = pop() if callable(pop) else None
+            if request is not None:
+                self._apply_protection(request, source=name)
         # `is not None`, not `or`: dashboard's own "" is cloud/app.py's sentinel
         # for "apply AI Custom" (see POST .../preset), a real, meaningful value
         # distinct from "nothing pending" (None) — an `or` chain treats an
@@ -1429,6 +1591,13 @@ class DeviceRuntime:
 
             new_rules = self.uplink.pop_pending_rules()
             if new_rules is not None:
+                problems = self._rule_problems(new_rules, self.module, self._preset_module or self.module_name)
+                if problems:
+                    # All or nothing: keep the rules already running and say why.
+                    self._record_rejection("rules", self.uplink.rules_version(), problems)
+                    log.warning("[POLICY] custom rules refused: %s", "; ".join(problems))
+                    return
+                self._custom_rules_rejected = False
                 self.rule_engine.replace_rules(new_rules)
                 # Written down as it arrives, so the next boot still has it.
                 self.monitoring.save(
@@ -1436,7 +1605,7 @@ class DeviceRuntime:
                     instruction=self.uplink.pending_instruction(),
                     version=self.uplink.rules_version(),
                 )
-                self.uplink.set_monitoring(self.monitoring.describe())
+                self._publish_monitoring()
                 # A new configuration can change which detector is needed.
                 self._apply_monitoring_mode()
                 self._apply_requested_labels()
@@ -1469,6 +1638,12 @@ class DeviceRuntime:
                 # a close() that threw) is logged and dropped; the loop -- and
                 # the module still installed -- carries on.
                 log.exception("applying a mode/rule/zone command failed; continuing")
+            if self._stopped is not None:
+                # Explicitly stopped: nothing is analysed and nothing alerts, and
+                # every report says "stopped". The loop stays alive for commands.
+                self._heartbeat = time.monotonic()
+                stop.wait(0.5)
+                continue
             if self._detection_degraded is not None:
                 # No detector, so there is nothing honest to compute. The
                 # heartbeat still ticks -- the loop IS alive, and health must be
@@ -1541,7 +1716,7 @@ class DeviceRuntime:
             # that grows its own events later, must not leak alerts nobody asked
             # for. The real saving is that the expensive module is not running
             # at all; see _apply_monitoring_mode.
-            if self.monitoring.active:
+            if self.mode is monitoring_mode.MonitoringMode.AI_CUSTOM:
                 events = []
             evidence_due = False
             alert_now = time.monotonic()

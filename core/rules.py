@@ -55,6 +55,16 @@ from core.detectors import upper_region as _upper_region
 from core.event_engine import CONFIRMED, EventEngine, RuleSpec
 from core.zones import Zone
 
+# Every condition the engine evaluates. Anything else is REJECTED (M0.1): an
+# unknown predicate used to fall through to plain presence, so "enters" fired as
+# soon as a person was seen.
+KNOWN_PREDICATES = frozenset({
+    "present", "absent", "in_zone", "count", "persists", "lingering", "still",
+    "near", "holding", "near_mouth",
+})
+_RELATIONAL = frozenset({"near", "holding", "near_mouth"})
+_PRESENCE_LIKE = frozenset({"present", "in_zone", "count", "persists", "lingering"})
+
 # Severity -> whether a confirmation should reach the user at all.
 _NOTIFY_KINDS = ("push", "sms", "silent")
 _SEVERITIES = ("info", "warning", "critical")
@@ -232,6 +242,8 @@ class ConfiguredRule:
         if not detection:
             return None
         predicate = str(raw.get("predicate") or "present").strip().lower()
+        if predicate not in KNOWN_PREDICATES:
+            return None  # fail closed; validate_rule_set reports it before this point
         severity = str(raw.get("severity") or "warning")
         notify = str(raw.get("notify") or "push")
         try:
@@ -382,6 +394,51 @@ class _StillnessWatcher:
             if nearest / diagonal <= _STILL_MAX_SHIFT:
                 return True
         return False
+
+
+def validate_rule_set(raw_rules, *, label_ok: Callable[[str], bool], zone_names) -> list[str]:
+    """Every reason this rule set cannot run as written on THIS device (empty = ok).
+
+    Fail-closed and all-or-nothing: the device applies a rule set only when every
+    rule is supported, otherwise it keeps the previous set and reports why.
+
+    Args:
+        raw_rules: The rule dicts as delivered (app/backend shape).
+        label_ok: Whether this device can currently detect a label (it differs by
+            role: an additive driver device can only target what its driver
+            module detects; a general device asks the capability registry).
+        zone_names: The areas defined on this device.
+    """
+    if not isinstance(raw_rules, list):
+        return ["rules must be a list"]
+    zones = {_zone_key(str(z)) for z in zone_names}
+    errors: list[str] = []
+    for index, raw in enumerate(raw_rules, start=1):
+        where = f"rule {index}"
+        if not isinstance(raw, dict):
+            errors.append(f"{where}: not a rule object")
+            continue
+        target = str(raw.get("target") or raw.get("detection") or "").strip().lower()
+        predicate = str(raw.get("predicate") or "present").strip().lower()
+        if not target:
+            errors.append(f"{where}: names nothing to detect")
+        elif not label_ok(target):
+            errors.append(f"{where}: this device cannot detect '{target}'")
+        if predicate not in KNOWN_PREDICATES:
+            errors.append(
+                f"{where}: unsupported condition '{predicate}' "
+                f"(supported: {', '.join(sorted(KNOWN_PREDICATES))})"
+            )
+        if predicate in _RELATIONAL:
+            secondary = str(raw.get("secondary") or "").strip().lower()
+            if not secondary:
+                errors.append(f"{where}: '{predicate}' needs a second object")
+            elif not label_ok(secondary):
+                errors.append(f"{where}: this device cannot detect '{secondary}'")
+        zone = str(raw.get("zone") or "").strip()
+        if zone and _zone_key(zone) not in zones:
+            errors.append(f"{where}: area '{zone}' is not defined on this device; draw it first")
+    return errors
 
 
 class RuleEngine:
@@ -643,8 +700,10 @@ class RuleEngine:
             if watcher is None:
                 watcher = self._stillness[rule.rule_id] = _StillnessWatcher()
             return watcher.observe(in_zone, now)
-        # present / in_zone / lingering / persists all start from "is it there,
-        # enough of it" -- inside the zone, when the rule has one.
+        # present / in_zone / count / lingering / persists all start from "is it
+        # there, enough of it" -- inside the zone, when the rule has one.
+        if rule.predicate not in _PRESENCE_LIKE:
+            return False  # an unhandled condition never fires (fail closed)
         if zone_bound:
             return len(in_zone) >= rule.min_count
         return seen and frame.count(rule.detection) >= rule.min_count
