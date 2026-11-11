@@ -1,0 +1,35 @@
+{
+  "schema": "sensordyme.incabin.annotation",
+  "version": 1,
+  "notes": "Label vocabulary for in-cabin pilot clips (docs/research/INCABIN_PILOT_PROTOCOL.md). Times are seconds from the clip's first frame. Definitions are binding for annotators; change them only by bumping the version.",
+  "events": {
+    "phone_use": "Phone in the subject's hand AND the subject's eyes on the phone, sustained >= 1 s. Start: first frame both hold. End: first frame either stops.",
+    "phone_handling": "Phone in hand without eyes on it (picking up, holding at the ear on a call, putting down).",
+    "eyes_off_road": "Gaze outside the windscreen road region for >= 2 s continuously (cluster, infotainment, lap, passenger, phone). Mirror checks are NOT this.",
+    "glance_mirror_left": "Gaze on the left mirror, 0.3-2 s. Legitimate; must not alert.",
+    "glance_mirror_right": "Gaze on the right mirror, 0.3-2 s. Legitimate; must not alert.",
+    "glance_mirror_rear": "Gaze on the rear-view mirror, 0.3-2 s. Legitimate; must not alert.",
+    "glance_cluster": "Gaze on the instrument cluster, < 2 s. Legitimate; must not alert.",
+    "glance_infotainment": "Gaze on the centre screen, < 2 s.",
+    "long_closure": "Both eyes closed >= 1.5 s (acted drowsiness).",
+    "yawn": "Mouth open in a yawn, with or without a hand.",
+    "nod": "Head pitch drops and recovers (acted microsleep nod).",
+    "eating_drinking": "Food or drink at the mouth."
+  },
+  "states": {
+    "eyes_closed": "Both upper lids cover the pupils. Per frame.",
+    "phone_in_hand": "A phone is held in either hand. Per frame.",
+    "phone_near_face": "A held phone is within one face-width of the face. Per frame.",
+    "phone_visible": "Any phone is visible in the frame (held, mounted or lying). Per frame.",
+    "face_visible": "At least both eyes and the nose are visible. Per frame."
+  },
+  "ignore_reasons": ["calibration", "setup", "operator_in_frame", "camera_obstructed", "consent_withdrawn_segment"],
+  "clip_conditions": {
+    "lighting": ["day", "low_light", "night_ir"],
+    "ir_illuminator": ["off", "850nm", "940nm"],
+    "mount": ["dash_centre", "mirror_base", "a_pillar", "column"],
+    "eyewear": ["none", "clear", "sunglasses_ir_pass", "sunglasses_ir_block"],
+    "vehicle": "free text (make/model/class)",
+    "subject": "pseudonym only"
+  }
+}
