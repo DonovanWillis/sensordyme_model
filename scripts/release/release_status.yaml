@@ -90,3 +90,15 @@ components:
   m65_training_run_exp08_full60:
     tiers: [experiment-only]
     evidence: "oryn job 20261111-055506-564ff3: 60/60 epochs, no early stop, best epoch 60, best_ckpt sha256 baad3842943b6ebc4cd58ecb6eff0a6615e9238d92d115cee50ddca94f4ef37b. Val: hand AP50 0.706, phone 0.798, person 0.690 (misses the person criterion by 0.003). Not compiled for Hailo; replaces nothing (docs/research/EXP08_FULL_RESULTS.md)"
+  m7_shared_perception_engine:
+    tiers: [software-ready, simulator-verified, hardware-pending]
+    evidence: "core/perception.py (sd-perception/1): one typed Observation per frame; detector, face, hand and pose graphs wrapped so each runs at most once per frame for every consumer; None = unavailable (never fabricated); per-component status, staleness and failure isolation reported upstream as monitoring.perception. Virtual device: 600 frames, 200 detector runs with Driver Safety + a custom rule + the people counter (tests/test_m7_shared_perception_sim.py; scripts/sim/m7_trace.py). Hailo per-frame cost and camera backpressure unmeasured"
+  m7_monitoring_nodes:
+    tiers: [software-ready, simulator-verified, hardware-pending]
+    evidence: "core/nodes.py: preset, rules and companion nodes (people_counter, zone_watch) on shared observations; set_nodes command signed through the existing path, persisted and restored; refusals coded; additive on the driver_safety role (driver_attention cannot be removed). Every node is at most synthetic_tests; Occupancy and Workplace Safety presets are node-backed and refused on driver_safety devices"
+  m7_driver_safety_card:
+    tiers: [software-ready, simulator-verified, hardware-pending]
+    evidence: "iOS: the Driver Safety row opens its details (device-reported capabilities, tier, settings); Activate confirms only on the device-reported preset AND a non-failed monitoring state; device refusals shown with the reason; backend stops resending refused presets. XCUITest journey 23 and scripts/sim/m7_trace.py exercise it against the real backend and virtual device"
+  m7_detector_analysis_exp09_proposal:
+    tiers: [experiment-only]
+    evidence: "docs/research/M7_DETECTOR_ANALYSIS.md: the EXP-08 person regression is false positives (precision 0.55 vs 0.695 at recall 0.70), most likely from DAMO-YOLO's fine-tune loader reinitialising the whole head; NMS 0.5 helps phone/hand; EXP-09 head-preserving fine-tune proposed, not run. No model or .hef change"

@@ -333,6 +333,27 @@ Pass (by a person): every pattern is audible and distinguishable, recorded at 50
 
 ---
 
+**G3. Shared perception report (M7)** (read-only):
+```bash
+curl -s -H "X-Device-Token: $TOKEN" localhost:8899/api/health | $PY -c '
+import json,sys;d=json.load(sys.stdin);m=d["device"]["monitoring"];p=m.get("perception") or {}
+print(p.get("schema"), p.get("simulated"))
+for n,c in (p.get("components") or {}).items(): print(n, c.get("state"), c.get("runs"), c.get("run_ms"), c.get("consumers"), c.get("reason"))
+for n in p.get("nodes") or []: print(n["id"], n.get("state"), n.get("validation"), n.get("missing_capabilities"))'
+```
+Expect:
+- `sd-perception/1 False`.
+- `object_detector ok` with `consumers` including `driver_attention`, a rising `runs`, and a `run_ms` you record. That is the first real Hailo per-frame cost.
+- `face_landmarks ok`.
+- Node `driver_safety active`, validation `synthetic_tests`.
+
+**FAIL:**
+- `simulated: True`;
+- any component `ok` while the matching capability is DEGRADED, or the reverse;
+- an `object_detector` with more runs than frames analysed.
+
+Record `runs`/frames for 60 s, with and without a custom person rule. The rule must not raise the detector's run count above one per analysed frame.
+
 ## H. Decoding parity and performance
 
 **H1. Legacy vs reference decoding, INT8 parity** (service stopped; M5 steps 5–6 and 12):
@@ -447,6 +468,21 @@ Simulate a startup crash, e.g. `sudo systemctl edit sensordyme` with `[Service]`
 > - **Ask Jupiter.** In the app use the full Ask Jupiter screen (the "Examples" link or the custom-rules card). The inline Ask Jupiter bar on the device screen failed UI automation: its field did not take keyboard focus. If it works by hand on the phone, record that in `$EV/LOG.md`.
 > - **`calibration.json`.** A `calibration.json` that is not a JSON object is now ignored and the driver recalibrates. Before, the device booted FAILED every time.
 
+
+> **M7 notes for G, K and L.** Shared perception engine and monitoring nodes (`docs/M7_IMPLEMENTATION_MAP.md`).
+>
+> - **The Driver Safety card:** in the app, tapping the Driver Safety row now opens its details sheet.
+>   - The sheet shows the device-reported capabilities (working / not working with a reason / unknown) and the validation tier.
+>   - Activate counts as confirmed only when the device runs the mode AND monitoring is not failed.
+>   - On Monday, check that the capability rows match G3 and that a refused change shows the device's reason.
+> - **Companion node:** "Also count people" turns on the `people_counter` node. It reads the same detector run as driver monitoring, with no second model. Check in G3 that `people_counter` appears in `consumers` and that the detector's runs do not rise. Node alerts never sound the buzzer.
+> - **New modes:** Occupancy and Workplace Safety exist but are not allowed on a `driver_safety`-role device, which refuses them by design. Do not change the role on Monday.
+> - **Detector truth:** if the Hailo detector fails, the device must report `objects` DEGRADED, with face-based drowsiness still alerting. That is the M7 failure-isolation claim, and only the simulator has shown it so far. Record what happens.
+> - **No model changes on Monday:**
+>   - the production `.hef` and the decoder default (`legacy`) are unchanged;
+>   - the EXP-08 3-class model stays experiment-only;
+>   - EXP-09 (`docs/research/M7_DETECTOR_ANALYSIS.md`) is proposed and not run.
+
 ---
 
 ## M. Optional: developer remote access (Tailscale)
@@ -510,6 +546,7 @@ All items are **NOT EXECUTED — requires the physical device**. Tick only with 
 - [ ] F4 service active, `NRestarts=0`, no DEGRADED
 - [ ] G1 model hash = pin; accelerator live; monitoring `ready`
 - [ ] G2 every buzzer pattern heard and recorded; end-to-end drowsiness alert heard
+- [ ] G3 perception report real (`simulated: False`); detector runs ≤ analysed frames with a custom rule active; `run_ms` recorded
 - [ ] H1 INT8 capture complete; worker parity report produced; decoder decision recorded (default `legacy`)
 - [ ] H2 processed FPS/latency recorded; `stalls_1s_total` recorded and explained if > 0
 - [ ] I calibration frames captured; intrinsics computed; orientation correct
