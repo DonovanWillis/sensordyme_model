@@ -34,6 +34,9 @@ struct DeviceStatus: Codable, Hashable {
     /// backend that does not pass it through; ProtectionControl then falls back
     /// to the protection state.
     var lastCommandID: String?
+    /// The shared perception engine's components and the monitoring nodes the
+    /// device runs (PerceptionStatus.swift). nil from an older backend or device.
+    var perception: PerceptionReport?
 
     struct Capabilities: Codable, Hashable {
         var available: [String]?
@@ -95,7 +98,7 @@ struct DeviceStatus: Codable, Hashable {
     }
 
     enum CodingKeys: String, CodingKey {
-        case protection, reasons, mode, role, capabilities, rules, stale
+        case protection, reasons, mode, role, capabilities, rules, stale, perception
         case monitoringState = "monitoring_state"
         case monitoringActive = "monitoring_active"
         case protectionReasons = "protection_reasons"
@@ -113,7 +116,7 @@ struct DeviceStatus: Codable, Hashable {
         role: String? = nil, roleTitle: String? = nil, allowedPresets: [String]? = nil,
         capabilities: Capabilities? = nil, rules: Rules? = nil, lastRejection: Rejection? = nil,
         presetRejection: PresetRejection? = nil, stale: Bool? = nil, reportedAt: Double? = nil,
-        lastCommandID: String? = nil
+        lastCommandID: String? = nil, perception: PerceptionReport? = nil
     ) {
         self.monitoringState = monitoringState
         self.monitoringActive = monitoringActive
@@ -131,6 +134,7 @@ struct DeviceStatus: Codable, Hashable {
         self.stale = stale
         self.reportedAt = reportedAt
         self.lastCommandID = lastCommandID
+        self.perception = perception
     }
 
     init(from decoder: Decoder) throws {
@@ -151,6 +155,29 @@ struct DeviceStatus: Codable, Hashable {
         stale = try? c.decodeIfPresent(Bool.self, forKey: .stale)
         reportedAt = try? c.decodeIfPresent(Double.self, forKey: .reportedAt)
         lastCommandID = try? c.decodeIfPresent(String.self, forKey: .lastCommandID)
+        perception = try? c.decodeIfPresent(PerceptionReport.self, forKey: .perception)
+    }
+
+    func encode(to encoder: Encoder) throws {
+        // The app only reads status; encoding keeps Codable for the cache and
+        // the demo, without the perception report (read-only device truth).
+        var c = encoder.container(keyedBy: CodingKeys.self)
+        try c.encodeIfPresent(monitoringState, forKey: .monitoringState)
+        try c.encodeIfPresent(monitoringActive, forKey: .monitoringActive)
+        try c.encodeIfPresent(protection, forKey: .protection)
+        try c.encodeIfPresent(reasons, forKey: .reasons)
+        try c.encodeIfPresent(protectionReasons, forKey: .protectionReasons)
+        try c.encodeIfPresent(mode, forKey: .mode)
+        try c.encodeIfPresent(role, forKey: .role)
+        try c.encodeIfPresent(roleTitle, forKey: .roleTitle)
+        try c.encodeIfPresent(allowedPresets, forKey: .allowedPresets)
+        try c.encodeIfPresent(capabilities, forKey: .capabilities)
+        try c.encodeIfPresent(rules, forKey: .rules)
+        try c.encodeIfPresent(lastRejection, forKey: .lastRejection)
+        try c.encodeIfPresent(presetRejection, forKey: .presetRejection)
+        try c.encodeIfPresent(stale, forKey: .stale)
+        try c.encodeIfPresent(reportedAt, forKey: .reportedAt)
+        try c.encodeIfPresent(lastCommandID, forKey: .lastCommandID)
     }
 
     /// Online and reporting: the only time anything below is current.

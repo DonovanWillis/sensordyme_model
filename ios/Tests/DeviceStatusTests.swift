@@ -1,6 +1,7 @@
 import Foundation
 
 // Run with ios/Tests/run.sh
+// run.sh deps: PerceptionStatus CapabilityTier
 
 var failures = 0
 func check(_ condition: Bool, _ what: String) {
