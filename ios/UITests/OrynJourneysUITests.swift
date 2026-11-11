@@ -347,6 +347,7 @@ final class OrynJourneysUITests: XCTestCase {
     /// Tap the card, read what it detects on THIS device and how far it is
     /// validated, activate, see the device's own confirmation, trigger a
     /// distraction, find it in history, break the detector, see degraded, recover.
+    /// (The failed component named under the status is journey 25.)
     func test23_DriverSafetyCard() throws {
         Stack.prepare()
         launch(["-orynOpenDevice"])
@@ -384,12 +385,8 @@ final class OrynJourneysUITests: XCTestCase {
 
         Stack.post("/device/start?scenario=detector_failure")
         waitFor(monitoring, label: "Degraded", timeout: 120)
-        let impaired = element("perception.degraded")
-        XCTAssertTrue(impaired.waitForExistence(timeout: 30), "the failed component is named under the status")
-        XCTAssertTrue(impaired.label.contains("Object detection"), impaired.label)
         shot("23d_degraded")
         waitFor(monitoring, label: "All clear", timeout: 180)
-        waitForAbsence(impaired, timeout: 30)
         shot("23e_recovered")
     }
 
@@ -399,6 +396,7 @@ final class OrynJourneysUITests: XCTestCase {
         Stack.prepare()
         launch(["-orynOpenDevice"])
         waitFor(monitoring, label: "All clear", timeout: 90)
+        try requirePerception()
         let toggle = reveal(app.switches["node.toggle.occupancy"])
         if (toggle.value as? String) == "1" {  // left on by an earlier run
             toggle.tap()
@@ -418,7 +416,36 @@ final class OrynJourneysUITests: XCTestCase {
         shot("24b_companion_off")
     }
 
+    /// A failing perception component is named under the status, in the
+    /// device's words, and disappears when it recovers.
+    func test25_PerceptionDegraded() throws {
+        Stack.prepare()
+        launch(["-orynOpenDevice"])
+        waitFor(monitoring, label: "All clear", timeout: 90)
+        try requirePerception()
+        Stack.post("/device/start?scenario=detector_failure")
+        waitFor(monitoring, label: "Degraded", timeout: 120)
+        let impaired = element("perception.degraded")
+        XCTAssertTrue(impaired.waitForExistence(timeout: 30), "the failed component is named under the status")
+        XCTAssertTrue(impaired.label.contains("Object detection"), impaired.label)
+        shot("25a_component_failed")
+        waitFor(monitoring, label: "All clear", timeout: 180)
+        waitForAbsence(impaired, timeout: 30)
+        shot("25b_component_recovered")
+    }
+
     // MARK: Helpers
+
+    /// Skips, saying why, when the stack does not report `status.perception`
+    /// (sd-perception/1) yet: that needs the M7 device and backend streams.
+    /// A skip is reported as a skip, never as a pass.
+    private func requirePerception() throws {
+        let section = element("nodes.section")
+        if !section.waitForExistence(timeout: 20) {
+            throw XCTSkip("the device/backend don't report status.perception yet (M7 device + backend streams)")
+        }
+        _ = reveal(section)
+    }
 
     static let dwellPrompt = "Alert me if someone stays inside the marked area for longer than 10 seconds"
 
