@@ -437,6 +437,16 @@ Simulate a startup crash, e.g. `sudo systemctl edit sensordyme` with `[Service]`
 
 **L3. Custom rules:** in the app, Configure with AI, e.g. "alert me if a phone is visible for 5 seconds"; review, then activate. Expect: the journal shows the rule set applied (rules version reported upstream); `/api/state` → `policy` shows the custom configuration; holding a phone in view for 5 s produces an alert in the app. Then switch back to Driver Safety and confirm the rules stop. Stop/resume: from the app, stop protection (with confirmation), then resume. Expect `[PROTECTION] STOPPED` / `resumed`, each applied exactly once.
 
+> **M6.5 notes for K and L.**
+>
+> - **Device auth.** Signed commands (`docs/DEVICE_AUTH_CONTRACT.md`) default to `cloud.command_auth: permissive` on the device and the backend's default mode. On Monday leave both at their defaults: existing pairing keeps working, and a command with a bad signature is never applied.
+>   - Switching to `required` is a later, deliberate step: the backend first, then each device.
+>   - Do not run `scripts/migrate_device_key.py` (dry-run by default) and do not rotate keys on Monday.
+> - **BLE provisioning.** It stays `network.provisioning.auth: legacy`, so K2 uses the existing app flow. The proof-of-possession flow (`docs/BLE_PROOF_OF_POSSESSION.md`) needs a setup-code label, an app build with its setup screen, and its own hardware session. Do not set `deployment: production` on Monday: with `legacy` that is a schema error by design.
+> - **Person rules.** Custom rules on `person` now receive the driver's person box (fixed in M6.5; before, "nobody in the seat" fired with the driver seated). If L3 includes a person rule, record whether it fires correctly.
+> - **Ask Jupiter.** In the app use the full Ask Jupiter screen (the "Examples" link or the custom-rules card). The inline Ask Jupiter bar on the device screen failed UI automation: its field did not take keyboard focus. If it works by hand on the phone, record that in `$EV/LOG.md`.
+> - **`calibration.json`.** A `calibration.json` that is not a JSON object is now ignored and the driver recalibrates. Before, the device booted FAILED every time.
+
 ---
 
 ## M. Optional: developer remote access (Tailscale)
