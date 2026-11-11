@@ -22,6 +22,7 @@ Nothing here verifies that a buzzer is physically audible.
 from __future__ import annotations
 
 import copy
+import itertools
 import random
 from pathlib import Path
 from typing import ClassVar
@@ -267,18 +268,24 @@ def _driver_runtime(tmp_path, clock, monkeypatch, *, closed):
     return runtime, module, frame, actuator
 
 
+#: Frame ids for _drive, as FrameBus sequence numbers would be.
+_FRAME_IDS = itertools.count(1)
+
+
 def _drive(runtime, module, frame, clock, seconds, step=0.05):
-    """The inference loop's per-frame production path (frame stamp, process,
-    dispatch, custom rules, heartbeat) on an injected clock."""
+    """The inference loop's per-frame production path (frame stamp, process
+    through the shared perception engine, dispatch, custom rules, monitoring
+    nodes, heartbeat) on an injected clock."""
     for _ in range(round(seconds / step)):
         runtime._apply_pending_commands()
         runtime.bus.publish(frame)
         if runtime._stopped is None:
             module.set_frame_time(clock["now"])
-            events = module.process(frame)
+            events, observation = runtime._perceive(module, frame, next(_FRAME_IDS), clock["now"])
             runtime.bus.record_processed()
             runtime._dispatch_module_events(module, events, clock["now"])
-            runtime._evaluate_custom_rules(module, frame, clock["now"])
+            runtime._evaluate_custom_rules(module, frame, clock["now"], observation)
+            runtime._run_nodes(observation, clock["now"])
         runtime._heartbeat = clock["now"]
         clock["now"] = round(clock["now"] + step, 6)
 

@@ -168,6 +168,8 @@ class ScriptedFaceMesh:
     """Stands in for mediapipe FaceMesh. Returns real NormalizedLandmarkList
     protos, so the module's own drawing code renders them on the live feed."""
 
+    model_name = "sim-scripted-face-mesh"
+
     def __init__(self) -> None:
         self.calls = 0
         self._cache: dict[tuple, Any] = {}
@@ -260,7 +262,13 @@ class _HandResult:
 class ScriptedHands:
     """Stands in for MediaPipe Hands: one hand wrapped around a held phone."""
 
+    model_name = "sim-scripted-hands"
+
+    def __init__(self) -> None:
+        self.calls = 0
+
     def process(self, rgb: np.ndarray) -> _HandResult:
+        self.calls += 1
         scene = decode_scene(rgb)
         if scene is None or not (scene.phone and scene.hand_on_phone):
             return _HandResult(None)
@@ -277,25 +285,38 @@ class ScriptedHands:
 def supports(module) -> bool:
     """Whether scripted perception can stand in for this module's models."""
     from modules.driver_attention import DriverAttentionModule
+    from modules.shared_perception import SharedPerceptionModule
 
-    return isinstance(module, DriverAttentionModule)
+    return isinstance(module, (DriverAttentionModule, SharedPerceptionModule))
 
 
-def install(module, faults) -> Any:
+def install(module, faults, detector: Optional[ScriptedDetector] = None) -> Any:
     """Replace a driver_attention module's model calls with scripted ones.
 
     Everything else on the module is untouched. The real FaceMesh graph the
     constructor built is closed first (it holds native threads until closed).
-    Returns the scripted detector, so a caller can count its calls.
+    Returns the scripted detector, so a caller can count its calls. Pass one
+    `detector` to share it across module builds, as the device shares its one
+    loaded detector: the runtime's perception engine (core/perception.py)
+    wraps it, and `detector.calls` then counts every real inference on the
+    device, whoever asked.
     """
     if not supports(module):
-        raise TypeError(f"scripted perception supports driver_attention only, not {type(module).__name__}")
+        raise TypeError(f"scripted perception supports driver_attention and shared_perception, "
+                        f"not {type(module).__name__}")
+    from modules.shared_perception import SharedPerceptionModule
+
+    if isinstance(module, SharedPerceptionModule):
+        # It owns no graphs: only the detector it would load lazily.
+        detector = detector if detector is not None else ScriptedDetector(faults)
+        module._yolo_model = detector
+        return detector
     real_face_mesh = getattr(module, "_face_mesh", None)
     if real_face_mesh is not None and not isinstance(real_face_mesh, ScriptedFaceMesh):
         with contextlib.suppress(Exception):  # closing a graph we discard must not stop the sim
             real_face_mesh.close()
     module._face_mesh = ScriptedFaceMesh()
-    detector = ScriptedDetector(faults)
+    detector = detector if detector is not None else ScriptedDetector(faults)
     # What the module's lazy loader (_ensure_object_detectors_loaded) would
     # have done with a real model, done with the scripted one.
     module._yolo_model = detector

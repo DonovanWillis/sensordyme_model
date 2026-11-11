@@ -99,6 +99,7 @@ import cv2
 import mediapipe as mp
 import numpy as np
 
+from core import perception as shared_perception
 from core.behavior import BehaviorFrame, BehaviorReasoner, parse_behavior
 from core.behavior.camera_model import CameraIntrinsics
 from core.behavior.eye_state import CLOSED as EYE_CLOSED
@@ -1322,6 +1323,9 @@ class DriverAttentionModule(VisionModule):
             min_tracking_confidence=float(config.get("face_tracking_confidence", 0.5)),
         )
         self._last_face_proto = None
+        # What this frame measured, typed, for the shared observation
+        # (perception_signals): only what was actually computed THIS frame.
+        self._frame_signals: dict = {}
         self._last_ear = 0.0
         self._last_iris: Optional[float] = None
         self._last_ear_threshold = 0.0
@@ -1364,9 +1368,11 @@ class DriverAttentionModule(VisionModule):
                     f"the '{self._yolo_weights}' model knows about — check config.yaml spelling"
                 )
         if self._enable_hands and self._hands is None:
-            self._hands = mp.solutions.hands.Hands(
+            # Through the shared engine: built lazily inside an analysed frame,
+            # so the factory (not the runtime's adopt) is what wraps it.
+            self._hands = shared_perception.shared_graph(shared_perception.HAND_LANDMARKS, mp.solutions.hands.Hands(
                 max_num_hands=2, min_detection_confidence=0.5, min_tracking_confidence=0.5
-            )
+            ))
         if not self._object_detection_ready:
             self._object_detection_ready = True
             print(
@@ -1706,6 +1712,7 @@ class DriverAttentionModule(VisionModule):
         # making max(frame_w, 1) == 1 and every normalized polygon test fail
         # for every box, forever, with no error and no log line.
         self._last_frame_size = (w, h)
+        self._frame_signals = {}
 
         self._frame_index += 1
         if self._frame_index % self._yolo_every_n_frames == 0:
@@ -1919,6 +1926,14 @@ class DriverAttentionModule(VisionModule):
             self._last_pitch_raw = raw_pitch
             self._last_head_yaw = raw_yaw
             self._last_head_pitch = raw_pitch
+            head_pose = shared_perception.HeadPose(yaw_deg=float(raw_yaw), pitch_deg=float(raw_pitch),
+                                                   calibrated=False)
+            if self._calibrator.is_calibrated:
+                rel_yaw, rel_pitch = relative_yaw_pitch_deg(self._calibrator.baseline_rotation, rotation)
+                if abs(rel_yaw) <= MAX_PLAUSIBLE_GAZE_DEG and abs(rel_pitch) <= MAX_PLAUSIBLE_GAZE_DEG:
+                    head_pose = shared_perception.HeadPose(yaw_deg=float(rel_yaw), pitch_deg=float(rel_pitch),
+                                                           calibrated=True)
+            self._frame_signals["head_pose"] = head_pose
         # Eye-in-head offset from the iris, fused onto head pose -- see the
         # module docstring and core/eye_signal.eye_gaze_offset_deg. Head-pose-
         # only for this frame when the eye is closed or the iris fit is
@@ -1934,6 +1949,9 @@ class DriverAttentionModule(VisionModule):
         ):
             gaze_offset = eye_gaze_offset_deg(points, self._gaze_scale_deg)
         self._last_gaze_offset = gaze_offset
+        if gaze_offset is not None:
+            self._frame_signals["gaze"] = shared_perception.Gaze(
+                yaw_offset_deg=float(gaze_offset[0]), pitch_offset_deg=float(gaze_offset[1]))
 
         self._calibrator.observe(ear, rotation, gaze_offset, now)
 
@@ -1993,6 +2011,12 @@ class DriverAttentionModule(VisionModule):
             )
 
         drowsy_condition = ear < effective_threshold and not iris_vetoes_closure
+        self._frame_signals["eye_state"] = shared_perception.EyeState(
+            ear=float(ear), iris_openness=None if iris_ratio is None else float(iris_ratio),
+            # Closed only against a calibrated threshold; before that there is
+            # nothing honest to judge an open eye by.
+            closed=bool(drowsy_condition) if self._calibrator.is_calibrated else None,
+        )
         fired = self._drowsy_tracker.update(drowsy_condition, now)
         # is_active (not the raw per-frame drowsy_condition) drives the live alert: a
         # blink makes drowsy_condition briefly True on every frame, but is_active only
@@ -2549,8 +2573,17 @@ class DriverAttentionModule(VisionModule):
             objects = Capability()
         status = {"face": Capability(), "objects": objects}
         if self._enable_hands:
-            status["hands"] = objects
+            # Hand landmarks are their own model, loaded with the detector and
+            # run on its ticks; the shared engine (core/perception.py) reports
+            # whether they actually ran. Never a copy of the detector's state.
+            status["hands"] = (Capability() if self._hands is not None
+                               else Capability(STARTING, "hand landmarks load with the object detector"))
         return status
+
+    def perception_signals(self) -> dict:
+        """Eye state, head pose and gaze measured on the last frame (core/perception.py
+        FaceObservation); a key is absent when it was not computed on that frame."""
+        return dict(self._frame_signals)
 
     def available_labels(self) -> frozenset[str]:
         """The detector class names this module asks for (hands are not detections).

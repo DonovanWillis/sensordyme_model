@@ -35,10 +35,13 @@ def entries(registry):
 # ---------------------------------------------------------------------- back-compat
 def test_existing_readers_see_exactly_the_runnable_presets():
     presets = P.load_presets()
-    assert set(presets) == {"driver_safety", "elderly_monitoring", "security_monitoring", "baby_monitoring"}
+    # M7: Occupancy and Workplace Safety run on the shared perception engine
+    # (module shared_perception + monitoring nodes) and are runnable now.
+    assert set(presets) == {"driver_safety", "elderly_monitoring", "security_monitoring", "baby_monitoring",
+                            "occupancy", "workplace_safety"}
     for preset in presets.values():
         assert preset["module"] and preset["title"]  # the fields every older reader uses
-    assert "occupancy" not in presets and "workplace_safety" not in presets
+    assert P.load_planned() == {}
 
 
 def test_aliases_and_variants_still_resolve():
@@ -61,10 +64,14 @@ def test_the_five_product_modes_are_all_present_honestly(entries):
     assert by_mode["driver_safety"]["id"] == "driver_safety"
     assert by_mode["child_monitoring"]["id"] == "baby_monitoring"
     assert by_mode["property_monitoring"]["id"] == "security_monitoring"
-    for planned in ("occupancy", "workplace_safety"):
-        entry = by_mode[planned]
-        assert entry["availability"] == "planned" and entry["planned_reason"]
-        assert set(entry["served_by"]) <= set(P.load_presets())
+    # Node-backed since M7: available, and honest about what they are not.
+    assert by_mode["occupancy"]["nodes"] == ["people_counter"]
+    assert by_mode["workplace_safety"]["nodes"] == ["zone_watch"]
+    for node_backed in ("occupancy", "workplace_safety"):
+        entry = by_mode[node_backed]
+        assert entry["availability"] == "available" and entry["module"] == "shared_perception"
+        assert any("virtual device" in limit for limit in entry["limitations"])
+    assert any("PPE" in limit for limit in by_mode["workplace_safety"]["limitations"])
 
 
 def test_every_entry_carries_the_contract_fields(entries):
@@ -96,7 +103,8 @@ def test_status_is_the_registry_weakest_link(registry, entries):
     # Today: only the detector has offline evidence; face/pose/hands have none.
     assert entries["security_monitoring"]["validation"]["status"] == "benchmarked_offline"
     assert entries["driver_safety"]["validation"]["status"] == "unevaluated"
-    assert entries["workplace_safety"]["validation"]["status"] == "not_applicable"
+    # Node-backed modes are only as validated as the shared detector they read.
+    assert entries["workplace_safety"]["validation"]["status"] == "benchmarked_offline"
     assert not any(e["validation"]["validated"] for e in entries.values())
 
 
@@ -192,7 +200,10 @@ def test_availability_codes_and_precedence(entries):
         {"name": "face", "reason": "no face landmarks for 10 s"},
         {"name": "audible_alert", "reason": "no audible alert output is configured"},
     ], "starting": []}
-    assert P.device_availability(entries["occupancy"], role=driver, capabilities=None, stale=True)[0] == "planned"
+    assert P.device_availability({**entries["occupancy"], "availability": "planned"}, role=driver,
+                                 capabilities=None, stale=True)[0] == "planned"
+    assert P.device_availability(entries["occupancy"], role=driver, capabilities=None,
+                                 stale=True)[0] == "role_forbids_preset"
     assert P.device_availability(entries["baby_monitoring"], role=driver, capabilities=None,
                                  stale=True)[0] == "role_forbids_preset"
     assert P.device_availability(entries["driver_safety"], role=driver, capabilities=None,

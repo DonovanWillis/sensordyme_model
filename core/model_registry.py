@@ -339,6 +339,35 @@ class EvidenceBinding:
 
 
 @dataclass(frozen=True)
+class InferenceComponent:
+    """One shared perception component (core/perception.py) and the model behind it."""
+
+    id: str  # object_detector | face_landmarks | hand_landmarks | pose
+    capability: str  # the monitoring capability kind it provides
+    provider: str  # model id
+    product_capabilities: tuple[str, ...] = ()
+
+
+@dataclass(frozen=True)
+class MonitoringNodeEntry:
+    """One monitoring node (core/nodes.py): what it consumes and the tier it claims.
+
+    A node can never claim more than the weakest product capability it depends
+    on (`node_tier`): a mode is not validated because its tests pass, and a
+    simulated event is not evidence of real-world accuracy.
+    """
+
+    id: str
+    kind: str  # preset | rules | companion
+    components: tuple[str, ...]
+    capabilities: tuple[str, ...]  # product capability ids
+    claimed_tier: str
+    preset: Optional[str] = None
+    experimental: bool = False
+    notes: str = ""
+
+
+@dataclass(frozen=True)
 class ModelRegistry:
     schema_version: int
     registry_version: str
@@ -347,6 +376,14 @@ class ModelRegistry:
     modules: tuple[tuple[str, ModuleUse], ...]
     capabilities: tuple[ProductCapability, ...] = ()
     bindings: tuple[EvidenceBinding, ...] = ()
+    components: tuple[InferenceComponent, ...] = ()
+    nodes: tuple[MonitoringNodeEntry, ...] = ()
+
+    def component(self, component_id: str) -> Optional[InferenceComponent]:
+        return next((c for c in self.components if c.id == component_id), None)
+
+    def node(self, node_id: str) -> Optional[MonitoringNodeEntry]:
+        return next((n for n in self.nodes if n.id == node_id), None)
 
     def product_capability(self, capability_id: str) -> Optional[ProductCapability]:
         return next((c for c in self.capabilities if c.id == capability_id), None)
@@ -551,12 +588,31 @@ def parse_registry(data: Any) -> ModelRegistry:
             status=_text(b.get("status")), date=_text(b.get("date")), metrics=_metrics(b.get("metrics")),
             notes=_text(b.get("notes")),
         ))
+    components = []
+    for comp_id, raw_comp in _map(data.get("inference_components")).items():
+        comp = _map(raw_comp)
+        components.append(InferenceComponent(
+            id=str(comp_id), capability=_text(comp.get("capability")), provider=_text(comp.get("provider")),
+            product_capabilities=tuple(_text(c) for c in _seq(comp.get("product_capabilities"))),
+        ))
+    nodes = []
+    for node_id, raw_node in _map(data.get("monitoring_nodes")).items():
+        node = _map(raw_node)
+        nodes.append(MonitoringNodeEntry(
+            id=str(node_id), kind=_text(node.get("kind")),
+            components=tuple(_text(c) for c in _seq(node.get("components"))),
+            capabilities=tuple(_text(c) for c in _seq(
+                node.get("product_capabilities") or node.get("requires") or node.get("capabilities"))),
+            claimed_tier=_text(node.get("claimed_tier")), preset=_opt_text(node.get("preset")),
+            experimental=bool(node.get("experimental", False)), notes=_text(node.get("notes")),
+        ))
     if problems:
         raise RegistryError(problems)
     return ModelRegistry(
         schema_version=1, registry_version=_text(data.get("registry_version")),
         models=models, providers=providers, modules=tuple(modules),
         capabilities=tuple(capabilities), bindings=tuple(bindings),
+        components=tuple(components), nodes=tuple(nodes),
     )
 
 
@@ -849,7 +905,83 @@ def registry_violations(registry: ModelRegistry, today: Optional[_dt.date] = Non
             errors.append(f"evidence_bindings.{b.id}: duplicate id")
         seen_bindings.add(b.id)
         errors += binding_violations(registry, b)
+    errors += component_violations(registry)
+    errors += node_violations(registry)
     return errors
+
+
+#: The shared perception components (core/perception.py COMPONENTS) and what each provides.
+COMPONENT_CAPABILITY = {"object_detector": "objects", "face_landmarks": "face",
+                        "hand_landmarks": "hands", "pose": "pose"}
+NODE_KINDS = ("preset", "rules", "companion")
+
+
+def component_violations(registry: ModelRegistry) -> list[str]:
+    errors: list[str] = []
+    for comp in registry.components:
+        where = f"inference_components.{comp.id}"
+        if comp.id not in COMPONENT_CAPABILITY:
+            errors.append(f"{where}: not a perception component ({sorted(COMPONENT_CAPABILITY)})")
+            continue
+        if comp.capability != COMPONENT_CAPABILITY[comp.id]:
+            errors.append(f"{where}: provides {COMPONENT_CAPABILITY[comp.id]}, not {comp.capability!r}")
+        if registry.provider_map.get(comp.capability) != comp.provider:
+            errors.append(f"{where}: provider {comp.provider!r} is not the registered {comp.capability} provider")
+        for cap_id in comp.product_capabilities:
+            cap = registry.product_capability(cap_id)
+            if cap is None:
+                errors.append(f"{where}: product capability {cap_id!r} is not declared")
+            elif cap.model != comp.provider:
+                errors.append(f"{where}: {cap_id} is served by {cap.model}, not by this component's model")
+    return errors
+
+
+def node_violations(registry: ModelRegistry) -> list[str]:
+    """A node naming unknown parts, or claiming more than its capabilities' evidence."""
+    errors: list[str] = []
+    seen: set[str] = set()
+    for node in registry.nodes:
+        where = f"monitoring_nodes.{node.id}"
+        if node.id in seen:
+            errors.append(f"{where}: duplicate id")
+        seen.add(node.id)
+        if node.kind not in NODE_KINDS:
+            errors.append(f"{where}: kind must be one of {NODE_KINDS}")
+        if tier_rank(node.claimed_tier) < 0:
+            errors.append(f"{where}: claimed_tier {node.claimed_tier!r} is not a tier")
+        for comp_id in node.components:
+            if registry.component(comp_id) is None:
+                errors.append(f"{where}: component {comp_id!r} is not declared in inference_components")
+        if not node.capabilities:
+            errors.append(f"{where}: a node must name the product capabilities it depends on")
+        for cap_id in node.capabilities:
+            cap = registry.product_capability(cap_id)
+            if cap is None:
+                errors.append(f"{where}: product capability {cap_id!r} is not declared")
+            elif tier_rank(node.claimed_tier) > tier_rank(cap.claimed_tier):
+                errors.append(f"{where}: claims {node.claimed_tier}, above {cap_id}'s {cap.claimed_tier}: "
+                              f"a node can never claim more than the evidence behind what it depends on")
+        if node.experimental and tier_rank(node.claimed_tier) > tier_rank("synthetic_tests"):
+            errors.append(f"{where}: an experimental node claims nothing above synthetic_tests")
+        if node.kind == "preset" and not node.preset:
+            errors.append(f"{where}: a preset node names its preset")
+    return errors
+
+
+def node_tier(registry: ModelRegistry, node_id: str) -> str:
+    """The tier a node may report: its claim, capped by its weakest capability.
+
+    Unknown nodes are `exists_in_code`. Capabilities that do not exist count as
+    `exists_in_code`, so a broken entry lowers what is reported, never raises it.
+    """
+    node = registry.node(node_id)
+    if node is None:
+        return TIERS[0]
+    ranks = [tier_rank(node.claimed_tier)]
+    for cap_id in node.capabilities:
+        cap = registry.product_capability(cap_id)
+        ranks.append(tier_rank(cap.claimed_tier) if cap is not None else 0)
+    return TIERS[max(0, min(ranks))]
 
 
 def load_registry(path: Union[str, Path, None] = None, *, validate: bool = True,
@@ -1113,7 +1245,18 @@ def capability_tiers(registry: ModelRegistry) -> dict:
             "evidence": [b.id for b in bindings if _supports(registry, cap, b, cap.claimed_tier)],
             "experiment_evidence": [b.id for b in bindings if b.status in ("experiment_only", "pending")],
         })
-    return {"registry_version": registry.registry_version, "tiers": list(TIERS), "capabilities": entries}
+    nodes = [{
+        "node": node.id, "kind": node.kind, "preset": node.preset,
+        "components": list(node.components), "product_capabilities": list(node.capabilities),
+        "claimed_tier": node.claimed_tier,
+        # What the node may report: never above its weakest capability.
+        "tier": node_tier(registry, node.id),
+        "experimental": node.experimental,
+        "device_verified": tier_rank(node_tier(registry, node.id)) >= tier_rank("device_verified"),
+        "production_validated": node_tier(registry, node.id) == "production_permitted",
+    } for node in registry.nodes]
+    return {"registry_version": registry.registry_version, "tiers": list(TIERS), "capabilities": entries,
+            "nodes": nodes}
 
 
 # ---------------------------------------------------------------------- re-evaluation
@@ -1206,12 +1349,51 @@ def as_dict(registry: ModelRegistry) -> dict:
 
 
 __all__ = [
-    "BINDING_STATUSES", "CAPABILITY_KINDS", "DECODERS", "DEFAULT_PATH", "EVIDENCE_LEVELS",
-    "HARDWARE_TARGETS", "LADDER", "PERCEPTION_KINDS", "TIERS",
-    "Approval", "CapabilityLink", "ChainView", "EvaluationStatus", "Evidence", "EvidenceBinding",
-    "Impact", "ModelCard", "ModelRegistry", "ProductCapability", "RegistryError", "as_dict",
-    "binding_violations", "capability_evidence", "capability_link", "capability_tiers",
-    "capability_violations", "card_violations", "chain_for", "display_state", "load_registry",
-    "parse_registry", "policy_view", "preset_view", "preset_views", "presets_using", "reevaluation_impact",
-    "registry_violations", "role_view", "role_views", "roles_using", "tier_rank", "weakest",
+    "BINDING_STATUSES",
+    "CAPABILITY_KINDS",
+    "DECODERS",
+    "DEFAULT_PATH",
+    "EVIDENCE_LEVELS",
+    "HARDWARE_TARGETS",
+    "LADDER",
+    "PERCEPTION_KINDS",
+    "TIERS",
+    "Approval",
+    "CapabilityLink",
+    "ChainView",
+    "EvaluationStatus",
+    "Evidence",
+    "EvidenceBinding",
+    "Impact",
+    "InferenceComponent",
+    "ModelCard",
+    "ModelRegistry",
+    "MonitoringNodeEntry",
+    "ProductCapability",
+    "RegistryError",
+    "as_dict",
+    "binding_violations",
+    "capability_evidence",
+    "capability_link",
+    "capability_tiers",
+    "capability_violations",
+    "card_violations",
+    "chain_for",
+    "component_violations",
+    "display_state",
+    "load_registry",
+    "node_tier",
+    "node_violations",
+    "parse_registry",
+    "policy_view",
+    "preset_view",
+    "preset_views",
+    "presets_using",
+    "reevaluation_impact",
+    "registry_violations",
+    "role_view",
+    "role_views",
+    "roles_using",
+    "tier_rank",
+    "weakest",
 ]

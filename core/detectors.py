@@ -58,7 +58,9 @@ def get_yolo_model(weights: str, device: Optional[str] = None) -> Any:
             hailo_model = accel.maybe_hailo_yolo(weights)
             if hailo_model is not None:
                 _model_cache[cache_key] = hailo_model
-                return hailo_model
+                from core import perception
+
+                return perception.shared_detector(hailo_model)
         try:
             from ultralytics import YOLO
         except ImportError as exc:
@@ -82,7 +84,12 @@ def get_yolo_model(weights: str, device: Optional[str] = None) -> Any:
             model.to(device)
             print(f"core.detectors: '{weights}' loaded on device={_model_device(model)}")
         _model_cache[cache_key] = model
-    return _model_cache[cache_key]
+    # Inside an analysed frame the shared perception engine hands out a proxy
+    # that runs the model at most once per frame for every caller
+    # (core/perception.py); anywhere else this is the model itself.
+    from core import perception
+
+    return perception.shared_detector(_model_cache[cache_key])
 
 
 def _no_backend_message(weights: str, device: Optional[str]) -> str:
@@ -149,7 +156,9 @@ def require_backend(weights: str, device: Optional[str] = None) -> str:
     .hef just to throw it away, and "the import works" is a weaker claim than
     "the weights actually loaded" anyway.
     """
-    model = get_yolo_model(weights, device)
+    from core import perception
+
+    model = perception.unwrap(get_yolo_model(weights, device))
     return "hailo" if type(model).__name__ == "HailoYOLO" else "ultralytics"
 
 
