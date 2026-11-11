@@ -19,6 +19,11 @@ import math
 
 import numpy as np
 import pytest
+from test_driver_attention_scenarios import (
+    _FakeFaceMeshResult,
+    _make_module,
+    make_fake_landmarks,
+)
 
 import modules.driver_attention as driver_attention_module
 from core.alerts import (
@@ -30,11 +35,6 @@ from core.alerts import (
 )
 from core.events import Event
 from main import ALERT_EVENT_TYPES_PI
-from test_driver_attention_scenarios import (
-    _FakeFaceMeshResult,
-    _make_module,
-    make_fake_landmarks,
-)
 
 
 class RecordingActuator:
@@ -216,7 +216,7 @@ def clock(monkeypatch):
 
 def _drive(module, frame, clock, manager, *, closed: dict, seconds: float, step: float = 0.05):
     """The runtime's per-frame alert path, on the real module, for `seconds`."""
-    for _ in range(int(round(seconds / step))):
+    for _ in range(round(seconds / step)):
         events = module.process(frame)
         manager.process_frame(
             clock["now"], events, alertable=ALERT_EVENT_TYPES_PI,
@@ -299,7 +299,7 @@ def test_real_module_a_blink_shorter_than_the_threshold_never_alerts(tmp_path, c
 
 
 def test_real_module_reports_its_episode_types_and_live_conditions(tmp_path, clock):
-    module, frame = _make_module(tmp_path, clock)
+    module, _frame = _make_module(tmp_path, clock)
     tracked = module.alert_episode_types()
     assert {"drowsiness", "attention_lost", "distraction", "eyes_down", "phone_use"} <= tracked
     assert module.active_alert_conditions() == set()

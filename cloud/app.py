@@ -421,6 +421,10 @@ def init_db() -> None:
             # this the app showed the base mode as selected while a custom
             # configuration was the thing actually running.
             "ALTER TABLE devices ADD COLUMN monitoring TEXT",
+            # A one-shot, explicitly confirmed stop/resume for the device (M0.1).
+            # Cleared once the device reports the matching state, so a device
+            # that reboots comes back protecting instead of being re-stopped.
+            "ALTER TABLE devices ADD COLUMN desired_protection TEXT",
             # Whether an event came from something the user configured. Without
             # it the app cannot tell a preset's own warning from the one thing
             # someone explicitly asked to be told about.
@@ -1062,6 +1066,13 @@ class ClaimBody(BaseModel):
 MAX_ACTIVATED_RULES = 32
 
 
+class ProtectionBody(BaseModel):
+    """Explicit stop/resume of monitoring. Stopping must be confirmed."""
+
+    action: str = Field(pattern="^(stop|resume)$")
+    confirm: bool = False
+
+
 class PresetBody(BaseModel):
     # Re-sent to the device on every poll until it converges, so its size is
     # paid on every ingest response, not once.
@@ -1513,6 +1524,42 @@ def _loads_dict(raw: Optional[str]) -> dict:
     return value if isinstance(value, dict) else {}
 
 
+def _reported_role(device: sqlite3.Row):
+    """The role the device last reported (core/roles.py), or None."""
+    from core.roles import ROLES
+
+    reported = _monitoring_payload(device["monitoring"]) or {}
+    name = (reported.get("role") or {}).get("name") if isinstance(reported.get("role"), dict) else None
+    return ROLES.get(name) if isinstance(name, str) else None
+
+
+def _role_refusal(device: sqlite3.Row, preset: str, presets: dict) -> Optional[str]:
+    from core.roles import preset_violation
+
+    role = _reported_role(device)
+    return preset_violation(role, preset, presets) if role is not None else None
+
+
+@app.post("/v1/devices/{device_id}/protection")
+def set_protection(device_id: int, body: ProtectionBody, uid: int = Depends(current_user)):
+    """Explicitly stop or resume monitoring on a device (M0.1).
+
+    Stopping is never implied by any other command and must carry
+    `confirm: true`. The device reports "stopped" until it is resumed or
+    restarted; the request is delivered once and cleared on convergence.
+    """
+    if body.action == "stop" and not body.confirm:
+        raise HTTPException(400, "stopping monitoring requires confirm: true")
+    with db() as conn:
+        _owned_device(conn, device_id, uid)
+        conn.execute(
+            "UPDATE devices SET desired_protection = ? WHERE id = ?",
+            (json.dumps({"action": body.action, "confirm": body.confirm, "requested_at": time.time()}),
+             device_id),
+        )
+    return {"ok": True, "desired_protection": body.action}
+
+
 @app.post("/v1/devices/{device_id}/preset")
 def set_preset(device_id: int, body: PresetBody, uid: int = Depends(current_user)):
     """Switch mode, or (preset "") activate AI Custom.
@@ -1540,6 +1587,11 @@ def set_preset(device_id: int, body: PresetBody, uid: int = Depends(current_user
                 variant and variant not in (presets[base].get("variants") or {})
             ):
                 raise HTTPException(400, f"unknown mode '{body.preset}'")
+            # The device's role (as the device last reported it) may forbid this
+            # mode. Refuse here with the reason; the device would refuse it too.
+            refusal = _role_refusal(device, normalized, presets)
+            if refusal:
+                raise HTTPException(409, refusal)
 
         draft_json = device["ai_rules_draft"]
         # The proposal on screen must still be the one stored. A newer preview
@@ -2632,11 +2684,27 @@ def ingest(body: IngestBody, background_tasks: BackgroundTasks, device: sqlite3.
                 )
                 continue
         row = conn.execute(
-            "SELECT desired_preset, ai_rules, zones, custom_monitoring_wanted, ai_rules_activation"
-            " FROM devices WHERE id = ?",
+            "SELECT desired_preset, ai_rules, zones, custom_monitoring_wanted, ai_rules_activation,"
+            " desired_protection FROM devices WHERE id = ?",
             (device["id"],),
         ).fetchone()
         desired, ai_rules_json, zones_json = row["desired_preset"], row["ai_rules"], row["zones"]
+        desired_protection = _loads_dict(row["desired_protection"]) if row["desired_protection"] else {}
+        reported_protection = (
+            ((body.monitoring or {}).get("protection") or {}).get("state")
+            if isinstance((body.monitoring or {}).get("protection"), dict) else None
+        )
+        protection_action = desired_protection.get("action")
+        protection_done = (
+            (protection_action == "stop" and reported_protection == "stopped")
+            or (protection_action == "resume" and reported_protection not in (None, "stopped"))
+        )
+        if protection_action and protection_done:
+            conn.execute(
+                "UPDATE devices SET desired_protection = NULL WHERE id = ? AND desired_protection = ?",
+                (device["id"], row["desired_protection"]),
+            )
+            protection_action = None
         rules_activation = row["ai_rules_activation"] or 0
         custom_monitoring_wanted = bool(row["custom_monitoring_wanted"])
         # A device can report the same active_preset string while AI Custom
@@ -2795,6 +2863,13 @@ def ingest(body: IngestBody, background_tasks: BackgroundTasks, device: sqlite3.
             command.pop("set_zones", None)
         else:
             command["zones_version"] = zone_version
+
+    # An explicit, confirmed stop/resume, until the device reports it (one-shot).
+    if protection_action in ("stop", "resume"):
+        command = dict(command or {})
+        command["set_protection"] = {
+            "action": protection_action, "confirm": desired_protection.get("confirm") is True,
+        }
 
     # The count that actually landed in the database, not the size of the
     # request -- these silently diverged before (see the `[:200]` removal

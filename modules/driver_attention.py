@@ -93,7 +93,7 @@ import statistics
 import time
 from collections import deque
 from pathlib import Path
-from typing import Optional
+from typing import ClassVar, Optional
 
 import cv2
 import mediapipe as mp
@@ -2242,7 +2242,7 @@ class DriverAttentionModule(VisionModule):
         return frame
 
     #: Conditions tracked as live episodes, and the flag that says each is active.
-    _EPISODE_FLAGS = {
+    _EPISODE_FLAGS: ClassVar[dict[str, str]] = {
         "drowsiness": "_drowsy_active",
         "distraction": "_distracted_active",
         "eyes_down": "_eyes_down_active",

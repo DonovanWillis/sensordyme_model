@@ -199,9 +199,10 @@ def _alert_violations(role: Role, alerts: dict) -> list[str]:
     if isinstance(categories, dict):
         for name in sorted(role.repeating_categories):
             override = categories.get(name)
-            if isinstance(override, dict):
-                if override.get("repeat_s", 1) == 0 or override.get("max_repeats", 1) == 0:
-                    errors.append(f"role '{role.name}' requires the '{name}' alert category to keep repeating")
+            if isinstance(override, dict) and (
+                override.get("repeat_s", 1) == 0 or override.get("max_repeats", 1) == 0
+            ):
+                errors.append(f"role '{role.name}' requires the '{name}' alert category to keep repeating")
     return errors
 
 

@@ -43,7 +43,7 @@ from collections import deque
 from collections.abc import Iterable
 from dataclasses import dataclass
 from enum import Enum
-from typing import Optional, Protocol
+from typing import ClassVar, Optional, Protocol
 
 from core.events import Event
 from core.logging_setup import get_logger
@@ -161,7 +161,7 @@ class _PatternPlayer:
     """
 
     _DEPTH = 2
-    _RANK = {"notice": 0, "warning": 1, "impaired": 2, "critical": 3}
+    _RANK: ClassVar[dict[str, int]] = {"notice": 0, "warning": 1, "impaired": 2, "critical": 3}
 
     def __init__(self, render_step) -> None:
         self._render_step = render_step  # callable(on_s) that blocks for on_s

@@ -995,7 +995,7 @@ class DeviceRuntime:
             f" instruction={self.monitoring.instruction!r}" if self.monitoring.instruction else "",
         )
 
-    def _emit_rule_alert(self, alert) -> None:
+    def _emit_rule_alert(self, alert, now: Optional[float] = None) -> None:
         """Route a confirmed AI-rule alert through the same path as built-in events.
 
         Custom rules are not a second-class channel: they log, notify locally, and
@@ -1022,6 +1022,7 @@ class DeviceRuntime:
             level=AlertLevel.CONTINUOUS if alert.severity == "critical" else AlertLevel.SOFT,
             category=_RULE_CATEGORY.get(alert.severity, "warning"),
             source="rules",
+            now=now,
         )
         self.logger.log(event)
         severity = "loud" if alert.severity == "critical" else "soft"
@@ -1401,6 +1402,7 @@ class DeviceRuntime:
         if not self.monitoring.active:
             return
         self.monitoring.clear()
+        self._custom_rules_rejected = False
         self.rule_engine.replace_rules([])
         self.rule_engine.set_zones(self._effective_zones(self.module_name))
         if self.uplink is not None:
@@ -1605,15 +1607,87 @@ class DeviceRuntime:
                     instruction=self.uplink.pending_instruction(),
                     version=self.uplink.rules_version(),
                 )
-                self._publish_monitoring()
                 # A new configuration can change which detector is needed.
                 self._apply_monitoring_mode()
                 self._apply_requested_labels()
+                # Reported after the mode is applied, so the report names the
+                # mode actually running (ADDITIVE vs AI_CUSTOM), not the old one.
+                self._publish_monitoring()
                 pending_zones = self.rule_engine.pending_zones()
                 print(
                     f"rules: enforcing {len(self.rule_engine.rules)} AI-configured rule(s)"
                     + (f"; awaiting zones: {', '.join(pending_zones)}" if pending_zones else "")
                 )
+
+    # ------------------------------------------------------------------ per-frame alert path
+    def _dispatch_module_events(self, module, events, now: float) -> bool:
+        """Alert, record and publish one frame's module events; advance its episodes.
+
+        Returns whether a loud event was seen (evidence capture is due). Split out
+        of the inference loop so the exact production path can be driven with an
+        injected clock (tests/test_m01_role_floors.py).
+        """
+        # Belt and braces. The module running under AI_CUSTOM is a general
+        # detector with no opinions to suppress, so this should already be
+        # empty — but a mode switch that has not landed yet, or a detector
+        # that grows its own events later, must not leak alerts nobody asked
+        # for. The real saving is that the expensive module is not running
+        # at all; see _apply_monitoring_mode. ADDITIVE never discards: the
+        # module there is a safeguard the role requires.
+        if self.mode is monitoring_mode.MonitoringMode.AI_CUSTOM:
+            events = []
+        evidence_due = False
+        for event in events:
+            # Alert first, then record. The alert is the product; a log
+            # write that fails (full or read-only SD card) must never be
+            # what stands between a confirmed event and the buzzer.
+            # Each event starts an alert EPISODE; it is never dropped
+            # because an earlier episode alerted recently (M0.1).
+            if event.type in self.alert_event_types:
+                self.alert_manager.notify(event, now=now)
+            self.logger.log(event)
+            severity = (
+                "loud" if event.type in self.loud_types
+                else "soft" if event.type in self.soft_types or event.type in self.alert_event_types
+                else "log"
+            )
+            if severity == "loud":
+                evidence_due = True
+            if self.dashboard is not None:
+                self.dashboard.push_event(event, severity)
+            # Edge-triggered: every genuinely new event reaching Recent
+            # Activity arms the flash window, regardless of severity --
+            # see _apply_alert_overlay's caller below and _FLASH_DURATION_S.
+            self._flash_until = time.monotonic() + _FLASH_DURATION_S
+            if self.uplink is not None and event.type in self.alert_event_types:
+                self.uplink.push_event(event, severity, model=self._model_identity)
+
+        # Advance this module's open episodes: repeat/escalate those whose
+        # condition is still true, end the ones that cleared.
+        tracked, active = _episode_state(module)
+        self.alert_manager.observe(now, source="module", active=active, tracked=tracked)
+        return evidence_due
+
+    def _evaluate_custom_rules(self, module, frame, now: float) -> None:
+        """Evaluate custom rules on the module's raw per-frame view; advance rule episodes.
+
+        AI-configured rules evaluate the module's raw per-frame view, not its
+        Events: zone and count rules need boxes and counts that an Event does
+        not carry, and Events are already debounced.
+        """
+        detection_frame = module.get_detections()
+        if detection_frame is not None and self.rule_engine.rules:
+            for alert in self.rule_engine.observe_frame(detection_frame, now=now):
+                self._emit_rule_alert(alert, now=now)
+                self._capture_training_sample(frame, alert, detection_frame)
+        # Custom-rule episodes: a critical rule repeats while it stays
+        # confirmed; every other rule alert is a one-off episode.
+        self.alert_manager.observe(
+            now, source="rules",
+            active=self.rule_engine.active_alerts(),
+            tracked={r.rule_id for r in self.rule_engine.rules
+                     if r.severity == "critical" and r.notify != "silent"},
+        )
 
     # ------------------------------------------------------------------ the inference loop
     def _inference_loop(self, stop: threading.Event) -> None:
@@ -1710,45 +1784,8 @@ class DeviceRuntime:
                 self._heartbeat = time.monotonic()
                 continue
 
-            # Belt and braces. The module running under AI_CUSTOM is a general
-            # detector with no opinions to suppress, so this should already be
-            # empty — but a mode switch that has not landed yet, or a detector
-            # that grows its own events later, must not leak alerts nobody asked
-            # for. The real saving is that the expensive module is not running
-            # at all; see _apply_monitoring_mode.
-            if self.mode is monitoring_mode.MonitoringMode.AI_CUSTOM:
-                events = []
-            evidence_due = False
             alert_now = time.monotonic()
-            for event in events:
-                # Alert first, then record. The alert is the product; a log
-                # write that fails (full or read-only SD card) must never be
-                # what stands between a confirmed event and the buzzer.
-                # Each event starts an alert EPISODE; it is never dropped
-                # because an earlier episode alerted recently (M0.1).
-                if event.type in self.alert_event_types:
-                    self.alert_manager.notify(event, now=alert_now)
-                self.logger.log(event)
-                severity = (
-                    "loud" if event.type in self.loud_types
-                    else "soft" if event.type in self.soft_types or event.type in self.alert_event_types
-                    else "log"
-                )
-                if severity == "loud":
-                    evidence_due = True
-                if self.dashboard is not None:
-                    self.dashboard.push_event(event, severity)
-                # Edge-triggered: every genuinely new event reaching Recent
-                # Activity arms the flash window, regardless of severity --
-                # see _apply_alert_overlay's caller below and _FLASH_DURATION_S.
-                self._flash_until = time.monotonic() + _FLASH_DURATION_S
-                if self.uplink is not None and event.type in self.alert_event_types:
-                    self.uplink.push_event(event, severity, model=self._model_identity)
-
-            # Advance this module's open episodes: repeat/escalate those whose
-            # condition is still true, end the ones that cleared.
-            tracked, active = _episode_state(module)
-            self.alert_manager.observe(alert_now, source="module", active=active, tracked=tracked)
+            evidence_due = self._dispatch_module_events(module, events, alert_now)
 
             # Evidence snapshots: OPT-IN (alerts.save_evidence), local-disk only,
             # bounded count — the single, deliberate exception to "frames are never
@@ -1756,22 +1793,7 @@ class DeviceRuntime:
             if evidence_due and self._evidence_dir is not None:
                 self._save_evidence(module, frame, events)
 
-            # AI-configured rules evaluate the module's raw per-frame view, not its
-            # Events: zone and count rules need boxes and counts that an Event does
-            # not carry, and Events are already debounced.
-            detection_frame = module.get_detections()
-            if detection_frame is not None and self.rule_engine.rules:
-                for alert in self.rule_engine.observe_frame(detection_frame):
-                    self._emit_rule_alert(alert)
-                    self._capture_training_sample(frame, alert, detection_frame)
-            # Custom-rule episodes: a critical rule repeats while it stays
-            # confirmed; every other rule alert is a one-off episode.
-            self.alert_manager.observe(
-                time.monotonic(), source="rules",
-                active=self.rule_engine.active_alerts(),
-                tracked={r.rule_id for r in self.rule_engine.rules
-                         if r.severity == "critical" and r.notify != "silent"},
-            )
+            self._evaluate_custom_rules(module, frame, alert_now)
 
             # A periodic frame with nothing happening. Negatives are what stop a
             # detector learning to answer yes to everything, and they are gated
