@@ -128,6 +128,8 @@ def _session(path: str, provider: str):
     opts = ort.SessionOptions()
     opts.graph_optimization_level = ort.GraphOptimizationLevel.ORT_ENABLE_ALL
     if provider == "cuda":
+        import torch  # noqa: F401  # pyright: ignore[reportMissingImports] - loads the CUDA/cuDNN libraries ORT needs
+
         providers: list[Any] = [("CUDAExecutionProvider", {"use_tf32": 0}), "CPUExecutionProvider"]
     elif provider == "dml":
         opts.enable_mem_pattern = False
