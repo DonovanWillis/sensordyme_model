@@ -47,8 +47,9 @@ EDITS: dict[str, list[tuple[str, str]]] = {
         (
             "        classes = torch.tensor(classes)\n        target.add_field('labels', classes)\n",
             "        classes = torch.tensor(classes)\n        target.add_field('labels', classes)\n"
-            "        target.add_field('sd_unverified', torch.as_tensor(np.tile(self._sd_unverified_row(idx), "
-            "(len(classes), 1))).reshape(len(classes), -1))  " + MARK + "\n",
+            "        _sd_row = self._sd_unverified_row(idx)  " + MARK + "\n"
+            "        target.add_field('sd_unverified', torch.as_tensor(np.tile(_sd_row, (len(classes), 1)))"
+            ".reshape(len(classes), len(_sd_row)))\n",
         ),
         (
             "        res = np.zeros((len(target.bbox), 5))\n        for idx in range(len(target.bbox)):\n"
@@ -62,8 +63,8 @@ EDITS: dict[str, list[tuple[str, str]]] = {
         (
             "            classes = torch.tensor(classes)[valid_idx]\n            target.add_field('labels', classes.long())\n",
             "            classes = torch.tensor(classes)[valid_idx]\n            target.add_field('labels', classes.long())\n"
-            "            _sd = np.array([label[5:] for label in labels], dtype=np.float32).reshape(len(labels), -1)  "
-            + MARK + "\n"
+            "            _sd = np.asarray(labels, dtype=np.float32)  " + MARK + "\n"
+            "            _sd = _sd[:, 5:] if _sd.ndim == 2 else np.zeros((0, 0), dtype=np.float32)\n"
             "            target.add_field('sd_unverified', torch.as_tensor(_sd)[valid_idx])\n",
         ),
         (
