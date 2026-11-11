@@ -107,3 +107,13 @@ merged. One entry per checkpoint: commit, feature or defect, tests, resource use
 - `release_status.yaml`: the six M6.5 entries filled with evidence and tiers; the status test now requires them filled.
 - `make verify-release` PASS at `bc4ceba`; systemd step skipped on macOS.
 - `docs/MONDAY_RUNBOOK.md`: an M6.5 notes block for K and L.
+
+## H. Final verification
+
+- **Combined suite on oryn:**
+  - At `73ba319` (job `20261111-090635-cdebb2`) and at `1a83e40` (job `20261111-091351-889f23`): **2,982 passed, 6 skipped, 0 failed**.
+  - ruff clean; worker checks OK (`systemd-analyze verify`, exposure 9.0 → 1.7, device dependencies).
+  - `cryptography` 50.0.2 matches the lock pin.
+  - The skips are environmental: no generated `Info.plist`, no migration backup, no `onnx`, no `visudo`, no `.hef` on the worker, not a git checkout.
+- **Mac:** `make verify-release` PASS at `bc4ceba`.
+- **Still running at the end:** nothing. The training job, agent jobs and background waits have all finished.
