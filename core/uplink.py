@@ -19,7 +19,7 @@ import threading
 import time
 import uuid
 from collections import deque
-from typing import Optional
+from typing import Any, Optional
 from urllib.parse import urlsplit
 
 from core import command_auth as auth
@@ -139,6 +139,9 @@ def _finite(value, default: float = 0.0) -> float:
     return number if math.isfinite(number) else default
 
 
+#: More entries than any device runs is not a command, it is garbage.
+_MAX_NODE_ENTRIES = 32
+
 class CloudUplink:
     """Background sync loop between this device and the cloud backend."""
 
@@ -168,6 +171,9 @@ class CloudUplink:
         self._pending_zones: Optional[list[dict]] = None
         #: Explicit stop/resume from the backend (M0.1); applied by the main loop.
         self._pending_protection: Optional[dict] = None
+        #: Companion monitoring nodes from the backend (M7, core/nodes.py):
+        #: {node_id: {enabled, settings}}; applied by the main loop.
+        self._pending_nodes: Optional[Any] = None
         self._stop = threading.Event()
         self._connected = False
         self._explained_failure = False
@@ -430,6 +436,17 @@ class CloudUplink:
             pending, self._pending_protection = self._pending_protection, None
             return pending
 
+    def pop_pending_nodes(self) -> Optional[Any]:
+        """A set_nodes command awaiting the main loop: {node_id: {enabled, settings}}.
+
+        Acknowledged by the device reporting the node in monitoring.perception
+        (core/perception.py) or refusing it as last_rejection {kind: "nodes"},
+        so it is not acked here.
+        """
+        with self._lock:
+            pending, self._pending_nodes = self._pending_nodes, None
+            return pending
+
     def pop_pending_zones(self) -> Optional[list[dict]]:
         """Zones drawn in the app, awaiting the main loop.
 
@@ -572,6 +589,13 @@ class CloudUplink:
             protection = command.get("set_protection")
             if isinstance(protection, dict) and protection.get("action") in ("stop", "resume"):
                 self._accept_protection(protection)
+            if "set_nodes" in command:
+                nodes = command.get("set_nodes")
+                if isinstance(nodes, (dict, list)) and len(nodes) <= _MAX_NODE_ENTRIES:
+                    with self._lock:
+                        self._pending_nodes = nodes
+                else:
+                    print("cloud_uplink: ignored a malformed set_nodes command")
             if "set_zones" in command:
                 zones = command.get("set_zones")
                 with self._lock:

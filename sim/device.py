@@ -99,6 +99,7 @@ class VirtualDevice:
         echo_alerts: bool = False,
         log_level: str = "info",
         honour_backoff: bool = False,
+        config_overrides: Optional[dict] = None,
     ) -> None:
         self.state_dir = Path(state_dir).resolve()
         self.state_dir.mkdir(parents=True, exist_ok=True)
@@ -115,6 +116,10 @@ class VirtualDevice:
         #: advance() waits CloudUplink.next_delay() between syncs (the production
         #: worker's jittered reconnection backoff) instead of the fixed poll interval.
         self.honour_backoff = bool(honour_backoff)
+        #: Top-level config keys replaced after the repo config is adapted (e.g.
+        #: {"role": "general", "module": "shared_perception"}): another kind of
+        #: device, same code.
+        self.config_overrides = dict(config_overrides or {})
         self.log_level = log_level
         self.buzzer = SimBuzzerSink(echo=echo_alerts)
         monotonic = clock.monotonic if clock is not None else time.monotonic
@@ -185,6 +190,7 @@ class VirtualDevice:
             modules["driver_attention"]["calibration_path"] = str(data / "calibration.json")
         if "driver_attention_dashsentinel" in modules:
             modules["driver_attention_dashsentinel"]["profile_path"] = str(data / "dashsentinel_profile.json")
+        config.update(copy.deepcopy(self.config_overrides))
         return config
 
     def write_config(self) -> Path:

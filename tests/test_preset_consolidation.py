@@ -16,9 +16,11 @@ def test_there_is_exactly_one_driver_mode():
     assert driver == ["driver_safety"], driver
 
 
-def test_the_four_consumer_modes_are_present():
+def test_the_consumer_modes_are_present():
     modes = set(load_presets())
-    assert modes == {"driver_safety", "baby_monitoring", "elderly_monitoring", "security_monitoring"}
+    # The four original modes, plus the two built from shared-perception nodes (M7).
+    assert modes == {"driver_safety", "baby_monitoring", "elderly_monitoring", "security_monitoring",
+                     "occupancy", "workplace_safety"}
 
 
 def test_the_driver_mode_is_named_for_what_it_does():

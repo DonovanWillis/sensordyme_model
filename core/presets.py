@@ -478,6 +478,8 @@ def _entry(registry: Any, name: str, preset: dict, presets: dict, *, planned: bo
             "references": _strings(preset.get("evidence")),
         },
         "limitations": _strings(preset.get("limitations")),
+        # Monitoring nodes the preset runs (core/nodes.py), when it is built from them.
+        "nodes": [str(n.get("node")) for n in preset.get("nodes") or [] if isinstance(n, dict) and n.get("node")],
     }
 
 
@@ -609,3 +611,22 @@ def device_availability(entry: dict, *, role: Any = None, capabilities: Optional
         if kind in impaired:
             return CODE_IMPAIRED, f"{kind} is impaired on this device ({impaired[kind] or 'no reason given'})"
     return None, None
+
+
+# ---------------------------------------------------------------------- monitoring nodes (M7)
+def load_companion_nodes() -> list[dict]:
+    """The companion monitoring nodes this software can run (core/nodes.py), as
+    the API describes them: id, title, required capabilities, settings schema,
+    events, limitations. The backend validates `POST .../nodes` against this.
+
+    Imported lazily: core.nodes pulls in the rule engine, which this module's
+    dependency-free callers may not want at import time.
+    """
+    from core.nodes import COMPANIONS
+
+    return [cls.spec.to_dict() for cls in COMPANIONS.values()]
+
+
+def load_nodes() -> list[dict]:
+    """Alias of load_companion_nodes() (the name the backend also looks for)."""
+    return load_companion_nodes()

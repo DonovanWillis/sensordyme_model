@@ -93,6 +93,13 @@ dashboard:
 # `required: true` refuses to start without a usable accelerator; with false the
 # device boots degraded instead, which is the more useful failure because health,
 # the dashboard and provisioning all stay up to report it.
+# The shared perception engine (core/perception.py, M7): every model runs at most
+# once per analysed frame whoever asks, and each frame ends in one typed
+# Observation for the module, custom rules and monitoring nodes (core/nodes.py).
+perception:
+  max_age_s: 1.0 # a result older than this is stale: reported, and never used as current
+  # detector_weights: unset = the running module's own detector weights
+
 # `yolo_hef` must point to a model compiled for Hailo with the
 # Dataflow Compiler (see docs/ACCELERATOR.md) — a .pt/.onnx cannot run on the HAT.
 accelerator:
@@ -630,6 +637,13 @@ modules:
     yawn_mar_threshold: 0.45
     yawn_frames_threshold: 12
     refine_landmarks: false # their default; true adds iris landmarks (slower)
+
+  # The module node-backed modes run on (modules/shared_perception.py, M7):
+  # keeps the shared detector running; the monitoring nodes do the rest.
+  shared_perception:
+    yolo_weights: yolo11n.pt # a cache key when accelerator.yolo_hef is set (same detector as driver_attention)
+    detect_every_n_frames: 2
+    confidence_threshold: 0.35
 
   occupancy:
     confidence_threshold: 0.5 # YOLO person-detection confidence threshold

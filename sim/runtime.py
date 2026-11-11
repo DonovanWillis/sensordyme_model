@@ -73,6 +73,11 @@ class SimContext:
         self.model_failure = model_failure
         self.scenario_name = scenario_name
         self.detectors: list = []
+        #: The device's one detector, shared by every module build and every
+        #: monitoring node, as on hardware (core/detectors.py loads it once).
+        #: The runtime's perception engine wraps it; `detector.calls` counts
+        #: every real inference, whoever asked.
+        self.detector = perception.ScriptedDetector(state)
         self.uplink: Optional[object] = None
         #: Every monitoring state this boot has passed through, in order.
         self.transitions: list[str] = []
@@ -83,7 +88,7 @@ class SimContext:
             raise RuntimeError("SIMULATED model failure: the perception model could not be loaded")
         module = module_cls(module_config)
         if self.scripted and perception.supports(module):
-            self.detectors.append(perception.install(module, self.state))
+            self.detectors.append(perception.install(module, self.state, detector=self.detector))
         return module
 
 
@@ -92,6 +97,9 @@ class SimRuntime(DeviceRuntime):
         self.sim = sim
         self.monitoring_path = str(sim.state_dir / "monitoring.json")
         super().__init__(**kwargs)
+        # Every Observation from this device says so (core/perception.py).
+        self._perception_source = "sim"
+        self._perception_simulated = True
         # Instance attribute, read as self._REBOOT_STATE_PATH: never data/ in the cwd.
         self._REBOOT_STATE_PATH = sim.state_dir / "reboot_state.json"
 
@@ -113,6 +121,12 @@ class SimRuntime(DeviceRuntime):
 
     def _scripted(self) -> bool:
         return self.sim.scripted and perception.supports(self.module)
+
+    def _load_shared_detector(self):
+        """A node beside a detector-less module gets the device's scripted detector."""
+        if self.sim.scripted:
+            return self.sim.detector
+        return super()._load_shared_detector()
 
     def _verify_detection_backend(self) -> None:
         from modules.base import UnavailableModule

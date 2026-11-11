@@ -58,6 +58,7 @@ from core.detectors import get_yolo_model
 from core.event_engine import CONFIRMED, RESOLVED, EventEngine, RuleSpec
 from core.events import Event
 from core.keypoints import from_detection_box
+from core.monitoring_state import Capability
 from core.tracking import PersonTracker
 from core.zones import BoundaryCrossing, load_zones
 from modules.base import VisionModule, register_module
@@ -516,6 +517,11 @@ class OccupancyModule(VisionModule):
         self._extra_labels = {label for label in labels if label in name_to_id}
         # Added to, never replacing, the zone rules' own vehicle/animal classes.
         self._refresh_requested_classes()
+
+    def capability_status(self) -> dict:
+        """The detector it runs on every frame. Pose verification works on crops
+        (outside the shared per-frame engine) and is not a capability it claims."""
+        return {"objects": Capability()}
 
     def get_detections(self) -> DetectionFrame:
         """This frame's detections, with boxes, so zone/count/relation rules can evaluate."""

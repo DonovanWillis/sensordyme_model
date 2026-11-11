@@ -22,6 +22,8 @@ _KNOWN_TOP_LEVEL = {
     "training",
     # Deployment role and its safety floor (core/roles.py, M0.1).
     "role",
+    # The shared perception engine (core/perception.py, M7): max_age_s, detector_weights.
+    "perception",
     # development (default) | production: production refuses insecure fallbacks,
     # e.g. unauthenticated Bluetooth setup (services/ble_pop.py, M6.5).
     "deployment",

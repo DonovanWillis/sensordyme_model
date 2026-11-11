@@ -249,6 +249,10 @@ class MonitoringReport:
     last_inference_age_s: Optional[float]
     model: Mapping[str, object]
     versions: Mapping[str, Optional[str]]
+    #: The shared perception engine's report (core/perception.py, sd-perception/1):
+    #: every component's state and every monitoring node. None for callers that
+    #: predate it.
+    perception: Optional[Mapping[str, object]] = None
 
     @property
     def monitoring(self) -> bool:
@@ -275,4 +279,5 @@ class MonitoringReport:
             "last_inference_age_s": self.last_inference_age_s,
             "model": dict(self.model),
             "versions": dict(self.versions),
+            **({"perception": dict(self.perception)} if self.perception is not None else {}),
         }

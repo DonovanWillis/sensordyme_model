@@ -251,48 +251,81 @@ presets:
       - Cannot hear crying (no microphone) or tell sleeping from awake
       - Will not claim a covered face; adult face and pose models are not reliable on infants
       - Pose-based flailing and choking-hazard scoring are unevaluated on consented footage
+      - Not a medical device. It does not detect choking, breathing problems or any medical emergency; choking_hazard is only a small object near the mouth region
     evidence:
       - docs/MODEL_REGISTRY.md
       - docs/DETECTIONS.md
 
-# Product modes no device can run yet. Listed so the app can show them honestly
-# ("planned", and why) instead of either hiding them or faking them. Never
-# returned by load_presets(), so no command path can select one.
-planned:
+  # ---- modes built from monitoring nodes on the shared perception engine (M7) ----
+  # They own no model: `module: shared_perception` keeps the shared object
+  # detector running and gives custom rules a per-frame view, and the nodes
+  # named under `nodes:` (core/nodes.py) read the detector's output from each
+  # frame's Observation (core/perception.py), so two consumers of person
+  # detection cost one inference. Their tier is synthetic_tests at most
+  # (core/model_registry.yaml monitoring_nodes): exercised on the virtual
+  # device only, never measured on real footage.
   occupancy:
     title: Occupancy
-    description: Room occupancy counts and capacity alerts.
-    module: occupancy
+    description: People count, entries and exits, and time spent in areas you draw.
+    module: shared_perception
+    nodes:
+      - { node: people_counter }
+    alert_types: [capacity_exceeded, zone_dwell]
     version: 1
     product_mode: occupancy
-    reason: >-
-      There is no standalone Occupancy mode yet. The occupancy module (person
-      counting, crowd threshold, presence in drawn areas) runs today inside
-      Security Monitoring; a dedicated mode needs its own alert set (capacity,
-      room empty) and an entry in the app.
-    served_by: [security_monitoring]
     required_capabilities: [camera, inference, objects, alert_output]
-    optional_capabilities: [pose]
+    optional_capabilities: []
+    hardware:
+      camera: Camera Module 3 Wide, a view of the room or doorway
+      accelerator: Hailo-8L for the shared object detector
+      audible_output: not required (alerts go to the app)
+    temporal_policies:
+      - { event: person_entered, description: the settled person count rose (a count must hold for 2 s), sustain_s: 2.0 }
+      - { event: person_exited, description: the settled person count fell, sustain_s: 2.0 }
+      - { event: zone_dwell, description: someone stayed inside a drawn area, sustain_s: 30.0 }
+      - { event: capacity_exceeded, description: more people than the set capacity (off unless set) }
+    alert_patterns:
+      - { tone: soft, events: [capacity_exceeded, zone_dwell], description: "push to the app; no local tone" }
+    compatibility:
+      custom_rules: replace
     limitations:
-      - Counts are per frame from the object detector; people hidden behind others are not counted
+      - Counts per-frame person boxes; people hidden behind others are not counted and identities are not tracked
+      - Exercised only on the virtual device (synthetic scenes); no in-domain occupancy evidence exists
     evidence:
+      - docs/M7_IMPLEMENTATION_MAP.md
       - docs/MODEL_REGISTRY.md
 
   workplace_safety:
     title: Workplace Safety
-    description: PPE compliance and hazard-area monitoring for work sites.
-    module: null
+    description: A person entering a restricted area you draw. No PPE, vehicle or forklift detection.
+    module: shared_perception
+    nodes:
+      - { node: zone_watch }
+    alert_types: [restricted_area]
     version: 1
     product_mode: workplace_safety
-    reason: >-
-      No PPE, hard-hat, hi-vis or forklift detector exists: COCO-80 has no such
-      classes and core/capabilities.py declares headwear detection unavailable.
-      The workplace-relevant capabilities that do exist are fall detection
-      (Elderly Monitoring) and restricted areas (Security Monitoring).
-    served_by: [elderly_monitoring, security_monitoring]
-    required_capabilities: [camera, inference, objects]
+    required_capabilities: [camera, inference, objects, alert_output]
     optional_capabilities: []
+    hardware:
+      camera: Camera Module 3 Wide, a view of the areas to watch
+      accelerator: Hailo-8L for the shared object detector
+      audible_output: not required (alerts go to the app)
+    temporal_policies:
+      - { event: restricted_area, description: a person inside an area drawn as restricted, sustain_s: 2.0 }
+    alert_patterns:
+      - { tone: soft, events: [restricted_area], description: "push to the app (critical areas: loud)" }
+    compatibility:
+      custom_rules: replace
     limitations:
-      - Needs a PPE detection model, a licence review, and in-domain evaluation before it can exist
+      - Person-in-area only. There is no PPE, hard-hat, hi-vis, vehicle or forklift detector; nothing here claims one
+      - Only areas drawn in the app as restricted are watched; an undrawn area watches nothing
+      - Exercised only on the virtual device (synthetic scenes)
     evidence:
+      - docs/M7_IMPLEMENTATION_MAP.md
       - docs/MODEL_REGISTRY.md
+
+# Product modes no device can run yet. Listed so the app can show them honestly
+# ("planned", and why) instead of either hiding them or faking them. Never
+# returned by load_presets(), so no command path can select one. Occupancy and
+# Workplace Safety left this list in M7 (node-backed presets above).
+planned: {}

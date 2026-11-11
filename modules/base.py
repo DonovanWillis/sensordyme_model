@@ -198,6 +198,15 @@ class VisionModule(ABC):
         """
         return None
 
+    def perception_signals(self) -> dict:
+        """What this module derived from the shared face model on the last frame.
+
+        Keys "eye_state", "head_pose" and "gaze", each a core/perception.py
+        dataclass, present only when actually computed on that frame. The
+        runtime folds them into the frame's Observation. Default: nothing.
+        """
+        return {}
+
     def get_telemetry_snapshot(self) -> Optional[dict]:
         """Raw per-frame signal snapshot for telemetry logging (future model-training data).
 

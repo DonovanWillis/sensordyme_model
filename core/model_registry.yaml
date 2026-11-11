@@ -47,6 +47,98 @@ modules:
     uses: [objects]
     optional: [pose]                      # verify_new_tracks_with_pose (default false)
     source: modules/occupancy.py
+  shared_perception:
+    uses: [objects]                       # M7: keeps the shared detector running for node-backed modes
+    source: modules/shared_perception.py
+
+# The shared perception engine's components (core/perception.py, M7): which
+# model each one runs and which product capabilities it serves. Every module
+# and monitoring node reaches these models through the engine, so each runs at
+# most once per frame however many consumers ask.
+inference_components:
+  object_detector:
+    capability: objects
+    provider: damo_yolo_tinynasl20_t_coco80
+    product_capabilities: [person_detection, phone_detection]
+  face_landmarks:
+    capability: face
+    provider: mediapipe_face_mesh
+    product_capabilities: [drowsiness, gaze_distraction]
+  hand_landmarks:
+    capability: hands
+    provider: mediapipe_hands
+    product_capabilities: [hand_object_association]
+  pose:
+    capability: pose
+    provider: mediapipe_pose
+    product_capabilities: [fall_detection]
+
+# Monitoring nodes (core/nodes.py): a mode, the custom-rule node, or a companion
+# beside a mode. claimed_tier is refused when it exceeds any product capability
+# the node depends on (node_violations), and the device reports
+# min(claimed_tier, those capabilities' tiers) (node_tier). No node is above
+# synthetic_tests: a mode is not validated because its tests pass, and a
+# simulated event is not evidence of real-world accuracy.
+monitoring_nodes:
+  driver_safety:
+    kind: preset
+    preset: driver_safety
+    components: [face_landmarks, object_detector, hand_landmarks]
+    product_capabilities: [drowsiness, gaze_distraction, phone_detection, person_detection]
+    claimed_tier: synthetic_tests
+    notes: >-
+      Drowsiness, gaze and phone events are exercised on the virtual device and
+      in unit tests; no in-cabin event-level evidence exists. behavior_v2
+      (hand-phone interaction, long glances, glance budgets, gaze zones) is
+      experimental and off by default.
+  elderly_monitoring:
+    kind: preset
+    preset: elderly_monitoring
+    components: [pose]
+    product_capabilities: [fall_detection]
+    claimed_tier: synthetic_tests
+  security_monitoring:
+    kind: preset
+    preset: security_monitoring
+    components: [object_detector]
+    product_capabilities: [person_detection]
+    claimed_tier: synthetic_tests
+  baby_monitoring:
+    kind: preset
+    preset: baby_monitoring
+    components: [object_detector, pose]
+    product_capabilities: [person_detection, fall_detection]
+    claimed_tier: synthetic_tests
+    notes: >-
+      Pose-based flailing and choking-hazard scoring have no product capability
+      of their own and no evidence; not a medical device.
+  occupancy:
+    kind: preset
+    preset: occupancy
+    components: [object_detector]
+    product_capabilities: [person_detection]
+    claimed_tier: synthetic_tests
+  workplace_safety:
+    kind: preset
+    preset: workplace_safety
+    components: [object_detector]
+    product_capabilities: [person_detection]
+    claimed_tier: synthetic_tests
+  rules:
+    kind: rules
+    components: [object_detector]
+    product_capabilities: [person_detection, phone_detection]
+    claimed_tier: synthetic_tests
+  people_counter:
+    kind: companion
+    components: [object_detector]
+    product_capabilities: [person_detection]
+    claimed_tier: synthetic_tests
+  zone_watch:
+    kind: companion
+    components: [object_detector]
+    product_capabilities: [person_detection]
+    claimed_tier: synthetic_tests
 
 models:
   # ---------------------------------------------------------------- objects

@@ -83,6 +83,7 @@ from core.hand_perception import (
     association_score,
 )
 from core.logging_setup import get_logger
+from core.monitoring_state import Capability
 from core.tracking import BoxTracker
 from core.zones import BoundaryCrossing, Zone, load_zones
 from modules.base import VisionModule, register_module
@@ -2016,6 +2017,13 @@ class BabyMonitoringModule(VisionModule):
                 self._pose.close()
             except Exception as exc:  # noqa: BLE001 - closing twice must be harmless
                 log.debug("pose graph close failed (harmless): %r", exc)
+
+    def capability_status(self) -> dict:
+        """The detector, and Pose only when `enable_pose` built it."""
+        caps = {"objects": Capability()}
+        if self._pose is not None:
+            caps["pose"] = Capability()
+        return caps
 
     def get_detections(self) -> DetectionFrame:
         """People seen in the most recent *detection* frame, for custom rules.

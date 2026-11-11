@@ -29,12 +29,15 @@ from contextlib import contextmanager, suppress
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
+from types import MappingProxyType
 from typing import Any, Optional
 
 import cv2
 
 from core import accel, device_health, device_state, monitoring_mode, roles, sdnotify
 from core import monitoring_state as ms
+from core import nodes as monitoring_nodes
+from core import perception as pc
 from core.alerts import AlertLevel, AlertManager
 from core.camera import Camera, CameraError
 from core.dataset import CaptureStore
@@ -211,6 +214,15 @@ class DeviceRuntime:
     # M0.2 monitoring-state defaults (see _evaluate_monitoring).
     _heartbeat = 0.0
     _heartbeat_reset_at = 0.0
+    # M7 shared-perception defaults: such a runtime has no nodes and a fresh engine.
+    _perception_source = "camera"
+    _perception_simulated = False
+    _last_observation = None
+    _detector_unavailable = None
+    _node_zone_signature = None
+    _companions = MappingProxyType({})
+    _preset_nodes = MappingProxyType({})
+    _node_errors = MappingProxyType({})
     _consecutive_process_failures = 0
     _last_process_error: Optional[str] = None
     _detection_degraded: Optional[str] = None
@@ -285,6 +297,22 @@ class DeviceRuntime:
         saved_zones = device_state.saved_zones()
         if saved_zones is not None:
             self._app_zones = _zones_from_app(saved_zones)
+
+        # The shared perception engine (core/perception.py): every model runs at
+        # most once per analysed frame, whoever asks, and each frame ends in one
+        # typed Observation that the module, custom rules and monitoring nodes
+        # all read. The boot module was built before the engine existed, so its
+        # full-frame models are adopted now; later builds are adopted as made.
+        perception_cfg = config.get("perception") if isinstance(config.get("perception"), dict) else {}
+        self._perception_engine = pc.PerceptionEngine(
+            max_age_s=float(perception_cfg.get("max_age_s", pc.DEFAULT_MAX_AGE_S)))
+        self.perception.set_detector_loader(self._load_shared_detector)
+        self.perception.adopt(module)
+        #: Where analysed frames come from (the simulator says "sim").
+        self._perception_source = "camera"
+        self._perception_simulated = False
+        self._last_observation: Optional[pc.Observation] = None
+        self._detector_unavailable: Optional[str] = None
 
         # AI-configured rules. A rule naming "pool" resolves against the same
         # polygon the module watches.
@@ -370,6 +398,16 @@ class DeviceRuntime:
         self.logger: Optional[EventLogger] = None
         self.telemetry: Optional[TelemetryLogger] = None
         self.hardware = None
+
+        # Monitoring nodes (core/nodes.py) beside the module. Companions the
+        # owner enabled survive a restart (device_state); a preset may also
+        # own nodes (presets.yaml `nodes:`), rebuilt with every preset switch.
+        self._companions: dict[str, monitoring_nodes.MonitoringNode] = {}
+        self._preset_nodes: dict[str, monitoring_nodes.MonitoringNode] = {}
+        self._node_errors: dict[str, str] = {}
+        self._node_zone_signature: Optional[tuple] = None
+        self._set_preset_nodes(active_preset)
+        self._restore_nodes()
 
     # ------------------------------------------------------------------ build
     def _build_module(self, module_name: str, module_config: dict):
@@ -1018,7 +1056,7 @@ class DeviceRuntime:
 
         try:
             module_cfg = self.config.get("modules", {}).get(wanted, {}) or {}
-            new_module = self._build_module(wanted, {**module_cfg, "recalibrate": False})
+            new_module = self.perception.adopt(self._build_module(wanted, {**module_cfg, "recalibrate": False}))
         except Exception as exc:  # noqa: BLE001 - a bad switch must not kill the device
             log.error("could not switch to '%s' for %s: %s", wanted, mode.value, exc)
             return
@@ -1397,16 +1435,374 @@ class DeviceRuntime:
         # rules_version was already acknowledged, so it was never re-sent.
         return validate_rule_set(raw_rules, label_ok=label_ok)
 
-    def _record_rejection(self, kind: str, subject: Optional[str], reasons: list[str]) -> None:
+    def _record_rejection(self, kind: str, subject: Optional[str], reasons: list[str],
+                          code: Optional[str] = None) -> None:
         self._last_rejection = {
             "kind": kind, "subject": subject or "", "reasons": list(reasons), "at": time.time(),
         }
+        if code:
+            self._last_rejection["code"] = code
         if getattr(self, "dashboard", None) is not None:
             setter = getattr(self.dashboard, "set_policy_state", None)
             if callable(setter):
                 setter(self._policy_state())
         if getattr(self, "uplink", None) is not None:
             self._publish_monitoring()
+
+    # ------------------------------------------------------------------ shared perception (M7)
+    @property
+    def perception(self) -> pc.PerceptionEngine:
+        """The shared perception engine (one per runtime; created on first use for a
+        runtime assembled without __init__, as several tests build them)."""
+        engine = self.__dict__.get("_perception_engine")
+        if engine is None:
+            engine = self.__dict__["_perception_engine"] = pc.PerceptionEngine()
+        return engine
+
+    def _shared_detector_weights(self) -> Optional[str]:
+        """The detector a model-less consumer runs: perception.detector_weights, else
+        the running module's, else any configured module's (they share one model)."""
+        cfg = self.config.get("perception") if isinstance(self.config.get("perception"), dict) else {}
+        if cfg.get("detector_weights"):
+            return str(cfg["detector_weights"])
+        module_cfg = self._active_module_config()
+        weights = next((module_cfg[k] for k in self._WEIGHTS_KEYS if module_cfg.get(k)), None)
+        if weights:
+            return str(weights)
+        modules = self.config.get("modules", {}) if isinstance(self.config.get("modules"), dict) else {}
+        for name in ("shared_perception", "driver_attention", "occupancy"):
+            section = modules.get(name) if isinstance(modules.get(name), dict) else {}
+            if section.get("yolo_weights"):
+                return str(section["yolo_weights"])
+        return None
+
+    def _load_shared_detector(self):
+        """PerceptionEngine's detector loader (a node beside a detector-less module)."""
+        from core import detectors
+
+        weights = self._shared_detector_weights()
+        if not weights:
+            raise RuntimeError("no object-detector weights are configured (perception.detector_weights)")
+        return detectors.get_yolo_model(weights)
+
+    def _sync_perception_facts(self) -> None:
+        """What the runtime knows about the detector that the engine cannot see:
+        a backend that is missing altogether, and which exact model loaded."""
+        reason = (f"object detection unavailable: {self._detection_degraded}"
+                  if self._detection_degraded is not None else None)
+        if reason != self._detector_unavailable:
+            self.perception.set_unavailable(pc.OBJECT_DETECTOR, reason)
+            self._detector_unavailable = reason
+        detector = (self._model_identity or {}).get("detector")
+        if detector:
+            self.perception.set_model(pc.OBJECT_DETECTOR, detector)
+
+    def _perceive(self, module, frame, frame_id: int, captured_at: Optional[float]):
+        """One analysed frame through the shared perception engine: (events, Observation).
+
+        Model-less consumers first: whatever a node asked for and is due runs,
+        and the module's own model calls on this frame are then answered from
+        the same results (core/perception.py). The frame always ends, also when
+        the module raises, so no half-open frame is left behind.
+        """
+        engine = self.perception
+        self._sync_perception_facts()
+        engine.begin_frame(frame, frame_id=frame_id, captured_at=captured_at,
+                           source=self._perception_source, simulated=self._perception_simulated)
+        try:
+            with engine.activated():
+                engine.run_due(frame)
+                with engine.consuming(self.module_name):
+                    events = module.process(frame)
+        except Exception:
+            self._last_observation = engine.end_frame()
+            raise
+        observation = engine.end_frame(self._module_signals(module))
+        self._last_observation = observation
+        return events, observation
+
+    @staticmethod
+    def _module_signals(module) -> Optional[dict]:
+        hook = getattr(module, "perception_signals", None)
+        if not callable(hook):
+            return None
+        try:
+            signals = hook()
+        except Exception:  # a broken hook loses the signals, never the frame
+            log.debug("perception_signals() failed", exc_info=True)
+            return None
+        return signals if isinstance(signals, dict) else None
+
+    def _rules_detection_frame(self, module, observation: Optional[pc.Observation]):
+        """The module's per-frame view for custom rules, only when it is current.
+
+        A module that runs the shared detector on a stride used to hand rules
+        the SAME boxes on every frame between detector runs, and its last boxes
+        after a failure. Now rules observe a frame only when the detector ran
+        on it for this module, and nothing while detection is failed, stale or
+        unavailable (the rule engine holds its state; health says why).
+        """
+        if observation is None:
+            return module.get_detections()
+        if pc.OBJECT_DETECTOR not in self.perception.consumed_by(self.module_name):
+            return module.get_detections()  # no shared detector behind its view (e.g. pose labels)
+        status = observation.components.get(pc.OBJECT_DETECTOR)
+        if status is not None and status.state in (pc.FAILED, pc.UNAVAILABLE, pc.STALE):
+            return None
+        if self.module_name not in observation.detection_consumers:
+            return None  # nothing new for this module since its last detector run
+        return module.get_detections()
+
+    # ------------------------------------------------------------------ monitoring nodes (M7)
+    def _node_zones(self) -> list:
+        return list(self._effective_zones(self.module_name))
+
+    def _active_companions(self) -> list:
+        """Companion nodes running now: the preset's own, then the owner's (deduplicated)."""
+        nodes = dict(self._preset_nodes)
+        for node_id, node in self._companions.items():
+            nodes.setdefault(node_id, node)
+        return list(nodes.values())
+
+    def _register_node(self, node) -> None:
+        node.set_zones(self._node_zones())
+        for demand in node.demands():
+            self.perception.demand(demand)
+
+    def _retire_node(self, node) -> None:
+        self.perception.withdraw(node.id)
+        try:
+            node.close()
+        except Exception:
+            log.debug("closing node %s failed", node.id, exc_info=True)
+        # A node id the other set still runs keeps its demands.
+        survivor = self._preset_nodes.get(node.id) or self._companions.get(node.id)
+        if survivor is not None and survivor is not node:
+            for demand in survivor.demands():
+                self.perception.demand(demand)
+
+    def _set_preset_nodes(self, preset_name: Optional[str]) -> None:
+        """Build the companion nodes the active preset owns (presets.yaml `nodes:`)."""
+        base = str(preset_name or "").partition("@")[0].partition(":")[0]
+        wanted = {}
+        for raw in ((self.presets.get(base) or {}).get("nodes") or []) if base else []:
+            if isinstance(raw, dict) and raw.get("node"):
+                wanted[str(raw["node"])] = raw.get("settings") or {}
+        for node_id in [n for n in self._preset_nodes if n not in wanted]:
+            node = self._preset_nodes.pop(node_id)
+            self._retire_node(node)
+        for node_id, settings in wanted.items():
+            if node_id in self._preset_nodes:
+                continue
+            try:
+                node = monitoring_nodes.build_companion(node_id, settings)
+            except (KeyError, ValueError) as exc:
+                log.error("[NODES] preset '%s' names node '%s', which cannot run: %s", base, node_id, exc)
+                self._record_rejection("nodes", node_id, [f"preset {base}: {exc}"], code="node_unavailable")
+                continue
+            self._preset_nodes[node_id] = node
+            self._register_node(node)
+
+    @staticmethod
+    def _node_items(raw) -> Optional[list[tuple[Any, Any]]]:
+        """(node id, {enabled, settings}) pairs from either command shape:
+        {node_id: {enabled, settings}} (the backend's) or [{node, enabled, settings}]."""
+        if isinstance(raw, dict):
+            return list(raw.items())
+        if isinstance(raw, list):
+            return [(item.get("node") if isinstance(item, dict) else None, item) for item in raw]
+        return None
+
+    def _node_problems(self, raw) -> tuple[list[tuple[str, str, str]], dict, set]:
+        """Why a set_nodes command cannot be applied (all or nothing): a list of
+        (node id, code, reason); the enabled nodes with validated settings; and
+        the nodes it explicitly disables."""
+        items = self._node_items(raw)
+        if items is None:
+            return [("", "malformed", "nodes must map node id -> {enabled, settings}")], {}, set()
+        problems: list[tuple[str, str, str]] = []
+        wanted: dict = {}
+        disabled: set[str] = set()
+        seen: set[str] = set()
+        for node_id, item in items:
+            if not isinstance(node_id, str) or not node_id:
+                problems.append(("", "malformed", "a node entry needs a node id"))
+                continue
+            if node_id in seen:
+                problems.append((node_id, "malformed", f"'{node_id}' is listed twice"))
+                continue
+            seen.add(node_id)
+            if not isinstance(item, dict):
+                problems.append((node_id, "malformed", f"'{node_id}' needs {{enabled, settings}}"))
+                continue
+            spec = monitoring_nodes.companion_spec(node_id)
+            if spec is None:
+                known = ", ".join(sorted(monitoring_nodes.COMPANIONS))
+                problems.append((node_id, "unknown_node",
+                                 f"unknown monitoring node '{node_id}' (this device runs: {known})"))
+                continue
+            enabled = item.get("enabled", True)
+            if not isinstance(enabled, bool):
+                problems.append((node_id, "malformed", f"'{node_id}': enabled must be true or false"))
+                continue
+            if not enabled:
+                disabled.add(node_id)
+                continue
+            try:
+                settings = monitoring_nodes.validate_node_settings(spec, item.get("settings"))
+            except ValueError as exc:
+                problems.append((node_id, "invalid_setting", str(getattr(exc, "reason", exc))))
+                continue
+            if "objects" in spec.required_capabilities:
+                missing = self._object_detection_missing()
+                if missing:
+                    problems.append((node_id, "capability_unavailable",
+                                     f"'{node_id}' needs object detection, which {missing}"))
+                    continue
+            wanted[node_id] = settings
+        running = (set(self._companions) - disabled) | set(wanted)
+        if len(running) > monitoring_nodes.MAX_COMPANIONS:
+            problems.append((",".join(sorted(running)), "too_many_nodes",
+                             f"at most {monitoring_nodes.MAX_COMPANIONS} companion nodes can run at once"))
+        return problems, wanted, disabled
+
+    def _object_detection_missing(self) -> Optional[str]:
+        """Why object detection cannot run on this device at all (None = it can)."""
+        if self._detection_degraded is not None:
+            return f"is unavailable on this device ({self._detection_degraded})"
+        status = self.perception.component(pc.OBJECT_DETECTOR)
+        if status.state == pc.UNAVAILABLE:
+            return f"is unavailable on this device ({status.reason})"
+        if not self._shared_detector_weights() and self.perception.detector() is None:
+            return "has no detector configured on this device"
+        return None
+
+    def _apply_nodes(self, raw, source: str) -> None:
+        """A set_nodes command: the wanted state of each named companion node.
+
+        Idempotent: a node already running with the same settings is left alone
+        (its counts and timers carry on), so a re-delivered command has no
+        second effect; nodes the command does not name are left as they are.
+        Refused all-or-nothing, reported as last_rejection {kind: "nodes",
+        subject: <node id>, reasons, code}.
+        """
+        problems, wanted, disabled = self._node_problems(raw)
+        if problems:
+            subject, code, _ = problems[0]
+            self._record_rejection("nodes", subject, [reason for _, _, reason in problems], code=code)
+            log.warning("[NODES] %s refused: %s", source, "; ".join(r for _, _, r in problems))
+            return
+        changed = False
+        for node_id in [n for n in self._companions if n in disabled]:
+            self._retire_node(self._companions.pop(node_id))
+            changed = True
+        for node_id, settings in wanted.items():
+            current = self._companions.get(node_id)
+            if current is not None and current.settings == settings:
+                continue
+            if current is not None:
+                self._retire_node(self._companions.pop(node_id))
+            node = monitoring_nodes.build_companion(node_id, settings)
+            self._companions[node_id] = node
+            self._register_node(node)
+            changed = True
+        if changed:
+            device_state.update(nodes={n.id: {"enabled": True, "settings": dict(n.settings)}
+                                       for n in self._companions.values()})
+            log.info("[NODES] %s: running %s", source, ", ".join(self._companions) or "no companion nodes")
+            if getattr(self, "uplink", None) is not None:
+                self._publish_monitoring()
+
+    def _restore_nodes(self) -> None:
+        saved = device_state.load().get("nodes")
+        if saved:
+            self._apply_nodes(saved, source="restore")
+
+    def _run_nodes(self, observation: pc.Observation, now: float) -> None:
+        nodes = self._active_companions()
+        if not nodes:
+            return
+        zones = self._node_zones()
+        signature = tuple((z.name, tuple(z.polygon), z.kind) for z in zones)
+        if signature != self._node_zone_signature:
+            for node in nodes:
+                node.set_zones(zones)
+            self._node_zone_signature = signature
+        for node in nodes:
+            try:
+                produced = node.consume(observation, now)
+            except Exception as exc:  # one node must never stop the others or the module
+                if self._node_errors.get(node.id) is None:
+                    log.exception("[NODES] %s failed on a frame; it keeps running", node.id)
+                self._node_errors[node.id] = str(exc) or type(exc).__name__
+                continue
+            self._node_errors.pop(node.id, None)
+            for item in produced:
+                self._emit_node_event(node, item)
+
+    def _emit_node_event(self, node, item) -> None:
+        """A node's event: logged, shown, and sent to the app like any other.
+
+        Not routed to the local alert outputs: a companion's count or area
+        event must not sound the driver's buzzer, which is reserved for the
+        safeguards the preset itself raises.
+        """
+        event = item.event
+        if self.logger is not None:
+            self.logger.log(event)
+        if self.dashboard is not None:
+            self.dashboard.push_event(event, item.severity)
+        if item.severity != "log":
+            self._flash_until = time.monotonic() + _FLASH_DURATION_S
+        if self.uplink is not None and item.notify != "silent":
+            self.uplink.push_event(event, item.severity, source=f"node:{node.id}",
+                                   model=self._model_identity, notify=item.notify)
+
+    def _node_entries(self, capabilities) -> list[dict]:
+        """`perception.nodes` (sd-perception/1): every node running now, with its state."""
+        stopped = self._stopped is not None
+        entries: list[dict] = []
+        base = str(getattr(self, "active_preset", None) or "").partition("@")[0].partition(":")[0]
+        preset = self.presets.get(base) if base else None
+        if preset is not None:
+            spec = monitoring_nodes.preset_spec(base, preset)
+            state, missing, reason = monitoring_nodes.node_state(spec, capabilities, stopped=stopped)
+            if self.mode is monitoring_mode.MonitoringMode.AI_CUSTOM and not stopped:
+                state, missing, reason = monitoring_nodes.INACTIVE, [], "custom rules replace this mode"
+            features = []
+            if base == "driver_safety":
+                module_cfg = self._active_module_config()
+                features = [{**f, "enabled": bool(module_cfg.get(f["config_key"], False))}
+                            for f in monitoring_nodes.EXPERIMENTAL_DRIVER_FEATURES]
+            entries.append(monitoring_nodes.wire_entry(
+                spec, state=state, missing=missing, reason=reason,
+                validation=monitoring_nodes.validation_tier(base), experimental_features=features))
+        if self._custom_active():
+            spec = monitoring_nodes.RULES_SPEC
+            state, missing, reason = monitoring_nodes.node_state(spec, capabilities, stopped=stopped)
+            entries.append(monitoring_nodes.wire_entry(
+                spec, state=state, missing=missing, reason=reason,
+                validation=monitoring_nodes.validation_tier("rules"),
+                metrics={"rules": len(self.rule_engine.rules)}))
+        for node in self._active_companions():
+            state, missing, reason = monitoring_nodes.node_state(node.spec, capabilities, stopped=stopped)
+            error = self._node_errors.get(node.id) or getattr(node, "degraded_reason", None)
+            if error and state == monitoring_nodes.ACTIVE:
+                state, reason = monitoring_nodes.DEGRADED, error
+            entry = monitoring_nodes.wire_entry(
+                node.spec, state=state, missing=missing, reason=reason,
+                validation=monitoring_nodes.validation_tier(node.id), metrics=node.metrics(),
+                settings=node.settings)
+            entry["enabled_by"] = "preset" if node.id in self._preset_nodes else "owner"
+            entries.append(entry)
+        return entries
+
+    def perception_report(self, capabilities=None) -> dict:
+        """`monitoring.perception` exactly as the wire contract describes it."""
+        if capabilities is None:
+            capabilities = self._evaluate_monitoring().capabilities
+        return self.perception.to_wire(simulated=self._perception_simulated,
+                                       nodes=self._node_entries(capabilities))
 
     # ------------------------------------------------------------------ monitoring state (M0.2)
     def _module_runs_without_detector(self, module=None) -> bool:
@@ -1465,20 +1861,69 @@ class DeviceRuntime:
                 return ms.Capability(ms.IMPAIRED, f"no frame analysed for {processed:.0f}s")
         return ms.Capability()
 
+    _PERCEPTION_KINDS = ("objects", "face", "hands", "pose")
+
     def _module_capabilities(self, module) -> dict[str, ms.Capability]:
+        """The perception capabilities the running module and nodes use, as the
+        shared engine observed them (core/perception.py), not as declared.
+
+        A module's own `capability_status()` says WHICH capabilities it needs
+        and may know more (a detector in backoff); whether each model actually
+        produced results recently is the engine's to say. A model that has not
+        run yet is STARTING (bounded by the readiness grace), never "available".
+        """
         hook: Any = getattr(module, "capability_status", dict)
-        caps: dict[str, ms.Capability]
         try:
-            caps = dict(hook())
+            declared = dict(hook())
         except Exception as exc:  # noqa: BLE001 - a broken report is itself a fact to report
-            caps = {"module": ms.Capability(ms.IMPAIRED, f"capability report failed: {exc}")}
-        if not caps:
-            # Undeclared: judged only by whether it processes frames (camera,
+            declared = {"module": ms.Capability(ms.IMPAIRED, f"capability report failed: {exc}")}
+        caps = {k: v for k, v in declared.items() if k not in self._PERCEPTION_KINDS}
+        expected = {k for k in declared if k in self._PERCEPTION_KINDS}
+        expected |= {pc.CAPABILITY_OF[c] for c in self.perception.consumed_by(self.module_name)}
+        for node in self._active_companions():
+            expected |= {k for k in (*node.spec.required_capabilities, *node.spec.optional_capabilities)
+                         if k in self._PERCEPTION_KINDS}
+        if not expected and not declared:
+            # A module this software does not describe, that has not touched a
+            # shared model: judged only by whether it processes frames (camera,
             # inference), which is all that can honestly be said about it.
-            caps = {kind: ms.Capability() for kind in ("objects", "pose", "face", "hands")}
+            caps = {kind: ms.Capability() for kind in self._PERCEPTION_KINDS}
+        status = self.perception.status()
+        now = time.monotonic()
+        for kind in sorted(expected):
+            caps[kind] = self._perception_capability(status[pc.COMPONENT_OF[kind]], declared.get(kind), now)
         if self._detection_degraded is not None:
             caps["objects"] = ms.Capability(ms.IMPAIRED, f"object detection unavailable: {self._detection_degraded}")
         return caps
+
+    def _perception_capability(self, status: pc.ComponentStatus, declared: Optional[ms.Capability],
+                               now: float) -> ms.Capability:
+        label = status.name.replace("_", " ")
+        if declared is not None and declared.state == ms.IMPAIRED:
+            return declared  # the module knows more (its own backoff, a refused load)
+        if status.state in (pc.FAILED, pc.UNAVAILABLE):
+            return ms.Capability(ms.IMPAIRED, f"{label} {status.state}: {status.reason}")
+        restarted_at = self._ready_grace_from
+        if (status.last_run_age_s is not None and now - status.last_run_age_s < restarted_at
+                and now - restarted_at <= self.perception.max_age_s):
+            # Monitoring just (re)started (boot, resume, mode switch): a result
+            # from before that does not count, and the model has one max_age_s
+            # to produce a fresh one before it is judged stale. Meanwhile the
+            # inference capability says whether anything has been analysed.
+            return declared if declared is not None else ms.Capability(
+                ms.STARTING, f"{label}: waiting for its first result since monitoring started")
+        if status.state == pc.OK:
+            return ms.Capability()
+        if status.state == pc.STALE and status.last_run_age_s is not None:
+            return ms.Capability(ms.IMPAIRED, f"{label} stale: {status.reason}")
+        if status.last_run_age_s is not None:
+            # It has produced results before but not lately (e.g. right after a
+            # stop and resume): an old result, not a cold start.
+            return ms.Capability(ms.IMPAIRED, f"{label} stale: no result for {status.last_run_age_s:.1f}s")
+        # Never produced a result yet (idle, or demanded but not run).
+        if declared is not None and declared.state == ms.STARTING and declared.reason:
+            return declared
+        return ms.Capability(ms.STARTING, f"{label}: waiting for its first result")
 
     def _capabilities(self, now: float, module) -> dict[str, ms.Capability]:
         caps = {"camera": self._camera_capability(now)}
@@ -1531,6 +1976,11 @@ class DeviceRuntime:
                     id=f"rule:{rule.rule_id}", kind="rule", name=rule.description or rule.rule_id,
                     events={rule.rule_id: ms.BASE_REQUIREMENTS | needs}, blocked=blocked,
                 ))
+        for node in self._active_companions():
+            policies.append(ms.Policy(
+                id=f"node:{node.id}", kind="node", name=node.spec.title,
+                events={event: ms.BASE_REQUIREMENTS | needs for event, needs in node.spec.events.items()},
+            ))
         return policies
 
     def _evaluate_monitoring(self) -> ms.Evaluation:
@@ -1568,6 +2018,7 @@ class DeviceRuntime:
             last_inference_age_s=None if processed is None else round(processed, 2),
             model={"detector": identity.get("detector"), "status": accel.live_status()[1]},
             versions={"software": _VERSION, "model": self._model_version()},
+            perception=self.perception_report(evaluation.capabilities),
         )
 
     def _monitoring_check(self) -> tuple[bool, str]:
@@ -1652,7 +2103,8 @@ class DeviceRuntime:
             self.uplink.set_monitoring({**self.monitoring.describe(), **self._policy_state(),
                                         "base_monitoring_disabled":
                                             self.mode is monitoring_mode.MonitoringMode.AI_CUSTOM,
-                                        "state": self._monitoring_state})
+                                        "state": self._monitoring_state,
+                                        "perception": self.perception_report()})
             refresh = getattr(self.uplink, "refresh_health_monitoring", None)
             if callable(refresh):
                 # Same moment, same facts: without this the 5 s health sample still
@@ -1779,6 +2231,10 @@ class DeviceRuntime:
         if preset is None or self.profile == "mac_max":
             if preset is None:
                 print(f"SensorDyme: ignoring unknown preset '{name}'")
+                self._record_rejection("preset", name, [f"unknown preset '{name}' on this device"],
+                                       code="unknown_preset")
+            else:
+                self._record_rejection("preset", name, ["the mac_max profile cannot switch presets"])
             return
         # Variant overrides plus any owner settings ("preset:variant@key=value",
         # core/presets.py), validated against the preset's schema. A setting this
@@ -1793,11 +2249,15 @@ class DeviceRuntime:
             return
         new_module_name = preset["module"]
         try:
-            new_module = self._build_module(
+            new_module = self.perception.adopt(self._build_module(
                 new_module_name, {**self.config["modules"][new_module_name], **overrides, "recalibrate": False}
-            )
+            ))
         except Exception as exc:  # noqa: BLE001 - a bad preset must not kill the device
             print(f"SensorDyme: preset switch to '{name}' failed: {exc}")
+            # Refused with the reason, so the backend stops re-sending a switch
+            # this device cannot make and the app can say why (M7).
+            self._record_rejection("preset", name, [f"the mode could not start on this device: {exc}"],
+                                   code="module_failed")
             return
         self._push_zones_to(new_module)
         # Exit custom monitoring BEFORE swapping the module, not after: an
@@ -1837,6 +2297,7 @@ class DeviceRuntime:
         # Re-point custom rules at the zones in force for the new module: the
         # app's when it has sent any, otherwise the new module's config.yaml.
         self.rule_engine.set_zones(self._effective_zones(new_module_name))
+        self._set_preset_nodes(name)
         # Release the old FaceMesh/graph (it used to leak). Guarded: the switch
         # has already happened, and a close() that raised used to skip the
         # dashboard/uplink updates below, leaving the app showing the old mode.
@@ -1923,6 +2384,11 @@ class DeviceRuntime:
                     module = self.module
                 self._push_zones_to(module)
                 print(f"zones: {len(zones)} area(s) active ({', '.join(z.name for z in zones) or 'none'})")
+
+            pop_nodes = getattr(self.uplink, "pop_pending_nodes", None)
+            new_nodes = pop_nodes() if callable(pop_nodes) else None
+            if new_nodes is not None:
+                self._apply_nodes(new_nodes, source="uplink")
 
             new_rules = self.uplink.pop_pending_rules()
             if new_rules is not None:
@@ -2019,14 +2485,15 @@ class DeviceRuntime:
                               "condition still active")
             self.alert_manager.notify(event, now=now)
 
-    def _evaluate_custom_rules(self, module, frame, now: float) -> None:
+    def _evaluate_custom_rules(self, module, frame, now: float,
+                               observation: Optional[pc.Observation] = None) -> None:
         """Evaluate custom rules on the module's raw per-frame view; advance rule episodes.
 
         AI-configured rules evaluate the module's raw per-frame view, not its
         Events: zone and count rules need boxes and counts that an Event does
         not carry, and Events are already debounced.
         """
-        detection_frame = module.get_detections()
+        detection_frame = self._rules_detection_frame(module, observation)
         if detection_frame is not None and self.rule_engine.rules:
             for alert in self.rule_engine.observe_frame(detection_frame, now=now):
                 self._emit_rule_alert(alert, now=now)
@@ -2132,7 +2599,7 @@ class DeviceRuntime:
             setter = getattr(module, "set_frame_time", None)
             if callable(setter):
                 setter(captured_at)  # decisions rest on when the frame was SEEN
-            events = module.process(frame)
+            events, observation = self._perceive(module, frame, seq, captured_at)
             self._consecutive_process_failures = 0
             self._last_process_error = None
             # Processed-frame cadence, not capture cadence: a stall here is
@@ -2168,7 +2635,8 @@ class DeviceRuntime:
         if evidence_due and self._evidence_dir is not None:
             self._save_evidence(module, frame, events)
 
-        self._evaluate_custom_rules(module, frame, alert_now)
+        self._evaluate_custom_rules(module, frame, alert_now, observation)
+        self._run_nodes(observation, alert_now)
 
         # A periodic frame with nothing happening. Negatives are what stop a
         # detector learning to answer yes to everything, and they are gated
