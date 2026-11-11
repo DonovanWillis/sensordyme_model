@@ -157,7 +157,9 @@ def _truths(rows: list[dict], groups: dict[str, str]) -> dict[str, list[oe.Image
             gts = [oe.GroundTruth((b["xmin"], b["ymin"], b["xmax"], b["ymax"]), b["group_of"] == 1,
                                  b["occluded"] == 1, b["truncated"] == 1, b["depiction"] == 1)
                    for b in row["boxes"] if b["mid"] in mids]
-            verified = key in pos or key in neg
+            # Verified present but never boxed (an annotation gap): a detection there could be right,
+            # so the image is not scored for this class rather than counting it as a false positive.
+            verified = (key in pos and bool(gts)) or (key in neg and key not in pos)
             out[label].append(oe.ImageTruth(row["id"], groups[row["id"]], gts, verified, key in neg and not gts))
     return out
 
