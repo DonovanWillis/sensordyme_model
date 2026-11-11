@@ -27,6 +27,7 @@ import socket
 import threading
 import time
 from collections import Counter, deque
+from collections.abc import Callable
 from datetime import UTC, datetime
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Optional
@@ -162,7 +163,7 @@ class DashboardServer:
         #: Role, protection state and the last refused change (M0.1), from the runtime.
         self._policy_state: dict = {}
         #: Set by the runtime: (preset name) -> reason it would weaken the role, or None.
-        self.preset_guard = None
+        self.preset_guard: Optional[Callable[[str], Optional[str]]] = None
         self._lock = threading.Lock()
         self._jpeg: Optional[bytes] = None
         self._jpeg_seq = 0

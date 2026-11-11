@@ -654,3 +654,39 @@ def test_rule_event_keys_carry_the_rule(tmp_path, clock, monkeypatch, isolated_s
     assert any(k.startswith("rule0:present:cell phone") for k in keys)
     assert isinstance(Event, type)
     runtime.logger.close()
+
+
+# ====================================================================== dashboard channel
+def test_dashboard_refuses_a_role_violating_preset_and_accepts_explicit_stop():
+    """The dashboard (local API) is one of the enforced channels: a forbidden
+    preset is refused with 409 and the reason; stop needs confirm; both reach
+    the runtime only through the queues it drains."""
+    import json as _json
+
+    from test_dashboard import _post
+
+    from core.dashboard import DashboardServer
+
+    server = DashboardServer(host="127.0.0.1", port=0, presets=PRESETS, active_preset="driver_safety")
+    server.preset_guard = lambda name: roles.preset_violation(DRIVER, name, PRESETS)
+    url = server.start()
+    try:
+        status, resp = _post(url + "/api/preset", {"preset": "security_monitoring"})
+        assert status == 409 and resp["refused"] is True and "driver_safety" in resp["error"]
+        assert server.pop_pending_preset() is None
+        status, _ = _post(url + "/api/preset", {"preset": "driver_safety:strict"})
+        assert status == 202 and server.pop_pending_preset() == "driver_safety:strict"
+
+        status, _ = _post(url + "/api/protection", {"action": "stop"})
+        assert status == 400 and server.pop_pending_protection() is None
+        status, _ = _post(url + "/api/protection", {"action": "stop", "confirm": True})
+        assert status == 202
+        assert server.pop_pending_protection() == {"action": "stop", "confirm": True}
+
+        server.set_policy_state({"protection": {"state": "stopped"}})
+        import urllib.request
+
+        with urllib.request.urlopen(url + "/api/state", timeout=5) as resp_state:  # noqa: S310 - local test server
+            assert _json.loads(resp_state.read())["policy"]["protection"]["state"] == "stopped"
+    finally:
+        server.close()

@@ -28,7 +28,7 @@ import time
 from contextlib import contextmanager, suppress
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import Optional
+from typing import Any, Optional
 
 import cv2
 
@@ -165,12 +165,9 @@ _RULE_CATEGORY = {"critical": "critical", "warning": "warning", "info": "notice"
 def _episode_state(module) -> tuple[frozenset, set]:
     """(tracked, active) alert conditions of a module; empty for modules that
     predate the hooks (test doubles not derived from VisionModule)."""
-    tracked = getattr(module, "alert_episode_types", None)
-    active = getattr(module, "active_alert_conditions", None)
-    return (
-        tracked() if callable(tracked) else frozenset(),
-        active() if callable(active) else set(),
-    )
+    tracked: Any = getattr(module, "alert_episode_types", frozenset)
+    active: Any = getattr(module, "active_alert_conditions", set)
+    return frozenset(tracked()), set(active())
 
 
 def _zones_from_app(raw) -> list:
@@ -1533,7 +1530,7 @@ class DeviceRuntime:
         for producer, name in ((self.dashboard, "dashboard"), (self.uplink, "uplink")):
             pop = getattr(producer, "pop_pending_protection", None) if producer is not None else None
             request = pop() if callable(pop) else None
-            if request is not None:
+            if isinstance(request, dict):
                 self._apply_protection(request, source=name)
         # `is not None`, not `or`: dashboard's own "" is cloud/app.py's sentinel
         # for "apply AI Custom" (see POST .../preset), a real, meaningful value

@@ -165,14 +165,16 @@ def config_violations(config: dict) -> list[str]:
             f"role '{role.name}' requires `module:` to be one of {sorted(role.mandatory_modules)}, "
             f"got {module!r}"
         )
-    modules_cfg = config.get("modules") if isinstance(config.get("modules"), dict) else {}
+    raw_modules = config.get("modules")
+    modules_cfg: dict = raw_modules if isinstance(raw_modules, dict) else {}
     for floor in role.parameter_floors:
         section = modules_cfg.get(floor.module)
         if isinstance(section, dict) and floor.key in section:
             reason = floor.violation(section[floor.key])
             if reason:
                 errors.append(f"role '{role.name}': {reason}")
-    alerts = config.get("alerts") if isinstance(config.get("alerts"), dict) else {}
+    raw_alerts = config.get("alerts")
+    alerts: dict = raw_alerts if isinstance(raw_alerts, dict) else {}
     errors += _alert_violations(role, alerts)
     return errors
 
