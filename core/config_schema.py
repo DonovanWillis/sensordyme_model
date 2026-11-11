@@ -223,7 +223,22 @@ def validate(config: dict) -> tuple[list[str], list[str]]:
             _check(errors, isinstance(queue_max, int) and not isinstance(queue_max, bool)
                    and 1 <= queue_max <= 1000,
                    f"`cloud.queue_max:` must be an integer in 1-1000, got {queue_max!r}")
-        if cloud.get("enabled") is True and not cloud.get("device_key"):
+        # sd-auth-v1 (core/command_auth.py) and the 0600 key file (core/secret_store.py).
+        if "command_auth" in cloud:
+            _check(errors, cloud["command_auth"] in ("off", "permissive", "required"),
+                   f"`cloud.command_auth:` must be off, permissive or required, got {cloud['command_auth']!r}")
+        for key in ("previous_device_key", "device_key_file"):
+            if cloud.get(key) is not None:
+                _check(errors, isinstance(cloud[key], str), f"`cloud.{key}:` must be a string")
+        revoked = cloud.get("revoked_key_ids")
+        if revoked is not None:
+            _check(errors, isinstance(revoked, list) and all(
+                isinstance(k, str) and len(k) == 16 and all(c in "0123456789abcdef" for c in k) for k in revoked),
+                "`cloud.revoked_key_ids:` must be a list of 16-hex-digit key ids")
+        if cloud.get("device_key") and cloud.get("device_key_file"):
+            errors.append("`cloud.device_key` and `cloud.device_key_file` are both set: keep only the file "
+                          "(docs/CREDENTIAL_STORAGE.md)")
+        if cloud.get("enabled") is True and not cloud.get("device_key") and not cloud.get("device_key_file"):
             warnings.append(
                 "cloud.enabled is true but cloud.device_key is empty: the uplink will not "
                 "start and this device will never reach the backend"

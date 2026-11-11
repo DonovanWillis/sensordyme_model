@@ -149,6 +149,20 @@ def _device_profile_and_exposure(config: dict) -> tuple[list[str], list[str]]:
         if cloud.get("tls_insecure_skip_verify", False):
             warnings.append("cloud.tls_insecure_skip_verify is true: the backend's certificate is not checked, so "
                             "anyone on the path can impersonate it and send commands. Development only.")
+        # sd-auth-v1 (docs/DEVICE_AUTH_CONTRACT.md). `off` obeys unsigned commands
+        # from anyone who can answer the uplink: never deployed. `permissive`
+        # (the default) refuses a bad signature but still obeys a backend that
+        # sends none, so an active man-in-the-middle can strip it: warned.
+        from core.command_auth import DEFAULT_MODE
+
+        mode = cloud.get("command_auth", DEFAULT_MODE)
+        if mode == "off":
+            errors.append("cloud.command_auth is 'off': the device would obey unsigned remote commands. Use "
+                          "'required' (or 'permissive' during migration); docs/DEVICE_AUTH_CONTRACT.md.")
+        elif mode == "permissive":
+            warnings.append("cloud.command_auth is 'permissive': signed commands are verified, but a command "
+                            "with no signature is still obeyed. Set 'required' once the backend signs "
+                            "(docs/DEVICE_AUTH_CONTRACT.md §7).")
     alerts = config.get("alerts") if isinstance(config.get("alerts"), dict) else {}
     training = config.get("training") if isinstance(config.get("training"), dict) else {}
     capture = training.get("capture") if isinstance(training.get("capture"), dict) else {}

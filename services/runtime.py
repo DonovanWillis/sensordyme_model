@@ -547,6 +547,19 @@ class DeviceRuntime:
                 )
 
         cloud_cfg = self.config.get("cloud", {})
+        if bool(cloud_cfg.get("enabled", False)) and cloud_cfg.get("device_key_file"):
+            # The key lives in its own 0600 file (core/secret_store.py). A file
+            # that cannot be used leaves the device running standalone, said
+            # once -- never a crash loop, never a fallback to no key.
+            from core.secret_store import CredentialError, resolve_cloud_credentials
+
+            try:
+                cloud_cfg, credential_warnings = resolve_cloud_credentials(cloud_cfg)
+                for warning in credential_warnings:
+                    print(f"SensorDyme: credentials: {warning}")
+            except CredentialError as exc:
+                print(f"SensorDyme: cloud uplink OFF -- the device key file cannot be used: {exc}")
+                cloud_cfg = {**cloud_cfg, "device_key": ""}
         if bool(cloud_cfg.get("enabled", False)) and cloud_cfg.get("device_key"):
             self.uplink = self._make_uplink(cloud_cfg)
             self.uplink.set_active_preset(self.active_preset)
