@@ -291,6 +291,8 @@ alerts:
                infant_unidentified, # baby_monitoring: choking-hazard scoring is paused (no person in view is
                # identifiably the baby). Now one of the preset's alert_types, and an alert type outside this list
                # is tagged soft, which cloud/notify.py never pushes -- the operator would again not be told.
+               capacity_exceeded, zone_dwell, restricted_area, # M7 occupancy / workplace_safety alerts (people_counter,
+               # zone_watch nodes); entries/exits stay log-only, like occupancy_change below
                person_lingering, vehicle_in_zone, animal_in_zone, crowd] # security_monitoring's own alert_types --
                # the SAME class of bug, found by generalizing the fix above into a regression test
                # (tests/test_config.py) that checks every preset, not just baby_monitoring's. (Security's

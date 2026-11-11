@@ -247,6 +247,31 @@ TAXONOMY: dict[str, list[Detection]] = {
            caveat="applies to AI-configured rules only; this mode's own zone/lingering/crowd "
                   "alerts are not time-conditioned"),
     ],
+    # ------------------------------------------------------------------ occupancy (M7)
+    # Node-backed: no model of its own; reads the shared detector's person boxes
+    # (core/perception.py) through the people_counter node (core/nodes.py).
+    "occupancy": [
+        _d("person_count", "How many people are present", SUPPORTED,
+           how="shared detector person boxes, count settled over a debounce window"),
+        _d("entry_exit", "Someone entered or left", SUPPORTED,
+           how="a rise/fall in the settled count (person_entered / person_exited, logged)"),
+        _d("capacity", "More people than a set capacity", SUPPORTED, how="capacity_exceeded on the settled count"),
+        _d("zone_dwell", "Someone staying in a drawn area too long", SUPPORTED,
+           how="user-drawn zones + per-area dwell timer on shared person boxes (zone_dwell)"),
+        _d("identity_tracking", "Following one specific person across visits", UNSUPPORTED,
+           requires="re-identification; counts are anonymous by design"),
+    ],
+    # ------------------------------------------------------------------ workplace_safety (M7)
+    "workplace_safety": [
+        _d("restricted_area", "Person entering a restricted area", SUPPORTED,
+           how="zone_watch node: a typed person-in-zone rule bundle on shared person boxes"),
+        _d("ppe", "Hard hat / vest / PPE compliance", UNSUPPORTED,
+           requires="a PPE detection model; none is shipped or validated"),
+        _d("forklift_vehicle", "Forklift or vehicle near people", UNSUPPORTED,
+           requires="industrial-vehicle detection and proximity validation"),
+        _d("worker_fall", "Worker fall", UNSUPPORTED,
+           requires="fall detection validated for workplace scenes (elderly_monitoring's is not)"),
+    ],
 }
 
 
