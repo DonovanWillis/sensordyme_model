@@ -330,9 +330,8 @@ struct Preset: Identifiable, Hashable {
 
     /// "driver_distraction:teen_driver" -> ("driver_distraction", "teen_driver")
     static func split(_ name: String?) -> (base: String, variant: String?) {
-        guard let name else { return ("", nil) }
-        let parts = name.split(separator: ":", maxSplits: 1).map(String.init)
-        return (parts.first ?? "", parts.count > 1 ? parts[1] : nil)
+        let parsed = PresetName.parse(name)  // drops a `@settings` suffix
+        return (parsed.base, parsed.variant)
     }
 
     static func title(for name: String?) -> String {

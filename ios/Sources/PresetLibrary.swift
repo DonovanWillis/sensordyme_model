@@ -132,6 +132,27 @@ private extension KeyedDecodingContainer where K == AnyKey {
 
 // MARK: - Whether the server has an endpoint at all
 
+/// The device names a running mode `preset[:variant][@key=value,...]`: the
+/// `@...` part carries preset settings (docs/PRESET_LIBRARY.md). Everything that
+/// compares or titles a mode must read the name through this, or a mode with
+/// settings looks like an unknown variant.
+enum PresetName {
+    static func parse(_ name: String?) -> (base: String, variant: String?, settings: [String: String]) {
+        guard let name, !name.isEmpty else { return ("", nil, [:]) }
+        let at = name.firstIndex(of: "@")
+        let mode = at.map { String(name[..<$0]) } ?? name
+        var settings: [String: String] = [:]
+        if let at {
+            for pair in name[name.index(after: at)...].split(separator: ",") {
+                let kv = pair.split(separator: "=", maxSplits: 1).map(String.init)
+                if kv.count == 2, !kv[0].isEmpty { settings[kv[0]] = kv[1] }
+            }
+        }
+        let parts = mode.split(separator: ":", maxSplits: 1).map(String.init)
+        return (parts.first ?? "", parts.count > 1 ? parts[1] : nil, settings)
+    }
+}
+
 enum ServerSupport {
     /// A 404/405 with no machine-readable code is FastAPI's own "no such
     /// route": an older backend that does not have this endpoint. A coded 404
