@@ -17,9 +17,17 @@ struct BackgroundAlertsSection: View {
     @Binding var topic: String
 
     @State private var saving = false
-    @State private var saved = false
     @State private var problem: String?
+    /// The channel this phone last saved to the server, from the Keychain.
+    /// The server has no GET /v1/account, so this is the only record the app
+    /// can show; the screen says so.
+    @State private var savedTopic = Keychain.get(BackgroundAlertsSection.savedTopicKey) ?? ""
     @StateObject private var progress = ProgressTracker()
+
+    /// Keychain key for the saved channel: it is a credential (see freshTopic).
+    static let savedTopicKey = "ntfyTopic"
+
+    private var saved: Bool { !topic.isEmpty && topic == savedTopic }
 
     var body: some View {
         Section("Alerts when the app is closed") {
@@ -82,9 +90,20 @@ struct BackgroundAlertsSection: View {
                         .buttonStyle(SDButtonStyle(kind: .primary, fullWidth: false))
                         .disabled(saving)
 
-                        Button("New channel") { topic = Self.freshTopic(); saved = false }
+                        Button("New channel") { topic = Self.freshTopic() }
                             .buttonStyle(SDButtonStyle(kind: .tertiary, fullWidth: false))
                     }
+
+                    // There is no way to read the account's settings back from
+                    // this server, so say what this line is actually based on.
+                    Text(saved
+                         ? "Saved to your account from this phone. This server can't send saved settings back, so another phone won't show it here."
+                         : (savedTopic.isEmpty
+                            ? "Not saved yet. Alerts won't arrive until you tap Save."
+                            : "Not saved yet — the server still uses the channel this phone saved before."))
+                        .font(SD.Typography.caption)
+                        .foregroundStyle(saved ? SD.Colors.textTertiary : SD.Colors.warning)
+                        .fixedSize(horizontal: false, vertical: true)
                 }
             }
 
@@ -129,7 +148,10 @@ struct BackgroundAlertsSection: View {
         defer { saving = false }
         do {
             try await progress.track { try await state.backend.setNtfyTopic(topic) }
-            saved = true
+            // Kept so the next visit shows this channel instead of generating
+            // a new one (which used to happen on every visit to Settings).
+            Keychain.set(Self.savedTopicKey, topic)
+            savedTopic = topic
         } catch {
             problem = error.localizedDescription
         }

@@ -91,9 +91,12 @@ enum SD {
         static let callout = Font.system(.callout)
         static let label = Font.system(.subheadline).weight(.medium)
         static let caption = Font.system(.caption)
-        /// Uppercase section labels and tags. Pair with `.kerning(SD.Typography.eyebrowKerning)`
+        /// Uppercase section labels and tags. Pair with `.tracking(SD.Typography.eyebrowKerning)`
         /// — or use `SDEyebrow`, which does both.
-        static let eyebrow = Font.system(size: 11, weight: .medium, design: .monospaced)
+        /// A text style, not a point size: caption2 is 11 pt at the default size, the
+        /// design value, and follows Dynamic Type from there. A fixed size never scaled,
+        /// and a ScaledMetric size was flagged by the accessibility audit as partial.
+        static let eyebrow = Font.system(.caption2, design: .monospaced).weight(.medium)
         static let eyebrowKerning: CGFloat = 1.4
         /// Small machine values: addresses, ids, timings.
         static let mono = Font.system(.caption, design: .monospaced)
@@ -208,11 +211,49 @@ struct SDEyebrow: View {
     }
 
     var body: some View {
+        // Tracking, not kerning: kerning also adds space after the last letter,
+        // outside the measured width, which the audit reported as clipped text.
+        // No line limit: a long label (a device name in a Jupiter header) wraps
+        // as far as the reader's text size needs; two lines clipped it (audit).
         Text(text.uppercased())
-            .font(SD.Typography.eyebrow)
-            .kerning(SD.Typography.eyebrowKerning)
+            .sdEyebrowFont()
+            .tracking(SD.Typography.eyebrowKerning)
             .foregroundStyle(color)
-            .lineLimit(1)
+            .fixedSize(horizontal: false, vertical: true)
+    }
+}
+
+// MARK: - Dynamic Type
+
+/// One of ORYN's fixed design sizes that still follows the reader's text size:
+/// the design value is the default and scales with the nearest text style.
+/// `Font.system(size:)` alone never scales, so an 11 pt label stayed 11 pt at
+/// the largest accessibility sizes.
+struct SDScaledFont: ViewModifier {
+    @ScaledMetric private var size: CGFloat
+    private let weight: Font.Weight
+    private let design: Font.Design
+
+    init(size: CGFloat, relativeTo style: Font.TextStyle, weight: Font.Weight, design: Font.Design) {
+        _size = ScaledMetric(wrappedValue: size, relativeTo: style)
+        self.weight = weight
+        self.design = design
+    }
+
+    func body(content: Content) -> some View {
+        content.font(.system(size: size, weight: weight, design: design))
+    }
+}
+
+extension View {
+    func sdScaledFont(_ size: CGFloat, relativeTo style: Font.TextStyle,
+                      weight: Font.Weight = .regular, design: Font.Design = .default) -> some View {
+        modifier(SDScaledFont(size: size, relativeTo: style, weight: weight, design: design))
+    }
+
+    /// `SD.Typography.eyebrow` (already a Dynamic Type style).
+    func sdEyebrowFont() -> some View {
+        font(SD.Typography.eyebrow)
     }
 }
 
@@ -318,12 +359,15 @@ struct SDButtonStyle: ButtonStyle {
 /// on every screen.
 enum SDStatus {
     case online, connecting, offline, warning, alert
+    /// The app can't tell (the latest refresh failed): neither online nor offline.
+    case unknown
 
     var label: String {
         switch self {
         case .online: "Online"
         case .connecting: "Connecting"
         case .offline: "Offline"
+        case .unknown: "Unknown"
         case .warning: "Needs attention"
         case .alert: "Alert"
         }
@@ -334,6 +378,7 @@ enum SDStatus {
         case .online: SD.Colors.success
         case .connecting: SD.Colors.warning
         case .offline: SD.Colors.offline
+        case .unknown: SD.Colors.textTertiary
         case .warning: SD.Colors.warning
         case .alert: SD.Colors.danger
         }
@@ -343,7 +388,7 @@ enum SDStatus {
         switch self {
         case .online: SD.Colors.successMuted
         case .connecting, .warning: SD.Colors.warningMuted
-        case .offline: SD.Colors.surfaceRaised
+        case .offline, .unknown: SD.Colors.surfaceRaised
         case .alert: SD.Colors.dangerMuted
         }
     }
@@ -353,6 +398,7 @@ enum SDStatus {
         case .online: "checkmark.circle.fill"
         case .connecting: "arrow.triangle.2.circlepath"
         case .offline: "moon.zzz.fill"
+        case .unknown: "questionmark.circle"
         case .warning: "exclamationmark.triangle.fill"
         case .alert: "bell.badge.fill"
         }
@@ -368,11 +414,12 @@ struct SDStatusPill: View {
     var pulses = false
 
     @State private var pulse = false
+    @Environment(\.accessibilityReduceMotion) private var reduceMotion
 
     var body: some View {
         HStack(spacing: 6) {
             ZStack {
-                if pulses {
+                if MotionPolicy.animates(pulses, reduceMotion: reduceMotion) {
                     Circle()
                         .fill(status.tint.opacity(0.35))
                         .frame(width: 12, height: 12)
@@ -389,9 +436,9 @@ struct SDStatusPill: View {
             }
             .frame(width: 12, height: 12)
             Text((text ?? status.label).uppercased())
-                .font(SD.Typography.eyebrow)
-                .kerning(1)
-                .foregroundStyle(status == .offline ? SD.Colors.textTertiary : status.tint)
+                .sdEyebrowFont()
+                .tracking(1)
+                .foregroundStyle(status == .offline || status == .unknown ? SD.Colors.textTertiary : status.tint)
                 .lineLimit(1)
         }
         .padding(.leading, 6)
@@ -399,7 +446,7 @@ struct SDStatusPill: View {
         .padding(.vertical, 5)
         .background(Capsule().fill(status.wash))
         .overlay(Capsule().strokeBorder(status.tint.opacity(status == .offline ? 0.25 : 0.22), lineWidth: 1))
-        .onAppear { if pulses { pulse = true } }
+        .onAppear { if MotionPolicy.animates(pulses, reduceMotion: reduceMotion) { pulse = true } }
         .accessibilityElement(children: .combine)
         .accessibilityLabel(text ?? status.label)
     }
@@ -422,6 +469,12 @@ struct SDLoadingState: View {
         }
         .frame(maxWidth: .infinity)
         .padding(.vertical, SD.Space.xl)
+        // One element that says what is loading, rather than an unlabelled
+        // spinner followed by the text.
+        .accessibilityElement(children: .ignore)
+        .accessibilityLabel(message)
+        .accessibilityAddTraits(.updatesFrequently)
+        .accessibilityIdentifier("state.loading")
     }
 }
 
@@ -447,14 +500,20 @@ struct SDEmptyState: View {
                         .strokeBorder(SD.Colors.border, lineWidth: 1)
                 )
                 .padding(.bottom, SD.Space.xxs)
-            Text(title)
-                .font(SD.Typography.headline)
-                .foregroundStyle(SD.Colors.textPrimary)
-            Text(message)
-                .font(SD.Typography.callout)
-                .foregroundStyle(SD.Colors.textTertiary)
-                .multilineTextAlignment(.center)
-                .fixedSize(horizontal: false, vertical: true)
+                .accessibilityHidden(true)  // decorative; the title says it
+            VStack(spacing: SD.Space.sm) {
+                Text(title)
+                    .font(SD.Typography.headline)
+                    .foregroundStyle(SD.Colors.textPrimary)
+                    .accessibilityAddTraits(.isHeader)
+                Text(message)
+                    .font(SD.Typography.callout)
+                    .foregroundStyle(SD.Colors.textTertiary)
+                    .multilineTextAlignment(.center)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+            .accessibilityElement(children: .combine)
+            .accessibilityIdentifier("state.empty")
             if let actionTitle, let action {
                 Button(actionTitle, action: action)
                     .buttonStyle(SDButtonStyle(kind: .secondary, fullWidth: false))
@@ -518,7 +577,9 @@ struct SDErrorState: View {
 /// one — the screen just quietly stops changing.
 struct ConnectionBanner: View {
     let message: String
-    var title = "Can't reach the server"
+    /// nil: from the message (ReplyError.bannerTitle), so an unreadable reply
+    /// is never headed "Can't reach the server".
+    var title: String? = nil
     var retry: (() async -> Void)?
 
     @State private var retrying = false
@@ -530,13 +591,20 @@ struct ConnectionBanner: View {
                 .frame(width: 2)
                 .clipShape(Capsule())
             VStack(alignment: .leading, spacing: SD.Space.xxs + 2) {
-                Text(title)
-                    .font(SD.Typography.label)
-                    .foregroundStyle(SD.Colors.textPrimary)
-                Text(message)
-                    .font(SD.Typography.caption)
-                    .foregroundStyle(SD.Colors.textSecondary)
-                    .fixedSize(horizontal: false, vertical: true)
+                VStack(alignment: .leading, spacing: SD.Space.xxs + 2) {
+                    Text(title ?? ReplyError.bannerTitle(for: message))
+                        .font(SD.Typography.label)
+                        .foregroundStyle(SD.Colors.textPrimary)
+                    Text(message)
+                        .font(SD.Typography.caption)
+                        .foregroundStyle(SD.Colors.textSecondary)
+                        .fixedSize(horizontal: false, vertical: true)
+                }
+                // Read as one sentence; the retry button below stays a separate,
+                // activatable element. Combining the whole banner folded the button
+                // into a static description that VoiceOver could not press.
+                .accessibilityElement(children: .combine)
+                .accessibilityIdentifier("banner.message")
                 if let retry {
                     Button {
                         retrying = true
@@ -552,6 +620,8 @@ struct ConnectionBanner: View {
                     }
                     .disabled(retrying)
                     .padding(.top, 2)
+                    .accessibilityLabel(retrying ? "Trying again" : "Try again")
+                    .accessibilityIdentifier("banner.retry")
                 }
             }
             Spacer(minLength: 0)
@@ -565,7 +635,8 @@ struct ConnectionBanner: View {
             RoundedRectangle(cornerRadius: SD.Radius.md, style: .continuous)
                 .strokeBorder(SD.Colors.warning.opacity(0.22), lineWidth: 1)
         )
-        .accessibilityElement(children: .combine)
+        .accessibilityElement(children: .contain)
+        .accessibilityIdentifier("banner.connection")
     }
 }
 

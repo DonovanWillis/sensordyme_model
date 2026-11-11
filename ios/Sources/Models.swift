@@ -28,9 +28,13 @@ struct Device: Codable, Identifiable, Hashable {
     /// The camera's own id (`SD-XXXXXXXX`, the same one it advertises over
     /// Bonjour). Nil from firmware or a backend that predates it. See FeedLink.
     var hardwareId: String? = nil
+    /// The backend's typed answer to "is it watching, and for what"
+    /// (DeviceStatus.swift, docs/APP_STATUS_CONTRACT.md). nil from a backend
+    /// that predates it. Every monitoring indicator reads this, not `health`.
+    var status: DeviceStatus? = nil
 
     enum CodingKeys: String, CodingKey {
-        case id, name, online, health, monitoring
+        case id, name, online, health, monitoring, status
         case hardwareId = "hardware_id"
         case activePreset = "active_preset"
         case desiredPreset = "desired_preset"
@@ -143,6 +147,33 @@ struct DeviceHealthReport: Codable, Hashable {
 
 struct DevicesResponse: Codable { let devices: [Device] }
 
+extension StatusTone {
+    /// The design system's status for a tone (DeviceStatus.swift stays
+    /// Foundation-only, so the mapping lives here).
+    var sdStatus: SDStatus {
+        switch self {
+        case .ok: .online
+        case .caution: .warning
+        case .critical: .alert
+        case .neutral: .offline
+        }
+    }
+}
+
+extension Device {
+    /// The monitoring state in words, from `status`. nil only for an online
+    /// device behind a backend that predates the status contract.
+    var monitoringPresentation: MonitoringStatusPresentation? {
+        MonitoringStatusPresentation.make(status: status, online: online)
+    }
+
+    /// What custom rules do on the device right now: nothing, replace the
+    /// mode (AI Custom), or run beside it (an additive role).
+    var customRules: CustomRulesRole {
+        MonitoringStatusPresentation.customRules(status: status, legacyActive: monitoring?.active == true)
+    }
+}
+
 /// A named area drawn over the camera view, in normalised 0..1 coordinates so
 /// one drawing survives any change of capture resolution or phone screen size.
 struct MonitorZone: Codable, Identifiable, Hashable {
@@ -226,7 +257,14 @@ struct AlertExplanation: Codable, Hashable {
 
 struct EventsResponse: Codable { let events: [EventItem] }
 
-// MARK: - Preset catalog (mirrors presets.yaml on the device)
+// MARK: - Built-in preset list (OFFLINE / DEMO FALLBACK ONLY)
+//
+// The preset library comes from the backend (GET /v1/presets, PresetLibrary.swift).
+// This list is used only when the server publishes none (an older backend, or
+// the catalog failed to load), and the screens label it as the built-in list
+// when they show it. It also supplies icons and the demo catalog's titles.
+// tests/test_app_preset_parity.py parses `static let catalog:` below, so it
+// must keep mirroring presets.yaml on the device.
 
 struct PresetVariant: Identifiable, Hashable {
     let name: String
@@ -272,13 +310,35 @@ struct Preset: Identifiable, Hashable {
                variants: [.init(name: "home", title: "Home"),
                           .init(name: "away", title: "Away"),
                           .init(name: "package_watch", title: "Package Watch")]),
+        // M7: modes built on the shared perception engine (no model of their own).
+        Preset(name: "occupancy", title: "Occupancy",
+               subtitle: "People count, entries, exits & time in areas", icon: "person.3.fill",
+               variants: []),
+        Preset(name: "workplace_safety", title: "Workplace Safety",
+               subtitle: "Person in a restricted area (no PPE detection)", icon: "exclamationmark.triangle.fill",
+               variants: []),
     ]
+
+    /// The built-in list as a catalog, labelled with why it is being shown.
+    static func builtInCatalog(reason: String) -> PresetCatalog {
+        PresetCatalog.builtIn(
+            catalog.map { preset in
+                (id: preset.name, title: preset.title, description: preset.subtitle,
+                 variants: preset.variants.map { (id: $0.name, title: $0.title) })
+            },
+            reason: reason)
+    }
+
+    /// An icon for a preset id; server presets the app has no icon for get a
+    /// neutral one.
+    static func icon(for id: String) -> String {
+        catalog.first(where: { $0.name == id })?.icon ?? "square.grid.2x2"
+    }
 
     /// "driver_distraction:teen_driver" -> ("driver_distraction", "teen_driver")
     static func split(_ name: String?) -> (base: String, variant: String?) {
-        guard let name else { return ("", nil) }
-        let parts = name.split(separator: ":", maxSplits: 1).map(String.init)
-        return (parts.first ?? "", parts.count > 1 ? parts[1] : nil)
+        let parsed = PresetName.parse(name)  // drops a `@settings` suffix
+        return (parsed.base, parsed.variant)
     }
 
     static func title(for name: String?) -> String {

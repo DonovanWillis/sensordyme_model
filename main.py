@@ -21,7 +21,7 @@ from typing import Optional, Union
 
 import yaml
 
-from core.alerts import AlertLevel, AlertManager, ConsoleSink, SoundSink
+from core.alerts import AlertLevel, AlertManager, ConsoleSink, SoundSink, UnavailableSink
 from modules import available_modules, get_module_class
 
 # Event types that reach the AlertManager at all, per profile. Anything else (e.g.
@@ -140,17 +140,16 @@ def restored_preset(config_module: Optional[str], modules_cfg: dict,
     name = device_state.saved_preset(config_module)
     if not name:
         return None
-    name = resolve_preset(name, presets)
-    base, _, variant_name = name.partition(":")
-    preset = presets.get(base)
-    if preset is None or preset.get("module") not in (modules_cfg or {}):
+    from core.presets import PresetError, preset_overrides
+
+    # Variant overrides plus any owner settings the saved name carries
+    # ("preset:variant@key=value"); a name this build cannot apply is not restored.
+    try:
+        name, preset, overrides = preset_overrides(name, presets)
+    except PresetError:
         return None
-    overrides: dict = {}
-    if variant_name:
-        variant = (preset.get("variants") or {}).get(variant_name)
-        if variant is None:
-            return None
-        overrides = variant.get("overrides") or {}
+    if preset.get("module") not in (modules_cfg or {}):
+        return None
     return name, preset, overrides
 
 
@@ -161,16 +160,23 @@ def alert_types_for(module_name: str, preset: Optional[dict] = None) -> set:
     return ALERT_EVENT_TYPES_BY_MODULE.get(module_name, ALERT_EVENT_TYPES_PI)
 
 
-def build_alert_manager(alert_cfg: dict, is_pi: bool) -> AlertManager:
+def build_alert_manager(alert_cfg: dict, is_pi: bool,
+                        sink_overrides: Optional[dict] = None) -> AlertManager:
     """Construct the AlertManager from an `alerts:`-shaped config block.
 
     Callers pick which block to pass: `config["alerts"]` for the pi profile,
     `config["mac_max"]["alerts"]` for mac_max -- the two profiles never share
     alert configuration (cooldowns, escalation types, etc).
+
+    `sink_overrides` maps a configured sink name to a zero-argument factory used
+    INSTEAD of the built-in construction (sim/'s simulated buzzer stands in for
+    `gpio_buzzer`). None -- every production caller -- changes nothing.
     """
     sinks = []
     for sink_name in alert_cfg.get("sinks", ["console"]):
-        if sink_name == "console":
+        if sink_overrides and sink_name in sink_overrides:
+            sinks.append(sink_overrides[sink_name]())
+        elif sink_name == "console":
             sinks.append(ConsoleSink())
         elif sink_name == "sound":
             sinks.append(SoundSink())
@@ -187,23 +193,57 @@ def build_alert_manager(alert_cfg: dict, is_pi: bool) -> AlertManager:
                     sinks.append(GPIOBuzzerSink(int(alert_cfg.get("gpio_buzzer_pin", 17))))
                 except Exception as exc:  # noqa: BLE001 - any failure means "no buzzer"
                     print(f"SensorDyme: 'gpio_buzzer' sink unavailable ({exc}); continuing without it")
+                    # Kept, as unavailable: health must report the missing buzzer
+                    # (a driver_safety device without one is FAILED, not protecting).
+                    sinks.append(UnavailableSink("gpio_buzzer", "buzzer", True, f"could not be set up: {exc}"))
             else:
                 print("SensorDyme: 'gpio_buzzer' sink skipped (not running on a Pi)")
+                sinks.append(UnavailableSink("gpio_buzzer", "buzzer", True, "not running on a Raspberry Pi"))
         else:
             print(f"SensorDyme: unknown alert sink '{sink_name}', skipping")
+            sinks.append(UnavailableSink(str(sink_name), "unknown", False, "unknown alert sink type"))
 
     fixed_levels = {}
+    type_categories: dict[str, str] = {}
     for event_type in alert_cfg.get("loud_types", []):
         fixed_levels[event_type] = AlertLevel.CONTINUOUS
+        type_categories[event_type] = "warning"
     for event_type in alert_cfg.get("soft_types", []):
         fixed_levels[event_type] = AlertLevel.SOFT
+        type_categories[event_type] = "notice"
+    # The most urgent, distinct pattern (sleep / unresponsive). A critical type
+    # is always loud.
+    for event_type in alert_cfg.get("critical_types", []):
+        fixed_levels[event_type] = AlertLevel.CONTINUOUS
+        type_categories[event_type] = "critical"
 
     return AlertManager(
         sinks=sinks,
         cooldown_s=float(alert_cfg.get("cooldown_s", 10.0)),
         escalation_window_s=float(alert_cfg.get("escalation_window_s", 60.0)),
         fixed_levels=fixed_levels,
+        categories=alert_categories(alert_cfg),
+        type_categories=type_categories,
+        duplicate_window_s=float(alert_cfg.get("duplicate_window_s", 2.0)),
     )
+
+
+def alert_categories(alert_cfg: dict) -> dict:
+    """DEFAULT_CATEGORIES with any `alerts.categories:` overrides applied.
+
+    Overrides are bounded by AlertCategory itself (known patterns, repeat leaves
+    room for the pattern, max 120 repeats); config_schema reports violations as
+    errors before this runs.
+    """
+    from dataclasses import replace
+
+    from core.alerts import DEFAULT_CATEGORIES
+
+    categories = dict(DEFAULT_CATEGORIES)
+    for name, override in (alert_cfg.get("categories") or {}).items():
+        if name in categories and isinstance(override, dict):
+            categories[name] = replace(categories[name], **override)
+    return categories
 
 
 def parse_args(argv: Optional[list[str]] = None) -> argparse.Namespace:
@@ -242,12 +282,41 @@ def run(argv: Optional[list[str]] = None) -> None:
     """Resolve profile/module/alert policy from config + CLI, then hand the wired
     pieces to services.runtime.DeviceRuntime, which owns the process lifetime
     (camera capture, inference, dashboard, uplink, provisioning, health, shutdown)."""
+    build_runtime(argv).run()
+
+
+def build_runtime(argv: Optional[list[str]] = None, *, runtime_cls=None, module_factory=None,
+                  sink_overrides: Optional[dict] = None):
+    """Everything run() does before DeviceRuntime.run(): the wired, unstarted runtime.
+
+    The keyword arguments are seams for sim/ (the virtual device), all None in
+    production, where this is exactly what run() always did:
+      runtime_cls     a DeviceRuntime subclass to construct instead
+      module_factory  (module_cls, module_config) -> module, instead of
+                      module_cls(module_config); a failure still boots FAILED
+      sink_overrides  see build_alert_manager
+    """
     args = parse_args(argv)
-    config = load_config(args.config)
+    try:
+        config = load_config(args.config)
+    except (OSError, yaml.YAMLError) as exc:
+        # Before the guard below existed for these, an unreadable or malformed
+        # file raised straight out (exit 1), which Restart=always and
+        # StartLimitAction=reboot turned into a reboot loop (audit D12).
+        print(f"SensorDyme: config ERROR: cannot read {args.config}: {exc}")
+        raise SystemExit(CONFIG_ERROR_EXIT) from exc
+    if not isinstance(config, dict):
+        print(f"SensorDyme: config ERROR: {args.config} must be a YAML mapping, got {type(config).__name__}")
+        raise SystemExit(CONFIG_ERROR_EXIT)
 
     from core.config_schema import validate
+    from core.secret_store import config_permission_warnings
 
     errors, warnings = validate(config)
+    # A config holding the device key or dashboard token must not be readable by
+    # other local users (docs/CREDENTIAL_STORAGE.md). Warned, not refused: a
+    # refusal here would take a working device offline over a file mode.
+    warnings = warnings + config_permission_warnings(args.config, config)
     for warning in warnings:
         print(f"SensorDyme: config warning: {warning}")
     if errors:
@@ -275,6 +344,15 @@ def run(argv: Optional[list[str]] = None) -> None:
     restored = None
     if profile != "mac_max" and args.module is None:
         restored = restored_preset(config.get("module"), config.get("modules", {}), presets)
+    if restored is not None:
+        # A saved preset the device's role forbids (saved before the role was set,
+        # or under another role) is not restored: the role's own module runs.
+        from core.roles import preset_violation, role_for_config
+
+        refusal = preset_violation(role_for_config(config), restored[0], presets)
+        if refusal:
+            print(f"SensorDyme: not restoring saved mode '{restored[0]}': {refusal}")
+            restored = None
     if restored is not None:
         module_name = restored[1]["module"]
 
@@ -330,7 +408,19 @@ def run(argv: Optional[list[str]] = None) -> None:
 
     _accel.configure(config.get("accelerator", {}))
 
-    module = module_cls(module_config)
+    try:
+        module = module_cls(module_config) if module_factory is None else module_factory(module_cls, module_config)
+    except Exception as exc:  # noqa: BLE001 - any failure: boot FAILED with the reason, never crash
+        # Raising here was exit 1 -> Restart=always -> StartLimitAction=reboot:
+        # a reboot loop over a missing model or a broken install (audit D12),
+        # with health, the dashboard, the app link and BLE setup all dark.
+        # The placeholder analyses nothing and the device reports FAILED, why,
+        # and stays reachable so a person (or a preset switch) can fix it.
+        from modules.base import UnavailableModule
+
+        print(f"SensorDyme: module '{module_name}' could not be built ({exc}); "
+              "starting FAILED so the device stays reachable")
+        module = UnavailableModule(module_name, str(exc))
     print(f"SensorDyme: profile '{profile}', running module '{module_name}' (available: {available_modules()})")
 
     debug = args.debug
@@ -339,12 +429,12 @@ def run(argv: Optional[list[str]] = None) -> None:
     from core.camera import detect_pi
     from services.runtime import DeviceRuntime
 
-    DeviceRuntime(
+    return (runtime_cls or DeviceRuntime)(
         config=config,
         profile=profile,
         module=module,
         module_name=module_name,
-        alert_manager=build_alert_manager(alert_cfg, detect_pi()),
+        alert_manager=build_alert_manager(alert_cfg, detect_pi(), sink_overrides),
         alert_cfg=alert_cfg,
         alert_event_types=alert_event_types,
         alert_types_for=alert_types_for,
@@ -354,7 +444,7 @@ def run(argv: Optional[list[str]] = None) -> None:
         debug=debug,
         window_name=WINDOW_NAME,
         module_config=module_config,
-    ).run()
+    )
 
 
 if __name__ == "__main__":

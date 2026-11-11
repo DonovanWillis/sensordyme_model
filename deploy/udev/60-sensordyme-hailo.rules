@@ -1,0 +1,14 @@
+# PREPARED, NOT INSTALLED. Gives /dev/hailo0 to the `hailo` group (0660) so the
+# least-privilege service (deploy/systemd/sensordyme.service.hardened, which is in
+# that group) can open the AI HAT without running as an admin user.
+#
+# Before installing, look at what hailo-all already installed:
+#     ls -l /dev/hailo0; grep -rl hailo /lib/udev/rules.d /etc/udev/rules.d
+# If its rule is MODE="0666" (world read/write), this file NARROWS it; the 60-
+# prefix sorts after vendor rules in /lib/udev/rules.d that use a lower number,
+# and a later rule's GROUP/MODE wins. Confirm with `udevadm test` on the device.
+#
+# Install: sudo groupadd --system hailo
+#          sudo install -m 0644 60-sensordyme-hailo.rules /etc/udev/rules.d/
+#          sudo udevadm control --reload && sudo udevadm trigger  (or reboot)
+KERNEL=="hailo[0-9]*", GROUP="hailo", MODE="0660"

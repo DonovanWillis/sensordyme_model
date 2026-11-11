@@ -13,6 +13,11 @@ struct APIError: LocalizedError {
     var isUnreachable = false
     /// The HTTP status, when a server answered. 0 for transport failures.
     var status: Int = 0
+    /// The backend's machine-readable refusal code ("role_forbids_preset",
+    /// "draft_superseded", ...; docs/APP_STATUS_CONTRACT.md). nil when the
+    /// server sent none. Branch on this, never on the status alone: several
+    /// different refusals share 409.
+    var code: String? = nil
     var errorDescription: String? { message }
 }
 
@@ -104,13 +109,16 @@ struct APIClient {
     /// used to report as an expired session, on the sign-in screen itself.
     static func httpError(status: Int, data: Data, sentToken: Bool) -> APIError? {
         if (200..<300).contains(status) { return nil }
-        // FastAPI errors arrive as {"detail": "..."}
-        let detail = (try? JSONSerialization.jsonObject(with: data) as? [String: Any])?["detail"] as? String
+        // FastAPI errors arrive as {"detail": "..."}, and refusals the app must
+        // tell apart also carry {"code": "..."} beside it.
+        let body = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any]
+        let detail = body?["detail"] as? String
+        let code = body?["code"] as? String
         if status == 401 && sentToken {
             return APIError(message: "Your session has expired. Please sign in again.",
-                            isAuthFailure: true, status: status)
+                            isAuthFailure: true, status: status, code: code)
         }
-        return APIError(message: detail ?? "request failed (\(status))", status: status)
+        return APIError(message: detail ?? "request failed (\(status))", status: status, code: code)
     }
 
     /// Did this fail to reach a server at all, rather than reach one that refused?
@@ -154,7 +162,17 @@ struct APIClient {
     }
 
     private func decode<T: Decodable>(_ type: T.Type, from data: Data) throws -> T {
-        try JSONDecoder().decode(type, from: data)
+        try Self.decodeReply(type, from: data)
+    }
+
+    /// Decode a reply, turning a malformed one into a message a person can act on
+    /// (ReplyError) instead of Foundation's "isn't in the correct format".
+    static func decodeReply<T: Decodable>(_ type: T.Type, from data: Data) throws -> T {
+        do {
+            return try JSONDecoder().decode(type, from: data)
+        } catch let error as DecodingError {
+            throw APIError(message: ReplyError.message(for: error) ?? ReplyError.unreadable)
+        }
     }
 
     // MARK: auth
@@ -185,6 +203,51 @@ struct APIClient {
 
     func setNtfyTopic(_ topic: String) async throws {
         _ = try await request("POST", "v1/account/ntfy", body: ["ntfy_topic": topic])
+    }
+
+    // MARK: preset library, rules, stop/resume
+    //
+    // Through `request`, so they get the same relocation, cleartext refusal and
+    // error wording as everything else. An older backend answers with an
+    // uncoded 404 (APIError.endpointMissing).
+
+    func presetCatalog() async throws -> PresetCatalog {
+        try decode(PresetCatalog.self, from: try await request("GET", "v1/presets"))
+    }
+
+    func devicePresets(deviceID: Int) async throws -> DevicePresets {
+        try decode(DevicePresets.self, from: try await request("GET", "v1/devices/\(deviceID)/presets"))
+    }
+
+    func activatePreset(deviceID: Int, preset: String, settings: [String: JSONValue]) async throws -> ActivationResult {
+        var body: [String: Any] = ["preset": preset]
+        if !settings.isEmpty { body["settings"] = settings.mapValues(\.foundationObject) }
+        let data = try await request("POST", "v1/devices/\(deviceID)/preset", body: body)
+        // The switch was accepted; an answer this build cannot read does not
+        // undo that, it only means nothing more was confirmed.
+        return (try? decode(ActivationResult.self, from: data)) ?? ActivationResult()
+    }
+
+    func deviceRules(deviceID: Int) async throws -> DeviceRules {
+        try decode(DeviceRules.self, from: try await request("GET", "v1/devices/\(deviceID)/rules"))
+    }
+
+    func setRuleEnabled(deviceID: Int, ruleID: String, enabled: Bool) async throws {
+        _ = try await request("PATCH", "v1/devices/\(deviceID)/rules/\(ruleID)", body: ["enabled": enabled])
+    }
+
+    func setProtection(deviceID: Int, action: ProtectionAction, confirm: Bool) async throws -> ProtectionCommand {
+        let data = try await request("POST", "v1/devices/\(deviceID)/protection",
+                                     body: ["action": action.rawValue, "confirm": confirm])
+        return (try? decode(ProtectionCommand.self, from: data)) ?? ProtectionCommand(commandID: nil)
+    }
+
+    func setNode(deviceID: Int, node: String, enabled: Bool) async throws {
+        _ = try await request("POST", "v1/devices/\(deviceID)/nodes", body: ["node": node, "enabled": enabled])
+    }
+
+    func capabilityTiers() async throws -> CapabilityTiersResponse {
+        try decode(CapabilityTiersResponse.self, from: try await request("GET", "v1/capability-tiers"))
     }
 }
 
@@ -981,6 +1044,8 @@ final class AppState: ObservableObject {
             accountHardwareIDsRaw = ""
             UserDefaults.standard.removeObject(forKey: "alertPhone")
             UserDefaults.standard.removeObject(forKey: "smsOnLoud")
+            // The ntfy channel this phone saved for the previous account.
+            Keychain.delete(BackgroundAlertsSection.savedTopicKey)
             AlertNotifier.shared.forgetAnnounced()
         }
         localStateOwner = owner

@@ -194,11 +194,16 @@ def test_an_info_rule_no_longer_silences_a_critical_rule_on_the_same_object():
                           level=AlertLevel.CONTINUOUS) is AlertLevel.CONTINUOUS
 
 
-def test_the_cooldown_still_applies_per_key():
+def test_duplicates_are_merged_per_key_but_a_new_episode_alerts():
+    """M0.1 (D1): previously "the cooldown still applies per key" (SUPPRESSED at
+    105 s). A rule's re-confirmation is gated by its own EventEngine cooldown_s;
+    the alert layer only merges a duplicate inside the open episode."""
     manager = AlertManager(sinks=[], cooldown_s=15.0)
     manager.notify(_rule_event(), now=100.0, key="rule1", level=AlertLevel.CONTINUOUS)
-    assert manager.notify(_rule_event(), now=105.0, key="rule1",
+    assert manager.notify(_rule_event(), now=101.0, key="rule1",
                           level=AlertLevel.CONTINUOUS) is AlertLevel.SUPPRESSED
+    assert manager.notify(_rule_event(), now=105.0, key="rule1",
+                          level=AlertLevel.CONTINUOUS) is AlertLevel.CONTINUOUS
 
 
 def test_a_level_override_beats_fixed_levels_and_escalation():
@@ -213,7 +218,8 @@ def test_a_level_override_beats_fixed_levels_and_escalation():
 def test_the_default_call_signature_is_unchanged():
     manager = AlertManager(sinks=[], cooldown_s=10.0, escalation_window_s=60.0)
     assert manager.notify(_rule_event(), now=0.0) is AlertLevel.SOFT
-    assert manager.notify(_rule_event(), now=5.0) is AlertLevel.SUPPRESSED
+    # M0.1: a duplicate inside the open episode is merged (was: 5 s -> SUPPRESSED).
+    assert manager.notify(_rule_event(), now=1.0) is AlertLevel.SUPPRESSED
     assert manager.notify(_rule_event(), now=20.0) is AlertLevel.CONTINUOUS
 
 
@@ -626,7 +632,10 @@ def test_mac_max_alerts_are_checked_too():
 
 def test_an_unknown_sink_is_a_warning():
     config = _repo_config()
-    config["alerts"]["sinks"] = ["console", "siren"]
+    # Keep an audible sink: the repo config is a driver_safety device, whose role
+    # (M0.1) makes "no audible sink at all" an error -- tested in
+    # tests/test_m01_role_floors.py. This test is about the unknown name only.
+    config["alerts"]["sinks"] = ["console", "gpio_buzzer", "siren"]
     errors, warnings = validate(config)
     assert not errors
     assert any("siren" in w for w in warnings)

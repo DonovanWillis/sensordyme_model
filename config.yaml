@@ -2,6 +2,14 @@
 # Switch products by changing ONE line: `module`.
 module: driver_attention
 
+# Deployment role (core/roles.py). A role declares the safeguards that must keep
+# running while the device reports it is protecting, and refuses any preset,
+# custom rule, config or remote command that would weaken them. driver_safety:
+# driver_attention always runs; custom rules are added beside it, never instead.
+# Other roles (general, child_monitoring, occupancy, property, workplace) carry
+# none of these restrictions. Omitted = general.
+role: driver_safety
+
 # profile: pi (default) | mac_max
 #   pi      -- the shipping product: nano models, config under `modules:` below.
 #              This is what setup_pi.sh deploys and what runs on the Raspberry Pi.
@@ -85,6 +93,13 @@ dashboard:
 # `required: true` refuses to start without a usable accelerator; with false the
 # device boots degraded instead, which is the more useful failure because health,
 # the dashboard and provisioning all stay up to report it.
+# The shared perception engine (core/perception.py, M7): every model runs at most
+# once per analysed frame whoever asks, and each frame ends in one typed
+# Observation for the module, custom rules and monitoring nodes (core/nodes.py).
+perception:
+  max_age_s: 1.0 # a result older than this is stale: reported, and never used as current
+  # detector_weights: unset = the running module's own detector weights
+
 # `yolo_hef` must point to a model compiled for Hailo with the
 # Dataflow Compiler (see docs/ACCELERATOR.md) — a .pt/.onnx cannot run on the HAT.
 accelerator:
@@ -103,6 +118,10 @@ accelerator:
   #
   # On a machine with no Hailo (a dev Mac) this is ignored and the CPU path is
   # used, so this default is safe to carry in the shared config.
+  yolo_decoder: legacy # legacy | reference. "reference" = DAMO-YOLO's own decode (anchor at
+  # cell*stride, every class per anchor); measured better on Open Images val (float ONNX),
+  # NOT yet validated on the INT8 .hef. Stays legacy until hardware validation passes:
+  # see docs/DECODER_CANDIDATE.md.
   yolo_hef_sha256: e69136d3ebf3cc8ebaf3da5417a59962b139f3d3d67d715e9a9b1ae10963960e
   # THE authoritative answer to "what detector binary is SensorDyme running?".
   # Advisory here (not enforced at runtime); enforced at install time by
@@ -142,6 +161,15 @@ network:
     # only ever punishes the person standing there trying to set the device up.
     grace_s: 0 # seconds offline before the BLE setup window opens
     poll_s: 10 # how often to re-check connectivity
+    # Who may hand the device a network over Bluetooth:
+    #   legacy -- anyone in range while the window is open (development only; refused
+    #             when a top-level `deployment: production` is set)
+    #   pop    -- only a phone that proves it holds the setup code on the device's
+    #             label/QR (services/ble_pop.py); credentials travel encrypted. Needs
+    #             the code file below (written once by scripts/ble_setup_code.py, 0600)
+    #             and an app build that speaks proof of possession.
+    auth: legacy
+    setup_code_path: /etc/sensordyme/ble_setup_code
 
 # Health monitoring and automatic recovery: every component (camera, inference,
 # accelerator, dashboard, uplink, wifi, provisioning, hardware) is checked
@@ -225,6 +253,13 @@ alerts:
 
   cooldown_s: 15 # minimum seconds between two alerts of the same type (patient: don't re-alert too soon)
   escalation_window_s: 60 # repeat within this window -> continuous tone (event types not in loud/soft_types below)
+  # The most urgent, distinct alert pattern, repeated while the condition lasts
+  # (core/alerts.py "critical" category): falling asleep and the driver no longer
+  # visible. Also listed in loud_types; the driver_safety role requires both here.
+  critical_types: [drowsiness, attention_lost]
+  # Alert episodes (M0.1): every new episode alerts immediately; a sustained one
+  # repeats and escalates within the bounds in core/alerts.py DEFAULT_CATEGORIES.
+  # cooldown_s below now de-duplicates only the rolling-window notices (soft_types).
   loud_types: [drowsiness, phone_use, eyes_down, eyes_up, attention_lost, high_risk, # always the loud/continuous tone
                distraction, # sustained sideways head turn (3s+). Was in NEITHER list: locally it
                # escalated by repetition (a deliberate mechanism), but its severity tag fell back to
@@ -256,6 +291,8 @@ alerts:
                infant_unidentified, # baby_monitoring: choking-hazard scoring is paused (no person in view is
                # identifiably the baby). Now one of the preset's alert_types, and an alert type outside this list
                # is tagged soft, which cloud/notify.py never pushes -- the operator would again not be told.
+               capacity_exceeded, zone_dwell, restricted_area, # M7 occupancy / workplace_safety alerts (people_counter,
+               # zone_watch nodes); entries/exits stay log-only, like occupancy_change below
                person_lingering, vehicle_in_zone, animal_in_zone, crowd] # security_monitoring's own alert_types --
                # the SAME class of bug, found by generalizing the fix above into a regression test
                # (tests/test_config.py) that checks every preset, not just baby_monitoring's. (Security's
@@ -308,6 +345,11 @@ modules:
     # (standard): 66. With the Wide lens and the face 20-30 deg off-axis, the default
     # mis-reads a 35 deg turn as 29-38 deg depending on direction, and a 25 deg nod as
     # up to 31. Changing it invalidates the stored calibration (the device recalibrates).
+    camera_intrinsics: null # calibrated lens intrinsics from a hardware calibration run
+    # (cv2.calibrateCamera): {width, height, fx, fy, cx, cy, distortion: [k1, k2, p1, p2, k3]},
+    # rescaled to the processed frame. null = the camera_hfov_deg / zero-distortion assumption
+    # above, unchanged. Use this OR camera_hfov_deg, not both. Changing it invalidates the
+    # stored calibration. See core/behavior/camera_model.py.
 
     # --- signal conditioning (glasses/glare robustness; see core/eye_signal.py) ---
     # Raw EAR and head-pose readings are noisy measurements, and glasses make
@@ -537,6 +579,16 @@ modules:
     risk_high_threshold: 0.75 # composite score above this, sustained, fires the loud "high_risk" event
     risk_confirm_seconds: 1.0 # composite score must stay above risk_high_threshold this long to fire "high_risk"
 
+    # --- behaviour reasoning v2 (core/behavior/; EXPERIMENTAL, NOT VALIDATED) ---
+    # false = the shipped logic above, byte-for-byte the same events. true = drowsiness,
+    # phone_use, phone_detected and frequent_glancing are decided by core/behavior/
+    # (closure vs downward glance, hand-held + gaze-to-phone, cabin glance zones, face-loss
+    # coasting, explicit "unknown" when inputs are missing) and long_glance /
+    # glance_budget_exceeded are logged (not alerted). Tested on synthetic scenarios only:
+    # read docs/BEHAVIOUR_REASONING.md before turning it on. Optional parameters go in a
+    # nested `behavior:` mapping (validated by core/config_schema.py; not preset-overridable).
+    behavior_v2: false
+
   driver_attention_openpilot:
     # comma.ai openpilot's driver monitoring, verbatim (model + policy from openpilot
     # v0.9.7). Run with: make dev-openpilot. See modules/driver_attention_openpilot.py.
@@ -587,6 +639,13 @@ modules:
     yawn_mar_threshold: 0.45
     yawn_frames_threshold: 12
     refine_landmarks: false # their default; true adds iris landmarks (slower)
+
+  # The module node-backed modes run on (modules/shared_perception.py, M7):
+  # keeps the shared detector running; the monitoring nodes do the rest.
+  shared_perception:
+    yolo_weights: yolo11n.pt # a cache key when accelerator.yolo_hef is set (same detector as driver_attention)
+    detect_every_n_frames: 2
+    confidence_threshold: 0.35
 
   occupancy:
     confidence_threshold: 0.5 # YOLO person-detection confidence threshold

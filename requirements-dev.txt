@@ -16,9 +16,9 @@
 # its findings between minor versions.
 
 # --- Tests --------------------------------------------------------------------
-# pytest is ALSO pinned in requirements.txt (the production file) at the same
-# version, because a handful of runtime modules are exercised on the device.
-# Keep the two in step; if they drift, the device and CI stop agreeing.
+# pytest is ALSO pinned in requirements.txt (developer + CI runtime) at the same
+# version; keep the two in step. It is NOT in requirements-device.txt since M6.5:
+# nothing a device runs imports it (scripts/release/check_device_deps.py).
 pytest==8.3.3
 
 # Coverage. `make test-cov` reports on the modules that make decisions

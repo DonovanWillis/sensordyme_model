@@ -27,6 +27,7 @@ import socket
 import threading
 import time
 from collections import Counter, deque
+from collections.abc import Callable
 from datetime import UTC, datetime
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Optional
@@ -158,6 +159,11 @@ class DashboardServer:
         self._jpeg_quality = max(1, min(100, int(jpeg_quality)))
         self._stream_interval = 1.0 / max(1.0, float(stream_fps))
         self._pending_preset: Optional[str] = None
+        self._pending_protection: Optional[dict] = None
+        #: Role, protection state and the last refused change (M0.1), from the runtime.
+        self._policy_state: dict = {}
+        #: Set by the runtime: (preset name) -> reason it would weaken the role, or None.
+        self.preset_guard: Optional[Callable[[str], Optional[str]]] = None
         self._lock = threading.Lock()
         self._jpeg: Optional[bytes] = None
         self._jpeg_seq = 0
@@ -203,11 +209,17 @@ class DashboardServer:
                     # who has not.
                     return not dashboard._network_reachable
                 sent = self.headers.get("X-Device-Token", "")
-                if not sent:
+                if not sent and self.command == "GET" and urlsplit(self.path).path.startswith("/stream"):
                     # Kept for the MJPEG <img> case, which cannot set a header. It is
                     # a real leak -- a token in a URL lands in proxy logs, browser
                     # history and Referer -- so it stays the fallback, never the
                     # documented path, and the app itself uses the header.
+                    #
+                    # M6: ONLY for GET /stream. It used to be accepted on every
+                    # path, POST included, so a link or a history entry carrying
+                    # ?token= could change the preset, stop monitoring or move the
+                    # device to another Wi-Fi network. The page, the iOS app and
+                    # every script send the header on /api and on every POST.
                     #
                     # Parsed, not split: the page sends encodeURIComponent(TOKEN),
                     # so a token containing + / = & or a space only matches once
@@ -292,8 +304,25 @@ class DashboardServer:
                         if base not in dashboard._presets:
                             self._json({"error": f"unknown preset '{name}'"}, 400)
                             return
+                        guard = dashboard.preset_guard
+                        refusal = guard(name) if callable(guard) else None
+                        if refusal:
+                            # The device's role forbids it: say so now, not silently later.
+                            self._json({"error": refusal, "refused": True}, 409)
+                            return
                         dashboard.request_preset(name)
                         self._json({"ok": True, "switching_to": name}, 202)
+                    elif self.path.startswith("/api/protection"):
+                        payload = self._read_json()
+                        action = str(payload.get("action", "")).lower()
+                        if action not in ("stop", "resume"):
+                            self._json({"error": "action must be 'stop' or 'resume'"}, 400)
+                            return
+                        if action == "stop" and payload.get("confirm") is not True:
+                            self._json({"error": "stopping monitoring requires \"confirm\": true"}, 400)
+                            return
+                        dashboard.request_protection({"action": action, "confirm": payload.get("confirm") is True})
+                        self._json({"ok": True, "requested": action}, 202)
                     else:
                         self.send_response(404)
                         self.end_headers()
@@ -514,6 +543,21 @@ class DashboardServer:
             pending, self._pending_preset = self._pending_preset, None
             return pending
 
+    def request_protection(self, request: dict) -> None:
+        """Queue an explicit stop/resume for the main loop."""
+        with self._lock:
+            self._pending_protection = dict(request)
+
+    def pop_pending_protection(self) -> Optional[dict]:
+        with self._lock:
+            pending, self._pending_protection = self._pending_protection, None
+            return pending
+
+    def set_policy_state(self, state: dict) -> None:
+        """Role, protection and last refusal, as the runtime reports them."""
+        with self._lock:
+            self._policy_state = dict(state or {})
+
     def set_active_preset(self, name: Optional[str], module_name: str) -> None:
         """Called by the main loop after a switch completes."""
         with self._lock:
@@ -626,6 +670,7 @@ class DashboardServer:
                 "counts": [{"type": t, "n": n} for t, n in top_counts],
                 "total_events": sum(self._counts.values()),
                 "risk": [round(r, 3) for _, r in self._risk_series],
+                "policy": dict(self._policy_state),
                 "generated_at": datetime.now(UTC).isoformat(),
             }
 

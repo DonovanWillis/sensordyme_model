@@ -13,6 +13,7 @@ struct DevicesView: View {
     @EnvironmentObject private var state: AppState
     @State private var devices: [Device] = []
     @State private var errorMessage: String?
+    @Environment(\.dynamicTypeSize) private var typeSize
     @State private var showClaim = false
     @State private var showSetup = false
     @State private var hasLoaded = false
@@ -69,9 +70,11 @@ struct DevicesView: View {
 
                     ForEach(devices) { device in
                         NavigationLink(value: device) {
-                            DeviceCard(device: device)
+                            DeviceCard(device: device, lastRefreshFailed: errorMessage != nil)
                         }
                         .buttonStyle(.plain)
+                        .accessibilityIdentifier("device.card")
+                        .accessibilityHint("Opens the live view and controls")
                     }
 
                     if devices.isEmpty {
@@ -161,23 +164,24 @@ struct DevicesView: View {
                 // Beside the actions so a background refresh is visible
                 // without occupying a row of its own.
                 SDProgress(phase: refreshing.phase)
-                headerButton("dot.radiowaves.left.and.right", label: "Connect over Bluetooth") {
+                headerButton("dot.radiowaves.left.and.right", label: "Connect over Bluetooth", id: "devices.bluetooth") {
                     showSetup = true
                 }
-                headerButton("plus", label: "Add device") { showClaim = true }
+                headerButton("plus", label: "Add device", id: "devices.add") { showClaim = true }
             }
             .padding(.top, SD.Space.xs)
 
             Text("Your Devices")
-                .font(.system(size: 32, weight: .semibold))
+                .sdScaledFont(32, relativeTo: .largeTitle, weight: .semibold)
                 .kerning(-0.6)
                 .foregroundStyle(SD.Colors.textPrimary)
                 .accessibilityAddTraits(.isHeader)
+                .accessibilityIdentifier("devices.title")
         }
         .frame(maxWidth: .infinity, alignment: .leading)
     }
 
-    private func headerButton(_ icon: String, label: String, action: @escaping () -> Void) -> some View {
+    private func headerButton(_ icon: String, label: String, id: String, action: @escaping () -> Void) -> some View {
         Button(action: action) {
             Image(systemName: icon)
                 .font(.system(size: 14, weight: .medium))
@@ -189,22 +193,31 @@ struct DevicesView: View {
         }
         .buttonStyle(.plain)
         .accessibilityLabel(label)
+        .accessibilityIdentifier(id)
     }
 
     /// One line under the title: how many devices, how many are up. Counted
     /// from the same `online` flag the cards show, so the two always agree.
     private var fleetSummary: some View {
-        HStack(spacing: SD.Space.sm) {
+        // Side by side normally; stacked at accessibility text sizes, where the
+        // one-line row clipped both labels (audit).
+        let layout = typeSize.isAccessibilitySize
+            ? AnyLayout(VStackLayout(alignment: .leading, spacing: SD.Space.xxs))
+            : AnyLayout(HStackLayout(spacing: SD.Space.sm))
+        return layout {
             SDEyebrow("\(devices.count) \(devices.count == 1 ? "device" : "devices")")
-            Rectangle().fill(SD.Colors.borderStrong).frame(width: 1, height: 10)
+            if !typeSize.isAccessibilitySize {
+                Rectangle().fill(SD.Colors.borderStrong).frame(width: 1, height: 10)
+            }
             HStack(spacing: 6) {
                 Circle()
                     .fill(onlineCount > 0 ? SD.Colors.success : SD.Colors.offline)
                     .frame(width: 6, height: 6)
                 SDEyebrow("\(onlineCount) online", color: onlineCount > 0 ? SD.Colors.textSecondary : SD.Colors.textTertiary)
             }
-            Spacer()
+            if !typeSize.isAccessibilitySize { Spacer() }
         }
+        .frame(maxWidth: .infinity, alignment: .leading)
         .accessibilityElement(children: .combine)
     }
 
@@ -264,13 +277,23 @@ struct DevicesView: View {
 
 struct DeviceCard: View {
     let device: Device
+    /// The latest refresh failed: `online` is from an older reply, so the card
+    /// says Unknown instead of a stale ONLINE (ConnectionTruth).
+    var lastRefreshFailed = false
 
-    private var status: SDStatus { device.online ? .online : .offline }
+    private var status: SDStatus {
+        switch ConnectionTruth.presence(online: device.online, lastRefreshFailed: lastRefreshFailed) {
+        case .online: .online
+        case .offline: .offline
+        case .unknown: .unknown
+        }
+    }
 
     /// "Offline" alone leaves people wondering whether it just happened or has
     /// been down all week, which is the first thing anyone wants to know.
     ///
-    /// Checks `device.monitoring?.active`, same as DeviceDetailView one tap
+    /// Checks what custom rules are doing (`device.customRules`: the device's
+    /// reported mode, else `monitoring.active`), same as DeviceDetailView one tap
     /// away — Models.swift's own doc comment on `CustomMonitoring` names the
     /// exact bug this guards against: showing the base mode as selected while
     /// a custom configuration is what the device is really doing, so someone
@@ -278,12 +301,20 @@ struct DeviceCard: View {
     /// watching for driver distraction. That was fixed on the device screen;
     /// this card had the identical unconditional read of `activePreset` and
     /// wasn't.
+    ///
+    /// Online, the mode is prefixed with the device's monitoring state whenever
+    /// it is not simply watching ("Stopped · Driver Safety", "Not monitoring ·
+    /// ..."), from the backend's status contract (DeviceStatus.swift). The card
+    /// used to read like a healthy device whatever the device reported.
     private var subtitle: String {
         if device.online {
-            if device.monitoring?.active == true {
-                return device.monitoring?.title ?? "AI Custom Monitoring"
-            }
-            return Preset.title(for: device.activePreset)
+            // Rules running alongside the mode (an additive role) leave the
+            // mode in charge, so the mode is what is named.
+            let modeTitle = device.customRules == .replacing
+                ? (device.monitoring?.title ?? "AI Custom Monitoring")
+                : Preset.title(for: device.activePreset)
+            return MonitoringStatusPresentation.cardSubtitle(
+                modeTitle: modeTitle, presentation: device.monitoringPresentation)
         }
         guard let lastSeen = device.lastSeen else { return "Not seen yet" }
         let elapsed = Date().timeIntervalSince(Date(timeIntervalSince1970: lastSeen))
@@ -299,7 +330,7 @@ struct DeviceCard: View {
     /// The mode glyph shown in the preview tile — what the camera is doing,
     /// not a generic camera icon.
     private var modeIcon: String {
-        if device.monitoring?.active == true { return "sparkles" }
+        if device.customRules == .replacing { return "sparkles" }
         let base = Preset.split(device.activePreset).base
         return Preset.catalog.first(where: { $0.name == base })?.icon ?? "video"
     }
@@ -309,14 +340,16 @@ struct DeviceCard: View {
             preview
             HStack(alignment: .center, spacing: SD.Space.sm) {
                 VStack(alignment: .leading, spacing: 3) {
+                    // Wraps instead of truncating: at the largest text sizes a
+                    // one- or two-line limit cut the name off (audit: clipped).
                     Text(device.name)
                         .font(SD.Typography.headline)
                         .foregroundStyle(SD.Colors.textPrimary)
-                        .lineLimit(1)
+                        .fixedSize(horizontal: false, vertical: true)
                     Text(subtitle)
                         .font(SD.Typography.caption)
-                        .foregroundStyle(SD.Colors.textTertiary)
-                        .lineLimit(1)
+                        .foregroundStyle(SD.Colors.textSecondary)
+                        .fixedSize(horizontal: false, vertical: true)
                 }
                 Spacer(minLength: SD.Space.xs)
                 Image(systemName: "arrow.up.right")
@@ -356,19 +389,25 @@ struct DeviceCard: View {
                 .foregroundStyle(device.online ? SD.Colors.textSecondary : SD.Colors.textDisabled)
             VStack {
                 HStack {
-                    SDStatusPill(status: status, pulses: device.online)
+                    SDStatusPill(status: status, pulses: status == .online)
                     Spacer()
                     if let id = device.hardwareId {
+                        // No shrink-to-fit: minimumScaleFactor stops the id following
+                        // the reader's text size (audit: Dynamic Type partially
+                        // unsupported); it wraps at large sizes instead.
                         Text(id)
                             .font(SD.Typography.mono)
-                            .foregroundStyle(SD.Colors.textDisabled)
+                            .foregroundStyle(SD.Colors.textSecondary)
+                            .multilineTextAlignment(.trailing)
+                            .fixedSize(horizontal: false, vertical: true)
                     }
                 }
                 Spacer()
             }
             .padding(SD.Space.sm)
         }
-        .frame(height: 132)
+        // A floor, not a fixed height: the pill and id grow with Dynamic Type.
+        .frame(minHeight: 132)
         .overlay(alignment: .bottom) {
             Rectangle().fill(SD.Colors.border).frame(height: 1)
         }

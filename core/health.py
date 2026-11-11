@@ -64,6 +64,9 @@ class _Component:
     total_restarts: int = 0
     restart_times: deque = field(default_factory=lambda: deque(maxlen=32))
     last_resort_fired: bool = False
+    #: The last-resort policy decided to stay up degraded rather than restart:
+    #: this outage no longer withholds the watchdog ping (see release_watchdog_hold).
+    watchdog_released: bool = False
 
 
 class HealthMonitor:
@@ -257,6 +260,7 @@ class HealthMonitor:
         comp.last_ok = time.monotonic()
         comp.consecutive_failures = 0
         comp.last_resort_fired = False
+        comp.watchdog_released = False  # a new outage withholds the ping again
 
     def _note_failure(self, comp: _Component, error: str) -> None:
         """Record an informational (push) failure without touching the
@@ -324,7 +328,27 @@ class HealthMonitor:
 
     def _critical_component_down(self) -> bool:
         with self._lock:
-            return any(c.critical and c.state == DOWN for c in self._components.values())
+            return any(
+                c.critical and c.state == DOWN and not c.watchdog_released
+                for c in self._components.values()
+            )
+
+    def release_watchdog_hold(self, name: str) -> None:
+        """Keep pinging the watchdog through `name`'s current outage.
+
+        Withholding the ping is how a DOWN critical component gets a process
+        restart from systemd. Once the last-resort policy has decided that a
+        restart will not help and the device should stay up degraded (reboot
+        suppressed, or a process restart already tried for this outage), the
+        hold must go: otherwise systemd kills the process every WatchdogSec for
+        a fault no restart fixes, and each restart drops the device's reports
+        and any explicit stop. The hold re-arms when the component recovers.
+        """
+        with self._lock:
+            comp = self._components.get(name)
+            if comp is not None and not comp.watchdog_released:
+                comp.watchdog_released = True
+                log.warning("%s stays down; keeping the watchdog fed and reporting degraded", name)
 
     # ------------------------------------------------------------------ reporting
     def snapshot(self) -> dict:

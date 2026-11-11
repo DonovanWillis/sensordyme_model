@@ -67,6 +67,12 @@ MIGRATIONS: list[tuple[str, str, str]] = [
 # level of a fresh repo checkout) is left untouched -- idempotent, like the
 # rest of this script.
 LIST_MIGRATIONS: list[tuple[str, str, str]] = [
+    ("alerts.loud_types", "capacity_exceeded",
+     "M7 occupancy preset's alert type: outside loud_types it could never produce a phone notification"),
+    ("alerts.loud_types", "zone_dwell",
+     "M7 occupancy preset's alert type: outside loud_types it could never produce a phone notification"),
+    ("alerts.loud_types", "restricted_area",
+     "M7 workplace_safety preset's alert type: outside loud_types it could never produce a phone notification"),
     ("alerts.loud_types", "unusual_stillness",
      ("baby/elderly presets' alert type was never in loud_types, so it could never produce a phone"
       " notification (severity defaulted to soft) -- see config.yaml's fuller comment")),

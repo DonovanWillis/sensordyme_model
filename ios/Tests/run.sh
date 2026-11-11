@@ -15,7 +15,12 @@ for test in ios/Tests/*Tests.swift; do
   subject="ios/Sources/${name%Tests}.swift"
   [ -f "$subject" ] || { echo "no subject for $name"; status=1; continue; }
   tmp=$(mktemp -d)
-  cat "$subject" "$test" > "$tmp/main.swift"
+  # A test may name other Foundation-only sources its subject needs, on a line
+  # `// run.sh deps: Name Other` (file names under ios/Sources, without .swift).
+  deps=$(sed -n 's#^// run.sh deps: ##p' "$test" | head -1)
+  sources=("$subject")
+  for dep in $deps; do sources+=("ios/Sources/$dep.swift"); done
+  cat "${sources[@]}" "$test" > "$tmp/main.swift"
   echo "== $name =="
   swift "$tmp/main.swift" || status=1
   rm -rf "$tmp"

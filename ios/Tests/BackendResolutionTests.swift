@@ -244,8 +244,8 @@ check(BackendResolution.chooseBackend(from: [mineByName, mineByAddress, theirs],
 
 typealias Endpoint = BackendResolution.BackendEndpoint
 
-let named = Endpoint(host: "sensordyme-backend.local", port: 8787, backendID: "bk_0eb63f4fc338")
-let numeric = Endpoint(host: "10.97.118.172", port: 8787, backendID: "bk_0eb63f4fc338")
+let named = Endpoint(host: "sensordyme-backend.local", port: 8787, backendID: "bk_00000000test")
+let numeric = Endpoint(host: "10.97.118.172", port: 8787, backendID: "bk_00000000test")
 
 check(named.baseURL == "http://sensordyme-backend.local:8787", "a name builds the URL it should")
 check(named.hostIsStable, "a .local name is resolvable again later, so it is stable")
@@ -291,7 +291,7 @@ check(BackendResolution.discoveryCache(after: "http://x", keeping: "") == "",
 
 let ordered = BackendResolution.preferringStableHost([
     numeric,
-    Endpoint(host: "fe80::1", port: 8787, backendID: "bk_0eb63f4fc338"),
+    Endpoint(host: "fe80::1", port: 8787, backendID: "bk_00000000test"),
     named,
 ])
 check(ordered.first == named, "the stable name is tried first, always")
@@ -325,7 +325,7 @@ check(BackendResolution.verificationIsCurrent(generation: 3, current: 2),
 // The Mac moves from 10.97.118.172 to 10.97.120.45. Identity is unchanged.
 
 do {
-    let before = Endpoint(host: "sensordyme-backend.local", port: 8787, backendID: "bk_0eb63f4fc338")
+    let before = Endpoint(host: "sensordyme-backend.local", port: 8787, backendID: "bk_00000000test")
     // Only the name was persisted, so there is no dead address to try.
     check(BackendResolution.mayPersistAsLocation(before), "the name is what got stored")
     let candidates = BackendResolution.candidates(
@@ -336,7 +336,7 @@ do {
     // mDNS resolves that same name to the new address; identity is unchanged.
     let after = Endpoint(
         host: "sensordyme-backend.local", port: 8787,
-        backendID: "bk_0eb63f4fc338", resolvedAddress: "10.97.120.45"
+        backendID: "bk_00000000test", resolvedAddress: "10.97.120.45"
     )
     check(after.baseURL == before.baseURL, "the URL every consumer uses did not change at all")
     check(after.backendID == before.backendID, "and it is recognisably the same backend")

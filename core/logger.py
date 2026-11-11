@@ -27,6 +27,7 @@ import contextlib
 import csv
 import math
 import os
+import threading
 import time
 from pathlib import Path
 from typing import Any, Union
@@ -141,6 +142,9 @@ class EventLogger:
         each having to tolerate corruption separately.
         """
         self._path = Path(csv_path)
+        # The inference loop and the health monitor (monitoring-state changes)
+        # both write rows; one writer at a time keeps every row whole.
+        self._write_lock = threading.Lock()
         self._errors = _WriteErrors(f"event log {self._path}")
         self._file: Any = None    # open text file, or None while it cannot be opened
         self._writer: Any = None
@@ -188,6 +192,10 @@ class EventLogger:
     def log(self, event: Event) -> None:
         """Append one event as a CSV row and sync it to the card. Never raises
         on a write failure: the row is dropped and the failure logged."""
+        with self._write_lock:
+            self._log(event)
+
+    def _log(self, event: Event) -> None:
         if not self._ensure_open():
             return
         try:

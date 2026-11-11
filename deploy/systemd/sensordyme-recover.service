@@ -1,0 +1,19 @@
+[Unit]
+Description=SensorDyme bounded reboot after the service exhausts its start limit
+# Started only by OnFailure= in sensordyme.service, so it is never enabled itself.
+# It reboots only when sensordyme.service failed with Result=start-limit-hit and
+# fewer than 3 such reboots happened in the last 6 hours (persisted below), so a
+# failure that is deterministic at startup can no longer reboot-loop the Pi.
+# An exit-78 config refusal, a manual stop or any other failure never reboots.
+DefaultDependencies=no
+After=local-fs.target
+
+[Service]
+Type=oneshot
+# Root, because it may reboot. The script is installed root-owned outside the
+# service user's checkout (scripts/release/install_units.sh), so the service
+# user cannot change what runs here.
+User=root
+StateDirectory=sensordyme-recover
+ExecStart=/usr/bin/python3 -I /usr/local/lib/sensordyme/start_limit_guard.py --unit sensordyme.service --state /var/lib/sensordyme-recover/reboots.json --max 3 --window 21600
+TimeoutStartSec=60

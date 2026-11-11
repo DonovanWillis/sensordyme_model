@@ -1,0 +1,42 @@
+{
+ "protocol": 1,
+ "pbkdf2_iterations": 600000,
+ "cases": [
+  {
+   "name": "basic",
+   "device_id": "SD-1A2B3C4D",
+   "code": "ABCD-EFGH-JKMN",
+   "na": "00112233445566778899aabbccddeeff",
+   "nd": "ffeeddccbbaa99887766554433221100",
+   "iv": "000102030405060708090a0b",
+   "ssid": "HomeWiFi",
+   "psk": "correct horse battery staple",
+   "qr": "SDSETUP:1:SD-1A2B3C4D:ABCDEFGHJKMN",
+   "code_key": "7305a2ddb6ed90e98be12005678dfe10dbb2b05af777d9295aa03c0dabca23f7",
+   "k_mac": "32ecff9fa9157d8d672f6ff2fa72025240f22e970f634b4b78a69a4cfec0cc12",
+   "k_enc": "ea609dbd840da06e6372c322c2575ce0652326274e1d832eb63a86eb77592346",
+   "transcript": "53656e736f7244796d6520424c4520506f502076317c0b53442d314132423343344400112233445566778899aabbccddeeffffeeddccbbaa99887766554433221100",
+   "app_proof": "029176b1d6b2fb003cc529882cd6e158c418194b861dfcfbe7fa0013750b995d",
+   "device_proof": "360aa40f9556222b31e2f5635624f0108756601e3c46e19f2f2fb4d0e7ac8bb3",
+   "creds_ct": "560d73e28aa9330bc4ee9457c6fd4c19bcb7164873f66407d4ef0dfbf2c60264d2a039b090f57c576e008ab6ae8d6d63d635116477f5a235b5f1af8c903918d209d45756f6511247"
+  },
+  {
+   "name": "unicode_open_network",
+   "device_id": "SD-00000000",
+   "code": "0123-4567-89VW",
+   "na": "0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f",
+   "nd": "f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0",
+   "iv": "a1a1a1a1a1a1a1a1a1a1a1a1",
+   "ssid": "Café ☕ 5G",
+   "psk": null,
+   "qr": "SDSETUP:1:SD-00000000:0123456789VW",
+   "code_key": "dd28e97006389ce537bc4698bc328dfa6190d1cf500f0d1d3d683b4854a8d1da",
+   "k_mac": "b4ad57d14fa8a52d2d127d5ff6129b31e6c599ba401498198308ea86e0fde7b8",
+   "k_enc": "5744c342ebd25784d5cfb80a73f2804a4d07fdd1ae16930da945359a85adcb74",
+   "transcript": "53656e736f7244796d6520424c4520506f502076317c0b53442d30303030303030300f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0ff0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0",
+   "app_proof": "ac8413bbed7eba5dca9cb33f0c417d29e60ce0af9a9d30c451922c6f70bb43ad",
+   "device_proof": "3dea30c5b1f2c7ad2025ced19b5fd521aaf89400d1eed7845fc9cbeb69b9c519",
+   "creds_ct": "f9de8388f7d09588334bc5dc2f5e8f599ec9e6ae48c6a8fd71ea1380dacddcfc29bf8ef6bfa494c54ada82bc02100ff0eb5d"
+  }
+ ]
+}

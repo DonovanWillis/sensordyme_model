@@ -247,6 +247,56 @@ TAXONOMY: dict[str, list[Detection]] = {
            caveat="applies to AI-configured rules only; this mode's own zone/lingering/crowd "
                   "alerts are not time-conditioned"),
     ],
+    # ------------------------------------------------------------------ occupancy (M7)
+    # Node-backed: no model of its own; reads the shared detector's person boxes
+    # (core/perception.py) through the people_counter node (core/nodes.py).
+    "occupancy": [
+        _d("person_count", "How many people are present", SUPPORTED,
+           how="shared detector person boxes, count settled over a debounce window"),
+        _d("entry_exit", "Someone entered or left", SUPPORTED,
+           how="a rise/fall in the settled count (person_entered / person_exited, logged)"),
+        _d("capacity", "More people than a set capacity", SUPPORTED, how="capacity_exceeded on the settled count"),
+        _d("zone_dwell", "Someone staying in a drawn area too long", SUPPORTED,
+           how="user-drawn zones + per-area dwell timer on shared person boxes (zone_dwell)"),
+        _d("identity_tracking", "Following one specific person across visits", UNSUPPORTED,
+           requires="re-identification; counts are anonymous by design"),
+    ],
+    # ------------------------------------------------------------------ workplace_safety (M7)
+    "workplace_safety": [
+        _d("restricted_area", "Person entering a restricted area", SUPPORTED,
+           how="zone_watch node: a typed person-in-zone rule bundle on shared person boxes"),
+        _d("ppe", "Hard hat / vest / PPE compliance", UNSUPPORTED,
+           requires="a PPE detection model; none is shipped or validated"),
+        _d("forklift_vehicle", "Forklift or vehicle near people", UNSUPPORTED,
+           requires="industrial-vehicle detection and proximity validation"),
+        _d("worker_fall", "Worker fall", UNSUPPORTED,
+           requires="fall detection validated for workplace scenes (elderly_monitoring's is not)"),
+    ],
+}
+
+
+#: Requests no mode can serve, whatever they are phrased as. Configure-with-AI
+#: refuses them up front with these reasons (jupiter/policy.py refusal_for)
+#: instead of letting any interpreter approximate them: "a stranger at the
+#: door" must never quietly become "a person at the door".
+REFUSALS: dict[str, Detection] = {
+    "identity": _d("identity", "Recognising who someone is (known / unknown / a named person)", UNSUPPORTED,
+                   requires="face recognition — deliberately not shipped (privacy). SensorDyme can tell "
+                            "that a person is present, never who it is"),
+    "intent": _d("intent", "Intent, purpose or suspicion", UNSUPPORTED,
+                 requires="never claimed from appearance by policy; ask for an observable action instead "
+                          "(someone entering or staying in an area you draw)"),
+    "emotion": _d("emotion", "Emotions or mood", UNSUPPORTED,
+                  requires="not determinable reliably from a camera image, and never claimed by policy"),
+    "audio": _d("audio", "Sounds (crying, shouting, barking, alarms, voices)", UNSUPPORTED,
+                requires="a microphone and an audio classifier; this device has no microphone"),
+    "intoxication": _d("intoxication", "Intoxication", UNSUPPORTED,
+                       requires="never claimed from appearance by policy"),
+    "medical": _d("medical", "Medical conditions (breathing, seizures, heart problems)", UNSUPPORTED,
+                  requires="out of scope by policy — the system reports observable safety conditions only"),
+    "repetition_window": _d("repetition_window", "Counting repeated occurrences in a time window", UNSUPPORTED,
+                            requires="a rule that counts episodes over a window; the device evaluates one "
+                                     "sustained condition per rule"),
 }
 
 

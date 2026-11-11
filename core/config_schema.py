@@ -20,6 +20,13 @@ _KNOWN_TOP_LEVEL = {
     # 'training:' (typo?)" on every boot for a section that is real and is read --
     # which is how an operator learns to ignore this validator's output entirely.
     "training",
+    # Deployment role and its safety floor (core/roles.py, M0.1).
+    "role",
+    # The shared perception engine (core/perception.py, M7): max_age_s, detector_weights.
+    "perception",
+    # development (default) | production: production refuses insecure fallbacks,
+    # e.g. unauthenticated Bluetooth setup (services/ble_pop.py, M6.5).
+    "deployment",
 }
 
 
@@ -51,7 +58,14 @@ def _validate_alerts(alerts: dict, where: str, errors: list[str], warnings: list
         value = alerts["escalation_window_s"]
         _check(errors, _is_num(value) and value >= 0,
                f"`{where}.escalation_window_s:` must be a non-negative number, got {value!r}")
-    for key in ("sinks", "loud_types", "soft_types"):
+    if "duplicate_window_s" in alerts:
+        value = alerts["duplicate_window_s"]
+        _check(errors, _is_num(value) and 0 <= value <= 60,
+               f"`{where}.duplicate_window_s:` must be a number in [0, 60], got {value!r}")
+    categories = alerts.get("categories")
+    if categories is not None:
+        _validate_categories(categories, where, errors)
+    for key in ("sinks", "loud_types", "soft_types", "critical_types"):
         if key not in alerts:
             continue
         value = alerts[key]
@@ -81,6 +95,29 @@ def _validate_alerts(alerts: dict, where: str, errors: list[str], warnings: list
                f"`{where}.evidence_max_files:` must be a non-negative integer, got {value!r}")
 
 
+def _validate_categories(categories, where: str, errors: list[str]) -> None:
+    """`alerts.categories:` overrides, bounded exactly as AlertCategory bounds them."""
+    from dataclasses import replace
+
+    from core.alerts import DEFAULT_CATEGORIES
+
+    if not isinstance(categories, dict):
+        errors.append(f"`{where}.categories:` must be a mapping of category -> settings")
+        return
+    allowed = {"initial_pattern", "escalated_pattern", "repeat_s", "escalate_after_s", "max_repeats"}
+    for name, override in categories.items():
+        if name not in DEFAULT_CATEGORIES:
+            errors.append(f"`{where}.categories.{name}:` unknown category (known: {sorted(DEFAULT_CATEGORIES)})")
+            continue
+        if not isinstance(override, dict) or set(override) - allowed:
+            errors.append(f"`{where}.categories.{name}:` may only set {sorted(allowed)}")
+            continue
+        try:
+            replace(DEFAULT_CATEGORIES[name], **override)
+        except (TypeError, ValueError) as exc:
+            errors.append(f"`{where}.categories.{name}:` {exc}")
+
+
 def validate(config: dict) -> tuple[list[str], list[str]]:
     """Validate the top-level runtime config. Returns (errors, warnings)."""
     errors: list[str] = []
@@ -97,6 +134,9 @@ def validate(config: dict) -> tuple[list[str], list[str]]:
            "`module:` must be a non-empty string")
     profile = config.get("profile", "pi")
     _check(errors, profile in ("pi", "mac_max"), f"`profile:` must be 'pi' or 'mac_max', got {profile!r}")
+    deployment = config.get("deployment", "development")
+    _check(errors, deployment in ("development", "production"),
+           f"`deployment:` must be development|production, got {deployment!r}")
 
     camera = config.get("camera", {})
     if isinstance(camera, dict):
@@ -136,6 +176,9 @@ def validate(config: dict) -> tuple[list[str], list[str]]:
         hef = accel_cfg.get("yolo_hef")
         _check(errors, hef is None or isinstance(hef, str),
                f"`accelerator.yolo_hef:` must be a path string or null, got {hef!r}")
+        decoder = accel_cfg.get("yolo_decoder", "legacy")
+        _check(errors, decoder in ("legacy", "reference"),
+               f"`accelerator.yolo_decoder:` must be legacy|reference, got {decoder!r}")
     else:
         errors.append("`accelerator:` must be a mapping")
 
@@ -146,6 +189,12 @@ def validate(config: dict) -> tuple[list[str], list[str]]:
             method = prov.get("method", "ble")
             _check(errors, method in ("ble", "hotspot", "off"),
                    f"`network.provisioning.method:` must be ble|hotspot|off, got {method!r}")
+            auth = prov.get("auth", "legacy")
+            _check(errors, auth in ("legacy", "pop"),
+                   f"`network.provisioning.auth:` must be legacy|pop, got {auth!r}")
+            if auth == "legacy" and config.get("deployment") == "production" and method == "ble":
+                errors.append("`network.provisioning.auth: legacy` (unauthenticated Bluetooth setup) is refused "
+                              "with `deployment: production`; set `auth: pop` (services/ble_pop.py)")
         else:
             errors.append("`network.provisioning:` must be a mapping")
     else:
@@ -188,7 +237,22 @@ def validate(config: dict) -> tuple[list[str], list[str]]:
             _check(errors, isinstance(queue_max, int) and not isinstance(queue_max, bool)
                    and 1 <= queue_max <= 1000,
                    f"`cloud.queue_max:` must be an integer in 1-1000, got {queue_max!r}")
-        if cloud.get("enabled") is True and not cloud.get("device_key"):
+        # sd-auth-v1 (core/command_auth.py) and the 0600 key file (core/secret_store.py).
+        if "command_auth" in cloud:
+            _check(errors, cloud["command_auth"] in ("off", "permissive", "required"),
+                   f"`cloud.command_auth:` must be off, permissive or required, got {cloud['command_auth']!r}")
+        for key in ("previous_device_key", "device_key_file"):
+            if cloud.get(key) is not None:
+                _check(errors, isinstance(cloud[key], str), f"`cloud.{key}:` must be a string")
+        revoked = cloud.get("revoked_key_ids")
+        if revoked is not None:
+            _check(errors, isinstance(revoked, list) and all(
+                isinstance(k, str) and len(k) == 16 and all(c in "0123456789abcdef" for c in k) for k in revoked),
+                "`cloud.revoked_key_ids:` must be a list of 16-hex-digit key ids")
+        if cloud.get("device_key") and cloud.get("device_key_file"):
+            errors.append("`cloud.device_key` and `cloud.device_key_file` are both set: keep only the file "
+                          "(docs/CREDENTIAL_STORAGE.md)")
+        if cloud.get("enabled") is True and not cloud.get("device_key") and not cloud.get("device_key_file"):
             warnings.append(
                 "cloud.enabled is true but cloud.device_key is empty: the uplink will not "
                 "start and this device will never reach the backend"
@@ -238,8 +302,34 @@ def validate(config: dict) -> tuple[list[str], list[str]]:
         for name, section in modules_cfg.items():
             if not isinstance(section, dict):
                 errors.append(f"`modules.{name}:` must be a mapping, got {section!r}")
+        driver = modules_cfg.get("driver_attention")
+        if isinstance(driver, dict):
+            # Experimental behaviour reasoning (core/behavior/, off by default):
+            # a typo'd or wrong-typed key there must fail loudly, not run defaults.
+            from core.behavior.camera_model import validate_intrinsics
+            from core.behavior.config import validate_behavior
+
+            errors.extend(validate_behavior(driver))
+            errors.extend(validate_intrinsics(driver.get("camera_intrinsics")))
+            if driver.get("camera_intrinsics") is not None and driver.get("camera_hfov_deg") is not None:
+                errors.append("`modules.driver_attention:` set camera_hfov_deg OR camera_intrinsics, not both "
+                              "(calibrated intrinsics already fix the field of view)")
     if profile != "mac_max" and isinstance(module_name, str) and isinstance(modules_cfg, dict):
         _check(errors, module_name in modules_cfg,
                f"`module: {module_name}` has no `modules.{module_name}:` config section")
+
+    # Deployment role: the safety floor this config must not weaken.
+    from core.roles import ROLES, config_violations
+
+    errors.extend(config_violations(config))
+    role_name = config.get("role")
+    if (
+        isinstance(role_name, str) and role_name in ROLES and ROLES[role_name].has_floor
+        and config.get("profile", "pi") == "mac_max"
+    ):
+        warnings.append(
+            f"role '{role_name}' is not enforced on the mac_max developer profile; "
+            "it never reports protection"
+        )
 
     return errors, warnings

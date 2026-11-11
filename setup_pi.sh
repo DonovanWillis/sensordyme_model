@@ -192,6 +192,14 @@ fi
 sudo install -m 0440 "$SUDOERS_TMP" /etc/sudoers.d/sensordyme-reboot
 rm -f "$SUDOERS_TMP"
 
+echo "==> Installing the bounded start-limit recovery unit (no unbounded reboot loop)"
+# sensordyme.service's OnFailure= target. The guard runs as root, so it is
+# installed root-owned OUTSIDE this (service-user-writable) checkout.
+sudo install -D -m 0755 -o root -g root scripts/start_limit_guard.py \
+  /usr/local/lib/sensordyme/start_limit_guard.py
+sudo install -m 0644 -o root -g root deploy/systemd/sensordyme-recover.service \
+  /etc/systemd/system/sensordyme-recover.service
+
 echo "==> Installing systemd service (Type=notify + watchdog + preflight)"
 sudo cp sensordyme.service /etc/systemd/system/sensordyme.service
 sudo sed -i "s#__SENSORDYME_DIR__#$(pwd)#g; s#__SENSORDYME_USER__#${SERVICE_USER}#g" \

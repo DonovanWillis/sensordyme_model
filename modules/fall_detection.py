@@ -65,6 +65,7 @@ from core.activity import ActivityRecognizer
 from core.detections import Detection, DetectionFrame
 from core.event_engine import CONFIRMED, DEVELOPING, OBSERVED, RESOLVED, EventEngine, RuleSpec
 from core.events import Event
+from core.monitoring_state import Capability
 from core.zones import BoundaryCrossing, load_zones
 from modules.base import VisionModule, register_module
 
@@ -808,6 +809,11 @@ class FallDetectionModule(VisionModule):
         combinations that matter.
         """
         return self._last_activity.as_dict() if self._last_activity else None
+
+    def capability_status(self) -> dict:
+        """MediaPipe Pose on every frame; whether it actually ran is the shared
+        engine's to say (core/perception.py), not this declaration's."""
+        return {"pose": Capability()}
 
     def get_detections(self) -> DetectionFrame:
         """The tracked person plus their posture, as labels custom rules can use.

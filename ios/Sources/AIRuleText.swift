@@ -122,8 +122,10 @@ enum DurationText {
 /// What an activation achieved, from what the backend confirmed.
 ///
 /// `POST /v1/devices/{id}/preset` reports `rules_active` — how many of the sent
-/// rules will run. A rule never runs beside a named monitoring mode, so for a
-/// preset proposal the mode switches and the rules come back unsupported; that
+/// rules will run. Rules sent WITH a named mode are never turned on (an additive
+/// role runs rules beside its mode, but only when they are activated on their
+/// own), so for a preset proposal the mode switches and the rules come back
+/// unsupported; that
 /// is a mode switch, not a failure, and must not read as either "Active" rules
 /// or an error.
 struct ActivationSummary: Equatable {
@@ -143,7 +145,12 @@ struct ActivationSummary: Equatable {
     ///   - isCustom: the proposal names no monitoring mode (AI Custom).
     ///   - rulesActive: from the backend; nil from one that predates it, which
     ///     keeps the old behaviour of claiming the activation as sent.
-    static func summarize(isCustom: Bool, rulesSent: Int, rulesActive: Int?) -> ActivationSummary {
+    ///   - additive: the device's role runs custom rules BESIDE its mode
+    ///     (DeviceStatus rules.additive). There "rules can't run alongside a
+    ///     monitoring mode" is false: activated on their own, they do. Only
+    ///     rules sent together with a mode switch are not turned on.
+    static func summarize(isCustom: Bool, rulesSent: Int, rulesActive: Int?,
+                          additive: Bool = false) -> ActivationSummary {
         guard let active = rulesActive else { return ActivationSummary(kind: .active, note: nil) }
         let elsewhere = "see \u{201C}Not yet possible\u{201D}"
         if active == 0 {
@@ -152,13 +159,23 @@ struct ActivationSummary: Equatable {
                     kind: .nothingRunning,
                     note: "None of these rules can run on this device — \(elsewhere).")
             }
+            if additive {
+                return ActivationSummary(
+                    kind: .modeSwitched,
+                    note: rulesSent == 0 ? nil
+                        : "\(rulesSent == 1 ? "This rule wasn't" : "These rules weren't") turned on with the mode. "
+                          + "Activate \(rulesSent == 1 ? "it" : "them") on \(rulesSent == 1 ? "its" : "their") own "
+                          + "to run \(rulesSent == 1 ? "it" : "them") alongside the mode. "
+                          + "See \u{201C}Not yet possible\u{201D}.")
+            }
             return ActivationSummary(
                 kind: .modeSwitched,
                 note: rulesSent == 0 ? nil
                     : "\(rulesSent == 1 ? "This rule needs" : "These rules need") AI Custom — "
                       + "rules can't run alongside a monitoring mode. See \u{201C}Not yet possible\u{201D}.")
         }
-        let running = active == 1 ? "1 rule running" : "\(active) rules running"
+        let running = (active == 1 ? "1 rule running" : "\(active) rules running")
+            + (additive ? " alongside the monitoring mode" : "")
         if active < rulesSent {
             return ActivationSummary(
                 kind: .active,

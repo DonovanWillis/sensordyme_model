@@ -283,9 +283,11 @@ struct SetupFlowView: View {
             // push from the device. Binding the field to parent state means
             // that churn reaches the text field and the keyboard, which is what
             // made typing feel unreliable.
-            PasswordSheet(initialSSID: selectedSSID, secured: selectedSecured) { ssid, password in
+            PasswordSheet(initialSSID: selectedSSID, secured: selectedSecured,
+                          requiresSetupCode: flow.ble.requiresSetupCode,
+                          connectedDeviceID: flow.ble.deviceID) { ssid, password, label in
                 showPasswordEntry = false
-                flow.send(ssid: ssid, password: password)
+                flow.send(ssid: ssid, password: password, label: label)
             }
         }
     }
@@ -366,19 +368,27 @@ struct SetupFlowView: View {
 private struct PasswordSheet: View {
     let initialSSID: String
     let secured: Bool
-    let onSubmit: (String, String) -> Void
+    /// The device accepts credentials only after proof of its setup code.
+    let requiresSetupCode: Bool
+    /// The connected device's own id: a QR label for another device is refused.
+    let connectedDeviceID: String?
+    let onSubmit: (String, String, BLEProofOfPossession.SetupLabel?) -> Void
 
     @Environment(\.dismiss) private var dismiss
     @State private var ssid: String
     @State private var password = ""
     @State private var reveal = false
+    @State private var setupCode = ""
     @FocusState private var focus: Field?
 
-    private enum Field { case ssid, password }
+    private enum Field { case ssid, password, setupCode }
 
-    init(initialSSID: String, secured: Bool, onSubmit: @escaping (String, String) -> Void) {
+    init(initialSSID: String, secured: Bool, requiresSetupCode: Bool = false, connectedDeviceID: String? = nil,
+         onSubmit: @escaping (String, String, BLEProofOfPossession.SetupLabel?) -> Void) {
         self.initialSSID = initialSSID
         self.secured = secured
+        self.requiresSetupCode = requiresSetupCode
+        self.connectedDeviceID = connectedDeviceID
         self.onSubmit = onSubmit
         _ssid = State(initialValue: initialSSID)
     }
@@ -442,6 +452,30 @@ private struct PasswordSheet: View {
                     }
                 }
 
+                if requiresSetupCode {
+                    Section {
+                        TextField("XXXX-XXXX-XXXX", text: $setupCode)
+                            .font(SD.Typography.body.monospaced())
+                            .textInputAutocapitalization(.characters)
+                            .autocorrectionDisabled()
+                            .focused($focus, equals: .setupCode)
+                            .accessibilityLabel("Setup code")
+                            .accessibilityIdentifier("setup.code")
+                        if case .failure(let problem) = setupLabel, !setupCode.isEmpty {
+                            Text(SetupCodeEntry.message(problem))
+                                .font(SD.Typography.caption)
+                                .foregroundStyle(SD.Colors.danger)
+                                .fixedSize(horizontal: false, vertical: true)
+                        }
+                    } header: {
+                        Text("Setup code")
+                    } footer: {
+                        Text("Printed on the label on your SensorDyme. You can also paste the text of its QR code. The device proves it knows this code before the Wi-Fi password is sent, encrypted.")
+                            .font(SD.Typography.caption)
+                            .foregroundStyle(SD.Colors.textTertiary)
+                    }
+                }
+
                 Section {
                     Button(action: submit) {
                         Text("Connect SensorDyme")
@@ -476,13 +510,20 @@ private struct PasswordSheet: View {
     /// a rejection thirty seconds later.
     private var canSubmit: Bool {
         guard !ssid.trimmingCharacters(in: .whitespaces).isEmpty else { return false }
+        if requiresSetupCode, case .failure = setupLabel { return false }
         return secured ? password.count >= 8 : true
+    }
+
+    private var setupLabel: Result<BLEProofOfPossession.SetupLabel, SetupCodeEntry.Problem> {
+        SetupCodeEntry.label(from: setupCode, connectedDeviceID: connectedDeviceID)
     }
 
     private func submit() {
         guard canSubmit else { return }
-        onSubmit(networkName, password)
+        let label = requiresSetupCode ? (try? setupLabel.get()) : nil
+        onSubmit(networkName, password, label)
         password = ""
+        setupCode = ""
     }
 
     /// The SSID to send, exactly. Spaces are legal at either end of an SSID,

@@ -89,3 +89,22 @@ with the current camera/models (what it would need is listed).
 | ❌ | Known vs unknown person (`known_person`) | face recognition — deliberately not shipped (privacy) |
 | ❌ | Face covering / carrying weapon / climbing barrier (`mask_or_weapon`) | specialized models with serious false-positive stakes; we refuse to approximate these with the current stack — actions like 'person entered restricted area' are reported instead of labels like 'burglar' |
 | 🟡 | Armed hours / motion during configured times (`schedule`) | AI-configured rules carry an HH:MM-HH:MM window, enforced on the device (core/rules.py) in the rule's timezone when it names one, else device local time **Caveat:** applies to AI-configured rules only; this mode's own zone/lingering/crowd alerts are not time-conditioned |
+
+## occupancy
+
+| | Detection | How / Caveat / Requires |
+|---|---|---|
+| ✅ | How many people are present (`person_count`) | shared detector person boxes, count settled over a debounce window |
+| ✅ | Someone entered or left (`entry_exit`) | a rise/fall in the settled count (person_entered / person_exited, logged) |
+| ✅ | More people than a set capacity (`capacity`) | capacity_exceeded on the settled count |
+| ✅ | Someone staying in a drawn area too long (`zone_dwell`) | user-drawn zones + per-area dwell timer on shared person boxes (zone_dwell) |
+| ❌ | Following one specific person across visits (`identity_tracking`) | re-identification; counts are anonymous by design |
+
+## workplace_safety
+
+| | Detection | How / Caveat / Requires |
+|---|---|---|
+| ✅ | Person entering a restricted area (`restricted_area`) | zone_watch node: a typed person-in-zone rule bundle on shared person boxes |
+| ❌ | Hard hat / vest / PPE compliance (`ppe`) | a PPE detection model; none is shipped or validated |
+| ❌ | Forklift or vehicle near people (`forklift_vehicle`) | industrial-vehicle detection and proximity validation |
+| ❌ | Worker fall (`worker_fall`) | fall detection validated for workplace scenes (elderly_monitoring's is not) |

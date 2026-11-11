@@ -180,6 +180,7 @@ struct AskJupiterBar: View {
                 .submitLabel(.send)
                 .onSubmit(submit)
                 .accessibilityLabel(placeholder)
+                .accessibilityIdentifier("jupiter.input")
 
                 Group {
                     if busy {
@@ -187,6 +188,7 @@ struct AskJupiterBar: View {
                             .controlSize(.small)
                             .tint(SD.Colors.textPrimary)
                             .frame(width: 30, height: 30)
+                            .accessibilityLabel("Jupiter is working")
                     } else {
                         Button(action: submit) {
                             Image(systemName: "arrow.up")
@@ -201,6 +203,7 @@ struct AskJupiterBar: View {
                         .buttonStyle(.plain)
                         .disabled(!canSubmit)
                         .accessibilityLabel("Send to Jupiter")
+                        .accessibilityIdentifier("jupiter.send")
                     }
                 }
                 .animation(SD.Motion.quick, value: canSubmit)
@@ -239,8 +242,11 @@ struct AskJupiterBar: View {
 /// Three dots breathing in sequence while Jupiter works — quieter than a
 /// spinner, and clearly "thinking" rather than "loading a page".
 struct ThinkingDots: View {
+    @Environment(\.accessibilityReduceMotion) private var reduceMotion
+
     var body: some View {
-        TimelineView(.animation(minimumInterval: 1 / 20)) { context in
+        TimelineView(.animation(minimumInterval: 1 / 20,
+                                paused: !MotionPolicy.animates(true, reduceMotion: reduceMotion))) { context in
             let t = context.date.timeIntervalSinceReferenceDate
             HStack(spacing: 4) {
                 ForEach(0..<3, id: \.self) { index in

@@ -24,9 +24,42 @@ enum ModeRowState: Equatable {
     case queuedOffline
     /// The device has confirmed this mode is what it's actually running.
     case active
+    /// The device runs this mode but is NOT monitoring (failed, or stopped),
+    /// with what it says. Never a green checkmark: selected is not protected.
+    case activeNotMonitoring(String)
     /// A switch to this mode was requested and did not succeed — either the
     /// request itself failed, or it never confirmed before the timeout.
     case failed(String)
+    /// This device cannot run this mode (its deployment role forbids it), with
+    /// the reason. Shown, not hidden: the person should see why it is not there.
+    case unavailable(String)
+
+    var isUnavailable: Bool {
+        if case .unavailable = self { return true }
+        return false
+    }
+
+    /// The device runs this mode, whether or not it is monitoring.
+    var isSelected: Bool {
+        switch self {
+        case .active, .activeNotMonitoring: true
+        default: false
+        }
+    }
+
+    /// The row's state for VoiceOver. On screen it is a checkmark, a spinner or
+    /// an icon; the reason texts are already read as part of the row's label.
+    var spokenValue: String {
+        switch self {
+        case .inactive: ""
+        case .switching: "Switching"
+        case .queuedOffline: "Waiting for the device to reconnect"
+        case .active: "Active"
+        case .activeNotMonitoring: "Selected, not monitoring"
+        case .failed: "Switch failed"
+        case .unavailable: "Not available on this device"
+        }
+    }
 }
 
 enum ModeSwitchState {
@@ -51,11 +84,23 @@ enum ModeSwitchState {
     struct PendingSwitch: Equatable {
         let targetBase: String
         let requestedAt: Date
+        /// For a failure: what the backend said when it refused the switch (a
+        /// role that forbids the mode, say). nil = no explanation available,
+        /// so the generic "Didn't switch" applies.
+        var reason: String? = nil
     }
 
     /// Pure derivation — no I/O, no SwiftUI, fully unit-testable. Every
     /// argument is a fact already available on DeviceDetailView; this
     /// function's only job is to not let any of them get inferred wrong.
+    ///
+    /// - Parameters:
+    ///   - customMonitoringActive: custom rules REPLACE the modes (AI Custom).
+    ///     False when they run beside the mode (an additive role), where the
+    ///     mode the device runs is still active.
+    ///   - unavailable: why this device cannot run this mode, or nil.
+    ///   - notMonitoring: when the device reports it is not monitoring (failed
+    ///     or stopped), what to say; the active row then never reads active.
     static func state(
         for presetName: String,
         activeBase: String,
@@ -63,14 +108,16 @@ enum ModeSwitchState {
         pending: PendingSwitch?,
         deviceOnline: Bool,
         failure: PendingSwitch?,
-        now: Date
+        now: Date,
+        unavailable: String? = nil,
+        notMonitoring: String? = nil
     ) -> ModeRowState {
         // A failure is scoped to the specific mode it happened for. Once the
         // user taps a DIFFERENT mode, the old failure is superseded (the
         // caller clears it) rather than following them to a row it no longer
         // describes.
         if let failure, failure.targetBase == presetName {
-            return .failed("Didn't switch — tap to try again")
+            return .failed(failure.reason ?? "Didn't switch — tap to try again")
         }
 
         if let pending, pending.targetBase == presetName {
@@ -87,7 +134,14 @@ enum ModeSwitchState {
         // charge — see DeviceDetailView's existing customMonitoringActive
         // handling, unchanged by this state machine.
         if !customMonitoringActive && activeBase == presetName {
+            if let notMonitoring { return .activeNotMonitoring(notMonitoring) }
             return .active
+        }
+
+        // After `.active`: a device reporting it runs this mode is believed,
+        // whatever the role table says.
+        if let unavailable {
+            return .unavailable(unavailable)
         }
 
         return .inactive

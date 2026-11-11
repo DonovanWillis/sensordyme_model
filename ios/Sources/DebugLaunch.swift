@@ -25,6 +25,18 @@ enum DebugLaunch {
     static var tab: String? { value(after: "-orynTab") }
     /// Text to pre-fill (and send) in Ask Jupiter.
     static var jupiterPrompt: String? { value(after: "-orynPrompt") }
+    /// Don't ask for notification permission (the prompt would cover the screen).
+    static var noPermissionPrompt: Bool { args.contains("-orynNoPrompt") }
+    /// Start signed out, so a UI test can begin at the sign-in screen. It calls the
+    /// ordinary sign-out (the token is revoked and forgotten); it signs no one in.
+    static var signOut: Bool { args.contains("-orynSignOut") }
+    /// Sign in with an existing backend session (`-orynSession <token> <email>`), so the
+    /// app can be driven against a local backend + virtual device (docs/VIRTUAL_DEVICE.md)
+    /// without typing. The token comes from a real /v1/login; nothing is bypassed.
+    static var session: (token: String, email: String)? {
+        guard let index = args.firstIndex(of: "-orynSession"), args.indices.contains(index + 2) else { return nil }
+        return (args[index + 1], args[index + 2])
+    }
 
     private static func value(after flag: String) -> String? {
         guard let index = args.firstIndex(of: flag), args.indices.contains(index + 1) else { return nil }
@@ -38,5 +50,8 @@ enum DebugLaunch {
     static let scrollToBottom = false
     static let tab: String? = nil
     static let jupiterPrompt: String? = nil
+    static let session: (token: String, email: String)? = nil
+    static let noPermissionPrompt = false
+    static let signOut = false
     #endif
 }

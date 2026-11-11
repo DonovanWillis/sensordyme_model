@@ -58,6 +58,9 @@ struct FeedCard: View {
                     .font(SD.Typography.caption)
                     .multilineTextAlignment(.center)
                     .foregroundStyle(SD.Colors.textTertiary)
+                    // The feed keeps its camera shape at every text size; the
+                    // sentence shrinks to fit it rather than being cut off.
+                    .minimumScaleFactor(0.5)
                     .padding(.horizontal, SD.Space.xl)
             }
         }
@@ -79,8 +82,12 @@ struct SimulatedFeedView: View {
         }
     }
 
+    /// The placeholder breathes and scans; under Reduce Motion it holds still.
+    @Environment(\.accessibilityReduceMotion) private var reduceMotion
+
     var body: some View {
-        TimelineView(.animation(minimumInterval: 1 / 30)) { context in
+        TimelineView(.animation(minimumInterval: 1 / 30,
+                                paused: !MotionPolicy.animates(true, reduceMotion: reduceMotion))) { context in
             let t = context.date.timeIntervalSinceReferenceDate
             ZStack {
                 SD.Colors.canvas
@@ -130,7 +137,7 @@ struct FeedLiveBadge: View {
         HStack(spacing: 6) {
             Circle().fill(SD.Colors.signal).frame(width: 6, height: 6)
             Text("LIVE")
-                .font(SD.Typography.eyebrow)
+                .sdEyebrowFont()
                 .kerning(1.2)
                 .foregroundStyle(SD.Colors.textPrimary)
         }
@@ -147,8 +154,8 @@ struct FeedTag: View {
 
     var body: some View {
         Text(text.uppercased())
-            .font(SD.Typography.eyebrow)
-            .kerning(1)
+            .sdEyebrowFont()
+            .tracking(1)
             .foregroundStyle(SD.Colors.textSecondary)
             .lineLimit(1)
             .padding(.horizontal, 9)

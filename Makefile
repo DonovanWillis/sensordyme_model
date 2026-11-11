@@ -1,7 +1,8 @@
 .PHONY: help dev dev-debug dev-max dev-openpilot dev-skinnemoen dev-dashsentinel \
-        bench accuracy accuracy-dataset accuracy-gate report deploy \
+        bench accuracy accuracy-dataset accuracy-gate report deploy deploy-preflight \
+        release-manifest release-verify verify-release \
         test test-cov test-ios lint lint-fix fmt-check typecheck audit check mutants \
-        setup-dev hooks clean
+        setup-dev hooks clean sim sim-backend sim-device sim-scenarios sim-e2e
 
 VENV := .venv/bin
 
@@ -38,6 +39,35 @@ dev-skinnemoen: ## Comparison: erlendskinnemoen's MediaPipe FaceMesh DMS, verbat
 
 dev-dashsentinel: ## Comparison: DashSentinel (vendored under third_party/)
 	$(VENV)/python main.py --module driver_attention_dashsentinel --debug
+
+# =============================================================================
+# Virtual device: the real runtime + real backend on this Mac, scripted
+# perception, clearly SIMULATED (docs/VIRTUAL_DEVICE.md). Point the iOS
+# Simulator at http://localhost:8787 (its default) and claim with the printed
+# code. Override the interpreter with SIM_PY=..., e.g.
+#   make sim SIM_PY=~/.venvs/sensordyme-m01/bin/python SCENARIO=drowsy
+# =============================================================================
+
+SIM_PY     ?= $(VENV)/python
+SCENARIO   ?= tour
+SIM_BACKEND ?= http://127.0.0.1:8787
+
+sim: ## Virtual device + local backend in one go (SCENARIO=tour; --list-scenarios via sim-scenarios)
+	$(SIM_PY) -m sim.virtual_device --with-backend --backend $(SIM_BACKEND) --scenario $(SCENARIO)
+
+sim-backend: ## The real backend locally on :8787, throwaway data, demo account, factory.json
+	$(SIM_PY) -m sim.backend --port $(lastword $(subst :, ,$(SIM_BACKEND)))
+
+sim-device: ## A virtual device against a running backend (FACTORY=path/to/factory.json)
+	$(SIM_PY) -m sim.virtual_device --backend $(SIM_BACKEND) --scenario $(SCENARIO) \
+		$(if $(FACTORY),--factory $(FACTORY),)
+
+sim-scenarios: ## List the virtual device's scenarios
+	$(SIM_PY) -m sim.virtual_device --list-scenarios
+
+sim-e2e: ## Deterministic end-to-end tests: virtual device x real backend (seconds, no sleeps)
+	PYTHONDONTWRITEBYTECODE=1 $(SIM_PY) -m pytest -p no:cacheprovider -q \
+		tests/test_sim_e2e.py tests/test_sim_units.py tests/test_sim_seams.py
 
 # =============================================================================
 # Benchmarks and reports
@@ -267,7 +297,21 @@ demo-check: ## run the demo preflight on the device (DEMO READY / NOT READY)
 demo-cycle: ## rehearse every demo mode on the device, with restarts
 	ssh pi@sensordyme.local 'cd ~/sensordyme && bash scripts/demo_cycle.sh'
 
-deploy: ## rsync to pi@sensordyme.local, install deps, migrate config, restart
+# The device's config.yaml is never overwritten (above), so check IT -- not the
+# repo's -- against the code about to land: schema, role floor, what the role
+# needs, and whether the .hef on the device is the build its config pins. A
+# device's role is never changed by a deploy; pass ROLE= to state which role
+# this deployment is for (e.g. `make deploy ROLE=driver_safety`).
+deploy-preflight: ## check the device's own config against this code (ROLE=driver_safety to require it)
+	@tmp=$$(mktemp -d) && trap 'rm -rf "$$tmp"' EXIT && \
+	scp -q pi@sensordyme.local:~/sensordyme/config.yaml "$$tmp/config.yaml" && \
+	hef=$$($(VENV)/python scripts/deploy_preflight.py --config "$$tmp/config.yaml" --print-hef-path) && \
+	if [ -n "$$hef" ]; then \
+		set -- --hef-sha256 "$$(ssh pi@sensordyme.local "cd ~/sensordyme && sha256sum '$$hef' 2>/dev/null | cut -d' ' -f1")"; \
+	else set --; fi && \
+	$(VENV)/python scripts/deploy_preflight.py --config "$$tmp/config.yaml" $(if $(ROLE),--expect-role $(ROLE)) "$$@"
+
+deploy: deploy-preflight ## preflight, rsync to pi@sensordyme.local, install deps, migrate config, restart
 	rsync -av --exclude='.venv' --exclude='data' --exclude='.git' --exclude='__pycache__' \
 		--exclude='config.yaml' --exclude='*.log' --exclude='.secrets' --exclude='*.pt' \
 		--exclude='*.hef' --exclude='*.db' --exclude='*.sqlite3' --exclude='*.csv' \
@@ -278,4 +322,34 @@ deploy: ## rsync to pi@sensordyme.local, install deps, migrate config, restart
 		./ pi@sensordyme.local:~/sensordyme/
 	ssh pi@sensordyme.local 'cd ~/sensordyme && .venv/bin/pip install -q -r requirements-device.txt'
 	ssh pi@sensordyme.local 'cd ~/sensordyme && python3 scripts/migrate_config.py config.yaml'
+	@# M6: rsync never touched /etc/systemd/system, so a release that changed the
+	@# unit (bounded start-limit reboots) landed with the OLD unit still in force.
+	ssh pi@sensordyme.local 'cd ~/sensordyme && sudo bash scripts/release/install_units.sh --user "$$(id -un)"'
 	ssh pi@sensordyme.local 'cd ~/sensordyme && sudo systemctl restart sensordyme.service'
+
+# =============================================================================
+# Release candidates (M6). A manifest pins exactly what a ref puts on a device;
+# `release-verify` compares a device snapshot (scripts/hw_validation/
+# integrity_manifest.py snapshot, run read-only ON the Pi) against it.
+# See docs/RELEASE_MANIFEST.md and docs/MONDAY_RUNBOOK.md.
+# =============================================================================
+REF ?= HEAD
+# Outside the checkout on purpose: `make deploy` rsyncs the working tree, and a
+# manifest left inside it would land on the device as an unexplained extra file.
+RELEASE_DIR ?= $(HOME)/sensordyme-release
+
+release-manifest: ## write $(RELEASE_DIR)/manifest.{json,md} for REF= (default HEAD); TESTS="..." records a test run
+	@mkdir -p $(RELEASE_DIR)
+	$(VENV)/python scripts/release/make_release_manifest.py build --ref $(REF) \
+		--out-json $(RELEASE_DIR)/manifest.json --out-md $(RELEASE_DIR)/manifest.md \
+		$(if $(TESTS),--test-ref "$(TESTS)")
+
+release-verify: ## compare SNAPSHOT= (device snapshot JSON) against $(RELEASE_DIR)/manifest.json
+	@test -n "$(SNAPSHOT)" || { echo "usage: make release-verify SNAPSHOT=path/to/snapshot.json"; exit 2; }
+	$(VENV)/python scripts/release/make_release_manifest.py verify \
+		--manifest $(RELEASE_DIR)/manifest.json --snapshot $(SNAPSHOT) --out $(RELEASE_DIR)/verify.json
+
+# M6.5: the one offline release check (device deps, manifest + release gates, systemd
+# units, focused tests). Seconds on the Mac; changes nothing. See docs/RELEASE_MANIFEST.md.
+verify-release: ## offline release verification of REF= (default HEAD): deps, gates, units, focused tests
+	bash scripts/release/verify.sh $(REF)

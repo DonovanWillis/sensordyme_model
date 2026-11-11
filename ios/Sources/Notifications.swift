@@ -87,6 +87,9 @@ final class AlertNotifier: NSObject, ObservableObject {
     }
 
     func requestPermission() async {
+        // Automated Simulator runs (docs/VIRTUAL_DEVICE.md): the system prompt would
+        // cover the screen being checked. DEBUG builds only; Release always asks.
+        if DebugLaunch.noPermissionPrompt { return }
         do {
             authorized = try await UNUserNotificationCenter.current()
                 .requestAuthorization(options: [.alert, .sound, .badge])

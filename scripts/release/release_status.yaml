@@ -1,0 +1,104 @@
+# Release status tiers, per component. The ONE place a release says how far each
+# part of SensorDyme has been proven. Read by scripts/release/make_release_manifest.py
+# (build embeds it; check validates it) and summarised in the manifest Markdown.
+#
+# Tiers are distinct statements, not a ladder:
+#   software-ready       code + unit tests exist; never run against the virtual device or hardware
+#   simulator-verified   exercised end to end on the virtual device (sim/) and/or iOS Simulator
+#   hardware-pending     software is done; the claim needs the real Pi/HAT/camera/radio to be true
+#   experiment-only      research artefact; must not be enabled or shipped
+#   production-blocked   a known defect or missing control forbids production use (cite it)
+# A component may list several tiers (e.g. simulator-verified AND hardware-pending).
+# NO entry may claim hardware validation: nothing below has run on the Pi in M6/M6.5.
+#
+# `pending_integration: true` marks a slot another M6.5 workstream fills in; the
+# integrator replaces the placeholder text with that workstream's evidence.
+format: sensordyme-release-status/1
+as_of: "2026-11-11"
+components:
+  device_runtime:
+    tiers: [simulator-verified, hardware-pending]
+    evidence: "virtual device e2e (docs/VIRTUAL_DEVICE.md, tests/test_sim_*.py); Monday runbook not executed"
+  hailo_detector_hef:
+    tiers: [hardware-pending]
+    evidence: "pinned .hef (setup_pi.sh MODEL_SHA256 = config = registry); INT8 on-device parity not measured (docs/HAILO_HARDWARE_VALIDATION.md)"
+  yolo_decoder_legacy:
+    tiers: [hardware-pending]
+    evidence: "shipping default accelerator.yolo_decoder: legacy"
+  yolo_decoder_reference:
+    tiers: [experiment-only]
+    evidence: "float OI val only; INT8 unvalidated (docs/DECODER_CANDIDATE.md); must stay disabled"
+  dashboard_api_auth:
+    tiers: [simulator-verified]
+    evidence: "X-Device-Token header; ?token= only for GET /stream (docs/SECURITY_REVIEW_M6.md S1)"
+  uplink_backend_protocol_v1:
+    tiers: [simulator-verified]
+    evidence: "virtual device against the real backend; route compatibility checked by `make_release_manifest.py check`"
+  ios_app_oryn_edge:
+    tiers: [simulator-verified]
+    evidence: "real app against real backend + virtual device on the iOS Simulator (docs/IOS_APP_STATUS.md)"
+  presets_and_rules:
+    tiers: [simulator-verified]
+    evidence: "docs/PRESET_LIBRARY.md, docs/PROMPT_POLICIES.md; role/preset refusal tested"
+  bounded_reboot_recovery:
+    tiers: [software-ready, hardware-pending]
+    evidence: "StartLimitAction=none + sensordyme-recover.service (tests/test_m6_autonomy_boot.py); runbook K4/K5 not executed"
+  ble_provisioning:
+    tiers: [production-blocked, hardware-pending]
+    evidence: "Just Works BLE (docs/SECURITY_REVIEW_M6.md section 4 item 1)"
+  device_command_authentication:
+    tiers: [production-blocked]
+    evidence: "unsigned commands over http (docs/SECURITY_REVIEW_M6.md section 4 item 2)"
+  credential_storage:
+    tiers: [production-blocked]
+    evidence: "plaintext device key; config.yaml not 0600 (docs/SECURITY_REVIEW_M6.md section 4 item 3)"
+  service_privilege:
+    tiers: [production-blocked]
+    evidence: "stock unit runs as the admin user with sudoers grants (section 4 item 4); least-privilege unit prepared, see service_least_privilege_unit"
+  service_least_privilege_unit:
+    tiers: [software-ready, hardware-pending]
+    evidence: "deploy/systemd/sensordyme.service.hardened; systemd-analyze verify clean, exposure 9.0 -> 1.7 (docs/LEAST_PRIVILEGE.md); not installed"
+  device_dependencies:
+    tiers: [software-ready]
+    evidence: "pytest/anthropic removed from requirements-device.txt (section 4 item 5 closed); cryptography added for BLE PoP; scripts/release/check_device_deps.py"
+  device_dependency_lock:
+    tiers: [software-ready, hardware-pending]
+    evidence: "requirements-device.lock, hashed, CPython 3.11 aarch64; not yet installed on a Pi"
+  disk_encryption:
+    tiers: [production-blocked]
+    evidence: "no encryption or documented acceptance (docs/SECURITY_REVIEW_M6.md section 4 item 6)"
+  exp08_finetuned_detector:
+    tiers: [experiment-only]
+    evidence: "DAMO-YOLO-T person/phone/hand research run; never a production model (docs/research/EXP08_RESULTS.md)"
+
+# --- M6.5 integration slots: filled by the integrator from each workstream's report.
+  m65_device_auth_signed_commands:
+    tiers: [software-ready, simulator-verified, hardware-pending, production-blocked]
+    evidence: "sd-auth-v1 (core/command_auth.py, docs/DEVICE_AUTH_CONTRACT.md): HKDF-derived keys from the existing device key, HMAC-SHA256 over device/command/body/nonce, request-bound replay defence, key rotation and revocation; config cloud.command_auth off|permissive|required (default permissive, so existing devices keep working). Secret store 0600, atomic, checksummed (core/secret_store.py, docs/CREDENTIAL_STORAGE.md); migration script dry-run only. Oryn job 20261111-061442-e529e8: 618 passed. Blocked for production until devices and backend run `required`, keys leave plaintext on the backend, and the nonce cache is shared"
+  m65_ble_proof_of_possession:
+    tiers: [software-ready, hardware-pending, production-blocked]
+    evidence: "services/ble_pop.py + ios/Sources/BLEProofOfPossession.swift (docs/BLE_PROOF_OF_POSSESSION.md): setup code (QR/label), PBKDF2+HKDF+HMAC proofs, AES-GCM credentials, explicit state machine, lockout; config network.provisioning.auth legacy|pop (default legacy); Python/Swift vectors match. Mac: 109 passed; Swift tests pass. Not validated on BLE hardware; the app has no setup screen for it yet; offline guessing from a recorded session needs a PAKE"
+  m65_xcuitest_journeys:
+    tiers: [simulator-verified]
+    evidence: "ios/UITests + scripts/sim/ios_uitest.sh against the real backend and virtual device: 19/20 journeys pass. Journey 10 (inline Ask Jupiter bar) fails: the field does not take keyboard focus (open defect; the stale-sheet fix b8fcff5 did not resolve it). Post-fix accessibility audit: 40 new issues (Dynamic Type on mono labels, clipping, 8 contrast); report in the M6.5 evidence folder"
+  m65_reliability_fault_scenarios:
+    tiers: [simulator-verified]
+    evidence: "sim/invariants.py monitor + tests/test_sim_reliability.py (21) + tests/test_sim_stress.py (12): every invariant held across multi-stage faults, 20 min with faults, queue overflow, retry storm, concurrent threads. Found and fixed: person boxes never reached custom rules; a non-object calibration.json failed the driver module on every boot. Oryn job 20261111-070356-5152a8: 14/15 files, the 15th (role-floor fuzz OOM) pre-existing and fixed in 73ba319"
+  m65_model_registry_evidence_binding:
+    tiers: [software-ready]
+    evidence: "core/model_registry.yaml product_capabilities + evidence_bindings; tiers exists_in_code < synthetic_tests < image_level_benchmark < video_evidence < device_verified < production_permitted, each claim bound to model hash, decoder, test, dataset manifest, hardware target. Highest held: image_level_benchmark (person, phone). GET /v1/capability-tiers reports production_validated false for all. Oryn job 20261111-060504-35b84a: 335 passed"
+  m65_training_run_exp08_full60:
+    tiers: [experiment-only]
+    evidence: "oryn job 20261111-055506-564ff3: 60/60 epochs, no early stop, best epoch 60, best_ckpt sha256 baad3842943b6ebc4cd58ecb6eff0a6615e9238d92d115cee50ddca94f4ef37b. Val: hand AP50 0.706, phone 0.798, person 0.690 (misses the person criterion by 0.003). Not compiled for Hailo; replaces nothing (docs/research/EXP08_FULL_RESULTS.md)"
+  m7_shared_perception_engine:
+    tiers: [software-ready, simulator-verified, hardware-pending]
+    evidence: "core/perception.py (sd-perception/1): one typed Observation per frame; detector, face, hand and pose graphs wrapped so each runs at most once per frame for every consumer; None = unavailable (never fabricated); per-component status, staleness and failure isolation reported upstream as monitoring.perception. Virtual device: 600 frames, 200 detector runs with Driver Safety + a custom rule + the people counter (tests/test_m7_shared_perception_sim.py; scripts/sim/m7_trace.py). Hailo per-frame cost and camera backpressure unmeasured"
+  m7_monitoring_nodes:
+    tiers: [software-ready, simulator-verified, hardware-pending]
+    evidence: "core/nodes.py: preset, rules and companion nodes (people_counter, zone_watch) on shared observations; set_nodes command signed through the existing path, persisted and restored; refusals coded; additive on the driver_safety role (driver_attention cannot be removed). Every node is at most synthetic_tests; Occupancy and Workplace Safety presets are node-backed and refused on driver_safety devices"
+  m7_driver_safety_card:
+    tiers: [software-ready, simulator-verified, hardware-pending]
+    evidence: "iOS: the Driver Safety row opens its details (device-reported capabilities, tier, settings); Activate confirms only on the device-reported preset AND a non-failed monitoring state; device refusals shown with the reason; backend stops resending refused presets. XCUITest journey 23 and scripts/sim/m7_trace.py exercise it against the real backend and virtual device"
+  m7_detector_analysis_exp09_proposal:
+    tiers: [experiment-only]
+    evidence: "docs/research/M7_DETECTOR_ANALYSIS.md: the EXP-08 person regression is false positives (precision 0.55 vs 0.695 at recall 0.70), most likely from DAMO-YOLO's fine-tune loader reinitialising the whole head; NMS 0.5 helps phone/hand; EXP-09 head-preserving fine-tune proposed, not run. No model or .hef change"
