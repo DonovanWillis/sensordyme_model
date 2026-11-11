@@ -546,19 +546,24 @@ evidence_bindings:
     date: "2026-11-11"
     metrics: {hand_ap50: 0.471, phone_ap50: 0.721, person_ap50: 0.638, epochs: 2}
     notes: 2-epoch pilot, stock labels, seed 1234; docs/research/EXP08_RESULTS.md. Not a production candidate
-  # Reserved for the one authorised 60-epoch run (job 20261111-055506-564ff3,
-  # EXP=exp08_full60). The integrator fills model_sha256 (best_ckpt.pth),
-  # metrics (val only) and date when it finishes, and keeps it experiment_only:
-  # a candidate model's evidence supports no product claim.
+  # The one authorised 60-epoch run (job 20261111-055506-564ff3, EXP=exp08_full60,
+  # source 536d786). Kept experiment_only: a candidate model's evidence supports no
+  # product claim. Val split only; the test split was not used.
   - id: hand_box_detection.exp08_full60
     capability: hand_box_detection
     tier: image_level_benchmark
     model: damo_yolo_t_exp08_person_phone_hand
-    model_sha256: null
+    model_sha256: "baad3842943b6ebc4cd58ecb6eff0a6615e9238d92d115cee50ddca94f4ef37b"
     decoder: reference
-    test_id: research/detector_bench score exp08_full60 (job 20261111-055506-564ff3)
+    test_id: research/detector_bench score exp08_full60 (job 20261111-055506-564ff3); research/pilot/compare_checkpoints.py
     dataset_manifest: b878e8429d221f3f
     hardware_target: oryn_gpu_float
-    status: pending
-    date: null
-    metrics: {}
+    status: experiment_only
+    date: "2026-11-11"
+    metrics: {hand_ap50: 0.706, hand_ap50_95: 0.425, phone_ap50: 0.798, phone_ap50_95: 0.688, person_ap50: 0.690, person_ap50_95: 0.489, phone_precision_at_recall_0_70: 0.771, phone_free_images_with_false_phone_at_0_5: 0.26, best_epoch: 60, epochs: 60}
+    notes: >-
+      best_ckpt.pth = epoch 60 (no early stop; patience peaked at 9/10). Misses its
+      pre-registered person criterion (AP50 0.690 vs >= 0.693). ONNX export
+      f591a6b6eca94baf has the same head-subgraph compute ops as the zoo graph behind
+      the shipping .hef (77 Conv, identical kernels); not compiled for Hailo, INT8
+      unvalidated. docs/research/EXP08_FULL_RESULTS.md

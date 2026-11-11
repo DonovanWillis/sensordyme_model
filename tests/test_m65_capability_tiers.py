@@ -85,16 +85,14 @@ def test_experiment_only_and_pending_evidence_supports_nothing():
     assert set(hand["experiment_evidence"]) == {"hand_box_detection.exp08a_rerun", "hand_box_detection.exp08_full60"}
 
 
-def test_the_60_epoch_slot_is_reserved_and_stays_experiment_only(doc):
+def test_the_60_epoch_run_is_recorded_and_stays_experiment_only(doc):
     slot = next(b for b in doc["evidence_bindings"] if b["id"] == "hand_box_detection.exp08_full60")
-    assert slot["status"] == "pending" and slot["model_sha256"] is None and slot["dataset_manifest"] == "b878e8429d221f3f"
-    filled = {**slot, "status": "experiment_only", "model_sha256": "a" * 64, "date": "2026-11-12",
-              "metrics": {"hand_ap50": 0.6}}
+    assert slot["status"] == "experiment_only" and slot["dataset_manifest"] == "b878e8429d221f3f"
+    assert len(slot["model_sha256"]) == 64 and slot["metrics"]["hand_ap50"] > 0
+    assert violations(doc) == []
     data = copy.deepcopy(doc)
-    data["evidence_bindings"] = [b for b in data["evidence_bindings"] if b["id"] != slot["id"]] + [filled]
-    assert violations(data) == []
-    data["evidence_bindings"][-1]["status"] = "current"
-    assert any("candidate model" in v for v in violations(data)), "a pilot checkpoint can never be current"
+    next(b for b in data["evidence_bindings"] if b["id"] == slot["id"])["status"] = "current"
+    assert any("candidate model" in v for v in violations(data)), "a candidate checkpoint can never be current"
 
 
 # ---------------------------------------------------------------------- refusals
