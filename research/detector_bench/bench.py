@@ -306,8 +306,8 @@ def run(data: Path, models: Path, split: str, provider: str, out: Path, *, max_s
                     for label, per_image in preds.items():
                         for image_id, rows in per_image.items():
                             for sc, box in rows:
-                                f.write(json.dumps({"id": image_id, "label": label, "score": sc,
-                                                    "box": list(box)}) + "\n")
+                                f.write(json.dumps({"id": image_id, "label": label, "score": float(sc),
+                                                    "box": [float(v) for v in box]}) + "\n")
             report["runs"][key] = entry
             out.mkdir(parents=True, exist_ok=True)
             (out / f"bench_{split}_{provider}.partial.json").write_text(json.dumps(report, indent=1, default=str))
