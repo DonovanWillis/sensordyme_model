@@ -161,16 +161,23 @@ def alert_types_for(module_name: str, preset: Optional[dict] = None) -> set:
     return ALERT_EVENT_TYPES_BY_MODULE.get(module_name, ALERT_EVENT_TYPES_PI)
 
 
-def build_alert_manager(alert_cfg: dict, is_pi: bool) -> AlertManager:
+def build_alert_manager(alert_cfg: dict, is_pi: bool,
+                        sink_overrides: Optional[dict] = None) -> AlertManager:
     """Construct the AlertManager from an `alerts:`-shaped config block.
 
     Callers pick which block to pass: `config["alerts"]` for the pi profile,
     `config["mac_max"]["alerts"]` for mac_max -- the two profiles never share
     alert configuration (cooldowns, escalation types, etc).
+
+    `sink_overrides` maps a configured sink name to a zero-argument factory used
+    INSTEAD of the built-in construction (sim/'s simulated buzzer stands in for
+    `gpio_buzzer`). None -- every production caller -- changes nothing.
     """
     sinks = []
     for sink_name in alert_cfg.get("sinks", ["console"]):
-        if sink_name == "console":
+        if sink_overrides and sink_name in sink_overrides:
+            sinks.append(sink_overrides[sink_name]())
+        elif sink_name == "console":
             sinks.append(ConsoleSink())
         elif sink_name == "sound":
             sinks.append(SoundSink())
@@ -276,6 +283,20 @@ def run(argv: Optional[list[str]] = None) -> None:
     """Resolve profile/module/alert policy from config + CLI, then hand the wired
     pieces to services.runtime.DeviceRuntime, which owns the process lifetime
     (camera capture, inference, dashboard, uplink, provisioning, health, shutdown)."""
+    build_runtime(argv).run()
+
+
+def build_runtime(argv: Optional[list[str]] = None, *, runtime_cls=None, module_factory=None,
+                  sink_overrides: Optional[dict] = None):
+    """Everything run() does before DeviceRuntime.run(): the wired, unstarted runtime.
+
+    The keyword arguments are seams for sim/ (the virtual device), all None in
+    production, where this is exactly what run() always did:
+      runtime_cls     a DeviceRuntime subclass to construct instead
+      module_factory  (module_cls, module_config) -> module, instead of
+                      module_cls(module_config); a failure still boots FAILED
+      sink_overrides  see build_alert_manager
+    """
     args = parse_args(argv)
     try:
         config = load_config(args.config)
@@ -384,7 +405,7 @@ def run(argv: Optional[list[str]] = None) -> None:
     _accel.configure(config.get("accelerator", {}))
 
     try:
-        module = module_cls(module_config)
+        module = module_cls(module_config) if module_factory is None else module_factory(module_cls, module_config)
     except Exception as exc:  # noqa: BLE001 - any failure: boot FAILED with the reason, never crash
         # Raising here was exit 1 -> Restart=always -> StartLimitAction=reboot:
         # a reboot loop over a missing model or a broken install (audit D12),
@@ -404,12 +425,12 @@ def run(argv: Optional[list[str]] = None) -> None:
     from core.camera import detect_pi
     from services.runtime import DeviceRuntime
 
-    DeviceRuntime(
+    return (runtime_cls or DeviceRuntime)(
         config=config,
         profile=profile,
         module=module,
         module_name=module_name,
-        alert_manager=build_alert_manager(alert_cfg, detect_pi()),
+        alert_manager=build_alert_manager(alert_cfg, detect_pi(), sink_overrides),
         alert_cfg=alert_cfg,
         alert_event_types=alert_event_types,
         alert_types_for=alert_types_for,
@@ -419,7 +440,7 @@ def run(argv: Optional[list[str]] = None) -> None:
         debug=debug,
         window_name=WINDOW_NAME,
         module_config=module_config,
-    ).run()
+    )
 
 
 if __name__ == "__main__":
