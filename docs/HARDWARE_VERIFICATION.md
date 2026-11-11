@@ -274,3 +274,22 @@ component failure (e.g. unplug the camera), and confirm the device reboots **onc
 and then stays up degraded with the suppression message in the journal.
 
 **Do not test this on a device you cannot physically reach.**
+
+---
+
+## M0.2 — monitoring state, recovery and alert outputs (2026-11-10)
+
+Everything below was exercised only with **simulated** faults (stub detectors,
+a clock that jumps, outputs that raise). See `docs/MONITORING_STATE.md`. None of
+it has run on a Pi.
+
+| # | Claim | Status | How to verify on the device |
+|---|---|---|---|
+| M2-1 | The buzzer is audible and each pattern (chirp, double, urgent, critical, impaired) is distinguishable | UNVERIFIED | Trigger each category from the dashboard; a person listens in a running car; record the result |
+| M2-2 | A disconnected or dead buzzer is detectable | **NOT DETECTABLE** in software (no feedback line) | Needs a sense line or a microphone check: hardware decision |
+| M2-3 | Unplugging the camera ribbon reaches `failed` within ~2 s and the impaired pattern plays | UNVERIFIED | Pull the ribbon while watching `/api/health` `device.monitoring.state` |
+| M2-4 | Reseating the camera returns to `ready` without a restart | UNVERIFIED | Reseat; `state` returns to `ready`; no service restart in `journalctl` |
+| M2-5 | A real HailoRT error leads to object detection retrying and recovering (face monitoring continues) | UNVERIFIED | Fault-inject with `hailortcli` or a pulled HAT; watch `capabilities.objects` |
+| M2-6 | A wedged Hailo `infer()` reaches `failed` and the impaired pattern plays from the health thread | UNVERIFIED | No caller-side timeout exists; observe whether HailoRT ever raises or the loop stays wedged |
+| M2-7 | With a reboot suppressed, the process is no longer restarted every `WatchdogSec` | UNVERIFIED | Dead camera with `reboot_max_total` reached; `systemctl status` shows no restarts after the first |
+| M2-8 | `make deploy-preflight ROLE=driver_safety` reads the device config and `.hef` hash over SSH | UNVERIFIED | Run against a device whose config lacks `role:`; expect REFUSED with the migration line |
