@@ -55,6 +55,7 @@ from cloud.ratelimit import (
     LOGIN_LIMITER,
     SIGNUP_LIMITER,
 )
+from core import command_auth as sd_auth
 from core.presets import (
     SETTINGS_SEPARATOR,
     PresetError,
@@ -74,6 +75,14 @@ from core.presets import (
 DB_PATH = os.environ.get("SENSORDYME_DB", str(Path(__file__).parent / "sensordyme.db"))
 JWT_TTL_S = 30 * 24 * 3600
 NTFY_BASE = os.environ.get("SENSORDYME_NTFY_BASE", "https://ntfy.sh")
+#: How devices authenticate (sd-auth-v1, docs/DEVICE_AUTH_CONTRACT.md).
+#: permissive (default): the bearer X-Device-Key still works, signed requests
+#: too, and commands are signed whenever the device sends a nonce. required:
+#: bearer-key requests are refused (production). off: never sign (rollback only).
+#: Anything else stops the server: a typo must not silently mean "no auth".
+DEVICE_AUTH_MODE = os.environ.get("SENSORDYME_DEVICE_AUTH", sd_auth.DEFAULT_MODE).strip().lower()
+if DEVICE_AUTH_MODE not in sd_auth.MODES:
+    raise RuntimeError(f"SENSORDYME_DEVICE_AUTH must be one of {sd_auth.MODES}, got {DEVICE_AUTH_MODE[:32]!r}")
 
 # uvicorn configures handlers for its own loggers and leaves the root logger
 # bare, so a logger named for this module would have its lines silently
@@ -306,7 +315,10 @@ class CodedError(HTTPException):
 
 @app.exception_handler(CodedError)
 async def _coded_error(_request: Request, exc: CodedError) -> JSONResponse:
-    return JSONResponse(status_code=exc.status_code, content={"detail": exc.detail, "code": exc.code})
+    content = {"detail": exc.detail, "code": exc.code}
+    if exc.code == "clock_skew":
+        content["server_time"] = int(time.time())
+    return JSONResponse(status_code=exc.status_code, content=content)
 
 
 @app.exception_handler(OverflowError)
@@ -526,6 +538,14 @@ def init_db() -> None:
             # the device's role forbids; without a record the app's switch just
             # vanished. Cleared by the next accepted mode request.
             "ALTER TABLE devices ADD COLUMN preset_rejection TEXT",
+            # sd-auth-v1 (core/command_auth.py, docs/DEVICE_AUTH_CONTRACT.md):
+            # the public key id of device_key, so a signed request -- which never
+            # carries the key -- can find its device. And the key being rotated
+            # out, still accepted for signed requests until revoked
+            # (`cloud/manage.py rotate-key` / `revoke-previous-key`).
+            "ALTER TABLE devices ADD COLUMN auth_kid TEXT",
+            "ALTER TABLE devices ADD COLUMN previous_device_key TEXT",
+            "ALTER TABLE devices ADD COLUMN previous_auth_kid TEXT",
         ):
             try:
                 conn.execute(statement)
@@ -553,6 +573,25 @@ def init_db() -> None:
         # For retention (see _prune_events): an age cut-off without this is a
         # full scan of the largest table, on a write transaction.
         conn.execute("CREATE INDEX IF NOT EXISTS idx_events_received ON events(received_at)")
+        _backfill_auth_kids(conn)
+
+
+def _backfill_auth_kids(conn) -> None:
+    """Fill auth_kid for device rows created without one (older rows, and rows
+    inserted by tools that predate sd-auth-v1). Keys under 16 bytes get none:
+    they can only use the legacy bearer path."""
+    rows = conn.execute(
+        "SELECT id, device_key, previous_device_key FROM devices"
+        " WHERE auth_kid IS NULL OR (previous_device_key IS NOT NULL AND previous_auth_kid IS NULL)"
+    ).fetchall()
+    for row in rows:
+        kids = []
+        for secret in (row[1], row[2]):
+            try:
+                kids.append(sd_auth.key_id(secret) if secret else None)
+            except ValueError:
+                kids.append(None)
+        conn.execute("UPDATE devices SET auth_kid = ?, previous_auth_kid = ? WHERE id = ?", (*kids, row[0]))
 
 
 init_db()
@@ -1013,13 +1052,98 @@ def _device_status(row: sqlite3.Row, now: float) -> dict:
     }
 
 
-def current_device(x_device_key: str = Header(default="")) -> sqlite3.Row:
-    """FastAPI dependency: resolve X-Device-Key to a device row."""
+#: Request nonces seen in the last 2 x CLOCK_SKEW_S (sd-auth-v1 replay refusal).
+#: Per process: the backend is a single SQLite-backed process.
+_REQUEST_NONCES = sd_auth.NonceCache()
+_REQUEST_NONCES_LOCK = threading.Lock()
+
+
+def _device_for_kid(kid: str) -> tuple[Optional[sqlite3.Row], Optional[sd_auth.Keyring]]:
+    """The device row a key id names, and the keys it may sign with."""
+    with db() as conn:
+        query = "SELECT * FROM devices WHERE auth_kid = ? OR previous_auth_kid = ?"
+        row = conn.execute(query, (kid, kid)).fetchone()
+        if row is None:
+            # A row inserted by a tool that predates sd-auth-v1 has no auth_kid yet.
+            _backfill_auth_kids(conn)
+            row = conn.execute(query, (kid, kid)).fetchone()
+    if row is None:
+        return None, None
+    try:
+        keyring = sd_auth.Keyring(sd_auth.DeviceKey(row["device_key"]),
+                                  sd_auth.DeviceKey(row["previous_device_key"]) if row["previous_device_key"] else None)
+    except ValueError:
+        return None, None
+    return row, keyring
+
+
+def _refuse_device(reason: str, kid: str = "") -> HTTPException:
+    # Reason code and public key id only: never the key, the tag or the body.
+    log.warning("device auth refused: %s%s", reason, f" (kid {kid})" if kid else "")
+    if reason == "clock_skew":
+        # Answered with server_time (see _coded_error): a Pi has no RTC. The
+        # device uses it only to timestamp its next request; freshness is still
+        # judged here, against this clock.
+        return CodedError(401, "clock_skew", "device clock is too far from the backend's")
+    return CodedError(401, f"device_auth_{reason}", "device authentication failed")
+
+
+async def current_device(request: Request, x_device_key: str = Header(default=""),
+                         x_sd_auth: str = Header(default=""), x_sd_nonce: str = Header(default="")) -> sqlite3.Row:
+    """FastAPI dependency: authenticate a device request (sd-auth-v1 or legacy key).
+
+    A signed request (X-SD-Auth) is checked against the key its id names, the
+    exact body bytes, the backend clock (+-CLOCK_SKEW_S) and the nonce cache.
+    Otherwise X-Device-Key is the bearer secret, as before -- unless
+    SENSORDYME_DEVICE_AUTH=required. Either way, `request.state.sd_auth` says
+    which key to sign the reply's command with and which request nonce it answers.
+    """
+    request.state.sd_auth = None
+    if x_sd_auth:
+        if DEVICE_AUTH_MODE == "off":
+            raise _refuse_device("disabled")
+        try:
+            parsed = sd_auth.parse_request_header(x_sd_auth)
+        except sd_auth.AuthError as exc:
+            raise _refuse_device(exc.reason) from None
+        row, keyring = _device_for_kid(parsed.kid)
+        if row is None or keyring is None:
+            raise _refuse_device("unknown_key", parsed.kid)
+        body = await request.body()
+        root = request.scope.get("root_path") or ""
+        path = request.url.path[len(root):] if root and request.url.path.startswith(root) else request.url.path
+        try:
+            with _REQUEST_NONCES_LOCK:
+                key = sd_auth.verify_request(keyring, parsed, request.method, path, body, nonces=_REQUEST_NONCES)
+        except sd_auth.AuthError as exc:
+            raise _refuse_device(exc.reason, parsed.kid) from None
+        request.state.sd_auth = (key, parsed.nonce)
+        return row
+    if DEVICE_AUTH_MODE == "required":
+        raise _refuse_device("signature_required")
     with db() as conn:
         row = conn.execute("SELECT * FROM devices WHERE device_key = ?", (x_device_key,)).fetchone()
     if row is None:
         raise HTTPException(401, "invalid device key")
+    if DEVICE_AUTH_MODE != "off" and x_sd_nonce and re.fullmatch(r"[0-9a-f]{32}", x_sd_nonce):
+        with suppress(ValueError):  # a key under 16 bytes: legacy only, nothing to sign with
+            request.state.sd_auth = (sd_auth.DeviceKey(row["device_key"]), x_sd_nonce)
     return row
+
+
+def _sign_command(request: Request, command: Optional[dict], hardware_id: Optional[str]) -> Optional[dict]:
+    """The sd-auth-v1 envelope for `command`, when the request asked for one."""
+    state = getattr(request.state, "sd_auth", None)
+    if not command or state is None:
+        return None
+    key, nonce = state
+    try:
+        return sd_auth.sign_command(key, command, device=hardware_id or f"kid:{key.kid}", request_nonce=nonce)
+    except (TypeError, ValueError):
+        # Not canonical JSON (a NaN stored by an old writer): unsigned, which a
+        # `required` device refuses -- visible there, never a 500 here.
+        log.warning("device auth: could not sign a command for kid %s", key.kid)
+        return None
 
 
 # ------------------------------------------------------------------------- push + SMS
@@ -3278,7 +3402,8 @@ def _prune_events_if_due() -> None:
 
 
 @app.post("/v1/ingest")
-def ingest(body: IngestBody, background_tasks: BackgroundTasks, device: sqlite3.Row = Depends(current_device)):
+def ingest(body: IngestBody, background_tasks: BackgroundTasks, request: Request,
+           device: sqlite3.Row = Depends(current_device)):
     now = time.time()
     # See _clean_text: an unencodable active_preset failed the whole poll.
     reported_preset = _clean_text(body.active_preset) if body.active_preset is not None else None
@@ -3644,4 +3769,11 @@ def ingest(body: IngestBody, background_tasks: BackgroundTasks, device: sqlite3.
     # of these are now durable", which is the number a caller actually needs.
     # Retention, after the response: see _prune_events_if_due.
     background_tasks.add_task(_prune_events_if_due)
-    return {"ok": True, "stored": len(newly_inserted_events), "command": command}
+    response = {"ok": True, "stored": len(newly_inserted_events), "command": command}
+    # sd-auth-v1: addressed to the hardware id reported in THIS request (what the
+    # device knows it sent), bound to this request's nonce. Only when asked for,
+    # so an older device's response is byte-for-byte what it was.
+    envelope = _sign_command(request, command, hardware_id)
+    if envelope is not None:
+        response["command_auth"] = envelope
+    return response

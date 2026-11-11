@@ -310,8 +310,13 @@ def build_runtime(argv: Optional[list[str]] = None, *, runtime_cls=None, module_
         raise SystemExit(CONFIG_ERROR_EXIT)
 
     from core.config_schema import validate
+    from core.secret_store import config_permission_warnings
 
     errors, warnings = validate(config)
+    # A config holding the device key or dashboard token must not be readable by
+    # other local users (docs/CREDENTIAL_STORAGE.md). Warned, not refused: a
+    # refusal here would take a working device offline over a file mode.
+    warnings = warnings + config_permission_warnings(args.config, config)
     for warning in warnings:
         print(f"SensorDyme: config warning: {warning}")
     if errors:
