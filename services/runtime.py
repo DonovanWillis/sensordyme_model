@@ -44,6 +44,7 @@ from core.logger import EventLogger
 from core.logging_setup import get_logger, setup_logging
 from core.monitoring_config import load_or_empty
 from core.network import WifiManager, nmcli_available
+from core.presets import DEVICE_POLICY_FEATURES
 from core.rules import RuleEngine, validate_rule_set
 from core.telemetry import TelemetryLogger
 from core.zones import load_zones
@@ -1597,6 +1598,10 @@ class DeviceRuntime:
             "protection": self.protection_state(),
             "mode": self.mode.value,
             "last_rejection": self._last_rejection,
+            # What this software understands beyond older firmware (preset
+            # settings, dwell rules): the backend sends those only to a device
+            # that reports them (core/presets.py DEVICE_POLICY_FEATURES).
+            "features": list(DEVICE_POLICY_FEATURES),
         }
 
     def _publish_monitoring(self) -> None:
@@ -1721,19 +1726,23 @@ class DeviceRuntime:
             self._record_rejection("preset", name, [violation])
             log.warning("[POLICY] preset '%s' refused: %s", name, violation)
             return
-        base_name, _, variant_name = name.partition(":")
+        base_name, _, variant_name = name.partition("@")[0].partition(":")
         preset = self.presets.get(base_name)
         if preset is None or self.profile == "mac_max":
             if preset is None:
                 print(f"SensorDyme: ignoring unknown preset '{name}'")
             return
-        overrides = {}
-        if variant_name:
-            variant = (preset.get("variants") or {}).get(variant_name)
-            if variant is None:
-                print(f"SensorDyme: preset '{base_name}' has no variant '{variant_name}'")
-                return
-            overrides = variant.get("overrides") or {}
+        # Variant overrides plus any owner settings ("preset:variant@key=value",
+        # core/presets.py), validated against the preset's schema. A setting this
+        # device cannot apply is refused with the reason, never half-applied.
+        from core.presets import PresetError, preset_overrides
+
+        try:
+            name, _preset, overrides = preset_overrides(name, self.presets)
+        except PresetError as exc:
+            self._record_rejection("preset", name, [exc.reason])
+            print(f"SensorDyme: preset '{name}' refused: {exc.reason}")
+            return
         new_module_name = preset["module"]
         try:
             new_module = get_module_class(new_module_name)(

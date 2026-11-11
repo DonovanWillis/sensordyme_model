@@ -32,6 +32,10 @@ What this layer owns, and the event engine deliberately does not:
     the zone is empty, and a counting rule counts inside it.
   * **stillness** — `still` asks whether the subject has stopped moving, which
     no single frame can answer; see `_StillnessWatcher`.
+  * **dwell** — a zone rule carrying `dwell_s` ("someone stays inside the
+    marked area for more than 10 seconds") asks whether ONE subject has been
+    inside the zone continuously for that long, not whether the zone has been
+    occupied by anyone; see `_DwellWatcher`.
 
 Everything temporal (persistence, occlusion grace, resolve, cooldown) stays in
 EventEngine, so custom rules get exactly the same debouncing as built-in ones.
@@ -64,6 +68,10 @@ KNOWN_PREDICATES = frozenset({
 })
 _RELATIONAL = frozenset({"near", "holding", "near_mouth"})
 _PRESENCE_LIKE = frozenset({"present", "in_zone", "count", "persists", "lingering"})
+
+#: Conditions a `dwell_s` may be attached to: "stays inside the zone".
+DWELL_PREDICATES = frozenset({"lingering", "in_zone", "present"})
+DWELL_MIN_S, DWELL_MAX_S = 1.0, 3600.0
 
 # Severity -> whether a confirmation should reach the user at all.
 _NOTIFY_KINDS = ("push", "sms", "silent")
@@ -227,6 +235,8 @@ class ConfiguredRule:
     schedule: Optional[tuple[int, int]] = None
     # IANA timezone the schedule is written in; None = engine default / device local.
     timezone: Optional[tzinfo] = None
+    # Seconds ONE subject must stay inside `zone` (per-subject dwell); None = not a dwell rule.
+    dwell_s: Optional[float] = None
 
     @classmethod
     def from_dict(cls, index: int, raw: dict) -> Optional["ConfiguredRule"]:
@@ -250,6 +260,12 @@ class ConfiguredRule:
             min_count = max(1, int(raw.get("min_count") or 1))
         except (TypeError, ValueError):
             min_count = 1
+        dwell_s = _dwell_seconds(raw)
+        zone = str(raw.get("zone") or "").strip()
+        if dwell_s is not None and (not zone or predicate not in DWELL_PREDICATES):
+            return None  # fail closed: a dwell with no area is not "anywhere"
+        if dwell_s is None and raw.get("dwell_s") not in (None, "", 0):
+            return None  # an unreadable dwell is refused, never dropped to plain presence
         return cls(
             rule_id=f"rule{index}:{predicate}:{detection}",
             detection=detection,
@@ -262,6 +278,7 @@ class ConfiguredRule:
             min_count=min_count,
             schedule=_parse_schedule(str(raw.get("schedule") or "")),
             timezone=_resolve_timezone(raw.get("timezone")),
+            dwell_s=dwell_s,
         )
 
     def spec(self, raw: dict) -> RuleSpec:
@@ -272,6 +289,19 @@ class ConfiguredRule:
             except (TypeError, ValueError):
                 return default
 
+        if self.dwell_s is not None:
+            # The dwell watcher has already demanded dwell_s of one subject's
+            # continuous presence, a far stronger floor than persist_s. The
+            # engine adds only its lifecycle: confirmation on the next frame,
+            # occlusion grace, resolve, and the rule's cooldown.
+            return RuleSpec(
+                detection=self.rule_id,
+                severity=self.severity,
+                min_confidence=number("confidence", 0.5, 0.05, 1.0),
+                persist_s=0.0,
+                min_frames=1,
+                cooldown_s=number("cooldown_s", 30.0, 5.0, 86400.0),
+            )
         # Floors, not just clamps: the AI is instructed to propose conservative
         # values, but a 0s-persistence rule from a bad generation would alert on
         # a single frame, which is the exact failure this product cannot ship.
@@ -396,6 +426,96 @@ class _StillnessWatcher:
         return False
 
 
+def _dwell_seconds(raw: dict) -> Optional[float]:
+    """A rule's `dwell_s` as a bounded number, or None when it has none.
+
+    Out-of-range values are clamped like every other duration here; a value
+    that is not a finite positive number reads as None, and the caller refuses
+    the rule rather than run it without its dwell.
+    """
+    value = raw.get("dwell_s")
+    if value is None or value == "" or isinstance(value, bool):
+        return None
+    try:
+        number = float(value)
+    except (TypeError, ValueError):
+        return None
+    if not math.isfinite(number) or number <= 0:
+        return None
+    return max(DWELL_MIN_S, min(DWELL_MAX_S, number))
+
+
+#: Dwell tracking: how long a subject may vanish (occlusion, a missed detection)
+#: and still be the same visit, and how far its box centre may move per second
+#: (in box diagonals) and still be matched to the same subject. A person
+#: walking covers about half a diagonal a second.
+_DWELL_GRACE_S = 1.0
+_DWELL_MAX_SHIFT_PER_S = 1.5
+_DWELL_MIN_SHIFT = 0.5
+
+
+@dataclass
+class _DwellTrack:
+    entered: float
+    last_seen: float
+    cx: float
+    cy: float
+    diagonal: float
+
+
+class _DwellWatcher:
+    """How long each subject inside a zone has been there, continuously.
+
+    "Someone stays inside the area for 10 s" is a claim about ONE subject, so
+    the zone being occupied for 10 s by a succession of people is not enough:
+    each in-zone box is matched to the nearest subject seen before (centre
+    distance, scaled by box size and by the time since that subject was last
+    seen), and a subject's clock starts when it first appears inside the zone.
+    A subject unseen for longer than `_DWELL_GRACE_S` has left; its clock is
+    gone, and coming back starts a new visit.
+
+    Box matching, not re-identification: two people crossing paths inside the
+    zone can swap clocks. That is bounded (no clock exceeds the longer of the
+    two real visits) and stated in the policy's explanation.
+    """
+
+    def __init__(self) -> None:
+        self._tracks: list[_DwellTrack] = []
+
+    def interrupt(self) -> None:
+        """Forget every visit (outside the rule's hours, or its zone is gone)."""
+        self._tracks = []
+
+    def observe(self, boxes: list, now: float) -> float:
+        """Feed this frame's in-zone boxes; return the longest current visit (s).
+
+        Only subjects seen in THIS frame count toward the answer: a visit in
+        its occlusion grace keeps its clock but does not, on its own, hold the
+        condition true.
+        """
+        self._tracks = [t for t in self._tracks if now - t.last_seen <= _DWELL_GRACE_S]
+        unmatched = list(self._tracks)
+        longest = 0.0
+        for box in boxes:
+            cx, cy, diagonal = _centre_and_diagonal(box)
+            if diagonal <= 0:
+                continue
+            best, best_distance = None, None
+            for track in unmatched:
+                allowed = max(_DWELL_MIN_SHIFT, _DWELL_MAX_SHIFT_PER_S * (now - track.last_seen))
+                distance = math.hypot(cx - track.cx, cy - track.cy) / max(diagonal, track.diagonal)
+                if distance <= allowed and (best_distance is None or distance < best_distance):
+                    best, best_distance = track, distance
+            if best is None:
+                best = _DwellTrack(entered=now, last_seen=now, cx=cx, cy=cy, diagonal=diagonal)
+                self._tracks.append(best)
+            else:
+                unmatched.remove(best)
+                best.last_seen, best.cx, best.cy, best.diagonal = now, cx, cy, diagonal
+            longest = max(longest, now - best.entered)
+        return longest
+
+
 def validate_rule_set(raw_rules, *, label_ok: Callable[[str], bool], zone_names=None) -> list[str]:
     """Every reason this rule set cannot run as written on THIS device (empty = ok).
 
@@ -440,6 +560,13 @@ def validate_rule_set(raw_rules, *, label_ok: Callable[[str], bool], zone_names=
         zone = str(raw.get("zone") or "").strip()
         if zone and zones is not None and _zone_key(zone) not in zones:
             errors.append(f"{where}: area '{zone}' is not defined on this device; draw it first")
+        if raw.get("dwell_s") not in (None, ""):
+            if _dwell_seconds(raw) is None:
+                errors.append(f"{where}: dwell_s must be a positive number of seconds")
+            elif not zone:
+                errors.append(f"{where}: a dwell needs an area to stay inside, and none was named")
+            elif predicate not in DWELL_PREDICATES:
+                errors.append(f"{where}: dwell_s cannot be combined with '{predicate}'")
     return errors
 
 
@@ -460,6 +587,7 @@ class RuleEngine:
         self._engine = EventEngine({})
         self._counters: dict[str, _CountWatcher] = {}
         self._stillness: dict[str, _StillnessWatcher] = {}
+        self._dwell: dict[str, _DwellWatcher] = {}
         self._persist: dict[str, float] = {}
         self.replace_rules(raw_rules or [])
 
@@ -473,6 +601,7 @@ class RuleEngine:
         # configuration's history, which is a fact about nothing.
         self._counters = {}
         self._stillness = {}
+        self._dwell = {}
         self._persist = {}
         for index, raw in enumerate(raw_rules or []):
             if not isinstance(raw, dict):
@@ -568,6 +697,9 @@ class RuleEngine:
                 # never drawn. Until now the only thing standing between a
                 # model and a frame-wide alert was jupiter/schema.py:145.
                 active = self._in_zone(rule.zone, boxes, frame_size)
+            if rule.dwell_s is not None:
+                in_zone = self._boxes_in_zone(rule.zone, boxes, frame_size) if active else None
+                active = self._dwell_active(rule, in_zone, now)
 
             for transition in self._engine.update(rule.rule_id, active, confidence, now=now):
                 if transition.state != CONFIRMED or rule.notify == "silent":
@@ -645,7 +777,10 @@ class RuleEngine:
                     ))
                 continue
 
-            active = self._evaluate(rule, frame, seen, boxes, zone_bound, zone, in_zone, now)
+            if rule.dwell_s is not None:
+                active = self._dwell_active(rule, in_zone if in_hours and zone is not None else None, now)
+            else:
+                active = self._evaluate(rule, frame, seen, boxes, zone_bound, zone, in_zone, now)
             if active and not in_hours:
                 active = False  # outside its hours the rule observes nothing at all
 
@@ -719,6 +854,28 @@ class RuleEngine:
         """Minute of day for `rule`'s schedule: its own timezone, else the
         engine's, else the device's local time."""
         return _minute_of_day(stamp, rule.timezone or self._timezone)
+
+    def _dwell_active(self, rule: ConfiguredRule, in_zone: Optional[list], now: float) -> bool:
+        """Whether one subject has now been inside the rule's zone for dwell_s.
+
+        `in_zone` None means the rule cannot observe at all right now (outside
+        its hours, or its zone is not drawn): every visit is forgotten, so time
+        spent unobserved never counts toward a dwell.
+        """
+        watcher = self._dwell.get(rule.rule_id)
+        if watcher is None:
+            watcher = self._dwell[rule.rule_id] = _DwellWatcher()
+        if in_zone is None:
+            watcher.interrupt()
+            return False
+        return watcher.observe(in_zone, now) >= (rule.dwell_s or 0.0)
+
+    def _boxes_in_zone(self, zone_name: str, boxes, frame_size) -> list:
+        zone = self._zones.get(_zone_key(zone_name))
+        if zone is None or not boxes or not frame_size:
+            return []
+        width, height = frame_size
+        return [box for box in boxes if zone.contains_box(box, width, height)]
 
     def _in_zone(
         self,
