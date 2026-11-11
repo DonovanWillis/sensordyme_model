@@ -546,6 +546,20 @@ def init_db() -> None:
             "ALTER TABLE devices ADD COLUMN auth_kid TEXT",
             "ALTER TABLE devices ADD COLUMN previous_device_key TEXT",
             "ALTER TABLE devices ADD COLUMN previous_auth_kid TEXT",
+            # M7 companion monitoring nodes (docs/M7_IMPLEMENTATION_MAP.md): the
+            # node states the owner asked for and the device has not reported yet
+            # (JSON {node: {enabled, settings}}), delivered as `set_nodes` until
+            # the device's perception.nodes agree, then cleared like desired_preset.
+            "ALTER TABLE devices ADD COLUMN desired_nodes TEXT",
+            # The last node request the device refused (JSON: node, code, reasons, at).
+            "ALTER TABLE devices ADD COLUMN nodes_rejection TEXT",
+            # Fingerprints of the device's last_rejection at the moment each kind
+            # of request (preset, nodes) was written, JSON {kind: fingerprint}.
+            # A refusal counts against a request only if it is NEWER than that
+            # baseline: last_rejection persists on the device, and a refusal of
+            # an earlier request for the same name must not cancel a new one.
+            # Compared by content, not by clock -- the device's clock is its own.
+            "ALTER TABLE devices ADD COLUMN rejection_baseline TEXT",
         ):
             try:
                 conn.execute(statement)
@@ -937,15 +951,152 @@ def _capabilities_summary(raw) -> Optional[dict]:
 
 
 def _rejection(raw) -> Optional[dict]:
-    """The device's last refusal (services/runtime.py _record_rejection), cleaned."""
-    if not isinstance(raw, dict) or raw.get("kind") not in ("preset", "rules", "protection"):
+    """The device's last refusal (services/runtime.py _record_rejection), cleaned.
+
+    `subject` is what was refused (a preset name, a rules version, a node id);
+    the M7 wire contract also allows `preset`/`node` and a single `reason`, and
+    an optional machine-readable `code`."""
+    if not isinstance(raw, dict) or raw.get("kind") not in ("preset", "rules", "protection", "nodes"):
         return None
+    subject = raw.get("subject") or raw.get("preset") or raw.get("node") or ""
+    reasons = _strings(raw.get("reasons"))
+    if not reasons and isinstance(raw.get("reason"), str) and raw["reason"]:
+        reasons = [raw["reason"][:500]]
+    code = raw.get("code")
     return {
         "kind": raw["kind"],
-        "subject": str(raw.get("subject") or "")[:200],
-        "reasons": _strings(raw.get("reasons")),
+        "subject": str(subject)[:200],
+        "reasons": reasons,
+        "code": code[:64] if isinstance(code, str) and code else None,
         "at": _reported_at(raw.get("at")),
     }
+
+
+def _rejection_fingerprint(raw) -> str:
+    """Identity of one device refusal, so a refusal already seen is not re-counted."""
+    cleaned = _rejection(raw)
+    if cleaned is None:
+        return ""
+    return hashlib.sha256(json.dumps(cleaned, sort_keys=True).encode()).hexdigest()[:16]
+
+
+# ---------------------------------------------------------------- M7 perception (device truth)
+#: docs/M7_IMPLEMENTATION_MAP.md wire contract, `monitoring.perception`.
+_COMPONENT_STATES = ("ok", "stale", "failed", "unavailable", "idle")
+_NODE_STATES = ("active", "degraded", "inactive", "failed")
+#: Which product capability kind each shared perception component provides.
+COMPONENT_CAPABILITY = {
+    "object_detector": "objects", "face_landmarks": "face", "hand_landmarks": "hands", "pose": "pose",
+}
+_MAX_COMPONENTS = 16
+_MAX_NODES = 32
+
+
+def _finite_or_none(value) -> Optional[float]:
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return None
+    value = float(value)
+    return value if math.isfinite(value) else None
+
+
+def _count(value) -> Optional[int]:
+    if isinstance(value, bool) or not isinstance(value, int):
+        return None
+    return max(0, value)
+
+
+def _short(value, limit: int = 200) -> Optional[str]:
+    return value[:limit] if isinstance(value, str) and value else None
+
+
+def _perception(raw) -> Optional[dict]:
+    """The device's perception block, bounded and typed; None if absent or unreadable.
+
+    Forwarded as reported -- never completed with guesses. A component state or
+    node state outside the contract's vocabulary reads "unknown", not "ok"."""
+    if not isinstance(raw, dict):
+        return None
+    components = {}
+    raw_components = raw.get("components")
+    for name, comp in list((raw_components if isinstance(raw_components, dict) else {}).items())[:_MAX_COMPONENTS]:
+        if not isinstance(name, str) or not isinstance(comp, dict):
+            continue
+        model = comp.get("model")
+        state = comp.get("state")
+        components[name[:64]] = {
+            "state": state if state in _COMPONENT_STATES else "unknown",
+            "model": ({k: _short(model.get(k), 128) for k in ("name", "sha256", "version")}
+                      if isinstance(model, dict) else None),
+            "last_run_age_s": _finite_or_none(comp.get("last_run_age_s")),
+            "runs": _count(comp.get("runs")),
+            "errors": _count(comp.get("errors")),
+            "reason": _short(comp.get("reason"), 500),
+            "consumers": _strings(comp.get("consumers"), 32) if isinstance(comp.get("consumers"), list) else [],
+        }
+    nodes = []
+    raw_nodes = raw.get("nodes")
+    for node in (raw_nodes if isinstance(raw_nodes, list) else [])[:_MAX_NODES]:
+        if not isinstance(node, dict) or not isinstance(node.get("id"), str) or not node["id"]:
+            continue
+        state = node.get("state")
+        nodes.append({
+            "id": node["id"][:64],
+            "kind": _short(node.get("kind"), 32),
+            "version": _short(node.get("version"), 64),
+            "preset": _short(node.get("preset"), 64),
+            "state": state if state in _NODE_STATES else "unknown",
+            "required_capabilities": _strings(node.get("required_capabilities"), 16)
+            if isinstance(node.get("required_capabilities"), list) else [],
+            "missing_capabilities": _strings(node.get("missing_capabilities"), 16)
+            if isinstance(node.get("missing_capabilities"), list) else [],
+            "validation": _short(node.get("validation"), 64),
+            "experimental": node.get("experimental") if isinstance(node.get("experimental"), bool) else None,
+            "reason": _short(node.get("reason"), 500),
+        })
+    return {
+        "schema": _short(raw.get("schema"), 64),
+        "simulated": raw.get("simulated") if isinstance(raw.get("simulated"), bool) else None,
+        "components": components,
+        "nodes": nodes,
+    }
+
+
+def _reported_perception(live_health: dict, monitoring: dict) -> Optional[dict]:
+    """Perception from a LIVE report: the health report's monitoring block, the
+    health report itself, or the pushed monitoring block (firmware generations)."""
+    live_monitoring = live_health.get("monitoring") if isinstance(live_health.get("monitoring"), dict) else {}
+    for source in (live_monitoring, live_health, monitoring):
+        if isinstance(source.get("perception"), dict):
+            return _perception(source["perception"])
+    return None
+
+
+def _bounded_dicts(raw, keys: tuple[str, ...], limit: int = 32) -> Optional[list[dict]]:
+    """A list of the device's report dicts reduced to `keys` (policies, actuators)."""
+    if not isinstance(raw, list):
+        return None
+    out = []
+    for item in raw[:limit]:
+        if not isinstance(item, dict):
+            continue
+        clean = {}
+        for key in keys:
+            value = item.get(key)
+            if isinstance(value, list):
+                clean[key] = _strings(value)
+            elif isinstance(value, bool) or value is None:
+                clean[key] = value
+            elif isinstance(value, (int, float)):
+                clean[key] = _finite_or_none(value)
+            else:
+                clean[key] = str(value)[:200]
+        out.append(clean)
+    return out
+
+
+_POLICY_KEYS = ("id", "kind", "name", "can_evaluate", "operational", "unavailable_events", "reasons")
+_ACTUATOR_KEYS = ("name", "kind", "audible", "ready", "detail", "commands_ok", "commands_failed",
+                  "physically_verified")
 
 
 def _device_status(row: sqlite3.Row, now: float) -> dict:
@@ -1033,6 +1184,10 @@ def _device_status(row: sqlite3.Row, now: float) -> dict:
     }
 
     preset_rejection = _loads_dict(row["preset_rejection"]) or None
+    # M7: device truth only, and only while the device is live. None means "not
+    # reported" (stale, or firmware without it) -- never filled in.
+    perception = None if stale else _reported_perception(live, monitoring)
+    last_command_id = reported_protection.get("last_command_id") if not stale else None
     return {
         "monitoring_state": state,
         "monitoring_active": active,
@@ -1047,6 +1202,13 @@ def _device_status(row: sqlite3.Row, now: float) -> dict:
         "rules": rules,
         "last_rejection": last_rejection,
         "preset_rejection": preset_rejection,
+        "nodes_rejection": _loads_dict(row["nodes_rejection"]) or None,
+        "perception": perception,
+        # The id of the last protection command the device applied, so the app
+        # converges on THIS request rather than inferring it from the state.
+        "last_command_id": last_command_id[:64] if isinstance(last_command_id, str) else None,
+        "policies": None if stale else _bounded_dicts(live_monitoring.get("policies"), _POLICY_KEYS),
+        "actuators": None if stale else _bounded_dicts(live_monitoring.get("actuators"), _ACTUATOR_KEYS),
         "stale": stale,
         "reported_at": _reported_at(row["last_seen"]),
     }
