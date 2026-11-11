@@ -257,7 +257,14 @@ struct AlertExplanation: Codable, Hashable {
 
 struct EventsResponse: Codable { let events: [EventItem] }
 
-// MARK: - Preset catalog (mirrors presets.yaml on the device)
+// MARK: - Built-in preset list (OFFLINE / DEMO FALLBACK ONLY)
+//
+// The preset library comes from the backend (GET /v1/presets, PresetLibrary.swift).
+// This list is used only when the server publishes none (an older backend, or
+// the catalog failed to load), and the screens label it as the built-in list
+// when they show it. It also supplies icons and the demo catalog's titles.
+// tests/test_app_preset_parity.py parses `static let catalog:` below, so it
+// must keep mirroring presets.yaml on the device.
 
 struct PresetVariant: Identifiable, Hashable {
     let name: String
@@ -304,6 +311,22 @@ struct Preset: Identifiable, Hashable {
                           .init(name: "away", title: "Away"),
                           .init(name: "package_watch", title: "Package Watch")]),
     ]
+
+    /// The built-in list as a catalog, labelled with why it is being shown.
+    static func builtInCatalog(reason: String) -> PresetCatalog {
+        PresetCatalog.builtIn(
+            catalog.map { preset in
+                (id: preset.name, title: preset.title, description: preset.subtitle,
+                 variants: preset.variants.map { (id: $0.name, title: $0.title) })
+            },
+            reason: reason)
+    }
+
+    /// An icon for a preset id; server presets the app has no icon for get a
+    /// neutral one.
+    static func icon(for id: String) -> String {
+        catalog.first(where: { $0.name == id })?.icon ?? "square.grid.2x2"
+    }
 
     /// "driver_distraction:teen_driver" -> ("driver_distraction", "teen_driver")
     static func split(_ name: String?) -> (base: String, variant: String?) {

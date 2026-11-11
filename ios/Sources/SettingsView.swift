@@ -235,10 +235,18 @@ struct SettingsView: View {
                     }
                     .disabled(alertPhone.isEmpty)
                     if phoneSaved {
-                        Label("Saved — serious alerts will text this number", systemImage: "checkmark.circle.fill")
+                        Label("Saved to your account", systemImage: "checkmark.circle.fill")
                             .font(.footnote).foregroundStyle(SD.Colors.success)
                     }
-                    Text("When the sensor detects distracted driving (or a fall, a covered face, an intruder), a text goes to this number within seconds.")
+                    if let errorMessage {
+                        Label(errorMessage, systemImage: "exclamationmark.circle")
+                            .font(.footnote).foregroundStyle(SD.Colors.danger)
+                    }
+                    // Honest about both limits: texts need SMS set up on the
+                    // server, and the server can't report saved values back
+                    // (no GET /v1/account), so the field shows what this phone
+                    // last entered, not what the account holds.
+                    Text("On a serious alert (distracted driving, a fall, a covered face, an intruder) the server texts this number — only if SMS is set up on the server. The server can't show saved settings back, so this field shows what this phone last entered.")
                         .font(.footnote)
                         .foregroundStyle(SD.Colors.textSecondary)
                 }
@@ -261,7 +269,15 @@ struct SettingsView: View {
             .navigationBarTitleDisplayMode(.large)
             .toolbarBackground(SD.Colors.background, for: .navigationBar)
             .sheet(isPresented: $showSetup) { SetupFlowView() }
-            .onAppear { tokenDraft = state.deviceToken }
+            .onAppear {
+                tokenDraft = state.deviceToken
+                // The channel this phone saved last time, not a new one: an
+                // empty field used to mean a fresh random channel on every
+                // visit, silently replacing the one the person subscribed to.
+                if ntfyTopic.isEmpty {
+                    ntfyTopic = Keychain.get(BackgroundAlertsSection.savedTopicKey) ?? ""
+                }
+            }
         }
     }
 

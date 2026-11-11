@@ -194,6 +194,43 @@ struct APIClient {
     func setNtfyTopic(_ topic: String) async throws {
         _ = try await request("POST", "v1/account/ntfy", body: ["ntfy_topic": topic])
     }
+
+    // MARK: preset library, rules, stop/resume
+    //
+    // Through `request`, so they get the same relocation, cleartext refusal and
+    // error wording as everything else. An older backend answers with an
+    // uncoded 404 (APIError.endpointMissing).
+
+    func presetCatalog() async throws -> PresetCatalog {
+        try decode(PresetCatalog.self, from: try await request("GET", "v1/presets"))
+    }
+
+    func devicePresets(deviceID: Int) async throws -> DevicePresets {
+        try decode(DevicePresets.self, from: try await request("GET", "v1/devices/\(deviceID)/presets"))
+    }
+
+    func activatePreset(deviceID: Int, preset: String, settings: [String: JSONValue]) async throws -> ActivationResult {
+        var body: [String: Any] = ["preset": preset]
+        if !settings.isEmpty { body["settings"] = settings.mapValues(\.foundationObject) }
+        let data = try await request("POST", "v1/devices/\(deviceID)/preset", body: body)
+        // The switch was accepted; an answer this build cannot read does not
+        // undo that, it only means nothing more was confirmed.
+        return (try? decode(ActivationResult.self, from: data)) ?? ActivationResult()
+    }
+
+    func deviceRules(deviceID: Int) async throws -> DeviceRules {
+        try decode(DeviceRules.self, from: try await request("GET", "v1/devices/\(deviceID)/rules"))
+    }
+
+    func setRuleEnabled(deviceID: Int, ruleID: String, enabled: Bool) async throws {
+        _ = try await request("PATCH", "v1/devices/\(deviceID)/rules/\(ruleID)", body: ["enabled": enabled])
+    }
+
+    func setProtection(deviceID: Int, action: ProtectionAction, confirm: Bool) async throws -> ProtectionCommand {
+        let data = try await request("POST", "v1/devices/\(deviceID)/protection",
+                                     body: ["action": action.rawValue, "confirm": confirm])
+        return (try? decode(ProtectionCommand.self, from: data)) ?? ProtectionCommand(commandID: nil)
+    }
 }
 
 /// App-wide session: backend URL, auth token, and a configured client.
@@ -989,6 +1026,8 @@ final class AppState: ObservableObject {
             accountHardwareIDsRaw = ""
             UserDefaults.standard.removeObject(forKey: "alertPhone")
             UserDefaults.standard.removeObject(forKey: "smsOnLoud")
+            // The ntfy channel this phone saved for the previous account.
+            Keychain.delete(BackgroundAlertsSection.savedTopicKey)
             AlertNotifier.shared.forgetAnnounced()
         }
         localStateOwner = owner

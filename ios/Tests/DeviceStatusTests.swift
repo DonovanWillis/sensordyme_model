@@ -129,5 +129,39 @@ check(oddDecoded != nil && oddDecoded?.monitoringState == nil && oddDecoded?.sta
       "a wrong-typed field is dropped, not fatal to the device list")
 check(present(oddDecoded)?.phase == .unknown, "and what is left reads as unknown")
 
+print("\noptional fields from newer backends:")
+let newer = #"{"monitoring_state": "stopped", "protection": "stopped", "last_command_id": "c9", "capabilities": {"available": ["face"], "evaluation": {"face": "benchmarked_offline"}}}"#.data(using: .utf8)!
+let newerDecoded = try? JSONDecoder().decode(DeviceStatus.self, from: newer)
+check(newerDecoded?.lastCommandID == "c9", "last_command_id decodes")
+check(newerDecoded?.capabilities?.evaluation?["face"] == "benchmarked_offline", "per-capability evaluation decodes")
+check(decoded?.lastCommandID == nil && decoded?.capabilities?.evaluation == nil, "and both are absent from older ones")
+
+print("\ncapability health: never green when unknown or stale:")
+let capable = DeviceStatus(
+    monitoringState: "degraded",
+    capabilities: .init(available: ["face", "camera"], impaired: [.init(name: "phone_use", reason: "object model missing")],
+                        starting: ["pose"], evaluation: ["face": "benchmarked_offline", "camera": "validated_on_device"]),
+    stale: false)
+let health = CapabilityHealth.rows(status: capable, online: true)
+check(health.notice == nil && health.rows.count == 4, "every capability gets a row")
+check(health.rows.first?.name == "phone_use" && health.rows.first?.tone == .critical
+      && health.rows.first?.detail.contains("object model missing") == true, "impaired first, with the reason")
+check(health.rows.first(where: { $0.name == "pose" })?.tone == .caution, "starting is caution")
+check(health.rows.first(where: { $0.name == "face" })?.detail == "Producing results · benchmarked offline only",
+      "available carries its evaluation status")
+check(health.rows.first(where: { $0.name == "camera" })?.detail.contains("validated on device") == true,
+      "validated on device is said as such")
+check(health.rows.first?.title == "Phone use", "names are humanised")
+var staleCapable = capable
+staleCapable.stale = true
+check(CapabilityHealth.rows(status: staleCapable, online: true).rows.isEmpty, "a stale device shows no green rows")
+check(CapabilityHealth.rows(status: capable, online: false).rows.isEmpty, "an offline device shows no green rows")
+check(CapabilityHealth.rows(status: capable, online: false).notice?.hasPrefix("Unknown") == true, "and says unknown")
+check(CapabilityHealth.rows(status: nil, online: true).notice?.contains("doesn't report") == true,
+      "an old backend says it doesn't report them")
+check(CapabilityHealth.rows(status: DeviceStatus(monitoringState: "ready", capabilities: nil, stale: false),
+                            online: true).rows.isEmpty, "null capabilities show nothing as working")
+check(CapabilityHealth.evaluationNote("something_new") == "validation unknown", "an unknown evaluation is unknown")
+
 print(failures == 0 ? "\nall passed" : "\n\(failures) FAILED")
 exit(failures == 0 ? 0 : 1)

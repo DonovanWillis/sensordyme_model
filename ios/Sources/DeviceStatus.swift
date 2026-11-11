@@ -29,11 +29,35 @@ struct DeviceStatus: Codable, Hashable {
     var presetRejection: PresetRejection?
     var stale: Bool?
     var reportedAt: Double?
+    /// The id of the last stop/resume the DEVICE says it applied (echo of the
+    /// `command_id` POST /v1/devices/{id}/protection returned). nil from a
+    /// backend that does not pass it through; ProtectionControl then falls back
+    /// to the protection state.
+    var lastCommandID: String?
 
     struct Capabilities: Codable, Hashable {
         var available: [String]?
         var impaired: [Impaired]?
         var starting: [String]?
+        /// Per-capability evaluation status (`validated_on_device`, ...), when
+        /// the backend reports one. Optional in the contract.
+        var evaluation: [String: String]?
+
+        init(available: [String]? = nil, impaired: [Impaired]? = nil, starting: [String]? = nil,
+             evaluation: [String: String]? = nil) {
+            self.available = available
+            self.impaired = impaired
+            self.starting = starting
+            self.evaluation = evaluation
+        }
+
+        init(from decoder: Decoder) throws {
+            let c = try decoder.container(keyedBy: CodingKeys.self)
+            available = try? c.decodeIfPresent([String].self, forKey: .available)
+            impaired = try? c.decodeIfPresent([Impaired].self, forKey: .impaired)
+            starting = try? c.decodeIfPresent([String].self, forKey: .starting)
+            evaluation = try? c.decodeIfPresent([String: String].self, forKey: .evaluation)
+        }
     }
 
     struct Impaired: Codable, Hashable {
@@ -80,6 +104,7 @@ struct DeviceStatus: Codable, Hashable {
         case lastRejection = "last_rejection"
         case presetRejection = "preset_rejection"
         case reportedAt = "reported_at"
+        case lastCommandID = "last_command_id"
     }
 
     init(
@@ -87,7 +112,8 @@ struct DeviceStatus: Codable, Hashable {
         reasons: [String]? = nil, protectionReasons: [String]? = nil, mode: String? = nil,
         role: String? = nil, roleTitle: String? = nil, allowedPresets: [String]? = nil,
         capabilities: Capabilities? = nil, rules: Rules? = nil, lastRejection: Rejection? = nil,
-        presetRejection: PresetRejection? = nil, stale: Bool? = nil, reportedAt: Double? = nil
+        presetRejection: PresetRejection? = nil, stale: Bool? = nil, reportedAt: Double? = nil,
+        lastCommandID: String? = nil
     ) {
         self.monitoringState = monitoringState
         self.monitoringActive = monitoringActive
@@ -104,6 +130,7 @@ struct DeviceStatus: Codable, Hashable {
         self.presetRejection = presetRejection
         self.stale = stale
         self.reportedAt = reportedAt
+        self.lastCommandID = lastCommandID
     }
 
     init(from decoder: Decoder) throws {
@@ -123,7 +150,11 @@ struct DeviceStatus: Codable, Hashable {
         presetRejection = try? c.decodeIfPresent(PresetRejection.self, forKey: .presetRejection)
         stale = try? c.decodeIfPresent(Bool.self, forKey: .stale)
         reportedAt = try? c.decodeIfPresent(Double.self, forKey: .reportedAt)
+        lastCommandID = try? c.decodeIfPresent(String.self, forKey: .lastCommandID)
     }
+
+    /// Online and reporting: the only time anything below is current.
+    func isLive(online: Bool) -> Bool { online && stale != true }
 }
 
 /// How alarming a status is, independent of the design system (the views map
@@ -264,5 +295,74 @@ struct MonitoringStatusPresentation: Equatable {
         let role = status?.roleTitle ?? status?.role
         return role.map { "Not available for this device's role (\($0))" }
             ?? "Not available on this device"
+    }
+}
+
+
+// MARK: - Capability health
+
+/// One capability on the health card: what it is, whether it works, and how
+/// far its results have been checked.
+struct CapabilityHealthRow: Equatable, Identifiable {
+    enum State: Equatable { case available, starting, impaired }
+
+    let name: String
+    let title: String
+    let state: State
+    let detail: String
+    let tone: StatusTone
+
+    var id: String { name }
+}
+
+enum CapabilityHealth {
+    /// The rows, and a sentence for when there are none to trust. Never a
+    /// green row for a device that is not reporting: `capabilities` is null
+    /// when stale, and an old list is not repeated.
+    static func rows(status: DeviceStatus?, online: Bool) -> (rows: [CapabilityHealthRow], notice: String?) {
+        guard let status else {
+            return ([], "This server doesn't report the device's capabilities.")
+        }
+        guard status.isLive(online: online), let capabilities = status.capabilities else {
+            return ([], "Unknown — the device isn't reporting, so no capability is shown as working.")
+        }
+        let evaluation = capabilities.evaluation ?? [:]
+        var rows: [CapabilityHealthRow] = []
+        for impaired in capabilities.impaired ?? [] {
+            let reason = impaired.reason.flatMap { $0.isEmpty ? nil : $0 } ?? "not working"
+            rows.append(.init(name: impaired.name, title: title(impaired.name), state: .impaired,
+                              detail: "Not working — \(reason)", tone: .critical))
+        }
+        for name in capabilities.starting ?? [] {
+            rows.append(.init(name: name, title: title(name), state: .starting,
+                              detail: "Starting", tone: .caution))
+        }
+        for name in capabilities.available ?? [] {
+            var detail = "Producing results"
+            if let note = evaluationNote(evaluation[name]) { detail += " · \(note)" }
+            rows.append(.init(name: name, title: title(name), state: .available, detail: detail, tone: .ok))
+        }
+        if rows.isEmpty {
+            return ([], "The device reports no capabilities.")
+        }
+        return (rows, nil)
+    }
+
+    /// The evaluation status in words, or nil when the backend gave none.
+    static func evaluationNote(_ raw: String?) -> String? {
+        switch raw {
+        case nil, "": return nil
+        case "validated_on_device": return "validated on device"
+        case "evaluated_in_domain": return "evaluated, not validated on device"
+        case "benchmarked_offline": return "benchmarked offline only"
+        case "unevaluated": return "not yet evaluated"
+        default: return "validation unknown"
+        }
+    }
+
+    /// "phone_use" -> "Phone use"
+    static func title(_ name: String) -> String {
+        let spaced = name.replacingOccurrences(of: "_", with: " ").replacingOccurrences(of: ".", with: " ")
+        return spaced.prefix(1).uppercased() + spaced.dropFirst()
     }
 }

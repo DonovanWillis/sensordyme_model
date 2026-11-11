@@ -122,37 +122,7 @@ extension AIRule {
     }
 }
 
-/// Any JSON value, so a rule's unknown keys can be carried through untouched.
-enum JSONValue: Codable, Equatable, Sendable {
-    case string(String)
-    case number(Double)
-    case bool(Bool)
-    case array([JSONValue])
-    case object([String: JSONValue])
-    case null
-
-    init(from decoder: Decoder) throws {
-        let c = try decoder.singleValueContainer()
-        if c.decodeNil() { self = .null }
-        else if let value = try? c.decode(Bool.self) { self = .bool(value) }
-        else if let value = try? c.decode(Double.self) { self = .number(value) }
-        else if let value = try? c.decode(String.self) { self = .string(value) }
-        else if let value = try? c.decode([JSONValue].self) { self = .array(value) }
-        else { self = .object(try c.decode([String: JSONValue].self)) }
-    }
-
-    func encode(to encoder: Encoder) throws {
-        var c = encoder.singleValueContainer()
-        switch self {
-        case .string(let value): try c.encode(value)
-        case .number(let value): try c.encode(value)
-        case .bool(let value): try c.encode(value)
-        case .array(let value): try c.encode(value)
-        case .object(let value): try c.encode(value)
-        case .null: try c.encodeNil()
-        }
-    }
-}
+// JSONValue lives in PresetLibrary.swift (Foundation-only, so its tests can use it).
 
 /// A part of the request the device honestly cannot do, with why and what it'd take.
 struct AIUnsupported: Codable, Equatable, Identifiable, Sendable {
@@ -300,6 +270,26 @@ protocol BackendAPI {
     func triggerDemoEvent(_ scenario: DemoScenario) async throws -> EventItem
     func placeOrder(quantity: Int, address: String) async throws -> Int
     func orders() async throws -> [Order]
+
+    // MARK: Preset library, custom rules, stop/resume (docs/IOS_APP_STATUS.md)
+    //
+    // An older backend answers these with an uncoded 404; callers check
+    // `APIError.endpointMissing` and say "not supported by this server".
+
+    /// GET /v1/presets
+    func presetCatalog() async throws -> PresetCatalog
+    /// GET /v1/devices/{id}/presets
+    func devicePresets(deviceID: Int) async throws -> DevicePresets
+    /// POST /v1/devices/{id}/preset with `settings`. Refusals carry a code
+    /// (role_forbids_preset, incompatible_policy, invalid_setting, unknown_preset).
+    func activatePreset(deviceID: Int, preset: String, settings: [String: JSONValue]) async throws -> ActivationResult
+    /// GET /v1/devices/{id}/rules
+    func deviceRules(deviceID: Int) async throws -> DeviceRules
+    /// PATCH /v1/devices/{id}/rules/{rule_id}
+    func setRuleEnabled(deviceID: Int, ruleID: String, enabled: Bool) async throws
+    /// POST /v1/devices/{id}/protection. The returned id is what the device
+    /// echoes once it has applied the request (ProtectionControl).
+    func setProtection(deviceID: Int, action: ProtectionAction, confirm: Bool) async throws -> ProtectionCommand
 }
 
 /// A rehearsable demo event. Waiting ~20s for a synthesised alert is not a
@@ -443,6 +433,16 @@ final class MockAPI: BackendAPI {
     private var deviceName = "Demo Unit"
     private var mockOrders: [Order] = []
     private var nextOrderID = 1001
+    /// Settings per preset base, as the demo device "runs" them.
+    private var presetSettings: [String: [String: JSONValue]] = [:]
+    /// Custom rules activated through Ask Jupiter, as the demo device runs them.
+    private var customRules: [DeviceRule] = []
+    private var customInstruction = ""
+    private var nextRuleID = 1
+    /// Stop/resume: what the device has applied, and what is still in flight.
+    private var protectionStopped = false
+    private var lastCommandID: String?
+    private var pendingProtection: (action: ProtectionAction, id: String, at: Date)?
 
     private init() {
         seedHistory()
@@ -503,6 +503,8 @@ final class MockAPI: BackendAPI {
     }
 
     private func synthesizeLiveEvents() {
+        // A stopped device watches nothing, so it reports nothing.
+        guard !protectionStopped else { return }
         // roughly one new event every ~20s of demo use, matching the active scenario
         guard Date().timeIntervalSince(lastSynthesized) > 20 else { return }
         lastSynthesized = Date()
@@ -541,30 +543,52 @@ final class MockAPI: BackendAPI {
 
     func devices() async throws -> [Device] {
         settleModeSwitch()
+        settleProtection()
+        let running = customRules.filter { $0.enabled && $0.status == "running" }
+        let customActive = !customRules.isEmpty
         return [
             Device(id: 1, name: deviceName, activePreset: activePreset,
                    desiredPreset: desiredPreset, online: true,
                    lastSeen: Date().timeIntervalSince1970,
                    health: Self.demoHealth,
-                   // Demo runs a standard mode; a custom configuration in the
-                   // demo would claim a capability nobody had configured.
-                   monitoring: nil,
-                   status: Self.demoStatus())
+                   // Only what was activated in this walkthrough: rules Ask
+                   // Jupiter turned on, never a configuration nobody made.
+                   monitoring: customActive
+                       ? CustomMonitoring(instruction: customInstruction, ruleCount: customRules.count, active: true)
+                       : nil,
+                   status: demoStatus(customActive: customActive, running: running.map(\.id)))
         ]
     }
 
     /// The status contract for the walkthrough device: a general-purpose role
-    /// (every mode can be picked), monitoring normally, nothing refused. The
-    /// capabilities are what the simulated health above claims, no more.
-    private static func demoStatus() -> DeviceStatus {
+    /// (every mode can be picked), nothing refused. The capabilities are what
+    /// the simulated health above claims, no more. Stopping it really stops it.
+    private func demoStatus(customActive: Bool, running: [String]) -> DeviceStatus {
         DeviceStatus(
-            monitoringState: "ready", monitoringActive: true, protection: "protecting",
-            reasons: [], protectionReasons: [], mode: "standard",
+            monitoringState: protectionStopped ? "stopped" : "ready",
+            monitoringActive: !protectionStopped,
+            protection: protectionStopped ? "stopped" : "protecting",
+            reasons: protectionStopped ? ["stopped from the app"] : [],
+            protectionReasons: protectionStopped ? ["monitoring was stopped on request"] : [],
+            mode: protectionStopped ? "off" : (customActive ? "ai_custom" : "standard"),
             role: "general", roleTitle: "General purpose", allowedPresets: nil,
             capabilities: .init(available: ["camera", "inference", "alert_output"], impaired: [], starting: []),
-            rules: .init(active: [], additive: false, rejected: nil),
-            stale: false, reportedAt: Date().timeIntervalSince1970
+            rules: .init(active: running, additive: false, rejected: nil),
+            stale: false, reportedAt: Date().timeIntervalSince1970,
+            lastCommandID: lastCommandID
         )
+    }
+
+    /// A stop/resume lands after a short delay, like a real device's poll.
+    private func settleProtection() {
+        guard let pending = pendingProtection, Date().timeIntervalSince(pending.at) > 2.5 else { return }
+        protectionStopped = pending.action == .stop
+        lastCommandID = pending.id
+        pendingProtection = nil
+        history.insert(
+            makeEvent(type: pending.action == .stop ? "monitoring_stopped" : "monitoring_resumed",
+                      signals: "requested from the app", severity: "log", at: Date()),
+            at: 0)
     }
 
     /// Health for the walkthrough device. Every line says "simulated" — a demo
@@ -611,6 +635,156 @@ final class MockAPI: BackendAPI {
     func setPreset(deviceID: Int, preset: String) async throws {
         desiredPreset = preset
         switchRequestedAt = Date()
+        // A named mode replaces AI Custom rules, as on a real device.
+        customRules = []
+        customInstruction = ""
+    }
+
+    // MARK: Preset library, rules, stop/resume (demo)
+
+    /// The demo catalog. Validation is said as it is: the demo device is
+    /// simulated, so nothing here is validated on a device.
+    static let demoCatalog: PresetCatalog = {
+        func setting(_ key: String, _ title: String, _ kind: PresetSetting.Kind, _ value: JSONValue,
+                     min: Double? = nil, max: Double? = nil, step: Double? = nil, unit: String? = nil,
+                     options: [PresetSetting.Option] = []) -> PresetSetting {
+            PresetSetting(key: key, title: title, kind: kind, defaultValue: value,
+                          min: min, max: max, step: step, unit: unit, options: options)
+        }
+        let sensitivity = setting("sensitivity", "Sensitivity", .number, .number(0.6), min: 0.3, max: 0.9, step: 0.1)
+        var presets = Preset.catalog.map { preset in
+            CatalogPreset(
+                id: preset.name, version: "demo", title: preset.title, description: preset.subtitle,
+                variants: preset.variants.map { PresetVariantInfo(id: $0.name, title: $0.title) },
+                validation: PresetValidation(status: .unevaluated, evidence: ["Demo catalog — the demo device is simulated."]))
+        }
+        for index in presets.indices {
+            switch presets[index].id {
+            case "driver_safety":
+                presets[index].requiredCapabilities = ["face", "gaze"]
+                presets[index].optionalCapabilities = ["phone_use"]
+                presets[index].hardware = ["IR camera facing the driver"]
+                presets[index].temporalPolicies = [
+                    TemporalPolicy(event: "eyes_off_road", description: "Eyes off the road", sustainS: 2),
+                    TemporalPolicy(event: "drowsiness", description: "Eyes closed", sustainS: 1.5),
+                ]
+                presets[index].settings = [
+                    sensitivity,
+                    setting("eyes_off_s", "Eyes off the road for", .number, .number(2), min: 1, max: 5, step: 0.5, unit: "s"),
+                    setting("chime", "Chime on the device", .bool, .bool(true)),
+                ]
+                presets[index].validation = PresetValidation(
+                    status: .benchmarkedOffline,
+                    evidence: ["Benchmarked offline on a public driver dataset (demo figure)."])
+                presets[index].limitations = ["Sunglasses can hide the eyes.", "Needs the face in view."]
+            case "baby_monitoring":
+                presets[index].requiredCapabilities = ["pose", "audio"]
+                presets[index].settings = [
+                    sensitivity,
+                    setting("cry_alert", "Alert on crying", .bool, .bool(true)),
+                ]
+                presets[index].limitations = ["Can't see through a fully covered crib."]
+            case "elderly_monitoring":
+                presets[index].requiredCapabilities = ["pose"]
+                presets[index].temporalPolicies = [
+                    TemporalPolicy(event: "fall", description: "On the floor after a fall", sustainS: 5),
+                    TemporalPolicy(event: "inactivity_warning", description: "No movement", sustainS: 1500),
+                ]
+                presets[index].settings = [
+                    setting("inactivity_min", "Alert after no movement for", .number, .number(25),
+                            min: 5, max: 120, step: 5, unit: "min"),
+                ]
+                presets[index].limitations = ["Falls out of the camera's view are missed."]
+            case "security_monitoring":
+                presets[index].requiredCapabilities = ["person"]
+                presets[index].settings = [
+                    setting("linger_s", "Lingering after", .number, .number(40), min: 10, max: 300, step: 10, unit: "s"),
+                    setting("arm", "Armed", .choice, .string("home"),
+                            options: [.init(value: "home", title: "Home"), .init(value: "away", title: "Away")]),
+                ]
+            default: break
+            }
+        }
+        presets.append(CatalogPreset(
+            id: "pool_safety", version: "demo", title: "Pool Safety",
+            description: "Someone entering the pool area",
+            requiredCapabilities: ["person", "zones"],
+            validation: PresetValidation(status: .unevaluated),
+            limitations: ["Planned. Not available on any device yet."]))
+        return PresetCatalog(catalogVersion: "demo-1", presets: presets, source: .server)
+    }()
+
+    func presetCatalog() async throws -> PresetCatalog {
+        Self.demoCatalog
+    }
+
+    func devicePresets(deviceID: Int) async throws -> DevicePresets {
+        settleModeSwitch()
+        let active = Preset.split(activePreset).base
+        return DevicePresets(
+            deviceID: 1, catalogVersion: Self.demoCatalog.catalogVersion, activePreset: activePreset, stale: false,
+            presets: Self.demoCatalog.presets.map { preset in
+                if preset.id == "pool_safety" {
+                    return DevicePresetState(id: preset.id, available: false, code: "planned",
+                                             reason: "Waiting on a validated pool-zone model",
+                                             validationStatus: preset.validation.status)
+                }
+                return DevicePresetState(
+                    id: preset.id, available: true, active: preset.id == active && customRules.isEmpty,
+                    validationStatus: preset.validation.status,
+                    settings: PresetSettingsForm.initialValues(preset.settings, current: presetSettings[preset.id] ?? [:]))
+            })
+    }
+
+    func activatePreset(deviceID: Int, preset: String, settings: [String: JSONValue]) async throws -> ActivationResult {
+        let base = Preset.split(preset).base
+        guard let entry = Self.demoCatalog.preset(base) else {
+            throw APIError(message: "no such preset: \(preset)", status: 400, code: "unknown_preset")
+        }
+        if base == "pool_safety" {
+            throw APIError(message: "Pool Safety is planned and not available on this device yet", status: 409,
+                           code: "incompatible_policy")
+        }
+        if let problem = PresetSettingsForm.problems(entry.settings, values: settings).first {
+            let title = entry.settings.first(where: { $0.key == problem.key })?.title ?? problem.key
+            throw APIError(message: "\(title): \(problem.value)", status: 400, code: "invalid_setting")
+        }
+        presetSettings[base] = settings
+        try await setPreset(deviceID: deviceID, preset: preset)
+        return ActivationResult(rulesActive: 0, rulesVersion: "", unsupported: [])
+    }
+
+    func deviceRules(deviceID: Int) async throws -> DeviceRules {
+        // Rules waiting for an area start once that area is drawn.
+        for index in customRules.indices where customRules[index].status == "waiting" {
+            if let zone = customRules[index].zone, demoZones.contains(where: { $0.name == zone }) {
+                customRules[index].status = "running"
+            }
+        }
+        return DeviceRules(rulesVersion: customRules.isEmpty ? "" : "demo-\(nextRuleID)",
+                           additive: false, rules: customRules)
+    }
+
+    func setRuleEnabled(deviceID: Int, ruleID: String, enabled: Bool) async throws {
+        guard let index = customRules.firstIndex(where: { $0.id == ruleID }) else {
+            throw APIError(message: "no such rule", status: 404, code: "rule_not_found")
+        }
+        customRules[index].enabled = enabled
+        if enabled {
+            let waiting = customRules[index].zone.map { zone in !demoZones.contains(where: { $0.name == zone }) } ?? false
+            customRules[index].status = waiting ? "waiting" : "running"
+        } else {
+            customRules[index].status = "disabled"
+        }
+    }
+
+    func setProtection(deviceID: Int, action: ProtectionAction, confirm: Bool) async throws -> ProtectionCommand {
+        if action == .stop && !confirm {
+            throw APIError(message: "stopping monitoring requires confirm: true", status: 400, code: "confirmation_required")
+        }
+        let id = String(UUID().uuidString.prefix(12)).lowercased()
+        pendingProtection = (action, id, Date())
+        return ProtectionCommand(commandID: id, desired: action.rawValue)
     }
 
     /// Mirrors the real backend: a custom proposal's rules all run (the demo has
@@ -618,6 +792,19 @@ final class MockAPI: BackendAPI {
     /// rules come back unsupported, because rules never run beside a mode.
     func activate(deviceID: Int, proposal: AIProposal) async throws -> ActivationResult {
         guard !proposal.preset.isEmpty else {
+            // The rules the demo device now runs, listed by GET rules. A rule
+            // that needs an area waits until that area is drawn.
+            customRules = proposal.rules.map { rule in
+                defer { nextRuleID += 1 }
+                let zone = rule.zone.isEmpty ? nil : rule.zone
+                let waiting = zone.map { zone in !demoZones.contains(where: { $0.name == zone }) } ?? false
+                return DeviceRule(
+                    id: "r\(nextRuleID)", enabled: true, summary: rule.headline,
+                    targets: [rule.target] + (rule.secondary.isEmpty ? [] : [rule.secondary]),
+                    zone: zone, dwellS: rule.persist_s, requiredCapabilities: [],
+                    status: waiting ? "waiting" : "running", reason: nil)
+            }
+            customInstruction = proposal.explanation
             return ActivationResult(rulesActive: proposal.rules.count, rulesVersion: "demo", unsupported: [])
         }
         try await setPreset(deviceID: deviceID, preset: proposal.preset)
@@ -737,6 +924,12 @@ final class MockAPI: BackendAPI {
                 support: "unsupported", alternatives: [])],
             source: "demo", mode: "custom")
     }
+}
+
+extension APIError {
+    /// The server answered, and it does not have this endpoint (an older
+    /// backend). Not a failure of the request: a capability the server lacks.
+    var endpointMissing: Bool { ServerSupport.endpointMissing(status: status, code: code) }
 }
 
 // MARK: - APIClient generic POST helper used by aiConfigure
