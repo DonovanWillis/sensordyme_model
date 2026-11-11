@@ -601,7 +601,9 @@ def device_availability(entry: dict, *, role: Any = None, capabilities: Optional
     for kind in entry.get("required_capabilities") or []:
         if kind in impaired:
             reason = impaired[kind] or "impaired"
-            if re.search(r"not (configured|provided)", str(reason)):
+            # "no audible alert output is configured", "not provided by this
+            # device": nothing to repair, the device does not have it.
+            if re.search(r"\bnot?\b", str(reason)) and re.search(r"\b(configured|provided)\b", str(reason)):
                 return CODE_UNSUPPORTED, f"{kind} is not available on this device ({reason})"
     for kind in entry.get("required_capabilities") or []:
         if kind in impaired:

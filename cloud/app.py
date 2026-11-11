@@ -1762,7 +1762,7 @@ def _rules_run_beside(role, preset: str) -> bool:
     """Would custom rules run BESIDE `preset` on a device with `role` (additive)?"""
     if role is None or not role.additive_custom_rules:
         return False
-    base = (preset or "").partition(":")[0]
+    base = (preset or "").partition(SETTINGS_SEPARATOR)[0].partition(":")[0]
     module = (load_presets().get(base) or {}).get("module")
     return module in role.mandatory_modules
 
