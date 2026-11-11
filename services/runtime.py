@@ -29,6 +29,7 @@ from contextlib import contextmanager, suppress
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
+from types import MappingProxyType
 from typing import Any, Optional
 
 import cv2
@@ -213,6 +214,15 @@ class DeviceRuntime:
     # M0.2 monitoring-state defaults (see _evaluate_monitoring).
     _heartbeat = 0.0
     _heartbeat_reset_at = 0.0
+    # M7 shared-perception defaults: such a runtime has no nodes and a fresh engine.
+    _perception_source = "camera"
+    _perception_simulated = False
+    _last_observation = None
+    _detector_unavailable = None
+    _node_zone_signature = None
+    _companions = MappingProxyType({})
+    _preset_nodes = MappingProxyType({})
+    _node_errors = MappingProxyType({})
     _consecutive_process_failures = 0
     _last_process_error: Optional[str] = None
     _detection_degraded: Optional[str] = None
@@ -294,7 +304,7 @@ class DeviceRuntime:
         # all read. The boot module was built before the engine existed, so its
         # full-frame models are adopted now; later builds are adopted as made.
         perception_cfg = config.get("perception") if isinstance(config.get("perception"), dict) else {}
-        self.perception = pc.PerceptionEngine(
+        self._perception_engine = pc.PerceptionEngine(
             max_age_s=float(perception_cfg.get("max_age_s", pc.DEFAULT_MAX_AGE_S)))
         self.perception.set_detector_loader(self._load_shared_detector)
         self.perception.adopt(module)
@@ -1440,6 +1450,15 @@ class DeviceRuntime:
             self._publish_monitoring()
 
     # ------------------------------------------------------------------ shared perception (M7)
+    @property
+    def perception(self) -> pc.PerceptionEngine:
+        """The shared perception engine (one per runtime; created on first use for a
+        runtime assembled without __init__, as several tests build them)."""
+        engine = self.__dict__.get("_perception_engine")
+        if engine is None:
+            engine = self.__dict__["_perception_engine"] = pc.PerceptionEngine()
+        return engine
+
     def _shared_detector_weights(self) -> Optional[str]:
         """The detector a model-less consumer runs: perception.detector_weights, else
         the running module's, else any configured module's (they share one model)."""
