@@ -62,7 +62,7 @@ enum Stack {
         throw lastError
     }
 
-    private static let session = URLSession(configuration: .ephemeral)
+    private static let urlSession = URLSession(configuration: .ephemeral)
 
     private static func attempt(_ method: String, _ path: String) throws -> [String: Any] {
         var request = URLRequest(url: URL(string: path, relativeTo: control)!)
@@ -71,7 +71,7 @@ enum Stack {
         request.setValue("close", forHTTPHeaderField: "Connection")
         var result: Result<Data, Error> = .failure(URLError(.timedOut))
         let done = DispatchSemaphore(value: 0)
-        session.dataTask(with: request) { data, response, error in
+        urlSession.dataTask(with: request) { data, response, error in
             if let error {
                 result = .failure(error)
             } else if let http = response as? HTTPURLResponse, http.statusCode == 200, let data {
