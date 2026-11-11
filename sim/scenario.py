@@ -139,7 +139,7 @@ SCENARIOS: dict[str, Scenario] = {s.name: s for s in (
     Scenario("no_buzzer", "No audible alert output on a driver_safety device (FAILED).",
              boot=BootFaults(no_buzzer=True)),
     Scenario("reboot", "The device process restarts at 40 s: identity, pairing, mode and rules persist.",
-             _timeline((C + 40, ATTENTIVE)), reboots=(C + 28,)),
+             reboots=(40.0,)),
     Scenario("tour", "Everything in one run, for an app demo: drowsy, phone, distracted, detector "
                      "failure, camera freeze, backend outage, each followed by recovery.",
              _timeline(
