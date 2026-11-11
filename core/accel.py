@@ -332,7 +332,7 @@ def maybe_hailo_yolo(weights: str):
                 "Pin it so a replaced or corrupted model is refused.", hef_path, actual,
             )
         try:
-            model = HailoYOLO(hef_path, sha256=actual)
+            model = HailoYOLO(hef_path, sha256=actual, decoder=_accel_cfg.get("yolo_decoder", "legacy"))
         except Exception as exc:  # noqa: BLE001 - never let the accelerator kill startup
             _refuse(f"Hailo init failed ({exc}) — running on CPU")
             return None
@@ -468,7 +468,19 @@ class HailoYOLO:
     #: day tuning IoU expecting it to fix duplicate boxes.
     _DEFAULT_NMS_IOU = 0.50
 
-    def __init__(self, hef_path: str, nms_iou: Optional[float] = None, sha256: Optional[str] = None) -> None:
+    #: Selectable off-chip decoders for raw (no-NMS) builds. "legacy" is what has
+    #: shipped; "reference" follows DAMO-YOLO's own decode. Nothing changes unless
+    #: config.yaml asks for it (accelerator.yolo_decoder).
+    DECODERS = ("legacy", "reference")
+    #: The reference postprocess keeps at most this many boxes per image
+    #: (damo/utils/boxes.py postprocess -> multiclass_nms(..., 500)).
+    _REFERENCE_MAX_DETECTIONS = 500
+
+    def __init__(self, hef_path: str, nms_iou: Optional[float] = None, sha256: Optional[str] = None,
+                 decoder: str = "legacy") -> None:
+        if decoder not in self.DECODERS:
+            raise ValueError(f"unknown decoder {decoder!r}; expected one of {self.DECODERS}")
+        self.decoder = decoder
         from hailo_platform import (  # imported here: only exists on the Pi
             HEF,
             ConfigureParams,
@@ -658,6 +670,8 @@ class HailoYOLO:
             at 0.85, channel 56 (`chair`) and 67 (`cell phone`) plausibly lit.
             Channels beyond the COCO 80 are padding and are dropped.
         """
+        if getattr(self, "decoder", "legacy") == "reference":
+            return self._decode_reference(raw, scale, left, top, w, h, classes, conf)
         wanted = {int(c) for c in classes} if classes is not None else None
         all_boxes: list[np.ndarray] = []
         all_scores: list[np.ndarray] = []
@@ -735,6 +749,85 @@ class HailoYOLO:
         for i in sorted(keep_idx, key=lambda j: -scores[j]):
             x1, y1, x2, y2 = boxes_xyxy[i]
             # Undo the letterbox: remove padding, then rescale to original pixels.
+            shim.append(_ShimBox(
+                np.asarray([
+                    min(max((x1 - left) / scale, 0.0), w),
+                    min(max((y1 - top) / scale, 0.0), h),
+                    min(max((x2 - left) / scale, 0.0), w),
+                    min(max((y2 - top) / scale, 0.0), h),
+                ]),
+                int(class_ids[i]), float(scores[i]),
+            ))
+        return [_ShimResult(shim)]
+
+    def _decode_reference(self, raw, scale, left, top, w, h, classes, conf):
+        """DAMO-YOLO's own decode, applied to the same raw head tensors.
+
+        Two differences from the legacy path, each a measured defect
+        (research/detector_bench, Open Images val, Missions 4-5):
+
+          * Anchor points are cell * stride, not (cell + 0.5) * stride.
+            Reference: DAMO-YOLO damo/base_models/heads/zero_head.py,
+            get_single_level_center_priors (``arange(w) * stride``) and
+            distance2bbox (``point -/+ distance``). The Hailo Model Zoo decodes
+            this network with offset 0.0 too. The legacy +0.5 shifts every box
+            right and down by half a stride (4/8/16 px at 640).
+          * Every (anchor, class) pair at or above ``conf`` is a candidate
+            (damo/utils/boxes.py multiclass_nms), not only each anchor's argmax
+            class, so a phone sharing an anchor with a stronger person is kept.
+
+        Channel mapping: the class head carries len(COCO_NAMES) = 80 sigmoid
+        probabilities; any further channels are padding and are dropped. The box
+        head carries 4 x _DFL_BINS raw logits (l, t, r, b); a distance is the
+        softmax expectation over its bins, in stride units. Suppression is
+        class-aware NMS at this model's IoU, then the top
+        _REFERENCE_MAX_DETECTIONS by score. Boxes are mapped back through the
+        letterbox and clipped to the frame exactly as on the legacy path.
+        """
+        num_classes = len(COCO_NAMES)
+        wanted = {int(c) for c in classes} if classes is not None else None
+        all_boxes: list[np.ndarray] = []
+        all_scores: list[np.ndarray] = []
+        all_classes: list[np.ndarray] = []
+        for spec in self._scales:
+            box_raw = np.asarray(raw[spec["box"]])[0]   # (G, G, 4*bins) logits
+            cls_raw = np.asarray(raw[spec["cls"]])[0]   # (G, G, C) probabilities
+            if cls_raw.shape[-1] < num_classes:
+                raise RuntimeError(f"class head has {cls_raw.shape[-1]} channels, expected >= {num_classes}")
+            grid, stride = spec["grid"], spec["stride"]
+            scores = cls_raw.reshape(-1, cls_raw.shape[-1])[:, :num_classes]
+            anchor_idx, class_idx = np.nonzero(scores >= conf)
+            if wanted is not None:
+                keep = np.isin(class_idx, list(wanted))
+                anchor_idx, class_idx = anchor_idx[keep], class_idx[keep]
+            if anchor_idx.size == 0:
+                continue
+            dfl = box_raw.reshape(-1, 4, self._DFL_BINS)[anchor_idx]
+            dfl = dfl - dfl.max(axis=2, keepdims=True)
+            prob = np.exp(dfl)
+            prob /= prob.sum(axis=2, keepdims=True)
+            dist = (prob * np.arange(self._DFL_BINS, dtype=np.float32)).sum(axis=2)
+            ys, xs = np.divmod(anchor_idx, grid)
+            px, py = xs * stride, ys * stride  # reference priors: no half-cell offset
+            all_boxes.append(np.stack([
+                px - dist[:, 0] * stride, py - dist[:, 1] * stride,
+                px + dist[:, 2] * stride, py + dist[:, 3] * stride,
+            ], axis=1))
+            all_scores.append(scores[anchor_idx, class_idx])
+            all_classes.append(class_idx)
+        if not all_boxes:
+            return [_ShimResult([])]
+        boxes_xyxy = np.concatenate(all_boxes)
+        scores = np.concatenate(all_scores)
+        class_ids = np.concatenate(all_classes)
+        keep_idx: list[int] = []
+        for cls_id in np.unique(class_ids):
+            sel = np.nonzero(class_ids == cls_id)[0]
+            keep_idx.extend(sel[_nms(boxes_xyxy[sel], scores[sel], self._nms_iou)])
+        keep_idx = sorted(keep_idx, key=lambda j: -scores[j])[: self._REFERENCE_MAX_DETECTIONS]
+        shim: list[_ShimBox] = []
+        for i in keep_idx:
+            x1, y1, x2, y2 = boxes_xyxy[i]
             shim.append(_ShimBox(
                 np.asarray([
                     min(max((x1 - left) / scale, 0.0), w),

@@ -111,6 +111,10 @@ accelerator:
   #
   # On a machine with no Hailo (a dev Mac) this is ignored and the CPU path is
   # used, so this default is safe to carry in the shared config.
+  yolo_decoder: legacy # legacy | reference. "reference" = DAMO-YOLO's own decode (anchor at
+  # cell*stride, every class per anchor); measured better on Open Images val (float ONNX),
+  # NOT yet validated on the INT8 .hef. Stays legacy until hardware validation passes:
+  # see docs/DECODER_CANDIDATE.md.
   yolo_hef_sha256: e69136d3ebf3cc8ebaf3da5417a59962b139f3d3d67d715e9a9b1ae10963960e
   # THE authoritative answer to "what detector binary is SensorDyme running?".
   # Advisory here (not enforced at runtime); enforced at install time by
