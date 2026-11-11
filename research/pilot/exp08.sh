@@ -17,7 +17,10 @@ CKPT_SHA=a5ee63820e0e02a8a0779704c3ba477aefd66927e2e38900bb6cec0168005f95
 CKPT="$DATA/models/drive/damoyolo_tinynasL20_T_418.pth"
 EXP="${EXP:-exp08a}"; PARTIAL="${PARTIAL_LABELS:-0}"; SEED="${SEED:-1234}"; EPOCHS="${EPOCHS:-2}"
 export SD_UNVERIFIED_WEIGHT="${SD_UNVERIFIED_WEIGHT:-0}"
-[ "$EPOCHS" -le 2 ] || { echo "EPOCHS=$EPOCHS exceeds the approved 1-2 epoch pilot scope"; exit 2; }
+# More than 2 epochs is a multi-hour campaign: it needs explicit owner approval, recorded by
+# setting ALLOW_LONG_RUN=1 for that one job (docs/research/EXP08_RESULTS.md, "Proposed full run").
+[ "$EPOCHS" -le 2 ] || [ "${ALLOW_LONG_RUN:-0}" = "1" ] || {
+  echo "EPOCHS=$EPOCHS exceeds the approved 1-2 epoch pilot scope (set ALLOW_LONG_RUN=1 only with approval)"; exit 2; }
 OI="$DATA/openimages/oi7-sd-v1"; WORK="$DATA/$EXP"; DAMO="$DATA/src/DAMO-YOLO-$COMMIT"; VENV="$DATA/venvs/damo-pilot"
 echo "experiment $EXP partial_labels=$PARTIAL unverified_weight=$SD_UNVERIFIED_WEIGHT seed=$SEED epochs=$EPOCHS" | tee "$O/experiment.txt"
 mkdir -p "$WORK" "$DATA/src" "$DATA/models"
