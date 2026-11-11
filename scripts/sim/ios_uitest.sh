@@ -45,6 +45,9 @@ cleanup() {
 trap cleanup EXIT
 
 echo "== backend + virtual device + fault proxy"
+# Fresh data every run: a backend kept from an earlier run already has the device
+# claimed, and the discovery journey (claiming it through Add device) then skips.
+rm -rf "$OUT/stack"
 "$PY" scripts/sim/uitest_control.py --work "$OUT/stack" --python "$PY" > "$OUT/control.out" 2>&1 &
 CTL=$!
 for _ in $(seq 120); do curl -sf http://127.0.0.1:8790/state >/dev/null && break; sleep 0.5; done
