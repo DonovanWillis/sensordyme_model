@@ -172,6 +172,15 @@ def test_firmware_without_a_monitoring_state_is_unknown_not_ready(backend):
     assert status["protection"] == "unknown"
 
 
+def test_a_live_device_that_sends_no_health_is_unknown_but_not_stale(backend):
+    client, headers, _ = backend
+    _ingest(client, health=None, monitoring=None)
+    status = _status(client, headers)
+    assert status["stale"] is False
+    assert status["monitoring_state"] == "unknown" and status["monitoring_active"] is None
+    assert "does not report" in status["reasons"][0]
+
+
 # ---------------------------------------------------------------------- role shapes
 def test_role_resolves_from_the_bare_name_as_well_as_the_dict(backend):
     client, headers, _ = backend

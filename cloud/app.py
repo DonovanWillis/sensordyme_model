@@ -873,8 +873,11 @@ def _device_status(row: sqlite3.Row, now: float) -> dict:
     monitoring_active is None. An old "ready" is never echoed: the last report
     is a photograph of a moment that has passed.
     """
-    health = _health_payload(row, now)
-    stale = health is None
+    last_seen = row["last_seen"]
+    stale = not last_seen or now - last_seen >= _HEALTH_STALE_S
+    # A live device that sends no health at all (older software) is not stale:
+    # it is "unknown" below for its own reason.
+    health = None if stale else _health_payload(row, now)
     monitoring = _monitoring_payload(row["monitoring"]) or {}
     try:
         stored_health = json.loads(row["health"] or "null")
@@ -901,7 +904,7 @@ def _device_status(row: sqlite3.Row, now: float) -> dict:
     if stale:
         state, protection, active = "unknown", "unknown", None
         reasons = [
-            "the device has not reported yet" if not row["last_seen"]
+            "the device has not reported yet" if not last_seen
             else f"no report from the device in the last {_HEALTH_STALE_S} s"
         ]
     else:
