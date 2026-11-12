@@ -1183,6 +1183,17 @@ class DriverAttentionModule(VisionModule):
         hfov = config.get("camera_hfov_deg")
         self._camera_hfov_deg: Optional[float] = None if hfov is None else float(hfov)
         self._camera_intrinsics = CameraIntrinsics.from_config(config.get("camera_intrinsics"))
+        # Which lens model head pose uses, stated (get_debug_state): calibrated
+        # intrinsics win, then camera_hfov_deg, else the historical fx = frame
+        # width (~53 deg HFOV) -- NOT the Camera Module 3 Wide's, whose value is
+        # hardware calibration's to set (docs/HAILO_HARDWARE_VALIDATION.md Q6).
+        if self._camera_intrinsics is not None:
+            self.head_pose_intrinsics = "calibrated camera_intrinsics"
+        elif self._camera_hfov_deg is not None:
+            self.head_pose_intrinsics = f"camera_hfov_deg {self._camera_hfov_deg:g}, zero distortion"
+        else:
+            self.head_pose_intrinsics = ("assumed: fx = frame width (~53 deg HFOV), zero distortion; "
+                                         "the Wide lens is uncalibrated")
         self._calibrator = AttentionCalibrator(
             calibration_path=Path(config.get("calibration_path", "data/calibration.json")),
             duration_s=float(config.get("calibration_duration_s", 10.0)),
@@ -2572,6 +2583,8 @@ class DriverAttentionModule(VisionModule):
             "phone_confidence": phone_confidence,
             "hand_overlaps_phone": self._hand_overlaps_phone,
             "phone_hold": self._phone_hold.state,
+            "gaze_calibrated": self._calibrator.is_calibrated,
+            "head_pose_intrinsics": self.head_pose_intrinsics,
             "erratic_hands_state": self._phase_label(self._hands_erratic_raw, self._erratic_hands_tracker),
             "erratic_hands_duration_s": round(self._erratic_hands_tracker.elapsed(now), 1),
             "distraction_state": self._phase_label(abs(self._last_yaw) > self._yaw_threshold_deg, self._distract_tracker),
@@ -2749,19 +2762,22 @@ class DriverAttentionModule(VisionModule):
     #: What each event this module raises depends on (core/monitoring_state.py).
     _FACE = frozenset({"face"})
     _OBJECTS = frozenset({"objects"})
+    #: "attention": this driver's calibrated forward gaze (AttentionCalibrator).
+    #: Gaze events are judged against it and are fed False until it exists.
+    _GAZE = frozenset({"face", "attention"})
     _EVENT_REQUIREMENTS: ClassVar[dict[str, frozenset[str]]] = {
-        **dict.fromkeys(("drowsiness", "fatigue_warning", "distraction", "frequent_glancing",
-                         "eyes_down", "eyes_up", "attention_lost", "elevated_risk", "high_risk"), _FACE),
+        **dict.fromkeys(("drowsiness", "fatigue_warning", "attention_lost", "elevated_risk", "high_risk"), _FACE),
+        **dict.fromkeys(("distraction", "frequent_glancing", "eyes_down", "eyes_up"), _GAZE),
         "phone_detected": _OBJECTS,
         "eating_drinking": _OBJECTS,
-        "phone_use": _FACE | _OBJECTS,
+        "phone_use": _GAZE | _OBJECTS,
         "erratic_hand_movement": frozenset({"hands", "objects"}),
     }
 
     def event_requirements(self) -> dict[str, frozenset[str]]:
         reqs = dict(self._EVENT_REQUIREMENTS)
         if self._behavior is not None:
-            reqs.update(dict.fromkeys(self._BEHAVIOR_V2_EVENTS, self._FACE))
+            reqs.update(dict.fromkeys(self._BEHAVIOR_V2_EVENTS, self._GAZE))
         if not self._enable_hands:
             reqs.pop("erratic_hand_movement")
         return reqs
@@ -2784,6 +2800,16 @@ class DriverAttentionModule(VisionModule):
             # whether they actually ran. Never a copy of the detector's state.
             status["hands"] = (Capability() if self._hands is not None
                                else Capability(STARTING, "hand landmarks load with the object detector"))
+        # Distraction, eyes down/up, glancing and phone use are measured against
+        # this driver's calibrated forward gaze; until the calibration window has
+        # settled none of them can fire, so they are not reported as running
+        # (it was READY throughout the first 10 s). Drowsiness (fallback EAR
+        # threshold) and attention-lost do run meanwhile. Bounded like every
+        # starting capability: the runtime reports it impaired after its grace.
+        status["attention"] = (
+            Capability() if self._calibrator.is_calibrated
+            else Capability(STARTING, "calibrating this driver's forward gaze (look at the road)")
+        )
         return status
 
     def perception_signals(self) -> dict:

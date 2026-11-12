@@ -305,8 +305,10 @@ Added for the virtual device; every default is the previous code, pinned by
 - The deterministic path runs the monitoring check and uplink on the
   production cadence but not the `HealthMonitor` component ladder (camera
   restart, watchdog); the live path runs all of it.
-- `driver_attention` reports READY during its 10 s calibration (module
-  behaviour, unchanged here).
+- On a first boot (no stored calibration) `driver_attention` reports
+  `starting` (`attention: starting`) during its 10 s gaze calibration, because
+  distraction, eyes down/up, glancing and phone use cannot fire until it
+  settles (M8). A restart loads the stored calibration and skips it.
 - For a module that cannot be built, the top-level `status.reasons` name the
   lost capability (`face: not provided by this device`); the cause is on
   `status.capabilities.impaired[name=module]`.

@@ -44,7 +44,9 @@ Vocabulary shared with `core/capabilities.py`:
 | `alert_output`, `audible_alert` | `AlertManager.actuators()` | no configured output ready; no *audible* output ready |
 
 A module declares what each event needs (`event_requirements()`); see
-driver_attention: drowsiness → face; phone_use → face + objects. A module that
+driver_attention: drowsiness → face; distraction / eyes down / eyes up /
+glancing → face + `attention` (the driver's calibrated forward gaze, `starting`
+until calibration settles); phone_use → face + attention + objects. A module that
 declares nothing is judged only by whether it processes frames. Custom rules
 need the capability that provides their target label. A rule naming an area
 that has not been drawn yet is *waiting*, and reported as such.
