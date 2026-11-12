@@ -2765,6 +2765,10 @@ class DriverAttentionModule(VisionModule):
     #: "attention": this driver's calibrated forward gaze (AttentionCalibrator).
     #: Gaze events are judged against it and are fed False until it exists.
     _GAZE = frozenset({"face", "attention"})
+    #: Capabilities computed by this module from a model capability rather than
+    #: produced by a model. core/model_registry.yaml lists models only, so these
+    #: are excluded from its `uses`; each maps to the model capability it is built on.
+    DERIVED_CAPABILITIES: ClassVar[dict[str, str]] = {"attention": "face"}
     _EVENT_REQUIREMENTS: ClassVar[dict[str, frozenset[str]]] = {
         **dict.fromkeys(("drowsiness", "fatigue_warning", "attention_lost", "elevated_risk", "high_risk"), _FACE),
         **dict.fromkeys(("distraction", "frequent_glancing", "eyes_down", "eyes_up"), _GAZE),
