@@ -81,7 +81,10 @@ lost phone detector does not teach a driver to ignore the buzzer.
 Every frame carries its capture (publish) time (`FrameBus.wait_for_fresh_stamped`).
 The runtime hands it to the module (`set_frame_time`). Trackers run on
 *evidence time* (`modules/base.py:EvidenceClock`): a gap between frames longer
-than `max_evidence_gap_s` (0.5 s) counts as only 0.5 s. A camera freeze or a
+than `max_evidence_gap_s` (0.5 s) counts as only 0.5 s. `driver_attention`
+uses a stricter clock (`StallAwareEvidenceClock`, M8): a stall counts as one
+ordinary frame interval of the stream, and only a stream that is slow
+throughout keeps the 0.5 s cap. A camera freeze or a
 blocked loop can no longer become evidence of eye closure or looking down.
 This is also the seam a deterministic replay would feed recorded timestamps
 through.
