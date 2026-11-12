@@ -41,20 +41,10 @@ struct AIConfigureView: View {
     @State private var notice: String?
     @StateObject private var thinkingProgress = ProgressTracker()
 
-    /// Deliberately spans what works and what doesn't, so the honest answers are
-    /// discovered during setup rather than in front of an investor.
-    private let examples = [
-        "Watch for someone entering the room after 10 PM",
-        "Alert me when someone picks up my laptop",
-        "Monitor for signs of driver distraction",
-        "Alert me if someone stays on the floor for 30 seconds",
-        "Tell me when the room becomes empty",
-    ]
-
     var body: some View {
         NavigationStack {
             ScrollView {
-                VStack(alignment: .leading, spacing: SD.Space.md) {
+                VStack(alignment: .leading, spacing: SD.Space.lg) {
                     promptCard
                     if let errorMessage {
                         Label(errorMessage, systemImage: "exclamationmark.circle.fill")
@@ -114,6 +104,14 @@ struct AIConfigureView: View {
         }
         .tint(SD.Colors.accent)
         .presentationBackground(SD.Colors.background)
+        // Success only when the DEVICE runs it; an error when it refuses.
+        .sensoryFeedback(trigger: followUpKind) { _, new in
+            switch new {
+            case "confirmed": .success
+            case "refused": .error
+            default: nil
+            }
+        }
         .onAppear {
             guard !didSendInitial else { return }
             didSendInitial = true
@@ -128,13 +126,17 @@ struct AIConfigureView: View {
 
     private var promptCard: some View {
         VStack(alignment: .leading, spacing: SD.Space.md) {
-            VStack(alignment: .leading, spacing: SD.Space.xxs) {
-                SDEyebrow("Jupiter · \(device.name)")
+            VStack(alignment: .leading, spacing: SD.Space.xs) {
+                HStack(spacing: SD.Space.xs) {
+                    OrynMark(height: 13, color: SD.Colors.signal)
+                    SDEyebrow("Jupiter · \(device.name)")
+                }
                 Text(proposal == nil && !thinking
                      ? "What should \(device.name) watch for?"
                      : "Your request")
-                    .font(SD.Typography.title)
+                    .sdScaledFont(28, relativeTo: .title, weight: .semibold)
                     .foregroundStyle(SD.Colors.textPrimary)
+                    .fixedSize(horizontal: false, vertical: true)
             }
             .padding(.top, SD.Space.sm)
 
@@ -148,61 +150,72 @@ struct AIConfigureView: View {
             }
 
             if thinking {
+                // The request is in flight, and that is all this says: no
+                // streamed text, no typing performance.
                 HStack(spacing: SD.Space.xs) {
-                    ThinkingDots()
-                    Text("Jupiter is working it out…")
-                        .font(SD.Typography.caption)
-                        .foregroundStyle(SD.Colors.textTertiary)
-                    SDProgress(phase: thinkingProgress.phase)
+                    ProgressView().controlSize(.small).tint(SD.Colors.textSecondary)
+                    Text("Jupiter is reading your request…")
+                        .font(SD.Typography.callout)
+                        .foregroundStyle(SD.Colors.textSecondary)
+                    SDProgress(phase: thinkingProgress.phase == .done ? .idle : thinkingProgress.phase)
                 }
                 .accessibilityElement(children: .combine)
                 .accessibilityIdentifier("jupiter.thinking")
-                .padding(.horizontal, SD.Space.xxs)
                 .transition(.opacity)
             } else if proposal == nil {
-                VStack(alignment: .leading, spacing: SD.Space.xs) {
-                    SDEyebrow("Try")
-                        .padding(.horizontal, SD.Space.xxs)
-                    VStack(spacing: 0) {
-                        ForEach(examples, id: \.self) { example in
-                            Button { prompt = example } label: {
-                                HStack(spacing: SD.Space.sm) {
-                                    Image(systemName: "arrow.turn.down.right")
-                                        .font(.system(size: 11, weight: .medium))
-                                        .foregroundStyle(SD.Colors.textDisabled)
-                                    Text(example)
-                                        .font(SD.Typography.callout)
-                                        .foregroundStyle(SD.Colors.textSecondary)
-                                        .multilineTextAlignment(.leading)
-                                    Spacer(minLength: 0)
-                                }
-                            }
-                            .buttonStyle(SDRowButtonStyle(minHeight: 44))
-                            if example != examples.last {
-                                Rectangle().fill(SD.Colors.border).frame(height: 1)
-                                    .padding(.leading, SD.Space.sm + 11 + SD.Space.sm)
-                            }
-                        }
-                    }
-                    .padding(SD.Space.xxs)
-                    .background(
-                        RoundedRectangle(cornerRadius: SD.Radius.lg, style: .continuous)
-                            .fill(SD.Colors.surface)
-                    )
-                    .overlay(
-                        RoundedRectangle(cornerRadius: SD.Radius.lg, style: .continuous)
-                            .strokeBorder(SD.Colors.border, lineWidth: 1)
-                    )
-                    Text("Jupiter turns your words into rules for this device. Nothing changes until you review and activate them.")
-                        .font(SD.Typography.caption)
-                        .foregroundStyle(SD.Colors.textTertiary)
-                        .fixedSize(horizontal: false, vertical: true)
-                        .padding(.horizontal, SD.Space.xxs)
-                        .padding(.top, SD.Space.xxs)
-                }
+                suggestionList
             }
         }
         .animation(SD.Motion.standard, value: thinking)
+    }
+
+    /// What Jupiter can be asked, from the policy grammar (JupiterSuggestions),
+    /// and one request it refuses, labelled as such.
+    private var suggestionList: some View {
+        VStack(alignment: .leading, spacing: SD.Space.sm) {
+            SDEyebrow("Jupiter can watch for")
+                .accessibilityAddTraits(.isHeader)
+            VStack(spacing: 0) {
+                ForEach(JupiterSuggestions.supported) { suggestion in
+                    suggestionRow(suggestion, refused: false)
+                    OrynRowDivider(inset: 0)
+                }
+                suggestionRow(JupiterSuggestions.refused, refused: true)
+            }
+            Text("Jupiter turns your words into rules for this device. Nothing changes until you review and activate them. Requests about who someone is, what they feel or intend, or sounds are refused, with the reason.")
+                .font(SD.Typography.caption)
+                .foregroundStyle(SD.Colors.textTertiary)
+                .fixedSize(horizontal: false, vertical: true)
+                .padding(.top, SD.Space.xs)
+        }
+    }
+
+    private func suggestionRow(_ suggestion: JupiterSuggestions.Suggestion, refused: Bool) -> some View {
+        Button { prompt = suggestion.text } label: {
+            HStack(alignment: .firstTextBaseline, spacing: SD.Space.sm) {
+                Image(systemName: refused ? "nosign" : "arrow.turn.down.right")
+                    .font(.system(size: 11, weight: .medium))
+                    .foregroundStyle(refused ? SD.Colors.warning : SD.Colors.textTertiary)
+                    .frame(width: 14)
+                VStack(alignment: .leading, spacing: 2) {
+                    Text(suggestion.text)
+                        .font(SD.Typography.callout)
+                        .foregroundStyle(SD.Colors.textPrimary)
+                        .multilineTextAlignment(.leading)
+                        .fixedSize(horizontal: false, vertical: true)
+                    Text(suggestion.kind)
+                        .font(SD.Typography.caption)
+                        .foregroundStyle(refused ? SD.Colors.warning : SD.Colors.textTertiary)
+                }
+                Spacer(minLength: 0)
+            }
+            .padding(.vertical, SD.Space.sm)
+            .frame(minHeight: 44)
+            .contentShape(Rectangle())
+        }
+        .buttonStyle(SDPressStyle(scale: 0.99))
+        .accessibilityElement(children: .combine)
+        .accessibilityHint("Fills in the request")
     }
 
     // MARK: What was understood
@@ -212,9 +225,10 @@ struct AIConfigureView: View {
             VStack(alignment: .leading, spacing: SD.Space.sm) {
                 HStack {
                     HStack(spacing: 6) {
-                        OrynMark(height: 11, color: SD.Colors.textTertiary)
-                        SDSectionHeader(title: "Jupiter understood")
+                        OrynMark(height: 11, color: SD.Colors.signal)
+                        SDEyebrow("Jupiter understood")
                     }
+                    Spacer()
                     switch followUp {
                     case .confirmed?: SDStatusPill(status: .online, text: "Active")
                     case .refused?: SDStatusPill(status: .alert, text: "Refused")
@@ -223,7 +237,7 @@ struct AIConfigureView: View {
                     }
                 }
                 Text(proposal.explanation)
-                    .font(SD.Typography.body)
+                    .font(SD.Typography.readout.weight(.regular))
                     .foregroundStyle(SD.Colors.textPrimary)
                     .fixedSize(horizontal: false, vertical: true)
                     .accessibilityIdentifier("jupiter.explanation")
@@ -453,11 +467,18 @@ struct AIConfigureView: View {
                 }
             }
             .frame(maxWidth: .infinity)
-            .padding(.vertical, SD.Space.xs)
+            .padding(SD.Space.md)
+            // The preview becomes the rule's own status surface: what was sent,
+            // then what the device reported.
+            .background(
+                RoundedRectangle(cornerRadius: SD.Radius.camera, style: .continuous)
+                    .fill(SD.Colors.surface)
+            )
+            .transition(.opacity)
             .accessibilityElement(children: .combine)
             .accessibilityIdentifier("jupiter.applied")
         } else {
-            Button { confirmActivate = true } label: {
+            Button { activateTaps += 1; confirmActivate = true } label: {
                 if activating {
                     ProgressView().tint(SD.Colors.textOnAccent)
                 } else if !proposal.isCustom {
@@ -469,6 +490,7 @@ struct AIConfigureView: View {
             }
             .buttonStyle(SDButtonStyle(kind: .primary))
             .disabled(activating)
+            .sensoryFeedback(.impact(weight: .medium), trigger: activateTaps)
             .accessibilityIdentifier("jupiter.activate")
             .confirmationDialog(
                 proposal.isCustom ? "Turn these rules on?" : "Switch to \(Preset.title(for: proposal.preset))?",
@@ -519,11 +541,13 @@ struct AIConfigureView: View {
 
     private func previewCard(_ proposal: AIProposal) -> some View {
         let preview = PolicyPreview(proposal: proposal, device: device)
-        return SDCard {
-            VStack(alignment: .leading, spacing: SD.Space.sm) {
+        return SDCard(raised: true) {
+            VStack(alignment: .leading, spacing: SD.Space.md) {
                 SDSectionHeader(title: "If you activate this")
                     .accessibilityIdentifier("jupiter.preview")
-                previewGroup("Will watch for", icon: "eye", color: SD.Colors.success, items: preview.will)
+                // Bone, not green: nothing is being watched until the device
+                // confirms it after Activate.
+                previewGroup("Will watch for", icon: "eye", color: SD.Colors.textPrimary, items: preview.will)
                 if !preview.wont.isEmpty {
                     previewGroup("Won't watch for", icon: "eye.slash", color: SD.Colors.warning, items: preview.wont)
                 }
@@ -543,10 +567,16 @@ struct AIConfigureView: View {
                 .font(SD.Typography.label)
                 .foregroundStyle(color)
             ForEach(items, id: \.self) { item in
-                Text("• \(item)")
-                    .font(SD.Typography.caption)
-                    .foregroundStyle(SD.Colors.textSecondary)
-                    .fixedSize(horizontal: false, vertical: true)
+                HStack(alignment: .firstTextBaseline, spacing: SD.Space.xs) {
+                    Text("–")
+                        .font(SD.Typography.callout)
+                        .foregroundStyle(SD.Colors.textTertiary)
+                        .accessibilityHidden(true)
+                    Text(item)
+                        .font(SD.Typography.callout)
+                        .foregroundStyle(SD.Colors.textSecondary)
+                        .fixedSize(horizontal: false, vertical: true)
+                }
             }
         }
     }
@@ -560,6 +590,17 @@ struct AIConfigureView: View {
     }
 
     @State private var waitingForDevice = false
+    @State private var activateTaps = 0
+
+    /// The follow-up as a comparable word, for feedback keyed to it.
+    private var followUpKind: String {
+        switch followUp {
+        case .confirmed?: "confirmed"
+        case .refused?: "refused"
+        case .waiting?: "waiting"
+        case nil: "none"
+        }
+    }
 
     /// Ask the device, not the server, whether it runs what was activated:
     /// the device list's status (and the rules list when the server has it)

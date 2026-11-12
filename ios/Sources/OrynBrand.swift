@@ -134,7 +134,7 @@ struct OrynFieldChrome<Field: View>: View {
 /// Placeholder text in ORYN's disabled grey. SwiftUI's default placeholder is a
 /// system grey that reads blue-ish on ink.
 func orynPrompt(_ text: String) -> Text {
-    Text(text).foregroundStyle(SD.Colors.textDisabled)
+    Text(text).foregroundStyle(SD.Colors.textTertiary)
 }
 
 // MARK: - Ask Jupiter
@@ -219,12 +219,13 @@ struct AskJupiterBar: View {
             .padding(.vertical, SD.Space.sm - 1 - 7)
             .frame(minHeight: 54)
             .background(
-                RoundedRectangle(cornerRadius: SD.Radius.lg, style: .continuous)
+                RoundedRectangle(cornerRadius: SD.Radius.xl, style: .continuous)
                     .fill(SD.Colors.field)
             )
+            // An outline only while focused: the field's edge is its surface.
             .overlay(
-                RoundedRectangle(cornerRadius: SD.Radius.lg, style: .continuous)
-                    .strokeBorder(focused ? SD.Colors.borderFocus : SD.Colors.borderStrong, lineWidth: 1)
+                RoundedRectangle(cornerRadius: SD.Radius.xl, style: .continuous)
+                    .strokeBorder(focused ? SD.Colors.borderFocus : Color.clear, lineWidth: 1)
             )
             .animation(SD.Motion.gentle, value: focused)
             .onAppear { if autoFocus { focused = true } }
@@ -242,30 +243,6 @@ struct AskJupiterBar: View {
         guard canSubmit else { return }
         focused = false
         onSubmit()
-    }
-}
-
-/// Three dots breathing in sequence while Jupiter works — quieter than a
-/// spinner, and clearly "thinking" rather than "loading a page".
-struct ThinkingDots: View {
-    @Environment(\.accessibilityReduceMotion) private var reduceMotion
-
-    var body: some View {
-        TimelineView(.animation(minimumInterval: 1 / 20,
-                                paused: !MotionPolicy.animates(true, reduceMotion: reduceMotion))) { context in
-            let t = context.date.timeIntervalSinceReferenceDate
-            HStack(spacing: 4) {
-                ForEach(0..<3, id: \.self) { index in
-                    let phase = (sin((t * 4) - Double(index) * 0.7) + 1) / 2
-                    Circle()
-                        .fill(SD.Colors.signal)
-                        .frame(width: 4, height: 4)
-                        .opacity(0.3 + 0.7 * phase)
-                }
-            }
-        }
-        .frame(height: 8)
-        .accessibilityHidden(true)
     }
 }
 
