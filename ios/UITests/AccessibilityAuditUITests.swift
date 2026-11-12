@@ -26,8 +26,10 @@ final class AccessibilityAuditUITests: XCTestCase {
     override func setUpWithError() throws {
         continueAfterFailure = true
         app = XCUIApplication()
-        try XCTSkipUnless(Stack.reachable, "the scenario controller is not running (scripts/sim/ios_uitest.sh)")
-        Stack.prepare()
+        try Stack.requireController()
+        // Its own backend, account and device, claimed and ready: the audit no
+        // longer claims the device the discovery journey (03) needs to pair.
+        try Stack.fresh(for: self)
     }
 
     override func tearDownWithError() throws {

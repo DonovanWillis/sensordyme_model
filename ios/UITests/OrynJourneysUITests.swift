@@ -9,15 +9,23 @@ import XCTest
 /// (`-orynSession`, DebugLaunch.swift); sign-in itself is typed. Waits are for
 /// conditions, each with a bound — no sleeps.
 ///
-/// The journeys run in name order and share one backend: 03 claims the device
-/// that every later journey uses. Each one sets the device state it needs.
+/// Every journey starts from its own fresh world (Stack.fresh, from setUp): a
+/// new backend, account and device — claimed and ready, except for 03, which
+/// pairs an unclaimed one — so no journey depends on another having run, and
+/// any order passes. Each launch starts signed out (`-orynSignOut`) and signs
+/// in to that test's own account, which also clears the previous account's
+/// phone-local state in the app (AppState.claimLocalState).
 final class OrynJourneysUITests: XCTestCase {
     private var app: XCUIApplication!
+
+    /// Journeys that start with the device NOT on the account.
+    private static let startUnclaimed: Set<String> = ["test03_Discovery"]
 
     override func setUpWithError() throws {
         continueAfterFailure = false
         app = XCUIApplication()
-        try XCTSkipUnless(Stack.reachable, "the scenario controller is not running (scripts/sim/ios_uitest.sh)")
+        try Stack.requireController()
+        try Stack.fresh(for: self, claimed: !Self.startUnclaimed.contains(Stack.testName(self)))
     }
 
     /// Set by `record(_:)`. `testRun.hasSucceeded` is not final during tearDown, so it
@@ -57,7 +65,8 @@ final class OrynJourneysUITests: XCTestCase {
     }
 
     func test03_Discovery() throws {
-        try XCTSkipIf(Stack.state()["device_id"] is Int, "the device is already claimed on this backend")
+        // Unclaimed by construction (setUp); said, never skipped, if it is not.
+        XCTAssertNil(Stack.state()["device_id"] as? Int, "the fresh account starts with no device")
         launch()
         XCTAssertTrue(app.descendants(matching: .any)["state.empty"].waitForExistence(timeout: 30),
                       "an empty account says so, not 'loading' forever")
@@ -84,7 +93,6 @@ final class OrynJourneysUITests: XCTestCase {
     }
 
     func test04_Ready() throws {
-        Stack.prepare()
         launch()
         let card = app.buttons["device.card"]
         XCTAssertTrue(card.waitForExistence(timeout: 30))
@@ -96,7 +104,6 @@ final class OrynJourneysUITests: XCTestCase {
     }
 
     func test05_Stop() throws {
-        Stack.prepare()
         launch(["-orynOpenDevice"])
         waitFor(monitoring, label: "All clear", timeout: 90)
         let protection = reveal(app.buttons["detail.protection"])
@@ -111,7 +118,6 @@ final class OrynJourneysUITests: XCTestCase {
     }
 
     func test06_Resume() throws {
-        Stack.prepare()
         Stack.post("/protection?action=stop")
         launch(["-orynOpenDevice"])
         waitFor(monitoring, label: "Stopped", timeout: 60)
@@ -124,7 +130,6 @@ final class OrynJourneysUITests: XCTestCase {
     }
 
     func test07_PresetBrowse() throws {
-        Stack.prepare()
         launch(["-orynOpenDevice"])
         waitFor(monitoring, label: "All clear", timeout: 90)
         let driver = reveal(app.buttons["preset.row.driver_safety"])
@@ -140,7 +145,6 @@ final class OrynJourneysUITests: XCTestCase {
     }
 
     func test08_PresetActivate() throws {
-        Stack.prepare()
         launch(["-orynOpenDevice"])
         waitFor(monitoring, label: "All clear", timeout: 90)
         let strict = reveal(app.buttons["preset.variant.strict"])
@@ -154,7 +158,6 @@ final class OrynJourneysUITests: XCTestCase {
     }
 
     func test09_PresetReject() throws {
-        Stack.prepare()
         launch(["-orynOpenDevice"])
         waitFor(monitoring, label: "All clear", timeout: 90)
         let security = reveal(app.buttons["preset.row.security_monitoring"])
@@ -170,7 +173,6 @@ final class OrynJourneysUITests: XCTestCase {
     }
 
     func test10_JupiterPrompt() throws {
-        Stack.prepare()
         launch(["-orynOpenDevice"])
         waitFor(monitoring, label: "All clear", timeout: 90)
         // Clear of the floating tab bar first: a tap there lands on the tab bar
@@ -204,7 +206,6 @@ final class OrynJourneysUITests: XCTestCase {
     }
 
     func test11_PolicyPreview() throws {
-        Stack.prepare()
         openJupiter(prompt: Self.dwellPrompt)
         let preview = reveal(element("jupiter.preview"))
         XCTAssertTrue(preview.exists)
@@ -215,7 +216,6 @@ final class OrynJourneysUITests: XCTestCase {
     }
 
     func test12_ZoneRequirement() throws {
-        Stack.prepare()
         openJupiter(prompt: Self.dwellPrompt)
         let zone = reveal(element("jupiter.zoneRequirement"))
         XCTAssertTrue(zone.label.contains("Draw the"), zone.label)
@@ -224,7 +224,6 @@ final class OrynJourneysUITests: XCTestCase {
     }
 
     func test13_RuleEnableDisable() throws {
-        Stack.prepare()
         openJupiter(prompt: Self.dwellPrompt)
         let activate = reveal(app.buttons["jupiter.activate"])
         activate.tap()
@@ -246,7 +245,6 @@ final class OrynJourneysUITests: XCTestCase {
     }
 
     func test14_MonitoringStatus() throws {
-        Stack.prepare()
         Stack.post("/device/start?scenario=detector_failure")
         launch(["-orynOpenDevice"])
         waitFor(monitoring, label: "Degraded", timeout: 120)
@@ -258,7 +256,6 @@ final class OrynJourneysUITests: XCTestCase {
     }
 
     func test15_Offline() throws {
-        Stack.prepare()
         launch()
         let card = app.buttons["device.card"]
         XCTAssertTrue(card.waitForExistence(timeout: 30))
@@ -274,7 +271,6 @@ final class OrynJourneysUITests: XCTestCase {
     }
 
     func test16_Stale() throws {
-        Stack.prepare()
         Stack.post("/device/start?scenario=backend_outage")  // the device loses the server for 60 s
         launch(["-orynOpenDevice"])
         waitFor(monitoring, label: "All clear", timeout: 90)
@@ -289,7 +285,6 @@ final class OrynJourneysUITests: XCTestCase {
     }
 
     func test17_Recovery() throws {
-        Stack.prepare()
         Stack.post("/device/stop")
         launch(["-orynOpenDevice"])
         waitFor(monitoring, label: "Status unknown", timeout: 90)
@@ -300,7 +295,6 @@ final class OrynJourneysUITests: XCTestCase {
     }
 
     func test18_AlertHistory() throws {
-        Stack.prepare()
         let before = Stack.state()["events"] as? Int ?? 0
         Stack.post("/device/start?scenario=drowsy")
         XCTAssertTrue(Stack.waitUntil(timeout: 120) { (Stack.state()["events"] as? Int ?? 0) > before },
@@ -315,7 +309,6 @@ final class OrynJourneysUITests: XCTestCase {
     }
 
     func test19_InvalidResponses() throws {
-        Stack.prepare()
         launch()
         let card = app.buttons["device.card"]
         XCTAssertTrue(card.waitForExistence(timeout: 30))
@@ -336,7 +329,6 @@ final class OrynJourneysUITests: XCTestCase {
     }
 
     func test20_ErrorMessaging() throws {
-        Stack.prepare()
         launch(signedIn: false)
         signIn(password: "not-the-password")
         let error = element("auth.error")
@@ -366,7 +358,6 @@ final class OrynJourneysUITests: XCTestCase {
     /// distraction, find it in history, break the detector, see degraded, recover.
     /// (The failed component named under the status is journey 25.)
     func test23_DriverSafetyCard() throws {
-        Stack.prepare()
         launch(["-orynOpenDevice"])
         waitFor(monitoring, label: "All clear", timeout: 90)
 
@@ -410,15 +401,12 @@ final class OrynJourneysUITests: XCTestCase {
     /// The occupancy companion runs beside Driver Safety on the same detections:
     /// the switch follows the device's report, both ways.
     func test24_CompanionNode() throws {
-        Stack.prepare()
         launch(["-orynOpenDevice"])
         waitFor(monitoring, label: "All clear", timeout: 90)
         try requirePerception()
         let toggle = reveal(app.switches["node.toggle.people_counter"])
-        if (toggle.value as? String) == "1" {  // left on by an earlier run
-            flip(toggle)
-            waitFor(toggle, value: "0", timeout: 60)
-        }
+        // A fresh device (setUp) runs no companion: nothing left on by another test.
+        waitFor(toggle, value: "0", timeout: 30)
         flip(toggle)
         waitFor(toggle, value: "1", timeout: 60)  // the device reports the node running
         let node = element("node.people_counter")
@@ -440,7 +428,6 @@ final class OrynJourneysUITests: XCTestCase {
     /// A failing perception component is named under the status, in the
     /// device's words, and disappears when it recovers.
     func test25_PerceptionDegraded() throws {
-        Stack.prepare()
         launch(["-orynOpenDevice"])
         waitFor(monitoring, label: "All clear", timeout: 90)
         try requirePerception()
@@ -463,7 +450,6 @@ final class OrynJourneysUITests: XCTestCase {
     /// keep saying ONLINE: the card, the count and the device screen go Stale
     /// together, and recover together.
     func test26_StaleTelemetry() throws {
-        Stack.prepare()
         launch()
         let card = app.buttons["device.card"]
         XCTAssertTrue(card.waitForExistence(timeout: 30))
@@ -495,7 +481,6 @@ final class OrynJourneysUITests: XCTestCase {
     /// HTML, never "request failed (502)", never silence. Ask Jupiter (its own
     /// request path) says the same.
     func test27_UnreadableReplies() throws {
-        Stack.prepare()
         launch()
         let card = app.buttons["device.card"]
         XCTAssertTrue(card.waitForExistence(timeout: 30))

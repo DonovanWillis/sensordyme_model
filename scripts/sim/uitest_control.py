@@ -11,8 +11,18 @@ loses the server while the device keeps working.
 
 The UI tests drive scenarios through the control port (127.0.0.1 only):
 
-    GET  /state                       mode, device process, scenario, claim code, demo account
-    GET  /session                     a fresh login for the demo account (token, email) for -orynSession
+    POST /fresh?claimed=1|0[&tag=T]   EVERY TEST STARTS HERE (ios/UITests/Stack.swift fresh()):
+                                      a brand-new world. The device and backend are stopped and
+                                      their data deleted; a new backend (new database and JWT secret,
+                                      empty rate limiters, no events/rules/zones/drafts) starts with
+                                      a NEW account (uitest-<n>@sensordyme.local) and a newly
+                                      provisioned device with a new identity; proxy faults are off.
+                                      claimed=1 (the default) claims the device for the account;
+                                      claimed=0 leaves it unclaimed (the discovery journey pairs it).
+                                      Answers once the device has reported to the new backend, so no
+                                      test starts against a device that is still booting (~20 s).
+    GET  /state                       mode, device process, scenario, claim code, current account
+    GET  /session                     a fresh login for the current account (token, email) for -orynSession
     POST /mode?m=MODE[&path=/v1/...]  what the proxy does with app requests under `path` (default: every
                                       /v1/ request except /v1/health):
                                         pass     forward
@@ -28,8 +38,9 @@ The UI tests drive scenarios through the control port (127.0.0.1 only):
     POST /device/start?scenario=NAME  (re)start it with a scenario from sim/scenario.py
     POST /claim                       claim the device for the demo account (what "Add device" does)
     POST /protection?action=stop|resume
-    POST /reset                       server answering, custom rules off, plain driver_safety mode,
-                                      device running "attentive", protection resumed
+    POST /reset                       (manual use) server answering, custom rules off, plain driver_safety
+                                      mode, device running "attentive", protection resumed. Keeps the
+                                      account, pairing and event history; the tests use /fresh.
 
 Every request is answered with JSON. Nothing leaves the machine; no camera is used.
 """
@@ -39,7 +50,9 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import shutil
 import signal
+import sqlite3
 import subprocess
 import sys
 import threading
@@ -71,6 +84,9 @@ CONTROLLER_CLIENT_HEADER = "X-UITest-Controller"
 class Stack:
     def __init__(self, work: Path, backend_port: int, python: str) -> None:
         self.work, self.python = work, python
+        # The account the tests sign in with. /fresh replaces it with a new one.
+        self.email, self.password = DEMO_EMAIL, DEMO_PASSWORD
+        self.generation = 0
         self.backend_url = f"http://127.0.0.1:{backend_port}"
         self.backend_port = backend_port
         self.mode = "pass"
@@ -92,7 +108,8 @@ class Stack:
         log = open(self.work / "backend.log", "ab")  # noqa: SIM115 - lives as long as the process
         self.backend = subprocess.Popen(
             [self.python, "-m", "sim.backend", "--port", str(self.backend_port), "--data-dir",
-             str(self.work / "backend")], cwd=REPO, env=self._env(), stdout=log, stderr=subprocess.STDOUT)
+             str(self.work / "backend"), "--email", self.email, "--password", self.password],
+            cwd=REPO, env=self._env(), stdout=log, stderr=subprocess.STDOUT)
         deadline = time.monotonic() + 60
         while time.monotonic() < deadline:
             try:
@@ -130,11 +147,86 @@ class Stack:
         with self.lock:
             self._stop_device_locked()
 
-    def close(self) -> None:
-        self.stop_device()
+    def stop_backend(self) -> None:
         if self.backend and self.backend.poll() is None:
             self.backend.terminate()
-            self.backend.wait(10)
+            try:
+                self.backend.wait(10)
+            except subprocess.TimeoutExpired:
+                self.backend.kill()
+                self.backend.wait(10)
+        self.backend = None
+
+    def close(self) -> None:
+        self.stop_device()
+        self.stop_backend()
+
+    def fresh(self, claimed: bool, tag: str) -> dict:
+        """A new world for one test (POST /fresh in the module docstring).
+
+        Nothing a previous test did can reach the next one: the backend's whole
+        data directory (database, JWT secret, factory file) and the device's
+        state directory are deleted, and the backend's in-memory rate limiters
+        go with its process. The account is new, so the app's own per-account
+        reset (AppState.claimLocalState: paired camera, announced alerts, SMS
+        number) runs on the next signed-in launch too. The logs are appended
+        to, with a marker per test."""
+        self.generation += 1
+        self.email = f"uitest-{self.generation}@sensordyme.local"
+        for name in ("backend.log", "device.log"):
+            with open(self.work / name, "a") as f:
+                f.write(f"\n===== fresh #{self.generation} for {tag or '?'} "
+                        f"({time.strftime('%H:%M:%S')}), account {self.email} =====\n")
+        self.stop_device()
+        self.stop_backend()
+        for name in ("backend", "device"):
+            shutil.rmtree(self.work / name, ignore_errors=True)
+        self._token = None
+        self.last_devices = None
+        self.start_backend()
+        self.start_device("attentive")
+        if claimed:
+            status, answer = self.api("POST", "/v1/devices/claim",
+                                      {"claim_code": self.factory()["devices"][0]["claim_code"]})
+            if status != 200:
+                raise ValueError(f"claim failed ({status}): {answer}")
+        deadline = time.monotonic() + 90
+        while time.monotonic() < deadline and not self.device_reported():
+            if not (self.device and self.device.poll() is None):
+                raise ValueError("the virtual device exited while starting; see device.log")
+            time.sleep(0.5)
+        if not self.device_reported():
+            raise ValueError("the virtual device did not report to the new backend within 90 s")
+        # A claimed device is handed over READY (calibrated, protecting), the state
+        # the journeys and the audit start from: a screen audited while the device
+        # was still calibrating shows other text than one audited after, and the
+        # audit's findings then depended on how fast the previous test finished.
+        while claimed and time.monotonic() < deadline and not self.device_ready():
+            time.sleep(0.5)
+        if claimed and not self.device_ready():
+            raise ValueError("the claimed device did not report ready within 90 s; see device.log")
+        return self.state()
+
+    def device_ready(self) -> bool:
+        status, answer = self.api("GET", "/v1/devices")
+        devices = answer.get("devices") if status == 200 and isinstance(answer, dict) else None
+        state = (devices[0].get("status") or {}) if devices else {}
+        return (bool(devices and devices[0].get("online")) and state.get("monitoring_state") == "ready"
+                and state.get("protection") == "protecting")
+
+    def device_reported(self) -> bool:
+        """Whether the device has reported to the current backend yet. Read from the
+        throwaway database, so it works for an unclaimed device as well."""
+        db = self.work / "backend" / "sensordyme.db"
+        try:
+            conn = sqlite3.connect(f"file:{db}?mode=ro", uri=True, timeout=5)
+            try:
+                row = conn.execute("SELECT MAX(last_seen) FROM devices").fetchone()
+            finally:
+                conn.close()
+        except sqlite3.Error:
+            return False
+        return bool(row and row[0])
 
     # ------------------------------------------------------------------ backend API
     def api(self, method: str, path: str, body: dict | None = None, auth: bool = True) -> tuple[int, object]:
@@ -152,7 +244,7 @@ class Stack:
 
     def token(self) -> str:
         if self._token is None:
-            _, answer = self.api("POST", "/v1/login", {"email": DEMO_EMAIL, "password": DEMO_PASSWORD}, auth=False)
+            _, answer = self.api("POST", "/v1/login", {"email": self.email, "password": self.password}, auth=False)
             self._token = answer["token"]  # type: ignore[index]
         return self._token
 
@@ -176,24 +268,27 @@ class Stack:
     def session(self) -> dict:
         # A fresh token per app launch: the app's -orynSignOut revokes the token it
         # held, so one shared token would be revoked by the next launch.
-        status, answer = self.api("POST", "/v1/login", {"email": DEMO_EMAIL, "password": DEMO_PASSWORD}, auth=False)
+        status, answer = self.api("POST", "/v1/login", {"email": self.email, "password": self.password}, auth=False)
         token = answer.get("token") if isinstance(answer, dict) else None
         if not token:
             # Said, not a crashed request: the test then launched the app with an
             # empty session and failed far from the cause.
             raise ValueError(f"demo login failed ({status}): {answer}")
-        return {"token": token, "email": DEMO_EMAIL}
+        return {"token": token, "email": self.email}
 
     def state(self) -> dict:
         device_id = self.device_id()
         events = 0
         if device_id is not None:
-            status, answer = self.api("GET", f"/v1/devices/{device_id}/events?limit=50")
+            # The backend's largest page: a count capped at 50 stopped growing, and a
+            # journey waiting for "more events than before" then waited in vain.
+            status, answer = self.api("GET", f"/v1/devices/{device_id}/events?limit=1000")
             events = len(answer.get("events", [])) if status == 200 and isinstance(answer, dict) else 0
         return {"mode": self.mode, "fault_path": self.fault_path, "scenario": self.scenario,
                 "device_running": bool(self.device and self.device.poll() is None),
                 "claim_code": self.factory()["devices"][0]["claim_code"],
-                "email": DEMO_EMAIL, "password": DEMO_PASSWORD, "device_id": device_id, "events": events}
+                "email": self.email, "password": self.password, "device_id": device_id, "events": events,
+                "generation": self.generation}
 
 
 class AppPort:
@@ -275,6 +370,8 @@ def proxy_handler(stack: Stack):
 
 
 def control_handler(stack: Stack, app_port: AppPort, stop: threading.Event):
+    scenario_lock = threading.Lock()
+
     class Control(BaseHTTPRequestHandler):
         def log_message(self, fmt, *args) -> None:
             with open(stack.work / "control.log", "a") as f:
@@ -294,10 +391,14 @@ def control_handler(stack: Stack, app_port: AppPort, stop: threading.Event):
         def do_GET(self) -> None:
             path = urlparse(self.path).path
             if path == "/state":
-                self._reply(200, stack.state())
+                with scenario_lock:
+                    answer = stack.state()
+                self._reply(200, answer)
             elif path == "/session":
                 try:
-                    self._reply(200, stack.session())
+                    with scenario_lock:
+                        answer = stack.session()
+                    self._reply(200, answer)
                 except ValueError as e:
                     self._reply(503, {"error": str(e)})
             else:
@@ -307,11 +408,20 @@ def control_handler(stack: Stack, app_port: AppPort, stop: threading.Event):
             url = urlparse(self.path)
             q = {k: v[0] for k, v in parse_qs(url.query).items()}
             try:
-                self._reply(200, self._act(url.path, q))
+                # One scenario change at a time: a request arriving while /fresh
+                # is replacing the backend would act on half a world.
+                with scenario_lock:
+                    answer = self._act(url.path, q)
+                self._reply(200, answer)
             except (ValueError, KeyError) as e:
                 self._reply(400, {"error": str(e)})
 
         def _act(self, path: str, q: dict[str, str]) -> object:
+            if path == "/fresh":
+                stack.mode = "pass"
+                stack.fault_path = "/v1/"
+                app_port.up()
+                return stack.fresh(claimed=q.get("claimed", "1") != "0", tag=q.get("tag", ""))
             if path == "/mode":
                 if q.get("m") not in MODES:
                     raise ValueError(f"m must be one of {', '.join(MODES)}")
