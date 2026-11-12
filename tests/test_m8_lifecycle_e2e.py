@@ -279,3 +279,31 @@ def test_recovery_from_a_boot_time_model_failure_and_a_damaged_config(stack, mon
     assert stack.row()["health"]["config"]["source"] == "last_known_good"
     timeline.save()
     monitor.assert_clean()
+
+
+# ---------------------------------------------------------------------- signed uplink in-process
+def test_a_required_command_auth_device_round_trips_through_the_in_process_backend(stack, monkeypatch):
+    """sim.uplink.TestClientTransport dropped `data=`, the raw body a `required`-mode device
+    signs (X-SD-Auth), so such a device could not run in the simulator at all."""
+    from sim.device import VirtualDevice
+
+    plain = VirtualDevice.config
+
+    def required(self):
+        config = plain(self)
+        config["cloud"] = {**config["cloud"], "command_auth": "required"}
+        return config
+
+    monkeypatch.setattr(VirtualDevice, "config", required)
+    device = stack.boot(sc.get("attentive"))
+    stack.claim()
+    assert device.runtime.uplink.command_auth_mode == "required"
+    device.advance(C)
+    status = stack.status()
+    assert status["stale"] is False and status["monitoring_state"] == "ready", status
+    assert device.network.sent > 0 and device.runtime.uplink.connected
+    # A signed command back the other way: stop, verified and applied once.
+    assert stack.protection("stop", confirm=True).status_code == 200
+    device.advance(4.0)
+    assert stack.status()["protection"] == "stopped"
+    assert device.runtime.uplink.command_auth_rejections == 0

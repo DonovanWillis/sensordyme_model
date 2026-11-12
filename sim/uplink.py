@@ -67,11 +67,17 @@ class TestClientTransport:
     def __init__(self, client) -> None:
         self._client = client
 
-    def post(self, url: str, *, json=None, headers=None, timeout=None, verify=None,
+    def post(self, url: str, *, json=None, data=None, headers=None, timeout=None, verify=None,
              allow_redirects: bool = True):
         del timeout, verify  # meaningless in-process
         parts = urlsplit(url)
         path = parts.path + (f"?{parts.query}" if parts.query else "")
+        if data is not None:
+            # cloud.command_auth: required signs the exact body bytes (X-SD-Auth), so
+            # they must reach the backend unchanged, with the caller's Content-Type.
+            content = data.encode() if isinstance(data, str) else data
+            return _Response(self._client.post(path, content=content, headers=headers,
+                                               follow_redirects=allow_redirects))
         return _Response(self._client.post(path, json=json, headers=headers,
                                            follow_redirects=allow_redirects))
 
