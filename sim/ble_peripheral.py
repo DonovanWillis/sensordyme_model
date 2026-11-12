@@ -645,12 +645,21 @@ def _device_launcher(args: argparse.Namespace, state_dir: Path, ident_key: str, 
         with lock:
             if "device" in started:
                 return
+            extra = shlex.split(args.device_args)
+            if not any(a in extra for a in ("--dashboard-port", "--no-dashboard")):
+                extra.append("--no-dashboard")  # never contend for 8899 unless asked
             argv = [sys.executable, "-m", "sim.virtual_device", "--backend", args.backend,
                     "--device-key", ident_key, "--claim-code", claim, "--state-dir", str(state_dir),
-                    "--scenario", args.scenario, "--log-level", "warning", *shlex.split(args.device_args)]
-            started["device"] = subprocess.Popen(argv, cwd=str(REPO))  # noqa: S603 - our own module
-            print(f"sim.ble_peripheral: joined {ssid!r}; started the virtual device runtime "
-                  f"(pid {started['device'].pid}) against {args.backend}", flush=True)
+                    "--scenario", args.scenario, "--log-level", "warning", *extra]
+            # Its banner prints the claim code and device token: to a 0600 file
+            # in the device's own state directory, never into this output.
+            log_fd = os.open(state_dir / "virtual_device.log", os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o600)
+            started["device"] = subprocess.Popen(argv, cwd=str(REPO), stdout=log_fd,  # noqa: S603 - our own module
+                                                 stderr=subprocess.STDOUT)
+            os.close(log_fd)
+            print(f"sim.ble_peripheral: on {ssid!r}; started the virtual device runtime "
+                  f"(pid {started['device'].pid}) against {args.backend}; its output: "
+                  f"{state_dir / 'virtual_device.log'}", flush=True)
 
     return on_joined, started
 
@@ -708,6 +717,8 @@ def main(argv: Optional[list[str]] = None) -> int:
     device = SimBLEDevice(spec)
     port = device.start(host, args.port)
     device.wait_advertising(5.0)
+    if on_joined is not None and args.online:
+        on_joined(args.online)  # an installed device: already on a network, already reporting
     print("=" * 72)
     print("VIRTUAL SensorDyme Bluetooth peripheral (SIMULATED, localhost only)")
     print(f"  device       {device.device_id} as {device.name!r}, auth: {args.auth}")
