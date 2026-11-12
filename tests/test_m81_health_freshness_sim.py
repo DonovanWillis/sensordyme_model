@@ -260,7 +260,7 @@ def test_signed_device_clock_jumps_compose_with_the_signed_clock_answer(stack, t
 
     monkeypatch.setattr(uplink_mod, "time", types.SimpleNamespace(
         **{**{k: getattr(real_time, k) for k in dir(real_time) if not k.startswith("_")},
-           "time": device_wall, "monotonic": lambda: real_time.monotonic()}))
+           "time": device_wall, "monotonic": lambda: real_time.monotonic()}))  # noqa: PLW0108 - late lookup: SimClock replaces it
     stack.claim()
     device = CloudUplink({"base_url": stack.backend.base_url, "device_key": stack.factory["device_key"],
                           "command_auth": "required", "poll_interval_s": 0})

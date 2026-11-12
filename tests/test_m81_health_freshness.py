@@ -154,7 +154,7 @@ def test_the_runtime_stamps_where_the_sample_is_generated():
     runtime._collect_component_health = lambda caller: {"camera": {"state": "ok"}}
     runtime.monitoring_report = lambda: types.SimpleNamespace(to_dict=lambda: {"state": "ready"}, monitoring=True)
     runtime.protection_state = lambda: {"state": "protecting"}
-    runtime._config_report = lambda: {}
+    runtime._config_report = dict
     runtime.uplink = None
     first = runtime._collect_health("uplink")["stamp"]
     second = runtime._collect_health("uplink")["stamp"]
