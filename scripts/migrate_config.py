@@ -331,8 +331,33 @@ def migrate(path: Path) -> list[str]:
     if added:
         stamp = datetime.now().strftime("%Y%m%d-%H%M%S")  # noqa: DTZ005 - local wall-clock stamp for a backup filename
         shutil.copy2(path, path.with_suffix(f".yaml.bak-{stamp}"))
-        path.write_text("".join(lines))
+        _atomic_write(path, "".join(lines))
     return added
+
+
+def _atomic_write(path: Path, text: str) -> None:
+    """Replace `path` so a power cut leaves the old file or the new one, never half (M8).
+
+    `write_text` truncated config.yaml first and then wrote it: a deploy that lost
+    power mid-migration left a device whose config could not be parsed. Same
+    directory (same filesystem, so the rename is atomic), fsync before the rename,
+    the original's mode kept (it holds the device key: 0600).
+    """
+    import os
+    import tempfile
+
+    mode = path.stat().st_mode & 0o777
+    fd, tmp = tempfile.mkstemp(dir=str(path.parent), prefix=f".{path.name}.", suffix=".tmp")
+    try:
+        with os.fdopen(fd, "w") as handle:
+            handle.write(text)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.chmod(tmp, mode)
+        os.replace(tmp, path)
+    except BaseException:
+        Path(tmp).unlink(missing_ok=True)
+        raise
 
 
 def main() -> int:
