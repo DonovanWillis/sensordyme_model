@@ -13,7 +13,17 @@ The UI tests drive scenarios through the control port (127.0.0.1 only):
 
     GET  /state                       mode, device process, scenario, claim code, demo account
     GET  /session                     a fresh login for the demo account (token, email) for -orynSession
-    POST /mode?m=pass|down|garbage    proxy: forward / stop listening (server down) / answer invalid JSON
+    POST /mode?m=MODE[&path=/v1/...]  what the proxy does with app requests under `path` (default: every
+                                      /v1/ request except /v1/health):
+                                        pass     forward
+                                        down     stop listening (server down; `path` ignored)
+                                        garbage  200 with invalid JSON
+                                        html     200 with a web page (a Wi-Fi sign-in page)
+                                        empty    200 with an empty body
+                                        error500 500 {"detail": "database is locked"}
+                                        gateway  502 with a reverse proxy's HTML error page
+                                        freeze   replay the last good GET /v1/devices reply (stale
+                                                 telemetry: online=true, last_seen frozen); other paths pass
     POST /device/stop                 kill the virtual device process (it goes offline)
     POST /device/start?scenario=NAME  (re)start it with a scenario from sim/scenario.py
     POST /claim                       claim the device for the demo account (what "Add device" does)
@@ -44,6 +54,10 @@ REPO = Path(__file__).resolve().parents[2]
 DEMO_EMAIL = "demo@sensordyme.local"
 DEMO_PASSWORD = "sensordyme-demo"  # noqa: S105 - the throwaway sim.backend demo account
 GARBAGE = b'{"devices": [ this is not JSON'
+PORTAL = b"<!DOCTYPE html><html><head><title>Sign in to Wi-Fi</title></head><body>Accept terms</body></html>"
+GATEWAY = (b"<html><head><title>502 Bad Gateway</title></head><body><center><h1>502 Bad Gateway</h1></center>"
+           b"<hr><center>nginx</center></body></html>")
+MODES = ("pass", "down", "garbage", "html", "empty", "error500", "gateway", "freeze")
 HOP_HEADERS = {"connection", "keep-alive", "transfer-encoding", "content-length", "host", "content-encoding"}
 
 
@@ -53,6 +67,9 @@ class Stack:
         self.backend_url = f"http://127.0.0.1:{backend_port}"
         self.backend_port = backend_port
         self.mode = "pass"
+        self.fault_path = "/v1/"
+        # The last good GET /v1/devices reply the app received (for "freeze").
+        self.last_devices: bytes | None = None
         self.scenario: str | None = None
         self.backend: subprocess.Popen | None = None
         self.device: subprocess.Popen | None = None
@@ -159,7 +176,7 @@ class Stack:
         if device_id is not None:
             status, answer = self.api("GET", f"/v1/devices/{device_id}/events?limit=50")
             events = len(answer.get("events", [])) if status == 200 and isinstance(answer, dict) else 0
-        return {"mode": self.mode, "scenario": self.scenario,
+        return {"mode": self.mode, "fault_path": self.fault_path, "scenario": self.scenario,
                 "device_running": bool(self.device and self.device.poll() is None),
                 "claim_code": self.factory()["devices"][0]["claim_code"],
                 "email": DEMO_EMAIL, "password": DEMO_PASSWORD, "device_id": device_id, "events": events}
@@ -199,15 +216,29 @@ def proxy_handler(stack: Stack):
         def _forward(self) -> None:
             length = int(self.headers.get("Content-Length") or 0)
             body = self.rfile.read(length) if length else None
-            if stack.mode == "garbage" and self.path.startswith("/v1/") and self.path != "/v1/health":
-                self._send(200, GARBAGE, "application/json")
+            faulted = self.path.startswith(stack.fault_path) and not self.path.startswith("/v1/health")
+            is_devices = self.command == "GET" and urlparse(self.path).path == "/v1/devices"
+            if faulted and stack.mode in ("garbage", "html", "empty", "error500", "gateway"):
+                self._send(*{
+                    "garbage": (200, GARBAGE, "application/json"),
+                    "html": (200, PORTAL, "text/html"),
+                    "empty": (200, b"", "application/json"),
+                    "error500": (500, b'{"detail": "database is locked"}', "application/json"),
+                    "gateway": (502, GATEWAY, "text/html"),
+                }[stack.mode])
+                return
+            if faulted and stack.mode == "freeze" and is_devices and stack.last_devices is not None:
+                self._send(200, stack.last_devices, "application/json")
                 return
             headers = {k: v for k, v in self.headers.items() if k.lower() not in HOP_HEADERS}
             request = urllib.request.Request(f"{stack.backend_url}{self.path}", data=body,  # noqa: S310
                                              method=self.command, headers=headers)
             try:
                 with urllib.request.urlopen(request, timeout=30) as r:  # noqa: S310
-                    self._send(r.status, r.read(), r.headers.get("Content-Type"), r.headers.items())
+                    payload = r.read()
+                    if is_devices and r.status == 200:
+                        stack.last_devices = payload
+                    self._send(r.status, payload, r.headers.get("Content-Type"), r.headers.items())
             except urllib.error.HTTPError as e:
                 self._send(e.code, e.read(), e.headers.get("Content-Type"), e.headers.items())
             except OSError:
@@ -264,9 +295,10 @@ def control_handler(stack: Stack, app_port: AppPort, stop: threading.Event):
 
         def _act(self, path: str, q: dict[str, str]) -> object:
             if path == "/mode":
-                if q.get("m") not in ("pass", "down", "garbage"):
-                    raise ValueError("m must be pass, down or garbage")
+                if q.get("m") not in MODES:
+                    raise ValueError(f"m must be one of {', '.join(MODES)}")
                 stack.mode = q["m"]
+                stack.fault_path = q.get("path", "/v1/")
                 app_port.down() if stack.mode == "down" else app_port.up()
             elif path == "/device/stop":
                 stack.stop_device()
@@ -285,6 +317,7 @@ def control_handler(stack: Stack, app_port: AppPort, stop: threading.Event):
                 return {"status": status, "answer": answer}
             elif path == "/reset":
                 stack.mode = "pass"
+                stack.fault_path = "/v1/"
                 app_port.up()
                 if not (stack.device and stack.device.poll() is None and stack.scenario == "attentive"):
                     stack.start_device("attentive")
