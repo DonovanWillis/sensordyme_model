@@ -33,7 +33,10 @@ final class OrynJourneysUITests: XCTestCase {
     private var failed = false
 
     override func record(_ issue: XCTIssue) {
-        failed = true
+        // Only what fails the test: a warning-severity issue (Xcode 26 records
+        // SwiftUI runtime warnings, e.g. journey 03's "Accessing Environment<Bool>'s
+        // value outside of being installed on a View") left a FAIL_ shot on a pass.
+        if issue.severity == .error { failed = true }
         super.record(issue)
     }
 
@@ -694,7 +697,30 @@ final class OrynJourneysUITests: XCTestCase {
             swipes += 1
         }
         XCTAssertTrue(element.isHittable, "\(element) is reachable on screen")
+        settle(element)
         return element
+    }
+
+    /// Until the element has stayed put for a second (at most 10 s). XCUITest
+    /// resolves a tap's point, then synthesizes it ~0.6 s later: content that
+    /// arrives late above the element (a banner after its network search, a
+    /// card filling in) can move the target in between, and the tap lands
+    /// beside it (M8.1 run B, journey 08: the Strict chip "tapped", nothing
+    /// sent). Not a retry: the tap still happens once, on a still screen.
+    private func settle(_ element: XCUIElement) {
+        var last = element.frame
+        var stillSince = Date()
+        let deadline = Date().addingTimeInterval(10)
+        while Date() < deadline {
+            _ = XCTWaiter().wait(for: [XCTestExpectation(description: "still")], timeout: 0.25)
+            let now = element.frame
+            if now != last {
+                last = now
+                stillSince = Date()
+            } else if Date().timeIntervalSince(stillSince) >= 1 {
+                return
+            }
+        }
     }
 
     private func waitFor(_ element: XCUIElement, label: String, timeout: TimeInterval,
