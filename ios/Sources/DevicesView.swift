@@ -11,6 +11,9 @@ import SwiftUI
 /// database" is the kind of thing that falls apart in a live demo.
 struct DevicesView: View {
     @EnvironmentObject private var state: AppState
+    /// A card zooms into its device's home (Continuity.swift).
+    @Namespace private var zoomNS
+    @Environment(\.accessibilityReduceMotion) private var reduceMotion
     @State private var devices: [Device] = []
     @State private var errorMessage: String?
     /// The banner's headline for `errorMessage` when the server answered with
@@ -53,57 +56,51 @@ struct DevicesView: View {
 
     var body: some View {
         NavigationStack {
-            ScrollView {
-                LazyVStack(spacing: SD.Space.sm) {
-                    header
-                        .padding(.bottom, SD.Space.xs)
-
-                    // Shown whether or not devices are loaded: a failed refresh
-                    // leaves stale cards on screen that look perfectly current.
-                    if let errorMessage {
-                        ConnectionBanner(message: errorMessage, title: errorTitle) { await reload() }
-                            .padding(.bottom, SD.Space.xxs)
-                    }
-                    if let alertOpenProblem {
-                        ConnectionBanner(message: alertOpenProblem, title: "Couldn't open that alert")
-                            .padding(.bottom, SD.Space.xxs)
-                    }
-
-                    if !devices.isEmpty {
-                        fleetSummary
-                            .padding(.top, SD.Space.xxs)
-                            .padding(.bottom, SD.Space.xxs)
-                    }
-                    // The backend's view of the same device, so the banner can
-                    // tell "switched off" from "not on this Wi-Fi" instead of
-                    // blaming the network for both.
-                    DeviceLinkBanner(
-                        link: link,
-                        backendDevice: linkedBackendDevice,
-                        backendReachable: errorMessage == nil,
-                        accountHasDevices: !devices.isEmpty
-                    )
-
-                    ForEach(devices) { device in
-                        NavigationLink(value: device) {
-                            DeviceCard(device: device, lastRefreshFailed: errorMessage != nil, now: now)
-                        }
-                        .buttonStyle(.plain)
-                        .accessibilityIdentifier("device.card")
-                        .accessibilityHint("Opens the live view and controls")
-                    }
-
-                    if devices.isEmpty {
-                        emptyOrLoading
-                    }
-                }
-                .padding(.horizontal, SD.Space.md)
-                .padding(.bottom, SD.Space.lg)
+            routed
+            // The home screen draws its own header (brand, actions, title) so
+            // the ORYN lockup is never squeezed into a toolbar slot. Pushed
+            // screens keep the standard navigation bar.
+            .navigationTitle("Your Devices")
+            .toolbar(.hidden, for: .navigationBar)
+            .sheet(isPresented: $showClaim) { SetupWizardView { await reload() } }
+            .sheet(isPresented: $showSetup) {
+                SetupFlowView()
+                    .onDisappear { Task { await link.ensureConnection() } }
             }
+            .refreshable { await reload() }
+            .task {
+                await reload()
+                if DebugLaunch.openDevice, launchTarget == nil { launchTarget = devices.first }
+                // Re-resolve the device's address on launch and whenever the
+                // network changes, so a move never requires typing an IP.
+                link.start()
+                await link.ensureConnection()
+            }
+            .onReceive(refreshTimer) { tick in
+                now = tick
+                // Same rule as DeviceDetailView: one timed reload at a time, and
+                // none into a backend AppState is already retrying on its own.
+                guard !timedReloadInFlight, state.periodicRefreshMayRun else { return }
+                timedReloadInFlight = true
+                Task {
+                    await reload()
+                    timedReloadInFlight = false
+                }
+            }
+        }
+        .tint(SD.Colors.accent)
+    }
+
+    /// The list with its destinations and notification routing.
+    private var routed: some View {
+            list
             .orynScreen()
             // Said once; gone after the person moves on, not pinned to the home screen.
             .onDisappear { alertOpenProblem = nil }
-            .navigationDestination(for: Device.self) { DeviceDetailView(device: $0) }
+            .navigationDestination(for: Device.self) { device in
+                DeviceDetailView(device: device)
+                    .sdZoomDestination(.device(device.id), in: zoomNS, enabled: !reduceMotion)
+            }
             .navigationDestination(item: $launchTarget) { DeviceDetailView(device: $0) }
             // A tapped notification opens its device, which then consumes
             // pendingEventID and shows the alert. Without this the id was set
@@ -141,38 +138,56 @@ struct DevicesView: View {
                     routeNotification()
                 }
             }
-            // The home screen draws its own header (brand, actions, title) so
-            // the ORYN lockup is never squeezed into a toolbar slot. Pushed
-            // screens keep the standard navigation bar.
-            .navigationTitle("Your Devices")
-            .toolbar(.hidden, for: .navigationBar)
-            .sheet(isPresented: $showClaim) { SetupWizardView { await reload() } }
-            .sheet(isPresented: $showSetup) {
-                SetupFlowView()
-                    .onDisappear { Task { await link.ensureConnection() } }
-            }
-            .refreshable { await reload() }
-            .task {
-                await reload()
-                if DebugLaunch.openDevice, launchTarget == nil { launchTarget = devices.first }
-                // Re-resolve the device's address on launch and whenever the
-                // network changes, so a move never requires typing an IP.
-                link.start()
-                await link.ensureConnection()
-            }
-            .onReceive(refreshTimer) { tick in
-                now = tick
-                // Same rule as DeviceDetailView: one timed reload at a time, and
-                // none into a backend AppState is already retrying on its own.
-                guard !timedReloadInFlight, state.periodicRefreshMayRun else { return }
-                timedReloadInFlight = true
-                Task {
-                    await reload()
-                    timedReloadInFlight = false
+    }
+
+    private var list: some View {
+            ScrollView {
+                LazyVStack(alignment: .leading, spacing: SD.Space.md) {
+                    header
+                        .padding(.bottom, SD.Space.xxs)
+
+                    // Shown whether or not devices are loaded: a failed refresh
+                    // leaves stale cards on screen that look perfectly current.
+                    if let errorMessage {
+                        ConnectionBanner(message: errorMessage, title: errorTitle) { await reload() }
+                            .padding(.bottom, SD.Space.xxs)
+                    }
+                    if let alertOpenProblem {
+                        ConnectionBanner(message: alertOpenProblem, title: "Couldn't open that alert")
+                            .padding(.bottom, SD.Space.xxs)
+                    }
+
+                    if !devices.isEmpty {
+                        fleetSummary
+                    }
+                    // The backend's view of the same device, so the banner can
+                    // tell "switched off" from "not on this Wi-Fi" instead of
+                    // blaming the network for both.
+                    DeviceLinkBanner(
+                        link: link,
+                        backendDevice: linkedBackendDevice,
+                        backendReachable: errorMessage == nil,
+                        accountHasDevices: !devices.isEmpty
+                    )
+
+                    ForEach(devices) { device in
+                        NavigationLink(value: device) {
+                            DeviceCard(device: device, zoomNS: zoomNS, zoomEnabled: !reduceMotion,
+                                       lastRefreshFailed: errorMessage != nil, now: now)
+                        }
+                        .buttonStyle(SDPressStyle(scale: 0.985))
+                        .accessibilityIdentifier("device.card")
+                        .accessibilityHint("Opens the live view and controls")
+                        .padding(.bottom, SD.Space.xs)
+                    }
+
+                    if devices.isEmpty {
+                        emptyOrLoading
+                    }
                 }
+                .padding(.horizontal, SD.Space.md)
+                .padding(.bottom, SD.Space.lg)
             }
-        }
-        .tint(SD.Colors.accent)
     }
 
     private var header: some View {
@@ -181,8 +196,10 @@ struct DevicesView: View {
                 OrynNavBrand()
                 Spacer()
                 // Beside the actions so a background refresh is visible
-                // without occupying a row of its own.
-                SDProgress(phase: refreshing.phase)
+                // without occupying a row of its own. Working and failed only:
+                // a green tick every 10 s said "the list refreshed" in the
+                // colour that means "your device is fine".
+                SDProgress(phase: refreshing.phase == .done ? .idle : refreshing.phase)
                 headerButton("dot.radiowaves.left.and.right", label: "Connect over Bluetooth", id: "devices.bluetooth") {
                     showSetup = true
                 }
@@ -206,13 +223,12 @@ struct DevicesView: View {
                 .font(.system(size: 14, weight: .medium))
                 .foregroundStyle(SD.Colors.textPrimary)
                 .frame(width: 38, height: 38)
-                .background(Circle().fill(SD.Colors.surface))
-                .overlay(Circle().strokeBorder(SD.Colors.borderStrong, lineWidth: 1))
+                .background(Circle().fill(SD.Colors.surfaceRaised))
                 // The circle stays 38 pt as designed; the target is the 44 pt minimum.
                 .frame(width: 44, height: 44)
                 .contentShape(Rectangle())
         }
-        .buttonStyle(.plain)
+        .buttonStyle(SDPressStyle(scale: 0.92))
         .accessibilityLabel(label)
         .accessibilityIdentifier(id)
     }
@@ -224,20 +240,23 @@ struct DevicesView: View {
         // one-line row clipped both labels (audit).
         let layout = typeSize.isAccessibilitySize
             ? AnyLayout(VStackLayout(alignment: .leading, spacing: SD.Space.xxs))
-            : AnyLayout(HStackLayout(spacing: SD.Space.sm))
+            : AnyLayout(HStackLayout(spacing: SD.Space.xs))
         return layout {
-            SDEyebrow("\(devices.count) \(devices.count == 1 ? "device" : "devices")")
+            Text("\(devices.count) \(devices.count == 1 ? "device" : "devices")")
+                .foregroundStyle(SD.Colors.textSecondary)
             if !typeSize.isAccessibilitySize {
-                Rectangle().fill(SD.Colors.borderStrong).frame(width: 1, height: 10)
+                Text("·").foregroundStyle(SD.Colors.textTertiary).accessibilityHidden(true)
             }
             HStack(spacing: 6) {
                 Circle()
                     .fill(onlineCount > 0 ? SD.Colors.success : SD.Colors.offline)
                     .frame(width: 6, height: 6)
-                SDEyebrow("\(onlineCount) online", color: onlineCount > 0 ? SD.Colors.textSecondary : SD.Colors.textTertiary)
+                Text("\(onlineCount) online")
+                    .foregroundStyle(onlineCount > 0 ? SD.Colors.textSecondary : SD.Colors.textTertiary)
             }
             if !typeSize.isAccessibilitySize { Spacer() }
         }
+        .font(SD.Typography.callout.monospacedDigit())
         .frame(maxWidth: .infinity, alignment: .leading)
         .accessibilityElement(children: .combine)
     }
@@ -320,6 +339,8 @@ struct DevicesView: View {
 struct DeviceCard: View {
     let device: Device
     @Environment(\.dynamicTypeSize) private var typeSize
+    var zoomNS: Namespace.ID? = nil
+    var zoomEnabled = true
     /// The latest refresh failed: `online` is from an older reply, so the card
     /// says Unknown instead of a stale ONLINE (ConnectionTruth).
     var lastRefreshFailed = false
@@ -374,42 +395,38 @@ struct DeviceCard: View {
     }
 
     var body: some View {
-        VStack(spacing: 0) {
-            preview
-            HStack(alignment: .center, spacing: SD.Space.sm) {
+        VStack(alignment: .leading, spacing: SD.Space.sm) {
+            Group {
+                if let zoomNS {
+                    preview.sdZoomSource(.device(device.id), in: zoomNS, cornerRadius: SD.Radius.camera,
+                                         enabled: zoomEnabled)
+                } else {
+                    preview
+                }
+            }
+            HStack(alignment: .firstTextBaseline, spacing: SD.Space.sm) {
                 VStack(alignment: .leading, spacing: 3) {
                     // Wraps instead of truncating: at the largest text sizes a
                     // one- or two-line limit cut the name off (audit: clipped).
                     Text(device.name)
                         .font(SD.Typography.headline)
                         .foregroundStyle(SD.Colors.textPrimary)
+                        .multilineTextAlignment(.leading)
                         .fixedSize(horizontal: false, vertical: true)
                     Text(subtitle)
-                        .font(SD.Typography.caption)
+                        .font(SD.Typography.callout)
                         .foregroundStyle(SD.Colors.textSecondary)
+                        .multilineTextAlignment(.leading)
                         .fixedSize(horizontal: false, vertical: true)
                 }
                 Spacer(minLength: SD.Space.xs)
-                Image(systemName: "arrow.up.right")
+                Image(systemName: "chevron.right")
                     .font(.system(size: 13, weight: .semibold))
-                    .foregroundStyle(SD.Colors.textSecondary)
-                    .frame(width: 32, height: 32)
-                    .background(Circle().fill(SD.Colors.surfaceRaised))
-                    .overlay(Circle().strokeBorder(SD.Colors.border, lineWidth: 1))
+                    .foregroundStyle(SD.Colors.textTertiary)
             }
-            .padding(.horizontal, SD.Space.md)
-            .padding(.vertical, SD.Space.sm + 2)
+            .padding(.horizontal, SD.Space.xxs)
         }
-        .background(
-            RoundedRectangle(cornerRadius: SD.Radius.lg, style: .continuous)
-                .fill(SD.Colors.surface)
-        )
-        .clipShape(RoundedRectangle(cornerRadius: SD.Radius.lg, style: .continuous))
-        .overlay(
-            RoundedRectangle(cornerRadius: SD.Radius.lg, style: .continuous)
-                .strokeBorder(SD.Colors.border, lineWidth: 1)
-        )
-        .contentShape(RoundedRectangle(cornerRadius: SD.Radius.lg, style: .continuous))
+        .contentShape(Rectangle())
         .accessibilityElement(children: .combine)
         .accessibilityLabel("\(device.name), \(ConnectionTruth.spoken(presence)), \(subtitle)")
     }
@@ -420,18 +437,21 @@ struct DeviceCard: View {
     private var preview: some View {
         ZStack {
             SD.Colors.canvas
-            CameraGrid()
-                .stroke(SD.Colors.border.opacity(live ? 0.9 : 0.5), lineWidth: 1)
+            RadialGradient(colors: [Color.white.opacity(live ? 0.05 : 0.02), .clear],
+                           center: .center, startRadius: 4, endRadius: 240)
+            ViewfinderCorners()
+                .stroke(Color.white.opacity(live ? 0.2 : 0.1), style: StrokeStyle(lineWidth: 1.5, lineCap: .round))
+                .padding(SD.Space.md)
             Image(systemName: modeIcon)
-                .font(.system(size: 30, weight: .light))
-                .foregroundStyle(live ? SD.Colors.textSecondary : SD.Colors.textDisabled)
+                .font(.system(size: 30, weight: .ultraLight))
+                .foregroundStyle(live ? SD.Colors.textSecondary : SD.Colors.textTertiary)
             VStack {
                 // Side by side normally; stacked at accessibility sizes, where the
                 // pill was cut to "ONLI…" beside the wrapping id.
                 (typeSize.isAccessibilitySize
                     ? AnyLayout(VStackLayout(alignment: .leading, spacing: SD.Space.xs))
                     : AnyLayout(HStackLayout())) {
-                    SDStatusPill(status: status, text: ConnectionTruth.label(presence), pulses: status == .online)
+                    SDStatusPill(status: status, text: ConnectionTruth.label(presence))
                     if !typeSize.isAccessibilitySize { Spacer() }
                     if let id = device.hardwareId {
                         // No shrink-to-fit: minimumScaleFactor stops the id following
@@ -446,14 +466,15 @@ struct DeviceCard: View {
                 }
                 Spacer()
             }
-            .padding(SD.Space.sm)
+            .padding(SD.Space.md)
         }
         // A floor, not a fixed height: the pill and id grow with Dynamic Type.
-        .frame(minHeight: 132)
-        .overlay(alignment: .bottom) {
-            Rectangle().fill(SD.Colors.border).frame(height: 1)
-        }
-        .opacity(live ? 1 : 0.85)
+        .frame(minHeight: 168)
+        .clipShape(RoundedRectangle(cornerRadius: SD.Radius.camera, style: .continuous))
+        .overlay(
+            RoundedRectangle(cornerRadius: SD.Radius.camera, style: .continuous)
+                .strokeBorder(Color.white.opacity(0.08), lineWidth: 1)
+        )
     }
 }
 
