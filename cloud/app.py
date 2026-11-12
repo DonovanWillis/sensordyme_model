@@ -1178,7 +1178,7 @@ def _perception(raw) -> Optional[dict]:
 def _reported_perception(live_health: dict, monitoring: dict) -> Optional[dict]:
     """Perception from a LIVE report: the health report's monitoring block, the
     health report itself, or the pushed monitoring block (firmware generations)."""
-    live_monitoring = live_health.get("monitoring") if isinstance(live_health.get("monitoring"), dict) else {}
+    live_monitoring = _dict_field(live_health, "monitoring")
     for source in (live_monitoring, live_health, monitoring):
         if isinstance(source.get("perception"), dict):
             return _perception(source["perception"])
@@ -1241,11 +1241,11 @@ def _device_status(row: sqlite3.Row, now: float) -> dict:
     role, role_title, allowed_presets, additive = _role_facts(monitoring, stored_monitoring, stored_protection)
 
     live = health or {}
-    live_monitoring = live.get("monitoring") if isinstance(live.get("monitoring"), dict) else {}
+    live_monitoring = _dict_field(live, "monitoring")
     reported_protection = live.get("protection")
     if not isinstance(reported_protection, dict):
         # Firmware that sends protection only in the monitoring block.
-        reported_protection = monitoring.get("protection") if isinstance(monitoring.get("protection"), dict) else {}
+        reported_protection = _dict_field(monitoring, "protection")
 
     reasons: list[str] = []
     protection_reasons: list[str] = []
@@ -2417,6 +2417,16 @@ def _loads_dict(raw: Optional[str]) -> dict:
     return value if isinstance(value, dict) else {}
 
 
+def _dict_field(source: dict, key: str) -> dict:
+    """source[key] when it is a dict (the same object, not a copy), else {}.
+
+    Reads the field once, so the isinstance check narrows the value that is
+    returned (`d.get(k) if isinstance(d.get(k), dict) else {}` checks one call
+    and returns another, which a type checker cannot see is the same dict)."""
+    value = source.get(key)
+    return value if isinstance(value, dict) else {}
+
+
 def _reported_role(device: sqlite3.Row):
     """The role the device last reported (core/roles.py), or None.
 
@@ -2431,8 +2441,8 @@ def _reported_role(device: sqlite3.Row):
     except (ValueError, TypeError):
         health = None
     health = health if isinstance(health, dict) else {}
-    health_monitoring = health.get("monitoring") if isinstance(health.get("monitoring"), dict) else {}
-    protection = reported.get("protection") if isinstance(reported.get("protection"), dict) else {}
+    health_monitoring = _dict_field(health, "monitoring")
+    protection = _dict_field(reported, "protection")
     name = _role_name(reported.get("role"), health_monitoring.get("role"), protection.get("role"))
     return ROLES.get(name) if name is not None else None
 
