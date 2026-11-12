@@ -38,15 +38,15 @@ struct EventHistoryView: View {
 
     var body: some View {
         ScrollView {
-            VStack(spacing: SD.Space.md) {
+            VStack(alignment: .leading, spacing: SD.Space.lg) {
                 if let errorMessage {
                     ConnectionBanner(message: errorMessage) { await reload() }
                 }
 
+                // The shape of today, on open space: when things happened and
+                // how serious they were. Each mark opens its event.
                 if !events.isEmpty {
-                    SDCard {
-                        EventTimeline(events: events) { selectedEvent = $0 }
-                    }
+                    EventTimeline(events: events) { selectedEvent = $0 }
                 }
 
                 Picker("Show", selection: $filter) {
@@ -79,26 +79,15 @@ struct EventHistoryView: View {
                 SDLoadingState(message: "Loading events…")
             } else {
                 SDEmptyState(
-                    icon: filter == .alerts ? "bell.slash" : "checkmark.circle",
+                    icon: filter == .alerts ? "bell.slash" : "clock",
                     title: filter == .alerts ? "No alerts" : "Nothing to report",
                     message: "Events appear here as soon as \(device.name) sees something worth telling you about."
                 )
             }
         } else {
-            SDCard(padding: SD.Space.xs) {
-                LazyVStack(spacing: 0) {
-                    ForEach(visible) { event in
-                        Button { selectedEvent = event } label: {
-                            EventRow(event: event)
-                        }
-                        .buttonStyle(SDRowButtonStyle(minHeight: 52))
-                        if event.id != visible.last?.id {
-                            Rectangle().fill(SD.Colors.border).frame(height: 1)
-                                .padding(.leading, SD.Space.sm + 8 + SD.Space.sm)
-                        }
-                    }
-                }
-            }
+            // A chronological flow grouped by day; a row opens in place and
+            // leads to "why this happened".
+            ActivityTimeline(events: visible) { selectedEvent = $0 }
         }
     }
 

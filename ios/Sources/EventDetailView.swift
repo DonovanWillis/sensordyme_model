@@ -27,7 +27,7 @@ struct EventDetailView: View {
     var body: some View {
         NavigationStack {
             ScrollView {
-                VStack(alignment: .leading, spacing: SD.Space.md) {
+                VStack(alignment: .leading, spacing: SD.Space.lg) {
                     header
                     // The detections around the alert, including the ones that
                     // never notified. One interruption, the whole story.
@@ -72,7 +72,7 @@ struct EventDetailView: View {
         VStack(alignment: .leading, spacing: SD.Space.xs) {
             HStack(spacing: SD.Space.xs) {
                 SDStatusPill(
-                    status: event.severityStatus,
+                    status: event.severityStatus == .online ? .unknown : event.severityStatus,
                     text: event.isCritical ? "Critical" : (event.severity == "soft" ? "Warning" : "Info")
                 )
                 Spacer()
@@ -123,7 +123,8 @@ struct EventDetailView: View {
     // MARK: Evidence
 
     private func factsCard(_ explanation: AlertExplanation) -> some View {
-        SDCard {
+        // Open space, not a box: the evidence reads as a list of facts.
+        Group {
             VStack(alignment: .leading, spacing: SD.Space.sm) {
                 SDSectionHeader(title: "What the camera saw")
                 if explanation.facts.isEmpty {
@@ -153,7 +154,7 @@ struct EventDetailView: View {
     }
 
     private func ruleCard(_ explanation: AlertExplanation) -> some View {
-        SDCard {
+        Group {
             VStack(alignment: .leading, spacing: SD.Space.xs) {
                 SDSectionHeader(title: "The rule that fired")
                 Text(explanation.rule)
@@ -224,17 +225,18 @@ struct EventTimeline: View {
                 GeometryReader { geometry in
                     ZStack(alignment: .topLeading) {
                         Capsule()
-                            .fill(SD.Colors.border)
-                            .frame(height: 3)
-                            .offset(y: 14)
+                            .fill(SD.Colors.borderStrong)
+                            .frame(height: 1)
+                            .offset(y: 15.5)
 
                         ForEach(todays) { event in
                             if let fraction = position(event) {
                                 Button { onSelect(event) } label: {
                                     Circle()
-                                        .fill(event.severityStatus.tint)
-                                        .frame(width: event.isCritical ? 14 : 10,
-                                               height: event.isCritical ? 14 : 10)
+                                        .fill(event.severityStatus == .online
+                                              ? SD.Colors.textTertiary : event.severityStatus.tint)
+                                        .frame(width: event.isCritical ? 12 : 8,
+                                               height: event.isCritical ? 12 : 8)
                                         .overlay(
                                             Circle().strokeBorder(SD.Colors.background, lineWidth: 2)
                                         )
