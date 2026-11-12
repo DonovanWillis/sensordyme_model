@@ -133,7 +133,11 @@ final class AccessibilityAuditUITests: XCTestCase {
         let nav = app.navigationBars.firstMatch
         let top = (nav.exists && nav.frame.height > 0 ? nav.frame.maxY : app.frame.minY + 62) + 24
         let tab = app.tabBars.firstMatch
-        let bottom = (tab.exists && tab.frame.height > 0 ? tab.frame.minY : app.frame.maxY) - 8
+        var bottom = (tab.exists && tab.frame.height > 0 ? tab.frame.minY : app.frame.maxY) - 8
+        // The device screen's Ask Jupiter dock floats above the tab bar the same
+        // way, and text scrolled under it is sampled through it.
+        let dock = app.descendants(matching: .any)["jupiter.dock"].firstMatch
+        if dock.exists, dock.frame.height > 0 { bottom = min(bottom, dock.frame.minY - 8) }
         return (top, bottom)
     }
 
