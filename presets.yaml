@@ -67,7 +67,10 @@ presets:
       long_haul:
         title: Long Haul
         overrides: { perclos_threshold: 0.12, perclos_window_s: 45.0 }
-    version: 2
+    # 3 (M8): phone_use judges only the driver's phone and never one hand
+    # tracking shows set down; a downward look that lowers the lids is
+    # eyes_down, not closure; a camera stall credits one frame of evidence.
+    version: 3
     product_mode: driver_safety
     # Face landmarks carry drowsiness, distraction and attention-lost, and a
     # driver alert nobody in the cabin hears protects no one. Objects (phone,
@@ -79,10 +82,10 @@ presets:
       accelerator: Hailo-8L for object detection (phone, food, drink); face/hands run on the Pi CPU
       audible_output: required (gpio_buzzer or sound)
     temporal_policies:
-      - { event: drowsiness, description: eyes closed continuously, sustain_s: 2.0, setting: drowsy_seconds }
+      - { event: drowsiness, description: "eyes closed continuously (lids lowered by a downward look are not closure)", sustain_s: 2.0, setting: drowsy_seconds }
       - { event: distraction, description: head turned away from the road, sustain_s: 3.0, setting: distraction_seconds }
       - { event: eyes_down, description: looking down (phone in lap), sustain_s: 2.5, setting: eyes_down_seconds }
-      - { event: phone_use, description: phone visible while the gaze is off the road, sustain_s: 2.0, setting: phone_use_seconds }
+      - { event: phone_use, description: "the driver's phone visible while the gaze is off the road; never a phone hand tracking shows set down (still, hands elsewhere)", sustain_s: 2.0, setting: phone_use_seconds }
       - { event: attention_lost, description: face lost and no person detected, sustain_s: 2.5 }
       - { event: fatigue_warning, description: eyes closed for more than the PERCLOS share of a rolling window, window_s: 60.0 }
       - { event: frequent_glancing, description: repeated off-road glances within a rolling window, window_s: 45.0 }
@@ -106,6 +109,7 @@ presets:
       - Face landmarks (MediaPipe Face Mesh) are unevaluated on in-cabin NoIR footage; the model card excludes life-critical use
       - The object detector gives a false phone box on about 60% of phone-free public validation images at the shipped threshold
       - Cannot tell texting from reading, or see the road; sunglasses and night driving are untested
+      - Hand-on-phone and looking-down rules are tested on synthetic scenes only; the hand model often misses a gripping hand, so a phone with no hand found is still judged as in use
     evidence:
       - docs/MODEL_REGISTRY.md
       - docs/DETECTION_THRESHOLDS.md
