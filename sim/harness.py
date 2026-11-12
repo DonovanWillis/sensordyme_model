@@ -71,6 +71,16 @@ class SimStack:
         self.power_off()
         return self.boot(scenario, **kwargs)
 
+    def power_cut(self) -> None:
+        """Power lost (M8): no shutdown code runs -- nothing is closed, flushed or
+        saved on the way down. What survives is exactly what was already on disk."""
+        self.device = None
+
+    def cold_restart(self, scenario: Scenario, **kwargs) -> VirtualDevice:
+        """Power cut, then power on again from the same state dir."""
+        self.power_cut()
+        return self.boot(scenario, **kwargs)
+
     def close(self) -> None:
         try:
             self.power_off()

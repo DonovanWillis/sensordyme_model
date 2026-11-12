@@ -278,6 +278,60 @@ def parse_args(argv: Optional[list[str]] = None) -> argparse.Namespace:
     return parser.parse_args(argv)
 
 
+def load_device_config(path: Union[str, Path]):
+    """config.yaml, validated -- or the last config that reached READY, with the fault.
+
+    Returns (config, fault): fault is None when config.yaml itself is in use,
+    else a core.config_lkg.ConfigFault the runtime reports in every health
+    report. Exits 78 (EX_CONFIG) when neither can be used: sensordyme.service
+    lists 78 in RestartPreventExitStatus, so a bad config stops the service with
+    the reason in the journal instead of a restart or reboot loop over a file no
+    restart can fix (audit D12).
+    """
+    from core import config_lkg
+    from core.config_schema import validate
+    from core.secret_store import config_permission_warnings
+
+    config, problem = config_lkg.read(path)
+    if config is None:
+        # Before this was guarded, an unreadable or malformed file raised straight
+        # out (exit 1), which Restart=always and StartLimitAction=reboot turned
+        # into a reboot loop (audit D12).
+        errors = [str(problem)]
+        print(f"SensorDyme: config ERROR: {problem}")
+    else:
+        errors, warnings = validate(config)
+        # A config holding the device key or dashboard token must not be readable by
+        # other local users (docs/CREDENTIAL_STORAGE.md). Warned, not refused: a
+        # refusal here would take a working device offline over a file mode.
+        warnings = warnings + config_permission_warnings(path, config)
+        for warning in warnings:
+            print(f"SensorDyme: config warning: {warning}")
+        torn = None if errors else config_lkg.torn_write(path)
+        if torn:
+            errors = [torn]
+        for error in errors:
+            print(f"SensorDyme: config ERROR: {error}")
+    if not errors:
+        return config, None
+
+    # M8: a config.yaml that cannot be used no longer has to mean a dark device.
+    # The last config that brought this device to READY is the same device (same
+    # key, same token, same role); run on it and say so everywhere.
+    fallback, fallback_path = config_lkg.load_last_good(path)
+    if fallback is None:
+        print(f"SensorDyme: invalid config ({len(errors)} error(s) above) and no usable "
+              f"last-known-good copy ({config_lkg.last_good_path(path)}) — refusing to start")
+        raise SystemExit(CONFIG_ERROR_EXIT)
+    reason = "; ".join(errors)
+    if len(reason) > 500:
+        reason = reason[:497] + "..."
+    print(f"SensorDyme: config FAULT: {path} cannot be used ({len(errors)} error(s) above). "
+          f"Running on the last configuration that reached READY ({fallback_path}). "
+          f"{path} was NOT changed: fix it and restart the service.")
+    return fallback, config_lkg.ConfigFault(str(path), reason, str(fallback_path))
+
+
 def run(argv: Optional[list[str]] = None) -> None:
     """Resolve profile/module/alert policy from config + CLI, then hand the wired
     pieces to services.runtime.DeviceRuntime, which owns the process lifetime
@@ -297,37 +351,7 @@ def build_runtime(argv: Optional[list[str]] = None, *, runtime_cls=None, module_
       sink_overrides  see build_alert_manager
     """
     args = parse_args(argv)
-    try:
-        config = load_config(args.config)
-    except (OSError, yaml.YAMLError) as exc:
-        # Before the guard below existed for these, an unreadable or malformed
-        # file raised straight out (exit 1), which Restart=always and
-        # StartLimitAction=reboot turned into a reboot loop (audit D12).
-        print(f"SensorDyme: config ERROR: cannot read {args.config}: {exc}")
-        raise SystemExit(CONFIG_ERROR_EXIT) from exc
-    if not isinstance(config, dict):
-        print(f"SensorDyme: config ERROR: {args.config} must be a YAML mapping, got {type(config).__name__}")
-        raise SystemExit(CONFIG_ERROR_EXIT)
-
-    from core.config_schema import validate
-    from core.secret_store import config_permission_warnings
-
-    errors, warnings = validate(config)
-    # A config holding the device key or dashboard token must not be readable by
-    # other local users (docs/CREDENTIAL_STORAGE.md). Warned, not refused: a
-    # refusal here would take a working device offline over a file mode.
-    warnings = warnings + config_permission_warnings(args.config, config)
-    for warning in warnings:
-        print(f"SensorDyme: config warning: {warning}")
-    if errors:
-        for error in errors:
-            print(f"SensorDyme: config ERROR: {error}")
-        print(f"SensorDyme: invalid config ({len(errors)} error(s) above) — refusing to start")
-        # EX_CONFIG. sensordyme.service lists it in RestartPreventExitStatus, so
-        # a bad config stops the service with the reason in the journal instead
-        # of Restart=always + StartLimitAction=reboot power-cycling the Pi for
-        # ever over a file no reboot can fix.
-        raise SystemExit(CONFIG_ERROR_EXIT)
+    config, config_fault = load_device_config(args.config)
 
     profile = args.profile if args.profile is not None else config.get("profile", "pi")
 
@@ -429,7 +453,7 @@ def build_runtime(argv: Optional[list[str]] = None, *, runtime_cls=None, module_
     from core.camera import detect_pi
     from services.runtime import DeviceRuntime
 
-    return (runtime_cls or DeviceRuntime)(
+    runtime = (runtime_cls or DeviceRuntime)(
         config=config,
         profile=profile,
         module=module,
@@ -445,6 +469,11 @@ def build_runtime(argv: Optional[list[str]] = None, *, runtime_cls=None, module_
         window_name=WINDOW_NAME,
         module_config=module_config,
     )
+    # Where this config came from: the runtime records it as last-known-good once
+    # it reaches READY, and reports a fault while it runs from the saved copy.
+    runtime.config_path = str(args.config)
+    runtime.config_fault = config_fault
+    return runtime
 
 
 if __name__ == "__main__":

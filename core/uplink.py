@@ -5,20 +5,25 @@ periodically (1) pushes queued alert events to the backend and (2) polls for
 remote commands (currently: set_preset from the mobile app). Frames NEVER go
 through this channel — only events and status, preserving the privacy design.
 
-Failure-tolerant by design: if the backend is unreachable, events queue in
-memory (bounded) and the device keeps working standalone; the dashboard and
-local alerts are never affected.
+Failure-tolerant by design: if the backend is unreachable, events queue
+(bounded) and the device keeps working standalone; the dashboard and local
+alerts are never affected. With `spool_path` set (the runtime sets it beside
+the event log) the backlog is also on disk, so an outage that outlasts a
+restart or a power cut still delivers every queued event once (M8).
 """
 
 from __future__ import annotations
 
+import contextlib
 import json
 import math
+import os
 import random
 import threading
 import time
 import uuid
 from collections import deque
+from pathlib import Path
 from typing import Any, Optional
 from urllib.parse import urlsplit
 
@@ -183,6 +188,16 @@ class CloudUplink:
         #: Protection command ids already accepted (bounded), so a re-delivered
         #: or replayed stop/resume is not applied a second time.
         self._seen_command_ids: deque[str] = deque(maxlen=_COMMAND_ID_MEMORY)
+        #: Events lost for good since start: evicted from a full backlog, or
+        #: refused by the backend for their content. Reported in health.
+        self.dropped_events = 0
+        #: Where the backlog survives a restart or a power cut (M8); None = memory only.
+        spool = config.get("spool_path")
+        self._spool_path: Optional[Path] = Path(str(spool)) if spool else None
+        self._spool_lines = 0
+        self.restored_events = 0
+        if self._spool_path is not None:
+            self._load_spool()
         self._init_command_auth(config)
         import requests  # already a dependency (VLM judge backends)
 
@@ -384,7 +399,10 @@ class CloudUplink:
             }
             if notify is not None:
                 item["notify"] = str(notify)
+            if self._queue.maxlen is not None and len(self._queue) >= self._queue.maxlen:
+                self.dropped_events += 1  # the deque evicts the oldest
             self._queue.append(item)
+            self._spool_append(item)
 
     def set_monitoring(self, described: Optional[dict]) -> None:
         """What custom configuration, if any, is currently in charge.
@@ -604,6 +622,12 @@ class CloudUplink:
             # A full batch that went through means a backlog: send the next
             # slice now rather than one per poll interval.
             more_waiting = bool(batch) and len(batch) >= self._batch_max
+            if batch:
+                # Delivered: they leave the on-disk backlog too. A power cut
+                # before this line replays them after restart, and the backend
+                # stores each event_key once.
+                with self._lock:
+                    self._spool_rewrite()
             self._failures = 0
             if not self._connected:
                 self._connected = True
@@ -668,7 +692,10 @@ class CloudUplink:
                     f"cloud_uplink: backend refused {len(batch)} event(s) with HTTP "
                     f"{status}; dropping them so newer events are not blocked"
                 )
+                self.dropped_events += len(batch)
                 batch = []
+                with self._lock:
+                    self._spool_rewrite()
             with self._lock:
                 # Put the batch back in front of anything recorded since,
                 # but never at the cost of those newer events.
@@ -688,11 +715,103 @@ class CloudUplink:
                         self._queue.appendleft(item)
                 dropped = len(batch) - max(space, 0)
                 if dropped > 0:
+                    self.dropped_events += dropped
+                    self._spool_rewrite()
                     print(
                         f"cloud_uplink: backlog full — {dropped} older event(s) dropped; "
                         f"newer ones kept"
                     )
         return more_waiting
+
+    # ------------------------------------------------------------------ backlog spool (M8)
+    def backlog(self) -> dict:
+        """The undelivered-event backlog, for health: depth, bound, losses, persistence."""
+        with self._lock:
+            return {"queued": len(self._queue), "capacity": self._queue.maxlen,
+                    "dropped": self.dropped_events, "restored": self.restored_events,
+                    "persistent": self._spool_path is not None}
+
+    def _load_spool(self) -> None:
+        """Re-queue events a previous run recorded but never delivered.
+
+        The spool is JSON lines, appended as events are queued: a power cut can
+        leave a torn last line, which is skipped (that one event was never fully
+        recorded); anything else unreadable is skipped and counted, never fatal.
+        """
+        assert self._spool_path is not None
+        try:
+            raw = self._spool_path.read_bytes()
+        except FileNotFoundError:
+            return
+        except OSError as exc:
+            print(f"cloud_uplink: undelivered-event spool unreadable ({exc}); starting empty")
+            return
+        items: dict[str, dict] = {}
+        damaged = 0
+        for line in raw.splitlines():
+            if not line.strip():
+                continue
+            try:
+                item = json.loads(line)
+            except (ValueError, UnicodeDecodeError):
+                damaged += 1
+                continue
+            if not isinstance(item, dict) or not isinstance(item.get("event_key"), str) \
+                    or not isinstance(item.get("type"), str):
+                damaged += 1
+                continue
+            items.pop(item["event_key"], None)  # one entry per key, latest position
+            items[item["event_key"]] = item
+        restored = list(items.values())
+        capacity = self._queue.maxlen
+        if capacity is not None and len(restored) > capacity:
+            self.dropped_events += len(restored) - capacity
+            restored = restored[-capacity:]  # the newest, as the live backlog keeps
+        self._queue.extend(restored)
+        self.restored_events = len(restored)
+        if restored or damaged:
+            print(f"cloud_uplink: {len(restored)} undelivered event(s) restored from the last run"
+                  + (f"; {damaged} damaged spool line(s) skipped" if damaged else ""))
+        self._spool_rewrite()
+
+    def _spool_append(self, item: dict) -> None:
+        """Record one queued event durably (caller holds the lock)."""
+        if self._spool_path is None:
+            return
+        capacity = self._queue.maxlen or MAX_QUEUE
+        if self._spool_lines >= 2 * capacity:
+            self._spool_rewrite()  # compaction: evicted events leave the file too
+            return
+        try:
+            line = json.dumps(_json_safe(item), allow_nan=False, default=str)
+            self._spool_path.parent.mkdir(parents=True, exist_ok=True)
+            with open(self._spool_path, "a", encoding="utf-8") as handle:
+                handle.write(line + "\n")
+                handle.flush()
+                os.fsync(handle.fileno())
+            self._spool_lines += 1
+        except (OSError, TypeError, ValueError) as exc:
+            # Losing durability is bad; losing the event or the alert is worse.
+            print(f"cloud_uplink: could not record a queued event on disk ({exc}); kept in memory")
+
+    def _spool_rewrite(self) -> None:
+        """Make the spool exactly the in-memory backlog (caller holds the lock). Atomic."""
+        if self._spool_path is None:
+            return
+        try:
+            if not self._queue:
+                with contextlib.suppress(FileNotFoundError):
+                    self._spool_path.unlink()
+                self._spool_lines = 0
+                return
+            from core.config_lkg import atomic_write_bytes
+
+            body = "".join(json.dumps(_json_safe(item), allow_nan=False, default=str) + "\n"
+                           for item in self._queue)
+            if atomic_write_bytes(self._spool_path, body.encode("utf-8"), mode=0o600):
+                self._spool_lines = len(self._queue)
+        except (OSError, TypeError, ValueError) as exc:
+            print(f"cloud_uplink: could not rewrite the undelivered-event spool ({exc})")
 
     def next_delay(self) -> float:
         """How long the worker waits before its next sync (see backoff_delay)."""
