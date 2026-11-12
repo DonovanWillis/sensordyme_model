@@ -202,6 +202,8 @@ def main(argv: Optional[list[str]] = None) -> int:
     failed = 0
     for name in names:
         run = run_scenario(binary, name, root / name)
+        # The virtual device's state holds its setup code: not evidence.
+        shutil.rmtree(root / name / "device", ignore_errors=True)
         checks = run.checks()
         print(f"{'PASS' if run.ok else 'FAIL'} {name}: {sum(checks.values())}/{len(checks)} checks, "
               f"{len(run.transcript)} device-side records ({root / name})")
