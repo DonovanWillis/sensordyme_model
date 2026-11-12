@@ -38,12 +38,13 @@ from __future__ import annotations
 
 import socket
 import threading
-from typing import Optional
+from collections.abc import Callable
+from typing import Any, Optional
 
 from core.identity import device_id, display_name
 from core.logging_setup import get_logger
 from core.network import WifiManager, nmcli_available
-from services.ble_pop import PopAuthenticator, SetupCodeError, load_setup_code, resolve_auth
+from services.ble_pop import Limits, PopAuthenticator, SetupCodeError, load_setup_code, resolve_auth
 
 log = get_logger("provisioning")
 
@@ -83,8 +84,22 @@ class ProvisioningService:
     _DORMANT_METHODS = ("off", "hotspot")
 
     def __init__(self, wifi: WifiManager, config: dict, version: str = "dev",
-                 deployment: str = "development") -> None:
+                 deployment: str = "development", *,
+                 ble_server_factory: Optional[Callable[..., Any]] = None,
+                 identity: Optional[tuple[str, str]] = None,
+                 radio_available: Optional[Callable[[], bool]] = None,
+                 pop_limits: Optional[Limits] = None) -> None:
+        """
+        The keyword-only arguments are seams for the virtual Bluetooth peripheral
+        (sim/ble_peripheral.py), which runs THIS state machine with an in-memory
+        GATT table and a simulated radio. Production passes none of them: the
+        BlueZ server, core.identity, nmcli and the protocol's own limits.
+        """
         self._wifi = wifi
+        self._ble_server_factory = ble_server_factory
+        self._identity = identity
+        self._radio_available = radio_available
+        self._pop_limits = pop_limits
         self._method = str(config.get("method", "ble"))
         # Proof of possession (services/ble_pop.py). A refused or unusable policy
         # is a reason the window cannot open, never a reason to open it unguarded.
@@ -235,7 +250,7 @@ class ProvisioningService:
 
     # ------------------------------------------------------------------ state machine
     def run(self, stop: threading.Event) -> None:
-        if self._method != "ble" or not nmcli_available():
+        if self._method != "ble" or not (self._radio_available or nmcli_available)():
             # Dev Mac, or hotspot/off installs: nothing to orchestrate in-process.
             self.state = "unavailable" if self._method == "ble" else self._method
             return
@@ -354,7 +369,7 @@ class ProvisioningService:
             "state": "online" if online else self.state,
             "ssid": self._wifi.current_ssid() if online else None,
             "ip": self._wifi.ip_address() if online else None,
-            "device_id": device_id(),
+            "device_id": self._device_id(),
             "reconfigurable": self.state == "reconfigurable",
             # Never merged into `state`: "which network am I on" and "did the
             # thing you just asked for work" are different questions, and the
@@ -368,7 +383,7 @@ class ProvisioningService:
         """_describe() from the last observed values -- no nmcli, safe on the GLib loop."""
         described = dict(self._last_described) if self._last_described else {
             "state": self.state, "ssid": None, "ip": None,
-            "device_id": device_id(),
+            "device_id": self._device_id(),
             "reconfigurable": self.state == "reconfigurable",
         }
         described["provision"] = self._provision
@@ -410,6 +425,9 @@ class ProvisioningService:
             return False, "BLE provisioning requested but BlueZ bindings are missing"
         return True, f"state: {self.state}"
 
+    def _device_id(self) -> str:
+        return self._identity[0] if self._identity else device_id()
+
     # ------------------------------------------------------------------ BLE window
     def _may_open_ble(self, now: float) -> bool:
         if self._ble_unavailable:
@@ -444,7 +462,8 @@ class ProvisioningService:
         """The proof-of-possession state machine, built once (PBKDF2 runs here, not per phone)."""
         if self._pop is None:
             code = load_setup_code(self._setup_code_path)  # SetupCodeError: caller fails closed
-            self._pop = PopAuthenticator(device_id=device_id(), setup_code=code)
+            self._pop = PopAuthenticator(device_id=self._device_id(), setup_code=code,
+                                         limits=self._pop_limits or Limits())
         return self._pop
 
     def _open_ble_window(self) -> None:
@@ -452,7 +471,7 @@ class ProvisioningService:
 
         from services.ble_gatt import BLEProvisioningServer, BLEStartError, BLEUnavailable
 
-        name = _ble_name()
+        name = self._identity[1] if self._identity else _ble_name()
         ble = None
         extra = {}
         if self._auth_mode == "pop":
@@ -468,12 +487,12 @@ class ProvisioningService:
             pop.start()
             extra["on_auth"] = self._on_auth
         try:
-            ble = BLEProvisioningServer(
+            ble = (self._ble_server_factory or BLEProvisioningServer)(
                 device_name=name,
                 device_info={
                     # The stable identity, so the app can recognise this device
                     # as the same one it already knows however it was found.
-                    "id": device_id(),
+                    "id": self._device_id(),
                     "name": name,
                     "model": "SensorDyme",
                     "version": self._version,
