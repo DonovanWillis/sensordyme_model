@@ -24,6 +24,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 OI = D / "openimages" / "oi7-sd-v1"
 PREDS = D / "m8cv"
 SPLITS = [s for s in os.environ.get("M8_SPLITS", "val,train").split(",") if s]
+STEPS = set(sys.argv[1:]) or {"ops", "paired", "phone"}  # e.g. `qc_coco80.py phone` re-runs only that
 
 
 def run(module: str, argv: list[str]) -> bool:
@@ -47,11 +48,13 @@ for split in SPLITS:
         run("research.m8.coco80_preds", ["--data", str(OI), "--models", str(D / "models"), "--out-preds", str(PREDS),
                                          "--report", str(OUT / f"coco80_{split}"), "--split", split, "--provider", "dml"])
     leg, ref = PREDS / f"coco80_legacy_{split}.jsonl", PREDS / f"coco80_reference_{split}.jsonl"
-    run("research.m8.analysis", ["ops", "--data", str(OI), "--split", split, "--out", str(OUT),
-                                 "--preds", f"legacy={leg}", "--preds", f"reference={ref}"])
-    run("research.m8.analysis", ["paired", "--data", str(OI), "--split", split, "--out", str(OUT),
-                                 "--a", f"reference={ref}", "--b", f"legacy={leg}", "--n", "300"])
-    for name, path in (("reference", ref), ("legacy", leg)):
+    if "ops" in STEPS:
+        run("research.m8.analysis", ["ops", "--data", str(OI), "--split", split, "--out", str(OUT),
+                                     "--preds", f"legacy={leg}", "--preds", f"reference={ref}"])
+    if "paired" in STEPS:
+        run("research.m8.analysis", ["paired", "--data", str(OI), "--split", split, "--out", str(OUT),
+                                     "--a", f"reference={ref}", "--b", f"legacy={leg}", "--n", "300"])
+    for name, path in (("reference", ref), ("legacy", leg)) if "phone" in STEPS else ():
         run("research.m8.analysis", ["phone", "--data", str(OI), "--split", split, "--out", str(OUT), "--tag", name,
                                      "--preds", f"{name}={path}"])
 print("done", flush=True)

@@ -398,16 +398,19 @@ def cmd_phone(data: Path, split: str, spec: str, hands_spec: Optional[str], pers
         for ratio in (0.5, 1.0, 2.0):
             gates[f"no_lookalike_ratio_{ratio}"] = (lambda q: lambda r: r["alt_score"] < q * r["score"])(ratio)
 
-    def score_gate(gate, thr: float) -> dict:
+    def score_gate(gate, thr: float, subset: Optional[set[str]] = None) -> dict:
+        truth = {i: t for i, t in phone_truth.items() if subset is None or i in subset}
         kept = {}
         for r in det_rows:
-            if r["score"] >= thr and gate(r):
+            if r["id"] in truth and r["score"] >= thr and gate(r):
                 kept.setdefault(r["id"], []).append((r["score"], r["box"]))
-        result = oe.evaluate_class(kept, list(phone_truth.values()))
+        result = oe.evaluate_class(kept, list(truth.values()))
         op = oe.operating_point(result, thr)
         matched = {(s.image_id, s.matched) for s in result.scored if s.tp and s.matched is not None}
         by = {"in_hand": [0, 0], "not_in_hand": [0, 0], "hand_unverified": [0, 0]}
         for key, v in held.items():
+            if key[0] not in truth:
+                continue
             slot = "hand_unverified" if v is None else "in_hand" if v else "not_in_hand"
             by[slot][0] += 1
             by[slot][1] += key in matched
@@ -417,15 +420,20 @@ def cmd_phone(data: Path, split: str, spec: str, hands_spec: Optional[str], pers
             g[0] += s.tp
             g[1] += 1
             g[2] += bool(s.tp and s.matched is not None)
-        for image_id, t in phone_truth.items():
+        for image_id, t in truth.items():
             vg.setdefault(groups[image_id], [0, 0, 0, 0])[3] += len(t.gts)
-        return {"precision": op["precision"], "recall": op["recall"], "tp": op["tp"], "fp": op["fp"],
+        return {"images": len(truth), "phone_free_images": result.negative_images,
+                "precision": op["precision"], "recall": op["recall"], "tp": op["tp"], "fp": op["fp"],
                 "fp_on_phone_free_images": round((op["fp_per_negative_image"] or 0) * result.negative_images),
                 "phone_free_images_with_a_false_phone": op["negative_images_with_a_false_box"],
                 "recall_by_human_hand": {k: {"n": n, "recall": (m / n if n else None)} for k, (n, m) in by.items()},
                 **_bootstrap_ci({g: tuple(v) for g, v in vg.items()})}
 
     report["gates"] = {f"t{thr}:{g}": score_gate(fn, thr) for thr in (0.2, 0.3, 0.4, 0.5) for g, fn in gates.items()}
+    # The human-hand gate can only pass where "hand" was verified, so on all images it also removes every
+    # false phone on hand-unverified images. Scoring on hand-verified images only removes that bias.
+    report["gates_on_hand_verified_images"] = {
+        f"t{thr}:{g}": score_gate(fn, thr, hand_verified) for thr in (0.2, 0.3, 0.5) for g, fn in gates.items()}
 
     # Held-vs-present as a classifier: among detections that hit a phone on a hand-verified image,
     # does the predicted-hand geometry agree with the human "in hand" label?
