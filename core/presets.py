@@ -597,7 +597,8 @@ def device_availability(entry: dict, *, role: Any = None, capabilities: Optional
         if refusal:
             return CODE_ROLE_FORBIDS, refusal
     if stale:
-        return CODE_STALE, "the device has not reported recently, so what it can run now is unknown"
+        return CODE_STALE, ("the device's monitoring status is not current (no recent report, or its health has not "
+                            "been updated), so what it can run now is unknown")
     impaired = {item.get("name"): item.get("reason") for item in (capabilities or {}).get("impaired") or []
                 if isinstance(item, dict)}
     for kind in entry.get("required_capabilities") or []:
