@@ -43,3 +43,35 @@ Branch `feat/m8.1-release-validation`, local only, created from M8 HEAD `618880c
 - `make deploy-preflight` is hard-wired to `pi@sensordyme.local:~/sensordyme`. F0 now has a manual block for a device whose user, host or directory differs.
 
 **New:** `docs/MONDAY_OPERATOR_CHECKLIST.md`.
+
+## P3. Pyright (merged `bc7fabd`)
+
+- Errors went from 42 to **0**; warnings from 978 to 981. The three new warnings are `reportMissingModuleSource` for the new `typings/onnx` stub, which is by design.
+- No rule was disabled, the type-checking mode is unchanged, and no file-level ignores were added. Two existing `# type: ignore` comments were removed by fixing what they hid.
+- Categories, every resolution and the genuine bugs are listed in `docs/TYPECHECK_STATUS.md`. One genuine bug: `uitest_control` could send "Bearer None" after a failed login.
+- Full suite after the merge: 3,224 passed, 5 skipped, 0 failed (`m81-evidence/full_pytest_bc7fabd.txt`).
+
+## P4 update: oryn back (2026-11-12 ~15:25)
+
+- Tailscale shows oryn online, but `sdrun` refused it with exit 76, a host-identity mismatch: the hostname is now `ORYN`, while the fleet expected `DESKTOP-6QV3CBB`.
+- The pinned ed25519 host key still matched under `StrictHostKeyChecking=yes`, so it is the same machine, renamed.
+- The user confirmed the rename. `expect_hostname` in `~/sensordyme-fleet/config/fleet.json` was changed to `ORYN`; the backup is `fleet.json.bak-20261112`.
+- `sdrun check -t oryn`: RTX 4060 idle at 36 °C, 7.5 GB VRAM free, 9.6 GB RAM available, no active jobs.
+
+## P5. CV (oryn job `20261112-152527-afe36f`, CPU only; `docs/research/M8_1_CV_FOLLOWUP.md`)
+
+- **Person regression, paired, significant:** recall at precision 0.80 is 0.627 against 0.661 (Δ 0.033, CI 0.018–0.052).
+- **Large people:** the gap is only 0.019, under M8's 0.02 bar for Arch B, so Arch B is not justified.
+- **Phone:** recall at precision 0.80 is 0.789 against 0.594, not significant (p = 0.064 that EXP-08 is better; 128 phones).
+- **Predicted-hand gate:** EXP-08's own predicted hands gate held phones as well as human labels. False-phone images go from 33.3% to 2.4%, and in-hand recall stays at 0.810.
+- **Verdict:** no training before Monday. EXP-09 is justified, but needs approval.
+
+## P1. Health freshness (merged `92d036d`, wording follow-up `07bcb40`)
+
+- **Device:** each sample carries `sd-health-v1` stamps: `boot_id`, `generation`, `revision` and monotonic generation time. The uplink adds `age_s` at send time.
+- **Backend:** judges freshness by the stamp (new, reboot, revised, repeat, out of order, retired boot, invalid, unverified), never by the device wall clock. `stale` = `link_stale` OR `health_stale`, so stale health falls to `unknown`.
+- **Compatibility:** an older device without a stamp is reported as "unverified" and behaves as before.
+- **App:** shows the new `monitoringStale` presence state.
+- **Tests:** 9 end-to-end scenarios (`tests/test_m81_health_freshness_sim.py`) plus 26 unit tests.
+- **Full suite at `07bcb40`:** 3,259 passed, 5 skipped, 0 failed. Pyright 0 errors. `make verify-release` PASS.
+- Evidence, including a control trace that reproduces the old "protecting" on a sample 122 s old: `m81-evidence/freshness/`.
