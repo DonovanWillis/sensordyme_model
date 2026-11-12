@@ -1036,6 +1036,36 @@ def _short(value, limit: int = 200) -> Optional[str]:
     return value[:limit] if isinstance(value, str) and value else None
 
 
+def _node_metrics(raw) -> Optional[dict]:
+    """A node's current values (M8: counts, per-area occupancy and dwell), bounded:
+    numbers, booleans and short id lists only -- never free text, never accuracy."""
+    if not isinstance(raw, dict):
+        return None
+
+    def scalar(value):
+        if isinstance(value, bool) or value is None:
+            return value
+        return _finite_or_none(value)
+
+    out: dict = {}
+    for key, value in list(raw.items())[:16]:
+        if not isinstance(key, str):
+            continue
+        if isinstance(value, dict):
+            nested = {}
+            for name, inner in list(value.items())[:16]:
+                if isinstance(name, str) and isinstance(inner, dict):
+                    nested[name[:64]] = {str(k)[:32]: scalar(v) for k, v in list(inner.items())[:8]}
+                elif isinstance(name, str):
+                    nested[name[:64]] = scalar(inner)
+            out[key[:32]] = nested
+        elif isinstance(value, list):
+            out[key[:32]] = [v for v in value[:64] if isinstance(v, int) and not isinstance(v, bool)]
+        else:
+            out[key[:32]] = scalar(value)
+    return out
+
+
 def _perception(raw) -> Optional[dict]:
     """The device's perception block, bounded and typed; None if absent or unreadable.
 
@@ -1079,12 +1109,26 @@ def _perception(raw) -> Optional[dict]:
             "validation": _short(node.get("validation"), 64),
             "experimental": node.get("experimental") if isinstance(node.get("experimental"), bool) else None,
             "reason": _short(node.get("reason"), 500),
+            # M8: what it measures now (people_counter: count, areas) and its
+            # experimental parts (baby monitoring's pose features), as reported.
+            "enabled_by": _short(node.get("enabled_by"), 16),
+            "metrics": _node_metrics(node.get("metrics")),
+            "experimental_features": [
+                {"id": _short(f.get("id"), 64), "status": _short(f.get("status"), 200),
+                 "enabled": f.get("enabled") if isinstance(f.get("enabled"), bool) else None}
+                for f in (node.get("experimental_features") or [])[:8] if isinstance(f, dict)
+            ] if isinstance(node.get("experimental_features"), list) else [],
         })
+    tracking = raw.get("tracking")
     return {
         "schema": _short(raw.get("schema"), 64),
         "simulated": raw.get("simulated") if isinstance(raw.get("simulated"), bool) else None,
         "components": components,
         "nodes": nodes,
+        # M8: the shared tracker's counters and cost (numbers only).
+        "tracking": ({k: _finite_or_none(v) for k, v in list(tracking.items())[:16]
+                      if isinstance(k, str) and not isinstance(v, bool) and isinstance(v, (int, float))}
+                     if isinstance(tracking, dict) else None),
     }
 
 
