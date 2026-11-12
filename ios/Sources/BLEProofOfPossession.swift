@@ -171,6 +171,21 @@ enum BLEProofOfPossession {
             self.codeKey = try BLEProofOfPossession.codeKey(code: label.code, deviceID: label.deviceID)
         }
 
+        private init(label: SetupLabel, codeKey: SymmetricKey, nonceApp: Data) {
+            self.label = label
+            self.codeKey = codeKey
+            self.nonceApp = nonceApp
+        }
+
+        /// A fresh handshake for the same label: new nonce, the code key reused.
+        ///
+        /// For a proof that lapsed (the device keeps one for 120 s) or a join
+        /// that failed: the device then wants a new hello, and deriving the
+        /// key again would cost the PBKDF2 time for nothing.
+        func renewed(nonceApp: Data = BLEProofOfPossession.randomBytes(16)) -> Session {
+            Session(label: label, codeKey: codeKey, nonceApp: nonceApp)
+        }
+
         func helloMessage() -> Data {
             Session.json(["op": "hello", "v": BLEProofOfPossession.protocolVersion,
                           "na": nonceApp.base64EncodedString()])

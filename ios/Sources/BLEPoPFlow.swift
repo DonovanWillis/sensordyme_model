@@ -10,7 +10,9 @@ import Foundation
 //
 // No CoreBluetooth here: BLEProvisioner writes what this returns and feeds it
 // what the device notifies, so ios/Tests/BLEPoPFlowTests.swift can run the
-// whole exchange against a simulated device. NOT validated over a physical
+// whole exchange against a simulated device, and
+// tests/test_m8_onboarding_crosslang.py runs it against the device's own
+// Python state machine (sim/ble_peripheral.py). NOT validated over a physical
 // Bluetooth link.
 
 /// What the person typed or pasted: the printed code ("XXXX-XXXX-XXXX") or the
@@ -56,36 +58,92 @@ enum SetupCodeEntry {
 
 /// One proof-of-possession exchange. Every reply moves it one step or fails it;
 /// credentials are produced only after the device has proven the code back.
+///
+/// Two ways to drive it:
+///   * prove first (`init(session:)`): hello -> proof -> `.proven`; the
+///     credentials follow later with `sendCredentials`, within the device's
+///     proof window (120 s). Onboarding uses this, so a wrong code or a
+///     lockout is reported before anyone types a Wi-Fi password.
+///   * one shot (`init(session:ssid:psk:)`): the credentials go out the
+///     moment the device has proven itself.
 final class BLEPoPFlow {
     enum Step: Equatable {
-        case ready, awaitingChallenge, awaitingProven, awaitingAccepted, accepted
+        case ready, awaitingChallenge, awaitingProven, proven, awaitingAccepted, accepted
         case failed(String)
     }
 
     enum Action: Equatable {
         /// Write this to the auth characteristic.
         case write(Data)
+        /// The device holds the code and proved it back: credentials may be sent.
+        case proven
         /// Credentials accepted: follow the status characteristic as before.
         case accepted
         case failed(String)
     }
 
-    private(set) var step: Step = .ready
-    private let session: BLEProofOfPossession.Session
-    private let ssid: String
-    private let psk: String?
+    /// Why the exchange stopped, in terms the caller can act on.
+    struct Rejection: Equatable {
+        enum Kind: Equatable {
+            /// The device's answers (services/ble_pop.py `_error`).
+            case wrongCode, locked, busy, expired, unsupportedVersion, refusedMessage, other
+            /// Found on the phone: the device is not the one on the label,
+            /// cannot prove the code, or speaks something this app does not.
+            case wrongDevice, notAuthentic, malformedReply
+        }
 
+        let kind: Kind
+        let message: String
+        /// The device's own wait, when it gave one (`retry_after_s`).
+        let retryAfterSeconds: Int?
+
+        /// Whether the link should be dropped: the device on the other end is
+        /// not one this phone should say anything more to.
+        var endsLink: Bool {
+            switch kind {
+            case .wrongDevice, .notAuthentic, .malformedReply: true
+            default: false
+            }
+        }
+    }
+
+    private(set) var step: Step = .ready
+    private(set) var rejection: Rejection?
+    let session: BLEProofOfPossession.Session
+    private var pending: (ssid: String, psk: String?)?
+
+    /// Prove first; credentials later with `sendCredentials`.
+    init(session: BLEProofOfPossession.Session) {
+        self.session = session
+    }
+
+    /// One shot: credentials go out as soon as the device has proven itself.
     /// - Parameter psk: nil for an open network.
     init(session: BLEProofOfPossession.Session, ssid: String, psk: String?) {
         self.session = session
-        self.ssid = ssid
-        self.psk = psk
+        self.pending = (ssid, psk)
     }
 
     func start() -> Action {
-        guard step == .ready else { return fail("the exchange already started") }
+        guard step == .ready else { return fail(.init(kind: .other, message: "the exchange already started", retryAfterSeconds: nil)) }
         step = .awaitingChallenge
         return .write(session.helloMessage())
+    }
+
+    /// The credentials, once the device has proven itself.
+    func sendCredentials(ssid: String, psk: String?) -> Action {
+        guard step == .proven else {
+            return fail(.init(kind: .other, message: "The device hasn't confirmed the setup code yet.", retryAfterSeconds: nil))
+        }
+        do {
+            let creds = try session.credentialsMessage(ssid: ssid, psk: psk)
+            step = .awaitingAccepted
+            return .write(creds)
+        } catch let failure as BLEProofOfPossession.Failure {
+            return fail(Self.rejection(failure))
+        } catch {
+            return fail(.init(kind: .other, message: "the exchange failed: \(error.localizedDescription)", retryAfterSeconds: nil))
+        }
     }
 
     func handle(reply: Data) -> Action {
@@ -97,9 +155,12 @@ final class BLEPoPFlow {
                 return .write(proof)
             case .awaitingProven:
                 try session.verify(proven: reply)
-                let creds = try session.credentialsMessage(ssid: ssid, psk: psk)
-                step = .awaitingAccepted
-                return .write(creds)
+                step = .proven
+                if let pending {
+                    self.pending = nil
+                    return sendCredentials(ssid: pending.ssid, psk: pending.psk)
+                }
+                return .proven
             case .awaitingAccepted:
                 let msg = (try? JSONSerialization.jsonObject(with: reply)) as? [String: Any]
                 if msg?["op"] as? String == "accepted" {
@@ -107,22 +168,51 @@ final class BLEPoPFlow {
                     return .accepted
                 }
                 if msg?["op"] as? String == "error" {
-                    return fail(Self.deviceError(msg?["error"] as? String, retryAfter: msg?["retry_after_s"] as? Int))
+                    return fail(Self.rejection(code: msg?["error"] as? String, retryAfter: msg?["retry_after_s"] as? Int))
                 }
-                return fail("the device sent an unexpected reply")
-            case .ready, .accepted, .failed:
-                return fail("unexpected reply from the device")
+                return fail(.init(kind: .malformedReply, message: "the device sent an unexpected reply", retryAfterSeconds: nil))
+            case .ready, .proven, .accepted, .failed:
+                return fail(.init(kind: .other, message: "unexpected reply from the device", retryAfterSeconds: nil))
             }
         } catch let failure as BLEProofOfPossession.Failure {
-            return fail(Self.message(failure))
+            return fail(Self.rejection(failure))
         } catch {
-            return fail("the exchange failed: \(error.localizedDescription)")
+            return fail(.init(kind: .other, message: "the exchange failed: \(error.localizedDescription)", retryAfterSeconds: nil))
         }
     }
 
-    private func fail(_ message: String) -> Action {
-        step = .failed(message)
-        return .failed(message)
+    private func fail(_ rejection: Rejection) -> Action {
+        self.rejection = rejection
+        step = .failed(rejection.message)
+        return .failed(rejection.message)
+    }
+
+    static func rejection(_ failure: BLEProofOfPossession.Failure) -> Rejection {
+        switch failure {
+        case .rejected(let code, let retryAfter):
+            return rejection(code: code, retryAfter: retryAfter)
+        case .wrongDevice:
+            return .init(kind: .wrongDevice, message: message(failure), retryAfterSeconds: nil)
+        case .deviceNotAuthentic, .notProven:
+            return .init(kind: .notAuthentic, message: message(failure), retryAfterSeconds: nil)
+        case .malformedReply:
+            return .init(kind: .malformedReply, message: message(failure), retryAfterSeconds: nil)
+        case .invalidCode, .invalidLabel, .keyDerivationFailed:
+            return .init(kind: .other, message: message(failure), retryAfterSeconds: nil)
+        }
+    }
+
+    static func rejection(code: String?, retryAfter: Int?) -> Rejection {
+        let kind: Rejection.Kind = switch code {
+        case "wrong_code": .wrongCode
+        case "locked": .locked
+        case "busy": .busy
+        case "unexpected": .expired
+        case "unsupported_version": .unsupportedVersion
+        case "malformed": .refusedMessage
+        default: .other
+        }
+        return .init(kind: kind, message: deviceError(code, retryAfter: retryAfter), retryAfterSeconds: retryAfter)
     }
 
     /// A failure in the person's terms, with what to do.
@@ -149,7 +239,9 @@ final class BLEPoPFlow {
         // The device's codes (services/ble_pop.py `_error`).
         switch code {
         case "wrong_code":
-            return "The setup code was wrong. Check the label and try again."
+            // The device attaches its wait to the wrong code that starts a lockout.
+            let lock = retryAfter.map { " That was too many wrong codes: the device will refuse for \($0) s." } ?? ""
+            return "The setup code was wrong. Check the label and try again." + lock
         case "locked":
             let wait = retryAfter.map { " Try again in \($0) s." } ?? " Wait a while and try again."
             return "Too many wrong codes, so the device is refusing for now." + wait
@@ -159,6 +251,8 @@ final class BLEPoPFlow {
             return "The device lost track of this setup (it may have timed out). Start again."
         case "unsupported_version":
             return "The device uses a different setup version. Update the app or the device."
+        case "malformed":
+            return "The device couldn't read what this phone sent, so nothing was applied. Try again."
         default:
             return "The device refused the setup" + (code.map { " (\($0))" } ?? "") + "."
         }
