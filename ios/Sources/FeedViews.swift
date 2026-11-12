@@ -41,29 +41,7 @@ struct FeedCard: View {
     }
 
     private var feedPlaceholder: some View {
-        ZStack {
-            SD.Colors.canvas
-            CameraGrid()
-                .stroke(SD.Colors.border.opacity(0.6), lineWidth: 1)
-            VStack(spacing: SD.Space.sm) {
-                Image(systemName: "video.slash")
-                    .font(.system(size: 22, weight: .light))
-                    .foregroundStyle(SD.Colors.textTertiary)
-                // No longer "set the device address in Settings": nobody types an
-                // address any more — the device is found over Bonjour, and the
-                // only thing a person can actually do about an empty address is
-                // get the device powered on and onto this Wi-Fi. Naming a setting
-                // that fills itself in sends someone looking for a field to edit.
-                Text("The live picture comes straight from your SensorDyme, so it needs to be switched on and on this Wi-Fi. ORYN EDGE finds it by itself.")
-                    .font(SD.Typography.caption)
-                    .multilineTextAlignment(.center)
-                    .foregroundStyle(SD.Colors.textTertiary)
-                    // The feed keeps its camera shape at every text size; the
-                    // sentence shrinks to fit it rather than being cut off.
-                    .minimumScaleFactor(0.5)
-                    .padding(.horizontal, SD.Space.xl)
-            }
-        }
+        CameraPlaceholder()
     }
 }
 
@@ -180,10 +158,51 @@ struct FeedAspectRatioKey: PreferenceKey {
     }
 }
 
+/// One device stream, shared by every view on a screen that shows it: the
+/// inline camera and the full-screen camera read the same frames over the same
+/// connection, so opening full screen never opens a second stream to the device
+/// (whose inference loop pays for every viewer, see core/dashboard.py).
+///
+/// Viewers attach and detach; the stream stops shortly after the last one
+/// leaves. The grace period covers a presentation swapping one viewer for
+/// another (inline -> full screen), whose appear/disappear order SwiftUI does
+/// not promise, without a reconnect in between. The reader itself, and every
+/// rule about connections, is unchanged (MJPEGReader).
+@MainActor
+final class LiveFeedSession {
+    let reader = MJPEGReader()
+    private var viewers = 0
+    private var pendingStop: Task<Void, Never>?
+
+    func attach(base: String, token: String) {
+        viewers += 1
+        pendingStop?.cancel()
+        pendingStop = nil
+        reader.start(base: base, token: token)
+    }
+
+    func detach() {
+        viewers = max(0, viewers - 1)
+        guard viewers == 0 else { return }
+        pendingStop?.cancel()
+        pendingStop = Task { [weak self] in
+            try? await Task.sleep(for: .milliseconds(600))
+            guard !Task.isCancelled, let self, self.viewers == 0 else { return }
+            self.reader.stop()
+        }
+    }
+}
+
 struct MJPEGView: View {
     let url: URL
+    /// The stream this view shows. Nil: a stream of its own (the zone editor).
+    var session: LiveFeedSession? = nil
     @EnvironmentObject private var state: AppState
-    @StateObject private var reader = MJPEGReader()
+    /// Holds the reference without observing it: frames re-render only
+    /// `MJPEGFrame` below, never the screen around the camera.
+    @State private var ownSession = LiveFeedSession()
+    private var feed: LiveFeedSession { session ?? ownSession }
+    private var reader: MJPEGReader { feed.reader }
     /// Backgrounding does not remove this view, so `onDisappear` never fires for
     /// it — the stream has to be released here instead. See the handler below.
     @Environment(\.scenePhase) private var scenePhase
@@ -200,66 +219,21 @@ struct MJPEGView: View {
     @StateObject private var link = DeviceLink()
 
     var body: some View {
-        ZStack {
-            SD.Colors.canvas
-            if let image = reader.image {
-                // FULL frame, always: fit (letterbox) at the camera's real aspect
-                // ratio, never fill+crop — cropping a safety camera hides exactly
-                // the edges where events happen. The container adopts the stream's
-                // aspect ratio so letterboxing only appears if the width forces it.
-                Image(uiImage: image)
-                    .resizable()
-                    .aspectRatio(contentMode: .fit)
-                    .frame(maxWidth: .infinity)
-                    .aspectRatio(image.size.height > 0 ? image.size.width / image.size.height : 4 / 3,
-                                 contentMode: .fit)
-            } else if reader.state.isRecoverableAutomatically {
-                ProgressView().tint(SD.Colors.textSecondary)
-                    .frame(height: 230)
-            } else {
-                // A state that will never heal on its own gets an icon rather than
-                // a spinner. A spinner is a promise that something is still
-                // happening, and for a rejected token or a malformed address
-                // nothing is.
-                Image(systemName: "exclamationmark.triangle.fill")
-                    .font(.title)
-                    .foregroundStyle(SD.Colors.textSecondary)
-                    .frame(height: 230)
-            }
-            if let message = reader.state.message {
-                VStack {
-                    Spacer()
-                    Label(message, systemImage: reader.state.isRecoverableAutomatically
-                          ? "wifi.exclamationmark" : "exclamationmark.triangle.fill")
-                        .font(.caption2)
-                        .multilineTextAlignment(.center)
-                        .padding(.horizontal, 10)
-                        .padding(.vertical, 6)
-                        .background(Color.black.opacity(0.65), in: Capsule())
-                        .overlay(Capsule().strokeBorder(Color.white.opacity(0.08), lineWidth: 1))
-                        .foregroundStyle(SD.Colors.textPrimary)
-                        .padding(8)
-                }
-            }
-        }
-        .preference(
-            key: FeedAspectRatioKey.self,
-            value: reader.image.flatMap { $0.size.height > 0 ? $0.size.width / $0.size.height : nil }
-        )
+        MJPEGFrame(reader: reader)
         .onAppear {
             // Wired before start(), so the very first run of failures can trigger
             // a re-resolve. Adopting the answer needs no code here: DeviceLink
             // writes the device's current address to the same stored key the feed
             // reads, so `onChange(of: url)` below picks it up and reconnects.
             reader.onAddressLooksStale = { Task { await link.resolve(force: true) } }
-            reader.start(base: url.absoluteString, token: state.deviceToken)
+            feed.attach(base: url.absoluteString, token: state.deviceToken)
             // An address is not an identity: confirm the camera answering there
             // is still the linked one (a DHCP swap, or two default-named Pis
             // trading `sensordyme.local`). If not, DeviceLink re-resolves and the
             // corrected address arrives through `onChange(of: url)`.
             Task { await link.ensureConnection() }
         }
-        .onDisappear { reader.stop() }
+        .onDisappear { feed.detach() }
         // Backgrounding is not `onDisappear`. The view stays in the hierarchy when
         // the app leaves the foreground, so the MJPEG connection stayed open for a
         // feed nobody could see — and on the device that is not merely untidy:
@@ -299,6 +273,75 @@ struct MJPEGView: View {
         }
         .onChange(of: state.deviceToken) { _, newToken in
             reader.start(base: url.absoluteString, token: newToken)
+        }
+    }
+}
+
+/// The picture and the stream's own state, observed from the reader. The only
+/// view that redraws per frame.
+struct MJPEGFrame: View {
+    @ObservedObject var reader: MJPEGReader
+
+    var body: some View {
+        ZStack {
+            SD.Colors.canvas
+            if let image = reader.image {
+                // FULL frame, always: fit (letterbox) at the camera's real aspect
+                // ratio, never fill+crop — cropping a safety camera hides exactly
+                // the edges where events happen. The container adopts the stream's
+                // aspect ratio so letterboxing only appears if the width forces it.
+                Image(uiImage: image)
+                    .resizable()
+                    .aspectRatio(contentMode: .fit)
+                    .frame(maxWidth: .infinity)
+                    .aspectRatio(image.size.height > 0 ? image.size.width / image.size.height : 4 / 3,
+                                 contentMode: .fit)
+                    .accessibilityLabel("Live picture")
+            } else if reader.state.isRecoverableAutomatically {
+                ProgressView().tint(SD.Colors.textSecondary)
+                    .frame(height: 230)
+                    .accessibilityLabel("Connecting to the camera")
+            } else {
+                // A state that will never heal on its own gets an icon rather than
+                // a spinner. A spinner is a promise that something is still
+                // happening, and for a rejected token or a malformed address
+                // nothing is.
+                Image(systemName: "exclamationmark.triangle")
+                    .font(.system(size: 24, weight: .light))
+                    .foregroundStyle(SD.Colors.textSecondary)
+                    .frame(height: 230)
+                    .accessibilityHidden(true)
+            }
+            if let message = reader.state.message {
+                VStack {
+                    Spacer()
+                    Label(message, systemImage: reader.state.isRecoverableAutomatically
+                          ? "wifi.exclamationmark" : "exclamationmark.triangle.fill")
+                        .font(SD.Typography.caption)
+                        .multilineTextAlignment(.center)
+                        .padding(.horizontal, 10)
+                        .padding(.vertical, 6)
+                        .background(Color.black.opacity(0.7), in: Capsule())
+                        .foregroundStyle(SD.Colors.textPrimary)
+                        .padding(SD.Space.sm)
+                }
+            }
+        }
+        .preference(
+            key: FeedAspectRatioKey.self,
+            value: reader.image.flatMap { $0.size.height > 0 ? $0.size.width / $0.size.height : nil }
+        )
+    }
+}
+
+/// "LIVE" only while frames are actually arriving from the device.
+struct MJPEGLiveIndicator: View {
+    @ObservedObject var reader: MJPEGReader
+
+    var body: some View {
+        if reader.state == .streaming {
+            FeedLiveBadge()
+                .transition(.opacity)
         }
     }
 }
