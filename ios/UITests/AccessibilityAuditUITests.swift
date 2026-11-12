@@ -189,8 +189,8 @@ final class AccessibilityAuditUITests: XCTestCase {
         return "\(screen)\tcontrast\tunder-bar\tPassed when re-checked clear of the bars\t\(label)\t"
     }
 
-    /// Moves the page by exactly what the element needs to sit inside the clear
-    /// band: a press-drag-hold of that distance, which leaves no momentum. The
+    /// Moves the page by exactly what centres the element in the clear band: a
+    /// press-drag-hold of that distance, which leaves no momentum. The
     /// slow swipes this replaces each moved the page ~400 pt and kept gliding,
     /// so an element nearly as tall as the band (the device-link banner's body
     /// at the largest text size) was overshot up and down and the re-check
@@ -200,10 +200,12 @@ final class AccessibilityAuditUITests: XCTestCase {
             guard element.exists else { return }
             let band = clearBand
             let frame = element.frame
-            var dy: CGFloat
-            if frame.maxY > band.bottom { dy = -(frame.maxY - band.bottom + 16) }  // page up
-            else if frame.minY < band.top { dy = band.top - frame.minY + 16 }     // page down
-            else { return }
+            // To the MIDDLE of the band, not just inside its edge: the floating
+            // tab bar's scroll-edge blur reaches above the bar, and text parked
+            // 16 pt inside the edge was still sampled through it (M8.1).
+            let middle = (band.top + band.bottom) / 2
+            var dy = middle - frame.midY
+            if abs(dy) < 12 { return }
             // One drag stays inside the band, so it starts and ends on page content.
             let limit = (band.bottom - band.top) / 2 - 12
             dy = max(-limit, min(limit, dy))
@@ -212,6 +214,8 @@ final class AccessibilityAuditUITests: XCTestCase {
             start.press(forDuration: 0.05, thenDragTo: start.withOffset(CGVector(dx: 0, dy: dy)),
                         withVelocity: .slow, thenHoldForDuration: 0.3)
             waitUntilStill(element)
+            // At the end of the page it can't go further; what is clear is checked after.
+            if abs(element.frame.midY - frame.midY) < 2 { return }
         }
     }
 

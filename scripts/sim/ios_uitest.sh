@@ -145,11 +145,21 @@ for name, msg in re.findall(r"error: -\[\S+ (test\w+)\] : (.*)", log):
     fails.setdefault(name, msg.strip()[:160])
 skips = dict(re.findall(r"-\[\S+ (test\w+)\] : Test skipped - (.*)", log))
 # Every test the sources define (or the -only-testing ones) must have reported.
-expected = set()
+# (class, test) for every test the sources define; with -only-testing, the ones
+# it names (a class names all of its tests).
+defined = set()
 for path in glob.glob("ios/UITests/*.swift"):
-    expected |= set(re.findall(r"func (test\w+)\(\)", open(path).read()))
-if only:
-    expected = {t for t in expected if any(t in o for o in only.split())}
+    for block in re.split(r"(?=\bclass \w+\s*:\s*XCTestCase)", open(path).read()):
+        cls = re.match(r"class (\w+)", block)
+        if cls:
+            defined |= {(cls.group(1), t) for t in re.findall(r"func (test\w+)\(\)", block)}
+def selected(cls, test):
+    for item in only.split():
+        parts = item.split(":", 1)[-1].split("/")  # -only-testing:Target/Class[/test]
+        if parts[1:2] == [cls] and (len(parts) < 3 or parts[2] == test):
+            return True
+    return False
+expected = {t for c, t in defined if not only or selected(c, t)}
 ran = [name for name, _, _ in rows]
 missing = sorted(expected - set(ran))
 lines = [f"Commit {commit}; order {order}; one xcodebuild invocation; no retries.", "",
