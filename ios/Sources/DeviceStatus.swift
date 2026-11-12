@@ -27,8 +27,19 @@ struct DeviceStatus: Codable, Hashable {
     var rules: Rules?
     var lastRejection: Rejection?
     var presetRejection: PresetRejection?
+    /// True when nothing here can be trusted now: the link is stale OR (M8.1)
+    /// the device's health evidence is. Every claim below is gated on it.
     var stale: Bool?
+    /// Backend receipt time of the device's last poll (link liveness), not when
+    /// the device observed anything; that is `healthFreshness.observedAt`.
     var reportedAt: Double?
+    /// M8.1: no poll in the live window. nil from a backend before M8.1.
+    var linkStale: Bool? = nil
+    /// M8.1: the device is polling but its health sample is too old to speak
+    /// for now (a frozen snapshot re-sent). nil from a backend before M8.1.
+    var healthStale: Bool? = nil
+    /// M8.1: how current the health evidence is, separately from the link.
+    var healthFreshness: HealthFreshness? = nil
     /// The id of the last stop/resume the DEVICE says it applied (echo of the
     /// `command_id` POST /v1/devices/{id}/protection returned). nil from a
     /// backend that does not pass it through; ProtectionControl then falls back
@@ -110,6 +121,9 @@ struct DeviceStatus: Codable, Hashable {
         case presetRejection = "preset_rejection"
         case reportedAt = "reported_at"
         case lastCommandID = "last_command_id"
+        case linkStale = "link_stale"
+        case healthStale = "health_stale"
+        case healthFreshness = "health_freshness"
     }
 
     init(
@@ -118,7 +132,8 @@ struct DeviceStatus: Codable, Hashable {
         role: String? = nil, roleTitle: String? = nil, allowedPresets: [String]? = nil,
         capabilities: Capabilities? = nil, rules: Rules? = nil, lastRejection: Rejection? = nil,
         presetRejection: PresetRejection? = nil, stale: Bool? = nil, reportedAt: Double? = nil,
-        lastCommandID: String? = nil, perception: PerceptionReport? = nil
+        lastCommandID: String? = nil, perception: PerceptionReport? = nil,
+        linkStale: Bool? = nil, healthStale: Bool? = nil, healthFreshness: HealthFreshness? = nil
     ) {
         self.monitoringState = monitoringState
         self.monitoringActive = monitoringActive
@@ -137,6 +152,9 @@ struct DeviceStatus: Codable, Hashable {
         self.reportedAt = reportedAt
         self.lastCommandID = lastCommandID
         self.perception = perception
+        self.linkStale = linkStale
+        self.healthStale = healthStale
+        self.healthFreshness = healthFreshness
     }
 
     init(from decoder: Decoder) throws {
@@ -158,6 +176,9 @@ struct DeviceStatus: Codable, Hashable {
         reportedAt = try? c.decodeIfPresent(Double.self, forKey: .reportedAt)
         lastCommandID = try? c.decodeIfPresent(String.self, forKey: .lastCommandID)
         perception = try? c.decodeIfPresent(PerceptionReport.self, forKey: .perception)
+        linkStale = try? c.decodeIfPresent(Bool.self, forKey: .linkStale)
+        healthStale = try? c.decodeIfPresent(Bool.self, forKey: .healthStale)
+        healthFreshness = try? c.decodeIfPresent(HealthFreshness.self, forKey: .healthFreshness)
     }
 
     func encode(to encoder: Encoder) throws {
@@ -180,10 +201,69 @@ struct DeviceStatus: Codable, Hashable {
         try c.encodeIfPresent(stale, forKey: .stale)
         try c.encodeIfPresent(reportedAt, forKey: .reportedAt)
         try c.encodeIfPresent(lastCommandID, forKey: .lastCommandID)
+        try c.encodeIfPresent(linkStale, forKey: .linkStale)
+        try c.encodeIfPresent(healthStale, forKey: .healthStale)
+        try c.encodeIfPresent(healthFreshness, forKey: .healthFreshness)
     }
 
-    /// Online and reporting: the only time anything below is current.
-    func isLive(online: Bool) -> Bool { online && stale != true }
+    /// Online and reporting: the only time anything below is current. Also false
+    /// when the device is reachable but its health evidence is stale (M8.1): a
+    /// successful poll is not proof it is monitoring.
+    func isLive(online: Bool) -> Bool { online && stale != true && !monitoringEvidenceStale }
+
+    /// M8.1: the device's monitoring evidence is too old, whatever the link says.
+    /// Read from either field so one missing value never reads as fresh.
+    var monitoringEvidenceStale: Bool { healthStale == true || healthFreshness?.state == "stale" }
+}
+
+// After DeviceStatus, not inside it, so its CodingKeys never precede the
+// status's own (tests/test_app_status_contract.py reads the first enum).
+extension DeviceStatus {
+    /// `status.health_freshness` (docs/APP_STATUS_CONTRACT.md, M8.1).
+    struct HealthFreshness: Codable, Hashable {
+        /// fresh | stale | unverified | absent
+        var state: String?
+        var verified: Bool?
+        /// Age of the device's sample when the backend built the reply.
+        var ageS: Double?
+        var thresholdS: Double?
+        /// When the device took the sample, on the backend's clock.
+        var observedAt: Double?
+        /// When the backend first received this sample.
+        var receivedAt: Double?
+        /// How many times the same sample arrived again unchanged.
+        var repeats: Int?
+
+        enum CodingKeys: String, CodingKey {
+            case state, verified, repeats
+            case ageS = "age_s"
+            case thresholdS = "threshold_s"
+            case observedAt = "observed_at"
+            case receivedAt = "received_at"
+        }
+
+        init(state: String? = nil, verified: Bool? = nil, ageS: Double? = nil, thresholdS: Double? = nil,
+             observedAt: Double? = nil, receivedAt: Double? = nil, repeats: Int? = nil) {
+            self.state = state
+            self.verified = verified
+            self.ageS = ageS
+            self.thresholdS = thresholdS
+            self.observedAt = observedAt
+            self.receivedAt = receivedAt
+            self.repeats = repeats
+        }
+
+        init(from decoder: Decoder) throws {
+            let c = try decoder.container(keyedBy: CodingKeys.self)
+            state = try? c.decodeIfPresent(String.self, forKey: .state)
+            verified = try? c.decodeIfPresent(Bool.self, forKey: .verified)
+            ageS = try? c.decodeIfPresent(Double.self, forKey: .ageS)
+            thresholdS = try? c.decodeIfPresent(Double.self, forKey: .thresholdS)
+            observedAt = try? c.decodeIfPresent(Double.self, forKey: .observedAt)
+            receivedAt = try? c.decodeIfPresent(Double.self, forKey: .receivedAt)
+            repeats = try? c.decodeIfPresent(Int.self, forKey: .repeats)
+        }
+    }
 }
 
 /// How alarming a status is, independent of the design system (the views map
@@ -233,8 +313,9 @@ struct MonitoringStatusPresentation: Equatable {
         }
         let reason = status.reasons?.first(where: { !$0.isEmpty }).map(CapabilityHealth.humanReason)
         // `online` and `stale` use the same 30 s window on the backend; either
-        // one alone is enough to stop trusting the last report.
-        if !online || status.stale == true {
+        // one alone is enough to stop trusting the last report. Stale health
+        // evidence on a live link (M8.1) is the same: never "All clear".
+        if !online || status.stale == true || status.monitoringEvidenceStale {
             return unknown(reason ?? "the device isn't reporting")
         }
         switch Phase(rawValue: status.monitoringState ?? "") ?? .unknown {

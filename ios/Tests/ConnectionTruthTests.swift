@@ -81,5 +81,47 @@ check(ConnectionTruth.notReportingMessage(.stale(age: 120))?.contains("2 minutes
 check(ConnectionTruth.notReportingMessage(.offline(age: 60))?.contains("apply when it reconnects") == true,
       "offline says changes wait for the device")
 
+print("\nM8.1: a polling device with a frozen health sample is not online:")
+func m81(stale: Bool? = true, link: Bool? = false, health: Bool? = true, healthAge: Double? = 95,
+         seenAgo: TimeInterval? = 1, receivedAgo: TimeInterval? = 5) -> ConnectionTruth.Reading {
+    var r = reading(online: true, stale: stale, seenAgo: seenAgo, receivedAgo: receivedAgo)
+    r.linkStale = link
+    r.healthStale = health
+    r.healthAge = healthAge
+    return r
+}
+check(presence(m81()) == .monitoringStale(age: 100),
+      "polled 1 s ago, health 95 s old in a reply held 5 s: monitoring stale for 100 s")
+check(!presence(m81()).isOnline, "a frozen sample is never online (so never 'All clear')")
+check(presence(m81(healthAge: nil)) == .monitoringStale(age: nil), "no age from the backend: still stale")
+check(presence(m81(receivedAgo: nil)) == .monitoringStale(age: 95), "a never-fetched value adds no hold time")
+check(presence(m81(link: true, seenAgo: 40)) == .stale(age: 40),
+      "a silent link wins: it is the older, plainer problem")
+check(presence(m81(link: nil, seenAgo: 2)) == .monitoringStale(age: 100),
+      "without link_stale, stale + health_stale reads as stale evidence on a live link")
+check(presence(m81(stale: false, health: false)) == .online, "fresh health on a live link is online")
+check(presence(m81(stale: false, link: nil, health: nil, healthAge: nil)) == .online,
+      "a backend before M8.1 (no new fields) behaves as before")
+check(presence(m81(stale: true, link: nil, health: nil, healthAge: nil, seenAgo: 31)) == .stale(age: 31),
+      "a backend before M8.1 saying stale is a stale link, as before")
+check(presence(m81(), failed: true) == .unknown(.refreshFailed), "a failed refresh still comes first")
+check(presence(m81(receivedAgo: 31)) == .unknown(.notRefreshed(age: 31)), "so does an old reply")
+let frozenFleet = [reading(online: true), m81()]
+check(ConnectionTruth.onlineCount(frozenFleet, lastRefreshFailed: false, now: now) == 1,
+      "the summary does not count a frozen device online")
+check(ConnectionTruth.label(.monitoringStale(age: 100)) == "Stale", "the pill says Stale, not Online")
+check(ConnectionTruth.cardLine(.monitoringStale(age: 100))
+      == "Connected — monitoring status not updated for 1 minute",
+      "the card says it is connected but its monitoring status is old")
+check(ConnectionTruth.cardLine(.monitoringStale(age: nil)) == "Connected — monitoring status not confirmed",
+      "with no age it says not confirmed")
+check(ConnectionTruth.spoken(.monitoringStale(age: 100)).hasPrefix("Connected, monitoring status not updated"),
+      "VoiceOver hears connected but not updated")
+let frozenBanner = ConnectionTruth.notReportingMessage(.monitoringStale(age: 100)) ?? ""
+check(frozenBanner.contains("whether it is watching is unknown") && frozenBanner.contains("1 minute"),
+      "the device-screen banner says monitoring is unknown and for how long")
+check(!frozenBanner.contains("All clear") && !frozenBanner.lowercased().contains("protecting"),
+      "and claims no protection")
+
 print("\n\(failures == 0 ? "PASSED" : "\(failures) FAILED")")
 exit(failures == 0 ? 0 : 1)

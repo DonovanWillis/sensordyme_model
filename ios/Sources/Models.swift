@@ -169,7 +169,10 @@ extension Device {
     /// only with fresh telemetry in a current reply.
     func presence(now: Date = .now, lastRefreshFailed: Bool = false) -> ConnectionTruth.Presence {
         ConnectionTruth.presence(
-            ConnectionTruth.Reading(online: online, stale: status?.stale, lastSeen: lastSeen, receivedAt: receivedAt),
+            ConnectionTruth.Reading(online: online, stale: status?.stale, lastSeen: lastSeen, receivedAt: receivedAt,
+                                    linkStale: status?.linkStale,
+                                    healthStale: status?.monitoringEvidenceStale,
+                                    healthAge: status?.healthFreshness?.ageS),
             lastRefreshFailed: lastRefreshFailed, now: now)
     }
 
