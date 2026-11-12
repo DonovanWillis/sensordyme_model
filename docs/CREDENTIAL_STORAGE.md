@@ -86,4 +86,28 @@ the store in place, or delete it.
 * **The dashboard token** stays in `config.yaml`. Only the startup warning
   covers it; moving it is a follow-up using the same store.
 * **The backend side** (device keys in plaintext in SQLite) is unchanged; see
-  `docs/DEVICE_AUTH_CONTRACT.md` §9.
+  `docs/DEVICE_AUTH_CONTRACT.md` §9. Revoked keys are also kept there now
+  (`revoked_device_keys`), so their holder is recognised and reported. They
+  authenticate nothing, and they are no more exposed than the live keys beside
+  them.
+
+## 5. M8 changes
+
+* **The backend's JWT secret file** is created 0600, as before. If an existing
+  file is group- or other-readable, its mode is now set to 0600 at startup, with
+  a warning. This happens after a restored backup or a copied data directory,
+  for example. Anyone who can read the file can mint a session for any account.
+  The database keeps its existing 0600 enforcement (`_restrict_db_permissions`).
+* **`scripts/migrate_device_key.py`** refuses a `config.yaml` that does not
+  parse, and names only the line and column. It used to end with PyYAML's
+  traceback, which quotes the offending line. That line is the device key when
+  the key line is the broken one.
+* Reviewed and unchanged:
+  * the 0600-from-the-first-byte writes;
+  * symlink and owner refusal;
+  * the checksum and backup fallback;
+  * redaction.
+  
+  One residual: the permission check (`lstat`) and the read are separate calls.
+  It is not exploitable without write access to the store's directory, which
+  already means the key can be replaced.

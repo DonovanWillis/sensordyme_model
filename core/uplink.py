@@ -250,6 +250,7 @@ class CloudUplink:
         #: from the backend's clock_skew answer (a Pi has no RTC). Never applied
         #: to the system clock, and never used to judge a command's freshness.
         self._clock_offset_s = 0.0
+        self._last_clock_refusal: Optional[str] = None
         self._seen_envelope_ids: deque[str] = deque(maxlen=_ENVELOPE_ID_MEMORY)
         self._unsigned_announced = False
         self._last_rejection: Optional[str] = None
@@ -304,17 +305,36 @@ class CloudUplink:
         self._last_rejection = None
         return command
 
-    def _learn_clock_offset(self, exc) -> None:
-        """Adopt the backend's clock for request timestamps after a clock_skew refusal."""
+    def _learn_clock_offset(self, exc, nonce: Optional[str]) -> None:
+        """Adopt the backend's clock for request timestamps after a clock_skew refusal.
+
+        Only a time the backend signed (`clock_auth`, bound to the nonce of the
+        request it refused) is adopted (M8). An unsigned `server_time` used to be
+        taken as is, so anyone on the path could push this device's request
+        timestamps into the future and keep its signed requests to deliver
+        later, inside the backend's window, with nonces the backend never saw.
+        """
         try:
             body = exc.response.json()
-            server_time = float(body.get("server_time"))
         except Exception:  # noqa: BLE001 - any unreadable answer: keep the current offset
             return
-        if body.get("code") == "clock_skew" and math.isfinite(server_time):
-            self._clock_offset_s = server_time - time.time()
-            print(f"cloud_uplink: device clock differs from the backend's by "
-                  f"{self._clock_offset_s:+.0f} s; signing with the backend's time")
+        if not isinstance(body, dict) or body.get("code") != "clock_skew":
+            return
+        if self._keyring is None or nonce is None:
+            return
+        try:
+            server_time = auth.verify_clock(self._keyring, body.get("clock_auth"), request_nonce=nonce)
+        except auth.AuthError as exc_auth:
+            reason = "unsigned_clock" if body.get("clock_auth") is None else exc_auth.reason
+            if reason != self._last_clock_refusal:
+                self._last_clock_refusal = reason
+                print(f"cloud_uplink: ignored the backend's clock_skew time ({reason}); request timestamps "
+                      f"keep the device clock. Check NTP on this device.")
+            return
+        self._last_clock_refusal = None
+        self._clock_offset_s = server_time - time.time()
+        print(f"cloud_uplink: device clock differs from the backend's by "
+              f"{self._clock_offset_s:+.0f} s; signing with the backend's time")
 
     def start(self) -> None:
         threading.Thread(target=self._run, daemon=True, name="cloud-uplink").start()
@@ -520,6 +540,7 @@ class CloudUplink:
         # worst failure shape available: no events, no error, no reconnect.
         batch: list = []
         more_waiting = False
+        nonce: Optional[str] = None
         try:
             with self._lock:
                 take = min(len(self._queue), self._batch_max)
@@ -652,7 +673,7 @@ class CloudUplink:
             self._failures += 1
             status = getattr(getattr(exc, "response", None), "status_code", None)
             if status == 401 and self._auth_mode == "required":
-                self._learn_clock_offset(exc)
+                self._learn_clock_offset(exc, nonce)
             if status == 413 and len(batch) > 1:
                 # Too big, not wrong: send less next time rather than lose it.
                 self._batch_max = max(1, len(batch) // 2)
