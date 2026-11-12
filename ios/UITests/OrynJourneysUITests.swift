@@ -519,6 +519,71 @@ final class OrynJourneysUITests: XCTestCase {
         shot("27e_jupiter_server_error")
     }
 
+    // MARK: Mission 8.1: health freshness
+
+    /// The device keeps polling, so the link is live, but its health sample
+    /// stops changing (a wedged sampling thread re-sending one snapshot:
+    /// `/health?freeze=1`). A successful poll proves the link, not the
+    /// monitoring: after the backend's 30 s threshold (`_HEALTH_STALE_S`) the
+    /// app says Connected but not updated, Stale, Status unknown — never
+    /// "All clear" or "Protecting" — and recovers on the next poll after the
+    /// samples flow again.
+    func test28_FrozenHealthSnapshot() throws {
+        launch()
+        let card = app.buttons["device.card"]
+        XCTAssertTrue(card.waitForExistence(timeout: 30))
+        waitFor(card, labelContains: "Online", timeout: 60)
+        XCTAssertTrue(label(containing: "1 ONLINE").exists || label(containing: "1 online").exists,
+                      "the summary counts the live device")
+        let frozen = Stack.post("/health?freeze=1")
+        XCTAssertEqual(frozen["health_frozen"] as? Bool, true, "the device took the freeze: \(frozen)")
+        defer { Stack.post("/health?freeze=0") }
+
+        // Threshold 30 s, plus the device's sampling interval, plus the list's 10 s poll.
+        waitFor(card, labelContains: "Connected, monitoring status not updated for", timeout: 75)
+        XCTAssertTrue(card.label.contains("Connected — monitoring status not updated for"),
+                      "the card line says so: \(card.label)")
+        for claim in ["Online", "All clear", "Protecting"] {
+            XCTAssertFalse(card.label.contains(claim), "frozen health never reads as '\(claim)': \(card.label)")
+        }
+        XCTAssertTrue(label(containing: "0 ONLINE").exists || label(containing: "0 online").exists,
+                      "the summary counts it out")
+        XCTAssertTrue(Stack.state()["device_running"] as? Bool == true, "the device is still running and polling")
+        shot("28a_frozen_card")
+
+        card.tap()
+        let presence = element("detail.online")
+        waitFor(presence, label: "Stale", timeout: 30)
+        waitFor(monitoring, label: "Status unknown", timeout: 30)
+        let banner = element("banner.message")
+        waitFor(banner, labelContains: "It is connected, but its monitoring status hasn't been updated for",
+                timeout: 30)
+        XCTAssertTrue(banner.label.contains("so whether it is watching is unknown"), banner.label)
+        shot("28b_frozen_detail")
+        XCTAssertTrue(reveal(label(containing: "Health appears here while the device is reporting")).exists,
+                      "the health card is withheld")
+        XCTAssertTrue(reveal(label(containing: "Unknown — the device isn't reporting, so no capability")).exists,
+                      "no capability row is shown as working")
+        shot("28c_frozen_capabilities")
+        for claim in ["All clear", "Protecting"] {
+            XCTAssertFalse(app.staticTexts.containing(NSPredicate(format: "label CONTAINS %@", claim)).firstMatch.exists,
+                           "nothing on the device screen says '\(claim)' on frozen health")
+        }
+        XCTAssertNotEqual(monitoring.label, "All clear")
+
+        // The samples flow again: the next device report is fresh, and the app's
+        // next poll (4 s on this screen) shows it.
+        let thawed = Stack.post("/health?freeze=0")
+        XCTAssertEqual(thawed["health_frozen"] as? Bool, false, "the device took the thaw: \(thawed)")
+        let started = Date()
+        waitFor(presence, label: "Online", timeout: 30)
+        waitFor(monitoring, label: "All clear", timeout: 30)
+        waitForAbsence(banner, timeout: 15)
+        Stack.saveText("recovered \(Int(Date().timeIntervalSince(started))) s after the thaw",
+                       name: "28_recovery_time", test: self)
+        shot("28d_recovered")
+    }
+
     // MARK: Helpers
 
     /// Tap a field and wait until it HAS keyboard focus, tapping once more if

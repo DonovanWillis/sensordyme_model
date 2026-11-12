@@ -38,6 +38,10 @@ The UI tests drive scenarios through the control port (127.0.0.1 only):
     POST /device/start?scenario=NAME  (re)start it with a scenario from sim/scenario.py
     POST /claim                       claim the device for the demo account (what "Add device" does)
     POST /protection?action=stop|resume
+    POST /health?freeze=1|0           freeze the device's health sample while it keeps polling (SIGUSR1 to
+                                      sim.virtual_device: the link stays live, the monitoring evidence
+                                      goes stale after the backend's 30 s), or let samples flow again.
+                                      Answers once the device has acknowledged it in device.log.
     POST /reset                       (manual use) server answering, custom rules off, plain driver_safety
                                       mode, device running "attentive", protection resumed. Keeps the
                                       account, pairing and event history; the tests use /fresh.
@@ -94,6 +98,7 @@ class Stack:
         # The last good GET /v1/devices reply the app received (for "freeze").
         self.last_devices: bytes | None = None
         self.scenario: str | None = None
+        self.health_frozen = False
         self.backend: subprocess.Popen | None = None
         self.device: subprocess.Popen | None = None
         self.lock = threading.Lock()
@@ -132,6 +137,7 @@ class Stack:
                  "--state-dir", str(self.work / "device"), "--scenario", scenario, "--no-dashboard"],
                 cwd=REPO, env=self._env(), stdout=log, stderr=subprocess.STDOUT)
             self.scenario = scenario
+            self.health_frozen = False  # a new process starts unfrozen
 
     def _stop_device_locked(self) -> None:
         if self.device and self.device.poll() is None:
@@ -146,6 +152,25 @@ class Stack:
     def stop_device(self) -> None:
         with self.lock:
             self._stop_device_locked()
+
+    def set_health_frozen(self, frozen: bool) -> None:
+        """POST /health: signal the device and wait for its acknowledgement."""
+        log = self.work / "device.log"
+        marker = b"FAULT health frozen" if frozen else b"FAULT health cleared"
+        with self.lock:
+            if not (self.device and self.device.poll() is None):
+                raise ValueError("the device is not running")
+            offset = log.stat().st_size
+            self.device.send_signal(signal.SIGUSR1 if frozen else signal.SIGUSR2)
+        deadline = time.monotonic() + 10
+        while time.monotonic() < deadline:
+            with open(log, "rb") as f:
+                f.seek(offset)
+                if marker in f.read():
+                    self.health_frozen = frozen
+                    return
+            time.sleep(0.2)
+        raise ValueError(f"the device did not acknowledge health freeze={frozen} within 10 s; see device.log")
 
     def stop_backend(self) -> None:
         if self.backend and self.backend.poll() is None:
@@ -294,7 +319,7 @@ class Stack:
                 "device_running": bool(self.device and self.device.poll() is None),
                 "claim_code": self.factory()["devices"][0]["claim_code"],
                 "email": self.email, "password": self.password, "device_id": device_id, "events": events,
-                "generation": self.generation}
+                "generation": self.generation, "health_frozen": self.health_frozen}
 
 
 class AppPort:
@@ -442,6 +467,10 @@ def control_handler(stack: Stack, app_port: AppPort, stop: threading.Event):
                 code = stack.factory()["devices"][0]["claim_code"]
                 return dict(zip(("status", "answer"), stack.api("POST", "/v1/devices/claim", {"claim_code": code}),
                                 strict=True))
+            elif path == "/health":
+                if q.get("freeze") not in ("0", "1"):
+                    raise ValueError("freeze must be 1 or 0")
+                stack.set_health_frozen(q["freeze"] == "1")
             elif path == "/protection":
                 action = q.get("action")
                 if action not in ("stop", "resume") or stack.device_id() is None:

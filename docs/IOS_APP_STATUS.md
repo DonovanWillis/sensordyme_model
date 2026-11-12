@@ -138,6 +138,59 @@ the presence pill to Unknown).
   and `error500` on `/v1/ai/configure` only (`&path=`), each with a readable
   headline and message.
 
+## Mission 8.1: the UI-test suite is order-independent
+
+The M8 full run passed 26 of 27 with journey 03 (discovery) SKIPPED. Cause:
+XCTest runs test classes alphabetically, so `AccessibilityAuditUITests` ran
+first, and its setUp called `Stack.prepare()`, which claimed the single
+virtual device for the shared demo account; 03 found the device already
+claimed and skipped. The journeys also leaned on each other the other way
+("03 claims the device every later journey uses").
+
+Every test now starts from its own world. `Stack.fresh` (from the setUp of
+both test classes) calls the controller's `POST /fresh`, which stops the
+device and backend, deletes their data and starts a new backend and a newly
+provisioned device with a new account, then claims the device and waits for
+it to report ready (or leaves it unclaimed, for 03). About 13 s per test,
+2 s for 03.
+
+| Concern | How it is handled |
+|---|---|
+| Device pairing | a new device per test; claimed by the controller, or unclaimed for 03, which pairs it through Add device. 03 asserts the unclaimed start (it no longer skips) |
+| Account and auth state | a new account per test (`uitest-<n>@sensordyme.local`); every launch passes `-orynSignOut` and then `-orynSession` with a token from a real `/v1/login` to that test's backend. A new account also runs the app's own per-account reset (`AppState.claimLocalState`: paired camera, announced alerts, SMS number) |
+| Login limiter | the backend's limiters live in its process, which is replaced per test; the controller's own logins still use their own rate-limit key (`SENSORDYME_CLIENT_IP_HEADER`), the app's are limited as in production |
+| Event history | a new database per test; the controller's event count is no longer capped at 50 (it stopped growing, so a "more events than before" wait could never finish) |
+| Rules, modes, nodes, zones, Ask Jupiter drafts | a new database and a new device state directory per test; 24 now asserts the companion starts off instead of switching off one left by another journey |
+| Proxy faults | `/fresh` puts the proxy back to `pass` and listening, and clears the replay cache used by `freeze` |
+| Simulator state | before the run the script uninstalls the app and its runner and resets the Simulator keychain; each test's tearDown terminates the app |
+| Shared fixtures (Stack.swift) | stateless apart from the controller; only transport failures are retried, a controller error fails the test with its message; with the controller missing, a scripted run FAILS (`ORYN_UITEST_REQUIRE_STACK=1`) instead of skipping |
+| Parallel testing | off: one controller on fixed ports, one Simulator and one app install cannot serve two tests. XcodeGen's scheme leaves it off, and the script forces it off (`-parallel-testing-enabled NO` and `ParallelizationEnabled` in the .xctestrun) |
+| Order | any: `ORDER=random scripts/sim/ios_uitest.sh` writes `TestExecutionOrdering=random` into the .xctestrun; summary.md lists the tests in the order they ran |
+| Retries | none: `-retry-tests-on-failure` and `-test-iterations` are never passed. summary.md counts skipped and never-reported tests, and the script exits non-zero unless every test passed |
+
+Health freshness (M8.1): a new presence state, `monitoringStale(age)`
+(ConnectionTruth). The device is still polling, but its health sample is
+older than the backend's 30 s (`status.health_stale`). It is never online
+(`isOnline` is false and it is not counted in "N online"). The card shows the
+amber Stale pill and "Connected — monitoring status not updated for N". The
+device screen shows "Status unknown", never "All clear", and withholds the
+health and capability rows.
+
+Journey 28 (frozen health snapshot): `POST /health?freeze=1` sends SIGUSR1 to
+the virtual device (`sim/virtual_device.py`). Its uplink keeps polling with the
+last health sample, which is the same fault as
+tests/test_m81_health_freshness_sim.py. The journey waits past the threshold
+and checks, on the card: the spoken label "Connected, monitoring status not
+updated for N", the card line, no Online/All clear/Protecting, and "0 online".
+On the device screen it checks: presence Stale, monitoring "Status unknown",
+the banner "It is connected, but its monitoring status hasn't been updated
+for N, so whether it is watching is unknown", the health card withheld, and
+the capabilities "Unknown" notice. After `freeze=0` it checks that Online and
+"All clear" come back. The time the recovery took goes into the result bundle
+(`28_recovery_time`).
+
+<!-- M81-RESULTS -->
+
 ## Screen-by-screen audit
 
 ### Sign in (AuthView)
