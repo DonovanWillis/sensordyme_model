@@ -8,6 +8,10 @@ The code for both sides is `core/command_auth.py`.
 **Status: simulator-verified only.** It is tested end to end on a Mac and on
 oryn: the real uplink against the real backend app (`tests/test_command_auth_*.py`).
 It has not run on a Pi or a deployed backend, and no key has been rotated.
+M8 additions (replay state that survives a restart, signed clock answers,
+revocation the app can see, and per-device enforcement) are tested in
+`tests/test_m8_security_*.py`. They were also run live against uvicorn
+backends (`docs/SECURITY_REVIEW_M6.md` §5).
 
 ## 1. Threats addressed
 
@@ -54,8 +58,11 @@ Header: `X-SD-Auth: sd-auth-v1 kid=<16 hex>,ts=<unix s>,nonce=<32 hex>,sig=<64 h
 * The device serialises the JSON body itself and signs those exact bytes.
 * The backend looks the device up by `kid`, either current or previous key. It
   then checks the tag, then `|ts − backend clock| ≤ 300 s`, then that the nonce
-  is new. Nonces are kept for 600 s and the cache is bounded at 50,000 entries,
-  per process.
+  is new. Nonces are kept in the backend database (table `auth_nonces`, M8) for
+  600 s and bounded at 1,000,000 rows. A backend restart therefore does not
+  reopen the replay window, and every process on the same database shares them.
+  (Until M8 they lived in process memory: a request captured up to 300 s before
+  a restart was accepted again after it.)
 * In `required` mode the request carries **no** `X-Device-Key`.
 
 ## 4. Command envelope (backend → device)
@@ -100,6 +107,17 @@ sig = HMAC(command-mac, "sd-auth-v1\ncommand\nkid\ndev\ntypes(comma)\nbody_sha25
   system clock, and never used to judge commands. A forged `server_time` can
   only cause refusals, which is denial of service, and an on-path attacker can
   do that anyway.
+* **The time in a `clock_skew` answer is signed (M8).** The answer carries
+  `clock_auth = {"v", "kid", "rn", "t", "sig"}`, where
+  `sig = HMAC(command-mac, "sd-auth-v1\nclock\n<kid>\n<rn>\n<t>")`. `rn` is the
+  refused request's nonce. The backend can always sign it, because the tag is
+  checked before the clock. A `required` device adopts `t` only when this
+  verifies. Otherwise it keeps its own clock and says why once
+  (`unsigned_clock`, `bad_signature`, `stale_response`, …). Before M8, the
+  plain `server_time` was adopted as is. An on-path attacker could then push
+  the device's request timestamps into the future, hold the signed requests,
+  and deliver them later inside the window, with nonces the backend had never
+  seen. `server_time` is still sent, for older devices.
 * M6's protection-id memory (`_accept_protection`, 64 ids) still applies, so a
   re-delivered stop is not applied twice.
 
@@ -117,6 +135,31 @@ Rotation is an operator procedure. **No key has been rotated by this work.**
 3. `python cloud/manage.py revoke-previous-key <device id>` closes the
    rotation. A device can also refuse a key id locally with
    `cloud.revoked_key_ids: [<kid>]`.
+
+**Revocation (M8).**
+* A revoked key is remembered in `revoked_device_keys`. Nothing that grants
+  access reads that table. A request made with a revoked key, signed or bearer,
+  is refused as `device_auth_revoked_key` instead of `unknown_key` or
+  `invalid device key`. The refusal is attributed to the device only when the
+  request proves it holds that key, either a valid tag or the exact bearer key.
+* `python cloud/manage.py revoke-device <device id>` refuses every request from
+  the device (`device_auth_revoked_device`), and revokes its previous key too.
+  It therefore cannot ingest, and it receives no command, because commands
+  travel only in ingest answers.
+* `rotate-key` on a revoked device re-instates it with a fresh key. The revoked
+  key stays refused.
+* **The app sees it.** `GET /v1/devices` carries
+  `credentials: {state, auth, signature_required, refusal}`:
+  * `state` is `accepted`, `refused`, `revoked` or `unknown`;
+  * `auth` is how the device last authenticated, `signed` or `bearer`;
+  * `refusal` is `{reason, detail, at}`.
+  
+  A stale device's `status.reasons` also names the refusal. Only refusals that
+  prove the key holder is calling are recorded: `revoked_key`,
+  `revoked_device`, `clock_skew` (the tag was valid) and `signature_required`
+  (the bearer key matched). A forged tag under a public kid is never recorded.
+  A refusal disappears once a later report is accepted. Writes are limited to
+  one per device per reason per minute.
 
 Legacy bearer auth (`off`/`permissive` devices) uses only the current key, so
 for such a device steps 1–2 must be done together.
@@ -148,8 +191,30 @@ An unknown value fails closed: it is treated as `required`.
 
 An unknown value stops the server at import.
 
+**Per device (M8).** Run `python cloud/manage.py require-signed <device id>`.
+That device must then sign whatever the backend mode is. A per-device setting
+can only tighten the backend mode, never loosen it. The command is refused
+until the device has been seen signing (`credentials.auth == "signed"`),
+unless `--force` is given. `allow-bearer <device id>` undoes it. Before M8,
+enforcement was all or nothing on the backend.
+
 **Compatibility:** every existing device and backend keeps working with both
 defaults. A legacy request, with no nonce, gets the exact legacy response.
+
+M8 checked this live: real uvicorn backends, with virtual devices over HTTP.
+Every pairing was run: device {11c524c, M8} × {no setting, off, permissive,
+required}, against backend {11c524c, M8} × {off, permissive, required}, plus
+M8 permissive with a per-device `required`. Evidence is in
+`~/sensordyme-audit/2026-11-10/m8-evidence/security/compat_matrix.json`.
+Every cell behaves identically on old and new code except one, which is
+deliberate:
+
+* An M8 `required` device behind an 11c524c backend still works. But it can no
+  longer recover from a clock more than 300 s off, because that backend's
+  `clock_skew` answer is unsigned.
+* Migration step 1 (backend first) avoids this pairing.
+* An 11c524c `required` device behind an M8 backend recovers as before, using
+  `server_time`.
 
 **Production gate:** `scripts/deploy_preflight.py` refuses a device config
 with `command_auth: off` and warns on `permissive`. The production target is
@@ -174,7 +239,9 @@ reason, and counted in `CloudUplink.command_auth_rejections`.
 `malformed`, `unsupported_version`, `unknown_key`, `revoked_key`,
 `bad_signature`, `wrong_device`, `stale_response`, `type_mismatch`,
 `body_mismatch`, `duplicate_command`, `missing_signature`, `no_usable_key`,
-`clock_skew`, `replayed_nonce`, `signature_required`, `disabled`.
+`clock_skew`, `replayed_nonce`, `signature_required`, `disabled`,
+`revoked_device` (M8, backend), and `unsigned_clock` (M8, device: a
+`clock_skew` time it would not adopt).
 
 **Logging rule** (enforced by tests): no device key, derived key or tag is
 ever logged, printed, put in an exception message or shown in a repr.
@@ -185,9 +252,20 @@ ever logged, printed, put in an exception message or shown in a repr.
   blocker 3). Hashing it at rest is incompatible with HMAC verification. The
   next step is an asymmetric scheme (Ed25519 via `cryptography`, which is not
   a dependency today) or a KMS-held key.
-* The nonce cache is in memory, per process. A multi-process backend would
-  need a shared store. A restart forgets nonces, but the ±300 s window still
-  bounds replay.
+* Request nonces are in the backend's SQLite database (M8), so they survive a
+  restart and are shared by processes on one database. A backend on several
+  hosts would need a shared store. At the 1,000,000 bound, the oldest unexpired
+  nonces are evicted, with a warning. That takes more than 1,600 signed
+  requests a second.
+* The device keeps no replay state on disk, and needs none. A command envelope
+  is bound to the nonce of the request it answers, and nonces are random per
+  request, so an envelope captured before a device restart answers a request
+  the restarted device never sends. Tested in
+  `tests/test_m8_security_device.py` and `tests/test_m8_security_e2e.py`.
+* `permissive` devices still obey an unsigned command. An on-path attacker can
+  strip the envelope. Setting that device's own `cloud.command_auth: required`
+  closes this. The backend's per-device `required` (§7) then also stops its
+  bearer key from being accepted, one device at a time.
 * The iOS app does not take part in this contract. App → backend stays JWT
   over HTTPS.
 * `/v1/ingest` is the only device endpoint. Any new device endpoint must use

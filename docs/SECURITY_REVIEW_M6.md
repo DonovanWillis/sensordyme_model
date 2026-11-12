@@ -64,3 +64,61 @@ Verified existing controls, re-asserted by the M6 tests:
 6. Disk encryption for secrets and personal data, or an explicit, documented acceptance of the physical-access risk.
 
 None of these can be closed by a device-only software change verified on a Mac.
+
+## 5. Mission 8 review (security hardening and compatibility)
+
+Branch `m8/security`, from `11c524c` (M0.1…M7). Scope:
+
+* device auth (`core/command_auth.py`, uplink verification);
+* backend auth, claim and ingest verification (`cloud/app.py`, `cloud/manage.py`, `cloud/ratelimit.py`);
+* credential storage;
+* a review of BLE proof of possession, which belongs to the onboarding stream.
+
+Each fix has a test that fails on `11c524c`. Evidence is in
+`~/sensordyme-audit/2026-11-10/m8-evidence/security/`:
+
+* the repro outputs;
+* `compat_matrix.json`, with 56 live cells;
+* `e2e_transitions.json`, the two scenarios against a live uvicorn backend.
+
+| # | Finding | Severity | Fix | Proving tests |
+|---|---|---|---|---|
+| M8-1 | The backend kept sd-auth-v1 request nonces in process memory. A captured signed request was accepted again after a backend restart, within ±300 s. Reproduced: `200` after a restart, where the same process answers `401 replayed_nonce`. | Medium | Nonces are stored in the `auth_nonces` table. `INSERT OR IGNORE` on the primary key is the atomic test-and-set. Rows are pruned after 600 s, and the table is bounded at 1 M rows. The store is shared across processes. | `tests/test_m8_security_backend.py::test_a_captured_request_is_refused_after_a_backend_restart[permissive,required]`, `::test_stored_nonces_are_pruned…`, `::test_the_stored_nonces_are_bounded`; E2E 2d/2e |
+| M8-2 | A `required` device adopted the unsigned `server_time` of any `clock_skew` answer. An on-path attacker (plain `http://`) could skew the device's request timestamps forward, hold the signed requests, and deliver them later as fresh, for example to fake heartbeats while the device is cut off. | Medium (http only; TLS covers it) | `clock_auth`: the backend signs its time with the command key, bound to the refused request's nonce. The device adopts only a verified time. | `tests/test_m8_security_device.py::test_an_unsigned_clock_answer_is_not_adopted`, `::test_a_forged_or_replayed_clock_answer_is_not_adopted` (4), `::test_a_signed_clock_answer_is_adopted…`; `tests/test_command_auth_uplink.py::test_a_clock_skew_refusal_teaches_the_request_clock_only` (updated to the signed form) |
+| M8-3 | Revocation was not visible. A revoked previous key got `unknown_key` or `invalid device key`, and the app showed only "offline" after 30 s. There was no way to revoke a device's current credential short of rotating it to a key nobody holds. | Medium (truthfulness, ops) | Revoked keys are remembered, giving `device_auth_revoked_key`. `manage.py revoke-device` refuses every request, giving `device_auth_revoked_device`, and `rotate-key` re-instates the device. `GET /v1/devices` gains `credentials`, and a stale status names the refusal. Only refusals proven to come from the key holder are recorded. | `tests/test_m8_security_backend.py::test_a_revoked_previous_key_is_refused_as_revoked_and_the_app_is_told`, `::test_a_forged_tag_under_a_revoked_kid_is_not_reported_against_the_device`, `::test_a_revoked_device_cannot_ingest_or_receive_commands_until_reissued`; E2E 1e/1f |
+| M8-4 | `required` could only be enforced for the whole backend. | Low (migration) | `devices.auth_mode`, set with `manage.py require-signed` or `allow-bearer`. It only tightens, and is refused until the device has been seen signing (`--force` overrides). | `::test_signed_requests_can_be_required_for_one_device`, `::test_a_device_cannot_loosen_a_required_backend`; matrix rows `new/permissive+device-required` |
+| M8-5 | Claim-code guessing was limited per address only. One account rotating addresses had no limit, for example a botnet, or a trusted proxy header naming a new client each time. | Low (48-bit codes) | `CLAIM_FAILURE_LIMITER`: 20 failed claims per account per hour. Only unknown codes and devices owned by another account count. | `::test_claim_guessing_is_limited_per_account_across_addresses`, `::test_a_successful_claim_is_not_a_failure_and_another_account_is_refused` |
+| M8-6 | An existing backend JWT secret file kept whatever mode it had (for example 0644 after a restore). Anyone who can read it can forge sessions. | Low (local) | The file is set to 0600 at startup, with a warning. | `::test_an_existing_jwt_secret_file_is_made_owner_only` |
+| M8-7 | `scripts/migrate_device_key.py` printed PyYAML's traceback for a config that does not parse. The traceback quotes the offending line, which can be the device key. | Low (operator terminal) | The script refuses with line and column only. | `tests/test_m8_security_credentials.py` (3) |
+
+Re-verified with tests that pass on both `11c524c` and M8, kept as regression pins:
+
+* A captured signed command is refused after a device restart (`stale_response`), with no on-disk replay state. The `rn` binding and per-request random nonces make that state unnecessary.
+* One device key cannot fetch or sign another device's commands.
+* Old backends that never sign are still obeyed by `off` and `permissive` devices.
+
+Unchanged by design, and documented:
+
+* `permissive` obeys a stripped envelope. Use device `required` for that.
+* Device keys are stored in plaintext in SQLite (symmetric scheme).
+* The claim code is never rotated. No unclaim or transfer endpoint exists, so re-claim is limited to the same account (idempotent) and a 409 for another account. Any future transfer endpoint must rotate the claim code.
+
+**Compatibility.** The full matrix is in `docs/DEVICE_AUTH_CONTRACT.md` §7. Old and new code behave identically in every cell except one. An M8 `required` device behind an 11c524c backend cannot recover from a clock more than 300 s off. This follows from M8-2 and is avoided by the backend-first migration order. No migration is enforced, no default changed, and no key rotated.
+
+**Onboarding stream (review only, not changed here).** `services/ble_pop.py` `load_setup_code` turns only lstat/format problems into `SetupCodeError`. An unreadable code file (mode 0000 owned by the service) or a non-ASCII one raises `PermissionError` or `UnicodeDecodeError`. `services/provisioning.py._open_ble_window` catches only `(SetupCodeError, ImportError)`, so the provisioning thread dies (`_guarded_run`: "crashed") instead of retrying with Bluetooth closed. The failure is closed, so it is not a bypass, but it is an availability defect. The suggested fix is to wrap the open/read in `except (OSError, UnicodeDecodeError) as exc: raise SetupCodeError(...) from None`. The rest of the protocol review found no defect:
+
+* one guess per challenge;
+* a device-held lockout capped at 1 h;
+* the device proves itself before credentials are sent;
+* a fixed PBKDF2 cost;
+* no code or tag in logs;
+* a 0600 / no-symlink / owner check, and an O_EXCL+link write.
+
+The documented limits stand: offline guessing from a recorded session, a lockout that resets on power cycle, and a default of `auth: legacy` outside `deployment: production`.
+
+**Still needs hardware.** Everything in §4, plus the following:
+
+* sd-auth-v1 and `clock_auth` on a Pi with no RTC and a real NTP-less boot;
+* the `auth_nonces` write cost at fleet poll rates on the deployed backend;
+* BLE PoP over a physical link;
+* `revoke-device` and `require-signed` exercised on a deployed backend.
