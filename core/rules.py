@@ -461,6 +461,8 @@ class _DwellTrack:
     cx: float
     cy: float
     diagonal: float
+    #: The shared tracker's id (core/tracking.py) when the box carried one.
+    track_id: Optional[int] = None
 
 
 class _DwellWatcher:
@@ -477,6 +479,13 @@ class _DwellWatcher:
     Box matching, not re-identification: two people crossing paths inside the
     zone can swap clocks. That is bounded (no clock exceeds the longer of the
     two real visits) and stated in the policy's explanation.
+
+    When the boxes carry the shared tracker's ids (M8, core/perception.py), a
+    box is matched to the visit with ITS track id instead -- the device's one
+    tracker decides who is who, and this watcher keeps only the clocks. Boxes
+    without an id keep the nearest-centre matching above, among visits that
+    have no id either. The grace (a gap of up to 1 s keeps the clock) is the
+    same either way.
     """
 
     def __init__(self) -> None:
@@ -486,22 +495,37 @@ class _DwellWatcher:
         """Forget every visit (outside the rule's hours, or its zone is gone)."""
         self._tracks = []
 
-    def observe(self, boxes: list, now: float) -> float:
+    def observe(self, boxes: list, now: float, track_ids: Optional[list] = None) -> float:
         """Feed this frame's in-zone boxes; return the longest current visit (s).
 
-        Only subjects seen in THIS frame count toward the answer: a visit in
-        its occlusion grace keeps its clock but does not, on its own, hold the
-        condition true.
+        `track_ids`, when given, is the shared tracker's id for each box (None
+        for a box no tracker followed). Only subjects seen in THIS frame count
+        toward the answer: a visit in its occlusion grace keeps its clock but
+        does not, on its own, hold the condition true.
         """
         self._tracks = [t for t in self._tracks if now - t.last_seen <= _DWELL_GRACE_S]
         unmatched = list(self._tracks)
         longest = 0.0
-        for box in boxes:
+        ids = list(track_ids) if track_ids is not None and len(track_ids) == len(boxes) else [None] * len(boxes)
+        for box, track_id in zip(boxes, ids, strict=True):
             cx, cy, diagonal = _centre_and_diagonal(box)
             if diagonal <= 0:
                 continue
+            if track_id is not None:
+                best = next((t for t in unmatched if t.track_id == track_id), None)
+                if best is None:
+                    best = _DwellTrack(entered=now, last_seen=now, cx=cx, cy=cy, diagonal=diagonal,
+                                       track_id=track_id)
+                    self._tracks.append(best)
+                else:
+                    unmatched.remove(best)
+                    best.last_seen, best.cx, best.cy, best.diagonal = now, cx, cy, diagonal
+                longest = max(longest, now - best.entered)
+                continue
             best, best_distance = None, None
             for track in unmatched:
+                if track.track_id is not None:
+                    continue
                 allowed = max(_DWELL_MIN_SHIFT, _DWELL_MAX_SHIFT_PER_S * (now - track.last_seen))
                 distance = math.hypot(cx - track.cx, cy - track.cy) / max(diagonal, track.diagonal)
                 if distance <= allowed and (best_distance is None or distance < best_distance):
@@ -778,7 +802,13 @@ class RuleEngine:
                 continue
 
             if rule.dwell_s is not None:
-                active = self._dwell_active(rule, in_zone if in_hours and zone is not None else None, now)
+                track_ids = None
+                if zone is not None:
+                    track_ids = [d.track_id for d in frame.detections
+                                 if d.label == rule.detection and d.box is not None
+                                 and zone.contains_box(d.box, frame.width, frame.height)]
+                active = self._dwell_active(rule, in_zone if in_hours and zone is not None else None, now,
+                                            track_ids)
             else:
                 active = self._evaluate(rule, frame, seen, boxes, zone_bound, zone, in_zone, now)
             if active and not in_hours:
@@ -855,7 +885,8 @@ class RuleEngine:
         engine's, else the device's local time."""
         return _minute_of_day(stamp, rule.timezone or self._timezone)
 
-    def _dwell_active(self, rule: ConfiguredRule, in_zone: Optional[list], now: float) -> bool:
+    def _dwell_active(self, rule: ConfiguredRule, in_zone: Optional[list], now: float,
+                      track_ids: Optional[list] = None) -> bool:
         """Whether one subject has now been inside the rule's zone for dwell_s.
 
         `in_zone` None means the rule cannot observe at all right now (outside
@@ -868,7 +899,7 @@ class RuleEngine:
         if in_zone is None:
             watcher.interrupt()
             return False
-        return watcher.observe(in_zone, now) >= (rule.dwell_s or 0.0)
+        return watcher.observe(in_zone, now, track_ids) >= (rule.dwell_s or 0.0)
 
     def _boxes_in_zone(self, zone_name: str, boxes, frame_size) -> list:
         zone = self._zones.get(_zone_key(zone_name))
