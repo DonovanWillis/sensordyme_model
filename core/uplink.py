@@ -28,6 +28,7 @@ from typing import Any, Optional
 from urllib.parse import urlsplit
 
 from core import command_auth as auth
+from core import health_stamp
 
 #: Upper bound on the backlog. It must not exceed the backend's MAX_INGEST_EVENTS
 #: (cloud/app.py): the whole backlog goes up in one POST, so a queue larger than
@@ -446,18 +447,26 @@ class CloudUplink:
         vcgencmd); a stop, a resume or a monitoring failure must not wait for the
         next one, or the app shows the old state beside a newer pushed one. Only
         the three monitoring keys change; the rest of the sample is kept.
+
+        The sample keeps its generation and its age (M8.1, core/health_stamp.py):
+        only its `revision` rises, so the backend stores the newer monitoring
+        keys without taking them as a newer sample. Freshness never improves
+        from a partial update.
         """
         with self._lock:
             if isinstance(self._health, dict):
-                self._health = {**self._health, "monitoring": monitoring,
-                                "monitoring_active": monitoring_active, "protection": protection}
+                self._health = health_stamp.revised(
+                    {**self._health, "monitoring": monitoring,
+                     "monitoring_active": monitoring_active, "protection": protection})
 
     def set_health(self, report: Optional[dict]) -> None:
         """Latest device health, sent with the next sync.
 
         Held as a snapshot rather than collected inside the worker so the health
         read happens on the runtime's own thread, where the frame bus, capture
-        service and Wi-Fi manager actually live.
+        service and Wi-Fi manager actually live. The snapshot carries the stamp
+        it was generated with (services/runtime.py `_collect_health`); every
+        sync re-sends it with its current age until a new one is set (M8.1).
         """
         with self._lock:
             self._health = report
@@ -568,6 +577,10 @@ class CloudUplink:
                 zones_version = self._zones_version
                 health = self._health
                 monitoring = self._monitoring
+            # How old the held sample is NOW, by this process's monotonic clock
+            # (M8.1): a snapshot that stopped being refreshed is re-sent with a
+            # growing age instead of passing for current. No wall clock needed.
+            health = health_stamp.with_send_age(health, time.monotonic())
             # 1) push events (an empty batch doubles as the online heartbeat)
             payload = _json_safe({
                 "events": batch,

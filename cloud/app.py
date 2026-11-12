@@ -60,6 +60,7 @@ from cloud.ratelimit import (
     SIGNUP_LIMITER,
 )
 from core import command_auth as sd_auth
+from core import health_stamp
 from core.presets import (
     SETTINGS_SEPARATOR,
     PresetError,
@@ -575,6 +576,21 @@ def init_db() -> None:
             # an earlier request for the same name must not cancel a new one.
             # Compared by content, not by clock -- the device's clock is its own.
             "ALTER TABLE devices ADD COLUMN rejection_baseline TEXT",
+            # Health freshness (M8.1, core/health_stamp.py): which sample the stored
+            # `health` is (boot id, generation, revision), when the BACKEND first
+            # received that generation, when the device observed it (on the
+            # backend's clock: received_at - the device's own monotonic age), how
+            # many times the same sample was re-sent, the boot ids already
+            # superseded by a reboot (JSON list), and the last report refused as
+            # older than the stored one (JSON {reason, at, boot_id, generation}).
+            "ALTER TABLE devices ADD COLUMN health_boot TEXT",
+            "ALTER TABLE devices ADD COLUMN health_generation INTEGER",
+            "ALTER TABLE devices ADD COLUMN health_revision INTEGER",
+            "ALTER TABLE devices ADD COLUMN health_received_at REAL",
+            "ALTER TABLE devices ADD COLUMN health_observed_at REAL",
+            "ALTER TABLE devices ADD COLUMN health_repeats INTEGER DEFAULT 0",
+            "ALTER TABLE devices ADD COLUMN health_boots TEXT",
+            "ALTER TABLE devices ADD COLUMN health_ignored TEXT",
         ):
             try:
                 conn.execute(statement)
@@ -794,11 +810,147 @@ def _health_payload(row: sqlite3.Row, now: float) -> Optional[dict]:
     last_seen = row["last_seen"]
     if not last_seen or now - last_seen >= _HEALTH_STALE_S:
         return None
+    # A device still polling is not proof the report is current (M8.1): a
+    # sample that stopped being refreshed is withheld like a silent device's.
+    if _health_freshness(row, now)["state"] == "stale":
+        return None
     try:
         report = json.loads(row["health"] or "null")
     except (ValueError, TypeError):
         return None
     return report if isinstance(report, dict) else None
+
+
+#: Boot ids remembered as superseded, so a delayed report from before a reboot
+#: is not taken for yet another reboot.
+_HEALTH_BOOTS_KEPT = 8
+
+_HEALTH_COLUMNS = ("health_boot", "health_generation", "health_revision", "health_received_at",
+                   "health_observed_at", "health_repeats", "health_boots")
+
+
+def _health_decision(stored: dict, health: dict, now: float) -> tuple[str, dict]:
+    """What a reported health sample does to the stored one (M8.1).
+
+    `stored` holds the _HEALTH_COLUMNS of the device row. Returns the outcome and
+    the columns to write (`health` itself only when the content is stored):
+
+      new          a newer generation of the current boot (or the first sample)
+      reboot       a boot id never seen before: the generation restart is accepted
+      revised      the same sample with newer monitoring keys: content stored, age kept
+      repeat       the same sample again: nothing new, it keeps ageing
+      out_of_order an older generation or revision of the current boot: ignored
+      retired_boot a report from a boot a reboot already superseded: ignored
+      invalid      a stamp that cannot be trusted: ignored, so it never refreshes
+      unverified   no stamp (firmware before M8.1): stored, freshness unknown
+
+    Ages are on the backend's clock only: receipt time minus the age the device
+    measured on its monotonic clock. The device's wall clock is never used.
+    """
+    try:
+        stamp = health_stamp.parse(health)
+    except health_stamp.StampError as exc:
+        return "invalid", {"health_ignored": json.dumps({"reason": "invalid", "detail": str(exc)[:120],
+                                                         "at": now, "boot_id": None, "generation": None})}
+    content = json.dumps(_finite(health))
+    if stamp is None:
+        return "unverified", {"health": content, "health_boot": None, "health_generation": None,
+                              "health_revision": None, "health_received_at": now,
+                              "health_observed_at": None, "health_repeats": 0}
+
+    def ignored(reason: str) -> tuple[str, dict]:
+        return reason, {"health_ignored": json.dumps({"reason": reason, "at": now, "boot_id": stamp.boot_id,
+                                                      "generation": stamp.generation})}
+
+    observed = now - (stamp.age_s or 0.0)
+    try:
+        retired = json.loads(stored.get("health_boots") or "[]")
+    except (TypeError, ValueError):
+        retired = []
+    retired = [b for b in retired if isinstance(b, str)] if isinstance(retired, list) else []
+    current = stored.get("health_boot")
+    new_sample = {"health": content, "health_boot": stamp.boot_id, "health_generation": stamp.generation,
+                  "health_revision": stamp.revision, "health_received_at": now,
+                  "health_observed_at": observed, "health_repeats": 0}
+    if stamp.boot_id in retired:
+        return ignored("retired_boot")
+    if current is None:
+        return "new", new_sample
+    if stamp.boot_id != current:
+        retired = [*retired, current][-_HEALTH_BOOTS_KEPT:]
+        return "reboot", {**new_sample, "health_boots": json.dumps(retired)}
+    generation, revision = stored.get("health_generation") or 0, stored.get("health_revision") or 0
+    if stamp.generation > generation:
+        return "new", new_sample
+    if stamp.generation < generation or stamp.revision < revision:
+        return ignored("out_of_order")
+    # The earliest estimate wins: another copy can only make the sample older.
+    stored_observed = stored.get("health_observed_at")
+    kept = min(observed, stored_observed) if isinstance(stored_observed, (int, float)) else observed
+    if stamp.revision > revision:
+        return "revised", {"health": content, "health_revision": stamp.revision, "health_observed_at": kept}
+    return "repeat", {"health_observed_at": kept, "health_repeats": (stored.get("health_repeats") or 0) + 1}
+
+
+def _store_health(conn: sqlite3.Connection, device_id: int, health: Optional[dict], now: float) -> str:
+    """Apply a reported health sample to the device row; returns the outcome (M8.1).
+
+    Called after ingest's first write, so this connection already holds the
+    database's write lock: two overlapping polls from one device (a timed-out
+    request still being served when the retry arrives) cannot both read the
+    same stored generation.
+    """
+    if health is None:
+        return "none"
+    stored = conn.execute(f"SELECT {', '.join(_HEALTH_COLUMNS)} FROM devices WHERE id = ?",  # noqa: S608 - fixed names
+                          (device_id,)).fetchone()
+    outcome, updates = _health_decision(dict(stored) if stored is not None else {}, health, now)
+    if updates:
+        assignments = ", ".join(f"{name} = ?" for name in updates)
+        conn.execute(f"UPDATE devices SET {assignments} WHERE id = ?",  # noqa: S608 - fixed names
+                     (*updates.values(), device_id))
+    if outcome in ("out_of_order", "retired_boot", "invalid"):
+        log.info("ingest: health report from device %s not applied (%s)", device_id, outcome)
+    return outcome
+
+
+def _health_freshness(row: sqlite3.Row, now: float) -> dict:
+    """How current the stored health is as evidence (M8.1, status `health_freshness`).
+
+    Separate from link liveness (`last_seen`): a device can poll every 2 s while
+    re-sending a sample minutes old. `fresh`/`stale` only for a stamped sample;
+    `unverified` for firmware that does not stamp (judged by the link alone, as
+    before M8.1); `absent` when no health was ever stored.
+    """
+    keys = row.keys()
+
+    def col(name: str):
+        return row[name] if name in keys else None
+
+    try:
+        stored = json.loads(row["health"] or "null")
+    except (ValueError, TypeError):
+        stored = None
+    out: dict = {"state": "absent", "verified": False, "age_s": None, "threshold_s": _HEALTH_STALE_S,
+                 "observed_at": None, "received_at": _reported_at(col("health_received_at")),
+                 "device_generated_at": None, "boot_id": None, "generation": None,
+                 "repeats": int(col("health_repeats") or 0),
+                 "last_ignored": _loads_dict(col("health_ignored")) or None}
+    if not isinstance(stored, dict):
+        return out
+    try:
+        stamp = health_stamp.parse(stored)
+    except health_stamp.StampError:
+        stamp = None
+    observed = _reported_at(col("health_observed_at"))
+    if stamp is None or col("health_boot") != stamp.boot_id or observed is None:
+        out["state"] = "unverified"
+        return out
+    age = max(0.0, now - observed)
+    out.update(state="fresh" if age < _HEALTH_STALE_S else "stale", verified=True, age_s=round(age, 1),
+               observed_at=observed, device_generated_at=stamp.generated_wall, boot_id=stamp.boot_id,
+               generation=stamp.generation)
+    return out
 
 
 def _rules_version(ai_rules_json: Optional[str], activation: int = 0) -> str:
@@ -1222,7 +1374,14 @@ def _device_status(row: sqlite3.Row, now: float) -> dict:
     is a photograph of a moment that has passed.
     """
     last_seen = row["last_seen"]
-    stale = not last_seen or now - last_seen >= _HEALTH_STALE_S
+    link_stale = not last_seen or now - last_seen >= _HEALTH_STALE_S
+    # M8.1: a successful poll is not proof the device is monitoring. A device
+    # that keeps polling while its health sample stops being refreshed is
+    # reachable (link_stale false) on stale evidence (health_stale true), and
+    # `stale` -- what every claim below is gated on -- covers both.
+    freshness = _health_freshness(row, now)
+    health_stale = freshness["state"] == "stale"
+    stale = link_stale or health_stale
     # A live device that sends no health at all (older software) is not stale:
     # it is "unknown" below for its own reason.
     health = None if stale else _health_payload(row, now)
@@ -1251,10 +1410,14 @@ def _device_status(row: sqlite3.Row, now: float) -> dict:
     protection_reasons: list[str] = []
     if stale:
         state, protection, active = "unknown", "unknown", None
-        reasons = [
-            "the device has not reported yet" if not last_seen
-            else f"no report from the device in the last {_HEALTH_STALE_S} s"
-        ]
+        if link_stale:
+            reasons = [
+                "the device has not reported yet" if not last_seen
+                else f"no report from the device in the last {_HEALTH_STALE_S} s"
+            ]
+        else:
+            reasons = [("the device is connected, but its monitoring status has not been updated for "
+                        f"{int(freshness['age_s'] or 0)} s")]
         refused = _credential_refusal(row)
         if refused is not None:
             reasons.append(refused["detail"])
@@ -1328,6 +1491,10 @@ def _device_status(row: sqlite3.Row, now: float) -> dict:
         "actuators": None if stale else _bounded_dicts(live_monitoring.get("actuators"), _ACTUATOR_KEYS),
         "stale": stale,
         "reported_at": _reported_at(row["last_seen"]),
+        # M8.1: the two halves of `stale`, and how old the evidence itself is.
+        "link_stale": bool(link_stale),
+        "health_stale": health_stale,
+        "health_freshness": freshness,
     }
 
 
@@ -4276,17 +4443,20 @@ def ingest(body: IngestBody, background_tasks: BackgroundTasks, request: Request
             )
         conn.execute(
             "UPDATE devices SET last_seen = ?, active_preset = COALESCE(?, active_preset),"
-            " health = COALESCE(?, health), monitoring = COALESCE(?, monitoring),"
+            " monitoring = COALESCE(?, monitoring),"
             " hardware_id = COALESCE(?, hardware_id) WHERE id = ?",
             (
                 now,
                 reported_preset,
-                json.dumps(_finite(body.health)) if body.health is not None else None,
                 json.dumps(_finite(body.monitoring)) if body.monitoring is not None else None,
                 hardware_id,
                 device["id"],
             ),
         )
+        # `last_seen` is link liveness only. The health sample is judged by its
+        # own stamp (M8.1): a re-sent or older sample never passes for a new one.
+        # Never a reason to refuse the poll -- its events are stored below.
+        _store_health(conn, device["id"], body.health, now)
         owner = (
             conn.execute("SELECT * FROM users WHERE id = ?", (device["owner_id"],)).fetchone()
             if device["owner_id"]

@@ -17,7 +17,12 @@ import Foundation
 ///   * `status.stale` could say "no report in 30 s" while the presence pill,
 ///     reading only `online`, said ONLINE beside a "Status unknown" pill;
 ///   * the device list's "N ONLINE" count ignored even the failed-refresh rule
-///     the cards used.
+///     the cards used;
+///   * (M8.1) a device that kept polling while re-sending a frozen health
+///     sample was ONLINE with "All clear": a successful poll proves the link,
+///     not the monitoring. `status.health_stale` now makes it
+///     `monitoringStale`: reachable, but nothing it says about monitoring is
+///     current.
 ///
 /// Every screen asks this, so the list, the card, the device screen and the
 /// sheets cannot disagree about the same reply. Foundation only, so
@@ -34,6 +39,11 @@ enum ConnectionTruth {
         /// The backend says the device has not reported recently. `age` is the
         /// time since its last report; nil when it never has.
         case offline(age: TimeInterval?)
+        /// M8.1: the device is reachable (it polled within the live window), but
+        /// the health sample it sends has not been updated for `age` seconds
+        /// (nil when the backend gave no age), so whether it is monitoring is
+        /// unknown. Never online, never "All clear".
+        case monitoringStale(age: TimeInterval?)
         /// The app cannot tell: the latest refresh failed, or the reply it has
         /// is too old to speak for now.
         case unknown(UnknownReason)
@@ -62,6 +72,13 @@ enum ConnectionTruth {
         /// When the phone received the reply. nil for a value that was never
         /// fetched (a preview, a hand-built demo) — then only the flags count.
         var receivedAt: Date?
+        /// M8.1 `status.link_stale`: no poll in the live window. nil from an
+        /// older backend; then `stale` speaks for the link, as before.
+        var linkStale: Bool? = nil
+        /// M8.1 `status.health_stale`: polling, but the health evidence is old.
+        var healthStale: Bool? = nil
+        /// M8.1 `status.health_freshness.age_s` when the reply was built.
+        var healthAge: Double? = nil
     }
 
     /// The backend's window (`_HEALTH_STALE_S` in cloud/app.py); DevicePresence
@@ -87,8 +104,17 @@ enum ConnectionTruth {
         // (the phone is behind the backend) reads as "just now".
         let age = reading.lastSeen.map { max(0, now.timeIntervalSince1970 - $0) }
         guard reading.online else { return .offline(age: age) }
-        if reading.stale == true { return .stale(age: age ?? liveWindow) }
+        let healthStale = reading.healthStale == true
+        // An older backend has only `stale`, which then means the link.
+        let linkStale = reading.linkStale ?? (reading.stale == true && !healthStale)
+        if linkStale { return .stale(age: age ?? liveWindow) }
         if let age, age > liveWindow + clockTolerance { return .stale(age: age) }
+        if healthStale {
+            // The backend's age plus how long the phone has held the reply.
+            let held = reading.receivedAt.map { max(0, now.timeIntervalSince($0)) } ?? 0
+            return .monitoringStale(age: reading.healthAge.map { max(0, $0) + held })
+        }
+        if reading.stale == true { return .stale(age: age ?? liveWindow) }
         return .online
     }
 
@@ -99,6 +125,7 @@ enum ConnectionTruth {
         switch presence {
         case .online: "Online"
         case .stale: "Stale"
+        case .monitoringStale: "Stale"
         case .offline: "Offline"
         case .unknown: "Unknown"
         }
@@ -112,6 +139,10 @@ enum ConnectionTruth {
             return nil
         case .stale(let age):
             return "No report for \(DevicePresence.duration(age)) — showing its last report"
+        case .monitoringStale(let age?):
+            return "Connected — monitoring status not updated for \(DevicePresence.duration(age))"
+        case .monitoringStale(nil):
+            return "Connected — monitoring status not confirmed"
         case .offline(let age?):
             return "Last seen \(DevicePresence.duration(age)) ago"
         case .offline(nil):
@@ -128,6 +159,9 @@ enum ConnectionTruth {
         switch presence {
         case .online: "Online"
         case .stale(let age): "Stale data, no report for \(DevicePresence.duration(age))"
+        case .monitoringStale(let age?):
+            "Connected, monitoring status not updated for \(DevicePresence.duration(age))"
+        case .monitoringStale(nil): "Connected, monitoring status not confirmed"
         case .offline(let age?): "Offline, last seen \(DevicePresence.duration(age)) ago"
         case .offline(nil): "Offline, never reported"
         case .unknown(.refreshFailed): "Unknown, the last refresh failed"
@@ -150,6 +184,10 @@ enum ConnectionTruth {
         case .stale(let age):
             return "Its last report is \(DevicePresence.duration(age)) old, so what you see here may no longer "
                 + "be true. Check it has power and Wi-Fi. Changes you make are saved and apply when it reports again."
+        case .monitoringStale(let age):
+            let since = age.map { " for \(DevicePresence.duration($0))" } ?? ""
+            return "It is connected, but its monitoring status hasn't been updated\(since), so whether it is "
+                + "watching is unknown. Any alert it sends is still delivered. If this lasts, restart the device."
         case .offline(let age?):
             return "Its status is unknown — last heard from \(DevicePresence.duration(age)) ago. Check it has "
                 + "power and Wi-Fi. Changes you make are saved and apply when it reconnects."

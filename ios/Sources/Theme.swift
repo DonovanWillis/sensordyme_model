@@ -416,7 +416,7 @@ extension SDStatus {
     init(_ presence: ConnectionTruth.Presence) {
         switch presence {
         case .online: self = .online
-        case .stale: self = .warning
+        case .stale, .monitoringStale: self = .warning
         case .offline: self = .offline
         case .unknown: self = .unknown
         }

@@ -187,5 +187,56 @@ do {
     check(CapabilityHealth.startingDetail("thermal").contains("not a failure"), "an unknown starting capability says it isn't failing")
 }
 
+print("\nM8.1: health freshness, separately from the link:")
+do {
+    let frozenJSON = """
+    {"monitoring_state": "unknown", "monitoring_active": null, "protection": "unknown",
+     "reasons": ["the device is connected, but its monitoring status has not been updated for 95 s"],
+     "stale": true, "link_stale": false, "health_stale": true, "reported_at": 1700000000.5,
+     "health_freshness": {"state": "stale", "verified": true, "age_s": 95.0, "threshold_s": 30,
+       "observed_at": 1699999905.5, "received_at": 1699999906.0, "device_generated_at": 12.0,
+       "boot_id": "9f1c2d3e4f5a6b7c", "generation": 42, "repeats": 47, "last_ignored": null}}
+    """.data(using: .utf8)!
+    let frozen = try? JSONDecoder().decode(DeviceStatus.self, from: frozenJSON)
+    check(frozen?.linkStale == false && frozen?.healthStale == true, "link_stale and health_stale decode")
+    check(frozen?.healthFreshness?.state == "stale" && frozen?.healthFreshness?.ageS == 95
+          && frozen?.healthFreshness?.repeats == 47 && frozen?.healthFreshness?.observedAt == 1699999905.5,
+          "health_freshness decodes")
+    check(frozen?.monitoringEvidenceStale == true, "the evidence is stale")
+    check(frozen?.isLive(online: true) == false, "a reachable device on stale evidence is not live")
+    let shown = present(frozen)
+    check(shown?.phase == .unknown && shown?.label == "Status unknown", "it reads Status unknown, never All clear")
+    check(shown?.detail.contains("connected, but its monitoring status has not been updated") == true,
+          "and says why in the backend's words")
+
+    // A backend that sets health_freshness but (say) loses health_stale: still not fresh.
+    var onlyFreshness = status("ready")
+    onlyFreshness.healthFreshness = .init(state: "stale", ageS: 40)
+    check(onlyFreshness.monitoringEvidenceStale && present(onlyFreshness)?.phase == .unknown,
+          "health_freshness.state stale alone is enough to stop trusting a ready")
+    var staleRows = DeviceStatus(monitoringState: "ready", capabilities: .init(available: ["face"]), stale: false)
+    staleRows.healthStale = true
+    check(CapabilityHealth.rows(status: staleRows, online: true).rows.isEmpty,
+          "no green capability rows on stale evidence")
+
+    var fresh = status("ready")
+    fresh.linkStale = false
+    fresh.healthStale = false
+    fresh.healthFreshness = .init(state: "fresh", verified: true, ageS: 3)
+    check(present(fresh)?.label == "All clear", "fresh evidence on a live link is still All clear")
+    var unverified = status("ready")
+    unverified.healthFreshness = .init(state: "unverified", verified: false)
+    check(present(unverified)?.label == "All clear", "an older device (unverified) behaves as before")
+    let oldBackend = #"{"monitoring_state": "ready", "stale": false}"#.data(using: .utf8)!
+    let old = try? JSONDecoder().decode(DeviceStatus.self, from: oldBackend)
+    check(old?.healthFreshness == nil && old?.healthStale == nil && old?.monitoringEvidenceStale == false,
+          "a backend before M8.1 decodes with the new fields absent")
+    let oddFreshness = #"{"stale": false, "health_freshness": {"state": 3, "age_s": "x"}, "health_stale": "yes"}"#
+        .data(using: .utf8)!
+    let oddDecodedFreshness = try? JSONDecoder().decode(DeviceStatus.self, from: oddFreshness)
+    check(oddDecodedFreshness != nil && oddDecodedFreshness?.healthFreshness?.state == nil
+          && oddDecodedFreshness?.healthStale == nil, "wrong-typed freshness fields are dropped, not fatal")
+}
+
 print(failures == 0 ? "\nall passed" : "\n\(failures) FAILED")
 exit(failures == 0 ? 0 : 1)

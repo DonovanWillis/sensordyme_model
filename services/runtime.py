@@ -34,7 +34,7 @@ from typing import Any, Optional, cast
 
 import cv2
 
-from core import accel, device_health, device_state, monitoring_mode, roles, sdnotify
+from core import accel, device_health, device_state, health_stamp, monitoring_mode, roles, sdnotify
 from core import monitoring_state as ms
 from core import nodes as monitoring_nodes
 from core import perception as pc
@@ -397,6 +397,9 @@ class DeviceRuntime:
         self.shutdown = threading.Event()
         self._module_lock = threading.Lock()  # guards module swaps vs. the inference loop
         self._heartbeat = 0.0  # monotonic time of the last completed inference iteration
+        #: Stamps every health snapshot where it is generated (M8.1, core/health_stamp.py):
+        #: a new boot id per process start, and a generation per sample.
+        self._health_stamper = health_stamp.HealthStamper()
         # When the heartbeat was last reset to "starting"; bounds that grace.
         self._heartbeat_reset_at = time.monotonic()
         self._inference_service: Optional[_InferenceService] = None
@@ -1084,7 +1087,16 @@ class DeviceRuntime:
         backlog = getattr(self.uplink, "backlog", None)
         if callable(backlog):
             report["uplink_backlog"] = backlog()
-        return report
+        # Stamped HERE, where the sample is taken, not where it is sent (M8.1): a
+        # snapshot re-sent unchanged keeps its generation, so the backend can tell
+        # a frozen report from a new one whatever the device's wall clock says.
+        return self._stamper().stamp(report)
+
+    def _stamper(self) -> health_stamp.HealthStamper:
+        stamper = getattr(self, "_health_stamper", None)
+        if stamper is None:  # a runtime built without __init__ (unit-test doubles)
+            stamper = self._health_stamper = health_stamp.HealthStamper()
+        return stamper
 
     def _check_saved_state(self) -> list[str]:
         """Faults in the files that carry the owner's choices across a restart.
