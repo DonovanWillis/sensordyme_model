@@ -99,8 +99,9 @@ def test_an_invalid_setting_is_refused_with_a_reason_and_nothing_changes(runtime
 def test_the_choice_survives_a_restart(runtime):
     runtime._switch_preset("probe@wait_s=3")
     assert device_state.saved_preset("m6_settings_probe") == "probe@wait_s=3"
-    name, preset, overrides = restored_preset(
-        "m6_settings_probe", {"m6_settings_probe": {}}, PRESETS)
+    restored = restored_preset("m6_settings_probe", {"m6_settings_probe": {}}, PRESETS)
+    assert restored is not None, "the saved choice must be restored"
+    name, preset, overrides = restored
     assert name == "probe@wait_s=3" and overrides == {"wait_s": 3}
     assert preset["module"] == "m6_settings_probe"
 

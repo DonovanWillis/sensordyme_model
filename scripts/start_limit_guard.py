@@ -55,7 +55,7 @@ def decide(result: str, history: list[float], now: float, *, max_reboots: int = 
     A timestamp in the future (the clock went backwards: no RTC battery, no NTP
     yet) is kept and counted -- the conservative direction.
     """
-    recent = [t for t in history if isinstance(t, (int, float)) and (t > now or now - t < window_s)]
+    recent: list[float] = [t for t in history if isinstance(t, (int, float)) and (t > now or now - t < window_s)]
     if result != TRIGGER_RESULT:
         return False, recent, f"unit result is {result or 'unknown'!r}, not {TRIGGER_RESULT!r}: no reboot"
     if len(recent) >= max_reboots:

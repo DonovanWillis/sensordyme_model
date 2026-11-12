@@ -244,8 +244,14 @@ class Stack:
 
     def token(self) -> str:
         if self._token is None:
-            _, answer = self.api("POST", "/v1/login", {"email": self.email, "password": self.password}, auth=False)
-            self._token = answer["token"]  # type: ignore[index]
+            status, answer = self.api("POST", "/v1/login", {"email": self.email, "password": self.password},
+                                      auth=False)
+            token = answer.get("token") if isinstance(answer, dict) else None
+            if not isinstance(token, str) or not token:
+                # Not a KeyError/TypeError from deep inside a request, and never a
+                # None token that would go out as "Authorization: Bearer None".
+                raise RuntimeError(f"demo login failed: HTTP {status}, {answer!r}")
+            self._token = token
         return self._token
 
     def device_id(self) -> int | None:
@@ -413,7 +419,7 @@ def control_handler(stack: Stack, app_port: AppPort, stop: threading.Event):
                 with scenario_lock:
                     answer = self._act(url.path, q)
                 self._reply(200, answer)
-            except (ValueError, KeyError) as e:
+            except (ValueError, KeyError, RuntimeError) as e:
                 self._reply(400, {"error": str(e)})
 
         def _act(self, path: str, q: dict[str, str]) -> object:

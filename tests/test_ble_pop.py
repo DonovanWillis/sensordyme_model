@@ -295,10 +295,9 @@ def test_lockout_is_capped(clock):
                          limits=Limits(max_failures=1, lockout_base_s=1000, lockout_max_s=1500))
     a.start()
     wrong = App(code="ZZZZ-ZZZZ-ZZZZ")
-    for _ in range(3):
-        reply = wrong.handshake(a)
-        clock.t += reply["retry_after_s"]
-    assert reply["retry_after_s"] == 1501
+    for _ in range(2):
+        clock.t += wrong.handshake(a)["retry_after_s"]
+    assert wrong.handshake(a)["retry_after_s"] == 1501
 
 
 def test_timeouts(auth, clock):

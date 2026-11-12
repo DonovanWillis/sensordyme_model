@@ -30,6 +30,7 @@ Reuses, does not duplicate:
 export PI=<user>@<pi-host-or-ip>      # e.g. pi@sensordyme.local. The user may NOT be `pi` (Bookworm)
 export RC=feat/m8-product-intelligence  # the approved release ref (or its merged successor); record `git rev-parse $RC`
 export REL=~/sensordyme-release        # manifest + tarball + evidence on the Mac
+export VENV=$HOME/.venvs/sensordyme-m01/bin  # M8.1: the Makefile defaults to .venv/bin, which this checkout does not have
 
 # On the Pi, discover the real service user and install directory first (§C1), then:
 export U=<service user>  D=/home/$U/sensordyme
@@ -74,7 +75,7 @@ Expect: `… passed` with 0 failed. Record the line; it goes into the manifest. 
 
 **A2. Build the manifest** (read-only on the repo; writes `$REL`):
 ```bash
-make release-manifest REF=$RC RELEASE_DIR=$REL TESTS="<the A1 summary line>, <date>, <machine>"
+make release-manifest VENV=$VENV REF=$RC RELEASE_DIR=$REL TESTS="<the A1 summary line>, <date>, <machine>"
 ```
 Expect: `<commit>  <N> files  aggregate <hash>…  model pins consistent: True`, exit 0.
 **FAIL** if the pins are not consistent: do not take this ref to the device.
@@ -263,8 +264,16 @@ Otherwise **upgrade in place** (§F). It keeps NetworkManager, BlueZ, avahi and 
 
 **F0. Precheck the device config against the release** (Mac, read-only on the device):
 ```bash
-make deploy-preflight ROLE=driver_safety     # copies only config.yaml to a temp dir; prints REFUSED/OK
+make deploy-preflight VENV=$VENV ROLE=driver_safety     # copies only config.yaml to a temp dir; prints REFUSED/OK
 ```
+`make deploy-preflight` is hard-wired to `pi@sensordyme.local:~/sensordyme`. If §C1 found a different user, host or directory, run the same check by hand (M8.1):
+```bash
+DPI=<install dir from §C1, e.g. /home/<user>/sensordyme>     # on the Mac; $D exists only on the Pi
+T=$(mktemp -d) && scp -q $PI:$DPI/config.yaml $T/config.yaml && \
+$VENV/python scripts/deploy_preflight.py --config $T/config.yaml --expect-role driver_safety \
+  --hef-sha256 "$(ssh $PI "sha256sum $DPI/models/damoyolo_tinynasL20_T.hef | cut -d' ' -f1")"; rm -rf $T
+```
+**Expected first REFUSED on a pre-M0.1 install:** a config with no `role:` runs as `general` and is refused for a `driver_safety` deploy (M8.1 dry run on the `50e9441` config). Add `role: driver_safety` to the device's config by hand (a deliberate, recorded change: deploys never change a role), then re-run.
 **FAIL:** any REFUSED. Fix the device config deliberately first (for example `profile: pi`, the model pin). Read every warning (token length, `http://`, frame capture) and record them.
 
 **F1. Stop, then stage the new tree beside the old one:**
@@ -306,7 +315,7 @@ sha256sum $D/models/*.hef                                 # expect: e69136d3…9
 ```bash
 $PY $V/integrity_manifest.py snapshot --root $D --expect-role driver_safety --out $EV/integrity_rc.json
 # Mac:
-scp $PI:m6-evidence/integrity_rc.json $REL/ && make release-verify RELEASE_DIR=$REL SNAPSHOT=$REL/integrity_rc.json
+scp $PI:m6-evidence/integrity_rc.json $REL/ && make release-verify VENV=$VENV RELEASE_DIR=$REL SNAPSHOT=$REL/integrity_rc.json
 ```
 Expect: `VERDICT: PASS against <commit>`: deployed files exact, model hash = pin, device config pins it, requirements installed, unit matches, preflight ok. **FAIL:** do not start. Explain each failing check, or roll back (§O).
 

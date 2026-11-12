@@ -22,7 +22,7 @@ import sys
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Optional
+from typing import Any, Literal, Optional, overload
 
 import numpy as np
 
@@ -81,8 +81,17 @@ def preprocess(image, size: int, mode: str) -> tuple[np.ndarray, float, float, i
     return canvas, scale, scale, left, top
 
 
+@overload
 def decode_dfl(heads: list[tuple[np.ndarray, np.ndarray, int]], *, conf: float, offset: float,
-               multilabel: bool, nms_iou: float, num_classes: int = 80, with_argmax: bool = False):
+               multilabel: bool, nms_iou: float, num_classes: int = 80,
+               with_argmax: Literal[False] = False) -> tuple[np.ndarray, np.ndarray, np.ndarray]: ...
+@overload
+def decode_dfl(heads: list[tuple[np.ndarray, np.ndarray, int]], *, conf: float, offset: float,
+               multilabel: bool, nms_iou: float, num_classes: int = 80,
+               with_argmax: Literal[True]) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]: ...
+def decode_dfl(heads: list[tuple[np.ndarray, np.ndarray, int]], *, conf: float, offset: float,
+               multilabel: bool, nms_iou: float, num_classes: int = 80, with_argmax: bool = False,
+               ) -> tuple[np.ndarray, np.ndarray, np.ndarray] | tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
     """DAMO-YOLO split heads -> (boxes_xyxy in input pixels, scores, class ids[, anchor argmax class]).
 
     ``heads``: per stride, (box logits HxWx(4*17), class probabilities HxWxC, stride).
