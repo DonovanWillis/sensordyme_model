@@ -80,5 +80,14 @@ do {
           "and the banner's headline agrees with it")
 }
 
+print("\na 401 ends the session only when there was one:")
+check(ServerReply.sessionEnded(status: 401, sentToken: true, signedIn: true)?.contains("expired") == true,
+      "a rejected token: sign in again")
+check(ServerReply.sessionEnded(status: 401, sentToken: false, signedIn: true)?.contains("sign in again") == true,
+      "signed in but no token sent: sign in again (was 'missing bearer token' on every refresh)")
+check(ServerReply.sessionEnded(status: 401, sentToken: false, signedIn: false) == nil,
+      "sign-in's own 401 (wrong password) is not an expired session")
+check(ServerReply.sessionEnded(status: 403, sentToken: true, signedIn: true) == nil, "only 401")
+
 print("\n\(failures == 0 ? "PASSED" : "\(failures) FAILED")")
 exit(failures == 0 ? 0 : 1)

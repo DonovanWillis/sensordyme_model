@@ -584,6 +584,8 @@ final class OrynJourneysUITests: XCTestCase {
         var args = ["-orynNoPrompt", "-orynSignOut"]
         if signedIn {
             let session = Stack.session()
+            // An empty token signs the app in with nothing to send (see uitest_control.py).
+            XCTAssertFalse(session.token.isEmpty, "the scenario controller could not sign the demo account in")
             args += ["-orynSession", session.token, session.email]
         }
         app.launchArguments = args + extra + Stack.extraLaunchArguments

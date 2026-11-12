@@ -78,6 +78,19 @@ enum ServerReply {
         return Failure(title: title, message: fallback(status: status, body: kind(of: data)), code: code)
     }
 
+    /// Why the session is over, when a 401 means it is; nil otherwise.
+    ///
+    /// Sign-in sends no token and its 401 is "wrong email or password", so a
+    /// 401 without a token used to be shown as a plain refusal. But a signed-in
+    /// app that sends no token (it lost it) got the same treatment: "missing
+    /// bearer token" on every refresh, never sent back to sign in.
+    static func sessionEnded(status: Int, sentToken: Bool, signedIn: Bool) -> String? {
+        guard status == 401 else { return nil }
+        if sentToken { return "Your session has expired. Please sign in again." }
+        if signedIn { return "This phone no longer has your sign-in, so the server refused it. Please sign in again." }
+        return nil
+    }
+
     /// The server's own sentence: FastAPI's `detail` (a string, a list of
     /// validation errors, or an object), or the `error`/`message` other
     /// servers and proxies use. nil when there is nothing readable.

@@ -1006,7 +1006,7 @@ extension APIClient {
         req.timeoutInterval = 30
         if let token { req.setValue("Bearer \(token)", forHTTPHeaderField: "Authorization") }
         let (data, status) = try await Self.perform(req, host: baseURL.host ?? "the server")
-        if let error = Self.httpError(status: status, data: data, sentToken: token != nil) {
+        if let error = Self.httpError(status: status, data: data, sentToken: token != nil, signedIn: signedIn) {
             throw error
         }
         return try Self.decodeReply(T.self, from: data)
@@ -1030,7 +1030,7 @@ extension APIClient {
         req.setValue("application/json", forHTTPHeaderField: "Content-Type")
         req.httpBody = try JSONSerialization.data(withJSONObject: body)
         let (data, status) = try await Self.perform(req, host: baseURL.host ?? "the server")
-        if let error = Self.httpError(status: status, data: data, sentToken: token != nil) {
+        if let error = Self.httpError(status: status, data: data, sentToken: token != nil, signedIn: signedIn) {
             throw error
         }
         return try Self.decodeReply(T.self, from: data)

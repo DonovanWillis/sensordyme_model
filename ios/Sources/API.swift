@@ -29,6 +29,10 @@ struct APIError: LocalizedError {
 struct APIClient {
     let baseURL: URL?
     let token: String?
+    /// The app believes it is signed in. A 401 then ends the session even when
+    /// no token could be sent (ServerReply.sessionEnded), instead of showing
+    /// "missing bearer token" on every refresh for ever.
+    var signedIn: Bool = false
     /// Finds the backend when the saved address is missing or has stopped
     /// answering. Supplied by AppState; see BackendLocator.
     var relocate: (@Sendable () async -> URL?)?
@@ -100,7 +104,7 @@ struct APIClient {
             )
         }
         let status = (response as? HTTPURLResponse)?.statusCode ?? 0
-        if let error = Self.httpError(status: status, data: data, sentToken: token != nil) {
+        if let error = Self.httpError(status: status, data: data, sentToken: token != nil, signedIn: signedIn) {
             throw error
         }
         return data
@@ -111,16 +115,15 @@ struct APIClient {
     /// A 401 means "your session expired" only when a session was sent. Sign-in
     /// sends none, and its 401 is "wrong email or password" -- which every caller
     /// used to report as an expired session, on the sign-in screen itself.
-    static func httpError(status: Int, data: Data, sentToken: Bool) -> APIError? {
+    static func httpError(status: Int, data: Data, sentToken: Bool, signedIn: Bool = false) -> APIError? {
         if (200..<300).contains(status) { return nil }
         // FastAPI errors arrive as {"detail": "..."}, and refusals the app must
         // tell apart also carry {"code": "..."} beside it. Anything else (an
         // HTML error page, a validation list, an empty body) is put into words
         // by ServerReply rather than shown raw or as "request failed (502)".
         let failure = ServerReply.httpFailure(status: status, data: data)
-        if status == 401 && sentToken {
-            return APIError(message: "Your session has expired. Please sign in again.",
-                            isAuthFailure: true, status: status, code: failure.code)
+        if let expired = ServerReply.sessionEnded(status: status, sentToken: sentToken, signedIn: signedIn) {
+            return APIError(message: expired, isAuthFailure: true, status: status, code: failure.code)
         }
         return APIError(message: failure.message, status: status, code: failure.code, title: failure.title)
     }
@@ -436,9 +439,24 @@ final class AppState: ObservableObject {
     /// Auth token, kept in the Keychain (not UserDefaults). Migrates any token
     /// stored by earlier builds on first launch.
     private var storedToken: String {
-        get { Keychain.get("authToken") ?? "" }
-        set { Keychain.set("authToken", newValue) }
+        get {
+            if let tokenMemory { return tokenMemory }
+            let read = Keychain.get("authToken") ?? ""
+            tokenMemory = read
+            return read
+        }
+        set {
+            tokenMemory = newValue
+            if !Keychain.set("authToken", newValue) {
+                Self.log.error("the session token could not be stored in the Keychain; it is kept for this run only")
+            }
+        }
     }
+    /// The token in memory, read from the Keychain once. Every request used to
+    /// re-read the Keychain (`api` is rebuilt per access); one failed read sent
+    /// a request with no token, and the signed-in app then showed "missing
+    /// bearer token" on every refresh (M8 full journey run, journey 05).
+    private var tokenMemory: String?
 
     /// The device's own dashboard token (`dashboard.token` in its config.yaml),
     /// sent as `X-Device-Token` on `/stream` and `/api`.
@@ -599,6 +617,7 @@ final class AppState: ObservableObject {
         return APIClient(
             baseURL: base.isEmpty ? nil : URL(string: base),
             token: storedToken.isEmpty ? nil : storedToken,
+            signedIn: isSignedIn && !isDemo,
             relocate: { [weak self] in await self?.relocateBackend() ?? nil },
             // Rebuilt on every access (this is a computed property), so the
             // wording tracks how many attempts have actually failed.

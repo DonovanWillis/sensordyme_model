@@ -69,6 +69,8 @@ final class AccessibilityAuditUITests: XCTestCase {
         var args = ["-orynNoPrompt", "-orynSignOut"]
         if signedIn {
             let session = Stack.session()
+            // An empty token signs the app in with nothing to send (see uitest_control.py).
+            XCTAssertFalse(session.token.isEmpty, "the scenario controller could not sign the demo account in")
             args += ["-orynSession", session.token, session.email]
         }
         app.launchArguments = args + extra
@@ -84,16 +86,17 @@ final class AccessibilityAuditUITests: XCTestCase {
         Stack.saveScreenshot(XCUIScreen.main.screenshot(), name: "audit_\(screen)", test: self)
         var lines: [String] = []
         // Contrast is measured from the screenshot. Text scrolled under the
-        // translucent floating tab bar is sampled through the glass, so it
-        // "fails" whatever its colour (seen: the mode list's lower rows). Such a
-        // finding is not accepted: the element is scrolled clear of the bar and
-        // audited again, and fails the test if it still fails there.
-        var underBar: [String] = []
+        // translucent floating tab bar, or into the blurred scroll edge under the
+        // navigation bar / status bar, is sampled through that material, so it
+        // "fails" whatever its colour (seen: the mode list's rows at either end).
+        // Such a finding is not accepted: the element is scrolled into the clear
+        // band and audited again, and fails the test if it still fails there.
+        var obscured: [(label: String, frame: CGRect)] = []
         do {
             try app.performAccessibilityAudit(for: .all) { issue in
                 let label = issue.element?.label ?? ""
-                if issue.auditType == .contrast, let element = issue.element, self.underTabBar(element) {
-                    underBar.append(label)
+                if issue.auditType == .contrast, let element = issue.element, self.obscuredByBars(element.frame) {
+                    obscured.append((label, element.frame))
                     return true
                 }
                 let known = self.knownIssues.first {
@@ -110,8 +113,8 @@ final class AccessibilityAuditUITests: XCTestCase {
         } catch {
             XCTFail("\(screen): \(error)")
         }
-        for label in underBar {
-            lines.append(recheckContrastClearOfTabBar(label, screen: screen))
+        for item in obscured {
+            lines.append(recheckContrastInClearBand(item.label, frame: item.frame, screen: screen))
         }
         let report = lines.isEmpty ? "\(screen)\tno issues" : lines.joined(separator: "\n")
         let attachment = XCTAttachment(string: report)
@@ -124,50 +127,63 @@ final class AccessibilityAuditUITests: XCTestCase {
         }
     }
 
-    private func underTabBar(_ element: XCUIElement) -> Bool {
-        let bar = app.tabBars.firstMatch
-        return bar.exists && element.frame.intersects(bar.frame)
+    /// The band where text is drawn on the plain page: below the navigation bar
+    /// (or the status bar) and its scroll-edge effect, above the tab bar.
+    private var clearBand: (top: CGFloat, bottom: CGFloat) {
+        let nav = app.navigationBars.firstMatch
+        let top = (nav.exists && nav.frame.height > 0 ? nav.frame.maxY : app.frame.minY + 62) + 24
+        let tab = app.tabBars.firstMatch
+        let bottom = (tab.exists && tab.frame.height > 0 ? tab.frame.minY : app.frame.maxY) - 8
+        return (top, bottom)
     }
 
-    /// Scroll `label` clear of the tab bar and audit contrast again. The line
-    /// says what happened; a failure there is a real failure.
-    private func recheckContrastClearOfTabBar(_ label: String, screen: String) -> String {
-        let element = app.descendants(matching: .any).matching(NSPredicate(format: "label == %@", label)).firstMatch
-        let bar = app.tabBars.firstMatch
-        // Text taller than the room above the bar (a paragraph at the largest
-        // sizes) can never be wholly clear of it, so it can't be re-measured.
-        // Reported as such: neither accepted nor counted as a failure.
-        if element.exists, bar.exists, element.frame.height > bar.frame.minY - app.frame.minY - 160 {
-            return "\(screen)\tcontrast\tunder-tab-bar-unverifiable\tTaller than the space above the tab bar\t\(label)\t"
+    private func obscuredByBars(_ frame: CGRect) -> Bool {
+        let band = clearBand
+        return frame.minY < band.top || frame.maxY > band.bottom
+    }
+
+    /// Scroll the element found at `frame` into the clear band and audit
+    /// contrast again; the line says what happened, and a failure there is a
+    /// real failure. Matched by label and position, since several rows can share
+    /// a label ("Not available for this device's role ...").
+    private func recheckContrastInClearBand(_ label: String, frame: CGRect, screen: String) -> String {
+        let candidates = app.descendants(matching: .any).matching(NSPredicate(format: "label == %@", label))
+        let element = candidates.allElementsBoundByIndex.min(by: {
+            abs($0.frame.midY - frame.midY) < abs($1.frame.midY - frame.midY)
+        }) ?? candidates.firstMatch
+        var band = clearBand
+        if element.exists, element.frame.height > band.bottom - band.top - 40 {
+            return "\(screen)\tcontrast\tunder-bar-unverifiable\tTaller than the clear band between the bars\t\(label)\t"
         }
         var swipes = 0
-        while element.exists && bar.exists && element.frame.maxY > bar.frame.minY - 8 && swipes < 8 {
-            app.swipeUp(velocity: .slow)
+        while element.exists && swipes < 10 {
+            band = clearBand
+            if element.frame.maxY > band.bottom { app.swipeUp(velocity: .slow) }
+            else if element.frame.minY < band.top { app.swipeDown(velocity: .slow) }
+            else { break }
             swipes += 1
         }
-        // An earlier re-check may have scrolled this one off the top.
-        while element.exists && element.frame.minY < app.frame.minY + 100 && swipes < 16 {
-            app.swipeDown(velocity: .slow)
-            swipes += 1
+        guard element.exists, !obscuredByBars(element.frame) else {
+            XCTFail("\(screen): contrast on '\(label)' could not be re-checked clear of the bars")
+            return "\(screen)\tcontrast\tNEW\tContrast failed (could not scroll clear of the bars)\t\(label)\t"
         }
-        guard element.exists, !underTabBar(element), app.frame.contains(element.frame) else {
-            XCTFail("\(screen): contrast on '\(label)' could not be re-checked clear of the tab bar")
-            return "\(screen)\tcontrast\tNEW\tContrast failed (could not scroll clear of the tab bar)\t\(label)\t"
-        }
+        let target = element.frame
         var stillFails = false
         do {
             try app.performAccessibilityAudit(for: .contrast) { issue in
-                if issue.element?.label == label, let el = issue.element, !self.underTabBar(el) { stillFails = true }
-                return true  // only `label` is being re-checked here
+                if let f = issue.element?.frame, abs(f.midY - target.midY) < 4, abs(f.midX - target.midX) < 4 {
+                    stillFails = true
+                }
+                return true  // only this element is being re-checked here
             }
         } catch {
             stillFails = true
         }
         if stillFails {
-            XCTFail("\(screen): '\(label)' fails contrast clear of the tab bar")
-            return "\(screen)\tcontrast\tNEW\tContrast failed clear of the tab bar\t\(label)\t"
+            XCTFail("\(screen): '\(label)' fails contrast clear of the bars")
+            return "\(screen)\tcontrast\tNEW\tContrast failed clear of the bars\t\(label)\t"
         }
-        return "\(screen)\tcontrast\tunder-tab-bar\tPassed when re-checked clear of the tab bar\t\(label)\t"
+        return "\(screen)\tcontrast\tunder-bar\tPassed when re-checked clear of the bars\t\(label)\t"
     }
 
     private static func name(_ type: XCUIAccessibilityAuditType) -> String {
