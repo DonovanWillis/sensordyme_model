@@ -192,6 +192,12 @@ def class_ops(result: oe.ClassResult) -> dict[str, Any]:
         "precision_at_recall": {str(r): p_at_r(result.scored, result.npos, r) for r in RECALLS},
         "recall_at_precision": {str(p): r_at_p(result.scored, result.npos, p) for p in PRECISIONS},
         "grid": grid,
+        # recall by ground-truth size/occlusion at the thresholds that give precision 0.7 / 0.8: in-cabin
+        # people are large, so the large-person recall is the one a driver monitor depends on
+        "recall_by_attribute_at_precision": {
+            str(p): (lambda t: {"threshold": t, **oe.operating_point(result, t)["recall_by_attribute"]}
+                     if t is not None else None)(r_at_p(result.scored, result.npos, p)["threshold"])
+            for p in (0.7, 0.8)},
         "calibration_bins": oe.calibration(result)["bins"],
         "calibration": crossfit_calibration(result),
     }
