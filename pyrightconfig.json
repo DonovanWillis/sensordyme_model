@@ -30,7 +30,10 @@
   // environment.
   // scripts/ is on the list because tests/test_dataset.py imports export_dataset
   // from there (it does `sys.path.insert(0, "scripts")` at call time).
-  "extraPaths": [".", "scripts"],
+  // scripts/hw_validation/ likewise: scripts/release/make_release_manifest.py and
+  // tests/test_m5_hw_validation.py put it on sys.path and import its modules
+  // (integrity_manifest, hwv_common, ...) by bare name.
+  "extraPaths": [".", "scripts", "scripts/hw_validation"],
 
   // requirements.txt: "Python 3.11+ required (mediapipe does not yet support
   // 3.13+)". The Pi ships 3.11; the dev venv is 3.12. Check against the floor.

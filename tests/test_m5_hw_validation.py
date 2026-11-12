@@ -602,5 +602,6 @@ def test_onnx_graph_surgery_exposes_intermediate_heads():
     sess, tensors, meta = cmp.build_session(model.SerializeToString(), ["Mul_224", "Sigmoid_244"])
     feed = np.random.default_rng(0).normal(size=(1, 3, 8, 8)).astype(np.float32)
     mid, final = sess.run([tensors["Mul_224"], tensors["Sigmoid_244"]], {meta["input_name"]: feed})
+    assert isinstance(mid, np.ndarray) and isinstance(final, np.ndarray), "dense head tensors"
     np.testing.assert_allclose(mid, np.maximum(feed, 0), atol=1e-6)
     assert final.shape == (1, 3, 8, 8)

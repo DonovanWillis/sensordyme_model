@@ -462,14 +462,15 @@ def test_a_malformed_config_stops_once_and_never_loops(tmp_path):
     for name, text in bad.items():
         path = tmp_path / name
         path.write_text(text)
-        starts = 0
+        starts, code = 0, None
         for _attempt in range(10):  # systemd: Restart=always unless the status is prevented
             starts += 1
             with pytest.raises(SystemExit) as exited:
                 main.build_runtime(["--config", str(path), "--no-display"])
-            if exited.value.code in prevent:
+            code = exited.value.code
+            if code in prevent:
                 break
-        assert starts == 1, f"{name}: exit {exited.value.code} would be restarted {starts} times"
+        assert starts == 1, f"{name}: exit {code} would be restarted {starts} times"
 
 
 # ---------------------------------------------------------------------- long-running monitoring

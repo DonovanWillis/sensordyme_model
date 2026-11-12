@@ -152,8 +152,14 @@ class Stack:
 
     def token(self) -> str:
         if self._token is None:
-            _, answer = self.api("POST", "/v1/login", {"email": DEMO_EMAIL, "password": DEMO_PASSWORD}, auth=False)
-            self._token = answer["token"]  # type: ignore[index]
+            status, answer = self.api("POST", "/v1/login", {"email": DEMO_EMAIL, "password": DEMO_PASSWORD},
+                                      auth=False)
+            token = answer.get("token") if isinstance(answer, dict) else None
+            if not isinstance(token, str) or not token:
+                # Not a KeyError/TypeError from deep inside a request, and never a
+                # None token that would go out as "Authorization: Bearer None".
+                raise RuntimeError(f"demo login failed: HTTP {status}, {answer!r}")
+            self._token = token
         return self._token
 
     def device_id(self) -> int | None:
