@@ -552,8 +552,9 @@ final class OrynJourneysUITests: XCTestCase {
         shot("28a_frozen_card")
 
         card.tap()
+        // The pill reads STALE; VoiceOver hears what it means (its label).
         let presence = element("detail.online")
-        waitFor(presence, label: "Stale", timeout: 30)
+        waitFor(presence, labelContains: "Connected, monitoring status not updated for", timeout: 30)
         waitFor(monitoring, label: "Status unknown", timeout: 30)
         let banner = element("banner.message")
         waitFor(banner, labelContains: "It is connected, but its monitoring status hasn't been updated for",
