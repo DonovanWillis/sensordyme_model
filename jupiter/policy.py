@@ -246,8 +246,14 @@ _REFUSAL_PATTERNS: tuple[tuple[str, re.Pattern], ...] = (
         r"\b(hears?|heard|hearing|sounds?|noises?|noisy|screams?|screaming|shouts?|shouting|yell(?:s|ing)?|"
         r"cry|cries|crying|bark(?:s|ing)?|voices?|talking|speaking|glass break(?:s|ing)?)\b")),
     ("intoxication", re.compile(r"\b(drunk|intoxicated|under the influence|high on)\b")),
+    # Child-safety emergencies are medical claims too (M8): no model here has
+    # been evaluated on infants, and baby monitoring's choking_hazard is only
+    # "a small object near the mouth region", never choking detection.
     ("medical", re.compile(
-        r"\b(seizures?|heart attack|stroke|not breathing|stops? breathing|breathing|diagnos\w*|unconscious)\b")),
+        r"\b(seizures?|heart attack|stroke|not breathing|stops? breathing|breathing|diagnos\w*|unconscious|"
+        r"chok(?:e|es|ed|ing)|suffocat\w*|smother\w*|sids|cot death|crib death|"
+        r"face[- ]down|(?:rolls?|rolled|rolling|turns?|turned) (?:over )?(?:onto|on) (?:his|her|their|its|the) "
+        r"(?:stomach|tummy|front|face)|fever|overheat\w*)\b")),
     ("repetition_window", re.compile(
         r"\b(?:\d+|two|three|four|five|six|seven|eight|nine|ten|several|multiple) times\b")),
 )
