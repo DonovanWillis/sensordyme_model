@@ -75,7 +75,7 @@ def normalize(boxes, scores, classes, scale, left, top, w, h):
         nx2 = min(max((x2 - left) / scale, 0.0), w) / w
         ny2 = min(max((y2 - top) / scale, 0.0), h) / h
         if nx2 > nx1 and ny2 > ny1:
-            out.append({"label": _name(int(c)), "score": float(s), "box": [nx1, ny1, nx2, ny2]})
+            out.append({"label": _name(int(c)), "score": float(s), "box": [float(v) for v in (nx1, ny1, nx2, ny2)]})
     return out
 
 
@@ -103,7 +103,8 @@ def main(argv=None) -> int:
     net = dm.DamoYolo(str(model_path), args.provider, variant="x", decoder="device_legacy")
     providers = net.session.get_providers()
     print("providers", providers, flush=True)
-    files = {d: (out_preds / f"coco80_{d}_{args.split}.jsonl").open("w") for d in ("legacy", "reference")}
+    final = {d: out_preds / f"coco80_{d}_{args.split}.jsonl" for d in ("legacy", "reference")}
+    files = {d: p.with_suffix(".part").open("w") for d, p in final.items()}  # renamed only when complete
     infer_ms, t0 = [], time.perf_counter()
     counts = dict.fromkeys(files, 0)
     for n, item in enumerate(items):
@@ -124,8 +125,9 @@ def main(argv=None) -> int:
                                  *image.size):
                 f.write(json.dumps({"id": item.id, **det}) + "\n")
                 counts[decoder] += 1
-    for f in files.values():
+    for d, f in files.items():
         f.close()
+        final[d].with_suffix(".part").replace(final[d])
     shas = {d: hashlib.sha256((out_preds / f"coco80_{d}_{args.split}.jsonl").read_bytes()).hexdigest()
             for d in files}
     report = {"split": args.split, "manifest_id": manifest.id, "images": len(items), "model_sha256": MODEL_SHA256,
@@ -134,6 +136,7 @@ def main(argv=None) -> int:
               "infer_ms_p50": dm.percentile(infer_ms, 0.5), "infer_ms_p90": dm.percentile(infer_ms, 0.9),
               "wall_s": round(time.perf_counter() - t0, 1)}
     (report_dir / "coco80_report.json").write_text(json.dumps(report, indent=1))
+    (out_preds / f"coco80_{args.split}.complete.json").write_text(json.dumps(report, indent=1))
     print(json.dumps(report, indent=1))
     return 0
 

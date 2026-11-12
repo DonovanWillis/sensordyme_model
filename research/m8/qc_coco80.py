@@ -42,7 +42,7 @@ def run(module: str, argv: list[str]) -> bool:
 
 
 for split in SPLITS:
-    done = all((PREDS / f"coco80_{d}_{split}.jsonl").exists() for d in ("legacy", "reference"))
+    done = (PREDS / f"coco80_{split}.complete.json").exists()  # written only after both files are whole
     if not done or os.environ.get("M8_REDO"):
         run("research.m8.coco80_preds", ["--data", str(OI), "--models", str(D / "models"), "--out-preds", str(PREDS),
                                          "--report", str(OUT / f"coco80_{split}"), "--split", split, "--provider", "dml"])
