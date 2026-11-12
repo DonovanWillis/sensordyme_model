@@ -14,7 +14,7 @@
 # `pending_integration: true` marks a slot another M6.5 workstream fills in; the
 # integrator replaces the placeholder text with that workstream's evidence.
 format: sensordyme-release-status/1
-as_of: "2026-11-11"
+as_of: "2026-11-12"
 components:
   device_runtime:
     tiers: [simulator-verified, hardware-pending]
@@ -77,7 +77,7 @@ components:
     evidence: "sd-auth-v1 (core/command_auth.py, docs/DEVICE_AUTH_CONTRACT.md): HKDF-derived keys from the existing device key, HMAC-SHA256 over device/command/body/nonce, request-bound replay defence, key rotation and revocation; config cloud.command_auth off|permissive|required (default permissive, so existing devices keep working). Secret store 0600, atomic, checksummed (core/secret_store.py, docs/CREDENTIAL_STORAGE.md); migration script dry-run only. Oryn job 20261111-061442-e529e8: 618 passed. Blocked for production until devices and backend run `required`, keys leave plaintext on the backend, and the nonce cache is shared"
   m65_ble_proof_of_possession:
     tiers: [software-ready, hardware-pending, production-blocked]
-    evidence: "services/ble_pop.py + ios/Sources/BLEProofOfPossession.swift (docs/BLE_PROOF_OF_POSSESSION.md): setup code (QR/label), PBKDF2+HKDF+HMAC proofs, AES-GCM credentials, explicit state machine, lockout; config network.provisioning.auth legacy|pop (default legacy); Python/Swift vectors match. Mac: 109 passed; Swift tests pass. Not validated on BLE hardware; the app has no setup screen for it yet; offline guessing from a recorded session needs a PAKE"
+    evidence: "services/ble_pop.py + ios/Sources/BLEProofOfPossession.swift (docs/BLE_PROOF_OF_POSSESSION.md): setup code (QR/label), PBKDF2+HKDF+HMAC proofs, AES-GCM credentials, explicit state machine, lockout; config network.provisioning.auth legacy|pop (default legacy); Python/Swift vectors match. Mac: 109 passed; Swift tests pass. Not validated on BLE hardware; the app's setup screen was added in M8 (m8_onboarding_pop_flow); offline guessing from a recorded session needs a PAKE"
   m65_xcuitest_journeys:
     tiers: [simulator-verified]
     evidence: "ios/UITests + scripts/sim/ios_uitest.sh against the real backend and virtual device: 19/20 journeys pass. Journey 10 (inline Ask Jupiter bar) fails: the field does not take keyboard focus (open defect; the stale-sheet fix b8fcff5 did not resolve it). Post-fix accessibility audit: 40 new issues (Dynamic Type on mono labels, clipping, 8 contrast); report in the M6.5 evidence folder"
@@ -102,3 +102,40 @@ components:
   m7_detector_analysis_exp09_proposal:
     tiers: [experiment-only]
     evidence: "docs/research/M7_DETECTOR_ANALYSIS.md: the EXP-08 person regression is false positives (precision 0.55 vs 0.695 at recall 0.70), most likely from DAMO-YOLO's fine-tune loader reinitialising the whole head; NMS 0.5 helps phone/hand; EXP-09 head-preserving fine-tune proposed, not run. No model or .hef change"
+
+# --- M8 (2026-11-12): integrated on feat/m8-product-intelligence. Evidence under
+# ~/sensordyme-audit/2026-11-10/m8-evidence/<stream>/ (not in git). No entry claims hardware.
+  m8_distracted_driving_activation:
+    tiers: [software-ready, simulator-verified, hardware-pending]
+    evidence: "tests/test_m8_driver_activation_sim.py: app POST /preset (401/404/200) -> desired_preset -> ingest set_preset -> device switch -> active_preset + status.perception (driver_safety node active, synthetic_tests) -> one stored event per alert episode, bounded repeats, ordered history surviving restart; owner settings applied, a looser floor refused 409. M7 path was already complete; verified, not rebuilt"
+  m8_driver_attention_fixes:
+    tiers: [software-ready, simulator-verified, hardware-pending]
+    evidence: "modules/driver_attention.py: phone held vs present (PhoneHoldEvidence; a mounted still phone never fires phone_use), looking down vs eye closure (classify_eye_state), stall-aware evidence clock, truthful 'attention' capability (STARTING until calibrated). tests/test_m8_driver_attention_defects.py + test_m8_driver_capabilities.py fail on 11c524c and pass now. Thresholds untuned on real cabins; MediaPipe Hands misses many phone grips (hold 'unknown' still alerts)"
+  m8_shared_tracking:
+    tiers: [software-ready, simulator-verified, hardware-pending]
+    evidence: "core/tracking.py ObjectTracker owned by the perception engine: one IoU/centroid tracker per detector run; track ids on every Observation; rules dwell and occupancy follow track ids; bounded 64 tracks. tests/test_m8_tracking.py (15). Mac cost 0.03-0.07 ms (5 people), worst 4-8 ms (64x64); Pi cost unmeasured; not re-identification"
+  m8_monitoring_nodes_modes:
+    tiers: [software-ready, simulator-verified, hardware-pending]
+    evidence: "Occupancy, Property (security_monitoring), Workplace Safety, Child (baby_monitoring) and custom prompt policies each verified on the virtual device: activation, events, state, restart persistence, coded refusals reaching the app, concurrent nodes on one detector run (tests/test_m8_nodes_modes.py, test_m8_nodes_e2e.py, test_m8_nodes_registry.py). Child emergency prompts refused (medical). Child pose alerts experimental and OFF by default (owner opt-in, reported truthfully). All nodes at most synthetic_tests"
+  m8_lifecycle_last_known_good_config:
+    tiers: [software-ready, simulator-verified, hardware-pending]
+    evidence: "core/config_lkg.py + main.load_device_config: a damaged config.yaml boots on data/config.last_good.yaml (recorded atomically, 0600, after READY) and reports config.source=last_known_good + a config_fault event; exit 78 only with no saved copy; atomic migrate_config writes; damaged saved state kept aside and reported. tests/test_m8_lifecycle_boot.py. Runbook K4a/K4b not executed"
+  m8_uplink_durable_backlog:
+    tiers: [software-ready, simulator-verified, hardware-pending]
+    evidence: "core/uplink.py: bounded fsynced JSON-lines spool beside events.csv; an alert queued during an outage survives a power cut and is delivered once (backend dedupes by event_key); health uplink_backlog. tests/test_m8_lifecycle_uplink.py, test_m8_lifecycle_e2e.py. SD-card durability and fsync latency unmeasured (runbook R4)"
+  m8_module_rebuild_and_accelerator_truth:
+    tiers: [software-ready, simulator-verified, hardware-pending]
+    evidence: "a module that fails at boot is rebuilt in-process (30 s doubling to 600 s) instead of staying FAILED until restart; no Hailo and no CPU backend reports 'object detection unavailable' (detector_available false), never 'running on CPU'. tests/test_m8_lifecycle_boot.py. Real MediaPipe/Hailo rebuild leaks unmeasured"
+  m8_release_rollback_guard:
+    tiers: [software-ready, hardware-pending]
+    evidence: "scripts/release/release_guard.py wired into make deploy: snapshot before rsync, confirm-or-rollback after restart, rollback on any failed step; setup_pi.sh archives the retired 4c71eab8 .hef and refuses a config pinning another hash. tests/test_m8_lifecycle_release.py (fake systemctl + temp tree). Real systemd 252 semantics unverified (runbook R6)"
+  m8_security_replay_clock_revocation:
+    tiers: [software-ready, simulator-verified, hardware-pending]
+    evidence: "backend nonces persisted (auth_nonces; captured request refused after a backend restart), signed clock answers (a required device adopts only a verified server time), visible revocation (revoked_device_keys, manage.py revoke-device, credentials state in GET /v1/devices), per-device required (devices.auth_mode), per-account claim limiter, .jwt_secret forced 0600, migrate_device_key never echoes a config line. 35 new tests; 56-cell compatibility matrix: old/new interoperate except an M8 required device behind a pre-M8 backend (deploy backend first). Defaults unchanged; no key rotated"
+  m8_onboarding_pop_flow:
+    tiers: [software-ready, simulator-verified, hardware-pending]
+    evidence: "iOS Onboarding state machine (ios/Sources/SetupOnboarding.swift) on the existing PoP protocol: discovery, setup code/QR, wrong code, device-held lockout countdown, Wi-Fi, join, claim (separate claim code, tied to the SD- id), wait for device, mode choice, re-provision without a second claim. BLETransport seam; DEBUG-only loopback simulated transport; sim/ble_peripheral.py runs the real ProvisioningService/PopAuthenticator. Cross-language Swift<->Python: 10 scenarios (tests/test_m8_onboarding_crosslang.py), E2E first-time + reprovision (test_m8_onboarding_e2e.py). Debug Simulator build succeeds. Default auth stays legacy. Not run over a physical radio"
+  m8_cv_research_hybrid_recommendation:
+    tiers: [experiment-only]
+    evidence: "docs/research/M8_CV_RESEARCH.md: quantcompute DirectML jobs 20261111-234153-084592 (+ re-runs); recommends one 3-class DAMO-T on Hailo-8L + Face Mesh on CPU after INT8 compile and Pi gates; Arch B only if EXP-09 fails; hand-overlap gate halves false phones (not 90%); calibrated per-class thresholds. Image-level Open Images only; no model or .hef change; oryn offline so EXP-08 paired analyses are scripted, not run"
+
