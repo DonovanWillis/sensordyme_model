@@ -55,7 +55,14 @@ def _cloud_block(lines: list[str]) -> tuple[int, int]:
 def plan(config_path: Path, store: Path) -> tuple[str, dict, list[str]]:
     """(new config text, secrets to store, human-readable steps). Raises ValueError."""
     text = config_path.read_text()
-    original = yaml.safe_load(text)
+    try:
+        original = yaml.safe_load(text)
+    except yaml.YAMLError as exc:
+        # Line and column only: PyYAML's own message quotes the offending line,
+        # which may be the key itself (M8).
+        mark = getattr(exc, "problem_mark", None)
+        where = f" (line {mark.line + 1}, column {mark.column + 1})" if mark is not None else ""
+        raise ValueError(f"{config_path} is not valid YAML{where}; fix it first. Nothing written.") from None
     cloud = (original or {}).get("cloud") if isinstance(original, dict) else None
     if not isinstance(cloud, dict):
         raise ValueError("config has no `cloud:` mapping")
