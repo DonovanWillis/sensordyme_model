@@ -30,7 +30,7 @@ from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
 from types import MappingProxyType
-from typing import Any, Optional
+from typing import Any, Optional, cast
 
 import cv2
 
@@ -230,9 +230,13 @@ class DeviceRuntime:
     _detector_unavailable = None
     _node_zone_signature = None
     _preset_nodes_suspended = False
-    _companions = MappingProxyType({})
-    _preset_nodes = MappingProxyType({})
-    _node_errors = MappingProxyType({})
+    # Read-only on purpose: a write raises TypeError instead of mutating one dict
+    # shared by every such runtime. __init__ binds real dicts, the declared type;
+    # the casts say "read-only on the class, a dict on the instance", which an
+    # annotation cannot express.
+    _companions = cast("dict[str, monitoring_nodes.MonitoringNode]", MappingProxyType({}))
+    _preset_nodes = cast("dict[str, monitoring_nodes.MonitoringNode]", MappingProxyType({}))
+    _node_errors = cast("dict[str, str]", MappingProxyType({}))
     _consecutive_process_failures = 0
     _last_process_error: Optional[str] = None
     _detection_degraded: Optional[str] = None
