@@ -118,3 +118,30 @@ Integration, the end-to-end simulator, the combined suite, the release manifest 
 - Real face/hand model latency on the Pi 5.
 - BLE proof of possession on hardware.
 - `required` signed commands on the device.
+
+## M8 additions (nodes stream)
+
+- **Shared tracking.** The engine owns the device's one `ObjectTracker`
+  (`core/tracking.py`): IoU-then-centroid, greedy, deterministic, confirmed
+  after 2 detector runs, EMA confidence, 2 s occlusion grace, at most 64
+  tracks and 64 boxes per run. It runs once per detector run. Each
+  `ObjectDetection` carries `track_id`; each `Observation` carries `tracks`.
+  Worst case measured ~8 ms per update (64 x 64, CPython, dev host); a
+  5-person room ~0.07 ms. Not re-identification: crossing people can swap ids.
+- **Wire.** `monitoring.perception.tracking` = `{tracker, live, confirmed,
+  max_tracks, updates, created, retired, evicted, dropped_detections,
+  update_ms, lost_grace_s, confirm_hits}` (additive; the backend does not
+  forward it yet).
+- **Consumers.** `people_counter` counts confirmed person tracks (entry,
+  exit, `zone_entered` / `zone_exited`, per-person `zone_dwell`);
+  `zone_watch` and custom-rule dwell follow the shared ids
+  (`Observation.attach_tracks`, `core/rules.py` `_DwellWatcher`).
+- **Registry.** `@register_companion` + a `monitoring_nodes` entry in
+  `core/model_registry.yaml` is all a new companion needs
+  (`tests/test_m8_nodes_registry.py`).
+- **Replaced presets.** Under AI custom on a general role, the preset's own
+  nodes stop with the preset (reported `inactive`); owner companions keep
+  running.
+- **Refusal codes.** Device preset refusals now always carry a code:
+  `role_forbids_preset`, `unknown_preset`, `invalid_setting`,
+  `module_failed`, `profile_fixed`.

@@ -62,7 +62,7 @@ CAPABILITY_KINDS = frozenset({
     "camera", "inference", "face", "objects", "hands", "pose", "alert_output", "audible_alert",
 })
 _OUTPUT_KINDS = frozenset({"alert_output", "audible_alert"})
-_TEMPORAL_KEYS = frozenset({"event", "description", "sustain_s", "window_s", "setting"})
+_TEMPORAL_KEYS = frozenset({"event", "description", "sustain_s", "window_s", "setting", "experimental", "config_key"})
 _PATTERN_KEYS = frozenset({"tone", "events", "description"})
 
 #: Availability codes for one preset on one device (docs/PRESET_LIBRARY.md).

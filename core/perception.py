@@ -38,13 +38,23 @@ Component states (the wire contract in docs/M7_IMPLEMENTATION_MAP.md):
   unavailable  it cannot run on this device (no backend, refused load)
   idle         nobody has needed it
 
-Pure Python and the standard library (plus core.detections for the rule view):
-no model is imported here, so the backend, tests and the simulator can use it.
+Tracking (M8): the engine also owns the device's ONE object tracker
+(core/tracking.py ObjectTracker). Every detector run's boxes are associated
+once, right where the run is parsed, so each ObjectDetection carries a
+persistent `track_id` and each Observation carries the live `tracks` (visible
+and coasting, with smoothed confidence and confirmation). Nodes and custom
+rules read those ids; none of them runs a tracker of its own. The tracker's
+counters and mean update time are reported as `perception.tracking`.
+
+Pure Python and the standard library (plus core.detections for the rule view
+and core.tracking): no model is imported here, so the backend, tests and the
+simulator can use it.
 """
 
 from __future__ import annotations
 
 import contextlib
+import dataclasses
 import threading
 import time
 from collections.abc import Callable, Iterable, Iterator, Mapping
@@ -52,6 +62,7 @@ from dataclasses import dataclass, field
 from typing import Any, Optional, Union
 
 from core.detections import Detection, DetectionFrame
+from core.tracking import ObjectTracker, Track, box_iou
 
 SCHEMA = "sd-perception/1"
 
@@ -198,6 +209,9 @@ class Observation:
     hands: Optional[tuple[HandObservation, ...]]
     components: Mapping[str, ComponentStatus]
     schema: str = SCHEMA
+    #: The shared tracker's live tracks (core/tracking.py), visible and coasting;
+    #: None whenever `detections` is None, or when no tracker ran (a replay).
+    tracks: Optional[tuple[Track, ...]] = None
 
     def available(self, capability: str) -> bool:
         status = self.components.get(COMPONENT_OF.get(capability, ""))
@@ -226,11 +240,39 @@ class Observation:
             return float(min_confidence)
 
         kept = tuple(
-            Detection(label=d.label, confidence=d.confidence, box=d.box)
+            Detection(label=d.label, confidence=d.confidence, box=d.box, track_id=d.track_id)
             for d in self.detections
             if (wanted is None or d.label in wanted) and d.confidence >= floor(d.label)
         )
         return DetectionFrame(width=self.width, height=self.height, detections=kept)
+
+    def attach_tracks(self, frame: Optional[DetectionFrame], min_iou: float = 0.9) -> Optional[DetectionFrame]:
+        """`frame` (a module's own view of THIS frame's detector run) with the
+        shared tracker's ids attached: each box takes the id of the same-label
+        detection it coincides with (IoU >= min_iou; a module may round its
+        boxes). Boxes with no such twin keep `track_id` None."""
+        if frame is None or not self.detections or not frame.detections:
+            return frame
+        tracked = [d for d in self.detections if d.track_id is not None]
+        if not tracked:
+            return frame
+        out = []
+        changed = False
+        for d in frame.detections:
+            best, best_iou = None, min_iou
+            if d.box is not None and d.track_id is None:
+                for t in tracked:
+                    if t.label != d.label:
+                        continue
+                    overlap = box_iou(tuple(float(v) for v in d.box), t.box)  # type: ignore[arg-type]
+                    if overlap >= best_iou:
+                        best, best_iou = t, overlap
+            if best is not None:
+                out.append(dataclasses.replace(d, track_id=best.track_id))
+                changed = True
+            else:
+                out.append(d)
+        return dataclasses.replace(frame, detections=tuple(out)) if changed else frame
 
 
 @dataclass(frozen=True)
@@ -474,9 +516,13 @@ class PerceptionEngine:
     """
 
     def __init__(self, *, max_age_s: float = DEFAULT_MAX_AGE_S,
-                 clock: Optional[Callable[[], float]] = None) -> None:
+                 clock: Optional[Callable[[], float]] = None,
+                 tracking: Optional[Mapping[str, Any]] = None) -> None:
         self.max_age_s = float(max_age_s)
         self._clock = clock
+        #: The device's one object tracker (core/tracking.py); `tracking` passes
+        #: its tuning (iou_min, lost_grace_s, max_tracks, ...).
+        self.tracker = ObjectTracker(**dict(tracking or {}))
         self._lock = threading.RLock()
         self._components = {name: _Component(name) for name in COMPONENTS}
         self._wrapped: dict[int, tuple[Any, Any]] = {}  # id(model or graph) -> (it, its proxy)
@@ -673,7 +719,9 @@ class PerceptionEngine:
         with self._lock:
             now = self._now()
             self._components[OBJECT_DETECTOR].ok(now, elapsed_ms)
-            self._detections = tuple(parsed)
+            # One association per detector run, for every consumer at once.
+            ids = self.tracker.update([(d.label, d.box, d.confidence) for d in parsed], now)
+            self._detections = tuple(dataclasses.replace(d, track_id=tid) for d, tid in zip(parsed, ids, strict=True))
             self._detections_at = now
             self._ran.add(OBJECT_DETECTOR)
 
@@ -757,6 +805,7 @@ class PerceptionEngine:
                 detection_consumers=frozenset(self._served) if fresh else frozenset(),
                 face_visible=face_visible, face=face, hands=hands,
                 components=self._status_unlocked(now),
+                tracks=self.tracker.tracks() if detections is not None else None,
             )
             self._frame = None
             return observation
@@ -819,7 +868,13 @@ class PerceptionEngine:
             "simulated": bool(simulated),
             "components": {name: status.to_dict() for name, status in self.status().items()},
             "nodes": [dict(n) for n in nodes],
+            "tracking": self.tracking_report(),
         }
+
+    def tracking_report(self) -> dict:
+        """The shared tracker's counters and cost (`perception.tracking`)."""
+        with self._lock:
+            return {"tracker": "iou_centroid", **self.tracker.stats()}
 
 
 # ---------------------------------------------------------------------- factories for modules

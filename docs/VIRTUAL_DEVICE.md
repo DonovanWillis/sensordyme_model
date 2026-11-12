@@ -265,10 +265,13 @@ down window, which production's jitter does not.
 | Config validation, role floors, preset restore, boot-FAILED | **real** `main.py` (`build_runtime`) |
 | Camera | simulated (rendered scene, scripted faults) |
 | FaceMesh / Hands / object detector | scripted (`--video` uses the real models) |
+| MediaPipe Pose (baby monitoring) | scripted to find **no** pose: pose-based signals never fire in the simulator |
+| Room scenes | `Scene.people`: standing people at given positions (sim/perception.py), for counting, tracking, areas and dwell |
 | Buzzer | simulated (recorded, silent) |
 | Network outage | simulated at the uplink transport |
 | Reboot | process restart of the virtual device; the host is never rebooted |
-| Other modules (occupancy, baby, fall, …) on a `general` role | real code, **no** scripted perception: on a Mac they honestly report DEGRADED/FAILED |
+| `shared_perception`, `occupancy` (Property), `baby_monitoring` (Child) on a `general` role | real code on scripted perception (M8) |
+| Other modules (fall detection, …) on a `general` role | real code, **no** scripted perception: on a Mac they honestly report DEGRADED/FAILED |
 
 ### Still needs the physical Pi
 

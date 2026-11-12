@@ -236,8 +236,11 @@ presets:
       - { event: person_absent, description: nobody visible (when presence is expected), sustain_s: 30.0, setting: absence_warning_s }
       - { event: safe_zone_exit, description: leaving the user-drawn safe area, sustain_s: 2.0, setting: zone_confirm_s }
       - { event: zone_violation, description: entering a user-drawn danger area, sustain_s: 2.0, setting: zone_confirm_s }
-      - { event: flailing, description: frantic arm movement over about 1.2 s }
-      - { event: choking_hazard, description: a hand-held small object closing on the mouth region }
+      # Experimental (M8): pose-based, unevaluated on any footage of children. Reported as
+      # experimental features of the node (perception.nodes[].experimental_features), with
+      # whether this device runs them (config_key). Neither detects choking or distress.
+      - { event: flailing, description: "EXPERIMENTAL: fast, repeated arm movement over about 1.2 s (pose; unevaluated)", experimental: true, config_key: enable_pose }
+      - { event: choking_hazard, description: "EXPERIMENTAL: a hand-held small object closing on the mouth region (pose + boxes; not choking detection, unevaluated)", experimental: true, config_key: enable_pose }
     alert_patterns:
       - { tone: loud, events: [zone_violation, safe_zone_exit, unusual_stillness, person_absent, flailing, choking_hazard, infant_unidentified], description: loud tone and push }
     settings:
@@ -280,16 +283,19 @@ presets:
       accelerator: Hailo-8L for the shared object detector
       audible_output: not required (alerts go to the app)
     temporal_policies:
-      - { event: person_entered, description: the settled person count rose (a count must hold for 2 s), sustain_s: 2.0 }
-      - { event: person_exited, description: the settled person count fell, sustain_s: 2.0 }
-      - { event: zone_dwell, description: someone stayed inside a drawn area, sustain_s: 30.0 }
+      - { event: person_entered, description: a new tracked person has been seen for 2 s (people already present when counting starts are not entries), sustain_s: 2.0 }
+      - { event: person_exited, description: a counted person's track was lost for the tracker's 2 s grace, sustain_s: 2.0 }
+      - { event: zone_entered, description: a tracked person's feet were inside a drawn area for 2 s (logged), sustain_s: 2.0 }
+      - { event: zone_exited, description: "a tracked person left a drawn area, with how long they stayed (logged)", sustain_s: 2.0 }
+      - { event: zone_dwell, description: one tracked person stayed inside a drawn area (once per visit), sustain_s: 30.0 }
       - { event: capacity_exceeded, description: more people than the set capacity (off unless set) }
     alert_patterns:
       - { tone: soft, events: [capacity_exceeded, zone_dwell], description: "push to the app; no local tone" }
     compatibility:
       custom_rules: replace
     limitations:
-      - Counts per-frame person boxes; people hidden behind others are not counted and identities are not tracked
+      - Counts tracked person boxes (core/tracking.py); people hidden behind others are not counted
+      - Identity is box tracking, not recognition; two people crossing can swap ids, and someone out of view for over 2 s returns as a new person
       - Exercised only on the virtual device (synthetic scenes); no in-domain occupancy evidence exists
     evidence:
       - docs/M7_IMPLEMENTATION_MAP.md

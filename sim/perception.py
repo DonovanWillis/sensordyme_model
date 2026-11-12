@@ -11,6 +11,16 @@ and replaces only the three model calls at its edge:
   MediaPipe Hands     -> ScriptedHands: a hand box on the phone when held
   object detector     -> ScriptedDetector: person / phone boxes; raises while
                          the scenario says the detector is failing
+  MediaPipe Pose      -> ScriptedPose (baby monitoring): never finds a pose. The
+                         simulator scripts no body landmarks, so pose-based
+                         signals (flailing, choking-hazard scoring) never fire
+                         here -- they are unevaluated and stay unclaimed
+
+Besides driver_attention, the same stand-ins run the room modules on a general
+device (M8): shared_perception (occupancy, workplace safety, custom rules),
+occupancy (security_monitoring) and baby_monitoring. A scene can hold extra
+standing people at given horizontal positions (`Scene.people`), so counting,
+tracking, area crossings and dwell are exercised with real moving boxes.
 
 What the scene is travels IN THE FRAME: a few pixels of row 0 carry it, written
 by sim.camera when the frame is rendered and read back here. A frozen camera
@@ -31,6 +41,9 @@ import numpy as np
 #: Row-0 header layout (every channel holds the same byte, so BGR->RGB is moot).
 _MAGIC = (0xA5, 0x5A)
 _HEADER_LEN = 6
+#: Column 5 holds how many extra people follow, one column each from column 6.
+MAX_PEOPLE = 8
+PEOPLE_WIDTH = 0.16
 _FLAG_FACE, _FLAG_EYES_CLOSED, _FLAG_PHONE, _FLAG_PERSON, _FLAG_HAND = 1, 2, 4, 8, 16
 
 
@@ -50,6 +63,10 @@ class Scene:
     #: A person box for the object detector (the driver's body).
     person: bool = True
     label: str = "attentive"
+    #: Extra standing people, by the horizontal centre of each box (0..1 of the
+    #: frame width; at most MAX_PEOPLE). Each is a PEOPLE_WIDTH-wide box from
+    #: 30% to 95% of the frame height, so its feet are at (x, 0.95).
+    people: tuple[float, ...] = ()
 
     def flags(self) -> int:
         return ((_FLAG_FACE if self.face else 0) | (_FLAG_EYES_CLOSED if self.eyes_closed else 0)
@@ -63,7 +80,10 @@ def _byte(angle: float) -> int:
 
 def encode_scene(frame: np.ndarray, scene: Scene) -> np.ndarray:
     """Write `scene` into row 0 of `frame` (in place) and return the frame."""
-    header = (*_MAGIC, scene.flags(), _byte(scene.head_down_deg), _byte(scene.yaw_deg), 0)
+    people = [min(250, max(0, round(float(x) * 250))) for x in scene.people[:MAX_PEOPLE]]
+    header = (*_MAGIC, scene.flags(), _byte(scene.head_down_deg), _byte(scene.yaw_deg), len(people), *people)
+    if frame.shape[1] < len(header):
+        raise ValueError("frame too narrow to carry this scene")
     for col, value in enumerate(header):
         frame[0, col] = value
     return frame
@@ -77,11 +97,13 @@ def decode_scene(image: np.ndarray) -> Optional[Scene]:
     if tuple(row[:2]) != _MAGIC:
         return None
     flags = row[2]
+    count = min(row[5], MAX_PEOPLE, max(0, image.shape[1] - _HEADER_LEN))
+    people = tuple(int(image[0, _HEADER_LEN + i, 0]) / 250.0 for i in range(count))
     return Scene(
         face=bool(flags & _FLAG_FACE), eyes_closed=bool(flags & _FLAG_EYES_CLOSED),
         head_down_deg=float(row[3] - 128), yaw_deg=float(row[4] - 128),
         phone=bool(flags & _FLAG_PHONE), person=bool(flags & _FLAG_PERSON),
-        hand_on_phone=bool(flags & _FLAG_HAND), label="",
+        hand_on_phone=bool(flags & _FLAG_HAND), label="", people=people,
     )
 
 
@@ -209,6 +231,12 @@ def person_box(width: int, height: int) -> tuple[float, float, float, float]:
     return (0.25 * width, 0.08 * height, 0.75 * width, 0.98 * height)
 
 
+def standing_box(x: float, width: int, height: int) -> tuple[float, float, float, float]:
+    """An extra standing person centred at `x` (0..1): feet at (x, 0.95)."""
+    half = PEOPLE_WIDTH / 2.0
+    return ((x - half) * width, 0.30 * height, (x + half) * width, 0.95 * height)
+
+
 class _Box:
     def __init__(self, class_id: int, xyxy, conf: float) -> None:
         self.cls = [class_id]
@@ -246,6 +274,15 @@ class ScriptedDetector:
             boxes.append(_Box(0, person_box(w, h), 0.92))
         if scene is not None and scene.phone:
             boxes.append(_Box(67, phone_box(w, h), 0.88))
+        for x in scene.people if scene is not None else ():
+            boxes.append(_Box(0, standing_box(x, w, h), 0.9))
+        wanted = _kwargs.get("classes")
+        if wanted is not None:
+            allowed = {int(c) for c in wanted}
+            boxes = [b for b in boxes if b.cls[0] in allowed]
+        conf = _kwargs.get("conf")
+        if conf is not None:
+            boxes = [b for b in boxes if b.conf[0] >= float(conf)]
         return [_Result(boxes)]
 
 
@@ -281,13 +318,40 @@ class ScriptedHands:
         return None
 
 
+class _PoseResult:
+    pose_landmarks = None
+
+
+class ScriptedPose:
+    """Stands in for MediaPipe Pose: it runs, and finds no pose. The simulator
+    scripts no body landmarks, so nothing pose-based is exercised (or claimed)."""
+
+    model_name = "sim-scripted-pose-none"
+
+    def __init__(self) -> None:
+        self.calls = 0
+
+    def process(self, _rgb: np.ndarray) -> _PoseResult:
+        self.calls += 1
+        return _PoseResult()
+
+    def close(self) -> None:
+        return None
+
+
 # ---------------------------------------------------------------------- installation
-def supports(module) -> bool:
-    """Whether scripted perception can stand in for this module's models."""
+def _scripted_classes() -> tuple[type, ...]:
+    from modules.baby_monitoring import BabyMonitoringModule
     from modules.driver_attention import DriverAttentionModule
+    from modules.occupancy import OccupancyModule
     from modules.shared_perception import SharedPerceptionModule
 
-    return isinstance(module, (DriverAttentionModule, SharedPerceptionModule))
+    return (DriverAttentionModule, SharedPerceptionModule, OccupancyModule, BabyMonitoringModule)
+
+
+def supports(module) -> bool:
+    """Whether scripted perception can stand in for this module's models."""
+    return isinstance(module, _scripted_classes())
 
 
 def install(module, faults, detector: Optional[ScriptedDetector] = None) -> Any:
@@ -302,14 +366,25 @@ def install(module, faults, detector: Optional[ScriptedDetector] = None) -> Any:
     device, whoever asked.
     """
     if not supports(module):
-        raise TypeError(f"scripted perception supports driver_attention and shared_perception, "
-                        f"not {type(module).__name__}")
+        raise TypeError(f"scripted perception supports driver_attention, shared_perception, occupancy "
+                        f"and baby_monitoring, not {type(module).__name__}")
+    from modules.baby_monitoring import BabyMonitoringModule
+    from modules.occupancy import OccupancyModule
     from modules.shared_perception import SharedPerceptionModule
 
     if isinstance(module, SharedPerceptionModule):
         # It owns no graphs: only the detector it would load lazily.
         detector = detector if detector is not None else ScriptedDetector(faults)
         module._yolo_model = detector
+        return detector
+    if isinstance(module, (OccupancyModule, BabyMonitoringModule)):
+        detector = detector if detector is not None else ScriptedDetector(faults)
+        module._model = detector  # what get_yolo_model() would have handed it on the first frame
+        real_pose = getattr(module, "_pose", None)
+        if real_pose is not None and not isinstance(real_pose, ScriptedPose):
+            with contextlib.suppress(Exception):  # closing a graph we discard must not stop the sim
+                real_pose.close()
+            module._pose = ScriptedPose()
         return detector
     real_face_mesh = getattr(module, "_face_mesh", None)
     if real_face_mesh is not None and not isinstance(real_face_mesh, ScriptedFaceMesh):

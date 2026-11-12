@@ -32,6 +32,10 @@ class Detection:
     label: str                                             # "person", "phone", "smoke", ...
     confidence: float = 1.0
     box: Optional[tuple[float, float, float, float]] = None  # pixel-space x1, y1, x2, y2
+    #: The shared tracker's id for this subject (core/tracking.py ObjectTracker),
+    #: None when no tracker followed it. Lets per-subject rules (dwell) follow
+    #: the device's one track instead of re-matching boxes themselves.
+    track_id: Optional[int] = None
 
 
 @dataclass(frozen=True)

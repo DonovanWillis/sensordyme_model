@@ -20,9 +20,10 @@ from __future__ import annotations
 
 import math
 import time
+from collections.abc import Iterable
 from dataclasses import dataclass, field
 from itertools import pairwise
-from typing import Optional
+from typing import Any, Optional
 
 from core.keypoints import Skeleton
 
@@ -469,3 +470,400 @@ class BoxTracker:
     def reset(self) -> None:
         self._tracks.clear()
         self._next_id = 1
+
+
+# ====================================================================== shared object tracking (M8)
+# ObjectTracker is the ONE tracker the shared perception engine runs
+# (core/perception.py). It follows every box the shared object detector
+# returns, once per detector run, and every monitoring node and custom rule
+# reads the same track ids from the frame's Observation. No node owns a
+# tracker of its own. (PersonTracker / BoxTracker above stay what they were:
+# internal helpers of the legacy preset modules -- occupancy's per-person
+# lingering, baby monitoring's hand/object trajectories.)
+#
+# Association, per detector run:
+#   1. retire tracks unseen for longer than `lost_grace_s` (occlusion patience)
+#   2. score every (live track, detection) pair of the SAME label: IoU when the
+#      boxes overlap at least `iou_min` (cost 1 - IoU), otherwise centre
+#      distance in box diagonals up to `max_centre_distance` (cost 1 + d), so an
+#      overlapping match always beats a distance-only one
+#   3. greedy assignment, cheapest first, ties broken by track id then detection
+#      index -- deterministic: no randomness, no wall clock (time is passed in)
+#   4. unmatched detections start new tracks; at capacity the stalest track is
+#      evicted (oldest last_seen, then fewest hits, then lowest id)
+#
+# Stability:
+#   - `confirmed` once matched in `confirm_hits` detector runs, and it stays
+#     confirmed until retired (a one-run flicker never becomes a track anyone
+#     reports; a confirmed track never flaps back to tentative)
+#   - `confidence` is an exponential moving average of the matched detections'
+#     confidences (`raw_confidence` is the latest). ConfidenceGate adds an
+#     enter/exit hysteresis band on top for consumers with a floor
+#
+# Failure mode, stated: no appearance model. Two same-label boxes that cross
+# can swap ids, and someone who leaves for longer than lost_grace_s comes back
+# as a new id. Nothing here is re-identification.
+#
+# Cost (bounded): at most `max_detections` (64) boxes and `max_tracks` (64)
+# live tracks, so one update is at most 64 x 64 = 4096 box comparisons (a few
+# float operations each) plus a sort of the candidate pairs; a typical room
+# (1-5 people) is ~25 comparisons. It runs once per detector run -- never per
+# consumer, never on frames the detector skipped. Memory is O(max_tracks).
+# The mean update time is reported as `perception.tracking.update_ms`
+# (tests/test_m8_tracking.py measures the worst case).
+
+SHARED_MAX_TRACKS = 64
+SHARED_MAX_DETECTIONS = 64
+SHARED_IOU_MIN = 0.2
+SHARED_MAX_CENTRE_DISTANCE = 1.0
+SHARED_CONFIRM_HITS = 2
+SHARED_LOST_GRACE_S = 2.0
+SHARED_CONFIDENCE_ALPHA = 0.4
+_UPDATE_MS_EMA = 0.2
+
+
+def box_iou(a: Box, b: Box) -> float:
+    """Intersection over union of two pixel-space (x1, y1, x2, y2) boxes."""
+    ix1, iy1 = max(a[0], b[0]), max(a[1], b[1])
+    ix2, iy2 = min(a[2], b[2]), min(a[3], b[3])
+    inter = max(0.0, ix2 - ix1) * max(0.0, iy2 - iy1)
+    if inter <= 0.0:
+        return 0.0
+    area_a = max(0.0, a[2] - a[0]) * max(0.0, a[3] - a[1])
+    area_b = max(0.0, b[2] - b[0]) * max(0.0, b[3] - b[1])
+    union = area_a + area_b - inter
+    return inter / union if union > 0.0 else 0.0
+
+
+def _box_centre(box: Box) -> tuple[float, float]:
+    return (box[0] + box[2]) / 2.0, (box[1] + box[3]) / 2.0
+
+
+def _box_diagonal(box: Box) -> float:
+    return math.hypot(box[2] - box[0], box[3] - box[1])
+
+
+def _as_box(box: Any) -> Box:
+    x1, y1, x2, y2 = (float(v) for v in tuple(box)[:4])
+    return x1, y1, x2, y2
+
+
+@dataclass(frozen=True)
+class Track:
+    """One followed object as a frame's Observation carries it (immutable)."""
+
+    track_id: int
+    label: str
+    box: Box
+    #: Smoothed (EMA) detector confidence; `raw_confidence` is the latest match.
+    confidence: float
+    raw_confidence: float
+    first_seen: float
+    last_seen: float
+    hits: int
+    confirmed: bool
+    #: Matched in the latest detector run (False: coasting through a miss).
+    visible: bool
+
+    @property
+    def age_s(self) -> float:
+        """How long this object has been followed, first to latest sighting."""
+        return self.last_seen - self.first_seen
+
+    def to_dict(self) -> dict:
+        return {"track_id": self.track_id, "label": self.label,
+                "box": [round(float(v), 1) for v in self.box],
+                "confidence": round(self.confidence, 3), "age_s": round(self.age_s, 2),
+                "hits": self.hits, "confirmed": self.confirmed, "visible": self.visible}
+
+
+@dataclass
+class _LiveTrack:
+    track_id: int
+    label: str
+    box: Box
+    confidence: float
+    raw_confidence: float
+    first_seen: float
+    last_seen: float
+    hits: int = 1
+    confirmed: bool = False
+    visible: bool = True
+
+    def frozen(self) -> Track:
+        return Track(self.track_id, self.label, self.box, self.confidence, self.raw_confidence,
+                     self.first_seen, self.last_seen, self.hits, self.confirmed, self.visible)
+
+
+class ObjectTracker:
+    """Persistent identity for the shared detector's boxes (see the section comment)."""
+
+    def __init__(self, *, iou_min: float = SHARED_IOU_MIN,
+                 max_centre_distance: float = SHARED_MAX_CENTRE_DISTANCE,
+                 confirm_hits: int = SHARED_CONFIRM_HITS, lost_grace_s: float = SHARED_LOST_GRACE_S,
+                 max_tracks: int = SHARED_MAX_TRACKS, max_detections: int = SHARED_MAX_DETECTIONS,
+                 confidence_alpha: float = SHARED_CONFIDENCE_ALPHA) -> None:
+        if max_tracks < 1 or max_detections < 1 or confirm_hits < 1:
+            raise ValueError("max_tracks, max_detections and confirm_hits must be >= 1")
+        if not 0.0 < confidence_alpha <= 1.0:
+            raise ValueError("confidence_alpha must be in (0, 1]")
+        self.iou_min = float(iou_min)
+        self.max_centre_distance = float(max_centre_distance)
+        self.confirm_hits = int(confirm_hits)
+        self.lost_grace_s = float(lost_grace_s)
+        self.max_tracks = int(max_tracks)
+        self.max_detections = int(max_detections)
+        self.alpha = float(confidence_alpha)
+        self._tracks: dict[int, _LiveTrack] = {}
+        self._next_id = 1
+        # Counters for the perception report (never accuracy claims).
+        self.updates = 0
+        self.created = 0
+        self.retired = 0
+        self.evicted = 0
+        self.dropped_detections = 0
+        self.update_ms: Optional[float] = None
+
+    # ------------------------------------------------------------------ the update
+    def update(self, detections: list[tuple[str, Any, float]], now: float) -> list[Optional[int]]:
+        """Associate one detector run's (label, box, confidence) boxes.
+
+        Returns the track id given to each detection, in input order (None for
+        a detection dropped by the `max_detections` bound).
+        """
+        started = time.perf_counter()
+        self.updates += 1
+        self._retire(now)
+        for track in self._tracks.values():
+            track.visible = False
+        boxes = [_as_box(box) for _label, box, _conf in detections]
+
+        kept = list(range(len(detections)))
+        if len(kept) > self.max_detections:
+            kept = sorted(kept, key=lambda i: (-float(detections[i][2]), i))[:self.max_detections]
+            kept.sort()
+            self.dropped_detections += len(detections) - len(kept)
+
+        pairs: list[tuple[float, int, int]] = []
+        for track_id in sorted(self._tracks):
+            track = self._tracks[track_id]
+            for i in kept:
+                if str(detections[i][0]) != track.label:
+                    continue
+                cost = self._cost(track.box, boxes[i])
+                if cost is not None:
+                    pairs.append((cost, track_id, i))
+        pairs.sort()
+
+        ids: list[Optional[int]] = [None] * len(detections)
+        used_tracks: set[int] = set()
+        for _cost, track_id, i in pairs:
+            if track_id in used_tracks or ids[i] is not None:
+                continue
+            conf = float(detections[i][2])
+            track = self._tracks[track_id]
+            track.box = boxes[i]
+            track.raw_confidence = conf
+            track.confidence = self.alpha * conf + (1.0 - self.alpha) * track.confidence
+            track.last_seen = now
+            track.hits += 1
+            track.visible = True
+            if track.hits >= self.confirm_hits:
+                track.confirmed = True
+            used_tracks.add(track_id)
+            ids[i] = track_id
+
+        for i in kept:
+            if ids[i] is not None:
+                continue
+            if len(self._tracks) >= self.max_tracks:
+                self._evict()
+            conf = float(detections[i][2])
+            track = _LiveTrack(
+                track_id=self._next_id, label=str(detections[i][0]), box=boxes[i],
+                confidence=conf, raw_confidence=conf, first_seen=now, last_seen=now,
+                confirmed=self.confirm_hits <= 1)
+            self._tracks[track.track_id] = track
+            self._next_id += 1
+            self.created += 1
+            ids[i] = track.track_id
+
+        elapsed_ms = (time.perf_counter() - started) * 1000.0
+        self.update_ms = elapsed_ms if self.update_ms is None else (
+            (1 - _UPDATE_MS_EMA) * self.update_ms + _UPDATE_MS_EMA * elapsed_ms)
+        return ids
+
+    def _cost(self, track_box: Box, box: Box) -> Optional[float]:
+        overlap = box_iou(track_box, box)
+        if overlap >= self.iou_min:
+            return 1.0 - overlap
+        diagonal = max(_box_diagonal(track_box), _box_diagonal(box))
+        if diagonal <= 1e-6:
+            return None
+        (tx, ty), (cx, cy) = _box_centre(track_box), _box_centre(box)
+        distance = math.hypot(cx - tx, cy - ty) / diagonal
+        return 1.0 + distance if distance <= self.max_centre_distance else None
+
+    def _retire(self, now: float) -> None:
+        for track_id in [tid for tid, t in self._tracks.items() if now - t.last_seen > self.lost_grace_s]:
+            del self._tracks[track_id]
+            self.retired += 1
+
+    def _evict(self) -> None:
+        stalest = min(self._tracks.values(), key=lambda t: (t.last_seen, t.hits, t.track_id))
+        del self._tracks[stalest.track_id]
+        self.evicted += 1
+
+    # ------------------------------------------------------------------ views
+    def tracks(self) -> tuple[Track, ...]:
+        """Every live track (visible or coasting), by id."""
+        return tuple(self._tracks[tid].frozen() for tid in sorted(self._tracks))
+
+    def __len__(self) -> int:
+        return len(self._tracks)
+
+    def stats(self) -> dict:
+        live = list(self._tracks.values())
+        return {
+            "live": len(live), "confirmed": sum(1 for t in live if t.confirmed),
+            "max_tracks": self.max_tracks, "updates": self.updates, "created": self.created,
+            "retired": self.retired, "evicted": self.evicted, "dropped_detections": self.dropped_detections,
+            "update_ms": None if self.update_ms is None else round(self.update_ms, 3),
+            "lost_grace_s": self.lost_grace_s, "confirm_hits": self.confirm_hits,
+        }
+
+    def reset(self) -> None:
+        self._tracks.clear()
+        self._next_id = 1
+
+
+class ConfidenceGate:
+    """Enter/exit hysteresis on a track's smoothed confidence.
+
+    A track is admitted once its confidence reaches `enter`, and stays admitted
+    until it falls below `enter - margin`: a person hovering around a node's
+    confidence floor is counted once, not on and off every detector run.
+    Memory is pruned to the tracks it was last shown (bounded by the tracker).
+    """
+
+    def __init__(self, enter: float, margin: float = 0.1) -> None:
+        self.enter = float(enter)
+        self.exit = max(0.0, self.enter - float(margin))
+        self._admitted: set[int] = set()
+
+    def admit(self, tracks: Iterable[Track]) -> list[Track]:
+        out = []
+        for track in tracks:
+            floor = self.exit if track.track_id in self._admitted else self.enter
+            if track.confidence >= floor:
+                out.append(track)
+        self._admitted = {t.track_id for t in out}
+        return out
+
+
+@dataclass(frozen=True)
+class ZoneTransition:
+    """A tracked object crossing into or out of a drawn area."""
+
+    kind: str  # "entered" | "exited"
+    zone: str
+    track_id: int
+    at: float
+    #: For "exited": how long it was inside (first sighting inside -> last).
+    dwell_s: float = 0.0
+
+
+@dataclass
+class _Membership:
+    inside: bool = False
+    candidate_since: Optional[float] = None  # first sighting inside (not yet settled)
+    entered_at: Optional[float] = None
+    outside_since: Optional[float] = None
+    last_inside_at: Optional[float] = None
+
+
+class ZoneMembership:
+    """Which tracks are inside which drawn areas, with hysteresis, and for how long.
+
+    Built on the shared tracker's ids: a node keeps one of these (state, not a
+    tracker -- it never associates boxes). A visible track whose feet point is
+    inside an area for `settle_s` has ENTERED it, its dwell clock starting at
+    its first sighting inside; outside for `settle_s` it has EXITED. A coasting
+    track (missed this run) changes nothing; a retired track that was inside
+    exits at its last sighting inside. Bounded by live tracks x areas.
+    """
+
+    def __init__(self, settle_s: float = 1.0) -> None:
+        self.settle_s = float(settle_s)
+        self._state: dict[tuple[str, int], _Membership] = {}
+
+    def update(self, tracks: Iterable[Track], zones: Iterable[Any], width: int, height: int,
+               now: float, *, live: Optional[Iterable[int]] = None) -> list[ZoneTransition]:
+        """Advance on one detector run. `tracks` are the tracks to place (a
+        consumer may have filtered them, e.g. by confidence); `live` is every
+        track id the tracker still holds (default: those of `tracks`). A track
+        that is live but not placed this run is treated like a coasting one."""
+        tracks = list(tracks)
+        zones = list(zones)
+        live = {t.track_id for t in tracks} if live is None else set(live)
+        names = [str(z.name) for z in zones]
+        out: list[ZoneTransition] = []
+        # Retired tracks and removed areas: close what was open, forget the rest.
+        for key in sorted(k for k in self._state if k[1] not in live or k[0] not in names):
+            state = self._state.pop(key)
+            if state.inside and key[0] in names and state.entered_at is not None:
+                last = state.last_inside_at if state.last_inside_at is not None else state.entered_at
+                out.append(ZoneTransition("exited", key[0], key[1], last, max(0.0, last - state.entered_at)))
+        for zone, name in zip(zones, names, strict=True):
+            for track in tracks:
+                if track.visible:
+                    out += self._observe(zone, name, track, width, height, now)
+        return out
+
+    def _observe(self, zone: Any, name: str, track: Track, width: int, height: int,
+                 now: float) -> list[ZoneTransition]:
+        key = (name, track.track_id)
+        inside = bool(zone.contains_box(track.box, width, height))
+        state = self._state.get(key)
+        if state is None:
+            if not inside:
+                return []
+            state = self._state[key] = _Membership()
+        if inside:
+            state.last_inside_at = now
+            state.outside_since = None
+            if state.inside:
+                return []
+            if state.candidate_since is None:
+                state.candidate_since = now
+            if now - state.candidate_since < self.settle_s:
+                return []
+            state.inside, state.entered_at = True, state.candidate_since
+            return [ZoneTransition("entered", name, track.track_id, now)]
+        state.candidate_since = None
+        if not state.inside:
+            del self._state[key]
+            return []
+        if state.outside_since is None:
+            state.outside_since = now
+        if now - state.outside_since < self.settle_s:
+            return []
+        entered = state.entered_at if state.entered_at is not None else now
+        last = state.last_inside_at if state.last_inside_at is not None else entered
+        del self._state[key]
+        return [ZoneTransition("exited", name, track.track_id, now, max(0.0, last - entered))]
+
+    def members(self, zone: str) -> dict[int, float]:
+        """Track id -> when its visit started, for every track inside `zone` now."""
+        return {tid: s.entered_at for (name, tid), s in sorted(self._state.items())
+                if name == zone and s.inside and s.entered_at is not None}
+
+    def dwell(self, zone: str, now: float) -> dict[int, float]:
+        """Track id -> seconds inside `zone` so far, for every track inside now."""
+        return {tid: max(0.0, now - since) for tid, since in self.members(zone).items()}
+
+    def __len__(self) -> int:
+        return len(self._state)
+
+    def clear(self) -> None:
+        self._state.clear()

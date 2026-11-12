@@ -31,10 +31,10 @@ silently dropping one side.
 | Product mode | Preset | Availability | Notes |
 |---|---|---|---|
 | Driver Safety | `driver_safety` | available | `driver_attention` module. |
-| Child Monitoring | `baby_monitoring` | available | Infant and young-child focus. Adult face and pose models are not reliable on infants, and the preset says so. |
+| Child Monitoring | `baby_monitoring` | available | Infant and young-child focus. Adult face and pose models are not reliable on infants, and the preset says so. Pose-based `flailing` and `choking_hazard` are marked `experimental` (reported in `perception.nodes[].experimental_features`); emergency prompts (breathing, choking, face-down) are refused. |
 | Property Monitoring | `security_monitoring` | available | `occupancy` module: areas, lingering, vehicles, animals, crowd. |
-| Occupancy | `occupancy` | **planned** | The occupancy module runs today inside Security Monitoring (`served_by`). A standalone mode needs its own alert set and an entry in the app. |
-| Workplace Safety | `workplace_safety` | **planned** | No PPE, hard-hat or hi-vis detector exists. `served_by` lists the parts that do exist: falls (Elderly) and areas (Security). |
+| Occupancy | `occupancy` | available (M7) | `shared_perception` + the `people_counter` node: tracked people count, entry/exit, area crossings and per-person dwell from the shared tracker (M8). |
+| Workplace Safety | `workplace_safety` | available (M7) | `shared_perception` + the `zone_watch` node: a person in a restricted area. No PPE, hard-hat, hi-vis, vehicle or forklift detector exists, and the preset says so. |
 | (none) | `elderly_monitoring` | available | Kept for existing installations. |
 
 Planned entries live under `planned:` in presets.yaml. `load_presets()` never
@@ -215,8 +215,12 @@ is never delivered. Codes: `rule_not_found` (404), `device_not_found` (404),
 
 - Settings exist only for keys that already exist in config.yaml. No new
   thresholds were invented.
-- No dedicated Occupancy or Workplace Safety mode exists. They are listed as
-  planned with the reason.
+- Occupancy and Workplace Safety are node-backed presets (M7) at `synthetic_tests`
+  at most: exercised on the virtual device only. Workplace Safety is
+  person-in-area only.
+- When custom rules replace a preset (general role, AI custom), the preset's
+  own nodes stop with it and are reported `inactive`; companions the owner
+  enabled keep running (M8).
 - `capability_unsupported` is inferred from the device's own impairment
   wording ("not configured" or "not provided"). The device reports no
   separate "absent" state.
