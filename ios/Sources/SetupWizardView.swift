@@ -21,13 +21,14 @@ struct SetupWizardView: View {
     @State private var busy = false
     @State private var errorMessage: String?
     @State private var showBluetoothSetup = false
+    @Environment(\.accessibilityReduceMotion) private var reduceMotion
 
     var body: some View {
         NavigationStack {
-            VStack(spacing: 26) {
+            VStack(alignment: .leading, spacing: SD.Space.lg) {
                 progressBar
 
-                Spacer()
+                Spacer(minLength: SD.Space.md)
 
                 Group {
                     switch step {
@@ -38,10 +39,11 @@ struct SetupWizardView: View {
                     case .done: doneStep
                     }
                 }
-                .transition(.asymmetric(insertion: .move(edge: .trailing).combined(with: .opacity),
-                                        removal: .move(edge: .leading).combined(with: .opacity)))
+                .transition(reduceMotion ? .opacity
+                            : .asymmetric(insertion: .move(edge: .trailing).combined(with: .opacity),
+                                          removal: .move(edge: .leading).combined(with: .opacity)))
 
-                Spacer()
+                Spacer(minLength: SD.Space.md)
 
                 if step != .done {
                     Button(action: advance) {
@@ -60,13 +62,14 @@ struct SetupWizardView: View {
                 }
 
                 if let errorMessage {
-                    Text(errorMessage).font(.callout).foregroundStyle(SD.Colors.danger)
+                    Text(errorMessage).font(SD.Typography.callout).foregroundStyle(SD.Colors.danger)
+                        .fixedSize(horizontal: false, vertical: true)
                         .accessibilityLabel("Error: \(errorMessage)")
                         .accessibilityIdentifier("wizard.error")
                 }
             }
-            .padding(24)
-            .animation(.spring(duration: 0.45), value: step)
+            .padding(SD.Space.lg)
+            .animation(SD.Motion.resolved(SD.Motion.spatial, reduceMotion: reduceMotion), value: step)
             .frame(maxWidth: .infinity, maxHeight: .infinity)
             .orynScreen()
             .navigationTitle("Set up device")
@@ -87,35 +90,53 @@ struct SetupWizardView: View {
         }
     }
 
+    /// Four hairline segments and the step in words: calm, and never ahead
+    /// of what has actually happened.
     private var progressBar: some View {
-        HStack(spacing: 6) {
-            ForEach(0..<4, id: \.self) { index in
-                Capsule()
-                    .fill(index <= min(step.rawValue, 3) ? SD.Colors.accent : SD.Colors.borderStrong)
-                    .frame(height: 5)
+        VStack(alignment: .leading, spacing: SD.Space.xs) {
+            Text(step == .done ? "Paired" : "Step \(min(step.rawValue, 3) + 1) of 4")
+                .font(SD.Typography.caption.weight(.medium).monospacedDigit())
+                .foregroundStyle(SD.Colors.textTertiary)
+            HStack(spacing: 4) {
+                ForEach(0..<4, id: \.self) { index in
+                    Capsule()
+                        .fill(index <= min(step.rawValue, 3) ? SD.Colors.accent : SD.Colors.borderStrong)
+                        .frame(height: 2)
+                }
             }
+            .accessibilityHidden(true)
         }
+        .accessibilityElement(children: .combine)
     }
 
+    /// One step: a symbol on a quiet tile, what to do, why. No animated
+    /// illustration: the person is doing something with their hands.
     private func stepBody(icon: String, title: String, text: String) -> some View {
-        VStack(spacing: 16) {
-            ZStack {
-                Circle().fill(SD.Colors.accent.opacity(0.15)).frame(width: 130, height: 130)
-                Image(systemName: icon)
-                    .font(.system(size: 52))
-                    .foregroundStyle(SD.Colors.accent)
-                    .symbolEffect(.pulse)
-            }
-            Text(title).font(.title2.bold())
+        VStack(alignment: .leading, spacing: SD.Space.md) {
+            Image(systemName: icon)
+                .font(.system(size: 24, weight: .regular))
+                .foregroundStyle(SD.Colors.textPrimary)
+                .frame(width: 60, height: 60)
+                .background(
+                    RoundedRectangle(cornerRadius: SD.Radius.xl, style: .continuous)
+                        .fill(SD.Colors.surfaceRaised)
+                )
+                .accessibilityHidden(true)
+            Text(title)
+                .sdScaledFont(28, relativeTo: .title, weight: .semibold)
+                .foregroundStyle(SD.Colors.textPrimary)
+                .fixedSize(horizontal: false, vertical: true)
+                .accessibilityAddTraits(.isHeader)
             Text(text)
-                .font(.subheadline)
+                .font(SD.Typography.body)
                 .foregroundStyle(SD.Colors.textSecondary)
-                .multilineTextAlignment(.center)
+                .fixedSize(horizontal: false, vertical: true)
         }
+        .frame(maxWidth: .infinity, alignment: .leading)
     }
 
     private var powerStep: some View {
-        VStack(spacing: 16) {
+        VStack(alignment: .leading, spacing: SD.Space.md) {
             stepBody(
                 icon: "power",
                 title: "Power it on",
@@ -130,9 +151,9 @@ struct SetupWizardView: View {
                 .buttonStyle(SDButtonStyle(kind: .secondary))
                 .accessibilityIdentifier("wizard.bluetooth")
                 Text("New SensorDyme? Bluetooth setup finds it, checks the setup code on its label and gives it your Wi-Fi.")
-                    .font(.footnote)
+                    .font(SD.Typography.caption)
                     .foregroundStyle(SD.Colors.textSecondary)
-                    .multilineTextAlignment(.center)
+                    .fixedSize(horizontal: false, vertical: true)
             }
         }
         .sheet(isPresented: $showBluetoothSetup) {
@@ -180,16 +201,17 @@ struct SetupWizardView: View {
     }
 
     private var hotspotStep: some View {
-        VStack(spacing: 14) {
+        VStack(alignment: .leading, spacing: SD.Space.md) {
             stepBody(
-                icon: "wifi.circle.fill",
+                icon: "wifi",
                 title: "Join its setup network",
                 text: "In Settings → Wi-Fi on this phone, join the network named SensorDyme-XXXX. Your device broadcasts it on first boot."
             )
             if !state.isDemo, let setup = Self.setupURL(token: state.deviceToken) {
                 Link(destination: setup) {
                     Label("Open device setup page", systemImage: "safari")
-                        .font(.subheadline.bold())
+                        .font(SD.Typography.label.weight(.semibold))
+                        .frame(minHeight: 44)
                 }
             }
         }
@@ -197,7 +219,7 @@ struct SetupWizardView: View {
 
     private var wifiStep: some View {
         stepBody(
-            icon: "house.fill",
+            icon: "house",
             title: "Give it your Wi-Fi",
             text: state.isDemo
                 ? "On the device's setup page you pick your home Wi-Fi and enter the password. In this demo, that just happened — instantly."
@@ -206,7 +228,7 @@ struct SetupWizardView: View {
     }
 
     private var pairStep: some View {
-        VStack(spacing: 16) {
+        VStack(alignment: .leading, spacing: SD.Space.md) {
             stepBody(
                 icon: "qrcode.viewfinder",
                 title: "Pair it to your account",
@@ -217,12 +239,12 @@ struct SetupWizardView: View {
             if !state.isDemo {
                 TextField("1A2B-3C4D-5E6F", text: $claimCode)
                     .font(.title3.monospaced())
-                    .multilineTextAlignment(.center)
+                    .multilineTextAlignment(.leading)
                     .autocapitalization(.allCharacters)
                     .autocorrectionDisabled()
-                    .padding(14)
-                    .background(RoundedRectangle(cornerRadius: SD.Radius.md, style: .continuous).fill(SD.Colors.field))
-                    .overlay(RoundedRectangle(cornerRadius: SD.Radius.md, style: .continuous).strokeBorder(SD.Colors.borderStrong))
+                    .padding(.horizontal, SD.Space.md)
+                    .frame(minHeight: 56)
+                    .background(RoundedRectangle(cornerRadius: SD.Radius.lg, style: .continuous).fill(SD.Colors.field))
                     // Its placeholder is an example code, which VoiceOver read as the field's name.
                     .accessibilityLabel("Claim code")
                     .accessibilityIdentifier("wizard.claimCode")
@@ -230,22 +252,31 @@ struct SetupWizardView: View {
         }
     }
 
+    /// Said as what happened: the claim succeeded. Whether the device is
+    /// reporting and watching is the device screen's to say, from its own
+    /// telemetry; this screen used to promise "online, watching" on a claim.
     private var doneStep: some View {
-        VStack(spacing: 16) {
-            ZStack {
-                Circle().fill(SD.Colors.successMuted).frame(width: 120, height: 120)
-                Circle().strokeBorder(SD.Colors.success.opacity(0.4), lineWidth: 1).frame(width: 120, height: 120)
-                Image(systemName: "checkmark")
-                    .font(.system(size: 44, weight: .semibold))
-                    .foregroundStyle(SD.Colors.success)
-            }
-            .transition(.scale.combined(with: .opacity))
-            Text("You're live").font(.title.bold())
-            Text("Your SensorDyme is online, watching, and fully controllable from this app — modes, alerts, reports, everything.")
-                .font(.subheadline)
+        VStack(alignment: .leading, spacing: SD.Space.md) {
+            Image(systemName: "checkmark")
+                .font(.system(size: 24, weight: .semibold))
+                .foregroundStyle(SD.Colors.textPrimary)
+                .frame(width: 60, height: 60)
+                .background(
+                    RoundedRectangle(cornerRadius: SD.Radius.xl, style: .continuous)
+                        .fill(SD.Colors.surfaceRaised)
+                )
+                .accessibilityHidden(true)
+            Text("Paired to your account")
+                .sdScaledFont(28, relativeTo: .title, weight: .semibold)
+                .foregroundStyle(SD.Colors.textPrimary)
+                .accessibilityAddTraits(.isHeader)
+            Text("Open it to see whether it's reporting and what it's watching for. Modes, alerts and reports are all on its screen.")
+                .font(SD.Typography.body)
                 .foregroundStyle(SD.Colors.textSecondary)
-                .multilineTextAlignment(.center)
+                .fixedSize(horizontal: false, vertical: true)
         }
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .transition(.opacity)
     }
 
     private func advance() {

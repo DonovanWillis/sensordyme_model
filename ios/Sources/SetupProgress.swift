@@ -16,42 +16,79 @@ import SwiftUI
 struct SetupProgressView: View {
     let steps: [SetupStep]
 
+    /// "Step 3 of 6", from the same reading as the rows below it.
+    private var position: (index: Int, count: Int)? {
+        guard let current = steps.firstIndex(where: { $0.status == .active || $0.status == .failed }) else {
+            return nil
+        }
+        return (current + 1, steps.count)
+    }
+
     var body: some View {
         VStack(alignment: .leading, spacing: SD.Space.sm) {
-            ForEach(steps) { step in
-                HStack(alignment: .firstTextBaseline, spacing: SD.Space.sm) {
-                    marker(for: step.status)
-                        .frame(width: 18)
-                    VStack(alignment: .leading, spacing: 1) {
-                        Text(step.title)
-                            .font(SD.Typography.callout)
-                            .foregroundStyle(colour(for: step.status))
-                        if let detail = step.detail, step.status != .pending {
-                            Text(detail)
-                                .font(SD.Typography.caption)
-                                .foregroundStyle(SD.Colors.textTertiary)
-                                .fixedSize(horizontal: false, vertical: true)
-                        }
-                    }
-                    Spacer(minLength: 0)
+            if let position {
+                Text("Step \(position.index) of \(position.count)")
+                    .font(SD.Typography.caption.weight(.medium).monospacedDigit())
+                    .foregroundStyle(SD.Colors.textTertiary)
+                    .accessibilityAddTraits(.isHeader)
+            }
+            VStack(alignment: .leading, spacing: 0) {
+                ForEach(Array(steps.enumerated()), id: \.element.id) { index, step in
+                    row(step, isLast: index == steps.count - 1)
                 }
-                .accessibilityElement(children: .combine)
-                .accessibilityLabel("\(step.title), \(step.status.spokenDescription)")
             }
         }
         .animation(SD.Motion.standard, value: steps)
     }
 
+    /// One step on a vertical spine: the marker, a hairline to the next step,
+    /// the step's name and (once it has started) what the device reported.
+    private func row(_ step: SetupStep, isLast: Bool) -> some View {
+        HStack(alignment: .top, spacing: SD.Space.sm) {
+            VStack(spacing: 0) {
+                marker(for: step.status)
+                    .frame(width: 20, height: 20)
+                if !isLast {
+                    Rectangle()
+                        .fill(step.status == .done ? SD.Colors.textTertiary : SD.Colors.border)
+                        .frame(width: 1)
+                        .frame(minHeight: 14, maxHeight: .infinity)
+                }
+            }
+            VStack(alignment: .leading, spacing: 1) {
+                Text(step.title)
+                    .font(step.status == .active ? SD.Typography.label.weight(.semibold) : SD.Typography.callout)
+                    .foregroundStyle(colour(for: step.status))
+                if let detail = step.detail, step.status != .pending {
+                    Text(detail)
+                        .font(SD.Typography.caption)
+                        .foregroundStyle(step.status == .failed ? SD.Colors.danger : SD.Colors.textTertiary)
+                        .fixedSize(horizontal: false, vertical: true)
+                }
+            }
+            .padding(.bottom, isLast ? 0 : SD.Space.sm)
+            Spacer(minLength: 0)
+        }
+        .accessibilityElement(children: .combine)
+        .accessibilityLabel("\(step.title), \(step.status.spokenDescription)")
+    }
+
     @ViewBuilder private func marker(for status: SetupStep.Status) -> some View {
         switch status {
         case .done:
-            Image(systemName: "checkmark.circle.fill")
-                .foregroundStyle(SD.Colors.success)
+            // Bone, not green: each step is something the device reported,
+            // and green is kept for "the device is working".
+            Image(systemName: "checkmark")
+                .font(.system(size: 9, weight: .bold))
+                .foregroundStyle(SD.Colors.textOnAccent)
+                .frame(width: 16, height: 16)
+                .background(Circle().fill(SD.Colors.textSecondary))
         case .active:
             ProgressView().controlSize(.small)
         case .pending:
-            Image(systemName: "circle")
-                .foregroundStyle(SD.Colors.textTertiary.opacity(0.5))
+            Circle()
+                .strokeBorder(SD.Colors.borderStrong, lineWidth: 1.5)
+                .frame(width: 12, height: 12)
         case .failed:
             Image(systemName: "exclamationmark.circle.fill")
                 .foregroundStyle(SD.Colors.danger)
@@ -60,7 +97,7 @@ struct SetupProgressView: View {
 
     private func colour(for status: SetupStep.Status) -> Color {
         switch status {
-        case .done: SD.Colors.textPrimary
+        case .done: SD.Colors.textSecondary
         case .active: SD.Colors.textPrimary
         case .pending: SD.Colors.textTertiary
         case .failed: SD.Colors.danger
