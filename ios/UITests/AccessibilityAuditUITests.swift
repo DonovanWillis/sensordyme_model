@@ -144,30 +144,36 @@ final class AccessibilityAuditUITests: XCTestCase {
         return frame.minY < band.top || frame.maxY > band.bottom
     }
 
-    /// Scroll the element found at `frame` into the clear band and audit
-    /// contrast again; the line says what happened, and a failure there is a
-    /// real failure. Matched by label and position, since several rows can share
-    /// a label ("Not available for this device's role ...").
+    /// Scroll the text found at `frame` to the middle of the clear band and
+    /// audit contrast again; the line says what happened, and a failure there
+    /// is a real failure.
+    ///
+    /// Positions, not element handles: several rows share a label ("Not
+    /// available for this device's role ..."), and in a lazily built list an
+    /// element bound by index can name a different row once the page moves
+    /// (M8.1: the re-check chased one and gave up). So the page is dragged by
+    /// the exact distance that centres `frame` (press-drag-hold, no momentum;
+    /// the slow swipes used before glided ~400 pt and overshot), and the text
+    /// is found again by label nearest to where it must now be. Centred, not
+    /// parked at the band's edge: the floating tab bar's scroll-edge blur
+    /// reaches above the bar, and text 16 pt inside the edge was still sampled
+    /// through it.
     private func recheckContrastInClearBand(_ label: String, frame: CGRect, screen: String) -> String {
-        let candidates = app.descendants(matching: .any).matching(NSPredicate(format: "label == %@", label))
-        let element = candidates.allElementsBoundByIndex.min(by: {
-            abs($0.frame.midY - frame.midY) < abs($1.frame.midY - frame.midY)
-        }) ?? candidates.firstMatch
         let band = clearBand
-        if element.exists, element.frame.height > band.bottom - band.top - 40 {
+        if frame.height > band.bottom - band.top - 40 {
             return "\(screen)\tcontrast\tunder-bar-unverifiable\tTaller than the clear band between the bars\t\(label)\t"
         }
-        scrollIntoClearBand(element)
-        // Measured on a still screen: contrast is sampled from pixels, so text
-        // still moving (or under a scroll-edge effect still fading) could "fail"
-        // the re-check. Seen once in M8.1 run A on 'NOT YET VALIDATED', after
-        // the old swipes; the same element passed its re-check in the run before.
-        waitUntilStill(element)
-        guard element.exists, !obscuredByBars(element.frame) else {
-            XCTFail("\(screen): contrast on '\(label)' could not be re-checked clear of the bars")
+        let moved = dragPage(by: (band.top + band.bottom) / 2 - frame.midY, within: band)
+        // Contrast is sampled from pixels: measured on a still screen.
+        let frames = stillFrames(label)
+        let expected = frame.midY + moved
+        guard let target = frames.min(by: { abs($0.midY - expected) < abs($1.midY - expected) }),
+              abs(target.midY - expected) < 60, !obscuredByBars(target) else {
+            let found = frames.map { Int($0.midY) }
+            XCTFail("\(screen): contrast on '\(label)' could not be re-checked clear of the bars "
+                    + "(expected at y \(Int(expected)), found at \(found))")
             return "\(screen)\tcontrast\tNEW\tContrast failed (could not scroll clear of the bars)\t\(label)\t"
         }
-        let target = element.frame
         let screenshot = XCUIScreen.main.screenshot()
         var finding: String?
         do {
@@ -175,7 +181,7 @@ final class AccessibilityAuditUITests: XCTestCase {
                 if let f = issue.element?.frame, abs(f.midY - target.midY) < 4, abs(f.midX - target.midX) < 4 {
                     finding = issue.compactDescription
                 }
-                return true  // only this element is being re-checked here
+                return true  // only this text is being re-checked here
             }
         } catch {
             finding = "the re-check audit itself failed: \(error)"
@@ -189,47 +195,39 @@ final class AccessibilityAuditUITests: XCTestCase {
         return "\(screen)\tcontrast\tunder-bar\tPassed when re-checked clear of the bars\t\(label)\t"
     }
 
-    /// Moves the page by exactly what centres the element in the clear band: a
-    /// press-drag-hold of that distance, which leaves no momentum. The
-    /// slow swipes this replaces each moved the page ~400 pt and kept gliding,
-    /// so an element nearly as tall as the band (the device-link banner's body
-    /// at the largest text size) was overshot up and down and the re-check
-    /// passed or failed on where the last swipe happened to stop (M8.1 run A).
-    private func scrollIntoClearBand(_ element: XCUIElement) {
-        for _ in 0..<8 {
-            guard element.exists else { return }
-            let band = clearBand
-            let frame = element.frame
-            // To the MIDDLE of the band, not just inside its edge: the floating
-            // tab bar's scroll-edge blur reaches above the bar, and text parked
-            // 16 pt inside the edge was still sampled through it (M8.1).
-            let middle = (band.top + band.bottom) / 2
-            var dy = middle - frame.midY
-            if abs(dy) < 12 { return }
-            // One drag stays inside the band, so it starts and ends on page content.
-            let limit = (band.bottom - band.top) / 2 - 12
-            dy = max(-limit, min(limit, dy))
-            let origin = app.coordinate(withNormalizedOffset: .zero)
-            let start = origin.withOffset(CGVector(dx: app.frame.width * 0.18, dy: (band.top + band.bottom) / 2 - dy / 2))
-            start.press(forDuration: 0.05, thenDragTo: start.withOffset(CGVector(dx: 0, dy: dy)),
+    /// Drags the page by `dy` points (positive moves content down) in
+    /// press-drag-hold steps that start and end inside `band`, so every touch
+    /// lands on page content and nothing glides on. Returns the distance asked
+    /// for; a page that stops short at its end is caught by the caller.
+    private func dragPage(by dy: CGFloat, within band: (top: CGFloat, bottom: CGFloat)) -> CGFloat {
+        let limit = (band.bottom - band.top) / 2 - 12
+        let middle = (band.top + band.bottom) / 2
+        let origin = app.coordinate(withNormalizedOffset: .zero)
+        var remaining = dy
+        while abs(remaining) >= 12 {
+            let step = max(-limit, min(limit, remaining))
+            let start = origin.withOffset(CGVector(dx: app.frame.width * 0.18, dy: middle - step / 2))
+            start.press(forDuration: 0.05, thenDragTo: start.withOffset(CGVector(dx: 0, dy: step)),
                         withVelocity: .slow, thenHoldForDuration: 0.3)
-            waitUntilStill(element)
-            // At the end of the page it can't go further; what is clear is checked after.
-            if abs(element.frame.midY - frame.midY) < 2 { return }
+            remaining -= step
         }
+        return dy - remaining
     }
 
-    /// Until the element's frame is the same half a second apart (at most 10
-    /// tries), then a beat for the scroll-edge effect to fade.
-    private func waitUntilStill(_ element: XCUIElement) {
-        var last = element.frame
+    /// The frames of the texts with this label once they read the same half a
+    /// second apart (at most 10 tries), after a beat for scroll-edge effects.
+    private func stillFrames(_ label: String) -> [CGRect] {
+        let query = app.descendants(matching: .any).matching(NSPredicate(format: "label == %@", label))
+        func read() -> [CGRect] { query.allElementsBoundByIndex.map(\.frame).filter { $0.height > 0 } }
+        var last = read()
         for _ in 0..<10 {
             _ = XCTWaiter().wait(for: [XCTestExpectation(description: "still")], timeout: 0.5)
-            let now = element.frame
+            let now = read()
             if now == last { break }
             last = now
         }
         _ = XCTWaiter().wait(for: [XCTestExpectation(description: "settle")], timeout: 1)
+        return read()
     }
 
     private static func name(_ type: XCUIAccessibilityAuditType) -> String {
