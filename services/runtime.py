@@ -225,6 +225,7 @@ class DeviceRuntime:
     _last_observation = None
     _detector_unavailable = None
     _node_zone_signature = None
+    _preset_nodes_suspended = False
     _companions = MappingProxyType({})
     _preset_nodes = MappingProxyType({})
     _node_errors = MappingProxyType({})
@@ -1570,18 +1571,43 @@ class DeviceRuntime:
             return None
         if self.module_name not in observation.detection_consumers:
             return None  # nothing new for this module since its last detector run
-        return module.get_detections()
+        # The module's boxes ARE this run's boxes: give them the shared tracker's
+        # ids, so per-subject rules (dwell) follow the device's one tracker (M8).
+        return observation.attach_tracks(module.get_detections())
 
     # ------------------------------------------------------------------ monitoring nodes (M7)
     def _node_zones(self) -> list:
         return list(self._effective_zones(self.module_name))
 
     def _active_companions(self) -> list:
-        """Companion nodes running now: the preset's own, then the owner's (deduplicated)."""
-        nodes = dict(self._preset_nodes)
+        """Companion nodes running now: the preset's own, then the owner's (deduplicated).
+
+        When custom rules REPLACE the preset (AI_CUSTOM, M8), the preset's own
+        nodes are part of what was replaced and stop with it; the owner's
+        companions are additive and keep running."""
+        nodes = {} if self._preset_replaced() else dict(self._preset_nodes)
         for node_id, node in self._companions.items():
             nodes.setdefault(node_id, node)
         return list(nodes.values())
+
+    def _preset_replaced(self) -> bool:
+        return getattr(self, "mode", None) is monitoring_mode.MonitoringMode.AI_CUSTOM
+
+    def _sync_preset_node_demands(self) -> None:
+        """Withdraw the preset's own nodes' detector demands while custom rules
+        replace the preset, and restore them when it is back."""
+        replaced = self._preset_replaced()
+        if replaced == self._preset_nodes_suspended:
+            return
+        self._preset_nodes_suspended = replaced
+        for node in self._preset_nodes.values():
+            if node.id in self._companions:
+                continue  # the owner's own copy keeps the (shared-key) demand
+            if replaced:
+                self.perception.withdraw(node.id)
+            else:
+                for demand in node.demands():
+                    self.perception.demand(demand)
 
     def _register_node(self, node) -> None:
         node.set_zones(self._node_zones())
@@ -1621,6 +1647,11 @@ class DeviceRuntime:
                 continue
             self._preset_nodes[node_id] = node
             self._register_node(node)
+        if self._preset_nodes_suspended:  # kept nodes had their demands withdrawn: restore them
+            for node in self._preset_nodes.values():
+                for demand in node.demands():
+                    self.perception.demand(demand)
+        self._preset_nodes_suspended = False  # every demand registered: the next frame re-checks the mode
 
     @staticmethod
     def _node_items(raw) -> Optional[list[tuple[Any, Any]]]:
@@ -1738,6 +1769,7 @@ class DeviceRuntime:
             self._apply_nodes(saved, source="restore")
 
     def _run_nodes(self, observation: pc.Observation, now: float) -> None:
+        self._sync_preset_node_demands()
         nodes = self._active_companions()
         if not nodes:
             return
@@ -1788,11 +1820,7 @@ class DeviceRuntime:
             state, missing, reason = monitoring_nodes.node_state(spec, capabilities, stopped=stopped)
             if self.mode is monitoring_mode.MonitoringMode.AI_CUSTOM and not stopped:
                 state, missing, reason = monitoring_nodes.INACTIVE, [], "custom rules replace this mode"
-            features = []
-            if base == "driver_safety":
-                module_cfg = self._active_module_config()
-                features = [{**f, "enabled": bool(module_cfg.get(f["config_key"], False))}
-                            for f in monitoring_nodes.EXPERIMENTAL_DRIVER_FEATURES]
+            features = monitoring_nodes.preset_experimental_features(base, preset, self._active_module_config())
             entries.append(monitoring_nodes.wire_entry(
                 spec, state=state, missing=missing, reason=reason,
                 validation=monitoring_nodes.validation_tier(base), experimental_features=features))
@@ -1814,6 +1842,17 @@ class DeviceRuntime:
                 settings=node.settings)
             entry["enabled_by"] = "preset" if node.id in self._preset_nodes else "owner"
             entries.append(entry)
+        if self._preset_replaced():
+            running = {e["id"] for e in entries}
+            for node in self._preset_nodes.values():
+                if node.id in running:
+                    continue
+                entry = monitoring_nodes.wire_entry(
+                    node.spec, state=monitoring_nodes.INACTIVE, missing=[],
+                    reason="custom rules replace this mode", validation=monitoring_nodes.validation_tier(node.id),
+                    settings=node.settings)
+                entry["enabled_by"] = "preset"
+                entries.append(entry)
         return entries
 
     def perception_report(self, capabilities=None) -> dict:
@@ -2242,7 +2281,7 @@ class DeviceRuntime:
             return
         violation = roles.preset_violation(self.role, name, self.presets)
         if violation:
-            self._record_rejection("preset", name, [violation])
+            self._record_rejection("preset", name, [violation], code="role_forbids_preset")
             log.warning("[POLICY] preset '%s' refused: %s", name, violation)
             return
         base_name, _, variant_name = name.partition("@")[0].partition(":")
@@ -2253,7 +2292,8 @@ class DeviceRuntime:
                 self._record_rejection("preset", name, [f"unknown preset '{name}' on this device"],
                                        code="unknown_preset")
             else:
-                self._record_rejection("preset", name, ["the mac_max profile cannot switch presets"])
+                self._record_rejection("preset", name, ["the mac_max profile cannot switch presets"],
+                                       code="profile_fixed")
             return
         # Variant overrides plus any owner settings ("preset:variant@key=value",
         # core/presets.py), validated against the preset's schema. A setting this
@@ -2263,7 +2303,7 @@ class DeviceRuntime:
         try:
             name, _preset, overrides = preset_overrides(name, self.presets)
         except PresetError as exc:
-            self._record_rejection("preset", name, [exc.reason])
+            self._record_rejection("preset", name, [exc.reason], code="invalid_setting")
             print(f"SensorDyme: preset '{name}' refused: {exc.reason}")
             return
         new_module_name = preset["module"]

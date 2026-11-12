@@ -9,7 +9,9 @@ behaviour and bounds, never accuracy on real footage.
 
 from __future__ import annotations
 
+import contextlib
 import time
+from typing import ClassVar
 
 import numpy as np
 import pytest
@@ -215,7 +217,7 @@ class _Result:
 
 
 class _Detector:
-    names = {0: "person", 16: "dog"}
+    names: ClassVar[dict[int, str]] = {0: "person", 16: "dog"}
 
     def __init__(self):
         self.calls = 0
@@ -235,11 +237,8 @@ def _frame(engine, detector, fid, now, *consumers):
     with engine.activated():
         engine.run_due(frame)
         for consumer in consumers:
-            with engine.consuming(consumer):
-                try:
-                    pc.shared_detector(detector).predict(frame, classes=[0], conf=0.3)
-                except RuntimeError:
-                    pass
+            with engine.consuming(consumer), contextlib.suppress(RuntimeError):
+                pc.shared_detector(detector).predict(frame, classes=[0], conf=0.3)
     return engine.end_frame()
 
 
@@ -286,7 +285,7 @@ def test_a_failed_detector_carries_no_tracks_and_ids_survive_a_short_failure():
     detector.fail = False
     clock[0] = 1.0
     back = _frame(engine, detector, 4, clock[0], "m")
-    assert [d.track_id for d in back.detections] == [1], "a 0.6 s outage keeps the identity"
+    assert [d.track_id for d in back.detections or ()] == [1], "a 0.6 s outage keeps the identity"
 
 
 def test_the_tracker_runs_only_when_the_detector_runs():
