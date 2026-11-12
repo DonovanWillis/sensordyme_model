@@ -311,7 +311,12 @@ deploy-preflight: ## check the device's own config against this code (ROLE=drive
 	else set --; fi && \
 	$(VENV)/python scripts/deploy_preflight.py --config "$$tmp/config.yaml" $(if $(ROLE),--expect-role $(ROLE)) "$$@"
 
-deploy: deploy-preflight ## preflight, rsync to pi@sensordyme.local, install deps, migrate config, restart
+deploy: deploy-preflight ## preflight, snapshot, rsync, install deps, migrate config, restart; roll back if it does not come up
+	@# M8: the running release is snapshotted on the device first (the NEW guard,
+	@# streamed over stdin), and a release that is not stably active after the
+	@# restart -- or any step that fails -- is rolled back to it
+	@# (scripts/release/release_guard.py; data/release/ on the device).
+	ssh pi@sensordyme.local 'cd ~/sensordyme && .venv/bin/python - snapshot --root .' < scripts/release/release_guard.py
 	rsync -av --exclude='.venv' --exclude='data' --exclude='.git' --exclude='__pycache__' \
 		--exclude='config.yaml' --exclude='*.log' --exclude='.secrets' --exclude='*.pt' \
 		--exclude='*.hef' --exclude='*.db' --exclude='*.sqlite3' --exclude='*.csv' \
@@ -319,13 +324,16 @@ deploy: deploy-preflight ## preflight, rsync to pi@sensordyme.local, install dep
 		--exclude='cloud/.jwt_secret' --exclude='cloud/.backend_id' --exclude='.env' \
 		--exclude='.env.*' --exclude='*.pem' --exclude='*.key' --exclude='logs' \
 		--exclude='ios' --exclude='benchmarks/results' \
-		./ pi@sensordyme.local:~/sensordyme/
-	ssh pi@sensordyme.local 'cd ~/sensordyme && .venv/bin/pip install -q -r requirements-device.txt'
-	ssh pi@sensordyme.local 'cd ~/sensordyme && python3 scripts/migrate_config.py config.yaml'
+		./ pi@sensordyme.local:~/sensordyme/ && \
+	ssh pi@sensordyme.local 'cd ~/sensordyme && .venv/bin/pip install -q -r requirements-device.txt' && \
+	ssh pi@sensordyme.local 'cd ~/sensordyme && python3 scripts/migrate_config.py config.yaml' && \
+	ssh pi@sensordyme.local 'cd ~/sensordyme && sudo bash scripts/release/install_units.sh --user "$$(id -un)"' && \
+	ssh pi@sensordyme.local 'cd ~/sensordyme && sudo systemctl restart sensordyme.service' && \
+	ssh pi@sensordyme.local 'cd ~/sensordyme && .venv/bin/python scripts/release/release_guard.py confirm-or-rollback --root . --user "$$(id -un)"' \
+	|| { ssh pi@sensordyme.local 'cd ~/sensordyme && .venv/bin/python scripts/release/release_guard.py rollback --root . --user "$$(id -un)"'; exit 1; }
 	@# M6: rsync never touched /etc/systemd/system, so a release that changed the
-	@# unit (bounded start-limit reboots) landed with the OLD unit still in force.
-	ssh pi@sensordyme.local 'cd ~/sensordyme && sudo bash scripts/release/install_units.sh --user "$$(id -un)"'
-	ssh pi@sensordyme.local 'cd ~/sensordyme && sudo systemctl restart sensordyme.service'
+	@# unit (bounded start-limit reboots) landed with the OLD unit still in force;
+	@# install_units.sh above runs before the restart.
 
 # =============================================================================
 # Release candidates (M6). A manifest pins exactly what a ref puts on a device;

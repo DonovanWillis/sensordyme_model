@@ -43,6 +43,20 @@ REPO = Path(__file__).resolve().parent.parent
 #: Health-monitor and uplink cadence in the deterministic path (production: 2 s each).
 MONITORING_CHECK_S = 2.0
 
+#: Ways a config.yaml is found damaged at boot (M8): a power cut mid-write, a bad
+#: hand edit, a migration that broke the schema, an emptied file.
+CONFIG_DAMAGE = {
+    # A write cut off by a power loss: a third of the file, stopping mid-line.
+    "truncated": lambda text: text[: len(text) // 3].rstrip("\n")[:-1],
+    # The same, cut where the result is no longer a mapping with `modules:`.
+    "truncated_early": lambda text: text[: len(text) // 10].rstrip("\n")[:-1],
+    "invalid_yaml": lambda text: text + "\nmodule: [unclosed\n",
+    "not_mapping": lambda _text: "- just\n- a list\n",
+    "schema": lambda text: text + "\nmodules: 7\n",
+    "empty": lambda _text: "",
+    "binary": lambda _text: "\x00\xff\xfe garbage",
+}
+
 
 class _SteppedCapture:
     """Stands in for CaptureService when advance() is the camera pump.
@@ -100,6 +114,7 @@ class VirtualDevice:
         log_level: str = "info",
         honour_backoff: bool = False,
         config_overrides: Optional[dict] = None,
+        config_damage: Optional[str] = None,
     ) -> None:
         self.state_dir = Path(state_dir).resolve()
         self.state_dir.mkdir(parents=True, exist_ok=True)
@@ -120,6 +135,11 @@ class VirtualDevice:
         #: {"role": "general", "module": "shared_perception"}): another kind of
         #: device, same code.
         self.config_overrides = dict(config_overrides or {})
+        #: How this boot's config.yaml is damaged on disk (M8 fault injection),
+        #: one of CONFIG_DAMAGE; None writes it intact.
+        if config_damage is not None and config_damage not in CONFIG_DAMAGE:
+            raise ValueError(f"unknown config damage {config_damage!r}; one of {sorted(CONFIG_DAMAGE)}")
+        self.config_damage = config_damage
         self.log_level = log_level
         self.buzzer = SimBuzzerSink(echo=echo_alerts)
         monotonic = clock.monotonic if clock is not None else time.monotonic
@@ -195,7 +215,10 @@ class VirtualDevice:
 
     def write_config(self) -> Path:
         path = self.state_dir / "config.yaml"
-        path.write_text(yaml.safe_dump(self.config(), sort_keys=False))
+        text = yaml.safe_dump(self.config(), sort_keys=False)
+        if self.config_damage is not None:
+            text = CONFIG_DAMAGE[self.config_damage](text)
+        path.write_text(text)
         return path
 
     # ------------------------------------------------------------------ build
@@ -232,6 +255,8 @@ class VirtualDevice:
         self._loop = runtime._new_inference_loop_state()
         self._loop.frame_timeout_s = 0.0
         self._next_check = self._next_sync = time.monotonic()
+        # What run() does right after READY=1.
+        runtime._record_known_good_config()
         return runtime
 
     def advance(self, seconds: float, step: float = 0.05) -> None:

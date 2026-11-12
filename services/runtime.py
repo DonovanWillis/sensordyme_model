@@ -107,6 +107,10 @@ _PROCESS_RESTART_WINDOW_S = 900.0
 _INFERENCE_STARTING_GRACE_S = 30.0
 #: While DEGRADED (no detector), how often to try loading it again.
 _DETECTOR_RETRY_S = 60.0
+#: A module that could not be built at boot (main.py's UnavailableModule) is
+#: rebuilt after this long, then at doubling intervals up to the cap (M8).
+_MODULE_REBUILD_FIRST_S = 30.0
+_MODULE_REBUILD_MAX_S = 600.0
 
 
 @dataclass
@@ -243,6 +247,14 @@ class DeviceRuntime:
     #: (SENSORDYME_MONITORING_PATH or data/monitoring.json). A seam for sim/,
     #: which keeps each virtual device's state in its own directory.
     monitoring_path: Optional[str] = None
+    #: The config file this runtime was built from (main.build_runtime sets it)
+    #: and, when that file could not be used, the fault: the runtime is then
+    #: running on core.config_lkg's last-known-good copy (M8).
+    config_path: Optional[str] = None
+    config_fault = None
+    #: When to try building an UnavailableModule again (inf: nothing to rebuild).
+    _module_rebuild_at = float("inf")
+    _module_rebuild_attempts = 0
 
     def __init__(
         self,
@@ -300,6 +312,9 @@ class DeviceRuntime:
         # and to the rule engine, and remembered across restarts so an offline
         # device does not come back without them. See _effective_zones.
         self._app_zones: Optional[list] = None
+        # Saved state that exists but cannot be read is restored as empty (every
+        # loader falls back safely) -- and reported, not silently forgotten (M8).
+        self._state_faults = self._check_saved_state()
         saved_zones = device_state.saved_zones()
         if saved_zones is not None:
             self._app_zones = _zones_from_app(saved_zones)
@@ -392,6 +407,9 @@ class DeviceRuntime:
         # up is IMPAIRED. Camera grace mirrors camera_check's.
         self._ready_grace_from = time.monotonic()
         self._camera_grace_until = time.monotonic() + 10.0
+        self._module_rebuild_attempts = 0
+        self._module_rebuild_at = (time.monotonic() + _MODULE_REBUILD_FIRST_S
+                                   if self._module_unavailable() else float("inf"))
 
         self.camera: Optional[Camera] = None
         self.capture: Optional[CaptureService] = None
@@ -606,6 +624,12 @@ class DeviceRuntime:
                 print(f"SensorDyme: cloud uplink OFF -- the device key file cannot be used: {exc}")
                 cloud_cfg = {**cloud_cfg, "device_key": ""}
         if bool(cloud_cfg.get("enabled", False)) and cloud_cfg.get("device_key"):
+            # M8: the undelivered-event backlog lives on disk beside the event log,
+            # so alerts raised during an outage survive a restart or a power cut.
+            if not cloud_cfg.get("spool_path"):
+                events_csv = str(logging_config.get("csv_path", "data/events.csv"))
+                cloud_cfg = {**cloud_cfg,
+                             "spool_path": str(Path(events_csv).parent / "uplink_spool.jsonl")}
             self.uplink = self._make_uplink(cloud_cfg)
             self.uplink.set_active_preset(self.active_preset)
             # Report the restored configuration at startup too, not only when a
@@ -736,6 +760,15 @@ class DeviceRuntime:
         )
         for name, component in self.hardware.health_checks().items():
             self.health.register(name, check=component, check_interval_s=60.0)
+
+        if self.config_fault is not None:
+            # Reported, not hidden: in the event log here, in every health report
+            # (_config_report), and on the journal by main.load_device_config.
+            log.error("[CONFIG] %s", self.config_fault.reason)
+            self._log_system_event("config_fault", "running on the last known good config "
+                                   f"({self.config_fault.fallback_path}): {self.config_fault.reason}")
+        for fault in getattr(self, "_state_faults", []) or []:
+            self._log_system_event("saved_state_fault", fault)
 
         # ---- supervisor -----------------------------------------------------------
         self.supervisor = Supervisor(self.health)
@@ -904,6 +937,62 @@ class DeviceRuntime:
             log.info("object detection recovered for %s; monitoring is active again",
                      self.module_name)
 
+    def _module_unavailable(self) -> bool:
+        from modules.base import UnavailableModule
+
+        return isinstance(getattr(self, "module", None), UnavailableModule)
+
+    def _retry_unavailable_module(self) -> bool:
+        """Rebuild a module that could not be built at boot (M8). True once it runs.
+
+        main.py boots FAILED-but-reachable with an UnavailableModule when the
+        module raised (a model file not mounted yet, a transient load error).
+        Nothing ever tried again, so a fault that cleared a second later kept
+        the device FAILED -- impaired buzzer and all -- until a person restarted
+        it. Retried here, on the inference thread like every module swap, after
+        _MODULE_REBUILD_FIRST_S and then at doubling intervals up to
+        _MODULE_REBUILD_MAX_S. Each failure keeps the reason current.
+        """
+        current = self.module
+        if not self._module_unavailable() or self.profile == "mac_max":
+            self._module_rebuild_at = float("inf")
+            return not self._module_unavailable()
+        self._module_rebuild_attempts += 1
+        delay = min(_MODULE_REBUILD_MAX_S, _MODULE_REBUILD_FIRST_S * 2 ** (self._module_rebuild_attempts - 1))
+        if current is self._boot_module and self._boot_module_config is not None:
+            module_cfg = self._boot_module_config
+        else:
+            module_cfg = (self.config.get("modules", {}) or {}).get(self.module_name, {}) or {}
+        try:
+            with self._module_swap():
+                new_module = self.perception.adopt(self._build_module(self.module_name, dict(module_cfg)))
+        except Exception as exc:  # noqa: BLE001 - still FAILED, with the current reason
+            self._module_rebuild_at = time.monotonic() + delay
+            current.reason = str(exc)
+            log.warning("module '%s' still cannot be built (attempt %d, next in %.0f s): %s",
+                        self.module_name, self._module_rebuild_attempts, delay, exc)
+            return False
+        self._push_zones_to(new_module)
+        with self._module_lock:
+            self.module = new_module
+            if current is self._boot_module:
+                self._boot_module = new_module
+            self._model_identity = None
+            self._consecutive_process_failures = 0
+            self._ready_grace_from = time.monotonic()
+        self._module_rebuild_at = float("inf")
+        self._verify_detection_backend()
+        if self._custom_active():
+            self._apply_requested_labels()
+        with suppress(Exception):
+            current.close()
+        log.info("module '%s' built on attempt %d; monitoring resumes", self.module_name,
+                 self._module_rebuild_attempts)
+        self._log_system_event("module_recovered", f"module '{self.module_name}' built after "
+                               f"{self._module_rebuild_attempts} retr{'y' if self._module_rebuild_attempts == 1 else 'ies'}")
+        self._publish_monitoring()
+        return True
+
     def _active_module_config(self) -> dict:
         """The config the RUNNING module was built from (see __init__)."""
         if self._boot_module_config is not None and self.module is self._boot_module:
@@ -977,7 +1066,70 @@ class DeviceRuntime:
         report["monitoring"] = monitoring.to_dict()
         report["monitoring_active"] = monitoring.monitoring
         report["protection"] = self.protection_state()
+        report["config"] = self._config_report()
+        report["saved_state"] = {"faults": list(getattr(self, "_state_faults", []) or [])}
+        backlog = getattr(self.uplink, "backlog", None)
+        if callable(backlog):
+            report["uplink_backlog"] = backlog()
         return report
+
+    def _check_saved_state(self) -> list[str]:
+        """Faults in the files that carry the owner's choices across a restart.
+
+        device_state.json (mode, zones, companion nodes) and monitoring.json
+        (custom rules) are read as empty when damaged -- the device boots on its
+        configured mode, which is the safe direction -- but the owner's choices
+        are gone, and the next save overwrites the evidence. So each damaged file
+        is copied aside (<name>.corrupt) and named in every health report.
+        """
+        from core.monitoring_config import DEFAULT_PATH as MONITORING_DEFAULT
+
+        paths = {
+            "device_state": Path(os.environ.get("SENSORDYME_DEVICE_STATE_PATH") or device_state.DEFAULT_PATH),
+            "custom_rules": Path(self.monitoring_path or MONITORING_DEFAULT),
+        }
+        faults: list[str] = []
+        for what, path in paths.items():
+            try:
+                raw = path.read_bytes()
+            except FileNotFoundError:
+                continue
+            except OSError as exc:
+                faults.append(f"{what} ({path.name}) unreadable: {exc}")
+                continue
+            try:
+                ok = isinstance(json.loads(raw), dict)
+            except (ValueError, UnicodeDecodeError):
+                ok = False
+            if ok:
+                continue
+            faults.append(f"{what} ({path.name}) was damaged and could not be restored; "
+                          f"kept as {path.name}.corrupt")
+            with suppress(OSError):
+                path.with_name(path.name + ".corrupt").write_bytes(raw)
+        for fault in faults:
+            log.error("[STATE] %s", fault)
+        return faults
+
+    def _config_report(self) -> dict:
+        """Which configuration is in force, and the fault when it is not config.yaml (M8)."""
+        if self.config_fault is not None:
+            return self.config_fault.describe()
+        return {"source": "config", "path": self.config_path, "fault": None}
+
+    def _record_known_good_config(self) -> None:
+        """Once READY: this config.yaml is the one to fall back to (core/config_lkg.py).
+
+        Never while running FROM the fallback -- the broken config.yaml must not
+        become the "good" copy -- and never for a runtime built without a file.
+        """
+        if not self.config_path or self.config_fault is not None:
+            return
+        from core import config_lkg
+
+        if not config_lkg.save_last_good(self.config_path):
+            log.warning("could not record %s as the last known good config (%s)",
+                        self.config_path, config_lkg.last_good_path(self.config_path))
 
     def _collect_component_health(self, caller: str) -> dict:
         heartbeat_age = None if self._heartbeat == 0.0 else time.monotonic() - self._heartbeat
@@ -998,12 +1150,17 @@ class DeviceRuntime:
             # per call because the active module changes at runtime when the
             # operator switches preset mid-demo.
             detector_required=self._module_uses_a_detector(),
+            # Whatever the accelerator probe says, no detector is no detector:
+            # never "OK, running on CPU" on a device with no CPU backend (M8).
+            detector_unavailable=self._detection_degraded,
         )
 
     def _accelerator_health(self) -> tuple[bool, str]:
         """Accelerator health, scoped to whether this mode actually uses it."""
         if not self._module_uses_a_detector():
             return True, f"not used by this mode ({self.module_name}) — {accel.status()[1]}"
+        if self._detection_degraded is not None:
+            return False, f"object detection unavailable — {self._detection_degraded}"
         return accel.live_status()
 
     def _module_uses_a_detector(self) -> bool:
@@ -2610,6 +2767,11 @@ class DeviceRuntime:
             self._heartbeat = time.monotonic()
             stop.wait(0.5)
             return True
+        if time.monotonic() >= self._module_rebuild_at and self._module_unavailable():
+            try:
+                self._retry_unavailable_module()
+            except Exception:  # a failed retry must not crash the loop
+                log.exception("module rebuild failed; still FAILED")
         if self._detection_degraded is not None:
             self._heartbeat = time.monotonic()
             if time.monotonic() - loop.last_detector_retry >= _DETECTOR_RETRY_S:
@@ -2885,6 +3047,7 @@ class DeviceRuntime:
         self.supervisor.start_all()
         self.health.start()
         sdnotify.notify_ready()
+        self._record_known_good_config()
         log.info(
             "runtime up: profile=%s module=%s display=%s accelerator=%s%s",
             self.profile, self.module_name, self.display, accel.status()[1],

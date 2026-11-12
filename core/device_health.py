@@ -271,6 +271,7 @@ def collect(
     detection_degraded: Optional[str] = None,
     caller: str = "default",
     detector_required: bool = True,
+    detector_unavailable: Optional[str] = None,
 ) -> dict:
     """Assemble the health report the device sends upstream each sync.
 
@@ -317,6 +318,14 @@ def collect(
         )
 
     accelerator = _accelerator()
+    if detector_required and detector_unavailable:
+        # M8: the accelerator branch above cannot see that NOTHING detects. With no
+        # Hailo and no CPU backend (a device: ultralytics is not installed) it said
+        # "OK, running on CPU" while the module ran without object detection.
+        accelerator = Component(
+            WARNING, f"object detection unavailable — {detector_unavailable}",
+            {**accelerator.metrics, "detector_available": False},
+        )
     # A detector that dies at frame 10,000 must flip this too, not just one that
     # was missing at boot. `detection_degraded` is set once, during startup, so on
     # its own it would leave monitoring_active True for a device whose NPU stopped
