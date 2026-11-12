@@ -55,6 +55,7 @@ struct JupiterDock: View {
     @State private var draft = ""
     @FocusState private var focused: Bool
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
+    @Environment(\.dynamicTypeSize) private var typeSize
 
     private var canSubmit: Bool { JupiterPrompt.canSubmit(draft) }
 
@@ -68,7 +69,7 @@ struct JupiterDock: View {
                 OrynMark(height: 17, color: focused ? SD.Colors.signal : SD.Colors.textPrimary)
                     .accessibilityHidden(true)
                 TextField("", text: $draft,
-                          prompt: Text("Ask Jupiter to watch for…").foregroundStyle(SD.Colors.textTertiary))
+                          prompt: Text("Ask Jupiter").foregroundStyle(SD.Colors.textTertiary))
                     .font(SD.Typography.body)
                     .foregroundStyle(SD.Colors.textPrimary)
                     .tint(SD.Colors.signal)
@@ -126,6 +127,9 @@ struct JupiterDock: View {
                     .accessibilityIdentifier("detail.examples")
             }
             .padding(.trailing, SD.Space.sm)
+            // At accessibility sizes the chips would be clipped or tower over the
+            // keyboard; "All examples" opens the full list instead.
+            if !typeSize.isAccessibilitySize {
             ScrollView(.horizontal, showsIndicators: false) {
                 HStack(spacing: SD.Space.xs) {
                     ForEach(JupiterSuggestions.supported) { suggestion in
@@ -150,6 +154,7 @@ struct JupiterDock: View {
                     }
                 }
                 .padding(.trailing, SD.Space.sm)
+            }
             }
         }
     }
