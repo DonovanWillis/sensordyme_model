@@ -1003,8 +1003,9 @@ class DeviceRuntime:
         """The config the RUNNING module was built from (see __init__)."""
         if self._boot_module_config is not None and self.module is self._boot_module:
             return self._boot_module_config
-        if self._switched_module_config is not None and self.module is self._switched_module:
-            return self._switched_module_config
+        switched_config = getattr(self, "_switched_module_config", None)
+        if switched_config is not None and self.module is getattr(self, "_switched_module", None):
+            return switched_config
         return (self.config.get("modules", {}) or {}).get(self.module_name, {}) or {}
 
     def _module_identity_name(self) -> str:
