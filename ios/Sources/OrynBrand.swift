@@ -116,14 +116,15 @@ struct OrynFieldChrome<Field: View>: View {
         .padding(.horizontal, SD.Space.md - 2)
         .frame(minHeight: 52)
         .background(
-            RoundedRectangle(cornerRadius: SD.Radius.md, style: .continuous)
+            RoundedRectangle(cornerRadius: SD.Radius.lg, style: .continuous)
                 .fill(SD.Colors.field)
         )
         .overlay(
-            RoundedRectangle(cornerRadius: SD.Radius.md, style: .continuous)
+            RoundedRectangle(cornerRadius: SD.Radius.lg, style: .continuous)
                 .strokeBorder(
+                    // An outline only when it says something: focus, or a problem.
                     invalid ? SD.Colors.danger.opacity(0.6)
-                        : focused ? SD.Colors.borderFocus : SD.Colors.borderStrong,
+                        : focused ? SD.Colors.borderFocus : Color.clear,
                     lineWidth: 1
                 )
         )
