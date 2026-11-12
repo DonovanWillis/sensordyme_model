@@ -162,8 +162,19 @@ def load_setup_code(path: str) -> str:
                              "it must be 0600")
     if hasattr(os, "getuid") and info.st_uid != os.getuid():
         raise SetupCodeError(f"{path} is owned by uid {info.st_uid}, not this service")
-    with open(path, encoding="ascii") as f:
-        return normalize_setup_code(f.read().strip())
+    # Every way the file can fail to give up a code is a SetupCodeError, which
+    # the provisioning service answers by keeping Bluetooth shut, saying why
+    # in health and retrying. An unreadable file (mode 0000) or non-ASCII
+    # content used to escape as PermissionError / UnicodeDecodeError and crash
+    # the provisioning thread instead. The message never includes the content.
+    try:
+        with open(path, encoding="ascii") as f:
+            text = f.read()
+    except UnicodeDecodeError:
+        raise SetupCodeError(f"{path} is not a setup code (not ASCII text)") from None
+    except OSError as exc:
+        raise SetupCodeError(f"{path} cannot be read ({type(exc).__name__}: {exc.strerror or 'error'})") from None
+    return normalize_setup_code(text.strip())
 
 
 def write_setup_code(path: str, code: str) -> None:

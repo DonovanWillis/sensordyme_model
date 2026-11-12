@@ -1,229 +1,379 @@
 import Combine
 import Foundation
-import Network
-import SwiftUI
 
-/// Drives setup from "where is my device" to "it is online", across both radios.
+/// The account side of onboarding: what SetupFlow asks the backend. The app's
+/// implementation is `AppStateOnboardingAccount` (SetupAccount.swift, over
+/// AppState.backend); the cross-language harness talks HTTP to sim.backend.
+@MainActor
+protocol OnboardingAccount: AnyObject {
+    var isSignedIn: Bool { get }
+    func accountDevices() async throws -> [Onboarding.AccountDevice]
+    /// POST /v1/devices/claim.
+    func claim(code: String) async throws
+    /// The modes the device can run, and the one it runs now.
+    func modes(deviceID: Int) async throws -> (modes: [Onboarding.Mode], active: String?)
+    func activate(mode: String, deviceID: Int) async throws
+    /// A refusal in the person's terms (Onboarding.claimMessage for a claim).
+    func explain(_ error: Error, claiming: Bool) -> String
+}
+
+/// Finding the device on the local network after it joined (mDNS), for the
+/// live feed. The app's implementation wraps DeviceLink.
+@MainActor
+protocol OnboardingLocalLink: AnyObject {
+    /// The device's local address, if it answers on this network.
+    func find(deviceID: String?) async -> String?
+    /// Why discovery cannot work from here, when that is knowable.
+    var problem: String? { get }
+    func stop()
+}
+
+/// Drives onboarding from "where is my device" to "it is watching", across
+/// Bluetooth, the device's new network and the account.
 ///
-/// The two halves already existed and never spoke: `BLEProvisioner` handed the
-/// device its credentials and stopped, and `DeviceLink` could find a device on
-/// Wi-Fi but nothing told it to start looking. So the app went quiet at exactly
-/// the moment the device was doing the thing it had been asked to do, and the
-/// person watching had to work out for themselves that setup had worked.
-///
-/// This owns both and carries the handover. It exists because the interesting
-/// part of provisioning is not either radio — it is the seam between them.
+/// `Onboarding` (SetupOnboarding.swift) holds every legal step; this turns
+/// what the radio and the backend report into its events and does what each
+/// new state asks for. The interesting part of provisioning is the seams --
+/// Bluetooth to Wi-Fi to the account -- and this owns all of them.
 @MainActor
 final class SetupFlow: ObservableObject {
-    enum Phase: Equatable {
-        case bluetoothUnavailable
-        case findingDevice
-        case connecting(name: String)
-        case choosingNetwork
-        case sending(ssid: String)
-        case deviceJoining(ssid: String)
-        case rediscovering(ssid: String, elapsed: Int)
-        case ready(ssid: String, url: String?)
-        case failed(String)
+    struct Transition: Equatable {
+        let from: Onboarding.State
+        let event: Onboarding.Event
+        let to: Onboarding.State
     }
 
-    @Published private(set) var phase: Phase = .findingDevice
-    /// The network the device was told to join, kept so every later screen can
-    /// name it rather than saying "your network".
-    @Published private(set) var targetSSID: String = ""
+    @Published private(set) var state: Onboarding.State = .discovering
+    @Published private(set) var context = Onboarding.Context()
+    /// Every accepted move, oldest first (the debug panel; evidence for the harness).
+    @Published private(set) var transitions: [Transition] = []
+    /// How long discovery has been running, so the UI can offer help rather
+    /// than spin indefinitely.
+    @Published private(set) var searchingSeconds = 0
+    /// The device's address on this network, once it answers there.
+    @Published private(set) var localURL: String?
+    @Published private(set) var modes: [Onboarding.Mode] = []
+    @Published private(set) var recommendedMode: String?
+    /// The network the device was told to join, so later screens can name it.
+    @Published private(set) var targetSSID = ""
+    /// Whether this device asked for its setup code (kept after Bluetooth closes).
+    @Published private(set) var requiresCode = false
 
-    let ble = BLEProvisioner()
-    let link = DeviceLink()
+    let ble: BLEProvisioner
+    private let localLink: OnboardingLocalLink?
+    private(set) var account: OnboardingAccount?
+    /// How long to wait for the device to report in after it joined. Generous:
+    /// it has to associate, get an address, reach the server and report.
+    var reportBudgetSeconds = 120
+    var pollSeconds: Double = 3
 
     private var observers: [AnyCancellable] = []
-    private var rediscoverTask: Task<Void, Never>?
+    private var work: Task<Void, Never>?
     private var searchClock: Task<Void, Never>?
+    /// The account's devices before the claim, to notice a code for another unit.
+    private var devicesBeforeClaim: [Onboarding.AccountDevice] = []
 
-    /// How long to keep looking for the device on its new network.
-    ///
-    /// Generous on purpose. The device has to associate, complete a handshake,
-    /// get an address by DHCP, and re-announce itself over mDNS — and the phone
-    /// often has to move networks too. Giving up early would report failure for
-    /// a setup that was about to succeed, which is the more damaging mistake:
-    /// the device really is on the new network, and the app has just told
-    /// someone it is not.
-    private let rediscoverBudget = 90
+    init(ble: BLEProvisioner, localLink: OnboardingLocalLink?, account: OnboardingAccount? = nil) {
+        self.ble = ble
+        self.localLink = localLink
+        self.account = account
+    }
+
+    func attach(account: OnboardingAccount?) {
+        self.account = account
+        context.signedIn = account?.isSignedIn ?? false
+    }
 
     // MARK: Lifecycle
 
     func start() {
-        phase = .findingDevice
-        link.start()
+        observe()
+        context.signedIn = account?.isSignedIn ?? false
+        state = .discovering
         ble.startScan()
-        observeBLE()
         startSearchClock()
     }
 
     func stop() {
-        rediscoverTask?.cancel()
-        rediscoverTask = nil
-        searchClock?.cancel()
-        searchClock = nil
+        work?.cancel(); work = nil
+        searchClock?.cancel(); searchClock = nil
         ble.stop()
-        // Its path monitor would otherwise outlive the setup sheet.
-        link.stop()
+        localLink?.stop()
     }
 
+    // MARK: What the person does
+
     func connect(to device: DiscoveredDevice) {
-        phase = .connecting(name: device.name)
+        guard apply(.deviceChosen(name: device.name)) else { return }
         ble.connect(id: device.id)
     }
 
-    /// - Parameter label: the setup code, for a device that requires proof of
-    ///   possession (`ble.requiresSetupCode`). nil uses the legacy plain write.
-    func send(ssid: String, password: String, label: BLEProofOfPossession.SetupLabel? = nil) {
+    /// The setup code as typed, or the QR text. Problems with the entry itself
+    /// (empty, malformed, another device's label) are answered here without a
+    /// word to the device.
+    @discardableResult
+    func prove(entry: String) -> SetupCodeEntry.Problem? {
+        switch SetupCodeEntry.label(from: entry, connectedDeviceID: ble.deviceID) {
+        case .failure(let problem):
+            return problem
+        case .success(let label):
+            guard apply(.proofStarted) else { return nil }
+            ble.prove(label: label)
+            return nil
+        }
+    }
+
+    func send(ssid: String, password: String) {
         targetSSID = ssid
-        phase = .sending(ssid: ssid)
-        if let label {
-            ble.sendSecure(label: label, ssid: ssid, password: password.isEmpty ? nil : password)
-        } else {
-            ble.send(ssid: ssid, password: password)
-        }
+        context.ssid = ssid
+        guard apply(.networkSent(ssid: ssid)) else { return }
+        ble.send(ssid: ssid, password: password)
     }
 
-    /// Start over from discovery, keeping nothing.
-    func retry() {
-        rediscoverTask?.cancel()
-        rediscoverTask = nil
-        ble.startScan()
-        phase = .findingDevice
-        startSearchClock()
-    }
-
-    // MARK: Bridging the two radios
-
-    private func observeBLE() {
-        // Once: start() can run again, and every extra sink re-ran the
-        // absorption below for each change.
-        guard observers.isEmpty else { return }
-        // Mirror the Bluetooth state machine into setup phases, rather than
-        // duplicating it. The one thing added here is what happens *after*
-        // success, which Bluetooth has no opinion about.
-        observers.append(ble.objectWillChange.sink { [weak self] in
+    func submitClaim(code: String) -> Bool {
+        guard let normalized = Onboarding.normalizeClaimCode(code), let account else { return false }
+        guard apply(.claimSubmitted) else { return false }
+        work?.cancel()
+        work = Task { [weak self] in
             guard let self else { return }
-            // Forward the change on. SwiftUI does NOT propagate through nested
-            // ObservableObjects: the view observes this flow, so a change to
-            // `ble.discovered` reaches nobody unless it is republished here.
-            //
-            // Without this line the app found the device every time and simply
-            // never redrew — it sat on "Searching for SensorDyme" forever with
-            // the device sitting in `ble.discovered` the whole time. The status
-            // quo was invisible rather than broken, which is why it survived a
-            // clean build and a passing test suite.
-            self.objectWillChange.send()
-            Task { @MainActor in self.absorbBLEState() }
-        })
-        observers.append(link.objectWillChange.sink { [weak self] in
-            self?.objectWillChange.send()
+            do {
+                self.devicesBeforeClaim = (try? await account.accountDevices()) ?? []
+                try await account.claim(code: normalized)
+                guard !Task.isCancelled else { return }
+                self.apply(.claimed)
+            } catch {
+                guard !Task.isCancelled else { return }
+                self.apply(.claimRefused(account.explain(error, claiming: true)))
+            }
+        }
+        return true
+    }
+
+    func chooseMode(_ mode: String) {
+        guard case .choosingMode(let deviceID) = state, let account, apply(.modeChosen(mode)) else { return }
+        work?.cancel()
+        work = Task { [weak self] in
+            guard let self else { return }
+            do {
+                try await account.activate(mode: mode, deviceID: deviceID)
+                self.apply(.modeActivated(mode))
+            } catch {
+                self.apply(.modeRefused(account.explain(error, claiming: false)))
+            }
+        }
+    }
+
+    func skipMode() { apply(.modeSkipped) }
+
+    func recover(_ recovery: Onboarding.Recovery) {
+        guard apply(.recover(recovery)) else { return }
+        switch recovery {
+        case .searchAgain:
+            work?.cancel(); work = nil
+            ble.startScan()
+            startSearchClock()
+        case .enterCodeAgain, .chooseNetwork, .skipMode, .retryClaim, .keepWaiting, .checkOnline, .chooseMode:
+            break  // the new state's reaction does the rest
+        }
+    }
+
+    // MARK: Events
+
+    /// Apply one event; false when it is not a legal move from here.
+    @discardableResult
+    func apply(_ event: Onboarding.Event) -> Bool {
+        guard let next = Onboarding.next(state, event, context: context) else { return false }
+        let from = state
+        if case .identified(let needsCode) = event { requiresCode = needsCode }
+        transitions.append(Transition(from: from, event: event, to: next))
+        state = next
+        react(to: next, from: from)
+        return true
+    }
+
+    private func observe() {
+        guard observers.isEmpty else { return }
+        // SwiftUI does not propagate through nested ObservableObjects: the view
+        // observes this flow, so a change to `ble.discovered` reaches nobody
+        // unless it is republished here.
+        observers.append(ble.objectWillChange.sink { [weak self] in self?.objectWillChange.send() })
+        observers.append(ble.$state.removeDuplicates().sink { [weak self] newState in
+            // $state publishes before the property changes; read it after.
+            Task { @MainActor in self?.absorb(newState) }
         })
     }
 
-    private func absorbBLEState() {
-        switch ble.state {
+    /// The Bluetooth side's state, as onboarding events.
+    func absorb(_ bleState: BLEProvisioner.State) {
+        switch bleState {
         case .bluetoothOff:
-            // Its own phase, not "searching".
-            //
-            // Denied permission and a switched-off radio both produce exactly
-            // the symptom of a device that is not there, and the app used to
-            // show the same endless "Looking for your SensorDyme" for all
-            // three. Two of those are fixed in Settings in five seconds, but
-            // only if the app says so.
-            if isBeforeSending { phase = .bluetoothUnavailable }
-        case .idle, .scanning:
-            if case .findingDevice = phase {} else if isBeforeSending { phase = .findingDevice }
-        case .connecting(let name):
-            phase = .connecting(name: name)
+            switch state.stage {
+            case .find, .connect: apply(.bluetoothOff)
+            default: apply(.linkFailed("Bluetooth was turned off. Turn it on and search again."))
+            }
+        case .scanning:
+            apply(.bluetoothOn)
+        case .idle, .connecting, .identifying, .proving, .sending:
+            break
         case .ready:
-            if isBeforeSending { phase = .choosingNetwork }
-        case .sending:
-            phase = .sending(ssid: targetSSID)
+            switch state {
+            case .connecting, .identifying:
+                apply(.identified(requiresCode: ble.requiresSetupCode))
+            case .proving, .sending:
+                let rejection = ble.proofRejection
+                apply(.proofRefused(message: rejection?.message ?? "The device didn't accept the setup code.",
+                                    lockedUntil: ble.lockedUntil))
+            default:
+                break
+            }
+        case .proven:
+            apply(.proven)
         case .deviceConnecting:
-            phase = .deviceJoining(ssid: targetSSID)
+            apply(.deviceJoining)
         case .success:
-            // The device has joined. From here Bluetooth has nothing more to
-            // say — the device is on a different network from the one this
-            // conversation started on, and may be on a different one from the
-            // phone. Everything after this is Wi-Fi's problem.
-            beginRediscovery()
+            apply(.deviceJoined)
+        case .joinFailed(let reason):
+            apply(.joinRefused(reason))
         case .failed(let reason):
-            phase = .failed(reason)
+            apply(.linkFailed(reason))
         }
     }
 
-    private var isBeforeSending: Bool {
-        switch phase {
-        case .bluetoothUnavailable, .findingDevice, .connecting, .choosingNetwork: true
-        default: false
+    // MARK: What each state asks for
+
+    private func react(to state: Onboarding.State, from: Onboarding.State) {
+        switch (from, state) {
+        case (.waitingForDevice, .waitingForDevice):
+            break  // a tick of the wait already running
+        case (_, .associating):
+            beginAssociation()
+        case (_, .waitingForDevice):
+            beginWaitingForDevice()
+        case (_, .choosingMode(let deviceID)):
+            loadModes(deviceID: deviceID)
+        default:
+            break
         }
     }
 
-    /// How long discovery has been running, so the UI can offer help rather
-    /// than spin indefinitely. A spinner that never changes tells someone
-    /// nothing about whether to keep waiting or go and check something.
-    @Published private(set) var searchingSeconds = 0
+    /// The device joined. Bluetooth has done its job; holding the link open
+    /// keeps the device's radio busy. Now: is this device on the account?
+    private func beginAssociation() {
+        let hardwareID = ble.deviceID
+        work?.cancel()
+        work = Task { [weak self] in
+            guard let self else { return }
+            // After the transition that brought us here, not inside it.
+            await Task.yield()
+            self.ble.stop()
+            guard let account = self.account, account.isSignedIn else {
+                // No account to add it to: finish when it answers on this network.
+                let url = await self.findLocally(hardwareID, budget: 60)
+                self.localURL = url
+                self.apply(.noAccount(found: url != nil))
+                return
+            }
+            do {
+                let devices = try await account.accountDevices()
+                guard !Task.isCancelled else { return }
+                if let owned = Onboarding.match(devices, hardwareID: hardwareID) {
+                    self.context.accountDeviceID = owned.id
+                    self.context.alreadyOwned = true
+                    self.apply(.alreadyOnAccount(deviceID: owned.id))
+                } else {
+                    self.apply(.needsClaim)
+                }
+            } catch {
+                guard !Task.isCancelled else { return }
+                self.apply(.claimRefused(account.explain(error, claiming: false)))
+            }
+        }
+    }
+
+    /// On the account; wait for the device itself to report in. The SD- id it
+    /// reported over Bluetooth is what identifies it -- never "the newest".
+    private func beginWaitingForDevice() {
+        let hardwareID = ble.deviceID
+        guard let account else { return }
+        work?.cancel()
+        let budget = reportBudgetSeconds
+        let poll = pollSeconds
+        work = Task { [weak self] in
+            guard let self else { return }
+            let started = Date()
+            // The live feed is found on the side; it does not hold setup up.
+            Task { [weak self] in
+                guard let self, self.localURL == nil else { return }
+                self.localURL = await self.findLocally(hardwareID, budget: 30)
+            }
+            while !Task.isCancelled {
+                let elapsed = Int(Date().timeIntervalSince(started))
+                if let devices = try? await account.accountDevices() {
+                    guard !Task.isCancelled else { return }
+                    if let mine = Onboarding.match(devices, hardwareID: hardwareID) {
+                        self.context.accountDeviceID = mine.id
+                        if mine.online {
+                            self.apply(.deviceOnline(deviceID: mine.id))
+                            return
+                        }
+                    } else if !self.context.alreadyOwned,
+                              let other = Onboarding.claimedOther(before: self.devicesBeforeClaim, after: devices,
+                                                                  hardwareID: hardwareID) {
+                        self.apply(.claimRefused(
+                            "That claim code added \(other.name) (\(other.hardwareID ?? "another device")), not the "
+                            + "SensorDyme you just set up (\(hardwareID ?? "unknown")). Check the card that came with this one."))
+                        return
+                    }
+                }
+                if elapsed >= budget { break }
+                if case .waitingForDevice(let shown) = self.state, shown != elapsed {
+                    self.apply(.waitTick(elapsed: elapsed))
+                }
+                try? await Task.sleep(nanoseconds: UInt64(poll * 1_000_000_000))
+            }
+            guard !Task.isCancelled else { return }
+            self.apply(.deviceSilent(
+                "Your SensorDyme joined \(self.context.ssid ?? "the network") but hasn't reported to the server yet. "
+                + "Check that network reaches the internet. It will appear in your devices as soon as it does."))
+        }
+    }
+
+    private func loadModes(deviceID: Int) {
+        guard let account else { return }
+        work?.cancel()
+        work = Task { [weak self] in
+            guard let self else { return }
+            do {
+                let (modes, active) = try await account.modes(deviceID: deviceID)
+                self.modes = modes
+                self.recommendedMode = Onboarding.recommendedMode(modes, active: active)?.id
+            } catch {
+                self.modes = []
+                self.recommendedMode = nil
+            }
+        }
+    }
+
+    private func findLocally(_ hardwareID: String?, budget: Int) async -> String? {
+        guard let localLink else { return nil }
+        let started = Date()
+        while !Task.isCancelled, Date().timeIntervalSince(started) < Double(budget) {
+            if let url = await localLink.find(deviceID: hardwareID) { return url }
+            try? await Task.sleep(nanoseconds: 3_000_000_000)
+        }
+        return nil
+    }
 
     private func startSearchClock() {
         searchClock?.cancel()
         searchingSeconds = 0
         searchClock = Task { [weak self] in
             while !Task.isCancelled {
-                try? await Task.sleep(for: .seconds(1))
+                try? await Task.sleep(nanoseconds: 1_000_000_000)
                 guard let self else { return }
-                guard case .findingDevice = phase else { continue }
-                searchingSeconds += 1
+                guard case .discovering = self.state else { continue }
+                self.searchingSeconds += 1
             }
-        }
-    }
-
-    private func beginRediscovery() {
-        guard rediscoverTask == nil else { return }
-        // Which device was just provisioned, read off Bluetooth before the link
-        // is dropped. Without it this went looking for whatever camera was
-        // linked BEFORE (setting up a second camera "verified" the first one,
-        // at the first one's address) or adopted the first camera to answer.
-        let provisionedID = ble.deviceID
-        // Bluetooth has done its job; holding the link open keeps the device's
-        // radio busy and stops it settling on the network it just joined.
-        ble.stop()
-
-        rediscoverTask = Task { [weak self] in
-            guard let self else { return }
-            let started = Date()
-            while !Task.isCancelled {
-                let elapsed = Int(Date().timeIntervalSince(started))
-                if elapsed >= rediscoverBudget { break }
-                phase = .rediscovering(ssid: targetSSID, elapsed: elapsed)
-
-                // Firmware that reports no id falls back to the general rule
-                // (the linked camera, else one this account owns, else a lone one).
-                await link.resolve(force: true, expecting: provisionedID)
-                if case let .connected(url) = link.state {
-                    phase = .ready(ssid: targetSSID, url: url)
-                    rediscoverTask = nil
-                    return
-                }
-                try? await Task.sleep(for: .seconds(3))
-            }
-            guard !Task.isCancelled else { return }
-            // Not found is not the same as not working. The commonest cause by
-            // far is that the phone is still on the old network — mDNS does not
-            // cross networks, so the device can be perfectly online and
-            // invisible from here.
-            // A knowable reason beats a guess. Telling someone to check their
-            // Wi-Fi when the real cause is a denied Local Network permission
-            // sends them round a loop that can never succeed.
-            phase = .failed(
-                link.discoveryProblem
-                ?? "Your SensorDyme was given the details for \(targetSSID) and said it joined, "
-                    + "but this phone can't see it yet. Check your phone is on \(targetSSID) too, "
-                    + "then search again."
-            )
-            rediscoverTask = nil
         }
     }
 }

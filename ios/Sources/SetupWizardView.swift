@@ -1,6 +1,11 @@
 import SwiftUI
 
-// MARK: - Pairing wizard: plug in -> join hotspot -> Wi-Fi -> claim. Four taps to a live device.
+// MARK: - Adding a device.
+//
+// The first screen offers Bluetooth setup (SetupFlowView: find, prove the setup
+// code, Wi-Fi, claim, mode -- the M8 onboarding) for a new device, and keeps the
+// older path for a device that is already on the network or uses the legacy
+// setup hotspot: plug in -> join hotspot -> Wi-Fi -> claim.
 
 struct SetupWizardView: View {
     @EnvironmentObject private var state: AppState
@@ -15,6 +20,7 @@ struct SetupWizardView: View {
     @State private var claimCode = ""
     @State private var busy = false
     @State private var errorMessage: String?
+    @State private var showBluetoothSetup = false
 
     var body: some View {
         NavigationStack {
@@ -109,11 +115,32 @@ struct SetupWizardView: View {
     }
 
     private var powerStep: some View {
-        stepBody(
-            icon: "power",
-            title: "Power it on",
-            text: "Plug your SensorDyme into power (car charger or wall). Give it ~30 seconds to boot — it glows when it's ready to be set up."
-        )
+        VStack(spacing: 16) {
+            stepBody(
+                icon: "power",
+                title: "Power it on",
+                text: "Plug your SensorDyme into power (car charger or wall). Give it ~30 seconds to boot — it glows when it's ready to be set up."
+            )
+            if !state.isDemo {
+                Button {
+                    showBluetoothSetup = true
+                } label: {
+                    Label("Set up over Bluetooth", systemImage: "dot.radiowaves.left.and.right")
+                }
+                .buttonStyle(SDButtonStyle(kind: .secondary))
+                .accessibilityIdentifier("wizard.bluetooth")
+                Text("New SensorDyme? Bluetooth setup finds it, checks the setup code on its label and gives it your Wi-Fi.")
+                    .font(.footnote)
+                    .foregroundStyle(SD.Colors.textSecondary)
+                    .multilineTextAlignment(.center)
+            }
+        }
+        .sheet(isPresented: $showBluetoothSetup) {
+            SetupFlowView {
+                await onPaired()
+                dismiss()
+            }
+        }
     }
 
     /// The device's own address while it is serving its first-boot setup

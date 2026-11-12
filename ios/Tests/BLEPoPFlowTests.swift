@@ -140,5 +140,45 @@ check(early.handle(reply: Data("{}".utf8)) == .failed("unexpected reply from the
 check(BLEPoPFlow.deviceError("busy", retryAfter: nil).contains("busy"), "busy")
 check(BLEPoPFlow.deviceError(nil, retryAfter: nil) == "The device refused the setup.", "no code")
 
+print("\nprove first, credentials later (onboarding):")
+let later = FakeDevice(deviceID: id, code: code)
+let session = try! BLEProofOfPossession.Session(label: label)
+let proveOnly = BLEPoPFlow(session: session)
+let (provedEnd, provedWrites) = run(proveOnly, later)
+check(provedEnd == .proven && proveOnly.step == .proven, "stops at proven")
+check(provedWrites == 2 && later.received == nil, "hello and proof only: nothing secret yet")
+var sendAction = proveOnly.sendCredentials(ssid: "Home", psk: "s3cret")
+if case .write(let creds) = sendAction { sendAction = proveOnly.handle(reply: later.reply(to: creds)) }
+check(sendAction == .accepted && later.received?.ssid == "Home", "the credentials follow on the same session")
+let notYet = BLEPoPFlow(session: try! BLEProofOfPossession.Session(label: label))
+check(notYet.sendCredentials(ssid: "Home", psk: "x") == .failed("The device hasn't confirmed the setup code yet."),
+      "credentials before a proof are refused on the phone")
+
+print("\na renewed session: same code key, fresh nonce, still proves:")
+let renewed = session.renewed()
+check(renewed.nonceApp != session.nonceApp && renewed.label == session.label, "new nonce, same label")
+let renewedDevice = FakeDevice(deviceID: id, code: code)
+check(run(BLEPoPFlow(session: renewed, ssid: "Home", psk: "s3cret"), renewedDevice).0 == .accepted,
+      "a renewed handshake is accepted")
+
+print("\nrejections say what to do and whether the link is over:")
+func rejection(of reply: String) -> BLEPoPFlow.Rejection? {
+    let flow = BLEPoPFlow(session: try! BLEProofOfPossession.Session(label: label))
+    _ = flow.start()
+    _ = flow.handle(reply: Data(reply.utf8))
+    return flow.rejection
+}
+let lockStart = rejection(of: #"{"op":"error","error":"wrong_code","retry_after_s":31}"#)
+check(lockStart?.kind == .wrongCode && lockStart?.retryAfterSeconds == 31, "the wrong code that starts a lockout keeps the wait")
+check(lockStart?.message.contains("refuse for 31 s") == true, "and says it, in the device's number")
+check(rejection(of: #"{"op":"error","error":"locked","retry_after_s":7}"#)?.kind == .locked, "locked")
+check(rejection(of: #"{"op":"error","error":"busy"}"#)?.endsLink == false, "busy keeps the link")
+let impostorChallenge = rejection(of: #"{"op":"challenge","v":1,"id":"SD-FFFFFFFF","nd":"AAAAAAAAAAAAAAAAAAAAAA=="}"#)
+check(impostorChallenge?.kind == .wrongDevice && impostorChallenge?.endsLink == true, "another device's challenge ends the link")
+check(rejection(of: "not json")?.kind == .malformedReply && rejection(of: "not json")?.endsLink == true,
+      "an unreadable reply ends the link")
+check(BLEPoPFlow.rejection(code: "unexpected", retryAfter: nil).kind == .expired, "unexpected is an expired proof")
+check(BLEPoPFlow.rejection(code: "malformed", retryAfter: nil).kind == .refusedMessage, "malformed is a refused message")
+
 print("\n\(failures == 0 ? "all passed" : "\(failures) FAILED")")
 exit(failures == 0 ? 0 : 1)

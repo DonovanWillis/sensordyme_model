@@ -92,96 +92,63 @@ struct SetupStep: Identifiable, Equatable {
 }
 
 extension SetupStep {
-    /// The setup checklist for a given provisioning state.
+    /// The onboarding checklist for one state of the journey.
     ///
-    /// One function, so the list can never disagree with itself — every step's
-    /// status comes from the same reading of the same state. Building this
-    /// inline in the view is how a screen ends up showing "connected" above
-    /// "connecting".
+    /// One function, so the list can never disagree with itself: every row's
+    /// status comes from the same reading of the same state. A failure marks
+    /// the row that was in flight and leaves the completed ones standing --
+    /// how far setup got is the most useful thing to know about what to try
+    /// next. Every row is derived from something reported; no timer moves it.
     static func checklist(
-        for state: BLEProvisioner.State,
-        networksFound: Int,
-        scanning: Bool,
-        stateBeforeFailure: BLEProvisioner.State? = nil,
-        handover: Status = .pending
+        for state: Onboarding.State,
+        requiresCode: Bool,
+        signedIn: Bool,
+        networksFound: Int = 0,
+        scanning: Bool = false,
+        now: Date = Date()
     ) -> [SetupStep] {
-        // Which step a failure belongs to: the one that was in flight. Marking
-        // the whole list failed would hide how far setup actually got, which is
-        // the most useful thing to know when deciding what to try next.
-        let failedStage: Int? = {
-            guard case .failed = state else { return nil }
-            return Self.stage(of: stateBeforeFailure ?? .scanning)
-        }()
-        // How far the flow got. Steps before this are done.
-        let currentStage = failedStage ?? Self.stage(of: state)
+        var stages = Onboarding.Stage.allCases
+        if !requiresCode { stages.removeAll { $0 == .prove } }
+        if !signedIn { stages.removeAll { $0 == .account || $0 == .mode } }
 
-        func status(_ index: Int) -> Status {
-            if let failedStage {
-                if index < failedStage { return .done }
-                return index == failedStage ? .failed : .pending
-            }
-            if index < currentStage { return .done }
-            return index == currentStage ? .active : .pending
-        }
+        let current = state.stage
+        let finished: Bool = { if case .finished = state { return true }; return false }()
+        let failed: Bool = { if case .failed = state { return true }; return false }()
 
-        var networkDetail: String?
-        if currentStage >= 2 {
-            if networksFound > 0 {
-                networkDetail = networksFound == 1
-                    ? "1 network in range"
-                    : "\(networksFound) networks in range"
-            } else if scanning {
-                networkDetail = "the device is looking…"
+        return stages.map { stage in
+            let status: Status
+            if finished || stage < current {
+                status = .done
+            } else if stage == current {
+                status = failed ? .failed : .active
             } else {
-                networkDetail = "the device could not see any Wi-Fi from here"
+                status = .pending
             }
+            return SetupStep(id: "\(stage)", title: stage.title,
+                             detail: detail(stage, state: state, networksFound: networksFound, scanning: scanning, now: now),
+                             status: status)
         }
-
-        var steps: [SetupStep] = [
-            SetupStep(id: "find", title: "Find your SensorDyme", status: status(0)),
-            SetupStep(id: "connect", title: "Connect over Bluetooth", status: status(1)),
-            SetupStep(id: "scan", title: "Look for Wi-Fi networks",
-                      detail: networkDetail, status: status(2)),
-            SetupStep(id: "send", title: "Send the Wi-Fi details", status: status(3)),
-            SetupStep(id: "join", title: "Device joins the network",
-                      detail: currentStage >= 4 ? "this can take up to a minute" : nil,
-                      status: status(4)),
-            // The step Bluetooth cannot report on. Once the device has been
-            // given credentials it leaves the network this conversation was
-            // happening over, so its own progress is unobservable from here —
-            // the app has to go and find it again. Showing this as a step is
-            // what stops the gap reading as a crash.
-            SetupStep(id: "rejoin", title: "Find it on the new network",
-                      detail: handover == .active ? "this can take a minute" : nil,
-                      status: handover == .pending ? status(5) : handover),
-        ]
-
-        if case let .failed(reason) = state, let failedStage,
-           failedStage < steps.count {
-            steps[failedStage].detail = reason
-        }
-        if case let .success(ip) = state {
-            // Bluetooth reporting success means the device accepted and joined —
-            // not that this phone can reach it. That is the next step's job.
-            steps[4].status = .done
-            steps[4].detail = ip.map { "device reports it is on \($0)" }
-        }
-        if handover == .done {
-            steps = steps.map { var s = $0; if s.status != .failed { s.status = .done }; return s }
-        }
-        return steps
     }
 
-    /// How far the flow has got. Steps before this one are done.
-    private static func stage(of state: BLEProvisioner.State) -> Int {
-        switch state {
-        case .idle, .bluetoothOff, .scanning: 0
-        case .connecting: 1
-        case .ready: 2
-        case .sending: 3
-        case .deviceConnecting: 4
-        case .success: 5
-        case .failed: 0
+    private static func detail(_ stage: Onboarding.Stage, state: Onboarding.State, networksFound: Int,
+                               scanning: Bool, now: Date) -> String? {
+        if case .failed(let failure) = state, failure.stage == stage { return failure.reason }
+        switch (stage, state) {
+        case (.prove, .enteringSetupCode(_, let lockedUntil?)) where lockedUntil > now:
+            return "the device is refusing codes for \(Int(lockedUntil.timeIntervalSince(now).rounded(.up))) s"
+        case (.prove, .proving):
+            return "the device checks the code, then proves it back"
+        case (.network, .choosingNetwork):
+            if networksFound > 0 { return networksFound == 1 ? "1 network in range" : "\(networksFound) networks in range" }
+            return scanning ? "the device is looking…" : "the device could not see any Wi-Fi from here"
+        case (.network, .sending):
+            return "sent encrypted, to this device only"
+        case (.join, .joining):
+            return "this can take up to a minute"
+        case (.online, .waitingForDevice(let elapsed)):
+            return elapsed > 0 ? "waiting for it to reach the server (\(elapsed) s)" : "waiting for it to reach the server"
+        default:
+            return nil
         }
     }
 }
