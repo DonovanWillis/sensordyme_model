@@ -97,7 +97,7 @@ xcrun simctl keychain "$SIM" reset
 # One test at a time, in the order asked for. Run from a copy of the build's
 # .xctestrun with the ordering and parallelization written into it, so what
 # ran is what the file says (and is kept in OUT for the record).
-SRC_RUN=$(ls "$OUT"/dd/Build/Products/*.xctestrun | head -1)
+SRC_RUN=$(ls "$OUT"/dd/Build/Products/*.xctestrun | grep -v "/oryn-[a-z]*\.xctestrun$" | head -1)
 RUNFILE="$OUT/dd/Build/Products/oryn-$ORDER.xctestrun"
 cp "$SRC_RUN" "$RUNFILE"
 "$PY" - "$RUNFILE" "$ORDER" <<'PY'
