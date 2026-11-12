@@ -96,7 +96,9 @@ struct DeviceLinkBanner: View {
                         Button(action) { Task { await link.resolve(force: true) } }
                             .font(SD.Typography.caption.weight(.semibold))
                             .foregroundStyle(SD.Colors.accent)
-                            .padding(.top, 2)
+                            // 44 pt hit area (M8 audit 21); the drawn text is unchanged.
+                            .frame(minHeight: 44, alignment: .leading)
+                            .contentShape(Rectangle())
                     }
                 }
                 Spacer(minLength: 0)
