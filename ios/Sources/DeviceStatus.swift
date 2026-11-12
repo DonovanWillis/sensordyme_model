@@ -87,6 +87,8 @@ struct DeviceStatus: Codable, Hashable {
         var kind: String?
         var subject: String?
         var reasons: [String]?
+        /// role_forbids_preset | unknown_node | invalid_setting | profile_fixed | ... (M8)
+        var code: String? = nil
         var at: Double?
     }
 
@@ -229,7 +231,7 @@ struct MonitoringStatusPresentation: Equatable {
         guard let status else {
             return online ? nil : unknown("the device isn't reporting")
         }
-        let reason = status.reasons?.first(where: { !$0.isEmpty })
+        let reason = status.reasons?.first(where: { !$0.isEmpty }).map(CapabilityHealth.humanReason)
         // `online` and `stale` use the same 30 s window on the backend; either
         // one alone is enough to stop trusting the last report.
         if !online || status.stale == true {
@@ -362,10 +364,10 @@ enum CapabilityHealth {
         }
         for name in capabilities.starting ?? [] {
             rows.append(.init(name: name, title: title(name), state: .starting,
-                              detail: "Starting", tone: .caution))
+                              detail: startingDetail(name), tone: .caution))
         }
         for name in capabilities.available ?? [] {
-            var detail = "Producing results"
+            var detail = vocabulary[name]?.available.map { "\($0) · producing results" } ?? "Producing results"
             if let note = evaluationNote(evaluation[name]) { detail += " · \(note)" }
             rows.append(.init(name: name, title: title(name), state: .available, detail: detail, tone: .ok))
         }
@@ -389,7 +391,37 @@ enum CapabilityHealth {
 
     /// "phone_use" -> "Phone use"
     static func title(_ name: String) -> String {
+        if let known = vocabulary[name]?.title { return known }
         let spaced = name.replacingOccurrences(of: "_", with: " ").replacingOccurrences(of: ".", with: " ")
         return spaced.prefix(1).uppercased() + spaced.dropFirst()
+    }
+
+    /// Capabilities the app can say more about than their name. `starting` is
+    /// what the row says while the device brings it up — in its own words, so a
+    /// capability that is getting ready never reads like one that failed.
+    static let vocabulary: [String: (title: String, starting: String, available: String?)] = [
+        // M8 DRIVER: the driver's calibrated forward gaze. STARTING for up to
+        // ~30 s on a first boot while it learns where "looking ahead" is;
+        // distraction, eyes down/up, glancing and phone use wait for it
+        // (drowsiness and attention-lost need only the face).
+        "attention": ("Attention", "Calibrating to the driver — look ahead normally; usually done within 30 seconds",
+                      "Calibrated to the driver's forward gaze"),
+        "face": ("Face", "Finding the driver's face", nil),
+        "objects": ("Objects", "Starting object detection", nil),
+        "hands": ("Hands", "Starting hand tracking", nil),
+        "pose": ("Body pose", "Starting body pose", nil),
+    ]
+
+    /// What a starting capability is doing, for its row.
+    static func startingDetail(_ name: String) -> String {
+        vocabulary[name]?.starting ?? "Starting — getting ready, not a failure"
+    }
+
+    /// The device's reason in words when it is "<capability>: starting" (the
+    /// status contract's form during start-up), else the reason unchanged.
+    static func humanReason(_ reason: String) -> String {
+        let parts = reason.split(separator: ":", maxSplits: 1).map { $0.trimmingCharacters(in: .whitespaces) }
+        guard parts.count == 2, parts[1] == "starting", !parts[0].isEmpty, !parts[0].contains(" ") else { return reason }
+        return "\(title(parts[0])): \(startingDetail(parts[0]).prefix(1).lowercased() + startingDetail(parts[0]).dropFirst())"
     }
 }

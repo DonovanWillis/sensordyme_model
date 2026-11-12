@@ -96,7 +96,12 @@ enum SD {
         /// A text style, not a point size: caption2 is 11 pt at the default size, the
         /// design value, and follows Dynamic Type from there. A fixed size never scaled,
         /// and a ScaledMetric size was flagged by the accessibility audit as partial.
-        static let eyebrow = Font.system(.caption2, design: .monospaced).weight(.medium)
+        /// Caption (12 pt), not caption2 (11 pt). caption2 is pinned at 11 pt for
+        /// every size from Extra Small to Large, so the audit reported every
+        /// eyebrow as "Dynamic Type partially unsupported"; two M8 experiments
+        /// ruled out the font construction (`system(_:design:)`, `.monospaced()`,
+        /// `fontDesign`) and left the text style. Caption follows every size.
+        static let eyebrow = Font.caption.weight(.medium).monospaced()
         static let eyebrowKerning: CGFloat = 1.4
         /// Small machine values: addresses, ids, timings.
         static let mono = Font.system(.caption, design: .monospaced)
@@ -211,13 +216,13 @@ struct SDEyebrow: View {
     }
 
     var body: some View {
-        // Tracking, not kerning: kerning also adds space after the last letter,
-        // outside the measured width, which the audit reported as clipped text.
+        // No tracking: with it (and with kerning before it) the audit reported
+        // every eyebrow as clipped text; without it, none (M8 experiment). The
+        // monospaced capitals carry the spacing on their own.
         // No line limit: a long label (a device name in a Jupiter header) wraps
         // as far as the reader's text size needs; two lines clipped it (audit).
         Text(text.uppercased())
             .sdEyebrowFont()
-            .tracking(SD.Typography.eyebrowKerning)
             .foregroundStyle(color)
             .fixedSize(horizontal: false, vertical: true)
     }
@@ -405,6 +410,19 @@ enum SDStatus {
     }
 }
 
+extension SDStatus {
+    /// The chip for a device's presence (ConnectionTruth). Stale is amber:
+    /// it is not offline, and it must not look like the green of a live device.
+    init(_ presence: ConnectionTruth.Presence) {
+        switch presence {
+        case .online: self = .online
+        case .stale: self = .warning
+        case .offline: self = .offline
+        case .unknown: self = .unknown
+        }
+    }
+}
+
 /// Compact status chip: a dot and a short uppercase label in a hairline capsule.
 /// Recognisable at a glance without shouting — and it carries a word as well as a
 /// colour, because colour alone fails colour-blind users and bright sun.
@@ -435,11 +453,14 @@ struct SDStatusPill: View {
                     .frame(width: 6, height: 6)
             }
             .frame(width: 12, height: 12)
+            // Wraps rather than truncating: at the largest text sizes one line cut
+            // "ONLINE" to "ON…" (seen at AX XXXL; the audit can't see inside the
+            // combined pill).
             Text((text ?? status.label).uppercased())
                 .sdEyebrowFont()
                 .tracking(1)
                 .foregroundStyle(status == .offline || status == .unknown ? SD.Colors.textTertiary : status.tint)
-                .lineLimit(1)
+                .fixedSize(horizontal: false, vertical: true)
         }
         .padding(.leading, 6)
         .padding(.trailing, 10)
@@ -618,8 +639,10 @@ struct ConnectionBanner: View {
                                 .foregroundStyle(SD.Colors.accent)
                         }
                     }
+                    // The text stays small; the target is the 44 pt minimum.
+                    .frame(minWidth: 44, minHeight: 44, alignment: .leading)
+                    .contentShape(Rectangle())
                     .disabled(retrying)
-                    .padding(.top, 2)
                     .accessibilityLabel(retrying ? "Trying again" : "Try again")
                     .accessibilityIdentifier("banner.retry")
                 }

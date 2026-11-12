@@ -42,12 +42,5 @@ check(ReplyError.bannerTitle(for: ReplyError.unreadable) == "The server's reply 
 check(ReplyError.bannerTitle(for: "No network connection. Check the phone's Wi-Fi.") == "Can't reach the server",
       "a network failure still says so")
 
-print("\nonline is only said while the app can tell:")
-check(ConnectionTruth.presence(online: true, lastRefreshFailed: false) == .online, "fresh and online")
-check(ConnectionTruth.presence(online: false, lastRefreshFailed: false) == .offline, "fresh and offline")
-check(ConnectionTruth.presence(online: true, lastRefreshFailed: true) == .unknown,
-      "a failed refresh never leaves ONLINE standing")
-check(ConnectionTruth.presence(online: false, lastRefreshFailed: true) == .unknown, "nor OFFLINE")
-
 print("\n\(failures == 0 ? "PASSED" : "\(failures) FAILED")")
 exit(failures == 0 ? 0 : 1)

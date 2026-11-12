@@ -77,7 +77,7 @@ struct DiagnosticsView: View {
             return .init(name: name, passed: nil,
                          detail: "this server doesn't report whether the device is monitoring (older backend)")
         }
-        let capabilities = CapabilityHealth.rows(status: device.status, online: device.online)
+        let capabilities = CapabilityHealth.rows(status: device.status, online: device.isLive())
         let impaired = capabilities.rows.filter { $0.state == .impaired }
         var detail = presentation.detail
         if !impaired.isEmpty {

@@ -19,6 +19,8 @@ final class AccessibilityAuditUITests: XCTestCase {
         ("devices", .hitRegion, "ORYN EDGE", "logotype; not interactive"),
         ("detail", .textClipped, "Virtual SensorDyme", "system navigation-bar title, truncated by UIKit; the full name is on screen"),
         ("jupiter", .dynamicType, "Done", "system bar button; UIKit caps bar text and offers the Large Content Viewer"),
+        ("jupiter", .dynamicType, "=Ask Jupiter", "navigation-bar title (static text, not the input field); the "
+            + "bar caps its text, and the title offers the Large Content Viewer (accessibilityShowsLargeContentViewer)"),
     ]
 
     override func setUpWithError() throws {
@@ -67,6 +69,8 @@ final class AccessibilityAuditUITests: XCTestCase {
         var args = ["-orynNoPrompt", "-orynSignOut"]
         if signedIn {
             let session = Stack.session()
+            // An empty token signs the app in with nothing to send (see uitest_control.py).
+            XCTAssertFalse(session.token.isEmpty, "the scenario controller could not sign the demo account in")
             args += ["-orynSession", session.token, session.email]
         }
         app.launchArguments = args + extra
@@ -74,14 +78,32 @@ final class AccessibilityAuditUITests: XCTestCase {
     }
 
     private func audit(_ screen: String) {
+        // Let content that arrives after the first answer settle (the device-link
+        // banner after its network search, the mode list after the device's
+        // presets): contrast is measured from pixels, and text caught mid-fade
+        // "failed" at ratios of 9:1 and more (#F2F1ED and #B6BABE on #0F1112).
+        _ = XCTWaiter().wait(for: [XCTestExpectation(description: "settle")], timeout: 3)
         Stack.saveScreenshot(XCUIScreen.main.screenshot(), name: "audit_\(screen)", test: self)
         var lines: [String] = []
+        // Contrast is measured from the screenshot. Text scrolled under the
+        // translucent floating tab bar, or into the blurred scroll edge under the
+        // navigation bar / status bar, is sampled through that material, so it
+        // "fails" whatever its colour (seen: the mode list's rows at either end).
+        // Such a finding is not accepted: the element is scrolled into the clear
+        // band and audited again, and fails the test if it still fails there.
+        var obscured: [(label: String, frame: CGRect)] = []
         do {
             try app.performAccessibilityAudit(for: .all) { issue in
                 let label = issue.element?.label ?? ""
+                if issue.auditType == .contrast, let element = issue.element, self.obscuredByBars(element.frame) {
+                    obscured.append((label, element.frame))
+                    return true
+                }
                 let known = self.knownIssues.first {
                     $0.screen == screen.components(separatedBy: "_").first && $0.type == issue.auditType
-                        && label.hasPrefix($0.label)
+                        && ($0.label.hasPrefix("=") ? label == String($0.label.dropFirst())
+                                                         && issue.element?.elementType == .staticText
+                                                     : label.hasPrefix($0.label))
                 }
                 let line = "\(screen)\t\(Self.name(issue.auditType))\t\(known == nil ? "NEW" : "known")\t"
                     + "\(issue.compactDescription)\t\(label)\t\(issue.element?.identifier ?? "")"
@@ -90,6 +112,9 @@ final class AccessibilityAuditUITests: XCTestCase {
             }
         } catch {
             XCTFail("\(screen): \(error)")
+        }
+        for item in obscured {
+            lines.append(recheckContrastInClearBand(item.label, frame: item.frame, screen: screen))
         }
         let report = lines.isEmpty ? "\(screen)\tno issues" : lines.joined(separator: "\n")
         let attachment = XCTAttachment(string: report)
@@ -100,6 +125,65 @@ final class AccessibilityAuditUITests: XCTestCase {
             try? (report + "\n").write(to: URL(fileURLWithPath: dir).appendingPathComponent("audit_\(screen).txt"),
                                        atomically: true, encoding: .utf8)
         }
+    }
+
+    /// The band where text is drawn on the plain page: below the navigation bar
+    /// (or the status bar) and its scroll-edge effect, above the tab bar.
+    private var clearBand: (top: CGFloat, bottom: CGFloat) {
+        let nav = app.navigationBars.firstMatch
+        let top = (nav.exists && nav.frame.height > 0 ? nav.frame.maxY : app.frame.minY + 62) + 24
+        let tab = app.tabBars.firstMatch
+        let bottom = (tab.exists && tab.frame.height > 0 ? tab.frame.minY : app.frame.maxY) - 8
+        return (top, bottom)
+    }
+
+    private func obscuredByBars(_ frame: CGRect) -> Bool {
+        let band = clearBand
+        return frame.minY < band.top || frame.maxY > band.bottom
+    }
+
+    /// Scroll the element found at `frame` into the clear band and audit
+    /// contrast again; the line says what happened, and a failure there is a
+    /// real failure. Matched by label and position, since several rows can share
+    /// a label ("Not available for this device's role ...").
+    private func recheckContrastInClearBand(_ label: String, frame: CGRect, screen: String) -> String {
+        let candidates = app.descendants(matching: .any).matching(NSPredicate(format: "label == %@", label))
+        let element = candidates.allElementsBoundByIndex.min(by: {
+            abs($0.frame.midY - frame.midY) < abs($1.frame.midY - frame.midY)
+        }) ?? candidates.firstMatch
+        var band = clearBand
+        if element.exists, element.frame.height > band.bottom - band.top - 40 {
+            return "\(screen)\tcontrast\tunder-bar-unverifiable\tTaller than the clear band between the bars\t\(label)\t"
+        }
+        var swipes = 0
+        while element.exists && swipes < 10 {
+            band = clearBand
+            if element.frame.maxY > band.bottom { app.swipeUp(velocity: .slow) }
+            else if element.frame.minY < band.top { app.swipeDown(velocity: .slow) }
+            else { break }
+            swipes += 1
+        }
+        guard element.exists, !obscuredByBars(element.frame) else {
+            XCTFail("\(screen): contrast on '\(label)' could not be re-checked clear of the bars")
+            return "\(screen)\tcontrast\tNEW\tContrast failed (could not scroll clear of the bars)\t\(label)\t"
+        }
+        let target = element.frame
+        var stillFails = false
+        do {
+            try app.performAccessibilityAudit(for: .contrast) { issue in
+                if let f = issue.element?.frame, abs(f.midY - target.midY) < 4, abs(f.midX - target.midX) < 4 {
+                    stillFails = true
+                }
+                return true  // only this element is being re-checked here
+            }
+        } catch {
+            stillFails = true
+        }
+        if stillFails {
+            XCTFail("\(screen): '\(label)' fails contrast clear of the bars")
+            return "\(screen)\tcontrast\tNEW\tContrast failed clear of the bars\t\(label)\t"
+        }
+        return "\(screen)\tcontrast\tunder-bar\tPassed when re-checked clear of the bars\t\(label)\t"
     }
 
     private static func name(_ type: XCUIAccessibilityAuditType) -> String {

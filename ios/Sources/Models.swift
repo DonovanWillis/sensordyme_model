@@ -32,6 +32,10 @@ struct Device: Codable, Identifiable, Hashable {
     /// (DeviceStatus.swift, docs/APP_STATUS_CONTRACT.md). nil from a backend
     /// that predates it. Every monitoring indicator reads this, not `health`.
     var status: DeviceStatus? = nil
+    /// When the phone received the reply this came in (stamped by
+    /// `APIClient.devices()`), so every screen can tell a current reading from
+    /// an old one (ConnectionTruth). Not part of the JSON.
+    var receivedAt: Date? = nil
 
     enum CodingKeys: String, CodingKey {
         case id, name, online, health, monitoring, status
@@ -161,10 +165,29 @@ extension StatusTone {
 }
 
 extension Device {
+    /// What this reading says about the device now (ConnectionTruth): online
+    /// only with fresh telemetry in a current reply.
+    func presence(now: Date = .now, lastRefreshFailed: Bool = false) -> ConnectionTruth.Presence {
+        ConnectionTruth.presence(
+            ConnectionTruth.Reading(online: online, stale: status?.stale, lastSeen: lastSeen, receivedAt: receivedAt),
+            lastRefreshFailed: lastRefreshFailed, now: now)
+    }
+
+    /// Online and reporting, judged by ConnectionTruth. What every screen
+    /// passes where it used to pass the raw `online` flag, so a stale or
+    /// unconfirmed reading never renders as live anywhere.
+    func isLive(now: Date = .now, lastRefreshFailed: Bool = false) -> Bool {
+        presence(now: now, lastRefreshFailed: lastRefreshFailed).isOnline
+    }
+
     /// The monitoring state in words, from `status`. nil only for an online
     /// device behind a backend that predates the status contract.
     var monitoringPresentation: MonitoringStatusPresentation? {
-        MonitoringStatusPresentation.make(status: status, online: online)
+        monitoringPresentation(live: isLive())
+    }
+
+    func monitoringPresentation(live: Bool) -> MonitoringStatusPresentation? {
+        MonitoringStatusPresentation.make(status: status, online: live)
     }
 
     /// What custom rules do on the device right now: nothing, replace the

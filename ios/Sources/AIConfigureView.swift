@@ -60,6 +60,8 @@ struct AIConfigureView: View {
                         Label(errorMessage, systemImage: "exclamationmark.circle.fill")
                             .font(SD.Typography.callout)
                             .foregroundStyle(SD.Colors.danger)
+                            .fixedSize(horizontal: false, vertical: true)
+                            .accessibilityIdentifier("jupiter.error")
                     }
                     if let notice {
                         Label(notice, systemImage: "arrow.triangle.2.circlepath")
@@ -97,6 +99,12 @@ struct AIConfigureView: View {
                     }
                     .accessibilityElement(children: .combine)
                     .accessibilityAddTraits(.isHeader)
+                    // The navigation bar caps its text size; at large sizes a long
+                    // press shows the title in the Large Content Viewer instead.
+                    .accessibilityShowsLargeContentViewer {
+                        Label("Ask Jupiter", systemImage: "sparkles")
+                    }
+                    .accessibilityIdentifier("jupiter.title")
                 }
                 ToolbarItem(placement: .cancellationAction) {
                     Button("Done") { dismiss() }
@@ -503,7 +511,7 @@ struct AIConfigureView: View {
                 wont += proposal.rules.map { "\($0.headline) — rules aren't turned on with a mode switch" }
             }
             wont += proposal.unsupported.map { "\($0.request) — \($0.reason)" }
-            if !(device.status?.isLive(online: device.online) ?? device.online) {
+            if !device.isLive() {
                 notes.append("\(device.name) isn't reporting right now. This applies when it reconnects.")
             }
         }
@@ -572,7 +580,7 @@ struct AIConfigureView: View {
             last = ActivationFollowUp.evaluate(
                 rulesExpected: rulesExpected, modeTitle: modeTitle,
                 modePending: !proposal.isCustom && fresh.desiredPreset != nil,
-                deviceLive: fresh.status?.isLive(online: fresh.online) ?? fresh.online,
+                deviceLive: fresh.isLive(),
                 rejectedReasons: rejected.map { $0.reasons ?? [] },
                 runningRuleIDs: fresh.status?.rules?.active, rules: rules)
             followUp = last

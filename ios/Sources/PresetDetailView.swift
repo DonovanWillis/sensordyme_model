@@ -43,11 +43,11 @@ struct PresetDetailView: View {
     /// Each capability this preset needs, judged from what the DEVICE reports.
     private var checks: [CapabilityCheck] {
         CapabilityChecks.make(required: preset.requiredCapabilities, optional: preset.optionalCapabilities,
-                              status: device.status, online: device.online, node: node)
+                              status: device.status, online: device.isLive(), node: node)
     }
 
     private var availability: PresetAvailability {
-        if deviceState != nil { return PresetAvailability.make(deviceState) }
+        if deviceState != nil { return PresetAvailability.make(deviceState, roleTitle: device.status?.roleTitle) }
         if let legacyUnavailableReason { return PresetAvailability(blocksSelection: true, note: legacyUnavailableReason) }
         return .open
     }
@@ -166,9 +166,9 @@ struct PresetDetailView: View {
 
     /// What the device is doing now with this preset: its own monitoring state.
     private var monitoringCard: some View {
-        let presentation = MonitoringStatusPresentation.make(status: device.status, online: device.online)
+        let presentation = MonitoringStatusPresentation.make(status: device.status, online: device.isLive())
         let impaired = PerceptionPresentation.degradedSummary(
-            device.status?.perception, live: device.status?.isLive(online: device.online) ?? false)
+            device.status?.perception, live: device.isLive())
         return SDCard {
             VStack(alignment: .leading, spacing: SD.Space.xs) {
                 HStack {
@@ -219,6 +219,7 @@ struct PresetDetailView: View {
             case .available: return ("Working", SD.Colors.success, "checkmark.circle.fill")
             case .unavailable(let why): return ("Not working — \(why)", SD.Colors.danger, "xmark.octagon.fill")
             case .unknown(let why): return ("Unknown — \(why)", SD.Colors.textTertiary, "questionmark.circle")
+            case .starting(let what): return (what, SD.Colors.warning, "hourglass")
             }
         }()
         return HStack(alignment: .firstTextBaseline, spacing: SD.Space.xs) {
@@ -461,7 +462,7 @@ struct PresetDetailView: View {
             }
             let status = ActivationStatus.evaluate(
                 base: preset.id, deviceName: device.name, title: preset.title, reportedPreset: fresh.activePreset,
-                customReplacing: fresh.customRules == .replacing, status: fresh.status, online: fresh.online,
+                customReplacing: fresh.customRules == .replacing, status: fresh.status, online: fresh.isLive(),
                 settingsConfirmed: settingsConfirmed, since: since)
             switch status.phase {
             case .waiting:

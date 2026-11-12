@@ -161,13 +161,14 @@ struct AskJupiterBar: View {
         VStack(alignment: .trailing, spacing: SD.Space.xxs) {
             HStack(alignment: expands ? .top : .center, spacing: SD.Space.sm) {
                 OrynMark(height: 18, color: focused ? SD.Colors.signal : SD.Colors.textPrimary)
-                    .padding(.top, expands ? 3 : 0)
+                    .padding(.top, expands ? 3 + 7 : 0)
                     .animation(SD.Motion.gentle, value: focused)
 
                 Group {
                     if expands {
                         TextField("", text: $text, prompt: orynPrompt(placeholder), axis: .vertical)
                             .lineLimit(1...5)
+                            .padding(.vertical, 7)  // the margin the bar's padding gave up
                     } else {
                         TextField("", text: $text, prompt: orynPrompt(placeholder))
                             .lineLimit(1)
@@ -187,7 +188,7 @@ struct AskJupiterBar: View {
                         ProgressView()
                             .controlSize(.small)
                             .tint(SD.Colors.textPrimary)
-                            .frame(width: 30, height: 30)
+                            .frame(width: 44, height: 44)
                             .accessibilityLabel("Jupiter is working")
                     } else {
                         Button(action: submit) {
@@ -199,6 +200,9 @@ struct AskJupiterBar: View {
                                     RoundedRectangle(cornerRadius: 8, style: .continuous)
                                         .fill(canSubmit ? SD.Colors.accent : SD.Colors.surfaceRaised)
                                 )
+                                // 30 pt as drawn; 44 pt to touch.
+                                .frame(width: 44, height: 44)
+                                .contentShape(Rectangle())
                         }
                         .buttonStyle(.plain)
                         .disabled(!canSubmit)
@@ -209,8 +213,10 @@ struct AskJupiterBar: View {
                 .animation(SD.Motion.quick, value: canSubmit)
             }
             .padding(.leading, SD.Space.md)
-            .padding(.trailing, SD.Space.sm - 2)
-            .padding(.vertical, SD.Space.sm - 1)
+            // The send button's 44 pt target carries 7 pt of its own margin, so the
+            // padding shrinks by as much and the bar keeps its drawn size.
+            .padding(.trailing, SD.Space.sm - 2 - 7)
+            .padding(.vertical, SD.Space.sm - 1 - 7)
             .frame(minHeight: 54)
             .background(
                 RoundedRectangle(cornerRadius: SD.Radius.lg, style: .continuous)

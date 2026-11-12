@@ -1,7 +1,7 @@
 import Foundation
 
 // Run with ios/Tests/run.sh
-// run.sh deps: DeviceStatus CapabilityTier
+// run.sh deps: DeviceStatus CapabilityTier PresetLibrary
 
 var failures = 0
 func check(_ condition: Bool, _ what: String) {
@@ -157,6 +157,42 @@ check(CompanionNodeToggle.isOn("people_counter", report: report, live: false) ==
 check(CompanionNodeToggle.isOn("people_counter", report: nil, live: true) == nil, "no report: unknown")
 check(CompanionNodeToggle.confirmed("people_counter", wanted: true, report: report, live: true), "on confirmed")
 check(!CompanionNodeToggle.confirmed("people_counter", wanted: false, report: report, live: true), "off not yet")
+
+print("\nM8: starting capabilities, experimental features, coded refusals:")
+do {
+    let calibrating = DeviceStatus(monitoringState: "starting", capabilities: .init(available: ["face"], starting: ["attention"]),
+                                   stale: false)
+    let checks = CapabilityChecks.make(required: ["face", "attention"], optional: [], status: calibrating, online: true)
+    if case .starting(let what)? = checks.first(where: { $0.name == "attention" })?.verdict {
+        check(what.hasPrefix("Calibrating to the driver"), "attention is calibrating: \(what)")
+    } else {
+        check(false, "attention is a starting verdict, not unknown or unavailable")
+    }
+    check(CapabilityChecks.blockingSummary(checks) == nil, "a calibrating capability does not block or read as failed")
+
+    let json = """
+    {"id": "baby_monitoring", "kind": "preset", "state": "active",
+     "experimental_features": [{"id": "flailing", "status": "experimental", "enabled": false},
+                               {"id": "choking_hazard", "enabled": true}, {"status": "no id"}]}
+    """
+    let node = try? JSONDecoder().decode(MonitoringNode.self, from: Data(json.utf8))
+    check(node?.experimentalFeatures.count == 2, "features decode; one without an id drops itself")
+    check(node.flatMap(NodePresentation.experimentalNote) == "Experimental: Flailing (off), Choking hazard (on)",
+          "experimental features are said as experimental, with on/off")
+    check(NodePresentation.experimentalNote(MonitoringNode(id: "x")) == nil, "none, nothing said")
+
+    check(RefusalText.message(code: "unknown_node", reason: "no companion node 'pets'; known: occupancy",
+                              fallback: "x") == "This device doesn't have that monitoring add-on.",
+          "a developer-worded refusal becomes a sentence")
+    check(RefusalText.message(code: "profile_fixed", reason: nil, fallback: "x").contains("profile is fixed"), "profile_fixed")
+    check(RefusalText.message(code: "invalid_setting", reason: "dwell must be 1–600 s", fallback: "x")
+          == "A setting was refused: dwell must be 1–600 s", "a readable reason is kept")
+    check(RefusalText.message(code: nil, reason: "camera busy", fallback: "x") == "camera busy", "uncoded keeps its reason")
+    let refused = DeviceStatus(lastRejection: .init(kind: "nodes", subject: "people_counter",
+                                                    reasons: ["role 'driver_safety' forbids it"], code: "role_forbids_preset", at: nil))
+    check(DeviceRefusal.forNode("people_counter", status: refused) == "This device's role doesn't allow that mode.",
+          "last_rejection's code is used")
+}
 
 print(failures == 0 ? "\nall passed" : "\n\(failures) FAILED")
 exit(failures == 0 ? 0 : 1)

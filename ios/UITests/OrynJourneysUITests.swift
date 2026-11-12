@@ -72,8 +72,7 @@ final class OrynJourneysUITests: XCTestCase {
         let code = app.textFields["wizard.claimCode"]
         XCTAssertTrue(code.waitForExistence(timeout: 10))
         XCTAssertEqual(code.label, "Claim code")
-        code.tap()
-        code.typeText(Stack.state()["claim_code"] as? String ?? "")
+        enter(Stack.state()["claim_code"] as? String ?? "", into: code)
         next.tap()
         XCTAssertTrue(app.buttons["wizard.done"].waitForExistence(timeout: 30), "the claim succeeded")
         shot("03b_paired")
@@ -174,12 +173,30 @@ final class OrynJourneysUITests: XCTestCase {
         Stack.prepare()
         launch(["-orynOpenDevice"])
         waitFor(monitoring, label: "All clear", timeout: 90)
-        let input = app.textFields["jupiter.input"].firstMatch
-        XCTAssertTrue(input.waitForExistence(timeout: 10))
-        input.tap()
-        input.typeText(Self.dwellPrompt)
+        // Clear of the floating tab bar first: a tap there lands on the tab bar
+        // and the field never gets focus.
+        let input = reveal(app.textFields["jupiter.input"].firstMatch, timeout: 10)
+        focus(input)
+        XCTAssertTrue(app.keyboards.firstMatch.waitForExistence(timeout: 10), "tapping the field brings up the keyboard")
+        // Focus must survive the screen's own refreshes (every 4 s, plus the
+        // device list's every 10 s): a refresh that rebuilt the field would drop
+        // the keyboard mid-sentence. Only a field that is found AND says it has
+        // no focus counts: during a refresh XCUITest can briefly fail to resolve
+        // the field (seen once in M8, ~20 s after the tap, with the field still
+        // focused on screen), and the old journey typed through `input` at such
+        // a moment — "neither element nor any descendant has keyboard focus".
+        let lost = Stack.waitUntil(timeout: 11) { self.focusState(input) == false }
+        if lost {  // what the app looked like at that moment, for diagnosis
+            Stack.saveText(app.debugDescription, name: "10_focus_lost_tree", test: self)
+            shot("10_focus_lost")
+        }
+        XCTAssertFalse(lost, "the field keeps keyboard focus across refreshes")
+        // Typed into whatever holds focus (just shown to be the field), so the
+        // keystrokes don't depend on re-resolving the field mid-refresh.
+        app.typeText(Self.dwellPrompt)
+        XCTAssertEqual(input.value as? String, Self.dwellPrompt, "the request went into the Ask Jupiter field")
         XCTAssertTrue(app.buttons["jupiter.send"].firstMatch.isEnabled, "a typed request can be sent")
-        input.typeText("\n")  // the keyboard's Send key
+        app.typeText("\n")  // the keyboard's Send key
         let explanation = app.staticTexts["jupiter.explanation"]
         XCTAssertTrue(explanation.waitForExistence(timeout: 45), "Jupiter answers")
         XCTAssertTrue(explanation.label.contains("marked area"), explanation.label)
@@ -399,18 +416,22 @@ final class OrynJourneysUITests: XCTestCase {
         try requirePerception()
         let toggle = reveal(app.switches["node.toggle.people_counter"])
         if (toggle.value as? String) == "1" {  // left on by an earlier run
-            toggle.tap()
+            flip(toggle)
             waitFor(toggle, value: "0", timeout: 60)
         }
-        toggle.tap()
+        flip(toggle)
         waitFor(toggle, value: "1", timeout: 60)  // the device reports the node running
         let node = element("node.people_counter")
         XCTAssertTrue(node.waitForExistence(timeout: 30), "the node is listed as running")
-        XCTAssertTrue(node.label.contains("Experimental"), "an experimental node says so: \(node.label)")
+        // As the device reports it (M8: "Not yet validated · simulated tests";
+        // M7 builds said "Experimental"), and never claimed as verified.
+        XCTAssertTrue(node.label.contains("Experimental") || node.label.contains("Not yet validated"),
+                      "the node says how far it is validated: \(node.label)")
+        XCTAssertFalse(node.label.contains("Verified"), node.label)
         XCTAssertTrue(element("node.driver_safety").exists, "Driver Safety keeps running beside it")
         waitFor(monitoring, label: "All clear", timeout: 30)
         shot("24a_companion_on")
-        toggle.tap()
+        flip(toggle)
         waitFor(toggle, value: "0", timeout: 60)
         waitForAbsence(node, timeout: 30)
         shot("24b_companion_off")
@@ -434,7 +455,129 @@ final class OrynJourneysUITests: XCTestCase {
         shot("25b_component_recovered")
     }
 
+    // MARK: Mission 8: telemetry truth and readable failures
+
+    /// The app receives stale telemetry: every reply from the server is fine,
+    /// but the device data in it stops changing (a cache or replica replaying
+    /// the last device list: online=true, last_seen frozen). The app must not
+    /// keep saying ONLINE: the card, the count and the device screen go Stale
+    /// together, and recover together.
+    func test26_StaleTelemetry() throws {
+        Stack.prepare()
+        launch()
+        let card = app.buttons["device.card"]
+        XCTAssertTrue(card.waitForExistence(timeout: 30))
+        waitFor(card, labelContains: "Online", timeout: 60)
+        Stack.post("/mode?m=freeze")
+        defer { Stack.post("/mode?m=pass") }
+        // last_seen + live window (30 s) + clock tolerance (30 s), polled every 10 s.
+        waitFor(card, labelContains: "Stale data", timeout: 100)
+        XCTAssertFalse(card.label.contains("Online"), "stale is never online: \(card.label)")
+        XCTAssertTrue(card.label.contains("showing its last report"), card.label)
+        XCTAssertTrue(label(containing: "0 ONLINE").exists || label(containing: "0 online").exists,
+                      "the summary counts it out")
+        shot("26a_stale_card")
+        card.tap()
+        waitFor(element("detail.online"), labelContains: "Stale", timeout: 30)
+        waitFor(monitoring, label: "Status unknown", timeout: 30)  // never "All clear" on old telemetry
+        waitFor(element("banner.message"), labelContains: "may no longer be true", timeout: 30)
+        shot("26b_stale_detail")
+        Stack.post("/mode?m=pass")
+        waitFor(element("detail.online"), label: "Online", timeout: 60)
+        waitFor(monitoring, label: "All clear", timeout: 60)
+        waitForAbsence(element("banner.message"), timeout: 30)
+        shot("26c_fresh_again")
+    }
+
+    /// Replies the app can't use are said in words, with a headline that
+    /// matches: a web page where SensorDyme should be, an empty body, a 500
+    /// with the server's own detail, a proxy's 502 page — never raw JSON or
+    /// HTML, never "request failed (502)", never silence. Ask Jupiter (its own
+    /// request path) says the same.
+    func test27_UnreadableReplies() throws {
+        Stack.prepare()
+        launch()
+        let card = app.buttons["device.card"]
+        XCTAssertTrue(card.waitForExistence(timeout: 30))
+        defer { Stack.post("/mode?m=pass") }
+        let banner = element("banner.message")
+        let cases: [(mode: String, says: String, shot: String)] = [
+            ("html", "Something else answered at this address", "27a_web_page"),
+            ("empty", "empty reply", "27b_empty"),
+            ("error500", "database is locked", "27c_server_error"),
+            ("gateway", "gateway", "27d_gateway"),
+        ]
+        for fault in cases {
+            Stack.post("/mode?m=\(fault.mode)")
+            waitFor(banner, labelContains: fault.says, timeout: 45)
+            for raw in ["<", "{", "request failed", "correct format"] {
+                XCTAssertFalse(banner.label.contains(raw), "\(fault.mode): no raw reply text: \(banner.label)")
+            }
+            XCTAssertFalse(banner.label.contains("Can't reach the server"),
+                           "\(fault.mode): the server answered; the headline must not say otherwise: \(banner.label)")
+            waitFor(card, labelContains: "Unknown", timeout: 15)
+            shot(fault.shot)
+        }
+        XCTAssertTrue(banner.label.contains("reported a problem") || banner.label.contains("gateway"), banner.label)
+        Stack.post("/mode?m=pass")
+        app.buttons["banner.retry"].tap()
+        waitForAbsence(banner, timeout: 30)
+
+        // Ask Jupiter's request fails with a server error: the screen says so.
+        Stack.post("/mode?m=error500&path=/v1/ai/configure")
+        app.terminate()
+        launch(["-orynOpenDevice", "-orynOpenJupiter", "-orynPrompt", Self.dwellPrompt])
+        let error = element("jupiter.error")
+        XCTAssertTrue(error.waitForExistence(timeout: 60), "a failed request is shown, not a silent spinner")
+        XCTAssertTrue(error.label.contains("database is locked"), error.label)
+        XCTAssertFalse(error.label.contains("{"), error.label)
+        shot("27e_jupiter_server_error")
+    }
+
     // MARK: Helpers
+
+    /// Tap a field and wait until it HAS keyboard focus, tapping once more if
+    /// it hasn't after 5 s. XCUITest's typeText waits for the app to go idle,
+    /// not for focus, and SwiftUI makes a tapped field first responder a beat
+    /// later: typing 0.46 s after the tap failed with "Neither element nor any
+    /// descendant has keyboard focus" on the sign-in screen (M8 full run,
+    /// journey 02) — the failure journey 10 was known for.
+    private func focus(_ field: XCUIElement, file: StaticString = #filePath, line: UInt = #line) {
+        field.tap()
+        if !Stack.waitUntil(timeout: 5, { self.focusState(field) == true }) {
+            field.tap()
+        }
+        waitFor(field, keyboardFocus: true, timeout: 10, file: file, line: line)
+    }
+
+    /// Focus a field (above), then type into the focused element.
+    private func enter(_ text: String, into field: XCUIElement, file: StaticString = #filePath, line: UInt = #line) {
+        focus(field, file: file, line: line)
+        app.typeText(text)
+    }
+
+    private func hasFocus(_ element: XCUIElement) -> Bool {
+        focusState(element) ?? false
+    }
+
+    /// The element's keyboard focus, or nil when it can't be resolved right now.
+    private func focusState(_ element: XCUIElement) -> Bool? {
+        guard element.exists else { return nil }
+        return element.value(forKey: "hasKeyboardFocus") as? Bool
+    }
+
+    /// Flip a labelled switch by its knob: XCUITest taps an element's centre,
+    /// which for a SwiftUI Toggle with a long label is the label, and iOS does
+    /// not toggle a switch from its label (journey 24 tapped and nothing moved).
+    private func flip(_ toggle: XCUIElement) {
+        toggle.coordinate(withNormalizedOffset: CGVector(dx: 0.94, dy: 0.5)).tap()
+    }
+
+    private func waitFor(_ element: XCUIElement, keyboardFocus: Bool, timeout: TimeInterval,
+                         file: StaticString = #filePath, line: UInt = #line) {
+        let ok = Stack.waitUntil(timeout: timeout) { self.hasFocus(element) == keyboardFocus }
+        XCTAssertTrue(ok, "\(element) keyboard focus == \(keyboardFocus)", file: file, line: line)
+    }
 
     /// Skips, saying why, when the stack does not report `status.perception`
     /// (sd-perception/1) yet: that needs the M7 device and backend streams.
@@ -463,6 +606,8 @@ final class OrynJourneysUITests: XCTestCase {
         var args = ["-orynNoPrompt", "-orynSignOut"]
         if signedIn {
             let session = Stack.session()
+            // An empty token signs the app in with nothing to send (see uitest_control.py).
+            XCTAssertFalse(session.token.isEmpty, "the scenario controller could not sign the demo account in")
             args += ["-orynSession", session.token, session.email]
         }
         app.launchArguments = args + extra + Stack.extraLaunchArguments
@@ -477,11 +622,9 @@ final class OrynJourneysUITests: XCTestCase {
     private func signIn(password: String) {
         let email = app.textFields["auth.email"]
         XCTAssertTrue(email.waitForExistence(timeout: 20))
-        email.tap()
-        email.typeText(Stack.state()["email"] as? String ?? "")
+        enter(Stack.state()["email"] as? String ?? "", into: email)
         let field = app.secureTextFields["auth.password"]
-        field.tap()
-        field.typeText(password)
+        enter(password, into: field)
         let submit = app.buttons["auth.submit"]
         XCTAssertTrue(submit.isEnabled)
         submit.tap()

@@ -52,6 +52,18 @@ enum Stack {
         }
     }
 
+    /// Kept in the result bundle, and written as a .txt when ORYN_UITEST_SHOTS names a folder.
+    static func saveText(_ text: String, name: String, test: XCTestCase) {
+        let attachment = XCTAttachment(string: text)
+        attachment.name = name
+        attachment.lifetime = .keepAlways
+        test.add(attachment)
+        if let dir = ProcessInfo.processInfo.environment["ORYN_UITEST_SHOTS"], !dir.isEmpty {
+            try? text.write(to: URL(fileURLWithPath: dir).appendingPathComponent("\(name).txt"),
+                            atomically: true, encoding: .utf8)
+        }
+    }
+
     /// Up to three attempts on a fresh connection each: one dropped connection
     /// (-1005) once launched the app with no session and failed two journeys.
     private static func request(_ method: String, _ path: String) throws -> [String: Any] {

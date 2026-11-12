@@ -18,6 +18,10 @@ struct APIError: LocalizedError {
     /// server sent none. Branch on this, never on the status alone: several
     /// different refusals share 409.
     var code: String? = nil
+    /// The headline for a banner (ServerReply.Title), when the server answered
+    /// with something other than the answer. nil for a transport failure, which
+    /// the banner heads "Can't reach the server".
+    var title: String? = nil
     var errorDescription: String? { message }
 }
 
@@ -25,6 +29,10 @@ struct APIError: LocalizedError {
 struct APIClient {
     let baseURL: URL?
     let token: String?
+    /// The app believes it is signed in. A 401 then ends the session even when
+    /// no token could be sent (ServerReply.sessionEnded), instead of showing
+    /// "missing bearer token" on every refresh for ever.
+    var signedIn: Bool = false
     /// Finds the backend when the saved address is missing or has stopped
     /// answering. Supplied by AppState; see BackendLocator.
     var relocate: (@Sendable () async -> URL?)?
@@ -96,7 +104,7 @@ struct APIClient {
             )
         }
         let status = (response as? HTTPURLResponse)?.statusCode ?? 0
-        if let error = Self.httpError(status: status, data: data, sentToken: token != nil) {
+        if let error = Self.httpError(status: status, data: data, sentToken: token != nil, signedIn: signedIn) {
             throw error
         }
         return data
@@ -107,18 +115,17 @@ struct APIClient {
     /// A 401 means "your session expired" only when a session was sent. Sign-in
     /// sends none, and its 401 is "wrong email or password" -- which every caller
     /// used to report as an expired session, on the sign-in screen itself.
-    static func httpError(status: Int, data: Data, sentToken: Bool) -> APIError? {
+    static func httpError(status: Int, data: Data, sentToken: Bool, signedIn: Bool = false) -> APIError? {
         if (200..<300).contains(status) { return nil }
         // FastAPI errors arrive as {"detail": "..."}, and refusals the app must
-        // tell apart also carry {"code": "..."} beside it.
-        let body = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any]
-        let detail = body?["detail"] as? String
-        let code = body?["code"] as? String
-        if status == 401 && sentToken {
-            return APIError(message: "Your session has expired. Please sign in again.",
-                            isAuthFailure: true, status: status, code: code)
+        // tell apart also carry {"code": "..."} beside it. Anything else (an
+        // HTML error page, a validation list, an empty body) is put into words
+        // by ServerReply rather than shown raw or as "request failed (502)".
+        let failure = ServerReply.httpFailure(status: status, data: data)
+        if let expired = ServerReply.sessionEnded(status: status, sentToken: sentToken, signedIn: signedIn) {
+            return APIError(message: expired, isAuthFailure: true, status: status, code: failure.code)
         }
-        return APIError(message: detail ?? "request failed (\(status))", status: status, code: code)
+        return APIError(message: failure.message, status: status, code: failure.code, title: failure.title)
     }
 
     /// Did this fail to reach a server at all, rather than reach one that refused?
@@ -166,12 +173,26 @@ struct APIClient {
     }
 
     /// Decode a reply, turning a malformed one into a message a person can act on
-    /// (ReplyError) instead of Foundation's "isn't in the correct format".
+    /// (ServerReply: empty, a web page, or unreadable data) instead of
+    /// Foundation's "isn't in the correct format".
     static func decodeReply<T: Decodable>(_ type: T.Type, from data: Data) throws -> T {
         do {
             return try JSONDecoder().decode(type, from: data)
-        } catch let error as DecodingError {
-            throw APIError(message: ReplyError.message(for: error) ?? ReplyError.unreadable)
+        } catch is DecodingError {
+            let failure = ServerReply.undecodable(data)
+            throw APIError(message: failure.message, status: 200, title: failure.title)
+        }
+    }
+
+    /// One URLSession call with the transport failure in words (APIClient.explain),
+    /// for the helpers that do not go through `request` (getJSON, postJSON). They
+    /// used to let a raw URLError through: "Could not connect to the server."
+    static func perform(_ request: URLRequest, host: String) async throws -> (Data, Int) {
+        do {
+            let (data, response) = try await URLSession.shared.data(for: request)
+            return (data, (response as? HTTPURLResponse)?.statusCode ?? 0)
+        } catch let error as URLError {
+            throw APIError(message: explain(error, host: host), isUnreachable: isUnreachable(error))
         }
     }
 
@@ -186,7 +207,9 @@ struct APIClient {
 
     // MARK: devices
     func devices() async throws -> [Device] {
-        try decode(DevicesResponse.self, from: try await request("GET", "v1/devices")).devices
+        let devices = try decode(DevicesResponse.self, from: try await request("GET", "v1/devices")).devices
+        let received = Date()
+        return devices.map { var device = $0; device.receivedAt = received; return device }
     }
 
     func claim(code: String) async throws {
@@ -416,9 +439,24 @@ final class AppState: ObservableObject {
     /// Auth token, kept in the Keychain (not UserDefaults). Migrates any token
     /// stored by earlier builds on first launch.
     private var storedToken: String {
-        get { Keychain.get("authToken") ?? "" }
-        set { Keychain.set("authToken", newValue) }
+        get {
+            if let tokenMemory { return tokenMemory }
+            let read = Keychain.get("authToken") ?? ""
+            tokenMemory = read
+            return read
+        }
+        set {
+            tokenMemory = newValue
+            if !Keychain.set("authToken", newValue) {
+                Self.log.error("the session token could not be stored in the Keychain; it is kept for this run only")
+            }
+        }
     }
+    /// The token in memory, read from the Keychain once. Every request used to
+    /// re-read the Keychain (`api` is rebuilt per access); one failed read sent
+    /// a request with no token, and the signed-in app then showed "missing
+    /// bearer token" on every refresh (M8 full journey run, journey 05).
+    private var tokenMemory: String?
 
     /// The device's own dashboard token (`dashboard.token` in its config.yaml),
     /// sent as `X-Device-Token` on `/stream` and `/api`.
@@ -579,6 +617,7 @@ final class AppState: ObservableObject {
         return APIClient(
             baseURL: base.isEmpty ? nil : URL(string: base),
             token: storedToken.isEmpty ? nil : storedToken,
+            signedIn: isSignedIn && !isDemo,
             relocate: { [weak self] in await self?.relocateBackend() ?? nil },
             // Rebuilt on every access (this is a computed property), so the
             // wording tracks how many attempts have actually failed.
