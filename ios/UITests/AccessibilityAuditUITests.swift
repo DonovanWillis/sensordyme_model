@@ -98,7 +98,7 @@ final class AccessibilityAuditUITests: XCTestCase {
             try app.performAccessibilityAudit(for: .all) { issue in
                 let label = issue.element?.label ?? ""
                 if issue.auditType == .contrast, let element = issue.element, self.obscuredByBars(element.frame) {
-                    obscured.append((label, element.frame))
+                    obscured.append(Seen(label: label, frame: element.frame))
                     return true
                 }
                 let known = self.knownIssues.first {
