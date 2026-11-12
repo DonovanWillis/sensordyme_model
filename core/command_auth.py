@@ -38,7 +38,7 @@ import time
 from collections import OrderedDict
 from collections.abc import Iterable
 from dataclasses import dataclass, field
-from typing import Optional
+from typing import Optional, Protocol
 
 CONTRACT = "sd-auth-v1"
 
@@ -53,7 +53,9 @@ DEFAULT_MODE = "permissive"
 
 #: Largest |request issued-at - backend clock| the backend accepts.
 CLOCK_SKEW_S = 300
-#: Request nonces the backend remembers (each for 2 * CLOCK_SKEW_S).
+#: Request nonces an in-memory NonceCache remembers (each for 2 * CLOCK_SKEW_S).
+#: The backend keeps its nonces in its database instead (cloud/app.py, M8), so
+#: a backend restart does not reopen the replay window.
 NONCE_CACHE_MAX = 50_000
 
 _SALT = b"sensordyme/" + CONTRACT.encode()
@@ -193,8 +195,14 @@ def parse_request_header(header: str) -> RequestAuth:
     return RequestAuth(kid, int(ts), nonce, sig)
 
 
+class NonceStore(Protocol):
+    def add(self, nonce: str, now: float) -> bool:
+        """Record `nonce`; False if it was already seen (a replay)."""
+        ...
+
+
 class NonceCache:
-    """Bounded memory of recently seen nonces, each kept for `ttl_s`."""
+    """Bounded memory of recently seen nonces, each kept for `ttl_s`, in this process."""
 
     def __init__(self, max_entries: int = NONCE_CACHE_MAX, ttl_s: float = 2 * CLOCK_SKEW_S) -> None:
         self._seen: OrderedDict[str, float] = OrderedDict()
@@ -211,7 +219,7 @@ class NonceCache:
 
 
 def verify_request(keyring: Keyring, auth: RequestAuth, method: str, path: str, body: bytes, *,
-                   nonces: NonceCache, now: Optional[float] = None,
+                   nonces: NonceStore, now: Optional[float] = None,
                    skew_s: float = CLOCK_SKEW_S) -> DeviceKey:
     """Check one signed request; returns the key that signed it (for the reply)."""
     now = time.time() if now is None else now
@@ -308,3 +316,43 @@ def verify_command(keyring: Keyring, command, envelope, *, devices: Iterable[str
     if not hmac.compare_digest(sha256_hex(body), env["body_sha256"]):
         raise AuthError("body_mismatch")
     return env
+
+
+# ------------------------------------------------------------------ clock answers (backend -> device)
+def sign_clock(key: DeviceKey, *, request_nonce: str, server_time: int) -> dict:
+    """`clock_auth` for a clock_skew refusal: the backend's time, bound to the
+    refused request's nonce, under the command key (M8).
+
+    Without it, the time in a clock_skew answer was unauthenticated, and a
+    `required` device adopted it as its request-clock offset. An on-path
+    attacker could then make the device sign requests stamped in the future,
+    hold them, and deliver them later, inside the backend's window and with
+    nonces it has never seen. Only a signed request reaches the clock check,
+    so the backend always knows the key to answer with.
+    """
+    if not _NONCE.fullmatch(request_nonce):
+        raise ValueError("bad request nonce")
+    answer = {"v": CONTRACT, "kid": key.kid, "rn": request_nonce, "t": int(server_time)}
+    answer["sig"] = _mac(key._command, (CONTRACT, "clock", key.kid, request_nonce, str(answer["t"])))
+    return answer
+
+
+def verify_clock(keyring: Keyring, answer, *, request_nonce: str) -> int:
+    """The backend time in a signed clock answer to the request with `request_nonce`."""
+    if not isinstance(answer, dict):
+        raise AuthError("malformed", "clock answer is not an object")
+    if answer.get("v") != CONTRACT:
+        raise AuthError("unsupported_version", str(answer.get("v"))[:32])
+    for name, pattern in (("kid", _KID), ("rn", _NONCE), ("sig", _SIG)):
+        if not isinstance(answer.get(name), str) or not pattern.fullmatch(answer[name]):
+            raise AuthError("malformed", name)
+    server_time = answer.get("t")
+    if not isinstance(server_time, int) or isinstance(server_time, bool) or not 0 <= server_time < 10 ** 12:
+        raise AuthError("malformed", "t")
+    key = keyring.for_kid(answer["kid"])
+    expected = _mac(key._command, (CONTRACT, "clock", key.kid, answer["rn"], str(server_time)))
+    if not hmac.compare_digest(expected, answer["sig"]):
+        raise AuthError("bad_signature")
+    if not hmac.compare_digest(answer["rn"], request_nonce):
+        raise AuthError("stale_response")
+    return server_time

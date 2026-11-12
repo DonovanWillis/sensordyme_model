@@ -194,9 +194,11 @@ def test_required_with_an_unusable_key_sends_nothing():
 
 # ------------------------------------------------------------------ clock
 def test_a_clock_skew_refusal_teaches_the_request_clock_only():
-    response = types.SimpleNamespace(status_code=401, json=lambda: {"code": "clock_skew", "server_time": 4_000_000_000})
-    error = requests.HTTPError("401", response=response)
-    uplink, backend = _uplink(lambda n, k: error, command_auth="required")
+    def skew(nonce, _kid):  # the backend signs its time, bound to the refused request (M8)
+        answer = {"code": "clock_skew", "server_time": 4_000_000_000,
+                  "clock_auth": a.sign_clock(a.DeviceKey(KEY), request_nonce=nonce, server_time=4_000_000_000)}
+        return requests.HTTPError("401", response=types.SimpleNamespace(status_code=401, json=lambda: answer))
+    uplink, backend = _uplink(skew, command_auth="required")
     uplink.sync_once()
     assert uplink._clock_offset_s > 1e9
     backend.reply = _signed(STOP)

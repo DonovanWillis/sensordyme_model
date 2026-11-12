@@ -40,6 +40,7 @@ from typing import Any, Optional
 import jwt
 import yaml
 from fastapi import BackgroundTasks, Depends, FastAPI, Header, HTTPException, Request
+from fastapi.concurrency import run_in_threadpool
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field
@@ -52,6 +53,7 @@ from cloud.ratelimit import (
     AI_GLOBAL_CONCURRENCY,
     AI_GLOBAL_KEY,
     AI_RATE_LIMITER,
+    CLAIM_FAILURE_LIMITER,
     CLAIM_LIMITER,
     LOGIN_FAILURE_LIMITER,
     LOGIN_LIMITER,
@@ -130,6 +132,14 @@ def _load_jwt_secret() -> str:
     try:
         existing = path.read_text().strip()
         if existing:
+            # Created 0600 below, but a restored backup or a copied data
+            # directory keeps whatever mode it arrived with, and anyone who can
+            # read this file can mint a session for any account (M8).
+            with suppress(OSError):
+                if path.stat().st_mode & 0o077:
+                    os.chmod(path, 0o600)
+                    logging.getLogger("uvicorn.error").warning(
+                        "%s was readable by other users; its mode is now 0600", path)
             return existing
     except FileNotFoundError:
         pass
@@ -313,6 +323,8 @@ class CodedError(HTTPException):
     def __init__(self, status_code: int, code: str, detail: str) -> None:
         super().__init__(status_code, detail)
         self.code = code
+        #: More fields for the answer body (a device clock_skew's signed time).
+        self.extra: dict = {}
 
 
 @app.exception_handler(CodedError)
@@ -320,6 +332,7 @@ async def _coded_error(_request: Request, exc: CodedError) -> JSONResponse:
     content = {"detail": exc.detail, "code": exc.code}
     if exc.code == "clock_skew":
         content["server_time"] = int(time.time())
+    content.update(getattr(exc, "extra", None) or {})
     return JSONResponse(status_code=exc.status_code, content=content)
 
 
@@ -589,6 +602,7 @@ def init_db() -> None:
         # For retention (see _prune_events): an age cut-off without this is a
         # full scan of the largest table, on a write transaction.
         conn.execute("CREATE INDEX IF NOT EXISTS idx_events_received ON events(received_at)")
+        _init_device_auth_tables(conn)
         _backfill_auth_kids(conn)
 
 
@@ -608,6 +622,35 @@ def _backfill_auth_kids(conn) -> None:
             except ValueError:
                 kids.append(None)
         conn.execute("UPDATE devices SET auth_kid = ?, previous_auth_kid = ? WHERE id = ?", (*kids, row[0]))
+
+
+def _init_device_auth_tables(conn) -> None:
+    """Device-auth state (docs/DEVICE_AUTH_CONTRACT.md §3, §6): request nonces,
+    revoked keys, per-device enforcement and the last refusal."""
+    conn.execute("CREATE TABLE IF NOT EXISTS auth_nonces (nonce TEXT PRIMARY KEY, seen_at REAL NOT NULL)"
+                 " WITHOUT ROWID")
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_auth_nonces_seen ON auth_nonces(seen_at)")
+    # A revoked key is kept, so a request from its holder is recognised and
+    # reported as revoked rather than as an unknown key. It authenticates
+    # nothing: no lookup that grants access reads this table.
+    conn.execute("CREATE TABLE IF NOT EXISTS revoked_device_keys (kid TEXT PRIMARY KEY,"
+                 " device_id INTEGER NOT NULL, device_key TEXT NOT NULL, revoked_at REAL NOT NULL)")
+    for statement in (
+        # 'required': this device must sign, whatever SENSORDYME_DEVICE_AUTH says
+        # (it can only tighten). NULL follows the backend mode.
+        "ALTER TABLE devices ADD COLUMN auth_mode TEXT",
+        # Set by `manage.py revoke-device`: every request from it is refused.
+        "ALTER TABLE devices ADD COLUMN auth_revoked_at REAL",
+        # 'signed' or 'bearer': how the device last authenticated.
+        "ALTER TABLE devices ADD COLUMN last_auth TEXT",
+        # JSON {reason, at}: the last refusal attributable to this device.
+        "ALTER TABLE devices ADD COLUMN auth_refusal TEXT",
+    ):
+        try:
+            conn.execute(statement)
+        except sqlite3.OperationalError as exc:
+            if "duplicate column name" not in str(exc).lower():
+                raise
 
 
 init_db()
@@ -1168,6 +1211,9 @@ def _device_status(row: sqlite3.Row, now: float) -> dict:
             "the device has not reported yet" if not last_seen
             else f"no report from the device in the last {_HEALTH_STALE_S} s"
         ]
+        refused = _credential_refusal(row)
+        if refused is not None:
+            reasons.append(refused["detail"])
     else:
         state = live_monitoring.get("state")
         if state not in _MONITORING_STATES:
@@ -1241,10 +1287,53 @@ def _device_status(row: sqlite3.Row, now: float) -> dict:
     }
 
 
-#: Request nonces seen in the last 2 x CLOCK_SKEW_S (sd-auth-v1 replay refusal).
-#: Per process: the backend is a single SQLite-backed process.
-_REQUEST_NONCES = sd_auth.NonceCache()
-_REQUEST_NONCES_LOCK = threading.Lock()
+#: Request nonces the backend remembers, in the database (sd-auth-v1 replay
+#: refusal). They used to live in this process's memory, so a backend restart
+#: forgot them and a request captured up to CLOCK_SKEW_S earlier was accepted
+#: again (M8). The table is pruned of nonces older than 2 x CLOCK_SKEW_S --
+#: those requests fail the clock check anyway -- and bounded.
+REQUEST_NONCES_MAX = 1_000_000
+_NONCE_PRUNE_EVERY_S = 30.0
+
+
+class _StoredNonces:
+    """sd_auth.NonceStore over the `auth_nonces` table: survives a restart, and
+    is shared by every process on this database. INSERT OR IGNORE on the primary
+    key is the atomic test-and-set, so no lock is needed."""
+
+    def __init__(self, max_entries: int = REQUEST_NONCES_MAX, ttl_s: float = 2 * sd_auth.CLOCK_SKEW_S) -> None:
+        self._max, self._ttl = max_entries, ttl_s
+        self._next_prune = 0.0
+
+    def add(self, nonce: str, now: float) -> bool:
+        with db() as conn:
+            if now >= self._next_prune:
+                self._next_prune = now + _NONCE_PRUNE_EVERY_S
+                conn.execute("DELETE FROM auth_nonces WHERE seen_at < ?", (now - self._ttl,))
+                excess = conn.execute("SELECT COUNT(*) FROM auth_nonces").fetchone()[0] - self._max
+                if excess > 0:
+                    # Not reachable at a single backend's request rate (it would take
+                    # over 1,600 signed requests a second); said loudly if it is.
+                    log.warning("device auth: %d unexpired request nonces evicted (table full)", excess)
+                    conn.execute("DELETE FROM auth_nonces WHERE nonce IN (SELECT nonce FROM auth_nonces"
+                                 " ORDER BY seen_at LIMIT ?)", (excess,))
+            inserted = conn.execute("INSERT OR IGNORE INTO auth_nonces (nonce, seen_at) VALUES (?, ?)",
+                                    (nonce, now))
+            return inserted.rowcount == 1
+
+
+_REQUEST_NONCES = _StoredNonces()
+
+#: What the app is told when the backend refused a device it could identify
+#: (GET /v1/devices `credentials` and the stale status reason). Only refusals
+#: that prove they came from the key's holder are recorded: anyone can send a
+#: bad tag under a public key id, and that must not paint a healthy device red.
+_CREDENTIAL_REFUSALS = {
+    "revoked_key": "the backend refused this device's key: it has been revoked",
+    "revoked_device": "this device's credentials have been revoked by the operator",
+    "clock_skew": "the device's clock is too far from the backend's for a signed request",
+    "signature_required": "the device sends unsigned requests, and the backend requires signed ones for it",
+}
 
 
 def _device_for_kid(kid: str) -> tuple[Optional[sqlite3.Row], Optional[sd_auth.Keyring]]:
@@ -1266,15 +1355,95 @@ def _device_for_kid(kid: str) -> tuple[Optional[sqlite3.Row], Optional[sd_auth.K
     return row, keyring
 
 
-def _refuse_device(reason: str, kid: str = "") -> HTTPException:
+def _revoked_key(kid: str) -> Optional[tuple[int, str]]:
+    """(device id, key) of a revoked key, by its public id."""
+    with db() as conn:
+        row = conn.execute("SELECT device_id, device_key FROM revoked_device_keys WHERE kid = ?", (kid,)).fetchone()
+    return (row[0], row[1]) if row is not None else None
+
+
+def _record_refusal(device_id: int, reason: str) -> None:
+    """Remember an authenticated refusal for the app. At most one write a minute
+    per device and reason, so a device retrying every poll is not a write storm."""
+    now = time.time()
+    with db() as conn:
+        conn.execute(
+            "UPDATE devices SET auth_refusal = ? WHERE id = ? AND (auth_refusal IS NULL"
+            " OR json_extract(auth_refusal, '$.reason') IS NOT ? OR json_extract(auth_refusal, '$.at') < ?)",
+            (json.dumps({"reason": reason, "at": now}), device_id, reason, now - 60),
+        )
+
+
+def _note_auth(row: sqlite3.Row, kind: str) -> None:
+    """Record how the device authenticated ('signed' / 'bearer'), on change only:
+    an operator moves a device to `required` once it is seen signing."""
+    if row["last_auth"] != kind:
+        with db() as conn:
+            conn.execute("UPDATE devices SET last_auth = ? WHERE id = ?", (kind, row["id"]))
+
+
+def _credential_refusal(row: sqlite3.Row) -> Optional[dict]:
+    """The device's last recorded refusal, unless a report was accepted after it."""
+    refusal = _loads_dict(row["auth_refusal"])
+    at = refusal.get("at")
+    if not isinstance(at, (int, float)) or refusal.get("reason") not in _CREDENTIAL_REFUSALS:
+        return None
+    if row["last_seen"] and row["last_seen"] >= at:
+        return None
+    return {"reason": refusal["reason"], "detail": _CREDENTIAL_REFUSALS[refusal["reason"]], "at": at}
+
+
+def _credentials_status(row: sqlite3.Row) -> dict:
+    """GET /v1/devices `credentials`: whether the backend accepts this device."""
+    refusal = _credential_refusal(row)
+    if row["auth_revoked_at"]:
+        state = "revoked"
+    elif refusal is not None:
+        state = "refused"
+    else:
+        state = "accepted" if row["last_seen"] else "unknown"
+    return {
+        "state": state,
+        "auth": row["last_auth"] if row["last_auth"] in ("signed", "bearer") else None,
+        "signature_required": DEVICE_AUTH_MODE == "required" or row["auth_mode"] == "required",
+        "refusal": refusal,
+    }
+
+
+def _refuse_device(reason: str, kid: str = "", *, extra: Optional[dict] = None) -> CodedError:
     # Reason code and public key id only: never the key, the tag or the body.
     log.warning("device auth refused: %s%s", reason, f" (kid {kid})" if kid else "")
     if reason == "clock_skew":
         # Answered with server_time (see _coded_error): a Pi has no RTC. The
         # device uses it only to timestamp its next request; freshness is still
         # judged here, against this clock.
-        return CodedError(401, "clock_skew", "device clock is too far from the backend's")
-    return CodedError(401, f"device_auth_{reason}", "device authentication failed")
+        error = CodedError(401, "clock_skew", "device clock is too far from the backend's")
+    else:
+        error = CodedError(401, f"device_auth_{reason}", "device authentication failed")
+    error.extra = extra or {}
+    return error
+
+
+def _signed_by(secret: str, parsed: sd_auth.RequestAuth, method: str, path: str, body: bytes) -> bool:
+    """Whether `secret` made this request's tag (no clock or nonce check)."""
+    try:
+        sd_auth.verify_request(sd_auth.Keyring(sd_auth.DeviceKey(secret)), parsed, method, path, body,
+                               nonces=sd_auth.NonceCache(), skew_s=float("inf"))
+    except (sd_auth.AuthError, ValueError):
+        return False
+    return True
+
+
+def _bearer_revoked(presented: str) -> Optional[int]:
+    """The device a revoked bearer key belonged to, if `presented` is exactly that key."""
+    try:
+        kid = sd_auth.key_id(presented)
+    except ValueError:
+        return None
+    revoked = _revoked_key(kid)
+    if revoked is not None and hmac.compare_digest(revoked[1].encode(), presented.encode()):
+        return revoked[0]
+    return None
 
 
 async def current_device(request: Request, x_device_key: str = Header(default=""),
@@ -1282,10 +1451,11 @@ async def current_device(request: Request, x_device_key: str = Header(default=""
     """FastAPI dependency: authenticate a device request (sd-auth-v1 or legacy key).
 
     A signed request (X-SD-Auth) is checked against the key its id names, the
-    exact body bytes, the backend clock (+-CLOCK_SKEW_S) and the nonce cache.
+    exact body bytes, the backend clock (+-CLOCK_SKEW_S) and the stored nonces.
     Otherwise X-Device-Key is the bearer secret, as before -- unless
-    SENSORDYME_DEVICE_AUTH=required. Either way, `request.state.sd_auth` says
-    which key to sign the reply's command with and which request nonce it answers.
+    SENSORDYME_DEVICE_AUTH=required or the device's own auth_mode is. A revoked
+    key or device is refused either way. `request.state.sd_auth` says which key
+    to sign the reply's command with and which request nonce it answers.
     """
     request.state.sd_auth = None
     if x_sd_auth:
@@ -1295,25 +1465,54 @@ async def current_device(request: Request, x_device_key: str = Header(default=""
             parsed = sd_auth.parse_request_header(x_sd_auth)
         except sd_auth.AuthError as exc:
             raise _refuse_device(exc.reason) from None
-        row, keyring = _device_for_kid(parsed.kid)
-        if row is None or keyring is None:
-            raise _refuse_device("unknown_key", parsed.kid)
         body = await request.body()
         root = request.scope.get("root_path") or ""
         path = request.url.path[len(root):] if root and request.url.path.startswith(root) else request.url.path
+        row, keyring = _device_for_kid(parsed.kid)
+        if row is None or keyring is None:
+            revoked = _revoked_key(parsed.kid)
+            if revoked is not None and _signed_by(revoked[1], parsed, request.method, path, body):
+                _record_refusal(revoked[0], "revoked_key")
+                raise _refuse_device("revoked_key", parsed.kid)
+            raise _refuse_device("unknown_key", parsed.kid)
         try:
-            with _REQUEST_NONCES_LOCK:
-                key = sd_auth.verify_request(keyring, parsed, request.method, path, body, nonces=_REQUEST_NONCES)
+            # In the threadpool: recording the nonce is a database write, and a
+            # write-lock wait here must not stall the event loop for every request.
+            key = await run_in_threadpool(sd_auth.verify_request, keyring, parsed, request.method, path, body,
+                                          nonces=_REQUEST_NONCES)
         except sd_auth.AuthError as exc:
-            raise _refuse_device(exc.reason, parsed.kid) from None
+            if exc.reason != "clock_skew":
+                raise _refuse_device(exc.reason, parsed.kid) from None
+            # The tag was checked before the clock, so this answer goes to the
+            # key's holder: sign the time, bound to the request it answers.
+            _record_refusal(row["id"], "clock_skew")
+            now = int(time.time())
+            clock = sd_auth.sign_clock(keyring.for_kid(parsed.kid), request_nonce=parsed.nonce, server_time=now)
+            raise _refuse_device("clock_skew", parsed.kid,
+                                 extra={"server_time": now, "clock_auth": clock}) from None
+        if row["auth_revoked_at"]:
+            _record_refusal(row["id"], "revoked_device")
+            raise _refuse_device("revoked_device", parsed.kid)
+        _note_auth(row, "signed")
         request.state.sd_auth = (key, parsed.nonce)
         return row
-    if DEVICE_AUTH_MODE == "required":
-        raise _refuse_device("signature_required")
     with db() as conn:
         row = conn.execute("SELECT * FROM devices WHERE device_key = ?", (x_device_key,)).fetchone()
     if row is None:
+        revoked_device = _bearer_revoked(x_device_key) if x_device_key else None
+        if revoked_device is not None:
+            _record_refusal(revoked_device, "revoked_key")
+            raise _refuse_device("revoked_key")
+        if DEVICE_AUTH_MODE == "required":
+            raise _refuse_device("signature_required")
         raise HTTPException(401, "invalid device key")
+    if DEVICE_AUTH_MODE == "required" or row["auth_mode"] == "required":
+        _record_refusal(row["id"], "signature_required")
+        raise _refuse_device("signature_required")
+    if row["auth_revoked_at"]:
+        _record_refusal(row["id"], "revoked_device")
+        raise _refuse_device("revoked_device")
+    _note_auth(row, "bearer")
     if DEVICE_AUTH_MODE != "off" and x_sd_nonce and re.fullmatch(r"[0-9a-f]{32}", x_sd_nonce):
         with suppress(ValueError):  # a key under 16 bytes: legacy only, nothing to sign with
             request.state.sd_auth = (sd_auth.DeviceKey(row["device_key"]), x_sd_nonce)
@@ -1972,11 +2171,16 @@ def rename_device(device_id: int, body: RenameBody, uid: int = Depends(current_u
 def claim_device(body: ClaimBody, request: Request, uid: int = Depends(current_user)):
     if not CLAIM_LIMITER.allow(_client_ip(request)):
         raise HTTPException(429, "too many attempts — try again in a few minutes")
+    account = f"uid:{uid}"
+    if CLAIM_FAILURE_LIMITER.blocked(account):
+        raise HTTPException(429, "too many attempts — try again in a few minutes")
     with db() as conn:
         row = conn.execute("SELECT * FROM devices WHERE claim_code = ?", (body.claim_code.strip(),)).fetchone()
         if row is None:
+            CLAIM_FAILURE_LIMITER.record(account)
             raise HTTPException(404, "unknown claim code")
         if row["owner_id"] is not None and row["owner_id"] != uid:
+            CLAIM_FAILURE_LIMITER.record(account)
             raise CodedError(409, "device_already_claimed", "device already claimed by another account")
         # Conditional, not a blind overwrite: two accounts holding the same code
         # could both pass the check above before either wrote, and both got a
@@ -2022,6 +2226,9 @@ def list_devices(uid: int = Depends(current_user)):
                 # What the app renders as "is it watching": the typed contract in
                 # docs/APP_STATUS_CONTRACT.md, "unknown" once the device goes quiet.
                 "status": _device_status(r, now),
+                # Whether the backend accepts this device's credentials, and why not
+                # (revoked, clock, unsigned): "offline" alone hid a lockout.
+                "credentials": _credentials_status(r),
             }
             for r in rows
         ]
