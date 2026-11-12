@@ -64,6 +64,11 @@ preset reasons written for developers ("preset 'x' would stop
 driver_attention; allowed: …") are put into sentences
 (RefusalText, PresetAvailability.readableReason).
 
+A 401 while the app believes it is signed in ends the session with a reason,
+even when no token could be sent (it used to show "missing bearer token" on
+every refresh, for ever). The session token is read from the Keychain once
+and kept in memory, instead of being re-read for every request.
+
 ### Capabilities and nodes (M8 DRIVER / NODES)
 
 `attention` (the driver's calibrated forward gaze) is titled "Attention" and,
@@ -92,13 +97,18 @@ the presence pill to Unknown).
   "ON…"/"AL…"; the device screen's status row, the device card's pill and id,
   and the Ask Jupiter caption/Examples stack at accessibility sizes; event
   signals and mode-row reasons wrap in full.
-- Eyebrow labels (SDEyebrow): the text style with `.monospaced()` and no
-  tracking. Two Simulator experiments isolated the audit findings: tracking
-  caused "text clipped"; `Font.system(_:design: .monospaced)` caused "Dynamic
-  Type partially unsupported".
+- Eyebrow labels (SDEyebrow, pills): `Font.caption.weight(.medium).monospaced()`
+  and no tracking on SDEyebrow. Three Simulator audit runs isolated the
+  findings: tracking caused "text clipped"; "Dynamic Type partially
+  unsupported" was the caption2 text style itself (pinned at 11 pt from Extra
+  Small to Large), not the font construction (`system(_:design:)`,
+  `.monospaced()` and `fontDesign` all gave the same finding). The labels are
+  1 pt larger at the default size as a result.
 - Contrast: unavailable-mode reasons and the sign-in "Welcome back" use
-  textSecondary. Contrast findings on text scrolled under the translucent tab
-  bar are re-measured with the element scrolled clear (AccessibilityAuditUITests).
+  textSecondary. The audit waits 3 s for late content to settle, and contrast
+  findings on text under the translucent tab bar or the navigation bar's
+  scroll edge are re-measured with the element scrolled clear
+  (AccessibilityAuditUITests).
 - VoiceOver: presence is spoken with its meaning ("Stale data, no report for
   2 minutes"); the Ask Jupiter title offers the Large Content Viewer.
 
@@ -106,7 +116,21 @@ the presence pill to Unknown).
 
 - 10 (Ask Jupiter): reveals the field clear of the tab bar, then requires the
   keyboard and keyboard focus, and that focus survives the screen's refreshes,
-  before typing.
+  then types into the focused element. What was found: with temporary
+  focus/lifetime logging, nine runs showed the field and the device screen
+  are never re-created by the 4 s refresh and focus holds until submit; one
+  run showed XCUITest briefly unable to resolve the field ~20 s after the tap
+  while it was still focused on screen; and the full run caught the same
+  error on the sign-in screen (journey 02) with `typeText` issued 0.46 s after
+  the tap: XCUITest waits for the app to go idle, not for focus, and SwiftUI
+  makes a tapped field first responder a beat later. The old journey typed
+  straight after the tap through a re-resolved element. Every journey that
+  types now taps, waits for keyboard focus (one more tap after 5 s), and types
+  into the focused element.
+- 24 (companion node): flips the switch by its knob; the nodes section is its
+  own accessibility element so the switch keeps its identifier.
+- The controller gives its own logins a separate rate-limit key (the backend
+  allows 10 logins per address per 5 minutes; it signs in once per launch).
 - 26 Stale telemetry: the proxy replays the last device list (`/mode?m=freeze`);
   card, count and device screen go Stale together, never "All clear", and
   recover together.

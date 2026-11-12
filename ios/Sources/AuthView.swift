@@ -17,6 +17,7 @@ struct AuthView: View {
     @State private var errorMessage: String?
     @State private var busy = false
     @FocusState private var focus: Field?
+    @Environment(\.dynamicTypeSize) private var typeSize
 
     private enum Field { case email, password }
 
@@ -72,11 +73,15 @@ struct AuthView: View {
 
     private var form: some View {
         VStack(alignment: .leading, spacing: SD.Space.sm) {
-            HStack(alignment: .firstTextBaseline) {
+            // Stacked at accessibility sizes: side by side, "Welcome back" was
+            // squeezed into a hyphenated column ("WEL- COME BACK").
+            (typeSize.isAccessibilitySize
+                ? AnyLayout(VStackLayout(alignment: .leading, spacing: SD.Space.xxs))
+                : AnyLayout(HStackLayout(alignment: .firstTextBaseline))) {
                 Text(isSignup ? "Create your account" : "Sign in")
                     .font(SD.Typography.title)
                     .foregroundStyle(SD.Colors.textPrimary)
-                Spacer()
+                if !typeSize.isAccessibilitySize { Spacer() }
                 // textSecondary: thin 11 pt capitals in textTertiary measured
                 // below the audit's contrast threshold on this screen.
                 SDEyebrow(isSignup ? "New" : "Welcome back", color: SD.Colors.textSecondary)

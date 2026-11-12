@@ -72,8 +72,7 @@ final class OrynJourneysUITests: XCTestCase {
         let code = app.textFields["wizard.claimCode"]
         XCTAssertTrue(code.waitForExistence(timeout: 10))
         XCTAssertEqual(code.label, "Claim code")
-        code.tap()
-        code.typeText(Stack.state()["claim_code"] as? String ?? "")
+        enter(Stack.state()["claim_code"] as? String ?? "", into: code)
         next.tap()
         XCTAssertTrue(app.buttons["wizard.done"].waitForExistence(timeout: 30), "the claim succeeded")
         shot("03b_paired")
@@ -177,9 +176,8 @@ final class OrynJourneysUITests: XCTestCase {
         // Clear of the floating tab bar first: a tap there lands on the tab bar
         // and the field never gets focus.
         let input = reveal(app.textFields["jupiter.input"].firstMatch, timeout: 10)
-        input.tap()
+        focus(input)
         XCTAssertTrue(app.keyboards.firstMatch.waitForExistence(timeout: 10), "tapping the field brings up the keyboard")
-        waitFor(input, keyboardFocus: true, timeout: 10)
         // Focus must survive the screen's own refreshes (every 4 s, plus the
         // device list's every 10 s): a refresh that rebuilt the field would drop
         // the keyboard mid-sentence. Only a field that is found AND says it has
@@ -425,7 +423,11 @@ final class OrynJourneysUITests: XCTestCase {
         waitFor(toggle, value: "1", timeout: 60)  // the device reports the node running
         let node = element("node.people_counter")
         XCTAssertTrue(node.waitForExistence(timeout: 30), "the node is listed as running")
-        XCTAssertTrue(node.label.contains("Experimental"), "an experimental node says so: \(node.label)")
+        // As the device reports it (M8: "Not yet validated · simulated tests";
+        // M7 builds said "Experimental"), and never claimed as verified.
+        XCTAssertTrue(node.label.contains("Experimental") || node.label.contains("Not yet validated"),
+                      "the node says how far it is validated: \(node.label)")
+        XCTAssertFalse(node.label.contains("Verified"), node.label)
         XCTAssertTrue(element("node.driver_safety").exists, "Driver Safety keeps running beside it")
         waitFor(monitoring, label: "All clear", timeout: 30)
         shot("24a_companion_on")
@@ -534,6 +536,26 @@ final class OrynJourneysUITests: XCTestCase {
 
     // MARK: Helpers
 
+    /// Tap a field and wait until it HAS keyboard focus, tapping once more if
+    /// it hasn't after 5 s. XCUITest's typeText waits for the app to go idle,
+    /// not for focus, and SwiftUI makes a tapped field first responder a beat
+    /// later: typing 0.46 s after the tap failed with "Neither element nor any
+    /// descendant has keyboard focus" on the sign-in screen (M8 full run,
+    /// journey 02) — the failure journey 10 was known for.
+    private func focus(_ field: XCUIElement, file: StaticString = #filePath, line: UInt = #line) {
+        field.tap()
+        if !Stack.waitUntil(timeout: 5, { self.focusState(field) == true }) {
+            field.tap()
+        }
+        waitFor(field, keyboardFocus: true, timeout: 10, file: file, line: line)
+    }
+
+    /// Focus a field (above), then type into the focused element.
+    private func enter(_ text: String, into field: XCUIElement, file: StaticString = #filePath, line: UInt = #line) {
+        focus(field, file: file, line: line)
+        app.typeText(text)
+    }
+
     private func hasFocus(_ element: XCUIElement) -> Bool {
         focusState(element) ?? false
     }
@@ -600,11 +622,9 @@ final class OrynJourneysUITests: XCTestCase {
     private func signIn(password: String) {
         let email = app.textFields["auth.email"]
         XCTAssertTrue(email.waitForExistence(timeout: 20))
-        email.tap()
-        email.typeText(Stack.state()["email"] as? String ?? "")
+        enter(Stack.state()["email"] as? String ?? "", into: email)
         let field = app.secureTextFields["auth.password"]
-        field.tap()
-        field.typeText(password)
+        enter(password, into: field)
         let submit = app.buttons["auth.submit"]
         XCTAssertTrue(submit.isEnabled)
         submit.tap()

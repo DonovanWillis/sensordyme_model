@@ -849,8 +849,13 @@ struct DeviceDetailView: View {
                     Text("Also count people")
                         .font(SD.Typography.body)
                         .foregroundStyle(SD.Colors.textPrimary)
+                    // How far it is validated comes from the device's report when it
+                    // is running (it said "Experimental" here while the device called
+                    // it "Not yet validated · simulated tests"); never "validated".
                     Text(pending ? "Waiting for \(device.name) to confirm…"
-                         : "Occupancy, from the same detections. Experimental.")
+                         : "Occupancy, from the same detections. "
+                            + (report.node("people_counter").map { NodePresentation.badge($0) + "." }
+                               ?? "Not yet validated."))
                         .font(SD.Typography.caption)
                         .foregroundStyle(SD.Colors.textSecondary)
                         .fixedSize(horizontal: false, vertical: true)
