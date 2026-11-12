@@ -198,7 +198,7 @@ class Stack:
         to, with a marker per test."""
         self.generation += 1
         self.email = f"uitest-{self.generation}@sensordyme.local"
-        for name in ("backend.log", "device.log"):
+        for name in ("backend.log", "device.log", "proxy.log"):
             with open(self.work / name, "a") as f:
                 f.write(f"\n===== fresh #{self.generation} for {tag or '?'} "
                         f"({time.strftime('%H:%M:%S')}), account {self.email} =====\n")
@@ -386,6 +386,11 @@ def proxy_handler(stack: Stack):
                 self._send(502, b'{"detail": "backend unreachable"}', "application/json")
 
         def _send(self, status: int, payload: bytes, ctype: str | None, extra=()) -> None:
+            # Every app request and its answer, for telling "the app never sent it"
+            # from "the backend or device dropped it" when a tap seems to do nothing.
+            with open(stack.work / "proxy.log", "a") as f:
+                f.write(f"{time.strftime('%H:%M:%S')} {self.command} {urlparse(self.path).path} -> {status} "
+                        f"[{stack.mode}]\n")
             self.send_response(status)
             for k, v in extra:
                 if k.lower() not in HOP_HEADERS and k.lower() != "content-type":

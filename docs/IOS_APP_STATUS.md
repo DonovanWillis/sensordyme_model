@@ -189,6 +189,33 @@ the capabilities "Unknown" notice. After `freeze=0` it checks that Online and
 "All clear" come back. The time the recovery took goes into the result bundle
 (`28_recovery_time`).
 
+The audit's re-check of text found under the bars was itself order- and
+timing-dependent. It scrolled with slow swipes that glided about 400 pt and
+overshot. It measured pixels while the page could still be moving, parked
+text at the band's edge inside the tab bar's blur, followed element handles
+that a lazily built list re-binds to other rows, and read each later finding
+at its pre-scroll position. It now drags the page by the exact distance that
+centres the flagged text, with no glide. It measures the page's real
+displacement from two accessibility snapshots, finds the text by label where
+it must now be, and audits it on a still screen. A failing re-check saves the
+screenshot it measured. Journeys tap an element only once its frame has
+stayed put for a second: XCUITest resolves a tap 0.6 s before it synthesizes
+it, and content arriving late above the target once made journey 08's tap
+miss.
+
+Runs (`scripts/sim/ios_uitest.sh`, iPhone 17 Pro Simulator, each run one
+xcodebuild invocation with no retries; evidence in
+`~/sensordyme-audit/2026-11-10/m81-evidence/ios/`):
+
+| Run | Commit | Order | Result |
+|---|---|---|---|
+| pre-merge | 71e1745 | alphabetical (audits first) | 27/27 |
+| A | 3e52700 (+ health freshness, journey 28) | alphabetical | 26/28: both audits failed in the re-check (fixed above) |
+| B | f41bea2 | alphabetical | 27/28: journey 08's tap missed (fixed above) |
+| C | f22564e | alphabetical | 28/28 |
+| D | f22564e | alphabetical (random was asked for; the script missed the build's format-1 .xctestrun, fixed) | 27/28: journey 06's Resume tap changed nothing (no resume reached the device) |
+| E | (same build as C and D) | random | <!-- M81-RUN-E --> |
+
 <!-- M81-RESULTS -->
 
 ## Screen-by-screen audit

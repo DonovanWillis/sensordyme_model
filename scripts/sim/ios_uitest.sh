@@ -105,13 +105,20 @@ import plistlib, sys
 path, order = sys.argv[1], sys.argv[2]
 with open(path, "rb") as f:
     plan = plistlib.load(f)
-for config in plan.get("TestConfigurations", []):
-    for target in config.get("TestTargets", []):
-        target["ParallelizationEnabled"] = False
-        if order == "random":
-            target["TestExecutionOrdering"] = "random"
-        else:
-            target.pop("TestExecutionOrdering", None)
+# Format 2 lists targets under TestConfigurations; format 1 (what a scheme
+# without a test plan builds) has one top-level key per target.
+if "TestConfigurations" in plan:
+    targets = [t for c in plan["TestConfigurations"] for t in c.get("TestTargets", [])]
+else:
+    targets = [v for k, v in plan.items() if k != "__xctestrun_metadata__" and isinstance(v, dict)]
+if not targets:
+    sys.exit(f"no test targets found in {path}")
+for target in targets:
+    target["ParallelizationEnabled"] = False
+    if order == "random":
+        target["TestExecutionOrdering"] = "random"
+    else:
+        target.pop("TestExecutionOrdering", None)
 with open(path, "wb") as f:
     plistlib.dump(plan, f)
 PY
