@@ -411,12 +411,12 @@ enum OrynAppearance {
             layout.normal.iconColor = steel
             layout.normal.titleTextAttributes = [
                 .foregroundColor: steel,
-                .font: UIFont.monospacedSystemFont(ofSize: 10, weight: .medium),
+                .font: UIFont.systemFont(ofSize: 10, weight: .medium),
             ]
             layout.selected.iconColor = bone
             layout.selected.titleTextAttributes = [
                 .foregroundColor: bone,
-                .font: UIFont.monospacedSystemFont(ofSize: 10, weight: .semibold),
+                .font: UIFont.systemFont(ofSize: 10, weight: .semibold),
             ]
         }
         UITabBar.appearance().standardAppearance = tab

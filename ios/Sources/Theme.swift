@@ -86,6 +86,9 @@ enum SD {
     enum Typography {
         static let display = Font.system(size: 30, weight: .semibold)
         static let title = Font.system(.title2).weight(.semibold)
+        /// The device's status readout ("All clear", "Stopped"): readable at arm's
+        /// length, one step under the device name.
+        static let readout = Font.system(.title3).weight(.semibold)
         static let headline = Font.system(.headline).weight(.semibold)
         static let body = Font.system(.body)
         static let callout = Font.system(.callout)
@@ -105,6 +108,8 @@ enum SD {
         static let eyebrowKerning: CGFloat = 1.4
         /// Small machine values: addresses, ids, timings.
         static let mono = Font.system(.caption, design: .monospaced)
+        /// A short machine value under another label (a key's count).
+        static let caption2Mono = Font.caption.monospacedDigit().weight(.medium)
         /// Numbers that update in place — monospaced digits stop the layout
         /// twitching on every refresh.
         static let metric = Font.system(.title3).monospacedDigit().weight(.medium)
@@ -131,6 +136,9 @@ enum SD {
         static let md: CGFloat = 10
         static let lg: CGFloat = 14
         static let xl: CGFloat = 18
+        /// The camera viewport. Nested surfaces step down 22 → 14 → 10 so their
+        /// corners stay concentric with the frame around them.
+        static let camera: CGFloat = 22
     }
 
     // MARK: Elevation
@@ -177,13 +185,43 @@ enum SD {
     }
 
     // MARK: Motion
+    //
+    // Native springs, applied at the container with `.animation(_:value:)` keyed
+    // to a real state value — never per element, never on a timer, never per
+    // telemetry packet. See docs/IOS_DESIGN_SYSTEM.md §4.
 
     enum Motion {
-        /// One spring for everything that moves, so the app feels like one product.
+        /// Acknowledging a touch: press states, small chrome changes.
+        static let feedback = Animation.spring(response: 0.18, dampingFraction: 0.9)
+        /// Most in-place changes. One spring, so the app feels like one product.
         static let standard = Animation.spring(response: 0.34, dampingFraction: 0.88)
+        /// Large spatial changes: expand/collapse, the Jupiter dock opening.
+        static let spatial = Animation.spring(response: 0.5, dampingFraction: 0.86)
+        /// Content arriving in a sheet.
+        static let sheet = Animation.spring(response: 0.42, dampingFraction: 0.9)
+        /// A status readout changing. No bounce: a truth changing is not a toy.
+        static let status = Animation.easeInOut(duration: 0.35)
+        /// Content revealed in sequence (capabilities in a mode's detail).
+        static let reveal = Animation.easeOut(duration: 0.28)
+        /// The step between staggered items, and how many items stagger at most.
+        static let revealStep: Double = 0.04
+        static let revealLimit = 8
         static let gentle = Animation.easeInOut(duration: 0.25)
         /// For acknowledging a touch. Anything slower reads as lag.
         static let quick = Animation.easeOut(duration: 0.12)
+
+        /// The animation to use under the reader's Reduce Motion setting:
+        /// spatial and staggered motion becomes an instant change; a status
+        /// cross-fade stays (it is an opacity change, not movement).
+        static func resolved(_ animation: Animation, reduceMotion: Bool) -> Animation? {
+            guard reduceMotion else { return animation }
+            return animation == status || animation == gentle || animation == quick ? animation : nil
+        }
+
+        /// The delay before item `index` of a staggered reveal.
+        static func revealDelay(_ index: Int, reduceMotion: Bool) -> Double {
+            reduceMotion ? 0 : Double(min(index, revealLimit)) * revealStep
+        }
     }
 }
 
@@ -264,7 +302,10 @@ extension View {
 
 // MARK: - Surfaces
 
-/// The standard content container: one surface colour, one hairline, one radius.
+/// A grouped surface, for the few places a container means something (a form
+/// group in a sheet, a set of controls). Open layouts (sections separated by
+/// space and type) are the default; this is not a wrapper for every block.
+/// One surface step up from the page and no outline: the step is the edge.
 struct SDCard<Content: View>: View {
     var padding: CGFloat = SD.Space.md
     var raised = false
@@ -278,13 +319,12 @@ struct SDCard<Content: View>: View {
                 RoundedRectangle(cornerRadius: SD.Radius.lg, style: .continuous)
                     .fill(raised ? SD.Colors.surfaceRaised : SD.Colors.surface)
             )
-            .overlay(
-                RoundedRectangle(cornerRadius: SD.Radius.lg, style: .continuous)
-                    .strokeBorder(SD.Colors.border, lineWidth: 1)
-            )
     }
 }
 
+/// A section's label on open space, with an optional action at the trailing
+/// edge (44 pt to touch). Sections are grouped by this and by spacing, not by
+/// boxes.
 struct SDSectionHeader: View {
     let title: String
     var action: (title: String, perform: () -> Void)?
@@ -292,11 +332,14 @@ struct SDSectionHeader: View {
     var body: some View {
         HStack(alignment: .firstTextBaseline) {
             SDEyebrow(title)
+                .accessibilityAddTraits(.isHeader)
             Spacer()
             if let action {
                 Button(action.title, action: action.perform)
                     .font(SD.Typography.caption.weight(.semibold))
                     .foregroundStyle(SD.Colors.textSecondary)
+                    .frame(minHeight: 44)
+                    .contentShape(Rectangle())
             }
         }
     }
@@ -423,51 +466,33 @@ extension SDStatus {
     }
 }
 
-/// Compact status chip: a dot and a short uppercase label in a hairline capsule.
-/// Recognisable at a glance without shouting — and it carries a word as well as a
-/// colour, because colour alone fails colour-blind users and bright sun.
+/// Compact status chip: a dot and a short word in a quiet capsule. It carries a
+/// word as well as a colour, because colour alone fails colour-blind users and
+/// bright sun. Sentence case: mono capitals are kept for section labels.
+///
+/// No pulse. A breathing dot says "alive" about a device whose state the dot
+/// does not know (`pulses` is accepted for source compatibility and ignored).
 struct SDStatusPill: View {
     let status: SDStatus
     var text: String?
     var pulses = false
 
-    @State private var pulse = false
-    @Environment(\.accessibilityReduceMotion) private var reduceMotion
-
     var body: some View {
         HStack(spacing: 6) {
-            ZStack {
-                if MotionPolicy.animates(pulses, reduceMotion: reduceMotion) {
-                    Circle()
-                        .fill(status.tint.opacity(0.35))
-                        .frame(width: 12, height: 12)
-                        .scaleEffect(pulse ? 1 : 0.5)
-                        .opacity(pulse ? 0 : 1)
-                        .animation(
-                            .easeOut(duration: 1.6).repeatForever(autoreverses: false),
-                            value: pulse
-                        )
-                }
-                Circle()
-                    .fill(status.tint)
-                    .frame(width: 6, height: 6)
-            }
-            .frame(width: 12, height: 12)
-            // Wraps rather than truncating: at the largest text sizes one line cut
-            // "ONLINE" to "ON…" (seen at AX XXXL; the audit can't see inside the
-            // combined pill).
-            Text((text ?? status.label).uppercased())
-                .sdEyebrowFont()
-                .tracking(1)
-                .foregroundStyle(status == .offline || status == .unknown ? SD.Colors.textTertiary : status.tint)
+            Circle()
+                .fill(status.tint)
+                .frame(width: 6, height: 6)
+            // Wraps rather than truncating: at the largest text sizes one line
+            // cut "Online" short (seen at AX XXXL).
+            Text(text ?? status.label)
+                .font(SD.Typography.caption.weight(.semibold))
+                .foregroundStyle(status == .offline || status == .unknown ? SD.Colors.textSecondary : status.tint)
                 .fixedSize(horizontal: false, vertical: true)
         }
-        .padding(.leading, 6)
+        .padding(.leading, 8)
         .padding(.trailing, 10)
-        .padding(.vertical, 5)
+        .padding(.vertical, 4)
         .background(Capsule().fill(status.wash))
-        .overlay(Capsule().strokeBorder(status.tint.opacity(status == .offline ? 0.25 : 0.22), lineWidth: 1))
-        .onAppear { if MotionPolicy.animates(pulses, reduceMotion: reduceMotion) { pulse = true } }
         .accessibilityElement(children: .combine)
         .accessibilityLabel(text ?? status.label)
     }
@@ -509,17 +534,9 @@ struct SDEmptyState: View {
     var body: some View {
         VStack(spacing: SD.Space.sm) {
             Image(systemName: icon)
-                .font(.system(size: 20, weight: .regular))
-                .foregroundStyle(SD.Colors.textSecondary)
-                .frame(width: 48, height: 48)
-                .background(
-                    RoundedRectangle(cornerRadius: SD.Radius.md, style: .continuous)
-                        .fill(SD.Colors.surfaceRaised)
-                )
-                .overlay(
-                    RoundedRectangle(cornerRadius: SD.Radius.md, style: .continuous)
-                        .strokeBorder(SD.Colors.border, lineWidth: 1)
-                )
+                .font(.system(size: 22, weight: .light))
+                .foregroundStyle(SD.Colors.textTertiary)
+                .frame(height: 32)
                 .padding(.bottom, SD.Space.xxs)
                 .accessibilityHidden(true)  // decorative; the title says it
             VStack(spacing: SD.Space.sm) {
@@ -559,13 +576,10 @@ struct SDErrorState: View {
     var body: some View {
         VStack(spacing: SD.Space.sm) {
             Image(systemName: "exclamationmark.triangle")
-                .font(.system(size: 20))
+                .font(.system(size: 22, weight: .light))
                 .foregroundStyle(SD.Colors.warning)
-                .frame(width: 48, height: 48)
-                .background(
-                    RoundedRectangle(cornerRadius: SD.Radius.md, style: .continuous)
-                        .fill(SD.Colors.warningMuted)
-                )
+                .frame(height: 32)
+                .accessibilityHidden(true)
             Text(title)
                 .font(SD.Typography.headline)
                 .foregroundStyle(SD.Colors.textPrimary)
@@ -649,17 +663,107 @@ struct ConnectionBanner: View {
             }
             Spacer(minLength: 0)
         }
-        .padding(SD.Space.sm + 2)
+        .padding(.vertical, SD.Space.sm)
+        .padding(.horizontal, SD.Space.sm + 2)
         .background(
-            RoundedRectangle(cornerRadius: SD.Radius.md, style: .continuous)
+            RoundedRectangle(cornerRadius: SD.Radius.lg, style: .continuous)
                 .fill(SD.Colors.warningMuted)
-        )
-        .overlay(
-            RoundedRectangle(cornerRadius: SD.Radius.md, style: .continuous)
-                .strokeBorder(SD.Colors.warning.opacity(0.22), lineWidth: 1)
         )
         .accessibilityElement(children: .contain)
         .accessibilityIdentifier("banner.connection")
+    }
+}
+
+// MARK: - Floating surfaces
+
+/// The one translucent surface in the app: things that float over content (the
+/// Ask Jupiter dock, the camera's controls). Native Liquid Glass on iOS 26, a
+/// thin material over ink before it, and an opaque ink field with a hairline
+/// under Reduce Transparency, so it stays legible with every blur switched off.
+struct SDFloatingSurface<S: Shape>: ViewModifier {
+    let shape: S
+    var shadow = true
+    @Environment(\.accessibilityReduceTransparency) private var reduceTransparency
+
+    func body(content: Content) -> some View {
+        if reduceTransparency {
+            content
+                .background(shape.fill(SD.Colors.field))
+                .overlay(shape.stroke(SD.Colors.borderStrong, lineWidth: 1))
+        } else if #available(iOS 26.0, *) {
+            content
+                .background(shape.fill(SD.Colors.background.opacity(0.55)))
+                .glassEffect(.regular, in: shape)
+                .shadow(color: .black.opacity(shadow ? 0.35 : 0), radius: 24, y: 8)
+        } else {
+            content
+                .background(shape.fill(SD.Colors.field.opacity(0.72)))
+                .background(.ultraThinMaterial, in: shape)
+                // One highlight hairline, brighter at the top, reads as a lit edge.
+                .overlay(shape.stroke(
+                    LinearGradient(colors: [Color.white.opacity(0.14), Color.white.opacity(0.03)],
+                                   startPoint: .top, endPoint: .bottom), lineWidth: 1))
+                .shadow(color: .black.opacity(shadow ? 0.35 : 0), radius: 24, y: 8)
+        }
+    }
+}
+
+extension View {
+    func sdFloatingSurface<S: Shape>(_ shape: S, shadow: Bool = true) -> some View {
+        modifier(SDFloatingSurface(shape: shape, shadow: shadow))
+    }
+}
+
+/// A contextual action key on the device screen (Activity, Areas, Report): a
+/// symbol over a short word on a raised surface, like a control on a dash.
+/// 64 pt tall at the default size, well above the 44 pt minimum.
+struct InstrumentKey: View {
+    let icon: String
+    let title: String
+    /// A short state word under the title ("Alert"); nil for none.
+    var badge: String? = nil
+    var badgeColor: Color = SD.Colors.textTertiary
+
+    var body: some View {
+        VStack(spacing: 6) {
+            Image(systemName: icon)
+                .font(.system(size: 17, weight: .regular))
+                .foregroundStyle(SD.Colors.textPrimary)
+                .frame(height: 22)
+                .accessibilityHidden(true)
+            Text(title)
+                .font(SD.Typography.caption.weight(.medium))
+                .foregroundStyle(SD.Colors.textSecondary)
+                .multilineTextAlignment(.center)
+                .fixedSize(horizontal: false, vertical: true)
+            if let badge {
+                Text(badge)
+                    .font(SD.Typography.caption2Mono)
+                    .foregroundStyle(badgeColor)
+            }
+        }
+        .padding(.vertical, SD.Space.sm)
+        .padding(.horizontal, SD.Space.xxs)
+        .frame(maxWidth: .infinity, minHeight: 64)
+        .background(
+            RoundedRectangle(cornerRadius: SD.Radius.lg, style: .continuous)
+                .fill(SD.Colors.surfaceRaised)
+        )
+        .contentShape(RoundedRectangle(cornerRadius: SD.Radius.lg, style: .continuous))
+    }
+}
+
+/// Press feedback for surfaces that are themselves the control (keys, the
+/// camera, mode rows): a slight scale and dim at once on press, settling on
+/// release.
+struct SDPressStyle: ButtonStyle {
+    var scale: CGFloat = 0.97
+
+    func makeBody(configuration: Configuration) -> some View {
+        configuration.label
+            .scaleEffect(configuration.isPressed ? scale : 1)
+            .opacity(configuration.isPressed ? 0.82 : 1)
+            .animation(configuration.isPressed ? nil : SD.Motion.feedback, value: configuration.isPressed)
     }
 }
 
