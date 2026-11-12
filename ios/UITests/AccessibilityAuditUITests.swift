@@ -153,39 +153,79 @@ final class AccessibilityAuditUITests: XCTestCase {
         let element = candidates.allElementsBoundByIndex.min(by: {
             abs($0.frame.midY - frame.midY) < abs($1.frame.midY - frame.midY)
         }) ?? candidates.firstMatch
-        var band = clearBand
+        let band = clearBand
         if element.exists, element.frame.height > band.bottom - band.top - 40 {
             return "\(screen)\tcontrast\tunder-bar-unverifiable\tTaller than the clear band between the bars\t\(label)\t"
         }
-        var swipes = 0
-        while element.exists && swipes < 10 {
-            band = clearBand
-            if element.frame.maxY > band.bottom { app.swipeUp(velocity: .slow) }
-            else if element.frame.minY < band.top { app.swipeDown(velocity: .slow) }
-            else { break }
-            swipes += 1
-        }
+        scrollIntoClearBand(element)
+        // Measured on a still screen: contrast is sampled from pixels, so text
+        // still moving (or under a scroll-edge effect still fading) could "fail"
+        // the re-check. Seen once in M8.1 run A on 'NOT YET VALIDATED', after
+        // the old swipes; the same element passed its re-check in the run before.
+        waitUntilStill(element)
         guard element.exists, !obscuredByBars(element.frame) else {
             XCTFail("\(screen): contrast on '\(label)' could not be re-checked clear of the bars")
             return "\(screen)\tcontrast\tNEW\tContrast failed (could not scroll clear of the bars)\t\(label)\t"
         }
         let target = element.frame
-        var stillFails = false
+        let screenshot = XCUIScreen.main.screenshot()
+        var finding: String?
         do {
             try app.performAccessibilityAudit(for: .contrast) { issue in
                 if let f = issue.element?.frame, abs(f.midY - target.midY) < 4, abs(f.midX - target.midX) < 4 {
-                    stillFails = true
+                    finding = issue.compactDescription
                 }
                 return true  // only this element is being re-checked here
             }
         } catch {
-            stillFails = true
+            finding = "the re-check audit itself failed: \(error)"
         }
-        if stillFails {
-            XCTFail("\(screen): '\(label)' fails contrast clear of the bars")
-            return "\(screen)\tcontrast\tNEW\tContrast failed clear of the bars\t\(label)\t"
+        if let finding {
+            // What the re-check measured, for the record.
+            Stack.saveScreenshot(screenshot, name: "audit_\(screen)_recheck_FAIL", test: self)
+            XCTFail("\(screen): '\(label)' fails contrast clear of the bars (\(finding), at \(target))")
+            return "\(screen)\tcontrast\tNEW\tContrast failed clear of the bars: \(finding) at \(target)\t\(label)\t"
         }
         return "\(screen)\tcontrast\tunder-bar\tPassed when re-checked clear of the bars\t\(label)\t"
+    }
+
+    /// Moves the page by exactly what the element needs to sit inside the clear
+    /// band: a press-drag-hold of that distance, which leaves no momentum. The
+    /// slow swipes this replaces each moved the page ~400 pt and kept gliding,
+    /// so an element nearly as tall as the band (the device-link banner's body
+    /// at the largest text size) was overshot up and down and the re-check
+    /// passed or failed on where the last swipe happened to stop (M8.1 run A).
+    private func scrollIntoClearBand(_ element: XCUIElement) {
+        for _ in 0..<8 {
+            guard element.exists else { return }
+            let band = clearBand
+            let frame = element.frame
+            var dy: CGFloat
+            if frame.maxY > band.bottom { dy = -(frame.maxY - band.bottom + 16) }  // page up
+            else if frame.minY < band.top { dy = band.top - frame.minY + 16 }     // page down
+            else { return }
+            // One drag stays inside the band, so it starts and ends on page content.
+            let limit = (band.bottom - band.top) / 2 - 12
+            dy = max(-limit, min(limit, dy))
+            let origin = app.coordinate(withNormalizedOffset: .zero)
+            let start = origin.withOffset(CGVector(dx: app.frame.width * 0.18, dy: (band.top + band.bottom) / 2 - dy / 2))
+            start.press(forDuration: 0.05, thenDragTo: start.withOffset(CGVector(dx: 0, dy: dy)),
+                        withVelocity: .slow, thenHoldForDuration: 0.3)
+            waitUntilStill(element)
+        }
+    }
+
+    /// Until the element's frame is the same half a second apart (at most 10
+    /// tries), then a beat for the scroll-edge effect to fade.
+    private func waitUntilStill(_ element: XCUIElement) {
+        var last = element.frame
+        for _ in 0..<10 {
+            _ = XCTWaiter().wait(for: [XCTestExpectation(description: "still")], timeout: 0.5)
+            let now = element.frame
+            if now == last { break }
+            last = now
+        }
+        _ = XCTWaiter().wait(for: [XCTestExpectation(description: "settle")], timeout: 1)
     }
 
     private static func name(_ type: XCUIAccessibilityAuditType) -> String {
