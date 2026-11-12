@@ -51,6 +51,9 @@ struct SetupDebugPanel: View {
                         row("Nearest", "\(first.name) (\(first.rssi)dBm)")
                     }
                     row("Setup phase", phaseLabel)
+                    row("Device id", ble.deviceID ?? "not yet read")
+                    row("Credentials", ble.requiresSetupCode ? "setup code (proof of possession)" : (ble.deviceAuth ?? "unknown"))
+                    row("Steps taken", "\(flow.transitions.count)")
                     row("Wi-Fi scan", ble.scanningNetworks ? "running on device" : "idle")
                     row("Networks received", "\(ble.networks.count)")
                     row("Networks characteristic",
@@ -95,31 +98,27 @@ struct SetupDebugPanel: View {
         case .bluetoothOff: "off or not permitted"
         case .scanning: "scanning"
         case .connecting(let name): "connecting to \(name)"
-        case .ready(let name): "connected to \(name)"
+        case .identifying(let name): "reading device info from \(name)"
+        case .ready(let name): "connected to \(name)" + (ble.requiresSetupCode ? " (needs setup code)" : "")
+        case .proving: "proving the setup code"
+        case .proven: "setup code proven"
         case .sending: "sending credentials"
         case .deviceConnecting: "device joining Wi-Fi"
         case .success: "device online"
+        case .joinFailed: "device could not join"
         case .failed: "failed"
         }
     }
 
     private var phaseLabel: String {
-        switch flow.phase {
-        case .bluetoothUnavailable: "Bluetooth off or not permitted"
-        case .findingDevice: "finding device"
-        case .connecting(let name): "connecting to \(name)"
-        case .choosingNetwork: "choosing network"
-        case .sending(let ssid): "sending \(ssid)"
-        case .deviceJoining(let ssid): "device joining \(ssid)"
-        case .rediscovering(let ssid, let elapsed): "looking for it on \(ssid) (\(elapsed)s)"
-        case .ready(let ssid, let url): "ready on \(ssid) — \(url ?? "no address")"
-        case .failed: "failed"
-        }
+        // The onboarding state, without any associated text a person typed.
+        let text = "\(flow.state)"
+        return String(text.prefix { $0 != "(" })
     }
 
     private var lastError: String? {
-        if case let .failed(reason) = flow.phase { return reason }
+        if case let .failed(failure) = flow.state { return failure.reason }
         if case let .failed(reason) = ble.state { return reason }
-        return nil
+        return ble.proofRejection?.message
     }
 }
