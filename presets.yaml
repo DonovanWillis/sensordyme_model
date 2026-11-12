@@ -225,7 +225,7 @@ presets:
       play_area:
         title: Play Area
         overrides: { still_warning_s: 60, zone_confirm_s: 1.5 }
-    version: 2
+    version: 3
     product_mode: child_monitoring
     required_capabilities: [camera, inference, objects, alert_output]
     # Pose carries flailing and choking-hazard scoring; presence, zones and
@@ -252,6 +252,10 @@ presets:
       - { key: absence_warning_s, title: Out-of-view time before alert, type: number, default: 30, min: 5, max: 300, step: 5, unit: s }
       - { key: expect_presence, title: Alert when nobody is visible, type: bool, default: true }
       - { key: zone_confirm_s, title: Time outside/inside an area before alert, type: number, default: 2.0, min: 0.5, max: 10.0, step: 0.5, unit: s }
+      # M8: off by default. Both pose features are experimental and unevaluated on any
+      # footage of children, so an owner must opt in; presence, zones and stillness
+      # do not need pose.
+      - { key: enable_pose, title: "Experimental: arm-movement and object-near-mouth alerts", type: bool, default: false }
     compatibility:
       custom_rules: replace
     limitations:

@@ -810,8 +810,9 @@ modules:
     # reversal frequency over a rolling ~1.2s window), not a two-frame position
     # delta. Reuses the exact landmark model modules/fall_detection.py already runs
     # every frame elsewhere in this product (proven affordable on a Pi).
-    enable_pose: true # false = fully opt out of pose inference (no flailing detection,
-    # lower CPU) for a deployment that can't spare the extra model
+    enable_pose: false # M8: off by default -- flailing and choking_hazard are EXPERIMENTAL
+    # (unevaluated on footage of children); the owner opts in from the app (preset setting
+    # enable_pose). false = no pose inference, lower CPU; presence/zones/stillness unaffected.
     pose_every_n_frames: 1 # 1 = every frame (matches fall_detection.py); raise to
     # trade flailing-detection latency/precision for CPU on a heavily loaded Pi
     hand_association_threshold: 0.35 # core.hand_perception's per-frame "is this object

@@ -41,7 +41,7 @@ modules:
     uses: [pose]
     source: modules/fall_detection.py (MediaPipe Pose on every frame)
   baby_monitoring:
-    uses: [objects, pose]                 # pose: enable_pose (default true) -- flailing, choking_hazard
+    uses: [objects, pose]                 # pose: enable_pose (default false since M8; experimental) -- flailing, choking_hazard
     source: modules/baby_monitoring.py
   occupancy:
     uses: [objects]

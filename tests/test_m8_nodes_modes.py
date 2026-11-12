@@ -312,16 +312,32 @@ def test_child_monitoring_runs_its_supported_alerts_and_reports_pose_features_as
     entry = node(device, "baby_monitoring")
     features = {f["id"]: f for f in entry["experimental_features"]}
     assert set(features) == {"flailing", "choking_hazard"}
-    assert all(f["enabled"] and f["status"].startswith("experimental") for f in features.values())
+    # M8: off by default; an owner opts in (below). Reported truthfully either way.
+    assert all(not f["enabled"] and f["status"].startswith("experimental") for f in features.values())
+    assert device.runtime.module._pose is None, "no pose inference unless the owner opts in"
     assert entry["validation"] == "synthetic_tests" and entry["validation"] not in ("device_verified",
                                                                                      "production_validated")
     backend_entry = next(n for n in stack.status()["perception"]["nodes"] if n["id"] == "baby_monitoring")
     assert {f["id"]: f["enabled"] for f in backend_entry["experimental_features"]} == {
-        "flailing": True, "choking_hazard": True}, "the app is told which parts are experimental"
+        "flailing": False, "choking_hazard": False}, "the app is told which parts are experimental"
+    # The owner opts in through the preset setting: the module now runs pose, and
+    # the report follows the config the running module was built from (not the
+    # bare config.yaml block), on the device and in the backend status.
+    opted = stack.set_preset("baby_monitoring", settings={"enable_pose": True})
+    assert opted.status_code == 200, opted.text
+    device.advance(2.5)
+    assert device.runtime.module._pose is not None
+    entry = node(device, "baby_monitoring")
+    assert all(f["enabled"] for f in entry["experimental_features"])
+    device.advance(2.5)
+    backend_entry = next(n for n in stack.status()["perception"]["nodes"] if n["id"] == "baby_monitoring")
+    assert {f["id"]: f["enabled"] for f in backend_entry["experimental_features"]} == {
+        "flailing": True, "choking_hazard": True}
     limitations = " ".join(preset["limitations"]).lower()
     assert "not a medical device" in limitations and "does not detect choking" in limitations
     device = restart(stack, script, _tap)
-    assert device.runtime.active_preset == "baby_monitoring"
+    assert device.runtime.active_preset == "baby_monitoring@enable_pose=true", "the opt-in survives a restart"
+    assert device.runtime.module._pose is not None
     assert sorted(z.name for z in device.runtime._node_zones()) == ["crib", "stairs"]
     record("child_monitoring", {"events": kinds, "experimental_features": entry["experimental_features"],
                                 "frames": frames, "detector_runs": calls})

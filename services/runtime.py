@@ -282,6 +282,12 @@ class DeviceRuntime:
         # labelled the pi detector while the module ran a different one on MPS.
         self._boot_module = module
         self._boot_module_config = module_config
+        # The config a module built by a PRESET SWITCH was built from: the
+        # module's config.yaml block plus the variant overrides and owner
+        # settings (M8). Without it, _active_module_config() re-read the bare
+        # config.yaml block, so reports ignored the owner's settings.
+        self._switched_module: Any = None
+        self._switched_module_config: Optional[dict] = None
         # Which exact model events from this module come from; see
         # _verify_detection_backend and core.detectors.model_identity.
         self._model_identity: Optional[dict] = None
@@ -997,6 +1003,8 @@ class DeviceRuntime:
         """The config the RUNNING module was built from (see __init__)."""
         if self._boot_module_config is not None and self.module is self._boot_module:
             return self._boot_module_config
+        if self._switched_module_config is not None and self.module is self._switched_module:
+            return self._switched_module_config
         return (self.config.get("modules", {}) or {}).get(self.module_name, {}) or {}
 
     def _module_identity_name(self) -> str:
@@ -2464,10 +2472,9 @@ class DeviceRuntime:
             print(f"SensorDyme: preset '{name}' refused: {exc.reason}")
             return
         new_module_name = preset["module"]
+        new_module_config = {**self.config["modules"][new_module_name], **overrides, "recalibrate": False}
         try:
-            new_module = self.perception.adopt(self._build_module(
-                new_module_name, {**self.config["modules"][new_module_name], **overrides, "recalibrate": False}
-            ))
+            new_module = self.perception.adopt(self._build_module(new_module_name, dict(new_module_config)))
         except Exception as exc:  # noqa: BLE001 - a bad preset must not kill the device
             print(f"SensorDyme: preset switch to '{name}' failed: {exc}")
             # Refused with the reason, so the backend stops re-sending a switch
@@ -2491,6 +2498,7 @@ class DeviceRuntime:
         with self._module_lock:
             old_module = self.module
             self.module, self.module_name, self.active_preset = new_module, new_module_name, name
+            self._switched_module, self._switched_module_config = new_module, new_module_config
             self._model_identity = None  # unknown, not the old module's, until verified below
             self.alert_event_types = self.alert_types_for(new_module_name, preset)
             self._consecutive_process_failures = 0  # the new module starts with a clean slate
