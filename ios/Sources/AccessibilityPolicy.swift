@@ -31,17 +31,6 @@ enum ReplyError {
     }
 }
 
-/// What the app may say about a device's connection. `online` is from the last
-/// reply that could be read; once a refresh fails, the app no longer knows.
-enum ConnectionTruth {
-    enum Presence: Equatable { case online, offline, unknown }
-
-    static func presence(online: Bool, lastRefreshFailed: Bool) -> Presence {
-        if lastRefreshFailed { return .unknown }
-        return online ? .online : .offline
-    }
-}
-
 /// Spoken descriptions where the screen relies on colour.
 enum EventAccessibility {
     /// The event dot's colour, in words: loud = red, soft = amber.

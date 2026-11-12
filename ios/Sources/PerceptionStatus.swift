@@ -111,11 +111,21 @@ struct MonitoringNode: Decodable, Hashable, Identifiable {
     var validation: String?
     var experimental: Bool
     var reason: String?
+    /// Experimental parts of a node (baby monitoring's `flailing`,
+    /// `choking_hazard`), as the device reports them (M8).
+    var experimentalFeatures: [ExperimentalFeature] = []
+
+    struct ExperimentalFeature: Decodable, Hashable {
+        var id: String
+        var status: String?
+        var enabled: Bool?
+    }
 
     enum CodingKeys: String, CodingKey {
         case id, kind, version, state, validation, experimental, reason
         case requiredCapabilities = "required_capabilities"
         case missingCapabilities = "missing_capabilities"
+        case experimentalFeatures = "experimental_features"
     }
 
     init(id: String, kind: String? = nil, version: String? = nil, state: String? = nil,
@@ -148,6 +158,16 @@ struct MonitoringNode: Decodable, Hashable, Identifiable {
         // on a node this build already knows is experimental.
         experimental = (try? c.decodeIfPresent(Bool.self, forKey: .experimental)) ?? false
         reason = try? c.decodeIfPresent(String.self, forKey: .reason)
+        // Lossy: one malformed feature drops itself, not the node.
+        let features = (try? c.decodeIfPresent([LossyFeature].self, forKey: .experimentalFeatures)) ?? []
+        experimentalFeatures = features.compactMap(\.value)
+    }
+
+    private struct LossyFeature: Decodable {
+        let value: ExperimentalFeature?
+        init(from decoder: Decoder) throws {
+            value = try? ExperimentalFeature(from: decoder)
+        }
     }
 
     /// Running (possibly degraded): what "enabled" means for a toggle.
@@ -242,6 +262,8 @@ struct CapabilityCheck: Equatable, Identifiable {
         case available
         case unavailable(String)
         case unknown(String)
+        /// Being brought up (e.g. attention calibrating): not a failure.
+        case starting(String)
     }
 
     let name: String
@@ -289,7 +311,8 @@ enum CapabilityChecks {
                 return .init(name: name, title: title, required: required, verdict: .available)
             }
             if caps?.starting?.contains(name) == true {
-                return .init(name: name, title: title, required: required, verdict: .unknown("starting"))
+                return .init(name: name, title: title, required: required,
+                             verdict: .starting(CapabilityHealth.startingDetail(name)))
             }
             return .init(name: name, title: title, required: required,
                          verdict: .unknown("not reported by the device while it runs another mode"))
@@ -327,7 +350,8 @@ enum DeviceRefusal {
         }
         if let rejection = status?.lastRejection, rejection.kind == "preset",
            baseName(rejection.subject) == base, recent(rejection.at) {
-            return rejection.reasons?.first(where: { !$0.isEmpty }) ?? "The device refused this mode."
+            return RefusalText.message(code: rejection.code, reason: rejection.reasons?.first(where: { !$0.isEmpty }),
+                                       fallback: "The device refused this mode.")
         }
         if let rejection = status?.presetRejection, baseName(rejection.preset) == base, recent(rejection.at) {
             return rejection.reason.flatMap { $0.isEmpty ? nil : $0 } ?? "The device refused this mode."
@@ -340,7 +364,8 @@ enum DeviceRefusal {
         guard let rejection = status?.lastRejection, rejection.kind == "nodes",
               rejection.subject == nil || rejection.subject == id else { return nil }
         if let since, let at = rejection.at, at < since.timeIntervalSince1970 - clockSlack { return nil }
-        return rejection.reasons?.first(where: { !$0.isEmpty }) ?? "The device refused this change."
+        return RefusalText.message(code: rejection.code, reason: rejection.reasons?.first(where: { !$0.isEmpty }),
+                                   fallback: "The device refused this change.")
     }
 
     private static func baseName(_ raw: String?) -> String? {
@@ -402,6 +427,30 @@ struct ActivationStatus: Equatable {
     }
 }
 
+// MARK: - Coded refusals in words
+
+/// A refusal's machine code (M8: last_rejection.code, and the backend's coded
+/// errors) as a sentence, keeping the device's own reason when it reads as
+/// one. "no companion node 'x'; known: a, b" is for developers, not people.
+enum RefusalText {
+    static func head(_ code: String?) -> String? {
+        switch code {
+        case "role_forbids_preset": "This device's role doesn't allow that mode"
+        case "unknown_node": "This device doesn't have that monitoring add-on"
+        case "invalid_setting": "A setting was refused"
+        case "profile_fixed": "This device's monitoring profile is fixed, so it can't be changed from the app"
+        case "firmware_unsupported": "This device's software can't do that yet — update it"
+        default: nil
+        }
+    }
+
+    static func message(code: String?, reason: String?, fallback: String) -> String {
+        let readable = reason.flatMap(PresetAvailability.readableReason)
+        guard let head = head(code) else { return readable ?? reason ?? fallback }
+        return readable.map { "\(head): \($0)" } ?? head + "."
+    }
+}
+
 // MARK: - Nodes in words
 
 struct NodePresentation: Equatable {
@@ -437,6 +486,21 @@ struct NodePresentation: Equatable {
             }
         }()
         return .init(title: title(node.id), stateText: stateText, tone: tone, badge: badge(node))
+    }
+
+    /// The node's experimental parts, said as experimental, with whether each
+    /// is on: "Experimental: Flailing (off), Choking hazard (off)". nil if none.
+    static func experimentalNote(_ node: MonitoringNode) -> String? {
+        guard !node.experimentalFeatures.isEmpty else { return nil }
+        let parts = node.experimentalFeatures.map { feature -> String in
+            let name = CapabilityHealth.title(feature.id)
+            switch feature.enabled {
+            case true?: return "\(name) (on)"
+            case false?: return "\(name) (off)"
+            case nil: return name
+            }
+        }
+        return "Experimental: " + parts.joined(separator: ", ")
     }
 
     static func badge(_ node: MonitoringNode) -> String {

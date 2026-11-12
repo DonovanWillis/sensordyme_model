@@ -531,9 +531,11 @@ struct PresetAvailability: Equatable {
 
     static let open = PresetAvailability(blocksSelection: false, note: nil)
 
-    static func make(_ state: DevicePresetState?) -> PresetAvailability {
+    /// - Parameter roleTitle: the device's role in words (`status.role_title`),
+    ///   used when the backend's reason is written for developers.
+    static func make(_ state: DevicePresetState?, roleTitle: String? = nil) -> PresetAvailability {
         guard let state else { return .open }
-        let reason = state.reason.flatMap { $0.isEmpty ? nil : $0 }
+        let reason = state.reason.flatMap(readableReason)
         if state.available { return .open }
         switch state.code {
         case "device_stale":
@@ -542,7 +544,8 @@ struct PresetAvailability: Equatable {
             return .init(blocksSelection: false,
                          note: "Device isn't reporting — can't check it can run this" + (reason.map { " (\($0))" } ?? ""))
         case "role_forbids_preset":
-            return .init(blocksSelection: true, note: reason ?? "Not allowed for this device's role")
+            return .init(blocksSelection: true,
+                         note: reason ?? "Not available for this device's role" + (roleTitle.map { " (\($0))" } ?? ""))
         case "capability_impaired":
             return .init(blocksSelection: true,
                          note: "Needs something that isn't working right now" + (reason.map { ": \($0)" } ?? ""))
@@ -554,6 +557,20 @@ struct PresetAvailability: Equatable {
         default:
             return .init(blocksSelection: true, note: reason ?? "Not available on this device")
         }
+    }
+}
+
+extension PresetAvailability {
+    /// The backend's reason when it is a sentence for a person; nil when it is
+    /// written for developers, e.g. "this device's role is 'driver_safety':
+    /// preset 'elderly_monitoring' would stop driver_attention; allowed:
+    /// driver_safety" — which the mode list used to show verbatim.
+    static func readableReason(_ raw: String) -> String? {
+        let text = raw.trimmingCharacters(in: .whitespacesAndNewlines)
+        if text.isEmpty { return nil }
+        let identifier = text.range(of: "[a-z0-9]+_[a-z0-9_]+", options: .regularExpression) != nil
+        if identifier || text.contains("'") && text.contains(":") || text.contains(";") { return nil }
+        return text
     }
 }
 

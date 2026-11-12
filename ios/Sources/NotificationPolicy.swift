@@ -95,3 +95,34 @@ enum NotificationPolicy {
         return (fresh, max(mark, newest ?? mark))
     }
 }
+
+/// Where a tapped notification goes. It used to fall back to the account's
+/// first device whenever its own device wasn't in the list: that device's
+/// screen then ignored the alert (it belongs to another device), so the tap
+/// opened the wrong camera and showed nothing, with no word of why.
+enum NotificationRouting {
+    enum Route: Equatable {
+        case open(Int)
+        /// The alert's device is not on this account (removed, or another account).
+        case deviceNotOnAccount
+        /// An old notification without a device id, on an account with several.
+        case ambiguous
+    }
+
+    static func route(pendingDeviceID: Int?, deviceIDs: [Int]) -> Route {
+        if let pendingDeviceID {
+            return deviceIDs.contains(pendingDeviceID) ? .open(pendingDeviceID) : .deviceNotOnAccount
+        }
+        return deviceIDs.count == 1 ? .open(deviceIDs[0]) : .ambiguous
+    }
+
+    static func message(_ route: Route) -> String? {
+        switch route {
+        case .open: nil
+        case .deviceNotOnAccount:
+            "That alert's device is no longer on this account, so it can't be opened here."
+        case .ambiguous:
+            "That alert doesn't say which device it came from. Open the device and its Event history to find it."
+        }
+    }
+}

@@ -1,7 +1,7 @@
 import Foundation
 
 // Run with ios/Tests/run.sh
-// run.sh deps: PerceptionStatus CapabilityTier
+// run.sh deps: PerceptionStatus CapabilityTier PresetLibrary
 
 var failures = 0
 func check(_ condition: Bool, _ what: String) {
@@ -163,6 +163,29 @@ check(CapabilityHealth.rows(status: nil, online: true).notice?.contains("doesn't
 check(CapabilityHealth.rows(status: DeviceStatus(monitoringState: "ready", capabilities: nil, stale: false),
                             online: true).rows.isEmpty, "null capabilities show nothing as working")
 check(CapabilityHealth.evaluationNote("something_new") == "validation unknown", "an unknown evaluation is unknown")
+
+print("\nattention (M8): calibrating is said as calibrating, never as a failure:")
+do {
+    let calibrating = DeviceStatus(
+        monitoringState: "starting", reasons: ["attention: starting"],
+        capabilities: .init(available: ["face"], starting: ["attention"]), stale: false)
+    let rows = CapabilityHealth.rows(status: calibrating, online: true).rows
+    let attention = rows.first(where: { $0.name == "attention" })
+    check(attention?.title == "Attention", "titled Attention")
+    check(attention?.detail.hasPrefix("Calibrating to the driver") == true,
+          "and explained, not a bare 'Starting': \(attention?.detail ?? "nil")")
+    check(attention?.state == .starting && attention?.tone != .critical, "starting is never critical")
+    let presented = MonitoringStatusPresentation.make(status: calibrating, online: true)
+    check(presented?.label == "Starting", "the device is Starting")
+    check(presented?.detail == "Starting — Attention: calibrating to the driver — look ahead normally; "
+          + "usually done within 30 seconds", "with the reason in words, not 'attention: starting': \(presented?.detail ?? "")")
+    let ready = DeviceStatus(monitoringState: "ready", capabilities: .init(available: ["attention"]), stale: false)
+    check(CapabilityHealth.rows(status: ready, online: true).rows.first?.detail
+          == "Calibrated to the driver's forward gaze · producing results", "calibrated says so")
+    check(CapabilityHealth.humanReason("camera disconnected") == "camera disconnected", "other reasons unchanged")
+    check(CapabilityHealth.humanReason("pose: starting") == "Body pose: starting body pose", "known names in words")
+    check(CapabilityHealth.startingDetail("thermal").contains("not a failure"), "an unknown starting capability says it isn't failing")
+}
 
 print(failures == 0 ? "\nall passed" : "\n\(failures) FAILED")
 exit(failures == 0 ? 0 : 1)

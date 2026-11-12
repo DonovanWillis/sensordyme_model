@@ -106,7 +106,7 @@ enum DevicePresence {
             // The useful case: the camera is working and recording, and only the
             // live picture is missing. Saying "can't find your device" here would
             // suggest the camera had stopped, which is the opposite of the truth.
-            return "It's reporting to your Mac normally, so alerts still work — "
+            return "It's reporting to your server normally, so alerts still work — "
                  + "the live picture needs the phone and the device on the same network."
         case .quiet:
             return "That usually means it's switched off or unplugged. Alerts and the "

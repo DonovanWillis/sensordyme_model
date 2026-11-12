@@ -77,7 +77,9 @@ struct AuthView: View {
                     .font(SD.Typography.title)
                     .foregroundStyle(SD.Colors.textPrimary)
                 Spacer()
-                SDEyebrow(isSignup ? "New" : "Welcome back")
+                // textSecondary: thin 11 pt capitals in textTertiary measured
+                // below the audit's contrast threshold on this screen.
+                SDEyebrow(isSignup ? "New" : "Welcome back", color: SD.Colors.textSecondary)
             }
             .padding(.bottom, SD.Space.xs)
 
@@ -244,9 +246,9 @@ struct AuthView: View {
                     .frame(minHeight: 44)
                     .contentShape(Rectangle())
             }
+            // Untracked: tracking made the audit report the line as clipped.
             Text("ORYN · SENSORDYME")
                 .sdEyebrowFont()
-                .tracking(SD.Typography.eyebrowKerning)
                 .foregroundStyle(SD.Colors.textTertiary)
                 .multilineTextAlignment(.center)
                 .fixedSize(horizontal: false, vertical: true)

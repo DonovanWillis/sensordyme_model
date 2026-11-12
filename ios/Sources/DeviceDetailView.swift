@@ -30,6 +30,17 @@ struct DeviceDetailView: View {
     /// taken over the UI.
     @State private var setModeGuard = LatestRequestGuard()
     @State private var errorMessage: String?
+    /// The banner's headline when the server answered with something unusable
+    /// (ServerReply); nil = it couldn't be reached.
+    @State private var errorTitle: String?
+    /// A tapped notification whose alert couldn't be found. Its own banner: it
+    /// used to go into `errorMessage`, which headed it "Can't reach the server"
+    /// and turned the presence pill to Unknown for a server that was fine.
+    @State private var alertOpenProblem: String?
+    /// Advanced by the refresh timer whether or not a reload runs, so a reply
+    /// that stops being refreshed stops claiming ONLINE (ConnectionTruth).
+    @State private var now = Date()
+    @Environment(\.dynamicTypeSize) private var typeSize
     @State private var showZones = false
     @State private var selectedEvent: EventItem?
     @State private var showDemoTrigger = false
@@ -104,14 +115,20 @@ struct DeviceDetailView: View {
                 // Above the feed, not below the fold: this view polls every 4s and
                 // keeps showing the last frame and event list when a refresh fails.
                 if let errorMessage {
-                    ConnectionBanner(message: errorMessage) { await reload() }
-                } else if hasLoaded && !deviceLive {
-                    // The server answers but the device doesn't: everything
-                    // below is the last thing it said, and changes wait for it.
+                    ConnectionBanner(message: errorMessage, title: errorTitle) { await reload() }
+                } else if hasLoaded, let message = ConnectionTruth.notReportingMessage(presence) {
+                    // The server answers but the device's telemetry is not live:
+                    // everything below is the last thing it said, and changes
+                    // wait for it.
                     ConnectionBanner(
-                        message: staleDeviceMessage,
-                        title: "\(device.name) isn't reporting"
+                        message: message,
+                        title: isNotRefreshed
+                            ? "This screen isn't up to date"
+                            : "\(device.name) isn't reporting"
                     ) { await reload() }
+                }
+                if let alertOpenProblem {
+                    ConnectionBanner(message: alertOpenProblem, title: "Couldn't open that alert")
                 }
 
                 // The camera is the centrepiece and always comes first.
@@ -185,7 +202,7 @@ struct DeviceDetailView: View {
                     Image(systemName: "ellipsis")
                         .font(.system(size: 15, weight: .semibold))
                         .foregroundStyle(SD.Colors.textPrimary)
-                        .frame(width: 32, height: 32)
+                        .frame(width: 44, height: 44)  // the minimum touch target
                         .contentShape(Rectangle())
                 }
                 .accessibilityLabel("Device options")
@@ -273,6 +290,7 @@ struct DeviceDetailView: View {
             // failed, showed "Couldn't open that alert" and cleared the id —
             // racing the screen DevicesView was pushing for Y.
             if let target = notifier.pendingDeviceID, target != device.id { return }
+            alertOpenProblem = nil
             if let match = events.first(where: { $0.eventID == id }) {
                 selectedEvent = match
                 notifier.pendingEventID = nil
@@ -283,7 +301,7 @@ struct DeviceDetailView: View {
                 if let match = events.first(where: { $0.eventID == id }) {
                     selectedEvent = match
                 } else {
-                    errorMessage = "Couldn't open that alert. Open Event history below to find it."
+                    alertOpenProblem = "It may be older than the alerts this screen loads. Open Event history below to find it."
                 }
                 notifier.pendingEventID = nil
             }
@@ -301,7 +319,8 @@ struct DeviceDetailView: View {
                 showHistory = true
             }
         }
-        .onReceive(refreshTimer) { _ in
+        .onReceive(refreshTimer) { tick in
+            now = tick
             // One timed reload at a time. Each is two sequential requests; on a
             // link slower than the 4s tick every reload was superseded by the
             // next before it landed, so LatestRequestGuard discarded them all
@@ -322,13 +341,19 @@ struct DeviceDetailView: View {
     /// (DeviceStatus): "All clear" only when the device reports `ready`, never
     /// for a failed, stopped, starting or silent one.
     private var statusRow: some View {
-        let pill = MonitoringStatusPresentation.pill(device.monitoringPresentation, alertActive: alertActive)
-        return HStack(spacing: SD.Space.xs) {
-            SDStatusPill(status: presenceStatus, pulses: presenceStatus == .online)
+        let pill = MonitoringStatusPresentation.pill(monitoringPresentation, alertActive: alertActive)
+        // One line normally; stacked at accessibility sizes, where the row
+        // truncated both pills to "ON…" and "AL…" and the mode to "Driver Safe…".
+        let layout = typeSize.isAccessibilitySize
+            ? AnyLayout(VStackLayout(alignment: .leading, spacing: SD.Space.xs))
+            : AnyLayout(HStackLayout(spacing: SD.Space.xs))
+        return layout {
+            SDStatusPill(status: presenceStatus, text: ConnectionTruth.label(presence), pulses: presenceStatus == .online)
+            .accessibilityLabel(ConnectionTruth.spoken(presence))
             .accessibilityIdentifier("detail.online")
             SDStatusPill(status: pill.tone.sdStatus, text: pill.text)
                 .accessibilityIdentifier("detail.monitoring")
-            Spacer(minLength: SD.Space.xs)
+            if !typeSize.isAccessibilitySize { Spacer(minLength: SD.Space.xs) }
             HStack(spacing: 5) {
                 if customMonitoringActive {
                     Image(systemName: "sparkles")
@@ -340,20 +365,31 @@ struct DeviceDetailView: View {
                      ? (device.monitoring?.title ?? "AI Custom Monitoring")
                      : presetTitle(device.activePreset))
                     .font(SD.Typography.caption.weight(.medium))
-                    .lineLimit(2)
-                    .multilineTextAlignment(.trailing)
+                    .fixedSize(horizontal: false, vertical: true)
+                    .multilineTextAlignment(typeSize.isAccessibilitySize ? .leading : .trailing)
             }
             .foregroundStyle(customMonitoringActive ? SD.Colors.textPrimary : SD.Colors.textTertiary)
         }
     }
 
-    /// ONLINE only while the latest refresh succeeded (ConnectionTruth).
-    private var presenceStatus: SDStatus {
-        switch ConnectionTruth.presence(online: device.online, lastRefreshFailed: errorMessage != nil) {
-        case .online: .online
-        case .offline: .offline
-        case .unknown: .unknown
-        }
+    /// ONLINE only with fresh telemetry in a reply from a refresh that
+    /// succeeded and is current (ConnectionTruth). Everything on this screen
+    /// that says "live" reads this, so no two parts of it can disagree.
+    private var presence: ConnectionTruth.Presence {
+        device.presence(now: now, lastRefreshFailed: errorMessage != nil)
+    }
+
+    private var isNotRefreshed: Bool {
+        if case .unknown(.notRefreshed) = presence { return true }
+        return false
+    }
+
+    private var presenceStatus: SDStatus { SDStatus(presence) }
+
+    /// The monitoring state, from `status` — "Status unknown" whenever the
+    /// telemetry is not live, so "All clear" can't stand on an old reply.
+    private var monitoringPresentation: MonitoringStatusPresentation? {
+        device.monitoringPresentation(live: deviceLive)
     }
 
     // MARK: Health
@@ -366,7 +402,7 @@ struct DeviceDetailView: View {
         VStack(alignment: .leading, spacing: SD.Space.xs) {
             SDSectionHeader(title: "Device health")
                 .padding(.horizontal, SD.Space.xxs)
-            if let health = device.health {
+            if let health = device.health, deviceLive {
                 SDCard {
                     VStack(alignment: .leading, spacing: SD.Space.sm) {
                         healthRow("Camera", systemImage: "camera", health.camera, metric: "fps", suffix: " fps")
@@ -386,9 +422,9 @@ struct DeviceDetailView: View {
                     HStack(alignment: .top, spacing: SD.Space.sm) {
                         Image(systemName: "info.circle")
                             .foregroundStyle(SD.Colors.textTertiary)
-                        Text(device.online
+                        Text(deviceLive
                              ? "This device isn't reporting its status yet. Update it to see camera and AI health here."
-                             : "Health appears here while the device is online.")
+                             : "Health appears here while the device is reporting.")
                             .font(SD.Typography.caption)
                             .foregroundStyle(SD.Colors.textTertiary)
                             .fixedSize(horizontal: false, vertical: true)
@@ -405,7 +441,7 @@ struct DeviceDetailView: View {
     /// each has been evaluated when the backend says. Empty, with a sentence,
     /// whenever the device isn't reporting: an old list is never shown green.
     @ViewBuilder private var capabilitiesCard: some View {
-        let health = CapabilityHealth.rows(status: device.status, online: device.online)
+        let health = CapabilityHealth.rows(status: device.status, online: deviceLive)
         SDSectionHeader(title: "Detection capabilities")
             .padding(.horizontal, SD.Space.xxs)
             .padding(.top, SD.Space.xs)
@@ -461,7 +497,7 @@ struct DeviceDetailView: View {
     /// the face model is gone. The inference component remains the fallback
     /// for a backend that predates the status contract.
     private func monitoringComponent(_ health: DeviceHealthReport) -> HealthComponent? {
-        guard let presentation = device.monitoringPresentation else { return health.inference }
+        guard let presentation = monitoringPresentation else { return health.inference }
         return HealthComponent(state: presentation.tone.healthState, detail: presentation.detail, metrics: nil)
     }
 
@@ -524,12 +560,16 @@ struct DeviceDetailView: View {
                 jupiterDraft = ""
                 jupiterSheet = JupiterSheet(prompt: request)
             }
-            HStack(spacing: SD.Space.xxs) {
+            // Stacked at accessibility sizes: side by side, the sentence was
+            // squeezed to a word per line beside "Exam-ples".
+            (typeSize.isAccessibilitySize
+                ? AnyLayout(VStackLayout(alignment: .leading, spacing: SD.Space.xxs))
+                : AnyLayout(HStackLayout(spacing: SD.Space.xxs))) {
                 Text("Tell \(device.name) what to watch for. You review it before anything changes.")
                     .font(SD.Typography.caption)
                     .foregroundStyle(SD.Colors.textTertiary)
                     .fixedSize(horizontal: false, vertical: true)
-                Spacer(minLength: SD.Space.xs)
+                if !typeSize.isAccessibilitySize { Spacer(minLength: SD.Space.xs) }
                 Button {
                     jupiterSheet = JupiterSheet(prompt: "")
                 } label: {
@@ -557,7 +597,7 @@ struct DeviceDetailView: View {
                 .padding(.horizontal, SD.Space.xxs)
             SDCard(padding: SD.Space.xxs) {
                 VStack(spacing: 0) {
-                    Button { showHistory = true } label: {
+                    Button { alertOpenProblem = nil; showHistory = true } label: {
                         OrynNavRow(
                             icon: "clock.arrow.circlepath",
                             title: "Event history",
@@ -644,7 +684,7 @@ struct DeviceDetailView: View {
     /// What the running mode's row says when the device is NOT monitoring
     /// (failed or stopped); nil when it is (or when there is no status).
     private var notMonitoringReason: String? {
-        guard let presentation = device.monitoringPresentation else { return nil }
+        guard let presentation = monitoringPresentation else { return nil }
         switch presentation.phase {
         case .failed: return presentation.detail
         case .stopped: return "Stopped — nothing is monitored until it's resumed"
@@ -759,6 +799,9 @@ struct DeviceDetailView: View {
                 }
                 occupancyToggle(report)
             }
+            // Its own element, so the id names the section without replacing the
+            // rows' and the switch's own ids (journey 24 found no switch).
+            .accessibilityElement(children: .contain)
             .accessibilityIdentifier("nodes.section")
         }
     }
@@ -775,13 +818,20 @@ struct DeviceDetailView: View {
                     .font(SD.Typography.caption)
                     .foregroundStyle(SD.Colors.textSecondary)
                     .fixedSize(horizontal: false, vertical: true)
+                if let experimental = NodePresentation.experimentalNote(node) {
+                    Text(experimental)
+                        .font(SD.Typography.caption)
+                        .foregroundStyle(SD.Colors.warning)
+                        .fixedSize(horizontal: false, vertical: true)
+                }
             }
             Spacer(minLength: SD.Space.xs)
             SDEyebrow(shown.badge, color: SD.Colors.warning)
                 .multilineTextAlignment(.trailing)
         }
         .accessibilityElement(children: .combine)
-        .accessibilityLabel("\(shown.title): \(shown.stateText). \(shown.badge)")
+        .accessibilityLabel("\(shown.title): \(shown.stateText). \(shown.badge)"
+            + (NodePresentation.experimentalNote(node).map { ". \($0)" } ?? ""))
         .accessibilityIdentifier("node.\(node.id)")
     }
 
@@ -831,7 +881,8 @@ struct DeviceDetailView: View {
                 state.expireSession(error.message)
             } catch let error as APIError {
                 nodeRequest = nil
-                nodeError = error.endpointMissing ? ServerSupport.notSupported : error.message
+                nodeError = error.endpointMissing ? ServerSupport.notSupported
+                    : RefusalText.message(code: error.code, reason: error.message, fallback: error.message)
             } catch {
                 nodeRequest = nil
                 nodeError = error.localizedDescription
@@ -851,7 +902,7 @@ struct DeviceDetailView: View {
         // rules running alongside (an additive role) leave the mode running.
         let rowState = ModeSwitchState.state(
             for: preset.id, activeBase: activeBase, customMonitoringActive: customReplacesModes,
-            pending: pendingSwitch, deviceOnline: device.online, failure: failedSwitch, now: .now,
+            pending: pendingSwitch, deviceOnline: deviceLive, failure: failedSwitch, now: .now,
             unavailable: unavailableReason(preset.id), notMonitoring: notMonitoringReason
         )
         let isActive = rowState.isSelected
@@ -884,9 +935,12 @@ struct DeviceDetailView: View {
                                 .font(SD.Typography.caption)
                                 .foregroundStyle(SD.Colors.danger)
                         case .unavailable(let reason):
+                            // textSecondary: the reason is the point of the row, and
+                            // textTertiary at caption size failed the audit's contrast.
                             Text(reason)
                                 .font(SD.Typography.caption)
-                                .foregroundStyle(SD.Colors.textTertiary)
+                                .foregroundStyle(SD.Colors.textSecondary)
+                                .fixedSize(horizontal: false, vertical: true)
                         case .queuedOffline:
                             Text("Device offline — will apply when it reconnects")
                                 .font(SD.Typography.caption)
@@ -948,7 +1002,7 @@ struct DeviceDetailView: View {
                 Image(systemName: "info.circle")
                     .font(.system(size: 15))
                     .foregroundStyle(SD.Colors.textSecondary)
-                    .frame(width: 32, height: 32)
+                    .frame(width: 44, height: 44)  // the minimum touch target
                     .contentShape(Rectangle())
             }
             .buttonStyle(.plain)
@@ -1012,7 +1066,7 @@ struct DeviceDetailView: View {
     /// server has GET /v1/devices/{id}/presets, else the role in `status`.
     private func unavailableReason(_ id: String) -> String? {
         if let devicePresets {
-            let availability = PresetAvailability.make(devicePresets.state(for: id))
+            let availability = PresetAvailability.make(devicePresets.state(for: id), roleTitle: device.status?.roleTitle)
             return availability.blocksSelection ? (availability.note ?? "Not available on this device") : nil
         }
         return MonitoringStatusPresentation.presetUnavailableReason(id, status: device.status)
@@ -1042,23 +1096,10 @@ struct DeviceDetailView: View {
         }
     }
 
-    /// What an unreported device means for the person: when it was last
-    /// heard from, and that changes are kept until it is back.
-    private var staleDeviceMessage: String {
-        var text = "Its status is unknown"
-        if let lastSeen = device.lastSeen {
-            let date = Date(timeIntervalSince1970: lastSeen)
-            text += " — last heard from \(Self.relative.localizedString(for: date, relativeTo: .now))"
-        } else {
-            text += " — it hasn't reported yet"
-        }
-        return text + ". Check it has power and Wi-Fi. Changes you make are saved and apply when it reconnects."
-    }
-
     // MARK: Custom rules
 
     /// Online and reporting. Nothing is shown as running otherwise.
-    private var deviceLive: Bool { device.status?.isLive(online: device.online) ?? device.online }
+    private var deviceLive: Bool { presence.isOnline }
 
     private func loadRules() async {
         if rulesLoad == .unsupported { return }
@@ -1279,12 +1320,20 @@ struct DeviceDetailView: View {
         // which is the only distinction that matters for not clobbering it.
         let reloadStartedAt = Date()
         do {
-            if let fresh = try await state.backend.devices().first(where: { $0.id == device.id }) {
-                guard reloadGuard.isLatest(token) else { return }
-                device = fresh
-                syncPendingSwitch(from: fresh, reloadStartedAt: reloadStartedAt)
-                settleProtection()
+            let all = try await state.backend.devices()
+            guard reloadGuard.isLatest(token) else { return }
+            guard let fresh = all.first(where: { $0.id == device.id }) else {
+                // Removed from the account (or moved to another): it used to keep
+                // the last reading on screen, ONLINE, polling for ever in silence.
+                errorTitle = "\(device.name) is no longer on this account"
+                errorMessage = "The server no longer lists this device for your account. Go back to Your Devices."
+                hasLoaded = true
+                return
             }
+            device = fresh
+            now = Date()
+            syncPendingSwitch(from: fresh, reloadStartedAt: reloadStartedAt)
+            settleProtection()
             let fetchedEvents = try await state.backend.events(deviceID: device.id, limit: 200)
             guard reloadGuard.isLatest(token) else { return }
             events = fetchedEvents
@@ -1299,12 +1348,14 @@ struct DeviceDetailView: View {
             // works on every screen. Announcing here as well duplicated the
             // work on the one screen that was already the busiest.
             errorMessage = nil
+            errorTitle = nil
         } catch let error as APIError where error.isAuthFailure {
             guard reloadGuard.isLatest(token) else { return }
             state.expireSession(error.message)
         } catch {
             guard reloadGuard.isLatest(token) else { return }
             errorMessage = error.localizedDescription
+            errorTitle = (error as? APIError)?.title
         }
         if reloadGuard.isLatest(token) { hasLoaded = true }
     }
@@ -1381,10 +1432,11 @@ struct EventRow: View {
                     .font(SD.Typography.body)
                     .foregroundStyle(SD.Colors.textPrimary)
                 if let signals = event.signals, !signals.isEmpty {
+                    // Wraps in full: two lines clipped the device's reason (audit).
                     Text(signals)
                         .font(SD.Typography.caption)
                         .foregroundStyle(SD.Colors.textSecondary)
-                        .lineLimit(2)
+                        .fixedSize(horizontal: false, vertical: true)
                 }
             }
             Spacer(minLength: SD.Space.xxs)

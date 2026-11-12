@@ -568,7 +568,8 @@ final class MockAPI: BackendAPI {
                    monitoring: customActive
                        ? CustomMonitoring(instruction: customInstruction, ruleCount: customRules.count, active: true)
                        : nil,
-                   status: demoStatus(customActive: customActive, running: running.map(\.id)))
+                   status: demoStatus(customActive: customActive, running: running.map(\.id)),
+                   receivedAt: Date())
         ]
     }
 
@@ -1004,8 +1005,7 @@ extension APIClient {
         req.httpMethod = "GET"
         req.timeoutInterval = 30
         if let token { req.setValue("Bearer \(token)", forHTTPHeaderField: "Authorization") }
-        let (data, response) = try await URLSession.shared.data(for: req)
-        let status = (response as? HTTPURLResponse)?.statusCode ?? 0
+        let (data, status) = try await Self.perform(req, host: baseURL.host ?? "the server")
         if let error = Self.httpError(status: status, data: data, sentToken: token != nil) {
             throw error
         }
@@ -1029,8 +1029,7 @@ extension APIClient {
         if let token { req.setValue("Bearer \(token)", forHTTPHeaderField: "Authorization") }
         req.setValue("application/json", forHTTPHeaderField: "Content-Type")
         req.httpBody = try JSONSerialization.data(withJSONObject: body)
-        let (data, response) = try await URLSession.shared.data(for: req)
-        let status = (response as? HTTPURLResponse)?.statusCode ?? 0
+        let (data, status) = try await Self.perform(req, host: baseURL.host ?? "the server")
         if let error = Self.httpError(status: status, data: data, sentToken: token != nil) {
             throw error
         }

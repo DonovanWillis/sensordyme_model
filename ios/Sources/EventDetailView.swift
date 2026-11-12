@@ -238,13 +238,17 @@ struct EventTimeline: View {
                                         .overlay(
                                             Circle().strokeBorder(SD.Colors.background, lineWidth: 2)
                                         )
+                                        // The dot as drawn; a 44 pt target around it
+                                        // (audit: hit area too small).
+                                        .frame(width: 44, height: 44)
+                                        .contentShape(Rectangle())
                                 }
                                 .buttonStyle(.plain)
-                                // Clamped so a midnight event isn't half off-screen.
+                                // Centred on its time, clamped so a midnight event
+                                // isn't half off-screen; on the line at y = 16.
                                 .offset(
-                                    x: min(max(fraction * geometry.size.width - 7, 0),
-                                           geometry.size.width - 14),
-                                    y: event.isCritical ? 9 : 11
+                                    x: min(max(fraction * geometry.size.width, 7), geometry.size.width - 7) - 22,
+                                    y: 16 - 22
                                 )
                                 .accessibilityLabel("\(event.title) at \(event.date.map { $0.formatted(date: .omitted, time: .shortened) } ?? "")")
                             }
@@ -253,14 +257,18 @@ struct EventTimeline: View {
                 }
                 .frame(height: 32)
 
+                // A visual scale: each dot already says its time to VoiceOver.
+                // A text style, not a fixed 10 pt (audit: Dynamic Type unsupported),
+                // and indexed: "12a" twice was a duplicate ForEach id.
                 HStack {
-                    ForEach(["12a", "6a", "12p", "6p", "12a"], id: \.self) { label in
+                    ForEach(Array(["12a", "6a", "12p", "6p", "12a"].enumerated()), id: \.offset) { index, label in
                         Text(label)
-                            .font(.system(size: 10))
+                            .font(.caption2)
                             .foregroundStyle(SD.Colors.textTertiary)
-                        if label != "12a" || true { Spacer(minLength: 0) }
+                        if index < 4 { Spacer(minLength: 0) }
                     }
                 }
+                .accessibilityHidden(true)
             }
         }
     }

@@ -18,6 +18,10 @@ struct APIError: LocalizedError {
     /// server sent none. Branch on this, never on the status alone: several
     /// different refusals share 409.
     var code: String? = nil
+    /// The headline for a banner (ServerReply.Title), when the server answered
+    /// with something other than the answer. nil for a transport failure, which
+    /// the banner heads "Can't reach the server".
+    var title: String? = nil
     var errorDescription: String? { message }
 }
 
@@ -110,15 +114,15 @@ struct APIClient {
     static func httpError(status: Int, data: Data, sentToken: Bool) -> APIError? {
         if (200..<300).contains(status) { return nil }
         // FastAPI errors arrive as {"detail": "..."}, and refusals the app must
-        // tell apart also carry {"code": "..."} beside it.
-        let body = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any]
-        let detail = body?["detail"] as? String
-        let code = body?["code"] as? String
+        // tell apart also carry {"code": "..."} beside it. Anything else (an
+        // HTML error page, a validation list, an empty body) is put into words
+        // by ServerReply rather than shown raw or as "request failed (502)".
+        let failure = ServerReply.httpFailure(status: status, data: data)
         if status == 401 && sentToken {
             return APIError(message: "Your session has expired. Please sign in again.",
-                            isAuthFailure: true, status: status, code: code)
+                            isAuthFailure: true, status: status, code: failure.code)
         }
-        return APIError(message: detail ?? "request failed (\(status))", status: status, code: code)
+        return APIError(message: failure.message, status: status, code: failure.code, title: failure.title)
     }
 
     /// Did this fail to reach a server at all, rather than reach one that refused?
@@ -166,12 +170,26 @@ struct APIClient {
     }
 
     /// Decode a reply, turning a malformed one into a message a person can act on
-    /// (ReplyError) instead of Foundation's "isn't in the correct format".
+    /// (ServerReply: empty, a web page, or unreadable data) instead of
+    /// Foundation's "isn't in the correct format".
     static func decodeReply<T: Decodable>(_ type: T.Type, from data: Data) throws -> T {
         do {
             return try JSONDecoder().decode(type, from: data)
-        } catch let error as DecodingError {
-            throw APIError(message: ReplyError.message(for: error) ?? ReplyError.unreadable)
+        } catch is DecodingError {
+            let failure = ServerReply.undecodable(data)
+            throw APIError(message: failure.message, status: 200, title: failure.title)
+        }
+    }
+
+    /// One URLSession call with the transport failure in words (APIClient.explain),
+    /// for the helpers that do not go through `request` (getJSON, postJSON). They
+    /// used to let a raw URLError through: "Could not connect to the server."
+    static func perform(_ request: URLRequest, host: String) async throws -> (Data, Int) {
+        do {
+            let (data, response) = try await URLSession.shared.data(for: request)
+            return (data, (response as? HTTPURLResponse)?.statusCode ?? 0)
+        } catch let error as URLError {
+            throw APIError(message: explain(error, host: host), isUnreachable: isUnreachable(error))
         }
     }
 
@@ -186,7 +204,9 @@ struct APIClient {
 
     // MARK: devices
     func devices() async throws -> [Device] {
-        try decode(DevicesResponse.self, from: try await request("GET", "v1/devices")).devices
+        let devices = try decode(DevicesResponse.self, from: try await request("GET", "v1/devices")).devices
+        let received = Date()
+        return devices.map { var device = $0; device.receivedAt = received; return device }
     }
 
     func claim(code: String) async throws {
