@@ -274,9 +274,14 @@ final class OrynJourneysUITests: XCTestCase {
     }
 
     func test16_Stale() throws {
-        Stack.post("/device/start?scenario=backend_outage")  // the device loses the server for 60 s
+        // The device (claimed and ready, setUp) restarts and loses the server 17 s
+        // later, for 60 s. Not waited for: "All clear" before the outage. That
+        // fits only in the gap between the restarted device's first report and
+        // the outage being noticed, and in M8.1 run E the first report came 1 s
+        // before the outage, so the journey waited out the outage and missed it.
+        Stack.post("/device/start?scenario=backend_outage")
         launch(["-orynOpenDevice"])
-        waitFor(monitoring, label: "All clear", timeout: 90)
+        XCTAssertTrue(monitoring.waitForExistence(timeout: 30), "the device screen is open")
         let banner = element("banner.message")
         waitFor(banner, labelContains: "isn't reporting", timeout: 90)
         XCTAssertNotEqual(monitoring.label, "All clear", "a stale device is never healthy")
@@ -684,19 +689,43 @@ final class OrynJourneysUITests: XCTestCase {
         submit.tap()
     }
 
-    /// Scroll until the element is on screen and clear of the floating tab bar
-    /// (bounded), and return it. `isHittable` alone passed for a chip lying under
-    /// the tab bar, and the tap landed on the tab bar.
+    /// Scroll until the element sits between the bars, still, and return it.
+    /// `isHittable` alone passed for a chip under the floating tab bar, and for
+    /// a button under the translucent navigation bar: the tap landed on the bar.
+    ///
+    /// Exact drags, either way, instead of swipes up: a slow swipe glides ~400 pt,
+    /// and in the stopped-device layout one carried the Resume button from below
+    /// the window to above it; the loop could only swipe further up (M8.1 run E:
+    /// "not reachable" after 10 swipes; run D: the tap hit the navigation bar).
+    /// Each drag is a press-drag-hold (no glide) in the page's left gutter, so
+    /// no control is pressed, by the distance that centres the element.
     @discardableResult
-    private func reveal(_ element: XCUIElement, timeout: TimeInterval = 15) -> XCUIElement {
-        XCTAssertTrue(element.waitForExistence(timeout: timeout), "\(element) exists")
-        let limit = app.frame.maxY * 0.78
-        var swipes = 0
-        while (!element.isHittable || element.frame.maxY > limit) && swipes < 10 {
-            app.swipeUp(velocity: .slow)
-            swipes += 1
+    private func reveal(_ element: XCUIElement, timeout: TimeInterval = 15,
+                        file: StaticString = #filePath, line: UInt = #line) -> XCUIElement {
+        XCTAssertTrue(element.waitForExistence(timeout: timeout), "\(element) exists", file: file, line: line)
+        let nav = app.navigationBars.firstMatch
+        let top = (nav.exists && nav.frame.height > 0 ? nav.frame.maxY : app.frame.minY + 100) + 16
+        let bottom = app.frame.maxY * 0.78
+        // Wholly inside the window; an element taller than it (a section), its centre,
+        // which is where a tap goes.
+        let inWindow = { () -> Bool in
+            guard element.isHittable else { return false }
+            let f = element.frame
+            return f.height <= bottom - top ? (f.minY >= top && f.maxY <= bottom)
+                                            : (f.midY >= top + 22 && f.midY <= bottom - 22)
         }
-        XCTAssertTrue(element.isHittable, "\(element) is reachable on screen")
+        var drags = 0
+        while element.exists && !inWindow() && drags < 12 {
+            let limit = (bottom - top) / 2 - 12
+            let dy = max(-limit, min(limit, (top + bottom) / 2 - element.frame.midY))  // > 0 moves content down
+            let start = app.coordinate(withNormalizedOffset: .zero)
+                .withOffset(CGVector(dx: 10, dy: (top + bottom) / 2 - dy / 2))
+            start.press(forDuration: 0.05, thenDragTo: start.withOffset(CGVector(dx: 0, dy: dy)),
+                        withVelocity: .slow, thenHoldForDuration: 0.3)
+            drags += 1
+        }
+        XCTAssertTrue(inWindow(), "\(element) is reachable on screen, between the bars: \(element.frame)",
+                      file: file, line: line)
         settle(element)
         return element
     }
