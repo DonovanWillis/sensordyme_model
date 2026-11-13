@@ -65,6 +65,19 @@ the state is `degraded`. Drowsiness, distraction and attention-lost keep working
 and keep alerting. Object detection retries on its own (1 s, doubling to 60 s)
 and the state returns to `ready`.
 
+## Heat (M8.3)
+
+A device the firmware is throttling still monitors, more slowly, so it is
+`degraded` with the reason (`device: SoC at 84.0°C, at or above the 80°C
+throttle point: analysis may be slower`), never `ready` and never `failed`.
+`core/device_health.py` `thermal_condition` uses the Pi 5's published limits
+unchanged (`core/thermal.py`): it enters at 80 °C or on any live
+`get_throttled` bit (under-voltage, frequency capped, throttled, soft limit)
+and clears below 75 °C with no live bit, so a device hovering at the limit
+does not flap. The health thread reads temperature and throttling every 20 s;
+an evaluation only reads the cached reason, so the inference loop never waits
+on `vcgencmd`. Tests: `tests/test_m83_truth_failure_matrix.py` (F20).
+
 ## Alert outputs
 
 Each output reports **software** readiness: it initialised, it says it is

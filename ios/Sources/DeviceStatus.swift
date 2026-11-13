@@ -48,6 +48,13 @@ struct DeviceStatus: Codable, Hashable {
     /// The shared perception engine's components and the monitoring nodes the
     /// device runs (PerceptionStatus.swift). nil from an older backend or device.
     var perception: PerceptionReport?
+    /// M8.3: the last stop/resume and its acknowledged outcome (pending,
+    /// confirmed, mismatch, timed_out). nil from a backend before M8.3; then
+    /// ProtectionControl falls back to the echo and its own timer.
+    var protectionCommand: ProtectionCommandStatus? = nil
+    /// M8.3: claims the backend withdrew because the device's report
+    /// contradicted itself (docs/STATE_MODEL.md). Empty normally.
+    var corrections: [String]? = nil
 
     struct Capabilities: Codable, Hashable {
         var available: [String]?
@@ -128,6 +135,8 @@ struct DeviceStatus: Codable, Hashable {
         case linkStale = "link_stale"
         case healthStale = "health_stale"
         case healthFreshness = "health_freshness"
+        case protectionCommand = "protection_command"
+        case corrections
     }
 
     init(
@@ -137,7 +146,8 @@ struct DeviceStatus: Codable, Hashable {
         capabilities: Capabilities? = nil, rules: Rules? = nil, lastRejection: Rejection? = nil,
         presetRejection: PresetRejection? = nil, stale: Bool? = nil, reportedAt: Double? = nil,
         lastCommandID: String? = nil, perception: PerceptionReport? = nil,
-        linkStale: Bool? = nil, healthStale: Bool? = nil, healthFreshness: HealthFreshness? = nil
+        linkStale: Bool? = nil, healthStale: Bool? = nil, healthFreshness: HealthFreshness? = nil,
+        protectionCommand: ProtectionCommandStatus? = nil, corrections: [String]? = nil
     ) {
         self.monitoringState = monitoringState
         self.monitoringActive = monitoringActive
@@ -159,6 +169,8 @@ struct DeviceStatus: Codable, Hashable {
         self.linkStale = linkStale
         self.healthStale = healthStale
         self.healthFreshness = healthFreshness
+        self.protectionCommand = protectionCommand
+        self.corrections = corrections
     }
 
     init(from decoder: Decoder) throws {
@@ -183,6 +195,8 @@ struct DeviceStatus: Codable, Hashable {
         linkStale = try? c.decodeIfPresent(Bool.self, forKey: .linkStale)
         healthStale = try? c.decodeIfPresent(Bool.self, forKey: .healthStale)
         healthFreshness = try? c.decodeIfPresent(HealthFreshness.self, forKey: .healthFreshness)
+        protectionCommand = try? c.decodeIfPresent(ProtectionCommandStatus.self, forKey: .protectionCommand)
+        corrections = try? c.decodeIfPresent([String].self, forKey: .corrections)
     }
 
     func encode(to encoder: Encoder) throws {
@@ -208,6 +222,8 @@ struct DeviceStatus: Codable, Hashable {
         try c.encodeIfPresent(linkStale, forKey: .linkStale)
         try c.encodeIfPresent(healthStale, forKey: .healthStale)
         try c.encodeIfPresent(healthFreshness, forKey: .healthFreshness)
+        try c.encodeIfPresent(protectionCommand, forKey: .protectionCommand)
+        try c.encodeIfPresent(corrections, forKey: .corrections)
     }
 
     /// Online and reporting: the only time anything below is current. Also false
@@ -223,6 +239,61 @@ struct DeviceStatus: Codable, Hashable {
 // After DeviceStatus, not inside it, so its CodingKeys never precede the
 // status's own (tests/test_app_status_contract.py reads the first enum).
 extension DeviceStatus {
+    /// `status.protection_command` (docs/APP_STATUS_CONTRACT.md, M8.3): the last
+    /// stop/resume the backend stored, and what the DEVICE did with it.
+    struct ProtectionCommandStatus: Codable, Hashable {
+        var id: String?
+        /// stop | resume
+        var action: String?
+        /// pending | confirmed | mismatch | timed_out
+        var outcome: String?
+        /// Whether the backend still sends it (a stop only for 30 s; a resume until applied).
+        var delivering: Bool?
+        var ageS: Double?
+        var timeoutS: Double?
+        /// Backend time the device's echo of this id first arrived.
+        var appliedAt: Double?
+        /// The protection state the device reported with that echo.
+        var reportedState: String?
+        /// Why the outcome is a mismatch, in the device's words when it refused.
+        var reason: String?
+
+        enum CodingKeys: String, CodingKey {
+            case id, action, outcome, delivering, reason
+            case ageS = "age_s"
+            case timeoutS = "timeout_s"
+            case appliedAt = "applied_at"
+            case reportedState = "reported_state"
+        }
+
+        init(id: String? = nil, action: String? = nil, outcome: String? = nil, delivering: Bool? = nil,
+             ageS: Double? = nil, timeoutS: Double? = nil, appliedAt: Double? = nil,
+             reportedState: String? = nil, reason: String? = nil) {
+            self.id = id
+            self.action = action
+            self.outcome = outcome
+            self.delivering = delivering
+            self.ageS = ageS
+            self.timeoutS = timeoutS
+            self.appliedAt = appliedAt
+            self.reportedState = reportedState
+            self.reason = reason
+        }
+
+        init(from decoder: Decoder) throws {
+            let c = try decoder.container(keyedBy: CodingKeys.self)
+            id = try? c.decodeIfPresent(String.self, forKey: .id)
+            action = try? c.decodeIfPresent(String.self, forKey: .action)
+            outcome = try? c.decodeIfPresent(String.self, forKey: .outcome)
+            delivering = try? c.decodeIfPresent(Bool.self, forKey: .delivering)
+            ageS = try? c.decodeIfPresent(Double.self, forKey: .ageS)
+            timeoutS = try? c.decodeIfPresent(Double.self, forKey: .timeoutS)
+            appliedAt = try? c.decodeIfPresent(Double.self, forKey: .appliedAt)
+            reportedState = try? c.decodeIfPresent(String.self, forKey: .reportedState)
+            reason = try? c.decodeIfPresent(String.self, forKey: .reason)
+        }
+    }
+
     /// `status.health_freshness` (docs/APP_STATUS_CONTRACT.md, M8.1).
     struct HealthFreshness: Codable, Hashable {
         /// fresh | stale | unverified | absent
@@ -322,7 +393,18 @@ struct MonitoringStatusPresentation: Equatable {
         if !online || status.stale == true || status.monitoringEvidenceStale {
             return unknown(reason ?? "the device isn't reporting")
         }
-        switch Phase(rawValue: status.monitoringState ?? "") ?? .unknown {
+        var phase = Phase(rawValue: status.monitoringState ?? "") ?? .unknown
+        if status.protection == "stopped" { phase = .stopped }
+        // M8.3: every policy needs frames and inference; a report that says
+        // ready or degraded without them contradicts itself (a backend before
+        // M8.3 passed it through). The device's own rule says failed.
+        if phase == .ready || phase == .degraded,
+           let down = status.capabilities?.impaired?.first(where: { $0.name == "camera" || $0.name == "inference" }) {
+            let why = down.reason.flatMap { $0.isEmpty ? nil : "\(down.name): \($0)" } ?? "\(down.name) unavailable"
+            return .init(phase: .failed, label: "Not monitoring", detail: sentence("Not monitoring", why),
+                         tone: .critical)
+        }
+        switch phase {
         case .ready:
             return .init(phase: .ready, label: "All clear", detail: "Monitoring normally", tone: .ok)
         case .degraded:
@@ -442,6 +524,28 @@ enum CapabilityHealth {
         }
         let evaluation = capabilities.evaluation ?? [:]
         var rows: [CapabilityHealthRow] = []
+        // M8.3, defence in depth for a backend or device before it: nothing that
+        // analyses is "producing results" while stopped, or while the camera or
+        // the inference loop that feeds it is impaired.
+        let impairedNames = Set((capabilities.impaired ?? []).map(\.name))
+        let pipelineDown = ["camera", "inference"].first { impairedNames.contains($0) }
+        let stopped = status.monitoringState == "stopped" || status.protection == "stopped"
+        var withheld: [String: CapabilityHealthRow] = [:]
+        for name in capabilities.available ?? [] where analysisCapabilities.contains(name) || (stopped && name == "inference") {
+            if stopped {
+                withheld[name] = .init(name: name, title: title(name), state: .paused, detail: pausedDetail, tone: .neutral)
+            } else if let pipelineDown {
+                withheld[name] = .init(name: name, title: title(name), state: .impaired,
+                                       detail: "Not working — no analysis while \(title(pipelineDown).lowercased()) is unavailable",
+                                       tone: .critical)
+            } else if let component = PerceptionPresentation.componentForCapability[name],
+                      let comp = status.perception?.components[component],
+                      comp.state == "failed" || comp.state == "unavailable" {
+                // The model behind it failed or is missing: it produces nothing.
+                withheld[name] = .init(name: name, title: title(name), state: .impaired,
+                                       detail: PerceptionPresentation.describe(comp).0, tone: .critical)
+            }
+        }
         for impaired in capabilities.impaired ?? [] {
             let reason = impaired.reason.flatMap { $0.isEmpty ? nil : $0 } ?? "not working"
             rows.append(.init(name: impaired.name, title: title(impaired.name), state: .impaired,
@@ -456,7 +560,8 @@ enum CapabilityHealth {
             rows.append(.init(name: name, title: title(name), state: .paused,
                               detail: pausedDetail, tone: .neutral))
         }
-        for name in capabilities.available ?? [] {
+        rows += (capabilities.available ?? []).compactMap { withheld[$0] }
+        for name in capabilities.available ?? [] where withheld[name] == nil {
             var detail = vocabulary[name]?.available.map { "\($0) · producing results" } ?? "Producing results"
             if let note = evaluationNote(evaluation[name]) { detail += " · \(note)" }
             rows.append(.init(name: name, title: title(name), state: .available, detail: detail, tone: .ok))
@@ -501,6 +606,10 @@ enum CapabilityHealth {
         "hands": ("Hands", "Starting hand tracking", nil),
         "pose": ("Body pose", "Starting body pose", nil),
     ]
+
+    /// Capabilities that are analysis results, fed by the camera and the
+    /// inference loop (M8.3; cloud/app.py `_ANALYSIS_CAPABILITIES`).
+    static let analysisCapabilities: Set<String> = ["face", "objects", "hands", "pose", "attention"]
 
     /// What a starting capability is doing, for its row.
     /// What a capability says while monitoring is stopped on purpose (M8.2).

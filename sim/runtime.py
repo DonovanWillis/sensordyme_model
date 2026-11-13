@@ -24,6 +24,7 @@ import logging
 from pathlib import Path
 from typing import Optional
 
+from core import device_health
 from core.alerts import AlertCategory, AlertLevel, AlertPattern
 from core.events import Event
 from services.runtime import DeviceRuntime
@@ -158,15 +159,27 @@ class SimRuntime(DeviceRuntime):
             "faults": faults.describe(),
             "perception": "scripted (no camera, no models)" if self._scripted()
                           else "not simulated for this module (real code, no models on this host)",
-            "not_simulated": ["camera sensor", "Hailo NPU", "BLE provisioning", "GPIO buzzer",
-                              "Wi-Fi", "thermals"],
+            "not_simulated": ["camera sensor", "Hailo NPU", "BLE provisioning", "GPIO buzzer", "Wi-Fi",
+                              *(() if faults.soc_temp_c is not None or faults.throttle else ("thermals",))],
         }
+        if faults.soc_temp_c is not None or faults.throttle:
+            # M8.3: a simulated thermal fault shows on the health card as on a Pi.
+            hot = device_health.thermal_condition(faults.soc_temp_c, list(faults.throttle), False)
+            report["system"] = {"state": "warning" if hot else "ok",
+                                "detail": f"SIMULATED: {hot or 'nominal'}",
+                                "metrics": {"temperature_c": faults.soc_temp_c,
+                                            "throttle_now": list(faults.throttle)}}
         report["network"] = (
             {"state": "failed", "detail": "SIMULATED network outage", "metrics": {}}
             if faults.network_down else
             {"state": "ok", "detail": "SIMULATED: host network, no Wi-Fi radio", "metrics": {}}
         )
         return report
+
+    def _thermal_reading(self) -> tuple[Optional[float], list[str]]:
+        """The scenario's SoC temperature and throttle flags (M8.3 fault hook)."""
+        faults = self.sim.state.current()
+        return faults.soc_temp_c, list(faults.throttle)
 
     def _monitoring_check(self) -> tuple[bool, str]:
         result = super()._monitoring_check()

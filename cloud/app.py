@@ -623,6 +623,11 @@ def init_db() -> None:
             "ALTER TABLE devices ADD COLUMN health_repeats INTEGER DEFAULT 0",
             "ALTER TABLE devices ADD COLUMN health_boots TEXT",
             "ALTER TABLE devices ADD COLUMN health_ignored TEXT",
+            # M8.3: the last stop/resume the app asked for and what became of it
+            # (JSON {id, action, requested_at, applied_at, applied_state, ...}).
+            # Unlike desired_protection it is never cleared, so the status can
+            # say confirmed / mismatch / timed_out after delivery ends.
+            "ALTER TABLE devices ADD COLUMN protection_request TEXT",
         ):
             try:
                 conn.execute(statement)
@@ -1402,6 +1407,164 @@ _ACTUATOR_KEYS = ("name", "kind", "audible", "ready", "detail", "commands_ok", "
                   "physically_verified")
 
 
+# ---------------------------------------------------------------- M8.3 truth (docs/STATE_MODEL.md)
+#: Capabilities that are analysis results, as opposed to the pipeline that feeds
+#: them (camera, inference) and the hardware outputs (alert_output, audible_alert).
+_ANALYSIS_CAPABILITIES = frozenset({"face", "objects", "hands", "pose", "attention"})
+#: How long a stop/resume may go unacknowledged before its outcome is `timed_out`
+#: (the app's ProtectionControl.timeout: stopping drains the pipeline).
+PROTECTION_ACK_TIMEOUT_S = 45.0
+#: A stop not delivered within this long is never delivered: a stop arriving
+#: minutes after the person gave up on it would end protection behind their back.
+#: A resume keeps being delivered until applied (the protective direction).
+PROTECTION_STOP_DELIVERY_S = 30.0
+
+
+def _make_coherent(status: dict) -> list[str]:
+    """Apply the device's own rules to its own report, in the safe direction only.
+
+    A report is normally coherent: services/runtime.py derives every field from
+    one evaluation. One that is not (older firmware, a sample torn between two
+    evaluations, a capability list from before M8.2) must never reach the app
+    as a claim the device's own rules forbid. Each correction only withdraws a
+    claim -- protecting, monitoring, a capability producing results -- never
+    adds one, and is listed in `status.corrections`. A stale status is not
+    touched: it already claims nothing.
+    """
+    if status["stale"]:
+        return []
+    fixes: list[str] = []
+    state, protection = status["monitoring_state"], status["protection"]
+    # An explicit stop is authoritative in whichever block reports it.
+    if (state == "stopped") != (protection == "stopped") and "stopped" in (state, protection):
+        fixes.append(f"stopped in one block but {state if protection == 'stopped' else protection} "
+                     "in the other: reported as stopped")
+        state = protection = "stopped"
+    caps = status.get("capabilities")
+    if isinstance(caps, dict):
+        available = list(caps.get("available") or [])
+        impaired = list(caps.get("impaired") or [])
+        paused = list(caps.get("paused") or [])
+        impaired_names = {i["name"]: i.get("reason") for i in impaired if isinstance(i, dict)}
+
+        def withdraw(name: str, *, pause: bool, reason: str, into_impaired: bool = True) -> None:
+            if name not in available:
+                return
+            available.remove(name)
+            if pause:
+                paused.append(name)
+            elif into_impaired:
+                impaired.append({"name": name, "reason": reason})
+                impaired_names[name] = reason
+            fixes.append(f"{name} withdrawn from available: {reason}")
+
+        if state == "stopped":
+            # M8.2: nothing analyses while stopped (a device before M8.2 said otherwise).
+            for name in sorted(_ANALYSIS_CAPABILITIES | {"inference"}):
+                withdraw(name, pause=True, reason="monitoring is stopped")
+        # Nothing produces results without frames or a running inference loop.
+        for pipe in ("camera", "inference"):
+            if pipe in impaired_names:
+                why = f"no analysis: {pipe} unavailable ({impaired_names[pipe] or 'impaired'})"
+                for name in sorted(_ANALYSIS_CAPABILITIES):
+                    withdraw(name, pause=False, reason=why)
+        # A model that failed or is missing produces nothing (perception truth).
+        # A missing one is left to the perception report, which says
+        # `unsupported` (capability_states): switching cannot repair it.
+        for component, comp in ((status.get("perception") or {}).get("components") or {}).items():
+            kind = COMPONENT_CAPABILITY.get(component)
+            if kind and isinstance(comp, dict) and comp.get("state") in ("failed", "unavailable"):
+                withdraw(kind, pause=False, into_impaired=comp["state"] == "failed",
+                         reason=f"{component.replace('_', ' ')} {comp['state']}: "
+                                f"{comp.get('reason') or 'no reason given'}")
+        # Every policy needs frames and inference (core/monitoring_state.py
+        # BASE_REQUIREMENTS): without either nothing can be evaluated -- FAILED.
+        lost = [p for p in ("camera", "inference") if p in impaired_names]
+        if lost and state in ("ready", "degraded"):
+            fixes.append(f"{state} while {', '.join(lost)} impaired: reported as failed")
+            status["reasons"] = [*status["reasons"],
+                                 *(f"required capability unavailable — {p}: {impaired_names[p]}" for p in lost)]
+            state = "failed"
+        status["capabilities"] = {**caps, "available": available, "impaired": impaired, "paused": paused}
+    if state == "stopped" and isinstance(status.get("perception"), dict):
+        for comp in (status["perception"].get("components") or {}).values():
+            if isinstance(comp, dict) and comp.get("state") in ("ok", "stale", "idle"):
+                comp["state"], comp["reason"] = "paused", "monitoring is stopped"
+                fixes.append("a perception component withdrawn while stopped")
+    if protection == "protecting" and state not in ("ready", "degraded"):
+        fixes.append(f"protecting while {state}: reported as not protecting")
+        protection = "not_protecting"
+        status["protection_reasons"] = [*status["protection_reasons"], f"monitoring state is {state}"]
+    status["monitoring_state"], status["protection"] = state, protection
+    if state != "unknown":
+        status["monitoring_active"] = state in ("ready", "degraded")
+    return fixes
+
+
+def _protection_command(row: sqlite3.Row, now: float) -> Optional[dict]:
+    """The last stop/resume the app asked for, and its outcome (M8.3).
+
+    outcome   pending    not applied yet, within PROTECTION_ACK_TIMEOUT_S
+              confirmed  the device echoed THIS id with the requested state
+              mismatch   the device echoed this id but reports another state
+                         (it refused, or something else changed it first)
+              timed_out  not applied within the timeout
+    The outcome is latched from the report that first carried the echo, so a
+    later local change cannot rewrite what this request did. `delivering` says
+    whether the backend still sends it: a resume until applied, a stop only for
+    PROTECTION_STOP_DELIVERY_S.
+    """
+    columns = row.keys()  # sqlite3.Row: `in row` would test the values
+    record = _loads_dict(row["protection_request"] if "protection_request" in columns else None)
+    action, command_id = record.get("action"), record.get("id")
+    if action not in ("stop", "resume") or not isinstance(command_id, str):
+        return None
+    requested = _reported_at(record.get("requested_at"))
+    age = max(0.0, now - requested) if requested is not None else None
+    applied_at = _reported_at(record.get("applied_at"))
+    applied_state = record.get("applied_state") if isinstance(record.get("applied_state"), str) else None
+    reason = None
+    if applied_at is not None:
+        wanted = applied_state == "stopped" if action == "stop" else applied_state not in (None, "stopped")
+        outcome = "confirmed" if wanted else "mismatch"
+        if not wanted:
+            reason = record.get("refusal") or f"the device reports {applied_state or 'no protection state'}"
+    elif age is not None and age >= PROTECTION_ACK_TIMEOUT_S:
+        outcome = "timed_out"
+    else:
+        outcome = "pending"
+    delivering = applied_at is None and (
+        action == "resume" or (age is not None and age < PROTECTION_STOP_DELIVERY_S))
+    return {"id": command_id[:64], "action": action, "requested_at": requested,
+            "age_s": None if age is None else round(age, 1), "timeout_s": PROTECTION_ACK_TIMEOUT_S,
+            "outcome": outcome, "delivering": delivering, "applied_at": applied_at,
+            "reported_state": applied_state, "reason": str(reason)[:500] if reason else None}
+
+
+def _record_protection_ack(conn: sqlite3.Connection, device_id: int, reported_block: Optional[dict],
+                           monitoring: Optional[dict]) -> None:
+    """Latch the outcome of the last stop/resume from the first report echoing its id (M8.3).
+
+    The state that report carries is what the request did: `stopped` for a stop
+    that took effect, anything else for one the device refused. Later reports
+    (a local resume, a restart) change the status, never this record.
+    """
+    if not reported_block or not isinstance(reported_block.get("last_command_id"), str):
+        return
+    stored = conn.execute("SELECT protection_request FROM devices WHERE id = ?", (device_id,)).fetchone()
+    record = _loads_dict(stored["protection_request"] if stored is not None else None)
+    if record.get("id") != reported_block["last_command_id"] or record.get("applied_at") is not None:
+        return
+    state = reported_block.get("state")
+    record["applied_at"] = time.time()
+    record["applied_state"] = state if state in _PROTECTION_STATES else None
+    refusal = _new_refusal((monitoring or {}).get("last_rejection"), "protection",
+                           json.dumps({"protection": record.get("refusal_baseline")}))
+    if refusal is not None:
+        record["refusal"] = "; ".join(refusal["reasons"]) or "the device refused it"
+    conn.execute("UPDATE devices SET protection_request = ? WHERE id = ?", (json.dumps(record), device_id))
+
+
 def _device_status(row: sqlite3.Row, now: float) -> dict:
     """The typed status the app renders (docs/APP_STATUS_CONTRACT.md).
 
@@ -1505,7 +1668,7 @@ def _device_status(row: sqlite3.Row, now: float) -> dict:
     # reported" (stale, or firmware without it) -- never filled in.
     perception = None if stale else _reported_perception(live, monitoring)
     last_command_id = reported_protection.get("last_command_id") if not stale else None
-    return {
+    status = {
         "monitoring_state": state,
         "monitoring_active": active,
         "protection": protection,
@@ -1532,7 +1695,12 @@ def _device_status(row: sqlite3.Row, now: float) -> dict:
         "link_stale": bool(link_stale),
         "health_stale": health_stale,
         "health_freshness": freshness,
+        # M8.3: the last stop/resume and its acknowledged outcome.
+        "protection_command": _protection_command(row, now),
     }
+    # M8.3: never a claim the device's own rules forbid (see _make_coherent).
+    status["corrections"] = _make_coherent(status)
+    return status
 
 
 #: Request nonces the backend remembers, in the database (sd-auth-v1 replay
@@ -2703,12 +2871,20 @@ def set_protection(device_id: int, body: ProtectionBody, uid: int = Depends(curr
         # stop still in flight cannot be mistaken for a later resume (or the
         # reverse) by comparing states alone.
         command_id = secrets.token_hex(6)
+        requested_at = time.time()
+        # M8.3: the request's record, kept after delivery ends so its outcome
+        # (confirmed / mismatch / timed_out) can be reported, with the device's
+        # current protection refusal as the baseline a new refusal must differ from.
+        record = {"id": command_id, "action": body.action, "requested_at": requested_at,
+                  "applied_at": None, "applied_state": None,
+                  "refusal_baseline": _rejection_fingerprint(_stored_last_rejection(device))}
         conn.execute(
-            "UPDATE devices SET desired_protection = ? WHERE id = ?",
+            "UPDATE devices SET desired_protection = ?, protection_request = ? WHERE id = ?",
             (json.dumps({"action": body.action, "confirm": body.confirm, "id": command_id,
-                         "requested_at": time.time()}), device_id),
+                         "requested_at": requested_at}), json.dumps(record), device_id),
         )
-    return {"ok": True, "desired_protection": body.action, "command_id": command_id}
+    return {"ok": True, "desired_protection": body.action, "command_id": command_id,
+            "timeout_s": PROTECTION_ACK_TIMEOUT_S}
 
 
 @app.post("/v1/devices/{device_id}/preset")
@@ -4633,12 +4809,19 @@ def ingest(body: IngestBody, background_tasks: BackgroundTasks, request: Request
                 # firmware that cannot do this: stop asking it every poll.
                 or (body.monitoring is not None and reported_block is None)
             )
-        if protection_action and protection_done:
+        # M8.3: a stop not delivered in PROTECTION_STOP_DELIVERY_S is withdrawn,
+        # never delivered late; its outcome becomes `timed_out` (a resume is
+        # delivered until applied: late protection is the safe direction).
+        requested_at = _reported_at(desired_protection.get("requested_at"))
+        stop_expired = (protection_action == "stop" and not protection_done and requested_at is not None
+                        and time.time() - requested_at >= PROTECTION_STOP_DELIVERY_S)
+        if protection_action and (protection_done or stop_expired):
             conn.execute(
                 "UPDATE devices SET desired_protection = NULL WHERE id = ? AND desired_protection = ?",
                 (device["id"], row["desired_protection"]),
             )
             protection_action = None
+        _record_protection_ack(conn, device["id"], reported_block, body.monitoring)
         rules_activation = row["ai_rules_activation"] or 0
         custom_monitoring_wanted = bool(row["custom_monitoring_wanted"])
         # A device can report the same active_preset string while AI Custom

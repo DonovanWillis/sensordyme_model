@@ -13,8 +13,10 @@ States, in precedence order (the first that applies wins):
              any active policy watches for can be evaluated at all
   STARTING   boot (or a mode switch) is still bringing a needed capability up,
              and nothing has failed outright; bounded by the caller's grace
-  DEGRADED   some policy, event or alert output cannot work, but every
-             role-required capability is available and something is watched
+  DEGRADED   some policy, event or alert output cannot work, or a device-wide
+             condition (sustained heat throttling the SoC, M8.3) makes it work
+             worse, but every role-required capability is available and
+             something is watched
   READY      every active policy can evaluate every event it declares, and
              every configured alert output is ready
 
@@ -194,10 +196,14 @@ def evaluate(
     policies: Iterable[Policy],
     role_required: Iterable[str] = (),
     actuators: Iterable[Actuator] = (),
+    conditions: Iterable[str] = (),
 ) -> Evaluation:
     """The device's monitoring state from observed facts. See the module docstring.
 
     `stopped` is the reason monitoring was explicitly stopped, or None.
+    `conditions` (M8.3) are device-wide facts that make monitoring work worse
+    without taking a capability away -- sustained heat throttling the SoC. Each
+    is a reason the state is DEGRADED and never READY; none can make it FAILED.
     """
     caps = dict(capabilities)
     actuators = list(actuators)
@@ -230,6 +236,7 @@ def evaluate(
 
     reasons = [f"{p.name}: {r}" for p in policy_health for r in p.reasons]
     reasons += [f"alert output {a.name} unavailable: {a.detail}" for a in actuators if not a.ready]
+    reasons += [f"device: {c}" for c in conditions if c]
     if reasons:
         return Evaluation(MonitoringState.DEGRADED, tuple(reasons), policy_health, caps)
     return Evaluation(MonitoringState.READY, (), policy_health, caps)

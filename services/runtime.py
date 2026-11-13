@@ -96,6 +96,9 @@ _FLASH_DURATION_S = 1.5
 #: Capabilities that are hardware, not analysis: they keep their real state while
 #: monitoring is stopped (the camera still captures; the outputs still work).
 _NOT_PAUSED_WHEN_STOPPED = frozenset({"camera", "audible_alert", "alert_output"})
+#: Capabilities that are analysis results (M8.3): never "available" while the
+#: camera or the inference loop that feeds them is impaired.
+_ANALYSIS_CAPABILITIES = frozenset({"face", "objects", "hands", "pose", "attention"})
 #: The stop reason in words for the app ("by uplink" was internal jargon).
 _STOP_SOURCE_WORDS = {"uplink": "from the app", "dashboard": "from the device's dashboard"}
 _MAX_SWAP_S = 120.0
@@ -1083,10 +1086,12 @@ class DeviceRuntime:
         # monitoring state decides monitoring_active (READY or DEGRADED), not
         # the components alone -- a stopped, failed or still-starting device is
         # not monitoring however healthy its parts look.
-        monitoring = self.monitoring_report()
+        # One evaluation for both blocks (M8.3): see monitoring_report().
+        evaluation = self._evaluate_monitoring()
+        monitoring = self.monitoring_report(evaluation)
         report["monitoring"] = monitoring.to_dict()
         report["monitoring_active"] = monitoring.monitoring
-        report["protection"] = self.protection_state()
+        report["protection"] = self.protection_state(evaluation)
         report["config"] = self._config_report()
         report["saved_state"] = {"faults": list(getattr(self, "_state_faults", []) or [])}
         backlog = getattr(self.uplink, "backlog", None)
@@ -2206,6 +2211,15 @@ class DeviceRuntime:
                 if cap.state == ms.STARTING and name != "inference" else cap
                 for name, cap in caps.items()
             }
+        # M8.3: nothing produces results without frames or a running inference
+        # loop. A model's last result stays "fresh" for its max age after the
+        # camera froze or the loop died; it is not "available" in that window.
+        lost = next((p for p in ("camera", "inference") if caps[p].impaired), None)
+        if lost is not None:
+            why = f"no analysis: {lost} unavailable ({caps[lost].reason or 'impaired'})"
+            caps = {name: ms.Capability(ms.IMPAIRED, why)
+                    if name in _ANALYSIS_CAPABILITIES and cap.available else cap
+                    for name, cap in caps.items()}
         return caps
 
     _LABEL_KINDS = frozenset({"objects", "pose", "face", "hands"})
@@ -2258,17 +2272,47 @@ class DeviceRuntime:
         module = getattr(self, "module", None)
         stopped = None if self._stopped is None else (
             f"monitoring stopped {_STOP_SOURCE_WORDS.get(self._stopped['by'], 'by ' + str(self._stopped['by']))}")
+        thermal = getattr(self, "_thermal_reason", None)
         return ms.evaluate(
             stopped=stopped,
             capabilities=self._capabilities(now, module),
             policies=self._active_policies(module),
             role_required=self.role.required_capabilities,
             actuators=self.alert_manager.actuators() if hasattr(self.alert_manager, "actuators") else (),
+            conditions=(thermal,) if thermal else (),
         )
 
-    def monitoring_report(self) -> ms.MonitoringReport:
-        """The public, typed monitoring state (dashboard /api/health, uplink, app)."""
-        evaluation = self._evaluate_monitoring()
+    #: How often the health thread re-reads temperature and throttling (vcgencmd).
+    _THERMAL_READ_EVERY_S = 20.0
+
+    def _thermal_reading(self) -> tuple[Optional[float], list[str]]:
+        """(SoC °C, live throttle flags). The virtual device overrides this."""
+        return device_health.thermal_reading()
+
+    def _refresh_thermal(self) -> None:
+        """Re-read heat and throttling at most every _THERMAL_READ_EVERY_S, on the
+        health thread (M8.3). Evaluations read only the cached reason, so the
+        inference loop never waits on vcgencmd."""
+        now = time.monotonic()
+        last = getattr(self, "_thermal_read_at", None)
+        if last is not None and now - last < self._THERMAL_READ_EVERY_S:
+            return
+        self._thermal_read_at = now
+        try:
+            temperature, flags = self._thermal_reading()
+        except Exception as exc:  # noqa: BLE001 - an unreadable sensor is not a fault of monitoring
+            log.debug("thermal reading failed: %s", exc)
+            temperature, flags = None, []
+        was = getattr(self, "_thermal_reason", None) is not None
+        self._thermal_reason = device_health.thermal_condition(temperature, list(flags), was)
+
+    def monitoring_report(self, evaluation: Optional[ms.Evaluation] = None) -> ms.MonitoringReport:
+        """The public, typed monitoring state (dashboard /api/health, uplink, app).
+
+        `evaluation` lets a caller report this and protection_state() from ONE
+        evaluation (M8.3): two evaluations a moment apart can straddle a
+        threshold and send "failed" beside "protecting" in the same sample."""
+        evaluation = evaluation if evaluation is not None else self._evaluate_monitoring()
         bus: Optional[FrameBus] = getattr(self, "bus", None)
         frame_age = None if bus is None or bus.age_s() == float("inf") else round(bus.age_s(), 2)
         processed = None if bus is None else bus.processed_age_s()
@@ -2293,6 +2337,7 @@ class DeviceRuntime:
 
     def _monitoring_check(self) -> tuple[bool, str]:
         """Health-monitor tick: evaluate, act on transitions, drive the impaired alert."""
+        self._refresh_thermal()
         report = self.monitoring_report()
         state = report.state
         now = time.monotonic()
@@ -2329,19 +2374,22 @@ class DeviceRuntime:
         self.alert_manager.observe(now, source="health", active={self._IMPAIRED_KEY} if impaired else (),
                                    tracked={self._IMPAIRED_KEY})
 
-    def protection_state(self) -> dict:
+    def protection_state(self, evaluation: Optional[ms.Evaluation] = None) -> dict:
         """The truthful answer to "is this device protecting right now?".
 
         stopped        an explicit, confirmed stop is in force
         protecting     every safeguard the role requires is running
         not_protecting something required is not running; `reasons` says what
+
+        Pass the `evaluation` the accompanying monitoring report was built from,
+        so the two can never disagree (M8.3).
         """
         if self._stopped is not None:
             return {"state": "stopped", "role": self.role.name, "since": self._stopped["since"],
                     "by": self._stopped["by"], "reasons": ["monitoring was stopped explicitly"],
                     "monitoring_state": ms.MonitoringState.STOPPED.value,
                     "last_command_id": self._last_protection_command}
-        evaluation = self._evaluate_monitoring()
+        evaluation = evaluation if evaluation is not None else self._evaluate_monitoring()
         reasons: list[str] = []
         if evaluation.state in (ms.MonitoringState.FAILED, ms.MonitoringState.STARTING):
             reasons += list(evaluation.reasons)
@@ -2379,8 +2427,9 @@ class DeviceRuntime:
             if callable(refresh):
                 # Same moment, same facts: without this the 5 s health sample still
                 # carried the previous state and the app saw a stop or a failure late.
-                report = self.monitoring_report()
-                refresh(report.to_dict(), report.monitoring, self.protection_state())
+                evaluation = self._evaluate_monitoring()
+                report = self.monitoring_report(evaluation)
+                refresh(report.to_dict(), report.monitoring, self.protection_state(evaluation))
         if self.dashboard is not None:
             setter = getattr(self.dashboard, "set_policy_state", None)
             if callable(setter):

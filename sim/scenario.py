@@ -41,9 +41,17 @@ class Faults:
     detector_failing: bool = False
     #: The backend is unreachable from the device (uplink requests fail).
     network_down: bool = False
+    #: M8.3: the SoC temperature the device reads (None: no sensor, as on a Mac),
+    #: and the firmware's live throttle flags (core/device_health.py names).
+    soc_temp_c: Optional[float] = None
+    throttle: tuple[str, ...] = ()
 
     def describe(self) -> list[str]:
         out = []
+        if self.soc_temp_c is not None:
+            out.append(f"SoC {self.soc_temp_c:.1f}°C")
+        if self.throttle:
+            out.append(f"throttle: {', '.join(self.throttle)}")
         if self.camera != "ok":
             out.append(f"camera {self.camera}")
         if self.detector_failing:
