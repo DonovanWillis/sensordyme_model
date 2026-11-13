@@ -279,3 +279,33 @@ def test_backend_stores_them_as_log_with_experimental_true_and_never_notifies(tm
     assert rows["drowsiness"]["severity"] == "loud"
     assert stack.considered == ["loud"]  # only the drowsiness reached the notification gate
     assert len(stack.notified) == 1
+
+
+def test_experimental_families_never_degrade_monitoring_unless_opted_in():
+    """Integrator (M8.4): an experimental observation is not a protection, so a capability
+    only it needs (hands for erratic_hand_movement, under scheduled Hands) must not degrade
+    the monitoring state. Found by test_m02_monitoring_state after the merge: a recovered
+    camera stayed DEGRADED on 'erratic_hand_movement: needs hands'. With the owner's explicit
+    opt-in the families alert, so they count again."""
+    from types import SimpleNamespace
+
+    from core import monitoring_mode
+    from services.runtime import DeviceRuntime
+
+    module = SimpleNamespace(event_requirements=lambda: {
+        "drowsiness": frozenset({"face"}),
+        "erratic_hand_movement": frozenset({"hands", "objects"}),
+        "high_risk": frozenset({"face"}),
+    })
+
+    def policies(opted_in: bool) -> set:
+        stub = SimpleNamespace(
+            mode=monitoring_mode.MonitoringMode.STANDARD, module_name="driver_attention",
+            active_preset="driver_safety", _module_uses_a_detector=lambda: True,
+            _custom_active=lambda: False, alert_manager=SimpleNamespace(experimental_audible=opted_in),
+            _active_companions=lambda: [])
+        found = DeviceRuntime._active_policies(stub, module)  # type: ignore[arg-type]
+        return {event for p in found for event in p.events}
+
+    assert policies(False) == {"drowsiness"}
+    assert policies(True) == {"drowsiness", "erratic_hand_movement", "high_risk"}

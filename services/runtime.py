@@ -2251,6 +2251,14 @@ class DeviceRuntime:
         if self.mode is not monitoring_mode.MonitoringMode.AI_CUSTOM:
             hook: Any = getattr(module, "event_requirements", dict)
             reqs: dict[str, frozenset[str]] = dict(hook())
+            if not getattr(getattr(self, "alert_manager", None), "experimental_audible", False):
+                # M8.4 Decision A: an experimental family is an observation, not a
+                # protection, so a capability only it needs (e.g. hands for
+                # erratic_hand_movement) never degrades monitoring. With the
+                # owner's explicit opt-in it alerts, and then it counts again.
+                from core.behavior.experimental import EXPERIMENTAL_ALERT_TYPES
+                kept = {event: needs for event, needs in reqs.items() if event not in EXPERIMENTAL_ALERT_TYPES}
+                reqs = kept or reqs
             if not reqs:
                 reqs = {self.module_name: frozenset({"objects"}) if self._module_uses_a_detector() else frozenset()}
             name = self.active_preset or self.module_name
