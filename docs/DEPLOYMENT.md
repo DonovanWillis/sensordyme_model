@@ -88,6 +88,11 @@ untouched, and the unit needs no change: it still names `~/sensordyme`.
 The adopt step refuses to run while the unit is active, while an M8 deploy is
 pending, or when the state directory already holds the same items.
 
+**A fresh device.** First install from an approved release with
+`setup_pi.sh`: extract the runbook A3 tarball to `~/sensordyme` and run
+`bash setup_pi.sh`. Since M8.5 it installs only the hashed lock. Then run
+`make deploy-adopt` once. Every update after that is `make deploy`.
+
 To undo the adopt step (service stopped):
 
 ```bash
@@ -232,6 +237,13 @@ make deploy … FIND_LINKS=sensordyme.wheels
 * **To the pre-M8.5 tree:** `TO=legacy-<time>`. To leave the staged layout
   entirely, undo the adopt step (§2).
 * **To the pre-session state:** runbook §O2/O3 (the E1 archive, or the SD image).
+* **A deploy left pending.** A power cut or a killed activation leaves
+  `pending.json`, and the next `make deploy` refuses until the deploy is
+  resolved. Resolve it on the device in one of two ways:
+  * `python3 ~/sensordyme/scripts/release/release_guard.py confirm-or-rollback
+    --root ~/sensordyme --user $(id -un)` judges the running release and confirms
+    it or switches back;
+  * `… rollback …` switches back unconditionally.
 
 ## 5. Dependencies (M84-4)
 
