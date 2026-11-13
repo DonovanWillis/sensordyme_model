@@ -104,7 +104,7 @@ struct CapabilityTierPresentation: Equatable {
                          isProductionValidated: false)
         case .imageLevelBenchmark:
             return .init(chip: "Not yet validated",
-                         detail: "Benchmarked on public still images only, not on video or a device.",
+                         detail: "Only measured on public still photos. Not checked on video or on a device.",
                          isProductionValidated: false)
         case .syntheticTests:
             return .init(chip: "Not yet validated",

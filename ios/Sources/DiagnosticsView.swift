@@ -7,6 +7,9 @@ struct DiagnosticsView: View {
     @EnvironmentObject private var state: AppState
     @State private var results: [StageResult] = []
     @State private var running = false
+    /// The app's own shared live-feed connection, as measured (StreamMetrics):
+    /// nil until a feed has been opened in this app session.
+    @State private var feedMetrics: String?
 
     struct StageResult: Identifiable {
         let id = UUID()
@@ -65,12 +68,33 @@ struct DiagnosticsView: View {
                     }
                 }
             }
+            // M8.4: what the app's own feed connection measured -- delivered
+            // fps, frame age, duplicates, reconnects -- read from the shared
+            // reader (no new connection is opened to show it).
+            Section {
+                Text(feedMetrics ?? "No live feed has been opened since the app started.")
+                    .font(feedMetrics == nil ? SD.Typography.caption : SD.Typography.caption.monospaced())
+                    .foregroundStyle(SD.Colors.textSecondary)
+                    .fixedSize(horizontal: false, vertical: true)
+                    .textSelection(.enabled)
+                    .accessibilityIdentifier("doctor.feedMetrics")
+            } header: {
+                Text("Live feed in this app")
+            } footer: {
+                Text("Counted by this phone for the camera feed it has open or had open: frames per second delivered, how old frames were when they arrived, and how often the connection dropped.")
+            }
         }
             .orynRows()
         }
         .orynFormStyle()
+        .onAppear { refreshFeedMetrics() }
         .navigationTitle("Connection doctor")
         .navigationBarTitleDisplayMode(.inline)
+    }
+
+    private func refreshFeedMetrics() {
+        let reader = LiveFeedSession.shared.reader
+        feedMetrics = reader.metrics.connectionOpens > 0 ? reader.metricsSummary() : nil
     }
 
     private func word(for passed: Bool?) -> String {
@@ -127,7 +151,7 @@ struct DiagnosticsView: View {
     // ------------------------------------------------------------------ checks
     private func runAll() async {
         running = true
-        defer { running = false }
+        defer { running = false; refreshFeedMetrics() }
         results = []
 
         if state.isDemo {
