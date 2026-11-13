@@ -137,7 +137,9 @@ def status_violations(row: dict) -> list[tuple[str, str]]:
         out.append(("stale_definition", f"health_stale={health_stale} freshness={freshness.get('state')}"))
     age, threshold = freshness.get("age_s"), freshness.get("threshold_s")
     if freshness.get("verified") and isinstance(age, (int, float)) and isinstance(threshold, (int, float)) \
-            and age >= threshold and not status.get("stale"):
+            and age >= threshold + 0.05 and not status.get("stale"):
+        # +0.05: the backend decides on the exact age (fresh iff age < threshold) and
+        # reports age_s rounded to 0.1 s, so 29.96 s is fresh and reads "30.0" (M8.4 soak).
         out.append(("stale_definition", f"health {age}s old (>= {threshold}s) but not stale; online={row.get('online')}"))
     if row.get("online") and link_stale:
         out.append(("stale_definition", "online but link_stale"))
