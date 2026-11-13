@@ -469,6 +469,9 @@ def run_live(args: argparse.Namespace) -> dict:
             if not device.alive():  # it crashed on its own: that is a finding, and it comes back
                 windows.add(now, now + 25, "device process exited unexpectedly")
                 violations["device_process_exited"] += 1
+                if violations["device_process_exited"] > 5:
+                    tail = (out / "device.log").read_text(errors="replace")[-3000:]
+                    raise RuntimeError(f"the device process keeps exiting; aborting the soak:\n{tail}")
                 device = start_device()
             if not backend.alive():
                 violations["backend_process_exited"] += 1
