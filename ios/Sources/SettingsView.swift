@@ -40,6 +40,15 @@ struct SettingsView: View {
                                 .fixedSize(horizontal: false, vertical: true)
                         }
                         .accessibilityElement(children: .combine)
+                        // M8.4: deleting the account, one level down, where what
+                        // is and is not deleted is said before anything happens.
+                        NavigationLink {
+                            AccountDeletionView()
+                        } label: {
+                            Label("Delete account", systemImage: "person.crop.circle.badge.xmark")
+                                .foregroundStyle(SD.Colors.danger)
+                        }
+                        .accessibilityIdentifier("settings.deleteAccount")
                     }
                 }
 
@@ -158,6 +167,7 @@ struct SettingsView: View {
                 case "text": TextAlertsSettingsView()
                 case "alerts": BackgroundAlertsSettingsView()
                 case "doctor": DiagnosticsView()
+                case "delete": AccountDeletionView()
                 default: EmptyView()
                 }
             }

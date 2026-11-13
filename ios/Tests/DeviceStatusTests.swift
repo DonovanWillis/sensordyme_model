@@ -1,7 +1,7 @@
 import Foundation
 
 // Run with ios/Tests/run.sh
-// run.sh deps: PerceptionStatus CapabilityTier PresetLibrary
+// run.sh deps: PerceptionStatus CapabilityTier PresetLibrary StreamLiveness MJPEGStream
 
 var failures = 0
 func check(_ condition: Bool, _ what: String) {
@@ -236,6 +236,23 @@ do {
     let oddDecodedFreshness = try? JSONDecoder().decode(DeviceStatus.self, from: oddFreshness)
     check(oddDecodedFreshness != nil && oddDecodedFreshness?.healthFreshness?.state == nil
           && oddDecodedFreshness?.healthStale == nil, "wrong-typed freshness fields are dropped, not fatal")
+}
+
+print("\nM8.4: camera_mode (owner Decision C) is decoded from the status:")
+do {
+    let reported = #"{"camera_mode": {"supported": true, "camera_only": false, "desired_camera_only": true, "#
+        + #""pending": true, "remote_stream": "off_while_stopped", "command_id": "a1b2c3", "stale": false}}"#
+    let status = try? JSONDecoder().decode(DeviceStatus.self, from: Data(reported.utf8))
+    check(status?.cameraMode?.supported == true && status?.cameraMode?.cameraOnly == false
+          && status?.cameraMode?.pending == true && status?.cameraMode?.remoteStream == "off_while_stopped",
+          "every reported field")
+    let presentation = CameraModePresentation.resolve(status?.cameraMode)
+    check(presentation.kind == .offWhileStopped && presentation.pending, "presented as off, turning on")
+    let none = try? JSONDecoder().decode(DeviceStatus.self, from: Data(#"{"stale": false}"#.utf8))
+    check(none?.cameraMode == nil && CameraModePresentation.resolve(none?.cameraMode).kind == .unknown,
+          "a backend before M8.4: unknown, no switch")
+    let odd = try? JSONDecoder().decode(DeviceStatus.self, from: Data(#"{"camera_mode": "on"}"#.utf8))
+    check(odd != nil && odd?.cameraMode == nil, "a malformed camera_mode is dropped, not fatal")
 }
 
 print(failures == 0 ? "\nall passed" : "\n\(failures) FAILED")

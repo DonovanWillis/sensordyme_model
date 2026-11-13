@@ -94,6 +94,11 @@ struct LiveFeedSettingsView: View {
                             : "Saved to this phone's keychain. It must match dashboard.token in the device's config.yaml."))
                 }
 
+                // M8.4 (owner Decision C): from the account, as the device reports it.
+                if !state.isDemo {
+                    CameraModeSection()
+                }
+
                 Section {
                     if let health {
                         LabeledContent("Overall") {

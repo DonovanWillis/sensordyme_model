@@ -1,7 +1,7 @@
 import Foundation
 
 // Run with ios/Tests/run.sh
-// run.sh deps: ConnectionTruth DevicePresence DeviceStatus PerceptionStatus CapabilityTier PresetLibrary
+// run.sh deps: ConnectionTruth DevicePresence DeviceStatus PerceptionStatus CapabilityTier PresetLibrary StreamLiveness MJPEGStream
 
 var failures = 0
 func check(_ condition: Bool, _ what: String) {

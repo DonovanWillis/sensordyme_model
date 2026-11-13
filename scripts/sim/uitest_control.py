@@ -47,6 +47,15 @@ The UI tests drive scenarios through the control port (127.0.0.1 only):
                                       account, pairing and event history; the tests use /fresh.
 
 Every request is answered with JSON. Nothing leaves the machine; no camera is used.
+
+Rendering the phone's camera-privacy behaviour (M8.4, owner Decision C): by
+default the virtual device runs with no local feed (--no-dashboard), which is
+what the journeys need. `--device-dashboard-port N` serves its feed on N (the
+app reaches it over loopback), and `--no-local-camera-while-stopped` sets
+`dashboard.local_camera_while_stopped: false`, so a stopped device shows the
+app what a phone NOT on the device's own network sees ("Camera off") rather
+than the local view ("Local view -- not monitoring"). Both are for renders;
+the test runner passes neither.
 """
 
 from __future__ import annotations
@@ -86,8 +95,13 @@ CONTROLLER_CLIENT_HEADER = "X-UITest-Controller"
 
 
 class Stack:
-    def __init__(self, work: Path, backend_port: int, python: str) -> None:
+    def __init__(self, work: Path, backend_port: int, python: str, dashboard_port: int | None = None,
+                 local_camera_while_stopped: bool = True) -> None:
         self.work, self.python = work, python
+        #: Render options (module docstring): the device's own feed, and whether a
+        #: stopped device still shows it on the local network.
+        self.dashboard_port = dashboard_port
+        self.local_camera_while_stopped = local_camera_while_stopped
         # The account the tests sign in with. /fresh replaces it with a new one.
         self.email, self.password = DEMO_EMAIL, DEMO_PASSWORD
         self.generation = 0
@@ -131,11 +145,18 @@ class Stack:
         with self.lock:
             self._stop_device_locked()
             log = open(self.work / "device.log", "ab")  # noqa: SIM115
-            self.device = subprocess.Popen(
-                [self.python, "-m", "sim.virtual_device", "--backend", self.backend_url,
-                 "--factory", str(self.work / "backend" / "factory.json"),
-                 "--state-dir", str(self.work / "device"), "--scenario", scenario, "--no-dashboard"],
-                cwd=REPO, env=self._env(), stdout=log, stderr=subprocess.STDOUT)
+            feed = (["--dashboard-port", str(self.dashboard_port)] if self.dashboard_port
+                    else ["--no-dashboard"])
+            device_args = ["--backend", self.backend_url, "--factory", str(self.work / "backend" / "factory.json"),
+                           "--state-dir", str(self.work / "device"), "--scenario", scenario, *feed]
+            if self.local_camera_while_stopped:
+                command = [self.python, "-m", "sim.virtual_device", *device_args]
+            else:
+                # The device's own config with dashboard.local_camera_while_stopped
+                # off; sim/ is unchanged (sim.device.VirtualDevice.config wrapped).
+                command = [self.python, "-c", _NO_LOCAL_CAMERA_WHILE_STOPPED, *device_args]
+            self.device = subprocess.Popen(command, cwd=REPO, env=self._env(), stdout=log,
+                                           stderr=subprocess.STDOUT)
             self.scenario = scenario
             self.health_frozen = False  # a new process starts unfrozen
 
@@ -501,6 +522,25 @@ def control_handler(stack: Stack, app_port: AppPort, stop: threading.Event):
     return Control
 
 
+#: Runs sim.virtual_device with `dashboard.local_camera_while_stopped: false`
+#: (render option; see the module docstring).
+_NO_LOCAL_CAMERA_WHILE_STOPPED = """
+import sys
+import sim.device as device
+import sim.virtual_device as virtual_device
+
+_config = device.VirtualDevice.config
+
+def config(self):
+    data = _config(self)
+    data["dashboard"] = {**data.get("dashboard", {}), "local_camera_while_stopped": False}
+    return data
+
+device.VirtualDevice.config = config
+sys.exit(virtual_device.main(sys.argv[1:]))
+"""
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     parser.add_argument("--work", required=True, type=Path)
@@ -509,10 +549,15 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--control-port", type=int, default=8790)
     parser.add_argument("--python", default=sys.executable, help="interpreter with the device + backend requirements")
     parser.add_argument("--claimed", action="store_true", help="claim the device for the demo account at start")
+    parser.add_argument("--device-dashboard-port", type=int, default=None,
+                        help="serve the virtual device's own feed on this port (renders; default: none)")
+    parser.add_argument("--no-local-camera-while-stopped", action="store_true",
+                        help="dashboard.local_camera_while_stopped: false on the virtual device (renders)")
     args = parser.parse_args(argv)
     args.work.mkdir(parents=True, exist_ok=True)
 
-    stack = Stack(args.work, args.backend_port, args.python)
+    stack = Stack(args.work, args.backend_port, args.python, dashboard_port=args.device_dashboard_port,
+                  local_camera_while_stopped=not args.no_local_camera_while_stopped)
     stop = threading.Event()
     app_port = AppPort(args.app_port, stack)
     control = ThreadingHTTPServer(("127.0.0.1", args.control_port), control_handler(stack, app_port, stop))
