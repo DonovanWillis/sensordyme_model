@@ -858,6 +858,7 @@ struct DeviceDetailView: View {
                     ForEach(Array(recent.enumerated()), id: \.element.id) { index, event in
                         TimelineRow(event: event, isLast: index == recent.count - 1,
                                     expanded: expandedEventID == event.id, relativeTime: true,
+                                    identifier: "detail.activity.row",
                                     onToggle: { expandedEventID = expandedEventID == event.id ? nil : event.id },
                                     onExplain: { selectedEvent = event })
                     }

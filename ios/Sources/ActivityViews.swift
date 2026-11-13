@@ -38,6 +38,9 @@ struct TimelineRow: View {
     /// Relative time ("6 min ago") for a short recent list; clock time when the
     /// list is grouped by day.
     var relativeTime = false
+    /// `event.row` in Activity; the device screen's short list uses its own,
+    /// so a query for the history's rows never finds the screen underneath.
+    var identifier = "event.row"
     var onToggle: () -> Void
     var onExplain: () -> Void
 
@@ -55,7 +58,7 @@ struct TimelineRow: View {
                         when: event.date.map { Self.spokenAge.localizedString(for: $0, relativeTo: .now) }))
                     .accessibilityHint(expanded ? "Hides the details" : "Shows the details")
                     .accessibilityAddTraits(expanded ? .isSelected : [])
-                    .accessibilityIdentifier("event.row")
+                    .accessibilityIdentifier(identifier)
                 if expanded { details }
             }
             .padding(.bottom, isLast ? 0 : SD.Space.md)
