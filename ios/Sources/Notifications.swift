@@ -172,9 +172,11 @@ final class AlertNotifier: NSObject, ObservableObject {
         content.userInfo = ["eventID": event.eventID ?? -1, "deviceID": device.id]
         content.threadIdentifier = "device-\(device.id)"
 
-        if simulated {
+        if simulated || event.isSimulated {
             // Never let a demo alert be mistaken for a real detection. This is
-            // the difference between a demo and a misrepresentation.
+            // the difference between a demo and a misrepresentation. The event
+            // itself says so too (M8.3): a virtual device's alert, reaching a
+            // real account, is labelled the same way.
             content.subtitle = "\(event.title) (simulated)"
         }
         // `.timeSensitive` needs an entitlement a free account may not carry, so
