@@ -1047,10 +1047,15 @@ struct DeviceDetailView: View {
                         .foregroundStyle(SD.Colors.warning)
                         .fixedSize(horizontal: false, vertical: true)
                 }
+                // How far it is validated, as the device reports it: said once,
+                // quietly, under the name (the mode library's treatment).
+                Label(shown.badge, systemImage: "seal")
+                    .font(SD.Typography.caption.weight(.medium))
+                    .foregroundStyle(SD.Colors.warning)
+                    .fixedSize(horizontal: false, vertical: true)
+                    .padding(.top, 2)
             }
-            Spacer(minLength: SD.Space.xs)
-            SDEyebrow(shown.badge, color: SD.Colors.warning)
-                .multilineTextAlignment(.trailing)
+            Spacer(minLength: 0)
         }
         .accessibilityElement(children: .combine)
         .accessibilityLabel("\(shown.title): \(shown.stateText). \(shown.badge)"
