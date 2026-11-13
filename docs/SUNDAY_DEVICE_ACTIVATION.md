@@ -479,16 +479,17 @@ attention_lost (loud/critical), fatigue_warning, frequent_glancing (soft); `elev
 `high_risk`, `erratic_hand_movement` sound today but are **experimental** (presets
 limitation). `phone_detected` and `eating_drinking` are log-only.
 
-**ALPHA is changing risk and phone logic in parallel** (Decision A: experimental alerts
-non-audible; Decision B: a visible phone contributes no risk). Rows marked
-**TODO-INTEGRATOR** must be re-read against ALPHA's merge before the session.
+Expectations are for the M8.4 candidate with ALPHA merged (Decision A: experimental alert families are
+logged observations, never audible; Decision B: a visible phone contributes no risk). The shadow behaviour
+engine (`docs/BEHAVIOR_ENGINE.md`) runs alongside and never alerts; record its abstentions from
+`/api/health` telemetry (`engine_*`) as findings.
 
-| # | Case (how) | Expected at `c9029fa` | Must NOT happen | Notes / TODO |
+| # | Case (how) | Expected (M8.4 candidate) | Must NOT happen | Notes |
 |---|---|---|---|---|
-| B1 | **Eyes closed 3 s**, head level, face visible | `drowsiness` after ~2.0 s of continuous closure (`drowsy_seconds` 2.0, + ~0.3 s median lag), critical tone, one CSV row; `elevated_risk` (soft) may follow (eye risk 0.42 weight) | blinks or a 1 s closure alerting | `elevated_risk` audibility: **TODO-INTEGRATOR (ALPHA, Decision A)** |
+| B1 | **Eyes closed 3 s**, head level, face visible | `drowsiness` after ~2.0 s of continuous closure (`drowsy_seconds` 2.0, + ~0.3 s median lag), critical tone, one CSV row; `elevated_risk` may be LOGGED as an experimental observation (`experimental: true`, severity `log`): never a sound or push (M8.4 Decision A) | blinks or a 1 s closure alerting; any audible `elevated_risk`/`high_risk` | Decision A merged (`alerts.experimental_alerts_audible: false`) |
 | B2 | **Sustained look-away**: head turned ~40° to the side (passenger), held 4 s | `distraction` at ~3.0 s (`distraction_seconds`; yaw > 35° calibrated), loud | an alert under 3 s | a turn beyond 55° gets `rearview_tolerance_seconds` 5.0 s; face lost mid-turn with the body visible coasts the turn, `attention_lost` waits 8 s |
-| B3 | **Phone mounted, unused**: phone in a dash/vent mount, screen on, eyes on the road, both hands visible on the wheel, 60 s | at most one `phone_detected` (log-only, rising edge); **no `phone_use`**; no loud alert | `phone_use` (Decision B) | at `c9029fa` a mounted phone still adds 0.3 phone risk (no alert alone). A glance at the mounted phone > 2 s: `phone_use` is suppressed only once hand tracking judged the phone **set down** (hands seen elsewhere + phone still ≥ 2 s); otherwise "hold unknown" → `phone_use` fires; a phone centred outside the driver's person box is ignored. **TODO-INTEGRATOR (ALPHA, Decision B)** |
-| B4 | **Phone held + eyes off road**: subject holds the phone in the lap and looks down at it 4 s | `phone_use` at ~2.0 s (`phone_use_seconds`), loud, detail "hand overlapping the phone (experimental hand tracking)" or "phone visible; no hand confirmed on it"; `eyes_down` at 2.5 s (pitch < −20°); `elevated_risk` likely | – | owner go-ahead (MHS E7). risk alerts: **TODO-INTEGRATOR (ALPHA)** |
+| B3 | **Phone mounted, unused**: phone in a dash/vent mount, screen on, eyes on the road, both hands visible on the wheel, 60 s | at most one `phone_detected` (log-only, rising edge); **no `phone_use`**; no loud alert | `phone_use` (Decision B) | M8.4 Decision B merged: a visible/mounted/unheld phone adds **0** risk. Known validated-alert behaviour (owner decision pending, docs/BEHAVIOR_ENGINE.md): a LOOK at the mounted phone ≥ 2 s that starts before hand tracking has judged it set down (≈ 2 s of stillness with hands seen elsewhere), or with no hands seen, still fires `phone_use` (the shadow engine abstains); record it as a finding, not a defect. A phone centred outside the driver's person box is ignored |
+| B4 | **Phone held + eyes off road**: subject holds the phone in the lap and looks down at it 4 s | `phone_use` at ~2.0 s (`phone_use_seconds`), loud, detail "hand overlapping the phone (experimental hand tracking)" or "phone visible; no hand confirmed on it"; `eyes_down` at 2.5 s (pitch < −20°); `elevated_risk`/`high_risk` only as logged experimental observations, never audible (Decision A) | – | owner go-ahead (MHS E7) |
 | B5 | **Mirror glance**: a 1 s look at the rear-view or side mirror, back to the road; repeat 3× spaced out | nothing | `distraction` | 5 glances past 35° within 45 s → `frequent_glancing` (soft) is designed behaviour: record if it fires |
 | B6 | **Sunglasses** (IR-pass and IR-block if available), eyes open 30 s, then closed 3 s | **unvalidated** (presets: "sunglasses and night driving are untested"). Record: face found? false `drowsiness` with eyes open? closure detected? If the face is lost and no person is detected → `attention_lost` after 2.5 s | a false `drowsiness` with eyes open is a finding | the iris veto only suppresses false closures; `behavior_v2` occlusion handling is off |
 | B7 | **Hands out of view** (hands in the lap, below the frame), eyes on the road, 30 s | no alert; hand evidence "unknown" | any alert | with a phone visible and eyes off the road it would still be `phone_use` (unknown keeps recall) |
@@ -521,6 +522,6 @@ signs the decision line in `$EV/LOG.md`.
 1. Record the M8.4 candidate commit: `git rev-parse feat/m8.4-leapfrog` → §0.1, `--expect-commit`, §2.
 2. ~~Step 22: PRIVSEC's names~~ (done: `status.camera_mode`, `POST /v1/devices/{id}/camera-mode`, `camera_only` / `camera_local` labels; `check_live_status.py` judges them).
 3. ~~§2: link PRIVSEC's matrix~~ (done: `docs/SECURITY_REVIEW_M6.md` §7).
-4. §5 rows B1, B3, B4 (and every `elevated_risk` / `high_risk` / `erratic_hand_movement` mention): re-read against ALPHA's merge (Decision A: experimental alerts non-audible; Decision B: a visible phone contributes no risk; phone hold logic).
+4. ~~§5 rows B1, B3, B4~~ (done: re-read against ALPHA's merge; Decisions A and B; the mounted-phone `phone_use` look is an open owner decision).
 5. If BETA changes the model artifact or decoder for Sunday (not expected), update §2's pin row and MHS §3.
 6. `docs/FAILURE_MATRIX.md` and `docs/BLE_PROOF_OF_POSSESSION.md` (other owners) still say "Monday 2026-11-16": add a Sunday pointer if wanted.
