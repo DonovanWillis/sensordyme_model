@@ -360,6 +360,7 @@ struct DeviceDetailView: View {
                 try? await Task.sleep(for: .seconds(1.5))
                 jupiterSheet = JupiterSheet(prompt: DebugLaunch.jupiterPrompt ?? "")
             } else if DebugLaunch.openHistory {
+                try? await Task.sleep(for: .seconds(1.5))  // after the push settles, as above
                 showHistory = true
             } else if let which = DebugLaunch.openEvent {
                 try? await Task.sleep(for: .seconds(1.5))
