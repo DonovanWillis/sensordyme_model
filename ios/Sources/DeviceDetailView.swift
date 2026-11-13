@@ -106,7 +106,7 @@ struct DeviceDetailView: View {
     /// of offering a control that cannot work.
     @State private var protectionUnsupported: String?
     /// What the device confirmed, shown for a while after it converged.
-    @State private var protectionNotice: (text: String, at: Date)?
+    @State private var protectionNotice: (text: String, at: Date, confirmed: Bool)?
     @State private var confirmStop = false
 
     private let refreshTimer = Timer.publish(every: 4, on: .main, in: .common).autoconnect()
@@ -291,7 +291,11 @@ struct DeviceDetailView: View {
             DemoTriggerView(device: device) { await reload() }
         }
         // Acknowledged only when the DEVICE confirms a stop or resume.
-        .sensoryFeedback(.success, trigger: protectionNotice?.at) { _, new in new != nil }
+        // Not for a stop/resume the device cancelled or answered differently
+        // (M8.3 failed / mismatch): those settle too, and are no success.
+        .sensoryFeedback(.success, trigger: protectionNotice?.at) { _, new in
+            new != nil && protectionNotice?.confirmed == true
+        }
         .onChange(of: instrument.kind) { old, new in
             // One quiet acknowledgement when monitoring becomes ready again —
             // never on first load, never for anything short of ready.
@@ -1573,7 +1577,7 @@ struct DeviceDetailView: View {
         case .idle: break
         }
         if let notice = protectionNotice, Date().timeIntervalSince(notice.at) < 20 {
-            return (notice.text, SD.Colors.textSecondary)
+            return (notice.text, notice.confirmed ? SD.Colors.textSecondary : SD.Colors.warning)
         }
         if device.status == nil {
             return ("This server doesn't report monitoring state, so a stop or resume couldn't be confirmed.",
@@ -1620,7 +1624,8 @@ struct DeviceDetailView: View {
               phase.isFinal, let text = phase.text
         else { return }
         protectionRequest = nil
-        protectionNotice = (text, Date())
+        let confirmed: Bool = { if case .confirmed = phase { return true }; return false }()
+        protectionNotice = (text, Date(), confirmed)
     }
 
     // Recent activity moved to EventHistoryView (Manage → Event history). The
