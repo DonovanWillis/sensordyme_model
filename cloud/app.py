@@ -2178,7 +2178,7 @@ _EVENT_TITLES = {
     "frequent_glancing": "⚠️ Frequent Glancing Away",
     "phone_use": "📱 Phone Use Detected",
     "phone_detected": "📱 Phone Detected",
-    "phone_in_hand": "📱 Phone In Hand",
+    "phone_in_hand": "📱 Phone Near Hand (experimental)",
     "eating_drinking": "🍔 Eating/Drinking Detected",
     "occupancy_change": "🚶 Occupancy Changed",
     "person_lingering": "🚨 Person Lingering",

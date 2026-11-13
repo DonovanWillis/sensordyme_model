@@ -79,7 +79,7 @@ def test_d1_a_held_phone_in_the_lap_is_phone_use_and_says_a_hand_holds_it(tmp_pa
     module, frame = _make(tmp_path, clock, v2=False, hands=hands)
     events = _run(module, frame, clock, 3.0, landmarks(**LOOK_DOWN))
     phone = [e for e in events if e.type == "phone_use"]
-    assert len(phone) == 1 and phone[0].contributing_signals == "hand on phone"
+    assert len(phone) == 1 and phone[0].contributing_signals == "hand overlapping the phone (experimental hand tracking)"
     assert phone[0].duration == pytest.approx(2.0, abs=0.1), "the configured phone_use_seconds"
     assert module._phone_hold.state == PHONE_HELD and module.is_alert_active()
 

@@ -648,7 +648,7 @@ M8 (`feat/m8-product-intelligence`) changes device behaviour in ways the steps a
 curl -s -H "X-Device-Token: $TOKEN" localhost:8899/api/health | $PY -c '
 import json,sys;d=json.load(sys.stdin)["device"]
 print("config", d.get("config")); print("saved_state", d.get("saved_state")); print("uplink_backlog", d.get("uplink_backlog"))
-acc=[c for c in (d.get("components") or []) if "accel" in json.dumps(c).lower()]; print("accelerator", json.dumps(acc)[:400])'
+print("accelerator", json.dumps(d.get("accelerator"))[:400])'
 ```
 
 Expect:
