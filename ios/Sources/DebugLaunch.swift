@@ -29,6 +29,14 @@ enum DebugLaunch {
     static var tab: String? { value(after: "-orynTab") }
     /// Text to pre-fill (and send) in Ask Jupiter.
     static var jupiterPrompt: String? { value(after: "-orynPrompt") }
+    /// Open a Settings page: live, text, alerts or doctor.
+    static var settingsPage: String? { value(after: "-orynSettingsPage") }
+    /// Scroll the device screen to a section (`-orynScrollTo modes`).
+    static var scrollTarget: String? { value(after: "-orynScrollTo") }
+    /// Open Add device (`wizard`) or Bluetooth setup (`bluetooth`) from the device list.
+    static var openSetup: String? { value(after: "-orynOpenSetup") }
+    /// Put the keyboard in the device screen's Ask Jupiter dock.
+    static var focusJupiter: Bool { args.contains("-orynFocusJupiter") }
     /// Don't ask for notification permission (the prompt would cover the screen).
     static var noPermissionPrompt: Bool { args.contains("-orynNoPrompt") }
     /// Start signed out, so a UI test can begin at the sign-in screen. It calls the
@@ -56,6 +64,10 @@ enum DebugLaunch {
     static let openMode: String? = nil
     static let tab: String? = nil
     static let jupiterPrompt: String? = nil
+    static let openSetup: String? = nil
+    static let scrollTarget: String? = nil
+    static let settingsPage: String? = nil
+    static let focusJupiter = false
     static let session: (token: String, email: String)? = nil
     static let noPermissionPrompt = false
     static let signOut = false

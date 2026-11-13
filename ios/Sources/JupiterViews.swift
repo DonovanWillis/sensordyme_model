@@ -34,18 +34,54 @@ enum JupiterSuggestions {
         kind: "Not possible: SensorDyme never identifies people")
 }
 
+
 // MARK: - The dock
 
-/// Ask Jupiter, floating above the tab bar on the device screen: a light
-/// prompt surface that opens in place when focused (what Jupiter can be asked,
-/// a comfortable field) and hands the request to the review sheet, which zooms
-/// out of it. Nothing changes on the device from here: the sheet shows what
-/// Jupiter understood and asks before activating.
+/// What the device screen's scroll view tells the dock: where the page is.
+/// Held by the device screen in `@State` and read only by the dock, so a
+/// scroll redraws the dock (and only when its form changes), never the page.
+@Observable
+final class JupiterDockModel {
+    /// The dock is the compact button because the page was scrolled down.
+    private(set) var minimised = false
+    /// Focused, or holding a typed request: the dock stays the field.
+    @ObservationIgnored var engaged = false
+    @ObservationIgnored private var tracker = JupiterDockBehavior.Tracker()
+
+    /// One scroll sample from the device screen (`onScrollGeometryChange`).
+    func scrolled(offset: Double, maxOffset: Double) {
+        if tracker.scrolled(offset: offset, maxOffset: maxOffset, engaged: engaged) {
+            minimised = tracker.minimised
+        }
+    }
+
+    func restore() {
+        tracker.restore()
+        if minimised { minimised = false }
+    }
+}
+
+/// Ask Jupiter, floating above the tab bar on the device screen.
 ///
-/// The field is one stable view whatever the dock's state, so focus survives
-/// the screen's 4 s refreshes (journey 10) and the suggestions appearing.
+/// At rest it is a light prompt field that opens in place when focused (what
+/// Jupiter can be asked, a comfortable field) and hands the request to the
+/// review sheet, which zooms out of it. Nothing changes on the device from
+/// here: the sheet shows what Jupiter understood and asks before activating.
+///
+/// It steps aside while the page is read (JupiterDockBehavior): scrolled down,
+/// it becomes a compact button at the trailing edge that a tap turns back into
+/// the field. At accessibility text sizes it is always that button, and the
+/// button opens the full Ask Jupiter screen, where the request has the whole
+/// width. The device screen sets the dock as its bottom safe-area inset, so the
+/// page always ends above it and nothing on the page is unreachable behind it.
+///
+/// The field is one stable view while it shows, so focus survives the screen's
+/// 4 s refreshes (journey 10) and the suggestions appearing.
 struct JupiterDock: View {
     let deviceName: String
+    let model: JupiterDockModel
+    var zoomNamespace: Namespace.ID
+    var zoomEnabled = true
     /// The request, normalised (JupiterPrompt), to open the review sheet with.
     var onSubmit: (String) -> Void
     /// The full Ask Jupiter screen with no request yet (all examples).
@@ -54,12 +90,53 @@ struct JupiterDock: View {
     /// Owned here, not by the device screen, so typing redraws the dock only.
     @State private var draft = ""
     @FocusState private var focused: Bool
+    @State private var submitted = 0
+    @State private var focusWhenShown = false
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
     @Environment(\.dynamicTypeSize) private var typeSize
 
+    /// The height of the dock in either form, so the page's inset does not
+    /// jump when it changes form.
+    static let height: CGFloat = 52
+
     private var canSubmit: Bool { JupiterPrompt.canSubmit(draft) }
 
+    private var form: JupiterDockBehavior.DockForm {
+        // In use, it stays the field whatever the page did.
+        if focused || !draft.isEmpty, !typeSize.isAccessibilitySize { return .field }
+        return JupiterDockBehavior.form(accessibilitySize: typeSize.isAccessibilitySize, minimised: model.minimised)
+    }
+
     var body: some View {
+        HStack(spacing: 0) {
+            Spacer(minLength: 0)
+            switch form {
+            case .field:
+                field
+                    .transition(.opacity)
+            case .button:
+                compactButton
+                    .transition(.opacity)
+            }
+        }
+        .animation(SD.Motion.resolved(SD.Motion.spatial, reduceMotion: reduceMotion), value: form)
+        .accessibilityElement(children: .contain)
+        .accessibilityIdentifier("jupiter.dock")
+        .onChange(of: focused) { _, isFocused in
+            model.engaged = isFocused || !draft.isEmpty
+            if isFocused { model.restore() }
+        }
+        .onChange(of: draft.isEmpty) { _, empty in model.engaged = focused || !empty }
+        .task {
+            guard DebugLaunch.focusJupiter else { return }
+            try? await Task.sleep(for: .seconds(2))
+            focused = true
+        }
+    }
+
+    // MARK: Field
+
+    private var field: some View {
         VStack(alignment: .leading, spacing: SD.Space.sm) {
             if focused {
                 suggestions
@@ -104,14 +181,54 @@ struct JupiterDock: View {
         .padding(.leading, SD.Space.md)
         .padding(.trailing, SD.Space.xxs)
         .padding(.vertical, focused ? SD.Space.sm : 2)
-        .frame(minHeight: 52)
+        .frame(minHeight: Self.height)
         .sdFloatingSurface(RoundedRectangle(cornerRadius: focused ? 24 : 26, style: .continuous))
+        .sdZoomSource(.jupiter, in: zoomNamespace, cornerRadius: 26, enabled: zoomEnabled)
         .animation(SD.Motion.resolved(SD.Motion.spatial, reduceMotion: reduceMotion), value: focused)
-        .accessibilityElement(children: .contain)
-        .accessibilityIdentifier("jupiter.dock")
+        .onAppear {
+            guard focusWhenShown else { return }
+            focusWhenShown = false
+            DispatchQueue.main.async { focused = true }
+        }
     }
 
-    @State private var submitted = 0
+    // MARK: Compact
+
+    /// The dock stepped aside: the Jupiter mark on the floating surface, the
+    /// same 52 pt as the field so the page does not move. Fixed in size at
+    /// every text size, like a tab bar item, with the Large Content Viewer for
+    /// its name.
+    private var compactButton: some View {
+        Button {
+            if typeSize.isAccessibilitySize {
+                onOpenFull()
+            } else {
+                // The field is focused once it is on screen (onAppear below):
+                // focus asked for in the same update as the field's arrival
+                // can land on nothing.
+                focusWhenShown = true
+                model.restore()
+            }
+        } label: {
+            OrynMark(height: 20, color: SD.Colors.signal)
+                .accessibilityHidden(true)
+                .frame(width: Self.height, height: Self.height)
+                .contentShape(Circle())
+        }
+        .buttonStyle(SDPressStyle(scale: 0.92))
+        .sdFloatingSurface(Circle())
+        .sdZoomSource(.jupiter, in: zoomNamespace, cornerRadius: Self.height / 2, enabled: zoomEnabled)
+        .accessibilityLabel("Ask Jupiter")
+        .accessibilityHint(typeSize.isAccessibilitySize
+                           ? "Opens Ask Jupiter to describe what \(deviceName) should watch for."
+                           : "Opens the Ask Jupiter field.")
+        .accessibilityShowsLargeContentViewer {
+            Label("Ask Jupiter", systemImage: "sparkles")
+        }
+        .accessibilityIdentifier("jupiter.open")
+    }
+
+    // MARK: Suggestions
 
     private var suggestions: some View {
         VStack(alignment: .leading, spacing: SD.Space.xs) {
@@ -127,9 +244,6 @@ struct JupiterDock: View {
                     .accessibilityIdentifier("detail.examples")
             }
             .padding(.trailing, SD.Space.sm)
-            // At accessibility sizes the chips would be clipped or tower over the
-            // keyboard; "All examples" opens the full list instead.
-            if !typeSize.isAccessibilitySize {
             ScrollView(.horizontal, showsIndicators: false) {
                 HStack(spacing: SD.Space.xs) {
                     ForEach(JupiterSuggestions.supported) { suggestion in
@@ -155,7 +269,6 @@ struct JupiterDock: View {
                 }
                 .padding(.trailing, SD.Space.sm)
             }
-            }
         }
     }
 
@@ -165,5 +278,33 @@ struct JupiterDock: View {
         focused = false
         draft = ""
         onSubmit(request)
+    }
+}
+
+// MARK: - The device screen's side
+
+/// Reports the device screen's scroll position to the dock (iOS 18+; on iOS 17
+/// the dock simply stays the field at default text sizes).
+struct JupiterDockScrollTracking: ViewModifier {
+    let model: JupiterDockModel
+
+    private struct Sample: Equatable {
+        var offset: Double
+        var maxOffset: Double
+    }
+
+    func body(content: Content) -> some View {
+        if #available(iOS 18.0, *) {
+            content.onScrollGeometryChange(for: Sample.self) { geometry in
+                let top = geometry.contentOffset.y + geometry.contentInsets.top
+                let max = geometry.contentSize.height + geometry.contentInsets.top + geometry.contentInsets.bottom
+                    - geometry.containerSize.height
+                return Sample(offset: top, maxOffset: max)
+            } action: { _, sample in
+                model.scrolled(offset: sample.offset, maxOffset: sample.maxOffset)
+            }
+        } else {
+            content
+        }
     }
 }

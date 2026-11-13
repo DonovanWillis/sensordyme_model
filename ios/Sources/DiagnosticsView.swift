@@ -30,20 +30,38 @@ struct DiagnosticsView: View {
                 }
                 .disabled(running)
             } footer: {
-                Text("Checks run top to bottom: account → cloud → device → live feed. The first ✗ is where your problem is.")
+                Text("Checks run top to bottom: server, account, device, live feed. The first one that fails is where to start.")
             }
 
             if !results.isEmpty {
-                Section("Results") {
+                Section {
                     ForEach(results) { result in
-                        HStack(alignment: .top, spacing: 10) {
+                        HStack(alignment: .firstTextBaseline, spacing: SD.Space.sm) {
                             Image(systemName: icon(for: result.passed))
                                 .foregroundStyle(color(for: result.passed))
+                                .accessibilityHidden(true)
                             VStack(alignment: .leading, spacing: 2) {
-                                Text(result.name).font(.subheadline.weight(.semibold))
-                                Text(result.detail).font(.caption).foregroundStyle(SD.Colors.textSecondary)
+                                Text(result.name)
+                                    .font(SD.Typography.label.weight(.semibold))
+                                    .foregroundStyle(SD.Colors.textPrimary)
+                                    .fixedSize(horizontal: false, vertical: true)
+                                Text(result.detail)
+                                    .font(SD.Typography.caption)
+                                    .foregroundStyle(SD.Colors.textSecondary)
+                                    .fixedSize(horizontal: false, vertical: true)
                             }
                         }
+                        // The result as a word too: the glyph's colour is not the only carrier.
+                        .accessibilityElement(children: .combine)
+                        .accessibilityValue(word(for: result.passed))
+                    }
+                } header: {
+                    Text("Results")
+                } footer: {
+                    if let first = results.first(where: { $0.passed == false }) {
+                        Text("Start with \u{201C}\(first.name)\u{201D}.")
+                    } else if results.allSatisfy({ $0.passed != false }) {
+                        Text("Nothing failed. A skipped check (—) depends on one before it.")
                     }
                 }
             }
@@ -52,6 +70,15 @@ struct DiagnosticsView: View {
         }
         .orynFormStyle()
         .navigationTitle("Connection doctor")
+        .navigationBarTitleDisplayMode(.inline)
+    }
+
+    private func word(for passed: Bool?) -> String {
+        switch passed {
+        case .some(true): "Passed"
+        case .some(false): "Failed"
+        case .none: "Skipped"
+        }
     }
 
     private func icon(for passed: Bool?) -> String {
@@ -252,7 +279,7 @@ struct DiagnosticsView: View {
                 let status = (resp as? HTTPURLResponse)?.statusCode ?? 0
                 if status == 401 || status == 403 {
                     results.append(.init(name: "Live stream", passed: false,
-                                         detail: "device rejected the token (\(status)) — the device's dashboard.token and Settings → Device token must match"))
+                                         detail: "device rejected the token (\(status)) — the device's dashboard.token and Settings → Live feed → Device token must match"))
                 } else if status == 200 {
                     connected = true
                     var parser = MJPEGFrameParser()

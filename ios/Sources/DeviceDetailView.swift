@@ -71,6 +71,9 @@ struct DeviceDetailView: View {
     /// `.sheet(isPresented:)` could be captured stale, opening the screen with an
     /// empty prompt that never got an answer (XCUITest journey 10).
     @State private var jupiterSheet: JupiterSheet?
+    /// Where the page is, for the Ask Jupiter dock only. Held, never read
+    /// here, so scrolling does not re-evaluate this screen.
+    @State private var dockModel = JupiterDockModel()
     @State private var showHistory = false
     @State private var renameError: String?
 
@@ -103,7 +106,7 @@ struct DeviceDetailView: View {
     /// of offering a control that cannot work.
     @State private var protectionUnsupported: String?
     /// What the device confirmed, shown for a while after it converged.
-    @State private var protectionNotice: (text: String, at: Date)?
+    @State private var protectionNotice: (text: String, at: Date, confirmed: Bool)?
     @State private var confirmStop = false
 
     private let refreshTimer = Timer.publish(every: 4, on: .main, in: .common).autoconnect()
@@ -144,6 +147,7 @@ struct DeviceDetailView: View {
                     .padding(.top, SD.Space.xl)
 
                 modeLibrary
+                    .id("modes")
                     .padding(.top, SD.Space.xl)
 
                 CustomRulesCard(
@@ -161,20 +165,30 @@ struct DeviceDetailView: View {
             .padding(.horizontal, SD.Space.md)
             .padding(.bottom, SD.Space.xl)
         }
+        // The page's position, to the dock alone (it steps aside while the
+        // page is read; JupiterDockBehavior).
+        .modifier(JupiterDockScrollTracking(model: dockModel))
         .task {
-            guard DebugLaunch.scrollToBottom else { return }
-            try? await Task.sleep(for: .seconds(1))
-            withAnimation { proxy.scrollTo("health", anchor: .bottom) }
+            if DebugLaunch.scrollToBottom {
+                try? await Task.sleep(for: .seconds(1))
+                withAnimation { proxy.scrollTo("health", anchor: .bottom) }
+            } else if let target = DebugLaunch.scrollTarget {
+                try? await Task.sleep(for: .seconds(1))
+                withAnimation { proxy.scrollTo(target, anchor: .top) }
+            }
         }
         }
         .scrollDismissesKeyboard(.interactively)
         // Ask Jupiter floats above the tab bar and rises with the keyboard.
+        // As the bottom safe-area inset, so the page always ends above it.
         .safeAreaInset(edge: .bottom, spacing: 0) {
             JupiterDock(
                 deviceName: device.name,
+                model: dockModel,
+                zoomNamespace: zoomNS,
+                zoomEnabled: zoomEnabled,
                 onSubmit: { jupiterSheet = JupiterSheet(prompt: $0) },
                 onOpenFull: { jupiterSheet = JupiterSheet(prompt: "") })
-                .sdZoomSource(.jupiter, in: zoomNS, cornerRadius: 26, enabled: zoomEnabled)
                 .padding(.horizontal, SD.Space.md)
                 .padding(.top, SD.Space.xs)
                 .padding(.bottom, SD.Space.xs)
@@ -277,7 +291,11 @@ struct DeviceDetailView: View {
             DemoTriggerView(device: device) { await reload() }
         }
         // Acknowledged only when the DEVICE confirms a stop or resume.
-        .sensoryFeedback(.success, trigger: protectionNotice?.at) { _, new in new != nil }
+        // Not for a stop/resume the device cancelled or answered differently
+        // (M8.3 failed / mismatch): those settle too, and are no success.
+        .sensoryFeedback(.success, trigger: protectionNotice?.at) { _, new in
+            new != nil && protectionNotice?.confirmed == true
+        }
         .onChange(of: instrument.kind) { old, new in
             // One quiet acknowledgement when monitoring becomes ready again —
             // never on first load, never for anything short of ready.
@@ -1559,7 +1577,7 @@ struct DeviceDetailView: View {
         case .idle: break
         }
         if let notice = protectionNotice, Date().timeIntervalSince(notice.at) < 20 {
-            return (notice.text, SD.Colors.textSecondary)
+            return (notice.text, notice.confirmed ? SD.Colors.textSecondary : SD.Colors.warning)
         }
         if device.status == nil {
             return ("This server doesn't report monitoring state, so a stop or resume couldn't be confirmed.",
@@ -1606,7 +1624,8 @@ struct DeviceDetailView: View {
               phase.isFinal, let text = phase.text
         else { return }
         protectionRequest = nil
-        protectionNotice = (text, Date())
+        let confirmed: Bool = { if case .confirmed = phase { return true }; return false }()
+        protectionNotice = (text, Date(), confirmed)
     }
 
     // Recent activity moved to EventHistoryView (Manage → Event history). The

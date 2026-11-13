@@ -102,6 +102,11 @@ final class BLEProvisioner: ObservableObject {
     }
 
     @Published private(set) var state: State = .idle
+    /// What the radio last reported (CBManagerState as BLERadioState), nil
+    /// until it has. Read-only presentation: `state` folds "unauthorized" and
+    /// "powered off" into `.bluetoothOff`, and the person needs to know which,
+    /// because the fixes differ (Settings for permission, Control Centre for power).
+    @Published private(set) var radio: BLERadioState?
     /// Discovered devices, strongest signal first.
     ///
     /// Signal strength is kept because a name alone can be ambiguous: a device
@@ -562,6 +567,9 @@ final class BLEProvisioner: ObservableObject {
     }
 
     private func radioChanged(_ radio: BLERadioState) {
+        // Recorded as reported, for the setup screen to say WHICH problem it is
+        // (permission, off, unsupported); nothing below depends on it.
+        self.radio = radio
         switch radio {
         case .poweredOn:
             // Back from off: say so, rather than staying on "Bluetooth is off".

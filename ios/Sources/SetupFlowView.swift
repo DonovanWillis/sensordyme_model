@@ -1,3 +1,4 @@
+import CoreBluetooth
 import SwiftUI
 
 /// Adding a SensorDyme, start to finish, from the phone.
@@ -10,7 +11,11 @@ import SwiftUI
 ///
 /// The journey itself is `Onboarding` (SetupOnboarding.swift), driven by
 /// `SetupFlow`; this view only renders the state and hands back what the
-/// person typed or chose.
+/// person typed or chose. Bluetooth problems are named as what they are
+/// (SetupBluetoothStatus: permission, restriction, power, no Bluetooth), from
+/// what the radio reported. Nothing here simulates a device: the simulated
+/// peripheral is reachable only in a DEBUG build launched with
+/// `-orynSimulatedBLE` (BLETransports.make).
 struct SetupFlowView: View {
     @Environment(\.dismiss) private var dismiss
     @EnvironmentObject private var appState: AppState
@@ -25,8 +30,11 @@ struct SetupFlowView: View {
     @State private var codeProblem: String?
     @State private var claimCode = ""
     @State private var chosenMode: String?
+    /// The clock, for the device's lockout countdown only. It ticks while a
+    /// lockout runs (`.task(id: lockedUntil)` below); a 1 Hz timer used to
+    /// redraw this whole screen every second of setup for it.
     @State private var now = Date()
-    private let tick = Timer.publish(every: 1, on: .main, in: .common).autoconnect()
+    @Environment(\.accessibilityReduceMotion) private var reduceMotion
 
     init(onFinished: (() async -> Void)? = nil) {
         self.onFinished = onFinished
@@ -35,13 +43,15 @@ struct SetupFlowView: View {
     var body: some View {
         NavigationStack {
             ScrollView {
-                VStack(alignment: .leading, spacing: SD.Space.md) {
+                VStack(alignment: .leading, spacing: SD.Space.lg) {
                     header
                     content
                     SetupDebugPanel(flow: flow, ble: flow.ble)
+                        .padding(.top, SD.Space.sm)
                 }
                 .padding(.horizontal, SD.Space.md)
                 .padding(.vertical, SD.Space.md)
+                .animation(SD.Motion.resolved(SD.Motion.standard, reduceMotion: reduceMotion), value: flow.state)
             }
             .orynScreen()
             .navigationTitle("Connect SensorDyme")
@@ -59,7 +69,14 @@ struct SetupFlowView: View {
                 flow.stop()
                 setupCode = ""
             }
-            .onReceive(tick) { now = $0 }
+            .task(id: lockedUntil) {
+                guard let until = lockedUntil else { return }
+                while !Task.isCancelled, Date() < until.addingTimeInterval(1) {
+                    now = Date()
+                    try? await Task.sleep(for: .seconds(1))
+                }
+                now = Date()
+            }
             .onChange(of: flow.recommendedMode) { _, mode in
                 if chosenMode == nil { chosenMode = mode }
             }
@@ -67,116 +84,228 @@ struct SetupFlowView: View {
         .tint(SD.Colors.accent)
     }
 
-    // MARK: Header
+    /// The device's refusal of codes until this time, while it lasts.
+    private var lockedUntil: Date? {
+        if case .enteringSetupCode(_, let until?) = flow.state { return until }
+        return nil
+    }
 
-    @ViewBuilder private var header: some View {
+    // MARK: Bluetooth itself
+
+    /// What is wrong with Bluetooth, if anything, while setup is still looking.
+    /// From the radio's own report and the app's permission; once a device is
+    /// connected the flow handles a radio change itself.
+    private var radioProblem: SetupBluetoothStatus.Problem? {
         switch flow.state {
-        case .bluetoothUnavailable:
-            headline("Bluetooth is off",
-                     "ORYN EDGE sets up your SensorDyme's Wi-Fi over Bluetooth. Turn it on in Settings, and allow ORYN EDGE to use it.")
-        case .discovering where !flow.ble.discovered.isEmpty:
-            headline("SensorDyme found", "Tap Connect to set it up.")
-        case .discovering:
-            headline("Looking for your SensorDyme",
-                     "Plug it in and stand within a few metres of it. Bluetooth doesn't reach much further.")
-        case .connecting(let name), .identifying(let name):
-            headline("Connecting to \(name)", nil)
-        case .enteringSetupCode, .proving:
-            headline("Prove it's yours",
-                     "Being nearby isn't enough: enter the setup code from the label on your SensorDyme, or paste the text of its QR code.")
-        case .choosingNetwork:
-            headline("Choose a Wi-Fi network",
-                     "These are the networks your SensorDyme can see from where it is — not the ones your phone can see.")
-        case .sending(let ssid), .joining(let ssid):
-            headline("Setting up \(ssid)", nil)
-        case .associating:
-            headline("Checking your account", nil)
-        case .enteringClaimCode, .claiming:
-            headline("Add it to your account",
-                     "Enter the claim code printed on the card that came with your SensorDyme.")
-        case .waitingForDevice:
-            headline("Waiting for your SensorDyme",
-                     "It's on \(flow.targetSSID.isEmpty ? "its network" : flow.targetSSID) and connecting to the server.")
-        case .choosingMode, .activatingMode:
-            headline("What should it watch for?", "You can change this any time from the device's screen.")
-        case .finished(let outcome):
-            headline("SensorDyme is ready",
-                     outcome.alreadyOwned ? "It's on \(outcome.ssid ?? "its new network") and still on your account."
-                         : (outcome.ssid.map { "Connected to \($0)." } ?? nil))
-        case .failed:
-            headline("Setup didn't finish", nil)
+        case .bluetoothUnavailable, .discovering:
+            return SetupBluetoothStatus.problem(radio: Self.radio(flow.ble.radio), access: Self.access)
+        default:
+            return nil
         }
     }
 
-    private func headline(_ title: String, _ detail: String?) -> some View {
-        VStack(alignment: .leading, spacing: SD.Space.xxs) {
-            Text(title)
-                .font(SD.Typography.title)
-                .foregroundStyle(SD.Colors.textPrimary)
-                .accessibilityIdentifier("setup.title")
-            if let detail {
-                Text(detail)
-                    .font(SD.Typography.callout)
-                    .foregroundStyle(SD.Colors.textSecondary)
-                    .fixedSize(horizontal: false, vertical: true)
+    private static func radio(_ radio: BLERadioState?) -> SetupBluetoothStatus.Radio? {
+        switch radio {
+        case .poweredOn?: .on
+        case .poweredOff?: .off
+        case .unauthorized?: .unauthorized
+        case .unsupported?: .unsupported
+        case .other?: .unknown
+        case nil: nil
+        }
+    }
+
+    /// The app's Bluetooth permission. Reading it never prompts.
+    private static var access: SetupBluetoothStatus.Access {
+        switch CBManager.authorization {
+        case .notDetermined: .notDetermined
+        case .denied: .denied
+        case .restricted: .restricted
+        case .allowedAlways: .allowed
+        @unknown default: .notDetermined
+        }
+    }
+
+    // MARK: Header
+
+    private enum Tone { case neutral, working, attention, failed, done }
+
+    @ViewBuilder private var header: some View {
+        if let radioProblem {
+            headline(radioProblem.title, nil, symbol: radioProblem.symbol, tone: .attention)
+        } else {
+            switch flow.state {
+            case .bluetoothUnavailable:
+                // The radio has not said why yet.
+                headline("Waiting for Bluetooth", "ORYN EDGE sets up your SensorDyme's Wi-Fi over Bluetooth.",
+                         symbol: "dot.radiowaves.left.and.right", tone: .working)
+            case .discovering where !flow.ble.discovered.isEmpty:
+                headline(flow.ble.discovered.count == 1 ? "SensorDyme found" : "\(flow.ble.discovered.count) SensorDymes found",
+                         "Tap Connect to set it up.", symbol: "dot.radiowaves.left.and.right", tone: .neutral)
+            case .discovering:
+                headline("Looking for your SensorDyme",
+                         "Plug it in and stand within a few metres of it. Bluetooth doesn't reach much further.",
+                         symbol: "magnifyingglass", tone: .working)
+            case .connecting(let name), .identifying(let name):
+                headline("Connecting to \(name)", "Over Bluetooth, to this device only.",
+                         symbol: "dot.radiowaves.left.and.right", tone: .working)
+            case .enteringSetupCode:
+                headline("Prove it's yours",
+                         "Being nearby isn't enough: enter the setup code from the label on your SensorDyme, or paste the text of its QR code.",
+                         symbol: "lock.shield", tone: .neutral)
+            case .proving:
+                headline("Checking the setup code", "Your SensorDyme proves it knows the code too, before anything is sent.",
+                         symbol: "lock.shield", tone: .working)
+            case .choosingNetwork:
+                headline("Choose a Wi-Fi network",
+                         "These are the networks your SensorDyme can see from where it is — not the ones your phone can see.",
+                         symbol: "wifi", tone: .neutral)
+            case .sending(let ssid):
+                headline("Sending \(ssid)", "Encrypted, to this device only.", symbol: "lock", tone: .working)
+            case .joining(let ssid):
+                headline("Joining \(ssid)", "Your SensorDyme is connecting. It leaves Bluetooth when it does — that's expected.",
+                         symbol: "wifi", tone: .working)
+            case .associating:
+                headline("Checking your account", nil, symbol: "person.crop.circle", tone: .working)
+            case .enteringClaimCode, .claiming:
+                headline("Add it to your account",
+                         "Enter the claim code printed on the card that came with your SensorDyme.",
+                         symbol: "person.crop.circle.badge.plus", tone: .neutral)
+            case .waitingForDevice:
+                headline("Waiting for your SensorDyme",
+                         "It's on \(flow.targetSSID.isEmpty ? "its network" : flow.targetSSID) and connecting to the server.",
+                         symbol: "antenna.radiowaves.left.and.right", tone: .working)
+            case .choosingMode, .activatingMode:
+                headline("What should it watch for?", "You can change this any time from the device's screen.",
+                         symbol: "square.grid.2x2", tone: .neutral)
+            case .finished(let outcome):
+                headline("SensorDyme is set up",
+                         outcome.alreadyOwned ? "It's on \(outcome.ssid ?? "its new network") and still on your account."
+                             : (outcome.ssid.map { "Connected to \($0)." } ?? nil),
+                         symbol: "checkmark", tone: .done)
+            case .failed:
+                headline("Setup didn't finish", nil, symbol: "exclamationmark.triangle", tone: .failed)
             }
+        }
+    }
+
+    /// The state as a symbol on a quiet tile, the title and one line of why.
+    /// The tile's colour follows the state's meaning (amber attention, red
+    /// failure); "done" stays bone — the device screen is where "working" is
+    /// said in green, from its own telemetry.
+    private func headline(_ title: String, _ detail: String?, symbol: String, tone: Tone) -> some View {
+        VStack(alignment: .leading, spacing: SD.Space.sm) {
+            Image(systemName: symbol)
+                .font(.system(size: 20, weight: .regular))
+                .foregroundStyle(toneColor(tone))
+                .frame(width: 48, height: 48)
+                .background(
+                    RoundedRectangle(cornerRadius: SD.Radius.lg, style: .continuous)
+                        .fill(tone == .attention ? SD.Colors.warningMuted
+                              : tone == .failed ? SD.Colors.dangerMuted : SD.Colors.surfaceRaised)
+                )
+                .accessibilityHidden(true)
+            VStack(alignment: .leading, spacing: SD.Space.xxs) {
+                Text(title)
+                    .sdScaledFont(26, relativeTo: .title, weight: .semibold)
+                    .foregroundStyle(SD.Colors.textPrimary)
+                    .fixedSize(horizontal: false, vertical: true)
+                    .accessibilityAddTraits(.isHeader)
+                    .accessibilityIdentifier("setup.title")
+                if let detail {
+                    Text(detail)
+                        .font(SD.Typography.callout)
+                        .foregroundStyle(SD.Colors.textSecondary)
+                        .fixedSize(horizontal: false, vertical: true)
+                }
+            }
+        }
+        .padding(.top, SD.Space.xs)
+    }
+
+    private func toneColor(_ tone: Tone) -> Color {
+        switch tone {
+        case .neutral, .done: SD.Colors.textPrimary
+        case .working: SD.Colors.textSecondary
+        case .attention: SD.Colors.warning
+        case .failed: SD.Colors.danger
         }
     }
 
     // MARK: Body
 
     @ViewBuilder private var content: some View {
-        switch flow.state {
-        case .bluetoothUnavailable:
-            bluetoothOffCard
-        case .discovering:
-            deviceList
-        case .connecting:
-            busyCard("Pairing…")
-        case .identifying:
-            busyCard("Asking it what it is…")
-        case .enteringSetupCode(let problem, let lockedUntil):
-            setupCodeCard(problem: problem, lockedUntil: lockedUntil)
-        case .proving:
-            busyCard("Checking the setup code. The device proves it back before anything is sent.")
-        case .choosingNetwork(let problem):
-            VStack(alignment: .leading, spacing: SD.Space.sm) {
-                if let problem { warning(problem) }
-                networkList
-            }
-        case .sending, .joining, .associating, .claiming, .activatingMode:
-            progressCard
-        case .enteringClaimCode(let problem):
-            claimCard(problem: problem)
-        case .waitingForDevice(let elapsed):
-            VStack(alignment: .leading, spacing: SD.Space.sm) {
-                progressCard
-                if elapsed > 30 {
-                    warning("Still waiting. If \(flow.targetSSID) needs a browser sign-in (hotel or campus Wi-Fi) the device can't get through it.")
+        if let radioProblem {
+            radioProblemCard(radioProblem)
+        } else {
+            switch flow.state {
+            case .bluetoothUnavailable:
+                busyCard("Waiting for Bluetooth to answer…")
+            case .discovering:
+                deviceList
+            case .connecting:
+                busyCard("Pairing…")
+            case .identifying:
+                busyCard("Asking it what it is…")
+            case .enteringSetupCode(let problem, let lockedUntil):
+                setupCodeCard(problem: problem, lockedUntil: lockedUntil)
+            case .proving:
+                busyCard("Checking the setup code. The device proves it back before anything is sent.")
+            case .choosingNetwork(let problem):
+                VStack(alignment: .leading, spacing: SD.Space.sm) {
+                    if let problem { warning(problem) }
+                    networkList
                 }
+            case .sending, .joining, .associating, .claiming, .activatingMode:
+                progressCard
+            case .enteringClaimCode(let problem):
+                claimCard(problem: problem)
+            case .waitingForDevice(let elapsed):
+                VStack(alignment: .leading, spacing: SD.Space.sm) {
+                    progressCard
+                    if elapsed > 30 {
+                        warning("Still waiting. If \(flow.targetSSID) needs a browser sign-in (hotel or campus Wi-Fi) the device can't get through it.")
+                    }
+                }
+            case .choosingMode:
+                modeCard
+            case .finished:
+                readySummary
+            case .failed(let failure):
+                failureCard(failure)
             }
-        case .choosingMode:
-            modeCard
-        case .finished:
-            readySummary
-        case .failed(let failure):
-            failureCard(failure)
         }
     }
 
-    private var bluetoothOffCard: some View {
-        SDCard {
-            VStack(alignment: .leading, spacing: SD.Space.sm) {
-                Label("Control Centre → Bluetooth, or Settings → Bluetooth", systemImage: "1.circle")
-                    .font(SD.Typography.callout)
-                    .foregroundStyle(SD.Colors.textPrimary)
-                Label("Settings → ORYN EDGE → allow Bluetooth", systemImage: "2.circle")
-                    .font(SD.Typography.callout)
-                    .foregroundStyle(SD.Colors.textPrimary)
-                Button("Open Settings") {
+    /// One Bluetooth problem, its fix, and — where the fix is in Settings —
+    /// the button that opens ORYN EDGE's page there. Power comes back by
+    /// itself (the radio reports it), so that case waits instead of offering a
+    /// button iOS gives apps no way to honour.
+    private func radioProblemCard(_ problem: SetupBluetoothStatus.Problem) -> some View {
+        VStack(alignment: .leading, spacing: SD.Space.md) {
+            Text(problem.detail)
+                .font(SD.Typography.body)
+                .foregroundStyle(SD.Colors.textSecondary)
+                .fixedSize(horizontal: false, vertical: true)
+                .accessibilityIdentifier("setup.bluetooth.problem")
+            if problem.opensAppSettings {
+                Button {
                     if let url = URL(string: UIApplication.openSettingsURLString) { UIApplication.shared.open(url) }
+                } label: {
+                    Label("Open Settings", systemImage: "gear")
                 }
                 .buttonStyle(SDButtonStyle(kind: .primary))
+                .accessibilityHint("Opens ORYN EDGE's page in Settings, where Bluetooth can be allowed.")
+                .accessibilityIdentifier("setup.bluetooth.settings")
+            } else if problem == .poweredOff {
+                HStack(spacing: SD.Space.xs) {
+                    ProgressView().controlSize(.small).tint(SD.Colors.textSecondary)
+                    Text("Waiting for Bluetooth to be turned on")
+                        .font(SD.Typography.callout)
+                        .foregroundStyle(SD.Colors.textTertiary)
+                        .fixedSize(horizontal: false, vertical: true)
+                }
+                .accessibilityElement(children: .combine)
             }
         }
     }
@@ -192,6 +321,7 @@ struct SetupFlowView: View {
                         .foregroundStyle(SD.Colors.textSecondary)
                         .fixedSize(horizontal: false, vertical: true)
                 }
+                .accessibilityElement(children: .combine)
             }
         }
     }
@@ -205,56 +335,84 @@ struct SetupFlowView: View {
     }
 
     private var deviceList: some View {
-        SDCard {
-            VStack(alignment: .leading, spacing: SD.Space.sm) {
-                if flow.ble.discovered.isEmpty {
-                    HStack {
-                        ProgressView().controlSize(.small)
-                        Text("Searching…").foregroundStyle(SD.Colors.textSecondary)
+        VStack(alignment: .leading, spacing: SD.Space.md) {
+            if flow.ble.discovered.isEmpty {
+                SDCard {
+                    VStack(alignment: .leading, spacing: SD.Space.sm) {
+                        HStack(spacing: SD.Space.sm) {
+                            ProgressView().controlSize(.small)
+                            Text(flow.searchingSeconds > 0 ? "Searching… \(flow.searchingSeconds) s" : "Searching…")
+                                .font(SD.Typography.callout.monospacedDigit())
+                                .foregroundStyle(SD.Colors.textSecondary)
+                        }
+                        .accessibilityElement(children: .combine)
+                        if flow.searchingSeconds > 20 {
+                            Divider().overlay(SD.Colors.border)
+                            Text("Still nothing after \(flow.searchingSeconds) s")
+                                .font(SD.Typography.label)
+                                .foregroundStyle(SD.Colors.warning)
+                            Text("Check the device is powered on and you are within a few metres of it.")
+                                .font(SD.Typography.caption)
+                                .foregroundStyle(SD.Colors.textSecondary)
+                                .fixedSize(horizontal: false, vertical: true)
+                            Button("Search again") { flow.recover(.searchAgain) }
+                                .buttonStyle(SDButtonStyle(kind: .secondary, fullWidth: false))
+                        }
                     }
+                }
+                VStack(alignment: .leading, spacing: SD.Space.sm) {
                     // The device advertises a custom service, which iOS Settings
                     // does not list. Someone who looks there sees nothing.
-                    Text("Your SensorDyme won't appear in the iPhone's Bluetooth settings — only here. That's normal.")
-                        .font(SD.Typography.caption)
-                        .foregroundStyle(SD.Colors.textTertiary)
-                        .fixedSize(horizontal: false, vertical: true)
+                    hint("antenna.radiowaves.left.and.right",
+                         "Your SensorDyme won't appear in the iPhone's Bluetooth settings — only here. That's normal.")
                     // A device already on Wi-Fi accepts Bluetooth setup only for a
                     // few minutes after it starts (services/provisioning.py).
-                    Text("Already set up and moving it to a new network? Unplug your SensorDyme for a few seconds and plug it back in — it accepts Bluetooth setup for 5 minutes after it starts.")
-                        .font(SD.Typography.caption)
-                        .foregroundStyle(SD.Colors.textTertiary)
-                        .fixedSize(horizontal: false, vertical: true)
-                    if flow.searchingSeconds > 20 {
-                        Divider().overlay(SD.Colors.border)
-                        Text("Still nothing after \(flow.searchingSeconds)s")
-                            .font(SD.Typography.label)
-                            .foregroundStyle(SD.Colors.warning)
-                        Text("Check the device is powered on and you are within a few metres of it.")
-                            .font(SD.Typography.caption)
-                            .foregroundStyle(SD.Colors.textSecondary)
-                            .fixedSize(horizontal: false, vertical: true)
-                        Button("Search again") { flow.recover(.searchAgain) }
-                            .buttonStyle(SDButtonStyle(kind: .secondary, fullWidth: false))
-                    }
-                } else if flow.ble.discovered.count == 1, let device = flow.ble.discovered.first {
-                    HStack(spacing: SD.Space.sm) {
-                        Image(systemName: "checkmark.circle.fill").foregroundStyle(SD.Colors.success)
-                        VStack(alignment: .leading, spacing: 1) {
-                            Text(device.name).font(SD.Typography.body).foregroundStyle(SD.Colors.textPrimary)
-                            Text(device.proximity).font(SD.Typography.caption).foregroundStyle(SD.Colors.textTertiary)
+                    hint("arrow.clockwise",
+                         "Moving one that's already set up to a new network? Unplug it for a few seconds and plug it back in — it accepts Bluetooth setup for 5 minutes after it starts.")
+                }
+            } else if flow.ble.discovered.count == 1, let device = flow.ble.discovered.first {
+                SDCard {
+                    VStack(alignment: .leading, spacing: SD.Space.md) {
+                        HStack(spacing: SD.Space.sm) {
+                            Image(systemName: "dot.radiowaves.left.and.right")
+                                .foregroundStyle(SD.Colors.textPrimary)
+                                .accessibilityHidden(true)
+                            VStack(alignment: .leading, spacing: 1) {
+                                Text(device.name).font(SD.Typography.headline).foregroundStyle(SD.Colors.textPrimary)
+                                Text(device.proximity).font(SD.Typography.caption).foregroundStyle(SD.Colors.textTertiary)
+                            }
+                            Spacer(minLength: 0)
                         }
-                        Spacer()
+                        .accessibilityElement(children: .combine)
+                        Button("Connect") { flow.connect(to: device) }
+                            .buttonStyle(SDButtonStyle(kind: .primary))
+                            .accessibilityIdentifier("setup.connect")
                     }
-                    Button("Connect") { flow.connect(to: device) }
-                        .buttonStyle(SDButtonStyle(kind: .primary))
-                        .accessibilityIdentifier("setup.connect")
-                } else {
-                    ForEach(flow.ble.discovered) { device in
-                        DeviceRow(device: device) { flow.connect(to: device) }
-                        if device.id != flow.ble.discovered.last?.id { Divider().overlay(SD.Colors.border) }
+                }
+            } else {
+                SDCard {
+                    VStack(alignment: .leading, spacing: SD.Space.sm) {
+                        ForEach(flow.ble.discovered) { device in
+                            DeviceRow(device: device) { flow.connect(to: device) }
+                            if device.id != flow.ble.discovered.last?.id { Divider().overlay(SD.Colors.border) }
+                        }
                     }
                 }
             }
+        }
+    }
+
+    private func hint(_ symbol: String, _ text: String) -> some View {
+        HStack(alignment: .firstTextBaseline, spacing: SD.Space.sm) {
+            Image(systemName: symbol)
+                .font(.system(size: 12, weight: .medium))
+                .foregroundStyle(SD.Colors.textTertiary)
+                .frame(width: 16)
+                .accessibilityHidden(true)
+            Text(text)
+                .font(SD.Typography.caption)
+                .foregroundStyle(SD.Colors.textTertiary)
+                .fixedSize(horizontal: false, vertical: true)
         }
     }
 

@@ -178,11 +178,25 @@ final class OrynJourneysUITests: XCTestCase {
     func test10_JupiterPrompt() throws {
         launch(["-orynOpenDevice"])
         waitFor(monitoring, label: "All clear", timeout: 90)
-        // Clear of the floating tab bar first: a tap there lands on the tab bar
-        // and the field never gets focus.
-        let input = reveal(app.textFields["jupiter.input"].firstMatch, timeout: 10)
-        focus(input)
-        XCTAssertTrue(app.keyboards.firstMatch.waitForExistence(timeout: 10), "tapping the field brings up the keyboard")
+        // The dock floats above the tab bar, outside the page: at the top of the
+        // page it is the field. Reading down the page steps it aside as a
+        // compact button (JupiterDockBehavior), and a tap on that button brings
+        // the field back, focused. The page is dragged in its left gutter
+        // (press-drag-hold, no glide), so no control is pressed.
+        XCTAssertTrue(app.textFields["jupiter.input"].firstMatch.waitForExistence(timeout: 10),
+                      "at the top of the page the dock is the field")
+        let gutter = app.coordinate(withNormalizedOffset: .zero)
+            .withOffset(CGVector(dx: 10, dy: app.frame.height * 0.62))
+        gutter.press(forDuration: 0.05, thenDragTo: gutter.withOffset(CGVector(dx: 0, dy: -app.frame.height * 0.3)),
+                     withVelocity: .slow, thenHoldForDuration: 0.3)
+        let open = app.buttons["jupiter.open"]
+        XCTAssertTrue(open.waitForExistence(timeout: 10), "reading down the page minimises the dock")
+        XCTAssertTrue(open.isHittable, "the minimised dock can be tapped")
+        open.tap()
+        let input = app.textFields["jupiter.input"].firstMatch
+        XCTAssertTrue(input.waitForExistence(timeout: 10), "a tap brings the field back")
+        waitFor(input, keyboardFocus: true, timeout: 10)
+        XCTAssertTrue(app.keyboards.firstMatch.waitForExistence(timeout: 10), "the field has the keyboard")
         // Focus must survive the screen's own refreshes (every 4 s, plus the
         // device list's every 10 s): a refresh that rebuilt the field would drop
         // the keyboard mid-sentence. Only a field that is found AND says it has

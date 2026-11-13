@@ -205,20 +205,28 @@ and deep links hold).
    → running-on-device nodes → custom rules → device health (expand in place;
    folded to one line only while the device reports and every component
    works, open by itself otherwise).
-   The **Ask Jupiter dock** floats above the tab bar.
+   The **Ask Jupiter dock** floats above the tab bar as the page's bottom
+   safe-area inset (the page always ends above it). It steps aside as a
+   compact button while the page is read, and is always that button at
+   accessibility text sizes (section 9).
 3. **Mode detail** (sheet, zooms from the row): identity, live state if
    running, capabilities as the device reports them (staggered reveal),
    validation, when it alerts, limitations, settings, Activate with pending →
    device-confirmed outcome.
-4. **Ask Jupiter** (sheet, zooms from the dock): request, what Jupiter
-   understood, editable rules, the policy preview (will / won't watch for),
-   activation with device confirmation.
+4. **Ask Jupiter** (sheet, zooms from the dock): request → the phase strip
+   (Request → Review → Sent → Running) → what Jupiter understood (open text)
+   → the editable rule (the one surface) → not yet possible → the policy
+   preview (will / won't watch for) → Activate, then the device's answer.
 5. **Activity** (push): a chronological timeline grouped by day, with severity
    markers on a hairline spine. A row opens the event's explanation sheet.
    Notification taps still open the exact event (DevicesView →
    DeviceDetailView routing unchanged).
-6. **Settings, setup and onboarding**: native grouped forms in ORYN chrome, and
-   a calm stepped progress for setup.
+6. **Settings** (native grouped form in ORYN chrome): Account → Devices
+   (Bluetooth setup, Live feed page: device, token, device health) → Alerts
+   (when the app is closed, text messages) → Server (verified status,
+   address, find, manual address, connection doctor) → Log out.
+7. **Setup and onboarding**: a status tile + title + one line for every phase,
+   the stepped checklist, and Bluetooth problems named as what they are.
 
 ## 6. Components (small set, `ios/Sources/Instrument.swift` and `Theme.swift`)
 
@@ -234,10 +242,12 @@ and deep links hold).
 | `ModeRow` / flagship treatment | Mode library rows (keep `preset.row.*`, `preset.info.*`, `preset.variant.*`). |
 | `CapabilityLine` | A capability as the device reports it, with word and glyph. |
 | `TimelineRow` | Activity row on the timeline spine (keeps `event.row`). |
-| `JupiterDock` | Floating prompt surface (keeps `jupiter.input`, `jupiter.send`; new `jupiter.dock`). |
+| `JupiterDock` | Floating prompt surface (keeps `jupiter.input`, `jupiter.send`, `jupiter.dock`); compact form `jupiter.open`. Behaviour in `JupiterDockBehavior` (tested). |
+| `JupiterPhaseStrip` | Request → Review → Sent → Running for an Ask Jupiter request (`jupiter.phase`), from `JupiterRequestPhase` (tested). |
 | `PolicyPreview` | Will / won't watch for, with no ticks before activation. |
 | `ConnectionBanner` | Unchanged API (`banner.connection`, `banner.message`, `banner.retry`), restyled. |
-| `SetupStepper` | Onboarding progress. |
+| `SetupStepper` | Onboarding progress (`SetupProgressView`). |
+| `SetupBluetoothStatus` | Which Bluetooth problem setup has (permission, restriction, power, unsupported) and its fix (tested). |
 | `SDSurface` | Floating material with a Reduce Transparency fallback. |
 
 ## 7. Accessibility
@@ -297,3 +307,100 @@ into the dock, policy preview → "Sent… waiting for the device" (never active
 before the device confirms), timeline row → in-place details, stale →
 interrupted visuals (banner, dimmed camera, Stale pill, "Status unknown") →
 recovered, stopped → "Resuming…" → device-confirmed "All clear".
+
+## 9. M8.3 product refinements
+
+Evidence: `~/sensordyme-audit/2026-11-10/m83-evidence/ios/` (`before/`,
+`after/`, side-by-side `compare/`, `perf/`). Every screen below is rendered
+at the default text size and at Accessibility XXXL.
+
+### Ask Jupiter dock (`JupiterDock`, `JupiterDockBehavior`)
+
+- It is the device screen's bottom **safe-area inset**: the page always ends
+  above it, so nothing on the page is unreachable behind it, and it rises with
+  the keyboard.
+- **Two forms, one height (52 pt)**, so the page's inset never jumps:
+  - the **field** (mark, prompt, send), opening in place with suggestions when
+    focused;
+  - the **compact button** (the Jupiter mark on the floating surface, trailing
+    edge, `jupiter.open`).
+- **Steps aside while the page is read**: 48 pt of deliberate downward travel
+  past the top minimises it; 28 pt up, the top of the page or the end of the
+  page restores it; a tap on the button restores it focused. Never while in
+  use (focused, or a request typed). Reduce Motion: the change is instant.
+- **Accessibility sizes**: always the compact button, fixed in size like a bar
+  item, with the Large Content Viewer ("Ask Jupiter"); it opens the full Ask
+  Jupiter screen, where the request has the whole width.
+- Scroll position reaches it through `JupiterDockModel` (`@Observable`, held
+  but never read by the device screen), so scrolling redraws the dock only, and
+  only when its form changes. iOS 17 has no scroll tracking: the field stays.
+
+### Ask Jupiter review (`AIConfigureView`, `JupiterRequestPhase`)
+
+One strip under the request says where the request is:
+**Request → Review → Sent → Running**.
+
+- *Review*: "Nothing has changed yet." Suggestions are only requests the
+  policy grammar parses into exactly one policy (re-checked with
+  `jupiter/policy.py parse`); the refused example stays labelled.
+- *Sent* (amber): the server has it, the device has not confirmed. A wait
+  that runs out stays "hasn't confirmed yet"; it never becomes Running.
+- *Running* (green, success haptic): only `ActivationFollowUp.confirmed`, i.e.
+  what the device reported.
+- *Failed* (red, with a word): the device refused it (Running → "Not
+  running") or the activation request failed (Sent).
+- Composition: understood text and limitations are open sections; only the
+  editable rule (controls) and the will/won't preview (what Activate commits
+  to) keep a surface. The rule is settled (disabled) once sent.
+
+### Bluetooth setup (`SetupFlowView`, `SetupBluetoothStatus`)
+
+Every phase has a status tile, a title and one line. Radio problems are named
+from what the radio reported (CBManagerState) and the permission
+(CBManagerAuthorization), each with its own fix:
+
+| Problem | Fix offered |
+|---|---|
+| Permission denied | "Open Settings" (the app's page, where the permission lives) |
+| Restricted | who can allow it; no button |
+| Powered off | Control Centre; waits and carries on by itself (iOS has no link to Bluetooth, so no button pretends to) |
+| Unsupported | said, instead of searching for ever (the iOS Simulator) |
+
+The simulated peripheral exists only in DEBUG builds launched with
+`-orynSimulatedBLE`; a device build never simulates a step.
+
+### Settings
+
+Account → Devices (Bluetooth setup; **Live feed**: device, token, device
+health as the device reported it) → Alerts (when the app is closed; **Text
+messages**: one draft, one Save, "Not saved yet", Remove number) → Server
+(verified status, address, find, manual address, connection doctor) → Log
+out. Every control acts or says it is unsaved; nothing is a placeholder.
+
+### Idle cost, before and after (iPhone Simulator)
+
+Same method as section 8 (the app's `ps %cpu` every 0.5 s for 20 s, after
+15 s to settle, real backend + virtual device), but **interleaved**: the
+machine is shared, and one 20 s window per screen moved by 5-20x with its
+load. Before (66cf6b6 + DEBUG launch hooks) and after (the integrated M8.3
+build) were installed in turn, three rounds each, on one fresh account;
+n = 120 samples per cell. Evidence: `m83-evidence/ios/perf/interleaved/`.
+
+| Screen | Before mean | Before median | After mean | After median |
+|---|---|---|---|---|
+| Your Devices | 0.7 % | 0.0 % | 0.5 % | 0.0 % |
+| Device home | 1.7 % | 0.1 % | 1.6 % | 0.1 % |
+| Device home, scrolled (dock minimised after) | 1.8 % | 0.1 % | 1.5 % | 0.1 % |
+| Full-screen camera (placeholder) | 2.0 % | 0.1 % | 1.9 % | 0.1 % |
+| Ask Jupiter review (sheet over the home) | 2.9 % | 0.3 % | 3.8 % | 0.5 % |
+| Bluetooth setup | 1.4 % | 0.6 % | 0.9 % | 0.3 % |
+
+- Setup's own 1 Hz timer (kept for the lockout countdown only) now runs only
+  while a lockout runs. A 1 s cadence remains while searching: SetupFlow's
+  search clock (`searchingSeconds`, shown as "Searching… N s"), which is the
+  flow's, not the view's.
+- The dock follows the scroll through `JupiterDockModel`, so scrolling never
+  re-evaluates the device screen; the dock redraws only when its form changes.
+- Everything else is within the run-to-run noise. The spikes on every screen
+  are the 4 s (device) and 10 s (list) polls. Instruments on an iPhone
+  (SwiftUI, Animation Hitches) remains the hardware follow-up.
