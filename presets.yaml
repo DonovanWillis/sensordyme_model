@@ -54,7 +54,7 @@ presets:
   # comma.ai's model. It is simply no longer a product decision.
   driver_safety:
     title: Driver Safety
-    description: Eyes, gaze, head pose, hands, phone use, drowsiness and risk fusion.
+    description: Drowsiness, eyes off the road, and phone use while looking away. Hand tracking and the combined risk score are experimental.
     module: driver_attention
     variants:
       standard: { title: Standard }
@@ -84,8 +84,8 @@ presets:
     temporal_policies:
       - { event: drowsiness, description: "eyes closed continuously (lids lowered by a downward look are not closure)", sustain_s: 2.0, setting: drowsy_seconds }
       - { event: distraction, description: head turned away from the road, sustain_s: 3.0, setting: distraction_seconds }
-      - { event: eyes_down, description: looking down (phone in lap), sustain_s: 2.5, setting: eyes_down_seconds }
-      - { event: phone_use, description: "the driver's phone visible while the gaze is off the road; never a phone hand tracking shows set down (still, hands elsewhere)", sustain_s: 2.0, setting: phone_use_seconds }
+      - { event: eyes_down, description: "looking down, away from the road (for example at a phone in the lap)", sustain_s: 2.5, setting: eyes_down_seconds }
+      - { event: phone_use, description: "a phone near the driver visible while the gaze is off the road; a phone that hand tracking judges set down (still, hands elsewhere) is skipped (hand tracking is experimental)", sustain_s: 2.0, setting: phone_use_seconds }
       - { event: attention_lost, description: face lost and no person detected, sustain_s: 2.5 }
       - { event: fatigue_warning, description: eyes closed for more than the PERCLOS share of a rolling window, window_s: 60.0 }
       - { event: frequent_glancing, description: repeated off-road glances within a rolling window, window_s: 45.0 }
@@ -100,7 +100,7 @@ presets:
       - { key: phone_use_seconds, title: Phone-use time before alert, type: number, default: 2.0, min: 0.5, max: 4.0, step: 0.1, unit: s }
       - { key: glance_min_count, title: Glances that count as frequent, type: number, default: 5, min: 2, max: 10, step: 1, unit: glances }
       - { key: perclos_threshold, title: Eyes-closed share for a fatigue warning, type: number, default: 0.15, min: 0.08, max: 0.3, step: 0.01, unit: fraction }
-      - { key: enable_hands, title: Use hand tracking for phone use, type: bool, default: true }
+      - { key: enable_hands, title: "Experimental: hand tracking (skips a phone that looks set down)", type: bool, default: true }
     compatibility:
       # On a driver_safety-role device custom rules run BESIDE this preset
       # (additive, core/roles.py); on any other role they replace it.
@@ -110,6 +110,8 @@ presets:
       - The object detector gives a false phone box on about 60% of phone-free public validation images at the shipped threshold
       - Cannot tell texting from reading, or see the road; sunglasses and night driving are untested
       - Hand-on-phone and looking-down rules are tested on synthetic scenes only; the hand model often misses a gripping hand, so a phone with no hand found is still judged as in use
+      - A visible phone is not phone use; phone_detected is logged, never alerted
+      - "Experimental and unvalidated, though they sound by default: the combined risk score (high_risk, elevated_risk; it counts a visible phone even with eyes on the road) and erratic_hand_movement (hand tracking)"
     evidence:
       - docs/MODEL_REGISTRY.md
       - docs/DETECTION_THRESHOLDS.md
