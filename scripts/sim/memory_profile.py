@@ -122,10 +122,12 @@ def type_census(top: int = 25) -> tuple[int, dict[str, int]]:
 _OWN = (__file__, tracemalloc.__file__)
 
 
+# Snapshot.filter_traces() is the slow part of a diff (measured: 4.5 s per 600k
+# traces at 1 frame, 17 s at 6), so the profiler's own rows are dropped from the
+# result instead of filtered out of the traces.
 def top_sites(snapshot: tracemalloc.Snapshot, baseline: tracemalloc.Snapshot, n: int = 25) -> list[dict]:
     """Allocation sites (file:line of the allocating frame) that grew most since `baseline`."""
-    filters = [tracemalloc.Filter(False, path) for path in _OWN]
-    stats = snapshot.filter_traces(filters).compare_to(baseline.filter_traces(filters), "lineno")
+    stats = [s for s in snapshot.compare_to(baseline, "lineno") if s.traceback[0].filename not in _OWN]
     rows = []
     for s in stats[:n]:
         frame = s.traceback[0]
@@ -136,8 +138,7 @@ def top_sites(snapshot: tracemalloc.Snapshot, baseline: tracemalloc.Snapshot, n:
 
 def top_tracebacks(snapshot: tracemalloc.Snapshot, baseline: tracemalloc.Snapshot, n: int = 8) -> list[dict]:
     """The same diff grouped by whole traceback (needs tracemalloc frames > 1)."""
-    filters = [tracemalloc.Filter(False, path) for path in _OWN]
-    stats = snapshot.filter_traces(filters).compare_to(baseline.filter_traces(filters), "traceback")
+    stats = [s for s in snapshot.compare_to(baseline, "traceback") if s.traceback[-1].filename not in _OWN]
     return [{"size_diff_kib": round(s.size_diff / 1024, 1), "count_diff": s.count_diff,
              "trace": [f"{_short(f.filename)}:{f.lineno}" for f in s.traceback]} for s in stats[:n]]
 
@@ -175,7 +176,10 @@ class MemorySampler(threading.Thread):
         self.pid = os.getpid()
         self._marks: list[str] = []
         self._lock = threading.Lock()
-        self._baseline: Optional[tracemalloc.Snapshot] = None
+        #: The post-warm-up tracemalloc baseline lives ON DISK (a temp file, never an
+        #: artifact): held in memory its hundreds of thousands of trace tuples would
+        #: be counted by every later object census and RSS sample.
+        self._baseline: Optional[Path] = None
         self._next_types = 0.0
         self._next_snapshot = 0.0
         if self.frames > 0 and not tracemalloc.is_tracing():
@@ -194,6 +198,9 @@ class MemorySampler(threading.Thread):
 
     def stop(self) -> None:
         self.stop_flag.set()
+        if self._baseline is not None:
+            with contextlib.suppress(OSError):
+                self._baseline.unlink()
 
     def sample(self) -> dict:
         started = time.perf_counter()
@@ -224,14 +231,21 @@ class MemorySampler(threading.Thread):
             s0 = time.perf_counter()
             snap = tracemalloc.take_snapshot()
             if self._baseline is None:
-                self._baseline = snap
+                import tempfile
+
+                fd, name = tempfile.mkstemp(prefix=f"memprof-{self.pid}-", suffix=".tracemalloc")
+                os.close(fd)
+                snap.dump(name)
+                self._baseline = Path(name)
                 record = {"t": row["t"], "pid": self.pid, "baseline": True,
                           "py_heap_mb": row.get("py_heap_mb")}
             else:
+                baseline = tracemalloc.Snapshot.load(str(self._baseline))
                 record = {"t": row["t"], "pid": self.pid, "baseline_t": round(self.warmup_s, 1),
-                          "py_heap_mb": row.get("py_heap_mb"), "sites": top_sites(snap, self._baseline)}
+                          "py_heap_mb": row.get("py_heap_mb"), "sites": top_sites(snap, baseline)}
                 if self.frames > 1:
-                    record["tracebacks"] = top_tracebacks(snap, self._baseline)
+                    record["tracebacks"] = top_tracebacks(snap, baseline)
+                del baseline
             del snap
             row["snapshot_ms"] = round((time.perf_counter() - s0) * 1000, 1)
             record["snapshot_ms"] = row["snapshot_ms"]
@@ -339,7 +353,9 @@ def analyze(run_dir: Path, warmup_s: float = 600.0, plot: bool = True) -> dict:
                 entry[key] = window_stats(pts, warmup_s)
         census = [r for r in life if "types" in r]
         if len(census) >= 2:
-            base = next((r for r in census if r["t"] >= warmup_s), census[0])
+            # Not the census taken in the same sample as the tracemalloc baseline:
+            # profiles from before the baseline moved to disk hold it from then on.
+            base = next((r for r in census if r["t"] >= warmup_s and "snapshot_ms" not in r), census[0])
             last = census[-1]
             growth = {k: last["types"].get(k, 0) - base["types"].get(k, 0)
                       for k in set(base["types"]) | set(last["types"])}
