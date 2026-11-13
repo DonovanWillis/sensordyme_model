@@ -110,8 +110,10 @@ def embed81(heads3: Path, heads81: Path, cls_convs: dict) -> None:
         inits[w_name].CopyFrom(numpy_helper.from_array(w81, w_name))
         inits[b_name].CopyFrom(numpy_helper.from_array(b81, b_name))
     del m.graph.value_info[:]  # stale 3-channel shapes downstream of the class convs
-    for o in m.graph.output:
+    for o in m.graph.output:  # _with_outputs leaves outputs untyped; a compiler parser wants float32 heads
+        o.type.tensor_type.elem_type = onnx.TensorProto.FLOAT
         o.type.tensor_type.ClearField("shape")
+    m = onnx.shape_inference.infer_shapes(m)
     onnx.checker.check_model(m)
     onnx.save(m, str(heads81))
 
