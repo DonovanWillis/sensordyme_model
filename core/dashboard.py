@@ -382,6 +382,8 @@ class DashboardServer:
                 body = json.dumps(obj).encode()
                 self.send_response(status)
                 self.send_header("Content-Type", "application/json")
+                # Device state, history and health: never kept by a cache or proxy.
+                self.send_header("Cache-Control", "no-store")
                 self.send_header("Content-Length", str(len(body)))
                 self.end_headers()
                 self.wfile.write(body)
@@ -462,6 +464,9 @@ class DashboardServer:
                         body = _PAGE.encode()
                         self.send_response(200)
                         self.send_header("Content-Type", "text/html; charset=utf-8")
+                        # This URL can carry ?token=: never leak it in a Referer.
+                        self.send_header("Referrer-Policy", "no-referrer")
+                        self.send_header("Cache-Control", "no-store")
                         self.send_header("Content-Length", str(len(body)))
                         self.end_headers()
                         self.wfile.write(body)
@@ -473,6 +478,9 @@ class DashboardServer:
                         body = _SETUP_PAGE.encode()
                         self.send_response(200)
                         self.send_header("Content-Type", "text/html; charset=utf-8")
+                        # This URL can carry ?token=: never leak it in a Referer.
+                        self.send_header("Referrer-Policy", "no-referrer")
+                        self.send_header("Cache-Control", "no-store")
                         self.send_header("Content-Length", str(len(body)))
                         self.end_headers()
                         self.wfile.write(body)
