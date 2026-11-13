@@ -117,7 +117,7 @@ The device can then be claimed again, and a new owner sees none of the old histo
 * **SQLite free pages.** They may still hold deleted rows until SQLite reuses them.
   There is no `secure_delete` and no VACUUM.
 * **Backups.** Copies of the database made before the deletion are outside this code.
-* **The app.** It does not offer the action yet. The IOS stream must wire it.
+* **The app.** Settings → Account → Delete account (M8.4): re-enter the password, a destructive confirmation, and a plain list of what is deleted, what is released and what is NOT deleted (copies on the device, backups, alerts already delivered). On success the phone forgets the paired camera, device token, ntfy channel and phone number, and signs out.
 
 ## 6. Known gaps
 
