@@ -34,7 +34,7 @@ Use RB-0 unchanged, with one change: the release candidate is now the M8.4 candi
 
 ```bash
 # Mac
-export RC=feat/m8.4-leapfrog          # M8.4 candidate; the integrator records `git rev-parse $RC` (TODO-INTEGRATOR)
+export RC=06dbca3b181449da5f253612f4d17a55ec7efcb4   # M8.4 tested candidate (feat/m8.4-leapfrog; later commits are docs only); pending owner approval
 export PI=<user>@<pi-host>  REL=~/sensordyme-release  VENV=$HOME/.venvs/sensordyme-m01/bin
 # Pi (RB-0 / RB-C1: discover U and D from the unit first)
 export U=<service user>  D=/home/$U/sensordyme  PY=$D/.venv/bin/python
@@ -519,9 +519,9 @@ signs the decision line in `$EV/LOG.md`.
 
 ## 7. TODO-INTEGRATOR
 
-1. Record the M8.4 candidate commit: `git rev-parse feat/m8.4-leapfrog` → §0.1, `--expect-commit`, §2.
+1. ~~Record the candidate commit~~ (done: `06dbca3`; Python 3,741 passed / 0 failed, XCUITest 28/28 one invocation, `make acceptance` PASS (simulated), verify-release PASS; use `--expect-commit 06dbca3b181449da5f253612f4d17a55ec7efcb4`).
 2. ~~Step 22: PRIVSEC's names~~ (done: `status.camera_mode`, `POST /v1/devices/{id}/camera-mode`, `camera_only` / `camera_local` labels; `check_live_status.py` judges them).
 3. ~~§2: link PRIVSEC's matrix~~ (done: `docs/SECURITY_REVIEW_M6.md` §7).
 4. ~~§5 rows B1, B3, B4~~ (done: re-read against ALPHA's merge; Decisions A and B; the mounted-phone `phone_use` look is an open owner decision).
-5. If BETA changes the model artifact or decoder for Sunday (not expected), update §2's pin row and MHS §3.
-6. `docs/FAILURE_MATRIX.md` and `docs/BLE_PROOF_OF_POSSESSION.md` (other owners) still say "Monday 2026-11-16": add a Sunday pointer if wanted.
+5. ~~BETA model change~~ (none: EXP-09 rejected; production `.hef` and `legacy` decoder unchanged).
+6. ~~Monday dates~~ (done: FAILURE_MATRIX now points at the Sunday session).

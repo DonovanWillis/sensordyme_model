@@ -17,7 +17,7 @@ Abbreviations: **M83** = `tests/test_m83_truth_failure_matrix.py`,
 **TR** = `tests/test_m84_reliability_recovery.py`, **TS** =
 `tests/test_m84_reliability_storage.py`, **TJ** = `tests/test_m84_twin_journeys.py`
 (component fidelity and the full journey map: `docs/DIGITAL_TWIN.md`).
-"Hardware" = cannot be proven without the Pi (Monday 2026-11-16 runbook).
+"Hardware" = cannot be proven without the Pi (the first hardware session, Sunday 2026-11-15: docs/SUNDAY_DEVICE_ACTIVATION.md).
 
 | # | Case | Device | Backend (`status`) | App | Test | Result | Hardware-only part |
 |---|---|---|---|---|---|---|---|
