@@ -421,8 +421,10 @@ def run_simclock(args: argparse.Namespace) -> dict:
     SimUplink.LEDGER = EventLedger()
     total_s = args.hours * 3600.0
     scenario = ts.soak_scenario(total_s)
-    sampler = MemorySampler(out, interval_s=1e9, types_every_s=0.0, warmup_s=args.warmup_cycles,
-                            snapshot_s=args.snapshot_cycles, tracemalloc_frames=args.tracemalloc_frames,
+    # The sampler's clock here is SIM seconds: warm-up, snapshot cadence and slopes
+    # are per simulated hour of device time.
+    sampler = MemorySampler(out, interval_s=1e9, types_every_s=0.0, warmup_s=args.warmup_h * 3600,
+                            snapshot_s=args.snapshot_h * 3600, tracemalloc_frames=args.tracemalloc_frames,
                             label="simclock")
     wall0 = time.time()
     with tempfile.TemporaryDirectory(prefix="m85-memsim-") as tmp, SimStack(Path(tmp)) as stack:
@@ -444,13 +446,12 @@ def run_simclock(args: argparse.Namespace) -> dict:
             device.advance(base + ts.CYCLE_S - (stack.clock.monotonic() - origin))
             cycle += 1
             gc.collect()
-            # The sampler's clock is "cycles" here: warm-up and snapshot cadence count cycles.
-            sampler.t0 = time.monotonic() - cycle
+            sampler.t0 = time.monotonic() - (stack.clock.monotonic() - origin)  # t = sim seconds
             row = sampler.sample()
             print(f"cycle {cycle} sim_h={(stack.clock.monotonic() - origin) / 3600:.2f} wall={time.time() - wall0:.0f}s "
                   f"rss={row.get('rss_mb')} heap={row.get('py_heap_mb')} objs={row.get('gc_objects')}", flush=True)
     SimUplink.LEDGER = None
-    return analyze(out, warmup_s=args.warmup_cycles, plot=False)
+    return analyze(out, warmup_s=args.warmup_h * 3600, plot=False)
 
 
 def main(argv: Optional[list[str]] = None) -> int:
@@ -463,8 +464,8 @@ def main(argv: Optional[list[str]] = None) -> int:
     s = sub.add_parser("simclock")
     s.add_argument("--hours", type=float, default=2.0)
     s.add_argument("--out", required=True)
-    s.add_argument("--warmup-cycles", type=float, default=3)
-    s.add_argument("--snapshot-cycles", type=float, default=3)
+    s.add_argument("--warmup-h", type=float, default=0.5, help="sim hours before the tracemalloc baseline")
+    s.add_argument("--snapshot-h", type=float, default=0.5, help="sim hours between tracemalloc diffs")
     s.add_argument("--tracemalloc-frames", type=int, default=1)
     s.add_argument("--no-stop-resume", dest="stop_resume", action="store_false")
     args = parser.parse_args(argv)
