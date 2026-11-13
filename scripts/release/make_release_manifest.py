@@ -36,6 +36,7 @@ from __future__ import annotations
 
 import argparse
 import fnmatch
+import gzip
 import hashlib
 import io
 import json
@@ -52,7 +53,9 @@ import yaml
 HERE = Path(__file__).resolve().parent
 REPO_ROOT = HERE.parent.parent
 sys.path.insert(0, str(REPO_ROOT / "scripts" / "hw_validation"))
+sys.path.insert(0, str(HERE))
 
+import check_device_deps as cdd  # noqa: E402 - path set above (marker evaluation, lock parsing)
 import integrity_manifest as im  # noqa: E402 - path set above; reused, not duplicated
 
 FORMAT = "sensordyme-release-manifest/1"
@@ -69,7 +72,9 @@ _UNITS = ("sensordyme.service", "deploy/systemd/sensordyme-recover.service",
 TIERS = ("software-ready", "simulator-verified", "hardware-pending", "experiment-only", "production-blocked")
 #: Files the device itself writes next to the code: scripts/migrate_config.py's
 #: config backups. Reported, never counted as drift. Deliberately narrow.
-DEVICE_STATE_GLOBS = ("config.yaml.bak-*",)
+DEVICE_STATE_GLOBS = ("config.yaml.bak-*",
+                      # M8.5: a staged release's own records, written by release_guard.py stage
+                      "STAGED.json", "ARTIFACTS.json")
 
 
 def _git(repo: Path, *args: str) -> str:
@@ -127,17 +132,22 @@ def registry_artifacts(registry_text: str) -> list[dict]:
 
 
 def requirement_pins(text: str) -> dict:
-    pins, other = {}, []
+    """`pins`: what the DEVICE installs (markers evaluated for the device, M8.5);
+    `not_on_device`: pins whose marker keeps them off it (e.g. simpleaudio on Linux)."""
+    pins, other, elsewhere = {}, [], {}
     for raw in text.splitlines():
         line = raw.split("#", 1)[0].strip()
         if not line:
             continue
-        name, sep, version = line.partition("==")
-        if sep:
+        spec, _, marker = line.partition(";")
+        name, sep, version = spec.partition("==")
+        if not sep:
+            other.append(line)
+        elif cdd.marker_applies(marker.strip() or None):
             pins[_norm(name)] = version.strip()
         else:
-            other.append(line)
-    return {"pins": pins, "unpinned": other}
+            elsewhere[_norm(name)] = version.strip()
+    return {"pins": pins, "unpinned": other, "not_on_device": elsewhere}
 
 
 def _norm(name: str) -> str:
@@ -199,7 +209,44 @@ def lock_status(everything: dict[str, bytes]) -> Optional[dict]:
     blocks = [b for b in re.split(r"\n(?=[A-Za-z0-9])", lock) if re.match(r"[A-Za-z0-9][A-Za-z0-9._-]*==", b)]
     unhashed = [b.split("==", 1)[0] for b in blocks if "--hash=sha256:" not in b]
     return {"path": _DEVICE_LOCK, "sha256": _sha(everything[_DEVICE_LOCK]), "packages": len(locked),
-            "pins_mismatched": mismatched, "unhashed": unhashed, "consistent": not mismatched and not unhashed}
+            "pins_mismatched": mismatched, "unhashed": unhashed, "consistent": not mismatched and not unhashed,
+            "locked": locked}
+
+
+#: Where a device gets its Python packages (M8.5, M84-4). Every pip install of the
+#: device set in these files must be the hashed, wheels-only lock install.
+INSTALL_PATH_FILES = ("setup_pi.sh", "Makefile", "scripts/release/release_guard.py",
+                      "scripts/release/install_units.sh")
+#: The marker a deliberate, documented non-device fallback carries on its line.
+UNHASHED_FALLBACK_MARK = "unhashed-fallback"
+
+
+def install_paths(everything: dict[str, bytes]) -> dict:
+    """Does every device install path use `--require-hashes` + the lock (M84-4)?
+
+    A violation is a non-comment line that pip-installs requirements-device.txt,
+    a bare `pkg==version`, or upgrades pip from the index, unless the line carries
+    the UNHASHED_FALLBACK_MARK (a documented fallback that refuses on a device)."""
+    violations: list[str] = []
+    hashed: dict[str, bool] = {}
+    present = [p for p in INSTALL_PATH_FILES if p in everything]
+    for path in present:
+        text = _text(everything, path)
+        installs = bool(re.search(r"pip\b.*\binstall\b|\"install\"", text))
+        hashed[path] = not installs or ("--require-hashes" in text and _DEVICE_LOCK in text)
+        for number, line in enumerate(text.splitlines(), 1):
+            code = line.split("#", 1)[0] if not path.endswith(".py") else line
+            stripped = code.strip()
+            if not stripped or stripped.startswith("#") or UNHASHED_FALLBACK_MARK in line:
+                continue
+            unhashed_req = re.search(r"pip[\w.\"', ]*install.*requirements-device\.txt", code)
+            bare = re.search(r"pip[\w.\"', ]*install\s+(?:-q\s+)?[A-Za-z0-9_.-]+==", code)
+            upgrade = re.search(r"pip[\w.\"', ]*install\s+(?:-q\s+)?--upgrade\s+pip", code)
+            if unhashed_req or bare or upgrade:
+                violations.append(f"{path}:{number}: {stripped[:120]}")
+    needs_lock = [p for p in present if not hashed.get(p)]
+    return {"files": present, "violations": violations, "missing_hashed_install": needs_lock,
+            "ok": bool(present) and not violations and not needs_lock}
 
 
 def config_schema_status(config: dict) -> dict:
@@ -271,6 +318,13 @@ def release_gates(manifest: dict) -> list[dict]:
              f"unhashed {lock['unhashed']}")
     else:
         gate("device lock", None, "no requirements-device.lock at this ref")
+    paths = manifest.get("install_paths")
+    if paths:
+        gate("every device install path uses pip --require-hashes with the lock (M84-4)", paths["ok"],
+             f"files {paths['files']}; unhashed installs {paths['violations'][:5]}; "
+             f"no hashed install in {paths['missing_hashed_install']}")
+    else:
+        gate("device install paths", None, "no install-path facts (manifest predates M8.5)")
     schema = manifest.get("config_schema") or {}
     if schema.get("checked"):
         gate("repo config.yaml passes core.config_schema", not schema["errors"],
@@ -339,6 +393,7 @@ def build(repo: Path, ref: str, test_refs: list[str], branch: Optional[str] = No
         "requirements": requirements,
         "systemd_units": {u: _sha(everything[u]) for u in _UNITS if u in everything},
         "dependency_lock": lock_status(everything),
+        "install_paths": install_paths(everything),
         "protocol": versions_and_protocol(everything),
         "config_schema": config_schema_status(config),
         "status_tiers": status_tiers(everything),
@@ -361,6 +416,56 @@ def build(repo: Path, ref: str, test_refs: list[str], branch: Optional[str] = No
         },
         "test_runs": list(test_refs),
     }
+
+
+def bundle(repo: Path, ref: str, out_dir: Path, test_refs: Optional[list[str]] = None) -> dict:
+    """M8.5 (M84-6): the release a device stages. From git objects only (never the
+    working tree): a deterministic tar.gz of EXACTLY the manifest's deploy set
+    (same excludes; regular files; mode 0644/0755; owner 0; mtime = commit time)
+    plus the manifest it is verified against. release_guard.py `stage` refuses any
+    file whose bytes differ, any extra or missing file, links and device state."""
+    manifest = build(repo, ref, list(test_refs or []))
+    commit = manifest["commit"]
+    rid = commit[:12]
+    when = int(_git(repo, "show", "-s", "--format=%ct", commit))
+    data = subprocess.run(["git", "-C", str(repo), "archive", "--format=tar", commit],
+                          capture_output=True, check=True, timeout=120).stdout
+    out_dir = Path(out_dir)
+    out_dir.mkdir(parents=True, exist_ok=True)
+    tar_path = out_dir / f"sensordyme-{rid}.tar.gz"
+    wanted = manifest["deploy_set"]["files"]
+    written = set()
+    with tarfile.open(fileobj=io.BytesIO(data)) as source, open(tar_path, "wb") as raw, \
+            gzip.GzipFile(filename="", mode="wb", fileobj=raw, mtime=0, compresslevel=6) as gz, \
+            tarfile.open(fileobj=gz, mode="w", format=tarfile.PAX_FORMAT) as out:
+        for member in sorted(source.getmembers(), key=lambda m: m.name):
+            if not member.isfile() or member.name not in wanted:
+                continue
+            handle = source.extractfile(member)
+            blob = handle.read() if handle is not None else b""
+            if _sha(blob) != wanted[member.name]["sha256"]:
+                raise RuntimeError(f"{member.name}: archive bytes differ from the manifest")
+            info = tarfile.TarInfo(member.name)
+            info.size, info.mtime = len(blob), when
+            info.mode = 0o755 if member.mode & 0o111 else 0o644
+            info.uid = info.gid = 0
+            info.uname = info.gname = ""
+            out.addfile(info, io.BytesIO(blob))
+            written.add(member.name)
+    if written != set(wanted):
+        raise RuntimeError(f"bundle and manifest disagree: {sorted(set(wanted) ^ written)[:10]}")
+    manifest_path = out_dir / f"sensordyme-{rid}.manifest.json"
+    manifest_bytes = (json.dumps(manifest, indent=2, sort_keys=True) + "\n").encode()
+    manifest_path.write_bytes(manifest_bytes)
+    (out_dir / f"sensordyme-{rid}.manifest.md").write_text(to_markdown(manifest))
+    sums = {tar_path.name: _sha(tar_path.read_bytes()), manifest_path.name: _sha(manifest_bytes)}
+    (out_dir / "SHA256SUMS").write_text("".join(f"{v}  {k}\n" for k, v in sums.items()))
+    (out_dir / "RELEASE_ID").write_text(rid + "\n")
+    (out_dir / "COMMIT").write_text(commit + "\n")
+    return {"release": rid, "commit": commit, "files": len(written), "tarball": str(tar_path),
+            "manifest": str(manifest_path), "manifest_sha256": sums[manifest_path.name],
+            "tarball_sha256": sums[tar_path.name],
+            "gates_ok": not any(g["result"] == "FAIL" for g in release_gates(manifest))}
 
 
 def to_markdown(manifest: dict) -> str:
@@ -426,6 +531,10 @@ def to_markdown(manifest: dict) -> str:
 
 
 # ------------------------------------------------------------------ verify
+#: What `pip freeze` leaves out by default.
+_FREEZE_HIDDEN = frozenset({"pip", "setuptools", "wheel", "distribute"})
+
+
 def _freeze_versions(freeze: Optional[str]) -> dict:
     out = {}
     for line in (freeze or "").splitlines():
@@ -484,6 +593,15 @@ def verify(manifest: dict, snapshot: dict, unit_template: Optional[bytes] = None
         wrong = {k: (v, freeze.get(k)) for k, v in wanted.items() if freeze.get(k) != v}
         add("installed requirements", not wrong,
             "all pinned versions installed" if not wrong else f"wanted vs installed: {wrong}")
+        locked = (manifest.get("dependency_lock") or {}).get("locked")
+        if locked:
+            # M8.5: the hashed lock installs EVERY package at its locked version, so
+            # a transitive dependency at another version means the venv did not come
+            # from the lock. pip freeze never lists pip/setuptools/wheel.
+            drift = {k: (v, freeze.get(k)) for k, v in locked.items()
+                     if k not in _FREEZE_HIDDEN and freeze.get(k) != v}
+            add("installed packages = the hashed lock", not drift,
+                f"all {len(locked)} locked versions installed" if not drift else f"locked vs installed: {drift}")
 
     if unit_template is not None and snapshot.get("service_unit_sha256"):
         candidates = _render_unit(unit_template, str(snapshot.get("root", "")))
@@ -515,6 +633,13 @@ def main(argv: Optional[list[str]] = None) -> int:
     b.add_argument("--test-ref", action="append", default=[], help="a test run backing this release (repeatable)")
     b.add_argument("--out-json", required=True)
     b.add_argument("--out-md", default=None)
+    k = sub.add_parser("bundle", help="M8.5: the release tarball + manifest a device stages (make deploy)")
+    k.add_argument("--ref", required=True)
+    k.add_argument("--repo", default=str(REPO_ROOT))
+    k.add_argument("--out-dir", required=True)
+    k.add_argument("--test-ref", action="append", default=[])
+    k.add_argument("--allow-failed-gates", action="store_true",
+                   help="write the bundle even when a release gate FAILs (never for a device)")
     c = sub.add_parser("check", help="release gates over a built manifest")
     c.add_argument("--manifest", required=True)
     v = sub.add_parser("verify")
@@ -533,6 +658,16 @@ def main(argv: Optional[list[str]] = None) -> int:
               f"aggregate {manifest['deploy_set']['aggregate_sha256'][:16]}…  "
               f"model pins consistent: {manifest['model_pins']['consistent']}")
         return 0 if manifest["model_pins"]["consistent"] else 1
+
+    if args.cmd == "bundle":
+        made = bundle(Path(args.repo), args.ref, Path(args.out_dir), args.test_ref)
+        print(f"release {made['release']} ({made['commit']}): {made['files']} files\n"
+              f"  {made['tarball']}  sha256 {made['tarball_sha256']}\n"
+              f"  {made['manifest']}  sha256 {made['manifest_sha256']}")
+        if not made["gates_ok"]:
+            print("RELEASE GATES FAIL for this ref: `make_release_manifest.py check` says why. Not for a device.")
+            return 0 if args.allow_failed_gates else 1
+        return 0
 
     manifest = json.loads(Path(args.manifest).read_text())
     if args.cmd == "check":

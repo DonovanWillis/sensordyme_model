@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
 # One-shot Raspberry Pi setup: apt packages, pip installs, and the systemd service.
-# Run this on the Pi itself (e.g. via `make deploy`, which rsyncs the repo first).
+# Run this on the Pi itself, in a checkout of an approved release (first install).
+# Updates after that are staged releases: `make deploy` (docs/DEPLOYMENT.md).
 set -euo pipefail
 
 cd "$(dirname "${BASH_SOURCE[0]}")"
@@ -54,14 +55,39 @@ python3 -m venv --system-site-packages .venv
 # shellcheck disable=SC1091
 source .venv/bin/activate
 
-pip install --upgrade pip
-# requirements-device.txt, NOT requirements.txt: this is a device we convey, and
-# the developer set pins ultralytics, which is AGPL-3.0 (docs/LICENSING.md).
+# The DEVICE set, NOT requirements.txt: this is a device we convey, and the
+# developer set pins ultralytics, which is AGPL-3.0 (docs/LICENSING.md).
 # Detection here runs on the AI HAT+ via core/accel.py, which needs no inference
 # framework — just hailo-all, installed above. Dropping ultralytics also drops
 # torch + torchvision, ~800MB that never had a use on this board.
-pip install -r requirements-device.txt
-pip install gpiozero==2.0.1 lgpio==0.2.2.0
+#
+# >>> device dependency install (tests/test_m85_deploy_lock.py runs this block)
+# M8.5 (M84-4): from the HASHED lock, wheels only. Every package (including the
+# MediaPipe wheel that carries the .tflite models, and gpiozero/lgpio, which used
+# to be a separate unhashed line here) must match a sha256 in
+# requirements-device.lock, and no package's build code runs at install time.
+# The same flags as make deploy's staged install (scripts/release/release_guard.py
+# PIP_FLAGS). There is deliberately no `pip install --upgrade pip` any more: it
+# fetched an unhashed pip from the index. Bookworm's pip supports every flag here.
+#
+# The ONLY fallback is for a non-device development box (not a Raspberry Pi) on
+# which the aarch64/CPython 3.11 lock cannot apply, and only with
+# SENSORDYME_ALLOW_UNHASHED=1. On a Raspberry Pi a failed hashed install stops
+# setup: an unhashed install from the index is never an option on a device.
+is_raspberry_pi() { grep -qa "Raspberry Pi" "${SENSORDYME_DT_MODEL:-/proc/device-tree/model}" 2>/dev/null; }
+DEVICE_PIP=(.venv/bin/python -m pip install --require-hashes --only-binary=:all: --disable-pip-version-check --no-input -r requirements-device.lock)
+if ! "${DEVICE_PIP[@]}"; then
+  if is_raspberry_pi || [ "${SENSORDYME_ALLOW_UNHASHED:-}" != "1" ]; then
+    echo "ERROR: the hash-checked install of requirements-device.lock failed; NOT falling back." >&2
+    echo "  The lock is for Pi OS Bookworm (CPython 3.11, aarch64): check python3 --version and" >&2
+    echo "  the network/index, then re-run. A device never installs unhashed packages." >&2
+    exit 1
+  fi
+  echo "WARNING: not a Raspberry Pi and SENSORDYME_ALLOW_UNHASHED=1: installing requirements-device.txt" >&2
+  echo "  WITHOUT hash checking. Development boxes only; never a device we convey." >&2
+  .venv/bin/python -m pip install -r requirements-device.txt  # unhashed-fallback: refuses on a device (above)
+fi
+# <<< device dependency install
 
 # --- object-detection model -------------------------------------------------
 # >>> model provisioning (tests/test_m8_lifecycle_boot.py runs this block)

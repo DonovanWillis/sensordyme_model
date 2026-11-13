@@ -5,12 +5,15 @@
 #   make verify-release [REF=<git ref>]        # or: bash scripts/release/verify.sh [REF]
 #
 # Steps (each prints PASS/FAIL/SKIP; exit 1 if any FAIL):
-#   1. device dependencies   scripts/release/check_device_deps.py (pins vs imports; no dev/test packages)
+#   1. device dependencies   scripts/release/check_device_deps.py (pins vs imports; no dev/test packages;
+#                            M8.5: the hashed lock is complete for the device and every entry hashed)
 #   2. release manifest      build for REF from git objects into a temp dir (never the working tree)
 #   3. release gates         make_release_manifest.py check: model pins, decoder legacy, /v1 protocol
-#                            compatibility, device lock, config schema, status tiers
+#                            compatibility, device lock, every device install path hashed (M8.5),
+#                            config schema, status tiers
 #   4. systemd units         scripts/release/verify_systemd_units.sh (SKIP where systemd is absent)
-#   5. focused tests         the release/packaging tests only (not the full suite)
+#   5. focused tests         the release/packaging tests only (not the full suite; the M8.5
+#                            fake-device end-to-end deploy, tests/test_m85_deploy_e2e.py, is not here)
 # Nothing here changes the repo, the .hef, or any device.
 set -uo pipefail
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
@@ -55,7 +58,8 @@ step "4 systemd units" bash scripts/release/verify_systemd_units.sh
 if "$PY" -c "import pytest" >/dev/null 2>&1; then
   step "5 focused tests" env PYTHONDONTWRITEBYTECODE=1 "$PY" -m pytest -p no:cacheprovider -q --disable-warnings -o addopts="" \
        tests/test_device_dependencies.py tests/test_least_privilege_unit.py \
-       tests/test_release_hardening.py tests/test_m6_security_release_manifest.py
+       tests/test_release_hardening.py tests/test_m6_security_release_manifest.py \
+       tests/test_m85_deploy_lock.py tests/test_m85_deploy_staged.py tests/test_m85_deploy_artifacts.py
 else
   RESULTS+=("SKIP  5 focused tests (no pytest in $PY)")
 fi

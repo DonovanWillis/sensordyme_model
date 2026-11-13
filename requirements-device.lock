@@ -1,8 +1,12 @@
 # Hash-locked device runtime for the Pi (Bookworm: CPython 3.11, aarch64). GENERATED; do not edit.
-# Regenerate (metadata only, nothing is installed):
-#   uv pip compile requirements-device.txt --python-version 3.11 --python-platform aarch64-unknown-linux-gnu --generate-hashes --no-header -o requirements-device.lock
-# then restore this header. Install on a device with:  pip install --require-hashes -r requirements-device.lock
-# Not yet used by setup_pi.sh or make deploy (hardware-pending: install on a real Pi first).
+# Regenerate (metadata only, nothing is installed; -c keeps every other package at its locked version):
+#   uv pip compile requirements-device.txt --python-version 3.11 --python-platform aarch64-unknown-linux-gnu --generate-hashes --no-header -c <old pins> -o requirements-device.lock
+# then restore this header and fold `# via -c ...` annotations. THE device install (setup_pi.sh, make deploy's
+# staged install, release_guard.py; docs/DEPLOYMENT.md):
+#   .venv/bin/python -m pip install --require-hashes --only-binary=:all: -r requirements-device.lock
+# Wheels only: every package here has a cp311 aarch64 wheel (checked with pip download --require-hashes
+# --only-binary=:all: --platform manylinux_2_*_aarch64; m85 evidence). M8.5 added gpiozero/lgpio (+colorzero,
+# setuptools) and dropped simpleaudio (no Linux wheel; requirements-device.txt).
 # NOTE: mediapipe 0.10.14 pulls opencv-contrib-python next to the pinned opencv-python; both
 # provide cv2. Pre-existing; see docs/LEAST_PRIVILEGE.md (4E).
 absl-py==2.5.1 \
@@ -343,6 +347,10 @@ charset-normalizer==3.5.2 \
     --hash=sha256:fd1fbe0f116b6e55da77aca2c6ddcddcfac2186cbf78bdebf40fc156efca389d \
     --hash=sha256:fe9753dfee015c570d73df76f899f18444d41388bffcde097deba51c4fadbb9f
     # via requests
+colorzero==2.0 \
+    --hash=sha256:0e60d743a6b8071498a56465f7719c96a5e92928f858bab1be2a0d606c9aa0f8 \
+    --hash=sha256:e7d5a5c26cd0dc37b164ebefc609f388de24f8593b659191e12d85f8f9d5eb58
+    # via gpiozero
 contourpy==1.3.3 \
     --hash=sha256:023b44101dfe49d7d53932be418477dba359649246075c996866106da069af69 \
     --hash=sha256:07ce5ed73ecdc4a03ffe3e1b3e3c1166db35ae7584be76f65dbbe28a7791b0cc \
@@ -554,6 +562,10 @@ fonttools==4.68.0 \
     --hash=sha256:fe80d05dd85e6ac58d0cd4fa10ddb96252a6f1046ee0fd00cd1d48f0c25921ac \
     --hash=sha256:fedc183bdbc3fdbfbdca26e0e04566d089cbb404712509a4e824608e9304cc77
     # via matplotlib
+gpiozero==2.0.1 \
+    --hash=sha256:8f621de357171d574c0b7ea0e358cb66e560818a47b0eeedf41ce1cdbd20c70b \
+    --hash=sha256:d4ea1952689ec7e331f9d4ebc9adb15f1d01c2c9dcfabb72e752c9869ab7e97e
+    # via -r requirements-device.txt
 idna==3.20 \
     --hash=sha256:a7db850025b95ded1eae8a46181a1a6c56c92c96f0e2b005d9ff8dc0210cab44 \
     --hash=sha256:ab7ae7122974553370f0bdb919e1a960b2cd1bc1ef0276416d896db81c14582c
@@ -731,6 +743,21 @@ kiwisolver==1.5.1 \
     --hash=sha256:fc271a6f0a2126958f4090e5507b9da5848927dae331f8f763bd4aa642b3d2cd \
     --hash=sha256:febcce10f2bcdbb80b4ea919238a6a4ac13dbc4c7cadbe8d5d75c3682f8b5404
     # via matplotlib
+lgpio==0.2.2.0 \
+    --hash=sha256:11372e653b200f76a0b3ef8a23a0735c85ec678a9f8550b9893151ed0f863fff \
+    --hash=sha256:1594dd4fdf054ff396bf0730802732c26aa2040d6c70250d0d34f703baafd121 \
+    --hash=sha256:2aadff092f642fcdada8457c158f87259dfda3a89ec19bae0b99ff22b34aac4b \
+    --hash=sha256:5b3c403e1fba9c17d178f1bde102726c548fc5c4fc1ccf5ec3e18f3c08e07e04 \
+    --hash=sha256:6c65ac42e878764d04a71ed12fe6d46089b36e9e8127722bf29bb2e4bc91de22 \
+    --hash=sha256:97fe5fb0e888c96031e8899e8c0eca64c63076a6d1f1e774acad8696430b2ff6 \
+    --hash=sha256:9ed135824c717901457dcf2462bb1af9f5445aa6e56bb7a9263fc064620ef586 \
+    --hash=sha256:a2f71fb95b149d8ac82c7c6bae70f054f6dc42a006ad35c90c7d8e54921fbcf4 \
+    --hash=sha256:d245f315e4bc5ba1b72df9fd935a16c99e56ccf6b41d9f66a87804c1dfd91c86 \
+    --hash=sha256:d907db79292c721c605af08187385ddb3b7af09907e1ffca56cf0cd6558ace0a \
+    --hash=sha256:e9f4f3915abe5ae0ffdb4b96f485076d80a663876d839e2d3fd9218a71b9873e \
+    --hash=sha256:f8f1a2818ed4293182999679ac8559aea70d45743f5a3ae8025837e529d9e0d4 \
+    --hash=sha256:f95d6a6db23f99e745e0aee36cd49a515dd6846a5ddb49474c73a390bb2048e2
+    # via -r requirements-device.txt
 matplotlib==3.9.2 \
     --hash=sha256:039082812cacd6c6bec8e17a9c1e6baca230d4116d522e81e1f63a74d01d2e21 \
     --hash=sha256:03ba9c1299c920964e8d3857ba27173b4dbb51ca4bab47ffc2c2ba0eb5e2cbc5 \
@@ -1185,15 +1212,10 @@ scipy==1.17.1 \
     # via
     #   jax
     #   jaxlib
-simpleaudio==1.0.4 \
-    --hash=sha256:05b63da515f5fc7c6f40e4d9673d22239c5e03e2bda200fc09fd21c185d73713 \
-    --hash=sha256:67348e3d3ccbae73bd126beed7f1e242976889620dbc6974c36800cd286430fc \
-    --hash=sha256:691c88649243544db717e7edf6a9831df112104e1aefb5f6038a5d071e8cf41d \
-    --hash=sha256:86f1b0985629852afe67259ac6c24905ca731cb202a6e96b818865c56ced0c27 \
-    --hash=sha256:f1a4fe3358429b2ea3181fd782e4c4fff5c123ca86ec7fc29e01ee9acd8a227a \
-    --hash=sha256:f346a4eac9cdbb1b3f3d0995095b7e86c12219964c022f4d920c22f6ca05fb4c \
-    --hash=sha256:f68820297ad51577e3a77369e7e9b23989d30d5ae923bf34c92cf983c04ade04
-    # via -r requirements-device.txt
+setuptools==84.2.1 \
+    --hash=sha256:3ff8b3b5492a0aa66960f4419365a86b84e013070d4313e4d4a6894f5d64d6bc \
+    --hash=sha256:ca140b45d5325a9478f880e351484f62fef15f336462e449ca0c03c873d589c2
+    # via colorzero
 sounddevice==0.5.6 \
     --hash=sha256:7f4162f514f007b0bf25a3ccfed3f1705bc2ec311888a90232729eec4f57a4f4 \
     --hash=sha256:8ec9fbfde2e32f020b167e348f3ab3bac6625a5f15af524d790108ac7147a410 \
