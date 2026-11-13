@@ -61,6 +61,7 @@ from cloud.ratelimit import (
 )
 from core import command_auth as sd_auth
 from core import health_stamp
+from core.logging_setup import describe_failure, mask_phone
 from core.presets import (
     SETTINGS_SEPARATOR,
     PresetError,
@@ -292,6 +293,7 @@ class _BodySizeLimit:
 
 
 app.add_middleware(_BodySizeLimit, limit=MAX_BODY_BYTES)
+
 
 
 @app.exception_handler(RequestValidationError)
@@ -1862,7 +1864,9 @@ def send_sms(user_row: sqlite3.Row, body: str) -> None:
     token = os.environ.get("TWILIO_AUTH_TOKEN")
     sender = os.environ.get("TWILIO_FROM")
     if not (sid and token and sender):
-        print(f"sms (log-only, set TWILIO_* env to send for real) -> {phone}: {body}")
+        # The number masked (M8.3): a backend without Twilio configured logged
+        # every account's phone number on every serious alert.
+        print(f"sms (log-only, set TWILIO_* env to send for real) -> {mask_phone(phone)}: {body}")
         return
     import requests
 
@@ -1893,12 +1897,14 @@ def _notify(
         try:
             send_push(owner, title, detail)
         except Exception as exc:  # noqa: BLE001 - see send_push's own docstring
-            log.warning("notify: push delivery failed after retries: %r", exc)
+            # Type and status only: the exception's text carries the ntfy URL,
+            # and the topic in it is the account's alert credential (M8.3).
+            log.warning("notify: push delivery failed after retries: %s", describe_failure(exc))
     if sms:
         try:
             send_sms(owner, f"{title} — {detail} ({device_name})")
         except Exception as exc:  # noqa: BLE001 - see send_sms's own docstring
-            log.warning("notify: sms delivery failed after retries: %r", exc)
+            log.warning("notify: sms delivery failed after retries: %s", describe_failure(exc))
 
 
 def _notify_channels(event: dict) -> tuple[bool, bool]:
