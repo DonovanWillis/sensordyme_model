@@ -303,7 +303,7 @@ def test_experimental_families_never_degrade_monitoring_unless_opted_in():
             mode=monitoring_mode.MonitoringMode.STANDARD, module_name="driver_attention",
             active_preset="driver_safety", _module_uses_a_detector=lambda: True,
             _custom_active=lambda: False, alert_manager=SimpleNamespace(experimental_audible=opted_in),
-            _active_companions=lambda: [])
+            _active_companions=list)
         found = DeviceRuntime._active_policies(stub, module)  # type: ignore[arg-type]
         return {event for p in found for event in p.events}
 
