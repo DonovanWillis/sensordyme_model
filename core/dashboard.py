@@ -15,6 +15,13 @@ annotated frames, in memory, over HTTP to browsers that connect — bound to
 0.0.0.0 on the Pi to view from your phone on the same network — that is an
 explicit opt-in, like the mac_max VLM exception.) Everything is Python stdlib —
 no new dependencies.
+
+M8.4 (owner Decision C): while monitoring is STOPPED, /stream sends no camera
+frame to a remote viewer unless the owner enabled camera-only mode through the
+backend; heartbeats say `camera_off_while_stopped` instead. A viewer on this
+machine (loopback) keeps the camera for local maintenance unless
+`dashboard.local_camera_while_stopped: false`. See core/camera_privacy.py and
+docs/PRIVACY.md.
 """
 
 from __future__ import annotations
@@ -38,6 +45,7 @@ from urllib.parse import parse_qs, urlsplit
 import cv2
 import numpy as np
 
+from core import camera_privacy as cp
 from core.logging_setup import get_logger
 
 #: This module had no logger at all. It needs exactly one — the open-dashboard
@@ -141,6 +149,24 @@ class _StreamFrame:
     source: str  # "annotated" (the runtime's analysed view) | "camera" (fallback, unanalysed)
 
 
+#: A loopback viewer while monitoring is stopped (local maintenance; never remote).
+_ACCESS_LOCAL = "local_maintenance"
+
+
+def _source_for(frame: _StreamFrame, access: str) -> str:
+    """The X-Frame-Source a viewer with `access` is told (M8.4, core/camera_privacy.py).
+
+    While monitoring is stopped nothing is analysed, so whatever the slot holds
+    is named for the access that let it out: `camera_only` (the owner's
+    camera-only mode) or `camera_local` (a viewer on the device itself).
+    """
+    if access == cp.STREAM_CAMERA_ONLY:
+        return cp.SOURCE_CAMERA_ONLY
+    if access == _ACCESS_LOCAL:
+        return cp.SOURCE_CAMERA_LOCAL
+    return frame.source
+
+
 @dataclass
 class _StreamClient:
     """Per-viewer counters; never holds frames (the slot is shared)."""
@@ -153,7 +179,7 @@ class _StreamClient:
     last_seq: int = 0
 
 
-def _part_header(frame: _StreamFrame, stream_id: str, now: float) -> bytes:
+def _part_header(frame: _StreamFrame, stream_id: str, now: float, source: Optional[str] = None) -> bytes:
     """One multipart part header for a JPEG.
 
     The first three lines are exactly what the stream always sent, so a client
@@ -166,8 +192,10 @@ def _part_header(frame: _StreamFrame, stream_id: str, now: float) -> bytes:
       X-Frame-Age-Ms   capture -> this write, on the device's own monotonic
                        clock (no clock sync needed); network transit is extra
       X-Frame-Source   "annotated" = the analysed view; "camera" = the camera
-                       without analysis (monitoring stopped, module degraded or
-                       not drawing) -- video can be live while monitoring is not
+                       without analysis while monitoring runs (module degraded
+                       or not drawing); M8.4: "camera_only" = monitoring is
+                       stopped and the OWNER enabled camera-only mode;
+                       "camera_local" = stopped, viewer on the device itself
       X-Stream-Id      random per dashboard process: a change means the device
                        restarted and the seq started again
     """
@@ -178,7 +206,7 @@ def _part_header(frame: _StreamFrame, stream_id: str, now: float) -> bytes:
         f"Content-Length: {len(frame.jpeg)}\r\n"
         f"X-Frame-Seq: {frame.seq}\r\n"
         f"X-Frame-Age-Ms: {age_ms}\r\n"
-        f"X-Frame-Source: {frame.source}\r\n"
+        f"X-Frame-Source: {source or frame.source}\r\n"
         f"X-Stream-Id: {stream_id}\r\n"
         "\r\n"
     ).encode()
@@ -240,6 +268,8 @@ class DashboardServer:
         health_provider=None,
         camera_fallback: bool = True,
         stream_send_timeout_s: float = _STREAM_SEND_TIMEOUT_S,
+        camera_privacy: Optional[cp.CameraPrivacy] = None,
+        local_camera_while_stopped: bool = True,
     ) -> None:
         self._host = host
         self._port = port
@@ -284,6 +314,15 @@ class DashboardServer:
         self._fallback_lock = threading.Lock()  # one encoder at a time, shared by all viewers
         self._fallback_bus_seq = 0
         self._stream_send_timeout_s = max(0.1, float(stream_send_timeout_s))
+        #: M8.4 Decision C: the owner's camera-only setting (OFF unless the
+        #: owner turned it on through the backend; core/camera_privacy.py).
+        self._camera_privacy = camera_privacy if camera_privacy is not None else cp.CameraPrivacy(persist=False)
+        #: Whether a viewer on this machine (loopback) still sees the camera
+        #: while monitoring is stopped (`dashboard.local_camera_while_stopped`).
+        self._local_camera_while_stopped = bool(local_camera_while_stopped)
+        #: Monitoring explicitly stopped, as the runtime reports it
+        #: (set_policy_state / set_monitoring_stopped).
+        self._monitoring_stopped = False
         #: Set by close(): every open /stream loop ends, so viewers reconnect to
         #: whatever serves next instead of holding a socket to a dead server.
         self._closing = threading.Event()
@@ -500,6 +539,7 @@ class DashboardServer:
                         self._json(dashboard.stream_stats())
                     elif self.path.startswith("/stream"):
                         heartbeat = self.headers.get("X-Stream-Heartbeat", "") == "1"
+                        local = cp.peer_is_local(self.client_address[0] if self.client_address else None)
                         self.send_response(200)
                         self.send_header(
                             "Content-Type", "multipart/x-mixed-replace; boundary=frame"
@@ -507,6 +547,9 @@ class DashboardServer:
                         self.send_header("Cache-Control", "no-store")
                         self.send_header("X-Stream-Id", dashboard._stream_id)
                         self.send_header("X-Stream-Max-Frame-Age-Ms", str(int(dashboard.MAX_FRAME_AGE_S * 1000)))
+                        # M8.4: what this viewer may see right now (it can change
+                        # mid-stream; heartbeats carry the change).
+                        self.send_header("X-Stream-Camera", dashboard.stream_access(local))
                         if heartbeat:
                             self.send_header(
                                 "X-Stream-Heartbeat-Interval-Ms", str(int(dashboard.HEARTBEAT_INTERVAL_S * 1000))
@@ -516,7 +559,7 @@ class DashboardServer:
                         # its own thread, and only this long (_STREAM_SEND_TIMEOUT_S).
                         with contextlib.suppress(OSError):
                             self.connection.settimeout(dashboard._stream_send_timeout_s)
-                        dashboard.serve_stream(self.wfile.write, self._peer_gone, heartbeat=heartbeat)
+                        dashboard.serve_stream(self.wfile.write, self._peer_gone, heartbeat=heartbeat, local=local)
                     else:
                         self.send_response(404)
                         self.end_headers()
@@ -619,7 +662,7 @@ class DashboardServer:
         self._frame_source = source
 
     def serve_stream(self, write: Callable[[bytes], object], peer_gone: Callable[[], bool],
-                     heartbeat: bool = False) -> None:
+                     heartbeat: bool = False, local: bool = False) -> None:
         """Feed one viewer until it leaves. Runs on that viewer's handler thread.
 
         Latest-frame-only by construction: each pass reads the ONE shared slot
@@ -629,6 +672,14 @@ class DashboardServer:
         client and a slow client never slows the producer (push_frame only
         swaps a reference under a lock). A viewer that stops reading entirely
         is dropped by the socket send timeout.
+
+        M8.4 (owner Decision C): every pass first asks what this viewer may see
+        (`stream_access`). While monitoring is stopped and the owner has not
+        enabled camera-only, a remote viewer is sent NO frame -- not the
+        camera, not a picture left in the slot from before the stop -- and,
+        if it asked for heartbeats, `camera_off_while_stopped` once a second,
+        on the same connection, so frames resume the moment monitoring does.
+        `local`: the viewer is on this machine (loopback).
         """
         client = _StreamClient(opened_at=time.monotonic())
         key = id(client)
@@ -646,6 +697,18 @@ class DashboardServer:
             # gap before the first frame is encoded for a newly connected viewer
             # -- there is no write to fail. See _Handler._peer_gone().
             while not peer_gone() and not self._closing.is_set():
+                access = self.stream_access(local)
+                if access == cp.STREAM_OFF:
+                    now = time.monotonic()
+                    if heartbeat and now - last_write >= self.HEARTBEAT_INTERVAL_S:
+                        write(_heartbeat_part(self._stream_id, cp.STATUS_CAMERA_OFF, None, client.last_seq))
+                        client.heartbeats += 1
+                        last_write = now
+                        with self._lock:
+                            self._stream_counts["heartbeats"] += 1
+                            self._stream_counts["privacy_heartbeats"] += 1
+                    time.sleep(self.stream_interval)
+                    continue
                 frame = self._current_frame()
                 now = time.monotonic()
                 if frame is not None and frame.seq != client.last_seq:
@@ -658,7 +721,8 @@ class DashboardServer:
                         # One write per part: header, JPEG and trailer together
                         # (the handler's wfile is unbuffered -- four writes were
                         # four syscalls per frame).
-                        payload = b"".join((_part_header(frame, self._stream_id, now), frame.jpeg, b"\r\n"))
+                        header = _part_header(frame, self._stream_id, now, _source_for(frame, access))
+                        payload = b"".join((header, frame.jpeg, b"\r\n"))
                         write(payload)
                         skipped = max(0, frame.seq - client.last_seq - 1) if client.last_seq else 0
                         client.last_seq = frame.seq
@@ -690,6 +754,37 @@ class DashboardServer:
             with self._lock:
                 self._clients.pop(key, None)
             self.viewer_left()
+
+    # ------------------------------------------------------------------ camera privacy (M8.4)
+    def stream_access(self, local: bool = False) -> str:
+        """What a /stream viewer may receive now (docs/PRIVACY.md, Decision C).
+
+        `monitoring` while monitoring is not stopped; while it is stopped,
+        `camera_only` if the owner enabled it, `local_maintenance` for a
+        loopback viewer (unless disabled), otherwise `off_while_stopped`.
+        """
+        with self._lock:
+            stopped = self._monitoring_stopped
+        access = self._camera_privacy.remote_stream(stopped)
+        if access == cp.STREAM_OFF and local and self._local_camera_while_stopped:
+            return _ACCESS_LOCAL
+        return access
+
+    def set_monitoring_stopped(self, stopped: bool) -> None:
+        """The runtime's explicit stop (also derived from set_policy_state)."""
+        with self._lock:
+            self._monitoring_stopped = bool(stopped)
+
+    @property
+    def camera_privacy(self) -> cp.CameraPrivacy:
+        return self._camera_privacy
+
+    def camera_report(self) -> dict:
+        """The camera-access block the device reports (core/camera_privacy.py)."""
+        with self._lock:
+            stopped = self._monitoring_stopped
+        return self._camera_privacy.report(stopped=stopped, dashboard=True,
+                                           local_while_stopped=self._local_camera_while_stopped)
 
     def _current_frame(self) -> Optional[_StreamFrame]:
         """The slot's frame, refreshed from the camera when the runtime is not drawing."""
@@ -760,6 +855,8 @@ class DashboardServer:
                 "stale_frames_withheld": counts["stale_frames_withheld"],
                 "client_send_timeouts": counts["client_send_timeouts"],
                 "camera_fallback_encodes": counts["camera_fallback_encodes"],
+                "privacy_heartbeats": counts["privacy_heartbeats"],
+                "remote_stream": self._camera_privacy.remote_stream(self._monitoring_stopped),
                 "latest_seq": self._jpeg_seq,
                 "max_pending_frames_per_client": 1,
                 "clients": [
@@ -864,9 +961,18 @@ class DashboardServer:
             return pending
 
     def set_policy_state(self, state: dict) -> None:
-        """Role, protection and last refusal, as the runtime reports them."""
+        """Role, protection and last refusal, as the runtime reports them.
+
+        Also the stream's privacy gate (M8.4): `protection.state == "stopped"`
+        is the explicit, confirmed stop, and from this call on no remote viewer
+        is sent a frame unless the owner enabled camera-only.
+        """
+        state = dict(state or {})
+        protection = state.get("protection")
+        stopped = isinstance(protection, dict) and protection.get("state") == "stopped"
         with self._lock:
-            self._policy_state = dict(state or {})
+            self._policy_state = state
+            self._monitoring_stopped = stopped
 
     def set_active_preset(self, name: Optional[str], module_name: str) -> None:
         """Called by the main loop after a switch completes."""
@@ -982,6 +1088,9 @@ class DashboardServer:
                 "total_events": sum(self._counts.values()),
                 "risk": [round(r, 3) for _, r in self._risk_series],
                 "policy": dict(self._policy_state),
+                # M8.4: who may see the camera right now (Decision C).
+                "camera": self._camera_privacy.report(stopped=self._monitoring_stopped, dashboard=True,
+                                                      local_while_stopped=self._local_camera_while_stopped),
                 "generated_at": datetime.now(UTC).isoformat(),
             }
 
@@ -1150,7 +1259,11 @@ function fmt(s){const m=Math.floor(s/60),h=Math.floor(m/60);return h?h+":"+Strin
 async function tick(){
   try{
     const s = await (await authFetch("/api/state")).json();
-    document.getElementById("sub").textContent = s.module + " · live";
+    // M8.4: say why the picture is empty instead of leaving a frozen image.
+    const cam = s.camera || {};
+    document.getElementById("sub").textContent = s.module + (
+      cam.remote_stream === "off_while_stopped" ? " · camera off — monitoring stopped"
+      : cam.remote_stream === "camera_only" ? " · camera only — not monitoring" : " · live");
     document.getElementById("uptime").textContent = fmt(s.uptime_s);
     document.getElementById("total").textContent = s.total_events;
     const risk = s.risk.length ? s.risk[s.risk.length-1] : 0;

@@ -9,6 +9,10 @@ open -- and a new viewer was handed that frozen picture as its first frame
 Now the camera keeps streaming, unannotated and labelled X-Frame-Source:
 camera, and every annotated part carries the age of the CAMERA capture it
 was drawn from (the FrameBus publish time), not the encode time.
+
+M8.4 (owner Decision C): while monitoring is STOPPED a remote viewer gets no
+frames unless the owner enabled camera-only; a loopback viewer (these tests
+connect over 127.0.0.1) keeps the camera, labelled camera_local.
 """
 
 from __future__ import annotations
@@ -150,7 +154,11 @@ def test_video_stays_live_and_labelled_while_monitoring_is_stopped(tmp_path, mon
                 "the picture is not"
             )
         parts = stopped.jpeg_parts()
-        assert {p.headers["x-frame-source"] for p in parts} == {"camera"}
+        # M8.4 Decision C: this client is on loopback (local maintenance), so it
+        # still sees the camera -- labelled camera_local. A REMOTE viewer gets no
+        # frame at all while stopped: tests/test_m84_privsec_camera_device.py.
+        assert stopped.headers.get("x-stream-camera") == "local_maintenance"
+        assert {p.headers["x-frame-source"] for p in parts} == {"camera_local"}
         seqs = [p.int_header("X-Frame-Seq") for p in parts]
         assert seqs == sorted(seqs) and len(set(seqs)) == len(seqs), "the seq must advance"
         assert all(p.int_header("X-Frame-Age-Ms") < 1000 for p in parts)
