@@ -164,6 +164,11 @@ struct MJPEGPartMeta: Equatable {
             let value = line[line.index(after: colon)...].trimmingCharacters(in: .whitespaces)
             if !name.isEmpty { fields[name] = value }
         }
+        return (from(fields: fields), fields["content-type"], fields["content-length"].flatMap { Int($0) })
+    }
+
+    /// From header fields whose names are already lowercased.
+    static func from(fields: [String: String]) -> MJPEGPartMeta {
         var meta = MJPEGPartMeta()
         meta.seq = fields[Header.seq].flatMap { Int($0) }
         meta.ageMs = fields[Header.age].flatMap { Int($0) }
@@ -172,7 +177,40 @@ struct MJPEGPartMeta: Equatable {
         meta.isHeartbeat = fields[Header.heartbeat] == "1"
         meta.status = fields[Header.status]
         meta.cameraAgeMs = fields[Header.cameraAge].flatMap { Int($0) }
-        return (meta, fields["content-type"], fields["content-length"].flatMap { Int($0) })
+        return meta
+    }
+}
+
+/// What one URLSession `didReceive response` means on /stream.
+///
+/// URLSession (CFNetwork, iOS and macOS) does not hand a
+/// `multipart/x-mixed-replace` body over as bytes: it calls `didReceive
+/// response` once for the HTTP response and then AGAIN FOR EVERY PART -- an
+/// NSHTTPURLResponse, status 200, whose headers are the part's own (merged with
+/// the top-level ones) -- and `didReceive data` with that part's body alone.
+/// Observed against the virtual device (m83-evidence/stream/
+/// urlsession_multipart_behaviour.txt). So the per-frame evidence reaches the
+/// app through responses, not through the parser, and a heartbeat (an empty
+/// part) is a response with no data at all.
+enum MJPEGResponse: Equatable {
+    /// The HTTP response to the request (or a non-200 answer).
+    case stream(status: Int, heartbeatCapable: Bool, streamID: String?)
+    /// The header of the JPEG part whose body arrives next.
+    case frameHeader(MJPEGPartMeta)
+    /// A heartbeat part (no body).
+    case heartbeat(MJPEGPartMeta)
+
+    static func classify(status: Int, mimeType: String?, headers: [String: String]) -> MJPEGResponse {
+        var fields: [String: String] = [:]
+        for (name, value) in headers { fields[name.lowercased()] = value }
+        let mime = (mimeType ?? fields["content-type"] ?? "").lowercased()
+        if status != 200 || mime.hasPrefix("multipart/") {
+            return .stream(status: status,
+                           heartbeatCapable: fields["x-stream-heartbeat-interval-ms"] != nil,
+                           streamID: fields[MJPEGPartMeta.Header.streamID])
+        }
+        let meta = MJPEGPartMeta.from(fields: fields)
+        return meta.isHeartbeat ? .heartbeat(meta) : .frameHeader(meta)
     }
 }
 
@@ -290,6 +328,13 @@ struct MJPEGFrameParser {
 
         enforceBufferCap()
         return parts
+    }
+
+    /// The metadata of the next JPEG, when the transport delivered the part's
+    /// headers separately (URLSession does -- see MJPEGResponse). A header block
+    /// found in the bytes still takes precedence.
+    mutating func expectNextFrame(_ meta: MJPEGPartMeta) {
+        pendingMeta = meta
     }
 
     /// Drop everything held. Used when a connection is replaced, so bytes from a

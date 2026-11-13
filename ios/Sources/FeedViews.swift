@@ -674,10 +674,14 @@ final class MJPEGReader: NSObject, ObservableObject, URLSessionDataDelegate {
     ) {
         let http = response as? HTTPURLResponse
         let status = http?.statusCode ?? 0
-        // M8.3: a device that sends heartbeats says so; its silence then means a
-        // dead connection (FeedLivenessTracker.shouldForceReconnect).
-        let heartbeatCapable = http?.value(forHTTPHeaderField: MJPEGStreamRequest.heartbeatIntervalHeader) != nil
-        let streamID = http?.value(forHTTPHeaderField: MJPEGStreamRequest.streamIDHeader)
+        // URLSession calls this once for the HTTP response and again for EVERY
+        // multipart part, with that part's headers (see MJPEGResponse). M8.3 reads
+        // the device's per-frame evidence and heartbeats from here.
+        var headers: [String: String] = [:]
+        for (name, value) in http?.allHeaderFields ?? [:] {
+            if let name = name as? String { headers[name] = "\(value)" }
+        }
+        let kind = MJPEGResponse.classify(status: status, mimeType: response.mimeType, headers: headers)
         // Reading the body of a response we cannot use only wastes the radio; the
         // status is recovered from `task.response` in didCompleteWithError below,
         // which is where the decision about retrying is made.
@@ -685,12 +689,23 @@ final class MJPEGReader: NSObject, ObservableObject, URLSessionDataDelegate {
         guard status == 200 else { return }
         Task { @MainActor [weak self] in
             guard let self, self.isCurrent(session) else { return }
-            self.responded = true
-            self.connectTimeoutTask?.cancel()
-            self.tracker.connectionOpened(now: Self.now(), heartbeatCapable: heartbeatCapable, streamID: streamID)
-            // The device answered. Anything still wrong from here is the camera's
-            // end, not the network's, and the badge should stop blaming Wi-Fi.
-            if self.state != .streaming { self.state = .waitingForFrames }
+            switch kind {
+            case .stream(_, let heartbeatCapable, let streamID):
+                self.responded = true
+                self.connectTimeoutTask?.cancel()
+                // A device that sends heartbeats says so; its silence then means
+                // a dead connection (FeedLivenessTracker.shouldForceReconnect).
+                self.tracker.connectionOpened(now: Self.now(), heartbeatCapable: heartbeatCapable,
+                                              streamID: streamID)
+                // The device answered. Anything still wrong from here is the camera's
+                // end, not the network's, and the badge should stop blaming Wi-Fi.
+                if self.state != .streaming { self.state = .waitingForFrames }
+            case .frameHeader(let meta):
+                self.parser.expectNextFrame(meta)
+            case .heartbeat(let meta):
+                self.tracker.heartbeatReceived(meta, now: Self.now())
+                self.refreshLiveness()
+            }
         }
     }
 

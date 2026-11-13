@@ -107,6 +107,48 @@ do {
     check(parser.highWaterBytes <= 1100, "the high-water mark is bounded too (cap + one chunk)")
 }
 
+print("\nURLSession hands each multipart part over as its own response (observed on the virtual device):")
+do {
+    // The shapes recorded in m83-evidence/stream/urlsession_multipart_behaviour.txt:
+    // the HTTP response, then one NSHTTPURLResponse per part whose headers are the
+    // part's own merged with the top-level ones.
+    let top = ["Content-Type": "multipart/x-mixed-replace; boundary=frame", "X-Stream-Id": "674d9eec",
+               "X-Stream-Heartbeat-Interval-Ms": "1000", "Cache-Control": "no-store"]
+    check(MJPEGResponse.classify(status: 200, mimeType: "multipart/x-mixed-replace", headers: top)
+          == .stream(status: 200, heartbeatCapable: true, streamID: "674d9eec"),
+          "the HTTP response opens the stream, heartbeat-capable, with its id")
+    var part = top
+    part["Content-Type"] = "image/jpeg"; part["Content-Length"] = "19112"
+    part["X-Frame-Seq"] = "4"; part["X-Frame-Age-Ms"] = "94"; part["X-Frame-Source"] = "annotated"
+    if case let .frameHeader(m) = MJPEGResponse.classify(status: 200, mimeType: "image/jpeg", headers: part) {
+        check(m.seq == 4 && m.ageMs == 94 && m.source == "annotated" && m.streamID == "674d9eec",
+              "a JPEG part's response carries the frame's evidence")
+    } else { check(false, "a JPEG part is a frame header, NOT a new connection (the probe caught this)") }
+    var beat = top
+    beat["Content-Type"] = "text/plain"; beat["Content-Length"] = "0"; beat["X-Stream-Heartbeat"] = "1"
+    beat["X-Stream-Status"] = "camera_stale"; beat["X-Camera-Age-Ms"] = "6150"
+    if case let .heartbeat(m) = MJPEGResponse.classify(status: 200, mimeType: "text/plain", headers: beat) {
+        check(m.status == "camera_stale" && m.cameraAgeMs == 6150, "a heartbeat part is a heartbeat")
+    } else { check(false, "a heartbeat part is recognised") }
+    check(MJPEGResponse.classify(status: 401, mimeType: "application/json", headers: [:])
+          == .stream(status: 401, heartbeatCapable: false, streamID: nil), "a refusal is a stream-level answer")
+    check(MJPEGResponse.classify(status: 200, mimeType: "multipart/x-mixed-replace",
+                                 headers: ["Content-Type": "multipart/x-mixed-replace; boundary=frame"])
+          == .stream(status: 200, heartbeatCapable: false, streamID: nil),
+          "firmware before M8.3: not heartbeat-capable, no id")
+
+    // The part's headers handed to the parser, then the body alone (no header block in the bytes).
+    var parser = MJPEGFrameParser()
+    var m = MJPEGPartMeta(); m.seq = 4; m.ageMs = 94
+    parser.expectNextFrame(m)
+    let parts = parser.appendParts(jpeg([7, 7]))
+    if case let .frame(_, got) = parts.first { check(got.seq == 4 && got.ageMs == 94, "the body gets its part's evidence") }
+    else { check(false, "the body is a frame") }
+    if case let .frame(_, got) = parser.appendParts(jpeg([8])).first {
+        check(got.seq == nil, "and the evidence is used once, never carried to the next body")
+    } else { check(false, "the next body is a frame") }
+}
+
 // ------------------------------------------------------------------ tracker
 print("\nLIVE only while fresh frames advance:")
 do {
@@ -145,6 +187,10 @@ do {
     check(t.frameReceived(meta(seq: 1, ageMs: 30_000), now: 0.1) == .stale(ageMs: 30_000),
           "a 30 s old picture (the old device's cached frame) is stale")
     check(t.liveness(transport: .streaming, now: 0.2) != .live, "and is never shown as LIVE")
+    // The pre-M8.3 rule (MJPEGLiveIndicator: `reader.state == .streaming`) lit
+    // LIVE here: the frame decoded, so the transport state was .streaming.
+    check(MJPEGStreamState.streaming.isShowingLiveVideo,
+          "(the transport alone still says .streaming -- which is exactly why it is not the badge's input)")
     check(t.metrics.staleFrames == 1 && t.metrics.lastFrameAgeMs == 30_000, "and its age is recorded")
     t.frameReceived(meta(seq: 2, ageMs: 2500), now: 0.3)
     check(t.liveness(transport: .streaming, now: 0.4) != .live, "2.5 s old is still not live")
