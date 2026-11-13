@@ -144,6 +144,7 @@ struct DeviceDetailView: View {
                     .padding(.top, SD.Space.lg)
 
                 recentActivity
+                    .id("activity")
                     .padding(.top, SD.Space.xl)
 
                 modeLibrary
@@ -355,6 +356,8 @@ struct DeviceDetailView: View {
         .task {
             await reload()
             if DebugLaunch.openJupiter {
+                // After the push settles: a sheet presented mid-transition is dropped.
+                try? await Task.sleep(for: .seconds(1.5))
                 jupiterSheet = JupiterSheet(prompt: DebugLaunch.jupiterPrompt ?? "")
             } else if DebugLaunch.openHistory {
                 showHistory = true
@@ -1718,7 +1721,9 @@ struct DeviceDetailView: View {
             settleProtection()
             let fetchedEvents = try await state.backend.events(deviceID: device.id, limit: 200)
             guard reloadGuard.isLatest(token) else { return }
-            events = fetchedEvents
+            // Merged like Activity (M8.3 EventFeed): one copy per event, a
+            // newer alert report never replaced by a stale poll, newest first.
+            events = EventFeed.merge(events, fetchedEvents)
             // The library, the device's availability and its rules. Each says
             // "not supported by this server" on its own when the endpoint is
             // missing, and none of them fails the screen.

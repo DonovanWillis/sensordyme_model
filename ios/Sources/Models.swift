@@ -243,6 +243,9 @@ extension EventItem {
     /// Matches jupiter/explain.py's severity mapping, so the app and the
     /// explanation endpoint never disagree about how alarming something is.
     var severityStatus: SDStatus {
+        // An experimental observation (M8.4) is never an alert, whatever
+        // severity or type it carries: no alert colour, no notification.
+        if isExperimental { return .online }
         if ["fall", "on_floor", "safe_zone_exit", "zone_violation"].contains(type.split(separator: ":").first.map(String.init) ?? type) {
             return .alert
         }

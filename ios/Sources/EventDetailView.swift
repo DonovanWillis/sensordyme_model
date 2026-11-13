@@ -30,6 +30,7 @@ struct EventDetailView: View {
                 VStack(alignment: .leading, spacing: SD.Space.lg) {
                     header
                     deviceAlertCard
+                    evidenceSection
                     // The detections around the alert, including the ones that
                     // never notified. One interruption, the whole story.
                     if !allEvents.isEmpty {
@@ -45,7 +46,7 @@ struct EventDetailView: View {
                         }
                     } else if let errorMessage {
                         SDErrorState(
-                            title: "Couldn't explain this alert",
+                            title: "Couldn't explain this event",
                             message: errorMessage,
                             retry: { await load() }
                         )
@@ -55,7 +56,9 @@ struct EventDetailView: View {
                 .padding(.bottom, SD.Space.xl)
             }
             .orynScreen()
-            .navigationTitle("Alert")
+            // "Alert" only for what alerted, or was asked for (M8.4): a plain
+            // detection or an experimental observation is an event.
+            .navigationTitle(event.isCritical || event.isConfigured ? "Alert" : "Event")
             .navigationBarTitleDisplayMode(.inline)
             .toolbar {
                 ToolbarItem(placement: .cancellationAction) {
@@ -74,7 +77,8 @@ struct EventDetailView: View {
             HStack(spacing: SD.Space.xs) {
                 SDStatusPill(
                     status: event.severityStatus == .online ? .unknown : event.severityStatus,
-                    text: event.isCritical ? "Critical" : (event.severity == "soft" ? "Warning" : "Info")
+                    text: event.isExperimental ? "Experimental"
+                        : (event.isCritical ? "Critical" : (event.severity == "soft" ? "Warning" : "Info"))
                 )
                 Spacer()
                 if let date = event.date {
@@ -109,15 +113,29 @@ struct EventDetailView: View {
         let evidence = event.alertEvidence
         return VStack(alignment: .leading, spacing: SD.Space.xs) {
             SDSectionHeader(title: "On the device")
-            Label(evidence.headline,
-                  systemImage: evidence.confirmedSound ? "speaker.wave.2.fill" : "speaker.slash")
-                .font(SD.Typography.body.weight(.semibold))
-                .foregroundStyle(SD.Colors.textPrimary)
-                .accessibilityIdentifier("eventDetail.alertEvidence")
-            Text(evidence.detail)
-                .font(SD.Typography.callout)
-                .foregroundStyle(SD.Colors.textSecondary)
-                .fixedSize(horizontal: false, vertical: true)
+            if event.isExperimental {
+                // M8.4: an experimental signal is recorded to evaluate it, never
+                // to warn anyone, and it is no evidence of what anyone was doing.
+                Label("Experimental observation (not an alert)", systemImage: "flask")
+                    .font(SD.Typography.body.weight(.semibold))
+                    .foregroundStyle(SD.Colors.textPrimary)
+                    .accessibilityIdentifier("eventDetail.alertEvidence")
+                Text("An unvalidated signal the device records so it can be evaluated. It never sounds or "
+                     + "notifies, and it isn't evidence of what anyone in view was doing.")
+                    .font(SD.Typography.callout)
+                    .foregroundStyle(SD.Colors.textSecondary)
+                    .fixedSize(horizontal: false, vertical: true)
+            } else {
+                Label(evidence.headline,
+                      systemImage: evidence.confirmedSound ? "speaker.wave.2.fill" : "speaker.slash")
+                    .font(SD.Typography.body.weight(.semibold))
+                    .foregroundStyle(SD.Colors.textPrimary)
+                    .accessibilityIdentifier("eventDetail.alertEvidence")
+                Text(evidence.detail)
+                    .font(SD.Typography.callout)
+                    .foregroundStyle(SD.Colors.textSecondary)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
             if let note = timeNote {
                 Text(note)
                     .font(SD.Typography.caption)
@@ -126,6 +144,51 @@ struct EventDetailView: View {
                     .accessibilityIdentifier("eventDetail.timeNote")
             }
         }
+        .accessibilityElement(children: .combine)
+    }
+
+    // MARK: The record (M8.4)
+
+    /// What this event's record supports, from its own fields (EventEvidence):
+    /// what the device measured, what it concluded, the detector's score when
+    /// one was recorded, whether an alert was asked for, and what is missing.
+    private var evidenceSection: some View {
+        let evidence = EventEvidence(event)
+        return VStack(alignment: .leading, spacing: SD.Space.xs) {
+            SDSectionHeader(title: "What the record shows")
+            recordRow("Observed", evidence.observed ?? "Not recorded")
+            recordRow("Device's conclusion", evidence.inferred)
+            recordRow("Confidence the device recorded", evidence.confidence ?? "Not recorded")
+            recordRow("Alert requested", evidence.alertRequested)
+            if !evidence.gaps.isEmpty {
+                VStack(alignment: .leading, spacing: 2) {
+                    ForEach(evidence.gaps, id: \.self) { gap in
+                        Label(gap, systemImage: "info.circle")
+                            .font(SD.Typography.caption)
+                            .foregroundStyle(SD.Colors.textTertiary)
+                            .fixedSize(horizontal: false, vertical: true)
+                    }
+                }
+                .padding(.top, SD.Space.xxs)
+                .accessibilityElement(children: .combine)
+                .accessibilityIdentifier("eventDetail.gaps")
+            }
+        }
+        .accessibilityIdentifier("eventDetail.record")
+    }
+
+    /// A label over its value: at every text size the value has the full width.
+    private func recordRow(_ label: String, _ value: String) -> some View {
+        VStack(alignment: .leading, spacing: 1) {
+            Text(label)
+                .font(SD.Typography.caption)
+                .foregroundStyle(SD.Colors.textTertiary)
+            Text(value)
+                .font(SD.Typography.callout)
+                .foregroundStyle(SD.Colors.textPrimary)
+                .fixedSize(horizontal: false, vertical: true)
+        }
+        .padding(.vertical, 2)
         .accessibilityElement(children: .combine)
     }
 

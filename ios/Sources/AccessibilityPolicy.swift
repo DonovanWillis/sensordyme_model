@@ -38,6 +38,7 @@ enum EventAccessibility {
         switch severity {
         case "loud": "Urgent alert"
         case "soft": "Alert"
+        case "experimental": "Experimental observation, not an alert"
         default: "Event"
         }
     }

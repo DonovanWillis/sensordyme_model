@@ -18,6 +18,12 @@ struct EventSeverityStyle {
     let emphasised: Bool
 
     init(_ event: EventItem) {
+        // An experimental observation (M8.4): a quiet ring with its own word,
+        // never an alert's colour or weight.
+        if event.isExperimental {
+            word = "Experimental"; color = SD.Colors.textTertiary; filled = false; size = 8; emphasised = false
+            return
+        }
         switch event.severityStatus {
         case .alert:
             word = "Urgent"; color = SD.Colors.danger; filled = true; size = 10; emphasised = true
@@ -45,6 +51,7 @@ struct TimelineRow: View {
     var onExplain: () -> Void
 
     private var style: EventSeverityStyle { EventSeverityStyle(event) }
+    @Environment(\.dynamicTypeSize) private var typeSize
 
     var body: some View {
         HStack(alignment: .top, spacing: SD.Space.sm) {
@@ -54,7 +61,8 @@ struct TimelineRow: View {
                     .buttonStyle(SDUndimmedButtonStyle())
                     // The marker's colour and shape are the severity; say it.
                     .accessibilityLabel(EventAccessibility.label(
-                        title: event.title, severity: event.severity, signals: event.signals,
+                        title: event.title, severity: event.isExperimental ? "experimental" : event.severity,
+                        signals: event.signals,
                         when: event.date.map { Self.spokenAge.localizedString(for: $0, relativeTo: .now) }))
                     .accessibilityValue(event.isSimulated ? "Simulated" : "")
                     .accessibilityHint(expanded ? "Hides the details" : "Shows the details")
@@ -88,58 +96,95 @@ struct TimelineRow: View {
 
     private var header: some View {
         VStack(alignment: .leading, spacing: 2) {
-            HStack(alignment: .firstTextBaseline, spacing: SD.Space.xs) {
-                Text(event.title)
-                    .font(style.emphasised ? SD.Typography.headline : SD.Typography.body)
-                    .foregroundStyle(SD.Colors.textPrimary)
-                    .multilineTextAlignment(.leading)
-                    .fixedSize(horizontal: false, vertical: true)
-                Spacer(minLength: SD.Space.xs)
-                if let date = event.date {
-                    Group {
-                        if relativeTime {
-                            Text(date, format: .relative(presentation: .numeric, unitsStyle: .abbreviated))
-                        } else {
-                            Text(date, format: .dateTime.hour().minute())
-                        }
-                    }
-                    .font(SD.Typography.caption.monospacedDigit())
-                    .foregroundStyle(SD.Colors.textTertiary)
-                    .lineLimit(1)
-                    .fixedSize()
+            // The time beside the title, or under it at accessibility sizes,
+            // where beside it broke the title mid-word ("Drows-iness", M8.4).
+            if typeSize.isAccessibilitySize {
+                VStack(alignment: .leading, spacing: 2) {
+                    titleText
+                    timeText
+                }
+            } else {
+                HStack(alignment: .firstTextBaseline, spacing: SD.Space.xs) {
+                    titleText
+                    Spacer(minLength: SD.Space.xs)
+                    timeText
                 }
             }
-            HStack(spacing: SD.Space.xs) {
-                if style.emphasised || event.severityStatus == .warning {
-                    Text(style.word)
-                        .font(SD.Typography.caption.weight(.semibold))
-                        .foregroundStyle(style.color)
+            // The badges on one line (stacked when they don't fit), and the
+            // device's own words on their own line under them (M8.4). In one
+            // row, a wrapping signals line squeezed "Urgent" until the two
+            // overlapped.
+            if hasBadges {
+                ViewThatFits(in: .horizontal) {
+                    HStack(spacing: SD.Space.xs) { badges }
+                    VStack(alignment: .leading, spacing: 2) { badges }
                 }
-                if event.isConfigured {
-                    Text("Your rule")
-                        .font(SD.Typography.caption.weight(.medium))
-                        .foregroundStyle(SD.Colors.textSecondary)
-                }
-                // Real vs rehearsal, on the row itself (M8.3): a simulated or
-                // demo event must never pass for a real detection.
-                if event.isSimulated {
-                    Text("Simulated")
-                        .font(SD.Typography.caption.weight(.semibold))
-                        .foregroundStyle(SD.Colors.textTertiary)
-                        .accessibilityIdentifier("event.simulated")
-                }
-                if let signals = event.signals, !signals.isEmpty {
-                    // Wraps in full: two lines clipped the device's reason (audit).
-                    Text(signals)
-                        .font(SD.Typography.caption)
-                        .foregroundStyle(SD.Colors.textSecondary)
-                        .multilineTextAlignment(.leading)
-                        .fixedSize(horizontal: false, vertical: true)
-                }
+            }
+            if let signals = event.signals, !signals.isEmpty {
+                // Wraps in full: two lines clipped the device's reason (audit).
+                Text(signals)
+                    .font(SD.Typography.caption)
+                    .foregroundStyle(SD.Colors.textSecondary)
+                    .multilineTextAlignment(.leading)
+                    .fixedSize(horizontal: false, vertical: true)
             }
         }
         .frame(maxWidth: .infinity, minHeight: 44, alignment: .leading)
         .contentShape(Rectangle())
+    }
+
+    private var titleText: some View {
+        Text(event.title)
+            .font(style.emphasised ? SD.Typography.headline : SD.Typography.body)
+            .foregroundStyle(SD.Colors.textPrimary)
+            .multilineTextAlignment(.leading)
+            .fixedSize(horizontal: false, vertical: true)
+    }
+
+    @ViewBuilder private var timeText: some View {
+        if let date = event.date {
+            Group {
+                if relativeTime {
+                    Text(date, format: .relative(presentation: .numeric, unitsStyle: .abbreviated))
+                } else {
+                    Text(date, format: .dateTime.hour().minute())
+                }
+            }
+            .font(SD.Typography.caption.monospacedDigit())
+            .foregroundStyle(SD.Colors.textTertiary)
+            .lineLimit(1)
+            .fixedSize()
+        }
+    }
+
+    private var showsWord: Bool {
+        event.isExperimental || style.emphasised || event.severityStatus == .warning
+    }
+    private var hasBadges: Bool { showsWord || event.isConfigured || event.isSimulated }
+
+    @ViewBuilder private var badges: some View {
+        if showsWord {
+            Text(style.word)
+                .font(SD.Typography.caption.weight(.semibold))
+                .foregroundStyle(event.isExperimental ? SD.Colors.textSecondary : style.color)
+                .fixedSize()
+                .accessibilityIdentifier(event.isExperimental ? "event.experimental" : "event.severity")
+        }
+        if event.isConfigured {
+            Text("Your rule")
+                .font(SD.Typography.caption.weight(.medium))
+                .foregroundStyle(SD.Colors.textSecondary)
+                .fixedSize()
+        }
+        // Real vs rehearsal, on the row itself (M8.3): a simulated or
+        // demo event must never pass for a real detection.
+        if event.isSimulated {
+            Text("Simulated")
+                .font(SD.Typography.caption.weight(.semibold))
+                .foregroundStyle(SD.Colors.textTertiary)
+                .fixedSize()
+                .accessibilityIdentifier("event.simulated")
+        }
     }
 
     /// Only what the backend recorded: confidence when the event carries one,
@@ -157,12 +202,21 @@ struct TimelineRow: View {
             if event.deviceClockError != nil {
                 fact("Device clock", "was wrong; time shown is from the server")
             }
-            if event.severityStatus != .online || event.alert != nil {
+            if event.isExperimental {
+                // M8.4: recorded to learn from, never an alert.
+                fact("Kind", "Experimental observation (not an alert)")
+                    .accessibilityIdentifier("event.alertEvidence")
+            } else if event.severityStatus != .online || event.alert != nil {
+                if event.alert?.decision != nil {
+                    fact("Alert requested", EventEvidence(event).alertRequested)
+                }
                 fact("Device alert", event.alertEvidence.short)
                     .accessibilityIdentifier("event.alertEvidence")
             }
             if let confidence = event.confidence {
-                fact("Detector confidence", String(format: "%.2f", confidence))
+                // The device's confidence that the condition held -- for a
+                // measured condition not a detector's score (jupiter/explain.py).
+                fact("Recorded confidence", String(format: "%.2f", confidence))
             }
             if let model = event.model?.summary {
                 fact("Produced by", model)
@@ -250,15 +304,19 @@ struct ActivityTimeline: View {
                                     onExplain: { onExplain(event) })
                     }
                 } header: {
-                    HStack(alignment: .firstTextBaseline) {
-                        Text(day.label)
-                            .font(SD.Typography.headline)
-                            .foregroundStyle(SD.Colors.textPrimary)
-                        Spacer()
-                        Text(summary(day.events))
-                            .font(SD.Typography.caption.monospacedDigit())
-                            .foregroundStyle(SD.Colors.textTertiary)
+                    // Side by side when they fit, the count under the day when not.
+                    ViewThatFits(in: .horizontal) {
+                        HStack(alignment: .firstTextBaseline) {
+                            dayLabel(day.label)
+                            Spacer()
+                            daySummary(day.events)
+                        }
+                        VStack(alignment: .leading, spacing: 2) {
+                            dayLabel(day.label)
+                            daySummary(day.events, wraps: true)
+                        }
                     }
+                    .frame(maxWidth: .infinity, alignment: .leading)
                     .padding(.top, SD.Space.lg)
                     .padding(.bottom, SD.Space.sm)
                     .accessibilityElement(children: .combine)
@@ -269,13 +327,27 @@ struct ActivityTimeline: View {
         .animation(SD.Motion.resolved(SD.Motion.standard, reduceMotion: reduceMotion), value: expandedID)
     }
 
+    private func dayLabel(_ label: String) -> some View {
+        Text(label)
+            .font(SD.Typography.headline)
+            .foregroundStyle(SD.Colors.textPrimary)
+            .fixedSize()
+    }
+
+    private func daySummary(_ events: [EventItem], wraps: Bool = false) -> some View {
+        Text(summary(events))
+            .font(SD.Typography.caption.monospacedDigit())
+            .foregroundStyle(SD.Colors.textTertiary)
+            .fixedSize(horizontal: !wraps, vertical: true)
+    }
+
     private func toggle(_ event: EventItem) {
         expandedID = expandedID == event.id ? nil : event.id
     }
 
     /// Counted, not scored: how many events, and how many alerted.
     private func summary(_ events: [EventItem]) -> String {
-        let alerts = events.filter { $0.isCritical || $0.isConfigured }.count
+        let alerts = events.filter { !$0.isExperimental && ($0.isCritical || $0.isConfigured) }.count
         let total = "\(events.count) \(events.count == 1 ? "event" : "events")"
         return alerts == 0 ? total : "\(total) · \(alerts) \(alerts == 1 ? "alert" : "alerts")"
     }

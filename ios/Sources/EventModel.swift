@@ -68,6 +68,11 @@ struct EventItem: Codable, Identifiable, Hashable {
     var alert: EventAlertReport? = nil
     /// True for an event from a simulated device or detector, or the demo.
     var simulated: Bool? = nil
+    /// M8.4: true for an EXPERIMENTAL observation (the driver module's combined
+    /// risk score, erratic hand movement): recorded with `severity: "log"`,
+    /// never an alert. Absent from older backends and firmware: nil, and the
+    /// event reads exactly as before.
+    var experimental: Bool? = nil
 
     enum CodingKeys: String, CodingKey {
         case eventID = "id"
@@ -76,7 +81,7 @@ struct EventItem: Codable, Identifiable, Hashable {
         case receivedAt = "received_at"
         case occurredAt = "occurred_at"
         case timeBasis = "time_basis"
-        case alert, simulated
+        case alert, simulated, experimental
     }
 
     /// Whether the user asked to be told about this specifically.
@@ -115,6 +120,9 @@ struct EventItem: Codable, Identifiable, Hashable {
     var receivedDate: Date? { receivedAt.map { Date(timeIntervalSince1970: $0) } }
 
     var isSimulated: Bool { simulated == true }
+
+    /// An experimental observation: shown, never presented as an alert.
+    var isExperimental: Bool { experimental == true }
 
     /// How far the device's clock was from when the event really happened, in
     /// seconds (positive: the device clock was ahead), when that was 2 minutes
@@ -316,4 +324,79 @@ extension ISO8601DateFormatter {
         formatter.formatOptions = [.withInternetDateTime]
         return formatter
     }()
+}
+
+
+/// What one event's record supports, split the way a person asks about it
+/// (M8.4): what the device observed, what it concluded, how sure the detector
+/// was (only when the record says), whether an alert was asked for, whether a
+/// real output confirmed it, and what is missing or stale. Foundation-only and
+/// built only from fields the backend stored -- nothing estimated here.
+struct EventEvidence: Equatable {
+    /// The device's conclusion, as its event type ("Drowsiness").
+    let inferred: String
+    /// What the device recorded measuring, in its own words; nil when it recorded nothing.
+    let observed: String?
+    /// The confidence the device recorded for this event, when it recorded one:
+    /// how sure it was that the condition held (for a measured condition such
+    /// as eye closure, not a detector's score -- jupiter/explain.py).
+    let confidence: String?
+    /// Whether the device's alert policy asked for an alert, in words.
+    let alertRequested: String
+    /// What the device reported its alert output did (AlertDeliveryEvidence).
+    let output: AlertDeliveryEvidence
+    let simulated: Bool
+    let experimental: Bool
+    /// What the record lacks, or why its time is not the device's own.
+    let gaps: [String]
+
+    init(_ event: EventItem) {
+        inferred = event.title
+        let signals = event.signals?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+        observed = signals.isEmpty ? nil : signals
+        confidence = event.confidence.map { String(format: "%.2f", $0) }
+        simulated = event.isSimulated
+        experimental = event.isExperimental
+        output = event.alertEvidence
+        alertRequested = Self.requested(decision: event.alert?.decision, experimental: event.isExperimental)
+        var gaps: [String] = []
+        if observed == nil { gaps.append("The device didn't record what it measured.") }
+        if event.confidence == nil { gaps.append("No confidence was recorded.") }
+        if event.alert == nil && !event.isExperimental {
+            gaps.append("The device didn't report what its alert output did (older firmware reports nothing).")
+        }
+        if event.timeIsArrival {
+            gaps.append("The device's clock couldn't be trusted; the time is when the server received it.")
+        } else if event.deviceClockError != nil {
+            gaps.append("The device's clock was wrong; the time is from the server.")
+        }
+        if let delay = event.deliveryDelay {
+            gaps.append("It reached the server \(Self.minutes(delay)) after it happened.")
+        }
+        self.gaps = gaps
+    }
+
+    /// The headline for the event's kind.
+    var kind: String {
+        if experimental { return "Experimental observation (not an alert)" }
+        return simulated ? "Simulated event" : "Detection"
+    }
+
+    static func requested(decision: String?, experimental: Bool) -> String {
+        switch decision {
+        case "alerted": return "Yes: the device's alert policy raised an alert"
+        case "merged": return "Joined an alert already under way for the same episode"
+        case "suppressed": return "No: recorded only (the device's alert policy held it back)"
+        default:
+            return experimental ? "No: experimental observations never alert"
+                : "Not reported by the device"
+        }
+    }
+
+    private static func minutes(_ seconds: Double) -> String {
+        let minutes = Int((seconds / 60).rounded())
+        if minutes < 60 { return "\(max(1, minutes)) min" }
+        let hours = Int((seconds / 3600).rounded())
+        return hours < 48 ? "\(hours) h" : "\(Int((seconds / 86_400).rounded())) d"
+    }
 }

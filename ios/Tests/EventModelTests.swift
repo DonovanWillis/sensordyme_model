@@ -155,5 +155,47 @@ check(EventFeed.ordered([row(7, at: 100), row(8, at: 100)]).map(\.eventID) == [8
 check(Set([row(1, at: 1).id, row(1, at: 99, rev: 3, output: "sounded").id]).count == 1,
       "an event's identity does not change when its report does")
 
+print("\nM8.4 evidence: observed, inferred, requested, confirmed, experimental:")
+let m84 = """
+{"events": [
+ {"id": 900, "timestamp": "2026-11-13T10:00:00+00:00", "type": "high_risk", "confidence": 0.81,
+  "signals": "risk 0.82 (phone 0.6, gaze off 0.4)", "severity": "log", "source": "module",
+  "experimental": true, "occurred_at": 1789293600, "time_basis": "device_monotonic"},
+ {"id": 901, "timestamp": "2026-11-13T10:01:00+00:00", "type": "drowsiness", "confidence": null,
+  "signals": "eyes closed 2.3 s", "severity": "loud", "source": "module",
+  "alert": {"decision": "alerted", "output": "sounded", "rev": 2,
+            "outputs": [{"name": "buzzer", "kind": "buzzer", "audible": true, "played": 1}]}},
+ {"id": 902, "timestamp": "1970-01-01T00:00:10+00:00", "type": "phone_use", "confidence": 0.7,
+  "signals": "", "severity": "loud", "source": "module", "occurred_at": 1789293700,
+  "received_at": 1789297300, "time_basis": "received",
+  "alert": {"decision": "suppressed", "output": "none"}}
+]}
+""".data(using: .utf8)!
+let m84rows = (try? JSONDecoder().decode(EventsBody.self, from: m84))?.events ?? []
+check(m84rows.count == 3, "rows with the M8.4 `experimental` flag decode")
+if m84rows.count == 3 {
+    let experimental = EventEvidence(m84rows[0])
+    check(m84rows[0].isExperimental, "experimental: true is read")
+    check(experimental.kind == "Experimental observation (not an alert)", "said to be an observation, not an alert")
+    check(experimental.alertRequested == "No: experimental observations never alert", "and that it never alerts")
+    check(!experimental.gaps.contains { $0.contains("alert output") },
+          "a missing alert report is not a gap for something that never alerts")
+    let sounded = EventEvidence(m84rows[1])
+    check(!m84rows[1].isExperimental, "no flag: today's behaviour")
+    check(sounded.inferred == "Drowsiness" && sounded.observed == "eyes closed 2.3 s", "inferred vs observed")
+    check(sounded.confidence == nil && sounded.gaps.contains("No confidence was recorded."),
+          "no score is said, never made up")
+    check(sounded.alertRequested.hasPrefix("Yes") && sounded.output.confirmedSound, "requested and confirmed")
+    let held = EventEvidence(m84rows[2])
+    check(held.alertRequested.hasPrefix("No: recorded only"), "a suppressed alert is not called an alert")
+    check(!held.output.confirmedSound, "and nothing claims it sounded")
+    check(held.observed == nil && held.gaps.contains("The device didn't record what it measured."),
+          "an empty signals line is a gap")
+    check(held.gaps.contains { $0.contains("clock couldn't be trusted") }, "an arrival-time stamp is a gap")
+}
+check(EventEvidence.requested(decision: nil, experimental: false) == "Not reported by the device",
+      "older firmware's silence is not a 'no'")
+check(EventEvidence.requested(decision: "merged", experimental: false).hasPrefix("Joined"), "merged")
+
 print("\n\(failures == 0 ? "PASSED" : "\(failures) FAILED")")
 exit(failures == 0 ? 0 : 1)
