@@ -471,7 +471,7 @@ def run_simclock(args: argparse.Namespace) -> dict:
 
 
 def main(argv: Optional[list[str]] = None) -> int:
-    parser = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
+    parser = argparse.ArgumentParser(description=(__doc__ or "").split("\n\n")[0])
     sub = parser.add_subparsers(dest="cmd", required=True)
     a = sub.add_parser("analyze")
     a.add_argument("run_dir")
