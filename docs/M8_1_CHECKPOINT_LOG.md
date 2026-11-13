@@ -53,7 +53,7 @@ Branch `feat/m8.1-release-validation`, local only, created from M8 HEAD `618880c
 
 ## P4 update: oryn back (2026-11-12 ~15:25)
 
-- Tailscale shows oryn online, but `sdrun` refused it with exit 76, a host-identity mismatch: the hostname is now `ORYN`, while the fleet expected `DESKTOP-6QV3CBB`.
+- Tailscale shows oryn online, but `sdrun` refused it with exit 76, a host-identity mismatch: the hostname is now `ORYN`, while the fleet expected its previous Windows machine name.
 - The pinned ed25519 host key still matched under `StrictHostKeyChecking=yes`, so it is the same machine, renamed.
 - The user confirmed the rename. `expect_hostname` in `~/sensordyme-fleet/config/fleet.json` was changed to `ORYN`; the backup is `fleet.json.bak-20261112`.
 - `sdrun check -t oryn`: RTX 4060 idle at 36 °C, 7.5 GB VRAM free, 9.6 GB RAM available, no active jobs.
