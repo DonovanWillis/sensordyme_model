@@ -323,3 +323,90 @@ CABIN_SCENARIOS: dict[str, CabinScenario] = {s.name: s for s in (
            (6.0, CabinScene(detector_failing=True)),
            kind="abstention", expected=[("eyes_down", 2.0, 6.0)]),
 )}
+
+
+# ====================================================================== M8.5 phone handling scenarios
+# Phone HANDLING vs prolonged OFF-ROAD ATTENTION (docs/BEHAVIOR_ENGINE.md, "M8.5
+# phone handling vs off-road attention"; tests/test_m85_phone_*.py). Kept out of
+# CABIN_SCENARIOS so the M8.4 pins stay as they were; scripts/eval_behavior.py
+# runs both sets. Labels are the script's own ground truth: SYNTHETIC.
+def _mount(**changes) -> CabinScene:
+    return CabinScene(**{"phone": "mount", **changes})
+
+
+def _lap_held(**changes) -> CabinScene:
+    return CabinScene(**{"phone": "lap", "hand_on_phone": True, **changes})
+
+
+M85_PHONE_SCENARIOS: dict[str, CabinScenario] = {s.name: s for s in (
+    # ------------------------------------------------ a mounted phone: never phone_use, never silence
+    _cabin("m85_mount_unseen_short_glance", "A phone in a dash mount, hands not seen; one 1.5 s look down "
+           "at it (under every threshold).", 15.0,
+           (0.0, _mount(wheel_hands=False)), (8.0, _mount(wheel_hands=False, head_down_deg=30.0)),
+           (9.5, _mount(wheel_hands=False))),
+    _cabin("m85_mount_unseen_long_look_side", "A phone in a dash mount, hands not seen; a 4 s look 40 deg "
+           "sideways (distraction is true; phone use is not).", 14.0,
+           (0.0, _mount(wheel_hands=False)), (5.0, _mount(wheel_hands=False, yaw_deg=40.0)),
+           (9.0, _mount(wheel_hands=False)), expected=[("distraction", 5.0, 9.0)]),
+    _cabin("m85_mount_flicker_long_look", "A mounted phone the detector sees on 60% of its ticks (the not-held "
+           "latch never forms), hands on the wheel; a 4 s look down at it.", 14.0,
+           (0.0, _mount(phone_visible_prob=0.6)), (5.0, _mount(phone_visible_prob=0.6, head_down_deg=30.0)),
+           (9.0, _mount(phone_visible_prob=0.6)), expected=[("eyes_down", 5.0, 9.0)]),
+    _cabin("m85_mount_detector_fails_mid_look", "A mounted phone, hands not seen; the detector fails as the "
+           "driver looks down for 4 s (phone evidence insufficient; eyes_down still true).", 14.0,
+           (0.0, _mount(wheel_hands=False)),
+           (5.0, _mount(wheel_hands=False, head_down_deg=30.0, detector_failing=True)),
+           (9.0, _mount(wheel_hands=False)), kind="abstention", expected=[("eyes_down", 5.0, 9.0)]),
+    _cabin("m85_sunglasses_mount_long_look", "Sunglasses; a mounted phone, hands not seen; a 3.5 s look down "
+           "at it.", 13.0,
+           (0.0, _mount(wheel_hands=False, sunglasses=True)),
+           (5.0, _mount(wheel_hands=False, sunglasses=True, head_down_deg=30.0)),
+           (8.5, _mount(wheel_hands=False, sunglasses=True)), expected=[("eyes_down", 5.0, 8.5)]),
+    _cabin("m85_stall_mount_long_look", "Frames in 0.4 s bursts with 1 s stalls; a mounted phone, hands not "
+           "seen; a 10 s look down at it.", 20.0,
+           (0.0, _mount(wheel_hands=False, stall_gap_s=1.0)),
+           (5.0, _mount(wheel_hands=False, stall_gap_s=1.0, head_down_deg=30.0)),
+           (15.0, _mount(wheel_hands=False, stall_gap_s=1.0)), expected=[("eyes_down", 5.0, 15.0)]),
+    # ------------------------------------------------ real handling: phone_use, unchanged timing
+    _cabin("m85_held_phone_eyes_on_road", "A phone held in the lap (hand on it), eyes on the road for 12 s.",
+           12.0, (0.0, _lap_held())),
+    _cabin("m85_mount_then_picked_up", "A phone in a dash mount (latched not held), then the driver picks it "
+           "up and looks down at it in the lap for 5 s.", 14.0,
+           (0.0, _mount()), (5.0, _lap_held(head_down_deg=30.0)), (10.0, _lap_held()),
+           kind="true_positive", expected=[("phone_use", 5.0, 10.0), ("eyes_down", 5.0, 10.0)]),
+    _cabin("m85_mount_then_picked_up_hands_unseen", "As above, but the hand model never sees a hand: the "
+           "phone moves from the mount to the lap and is looked at for 5 s.", 14.0,
+           (0.0, _mount(wheel_hands=False)), (5.0, CabinScene(phone="lap", wheel_hands=False, head_down_deg=30.0)),
+           (10.0, CabinScene(phone="lap", wheel_hands=False)),
+           kind="true_positive", expected=[("phone_use", 5.0, 10.0), ("eyes_down", 5.0, 10.0)]),
+    _cabin("m85_mount_look_then_pick_up", "A long look down at a mounted phone that, 1.5 s in, the driver "
+           "takes out of the mount and keeps looking at in the lap (phone moved mid-episode).", 14.0,
+           (0.0, _mount()), (5.0, _mount(head_down_deg=30.0)), (6.5, _lap_held(head_down_deg=30.0)),
+           (10.0, _lap_held()),
+           kind="true_positive", expected=[("eyes_down", 5.0, 10.0), ("phone_use", 6.5, 10.0)]),
+    _cabin("m85_held_then_mounted_mid_look", "Holds the phone in the lap looking down at it 1.5 s, puts it in "
+           "the mount and keeps looking at it 4.5 s more.", 12.0,
+           (0.0, _lap_held()), (2.0, _lap_held(head_down_deg=30.0)), (3.5, _mount(head_down_deg=30.0)),
+           (8.0, _mount()), expected=[("eyes_down", 2.0, 8.0)], allowed=["phone_use"]),
+    _cabin("m85_phone_at_ear_look_away", "On a call with the phone at the ear (no hand seen), the driver looks "
+           "40 deg sideways for 4.5 s.", 12.0,
+           (0.0, CabinScene(phone="ear", wheel_hands=False)),
+           (4.0, CabinScene(phone="ear", wheel_hands=False, yaw_deg=40.0)),
+           (8.5, CabinScene(phone="ear", wheel_hands=False)),
+           kind="true_positive", expected=[("phone_use", 4.0, 8.5), ("distraction", 4.0, 8.5)]),
+    _cabin("m85_moving_phone_hands_unseen", "A phone held beside the lap, moving in the hand (no hand seen), "
+           "looked down at for 5 s.", 11.0,
+           (0.0, CabinScene(phone="side", wheel_hands=False, phone_jitter_px=12.0)),
+           (3.0, CabinScene(phone="side", wheel_hands=False, phone_jitter_px=12.0, head_down_deg=30.0)),
+           (8.0, CabinScene(phone="side", wheel_hands=False, phone_jitter_px=12.0)),
+           kind="true_positive", expected=[("phone_use", 3.0, 8.0), ("eyes_down", 3.0, 8.0)]),
+    _cabin("m85_sunglasses_held_phone", "Sunglasses; holds a phone in the lap and looks down at it for 6 s.",
+           10.0, (0.0, _lap_held(sunglasses=True)), (2.0, _lap_held(sunglasses=True, head_down_deg=30.0)),
+           (8.0, _lap_held(sunglasses=True)),
+           kind="true_positive", expected=[("phone_use", 2.0, 8.0), ("eyes_down", 2.0, 8.0)]),
+    _cabin("m85_stall_held_phone", "Frames in 0.4 s bursts with 1 s stalls; holds a phone in the lap and looks "
+           "down at it for 10 s.", 15.0,
+           (0.0, _lap_held(stall_gap_s=1.0)), (2.0, _lap_held(stall_gap_s=1.0, head_down_deg=30.0)),
+           (12.0, _lap_held(stall_gap_s=1.0)),
+           kind="true_positive", expected=[("phone_use", 2.0, 12.0), ("eyes_down", 2.0, 12.0)]),
+)}

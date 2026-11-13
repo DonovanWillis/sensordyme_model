@@ -426,6 +426,11 @@ CABIN_MOUNT_PHONE = (360, 330, 410, 400)  # dash mount in front of the driver, i
 CABIN_PASSENGER_PHONE = (20, 300, 70, 380)
 CABIN_PASSENGER_HAND = (10, 310, 80, 400)
 CABIN_WHEEL_HANDS = ((215, 405, 275, 460), (395, 415, 455, 465))
+#: M8.5 additions (new scenarios only): a phone held to the ear (face height,
+#: beside the face) and one held off to the side of the lap, below the chin but
+#: outside the face's horizontal span (neither the lap zone nor the face).
+CABIN_EAR_PHONE = (370, 220, 410, 290)
+CABIN_SIDE_PHONE = (380, 340, 430, 410)
 
 
 @dataclass(frozen=True)
@@ -439,7 +444,7 @@ class CabinScene:
     yaw_deg: float = 0.0
     pose_jitter_deg: float = 0.0  # per-frame head-pose noise (poor light, partial occlusion)
     face_dropout: float = 0.0  # probability the face model misses the face on a frame
-    phone: str = "none"  # none | lap | mount | passenger
+    phone: str = "none"  # none | lap | mount | passenger | ear | side (the last two: M8.5)
     phone_visible_prob: float = 1.0  # detector recall on the phone per tick
     hand_on_phone: bool = False
     wheel_hands: bool = True  # the driver's hands on the wheel, visible to the hand model
@@ -453,6 +458,9 @@ class CabinScene:
     stall_gap_s: float = 0.0
     stall_burst_s: float = 0.4
     label: str = ""
+    #: M8.5 (new scenarios only): the detector's phone box moves by up to this
+    #: many pixels per tick (a phone in a moving hand); 0 = still.
+    phone_jitter_px: float = 0.0
 
 
 @dataclass(frozen=True)
@@ -551,6 +559,10 @@ class CabinDetector:
                 boxes.append(_Box(0, CABIN_PASSENGER_LEANING_BOX, 0.9))
             phone = self.cabin.phone_box()
             if phone is not None and self.cabin.rng.random() < scene.phone_visible_prob:
+                if scene.phone_jitter_px > 0:  # M8.5: a phone moving in a hand
+                    dx, dy = (float(v) for v in self.cabin.rng.uniform(-scene.phone_jitter_px,
+                                                                       scene.phone_jitter_px, 2))
+                    phone = (phone[0] + dx, phone[1] + dy, phone[2] + dx, phone[3] + dy)
                 boxes.append(_Box(67, phone, 0.8))
         conf = kwargs.get("conf")
         if conf is not None:
@@ -601,7 +613,8 @@ class ScriptedCabin:
 
     def phone_box(self) -> Optional[tuple]:
         return {"lap": CABIN_LAP_PHONE, "mount": CABIN_MOUNT_PHONE,
-                "passenger": CABIN_PASSENGER_PHONE}.get(self.scene.phone)
+                "passenger": CABIN_PASSENGER_PHONE,
+                "ear": CABIN_EAR_PHONE, "side": CABIN_SIDE_PHONE}.get(self.scene.phone)
 
     def face_landmarks_now(self) -> Optional[list]:
         return self._landmarks

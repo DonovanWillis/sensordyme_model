@@ -2,8 +2,11 @@
 """Behavioural evaluation harness over the scripted cabin scenarios (M8.4, A5/A6).
 
     python scripts/eval_behavior.py --out <file.json> [--scenario NAME ...] [--hands-policy POLICY]
+                                    [--set m84|m85|all]
 
-Runs every sim.scenario.CABIN_SCENARIOS entry through the REAL
+Runs every sim.scenario.CABIN_SCENARIOS entry (set "m84", 24) and, by default,
+every M8.5 phone-handling scenario (sim.scenario.M85_PHONE_SCENARIOS, set "m85")
+through the REAL
 DriverAttentionModule (sim.perception.run_cabin) and writes machine-readable
 JSON: per scenario, the shipped alerts, the experimental observations, the risk
 score, the engine's shadow decisions and abstentions, hand-model calls; and
@@ -34,15 +37,17 @@ from core.behavior.evaluation import (
 )
 from core.behavior.experimental import EXPERIMENTAL_ALERT_TYPES
 from sim.perception import run_cabin
-from sim.scenario import CABIN_SCENARIOS
+from sim.scenario import CABIN_SCENARIOS, M85_PHONE_SCENARIOS
 
 SHADOW_CLAIMS = ("drowsiness", "distraction", "eyes_down", "phone_use", "attention_lost")
+SETS = {"m84": CABIN_SCENARIOS, "m85": M85_PHONE_SCENARIOS}
+ALL_SCENARIOS = {**CABIN_SCENARIOS, **M85_PHONE_SCENARIOS}
 
 
 def evaluate(names: list[str], **overrides) -> dict:
     rows, shadow_rows, durations, per_scenario, reports = [], [], [], {}, []
     for name in names:
-        scenario = CABIN_SCENARIOS[name]
+        scenario = ALL_SCENARIOS[name]
         with tempfile.TemporaryDirectory() as tmp:
             trace = run_cabin(scenario, tmp, **overrides)
         expected, allowed = scenario.label.expected, scenario.label.allowed
@@ -56,6 +61,7 @@ def evaluate(names: list[str], **overrides) -> dict:
         experimental = [e for e in trace["events"] if e["type"] in EXPERIMENTAL_ALERT_TYPES]
         engine = trace["engine"] or {}
         per_scenario[name] = {
+            "set": "m85" if name in M85_PHONE_SCENARIOS else "m84",
             "kind": scenario.kind, "description": scenario.description,
             "expected": [list(e) for e in expected], "allowed": list(allowed),
             "alerts": [f"{e['type']}@{e['t']}" for e in trace["events"] if e["type"] in ALERT_TYPES],
@@ -89,8 +95,10 @@ def main() -> int:
     parser.add_argument("--out", type=Path)
     parser.add_argument("--scenario", action="append", default=[])
     parser.add_argument("--hands-policy", default=None, help="override modules.driver_attention.hands_policy")
+    parser.add_argument("--set", choices=("m84", "m85", "all"), default="all",
+                        help="scenario set when no --scenario is given (default: all)")
     args = parser.parse_args()
-    names = args.scenario or sorted(CABIN_SCENARIOS)
+    names = args.scenario or sorted(ALL_SCENARIOS if args.set == "all" else SETS[args.set])
     overrides = {"hands_policy": args.hands_policy} if args.hands_policy else {}
     result = evaluate(names, **overrides)
     text = json.dumps(result, indent=2, sort_keys=True, default=str)
