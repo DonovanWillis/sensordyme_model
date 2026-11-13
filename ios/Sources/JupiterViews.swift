@@ -109,6 +109,11 @@ struct JupiterDock: View {
         .animation(SD.Motion.resolved(SD.Motion.spatial, reduceMotion: reduceMotion), value: focused)
         .accessibilityElement(children: .contain)
         .accessibilityIdentifier("jupiter.dock")
+        .task {
+            guard DebugLaunch.focusJupiter else { return }
+            try? await Task.sleep(for: .seconds(2))
+            focused = true
+        }
     }
 
     @State private var submitted = 0

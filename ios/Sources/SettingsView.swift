@@ -18,6 +18,7 @@ struct SettingsView: View {
 
     var body: some View {
         NavigationStack {
+            ScrollViewReader { proxy in
             Form {
             Group {
                 if state.isDemo {
@@ -259,11 +260,18 @@ struct SettingsView: View {
                         Button("Log out", role: .destructive) {
                             state.signOut()
                         }
+                        .id("settings.end")
                     }
                 }
             }
             .orynRows()
         }
+        .task {
+            guard DebugLaunch.scrollToBottom else { return }
+            try? await Task.sleep(for: .seconds(1))
+            proxy.scrollTo("settings.end", anchor: .bottom)
+        }
+            }
         .orynFormStyle()
             .navigationTitle("Settings")
             .navigationBarTitleDisplayMode(.large)

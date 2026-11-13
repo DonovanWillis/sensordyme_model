@@ -71,6 +71,11 @@ struct DevicesView: View {
             .task {
                 await reload()
                 if DebugLaunch.openDevice, launchTarget == nil { launchTarget = devices.first }
+                switch DebugLaunch.openSetup {
+                case "wizard"?: showClaim = true
+                case "bluetooth"?: showSetup = true
+                default: break
+                }
                 // Re-resolve the device's address on launch and whenever the
                 // network changes, so a move never requires typing an IP.
                 link.start()
