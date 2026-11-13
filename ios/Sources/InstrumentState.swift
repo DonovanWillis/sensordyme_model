@@ -36,14 +36,19 @@ struct InstrumentState: Equatable {
     /// An SF Symbol that differs for every kind, so a state is never told by
     /// colour alone.
     let symbol: String
+    /// M8.3: the presence was online when this was made. An alert shown for a
+    /// device that has since gone offline or stale keeps its word, but never
+    /// the live visuals: the alert happened, the telemetry is not current.
+    var live: Bool = true
 
     /// Whether the screen may show "active" visuals (the live hairline, the
     /// camera's state frame in an active tone). Only for a device whose
     /// telemetry is live.
     var isActive: Bool {
+        guard live else { return false }
         switch kind {
-        case .ready, .alert, .starting, .degraded: true
-        default: false
+        case .ready, .alert, .starting, .degraded: return true
+        default: return false
         }
     }
 
@@ -52,6 +57,7 @@ struct InstrumentState: Equatable {
     var isInterrupted: Bool {
         switch kind {
         case .offline, .stale, .unknown, .connecting: true
+        case .alert: !live
         default: false
         }
     }
@@ -89,7 +95,8 @@ struct InstrumentState: Equatable {
         // pill that says All clear over old telemetry is exactly what this
         // screen must not show.
         let tone: StatusTone = (kind == .ready) ? pill.tone : (pill.tone == .ok ? .neutral : pill.tone)
-        return InstrumentState(kind: kind, word: pill.text, tone: tone, symbol: symbol(kind))
+        return InstrumentState(kind: kind, word: pill.text, tone: tone, symbol: symbol(kind),
+                               live: presence.isOnline)
     }
 
     static func symbol(_ kind: Kind) -> String {
