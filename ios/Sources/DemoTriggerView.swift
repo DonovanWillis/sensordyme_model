@@ -64,10 +64,11 @@ struct DemoTriggerView: View {
 
     private var intro: some View {
         VStack(alignment: .leading, spacing: SD.Space.xxs) {
-            Text("Run the real pipeline")
+            // M8.4: the event is simulated; only the app's handling of it is real.
+            Text("Rehearse an alert")
                 .font(SD.Typography.title)
                 .foregroundStyle(SD.Colors.textPrimary)
-            Text("Each one creates an event, classifies its severity, sends the notification, and writes it to the timeline — the same path a real detection takes.")
+            Text("Each one creates a simulated event and sends it through the app's own alert handling: its severity, the notification and the timeline. No camera or device detects anything, and nothing sounds.")
                 .font(SD.Typography.callout)
                 .foregroundStyle(SD.Colors.textSecondary)
                 .fixedSize(horizontal: false, vertical: true)

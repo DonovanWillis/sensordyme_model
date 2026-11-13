@@ -319,7 +319,7 @@ struct ManualBackendView: View {
                 if let message {
                     Text(message)
                 } else {
-                    Text("While this is set, ORYN EDGE uses it in preference to whatever it finds on the network. Clear it to go back to finding your Mac automatically.")
+                    Text("While this is set, ORYN EDGE uses it in preference to whatever it finds on the network. Clear it to go back to finding the server on your network automatically.")
                 }
             }
         }

@@ -324,7 +324,8 @@ final class OrynJourneysUITests: XCTestCase {
         launch(["-orynOpenDevice", "-orynOpenHistory"])
         let row = app.descendants(matching: .any)["event.row"].firstMatch
         XCTAssertTrue(row.waitForExistence(timeout: 30), "the alert is in the history")
-        XCTAssertTrue(row.label.contains("Alert") || row.label.contains("Event"), "severity is spoken: \(row.label)")
+        XCTAssertTrue(["Alert", "Warning", "Event"].contains { row.label.contains($0) },
+                      "severity is spoken: \(row.label)")
         shot("18a_history")
         row.tap()
         shot("18b_event_detail")

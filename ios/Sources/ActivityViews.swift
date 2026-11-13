@@ -28,7 +28,9 @@ struct EventSeverityStyle {
         case .alert:
             word = "Urgent"; color = SD.Colors.danger; filled = true; size = 10; emphasised = true
         case .warning:
-            word = "Alert"; color = SD.Colors.warning; filled = true; size = 8; emphasised = false
+            // "Warning", as the event sheet says it (M8.4): a soft event is not
+            // counted or filtered as an alert anywhere, so "Alert" disagreed.
+            word = "Warning"; color = SD.Colors.warning; filled = true; size = 8; emphasised = false
         default:
             word = "Event"; color = SD.Colors.textTertiary; filled = false; size = 8; emphasised = false
         }

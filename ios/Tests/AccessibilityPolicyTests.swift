@@ -29,14 +29,14 @@ do {
 
 print("\nan event's colour is also said:")
 check(EventAccessibility.severity("loud") == "Urgent alert", "loud is urgent")
-check(EventAccessibility.severity("soft") == "Alert", "soft is an alert")
+check(EventAccessibility.severity("soft") == "Warning", "soft is a warning, as the event sheet says (M8.4)")
 check(EventAccessibility.severity(nil) == "Event", "no severity is an event")
 check(EventAccessibility.severity("experimental") == "Experimental observation, not an alert",
       "an experimental observation is said not to be an alert (M8.4)")
 check(EventAccessibility.label(title: "Drowsiness", severity: "loud", signals: "eyes closed 2.1 s", when: "2 min ago")
       == "Urgent alert: Drowsiness, eyes closed 2.1 s, 2 min ago", "the full label")
 check(EventAccessibility.label(title: "Phone Use", severity: "soft", signals: "", when: nil)
-      == "Alert: Phone Use", "empty parts are left out")
+      == "Warning: Phone Use", "empty parts are left out")
 
 print("\nthe banner's headline agrees with its body:")
 check(ReplyError.bannerTitle(for: ReplyError.unreadable) == "The server's reply couldn't be read",
