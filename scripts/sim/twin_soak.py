@@ -100,6 +100,16 @@ def soak_scenario(total_s: float, *, cycle_s: float = CYCLE_S, reboot_every_s: f
                     tuple(segments), reboots=reboots)
 
 
+def fault_at(scenario: Scenario, t: float) -> Optional[tuple[str, float]]:
+    """("frozen" | "detector", seconds into it) when that fault is in force at scenario time `t`."""
+    seg = scenario.at(t)
+    if seg.faults.camera == "frozen":
+        return "frozen", t - seg.start
+    if seg.faults.detector_failing:
+        return "detector", t - seg.start
+    return None
+
+
 def cycle_offset(t: float, cycle_s: float = CYCLE_S) -> Optional[float]:
     if t < CALIBRATION_S:
         return None
@@ -500,16 +510,20 @@ def run_live(args: argparse.Namespace) -> dict:
                         if isinstance(backlog.get("queued"), int):
                             queue_depths.append(backlog["queued"])
                             dropped_max = max(dropped_max, int(backlog.get("dropped") or 0))
-                        sim_block = health.get("simulation") or {}
-                        st = sim_block.get("scenario_time_s")
                         state = status.get("monitoring_state")
-                        if isinstance(st, (int, float)) and not status.get("stale"):
-                            seg = scenario.at(st)
-                            into = st - seg.start
-                            if seg.faults.camera == "frozen" and into >= 8 and state in ("ready", "degraded"):
-                                false_protecting.append({"t": round(t), "scenario_t": st, "state": state})
-                            if seg.faults.detector_failing and into >= 8 and state == "ready":
-                                missed_degraded.append({"t": round(t), "scenario_t": st})
+                        # Judged on THIS row's time (scenario time = wall time since the start),
+                        # not health.simulation.scenario_time_s: the health sample is taken every
+                        # 5 s while the monitoring state is pushed at each transition, so the two
+                        # can be seconds apart and the older one would accuse a recovered device.
+                        if not status.get("stale"):
+                            current = fault_at(scenario, t)
+                            if current is not None:
+                                kind, into = current
+                                if kind == "frozen" and into >= 10 and state in ("ready", "degraded"):
+                                    false_protecting.append({"t": round(t, 1), "into_s": round(into, 1),
+                                                             "state": state})
+                                if kind == "detector" and into >= 10 and state == "ready":
+                                    missed_degraded.append({"t": round(t, 1), "into_s": round(into, 1)})
                         for cmd in commands:
                             pc = status.get("protection_command") or {}
                             if pc.get("id") == cmd["id"] and pc.get("outcome") == "confirmed" and not cmd.get("confirmed"):
