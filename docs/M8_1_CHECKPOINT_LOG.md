@@ -53,7 +53,7 @@ Branch `feat/m8.1-release-validation`, local only, created from M8 HEAD `618880c
 
 ## P4 update: oryn back (2026-11-12 ~15:25)
 
-- Tailscale shows oryn online, but `sdrun` refused it with exit 76, a host-identity mismatch: the hostname is now `ORYN`, while the fleet expected `DESKTOP-6QV3CBB`.
+- Tailscale shows oryn online, but `sdrun` refused it with exit 76, a host-identity mismatch: the hostname is now `ORYN`, while the fleet expected its previous Windows machine name.
 - The pinned ed25519 host key still matched under `StrictHostKeyChecking=yes`, so it is the same machine, renamed.
 - The user confirmed the rename. `expect_hostname` in `~/sensordyme-fleet/config/fleet.json` was changed to `ORYN`; the backup is `fleet.json.bak-20261112`.
 - `sdrun check -t oryn`: RTX 4060 idle at 36 °C, 7.5 GB VRAM free, 9.6 GB RAM available, no active jobs.
@@ -75,3 +75,27 @@ Branch `feat/m8.1-release-validation`, local only, created from M8 HEAD `618880c
 - **Tests:** 9 end-to-end scenarios (`tests/test_m81_health_freshness_sim.py`) plus 26 unit tests.
 - **Full suite at `07bcb40`:** 3,259 passed, 5 skipped, 0 failed. Pyright 0 errors. `make verify-release` PASS.
 - Evidence, including a control trace that reproduces the old "protecting" on a sample 122 s old: `m81-evidence/freshness/`.
+
+## P2. Deterministic iOS suite (merged `7eca2d9`; integrator fixes `13054e4`, `676801a`)
+
+- **Cause of the skip:** test classes run alphabetically, so the audit class claimed the single shared device before journey 03 ran.
+- **Fix:** a controller `POST /fresh` gives every test its own backend, database, JWT secret, rate limiters, account and device. Faults are reset each time, parallel testing is off, and the runner exits non-zero on any failure, skip or missing test.
+- **Journey 28** (frozen health): the app shows Stale, "Status unknown", no "All clear" or "Protecting", and recovers after the thaw.
+- **Integrator fixes found through the suite:**
+  - The running mode's row kept its green check on frozen health. It now shows `activeUnconfirmed`, "Selected, status unknown", which journey 28 asserts.
+  - `SDButtonStyle` read `isEnabled` where the environment is not installed, so disabled buttons could draw at full opacity.
+- **Result at `676801a`: 28/28 in ONE invocation** (alphabetical, no retries, 30.5 min). The stream also ran 28/28 twice at `72aa192`, once alphabetical and once in random order.
+
+## Final verification at `676801a`
+
+- Full Python suite: 3,259 passed, 5 skipped, 0 failed.
+- `ruff check` clean.
+- Pyright: 0 errors, 984 warnings.
+- `make verify-release` PASS.
+- Swift logic tests: 1,116 checks, 0 failures.
+
+## Remaining software defects (known, not fixed in M8.1)
+
+1. **A stopped device's capability rows read "Not working — face landmarks stale"**, because components go stale while nothing runs. The overall state correctly says Stopped. The fix needs a "paused" capability state in the device→app contract and the app. Using "starting" would show misleading start-up wording.
+2. **`make deploy` is hard-wired to `pi@sensordyme.local:~/sensordyme`.** The runbook works around it with a manual preflight; parameterising the target is a follow-up.
+3. **Repo-wide `ruff check .` also lints `.claude/worktrees/*`.** Use `--exclude .claude`. Not a code defect.

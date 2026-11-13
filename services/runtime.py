@@ -2041,8 +2041,16 @@ class DeviceRuntime:
         """`monitoring.perception` exactly as the wire contract describes it."""
         if capabilities is None:
             capabilities = self._evaluate_monitoring().capabilities
-        return self.perception.to_wire(simulated=self._perception_simulated,
+        wire = self.perception.to_wire(simulated=self._perception_simulated,
                                        nodes=self._node_entries(capabilities))
+        if getattr(self, "_stopped", None) is not None:
+            # Stopped on purpose (M8.2): a component that is only stale or idle
+            # because nothing runs is reported "paused" with the reason; failed
+            # and unavailable components keep their own state (real faults).
+            for status in (wire.get("components") or {}).values():
+                if isinstance(status, dict) and status.get("state") in (pc.OK, pc.STALE, pc.IDLE):
+                    status["state"], status["reason"] = "paused", "monitoring is stopped"
+        return wire
 
     # ------------------------------------------------------------------ monitoring state (M0.2)
     def _module_runs_without_detector(self, module=None) -> bool:
@@ -2087,6 +2095,9 @@ class DeviceRuntime:
             return ms.Capability(
                 ms.IMPAIRED, f"analysis failing ({self._consecutive_process_failures} frame(s) in a row): "
                              f"{self._last_process_error}")
+        if getattr(self, "_stopped", None) is not None:
+            # The loop is alive (checked above) but analyses nothing by design.
+            return ms.Capability(ms.PAUSED, "paused while monitoring is stopped")
         analysing = self._detection_degraded is None or self._module_runs_without_detector()
         bus: Optional[FrameBus] = getattr(self, "bus", None)
         if camera_ok and analysing and bus is not None:
@@ -2143,6 +2154,10 @@ class DeviceRuntime:
             return declared  # the module knows more (its own backoff, a refused load)
         if status.state in (pc.FAILED, pc.UNAVAILABLE):
             return ms.Capability(ms.IMPAIRED, f"{label} {status.state}: {status.reason}")
+        if getattr(self, "_stopped", None) is not None:
+            # Stopped on purpose: no result is expected, so a stale or missing
+            # one is not a fault (M8.2). Real faults are reported above.
+            return ms.Capability(ms.PAUSED, f"{label}: paused while monitoring is stopped")
         restarted_at = self._ready_grace_from
         if (status.last_run_age_s is not None and now - status.last_run_age_s < restarted_at
                 and now - restarted_at <= self.perception.max_age_s):
@@ -2169,6 +2184,11 @@ class DeviceRuntime:
         caps = {"camera": self._camera_capability(now)}
         caps["inference"] = self._inference_capability(now, caps["camera"].available)
         caps.update(self._module_capabilities(module))
+        if getattr(self, "_stopped", None) is not None:
+            # Nothing starts while stopped (e.g. the driver calibration waits for
+            # frames): paused, not "not ready after 30 s" (M8.2).
+            return {name: ms.Capability(ms.PAUSED, f"{name}: paused while monitoring is stopped")
+                    if cap.state == ms.STARTING else cap for name, cap in caps.items()}
         if now - self._ready_grace_from >= _INFERENCE_STARTING_GRACE_S:
             # Bounded: a capability "starting" past the grace never came up.
             caps = {

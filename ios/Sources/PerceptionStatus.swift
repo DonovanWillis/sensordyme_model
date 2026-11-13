@@ -234,6 +234,8 @@ enum PerceptionPresentation {
             return ("Working", .ok)
         case "idle":
             return ("Idle — not needed by what's running now", .neutral)
+        case "paused":
+            return (CapabilityHealth.pausedDetail, .neutral)
         case "stale":
             let age = component.lastRunAgeS.map { " for \(Int($0.rounded())) s" } ?? ""
             return ("No fresh results\(age)" + (reason.map { " — \($0)" } ?? ""), .caution)
@@ -264,6 +266,8 @@ struct CapabilityCheck: Equatable, Identifiable {
         case unknown(String)
         /// Being brought up (e.g. attention calibrating): not a failure.
         case starting(String)
+        /// Not running because monitoring was stopped on purpose (M8.2): not a failure.
+        case paused(String)
     }
 
     let name: String
@@ -293,11 +297,18 @@ enum CapabilityChecks {
                              verdict: .unavailable(node.reason.flatMap { $0.isEmpty ? nil : $0 }
                                                    ?? "missing on this device"))
             }
+            if caps?.paused?.contains(name) == true {
+                return .init(name: name, title: title, required: required,
+                             verdict: .paused(CapabilityHealth.pausedDetail))
+            }
             if let componentName = PerceptionPresentation.componentForCapability[name],
                let component = report?.components[componentName] {
                 switch component.state {
                 case "ok", "idle":
                     return .init(name: name, title: title, required: required, verdict: .available)
+                case "paused":
+                    return .init(name: name, title: title, required: required,
+                                 verdict: .paused(CapabilityHealth.pausedDetail))
                 default:
                     let (detail, _) = PerceptionPresentation.describe(component)
                     return .init(name: name, title: title, required: required, verdict: .unavailable(detail))

@@ -47,6 +47,10 @@ class MonitoringState(str, Enum):  # noqa: UP042 - str() of members is part of t
 AVAILABLE = "available"
 IMPAIRED = "impaired"
 STARTING = "starting"
+#: Not running because the owner stopped monitoring (M8.2). Neither a failure
+#: nor start-up: the device is not watching on purpose, and says so. Real faults
+#: found while stopped (a failed model, a camera fault) stay IMPAIRED.
+PAUSED = "paused"
 
 #: Every policy needs frames and a running inference loop, whatever it watches.
 BASE_REQUIREMENTS = frozenset({"camera", "inference"})
@@ -66,6 +70,10 @@ class Capability:
     @property
     def impaired(self) -> bool:
         return self.state == IMPAIRED
+
+    @property
+    def paused(self) -> bool:
+        return self.state == PAUSED
 
     def to_dict(self) -> dict:
         return {"state": self.state, "reason": self.reason}
@@ -273,6 +281,7 @@ class MonitoringReport:
             "capabilities": {name: cap.to_dict() for name, cap in sorted(caps.items())},
             "available": sorted(n for n, c in caps.items() if c.available),
             "impaired": sorted(n for n, c in caps.items() if c.impaired),
+            "paused": sorted(n for n, c in caps.items() if c.paused),
             "policies": [p.to_dict() for p in self.policies],
             "actuators": [a.to_dict() for a in self.actuators],
             "last_frame_age_s": self.last_frame_age_s,

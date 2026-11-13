@@ -194,5 +194,36 @@ do {
           "last_rejection's code is used")
 }
 
+print("\na stopped device is paused, never 'Not working' (M8.2):")
+let stoppedWire = """
+{"monitoring_state": "stopped", "protection": "stopped", "stale": false,
+ "capabilities": {"available": ["camera"], "impaired": [{"name": "audible_alert", "reason": "buzzer missing"}],
+                  "starting": [], "paused": ["face", "objects", "inference"]},
+ "perception": {"schema": "sd-perception/1", "simulated": true,
+  "components": {"face_landmarks": {"state": "paused", "reason": "monitoring is stopped"},
+                 "object_detector": {"state": "paused", "reason": "monitoring is stopped"},
+                 "hand_landmarks": {"state": "failed", "reason": "model crashed"}}, "nodes": []}}
+"""
+let stopped = decodeStatus(stoppedWire)
+check(stopped?.capabilities?.paused == ["face", "objects", "inference"], "paused decodes")
+let stoppedRows = CapabilityHealth.rows(status: stopped, online: true).rows
+check(stoppedRows.first { $0.name == "face" }?.state == .paused, "face row is paused")
+check(stoppedRows.first { $0.name == "face" }?.detail == "Paused — monitoring is stopped", "said plainly")
+check(stoppedRows.first { $0.name == "face" }?.tone == .neutral, "neutral, not caution or critical")
+check(stoppedRows.first { $0.name == "audible_alert" }?.state == .impaired, "a real fault while stopped is still a fault")
+check(PerceptionPresentation.describe(PerceptionComponent(state: "paused")).0 == "Paused — monitoring is stopped",
+      "a paused component is described as paused")
+check(PerceptionPresentation.describe(PerceptionComponent(state: "paused")).1 == .neutral, "neutral tone")
+check(PerceptionPresentation.degradedSummary(stopped?.perception, live: true)?.contains("Face") != true,
+      "paused components are not in the 'detection is impaired' banner")
+check(PerceptionPresentation.degradedSummary(stopped?.perception, live: true)?.contains("Hand tracking") == true,
+      "a failed component still is")
+let stoppedChecks = CapabilityChecks.make(required: ["face", "objects"], optional: ["hands"], status: stopped, online: true)
+check(stoppedChecks.first { $0.name == "face" }?.verdict == .paused("Paused — monitoring is stopped"),
+      "mode details say paused for face")
+check(stoppedChecks.first { $0.name == "hands" }?.verdict != .available, "a failed component is never available")
+let oldBackend = decodeStatus(#"{"monitoring_state": "stopped", "capabilities": {"available": [], "impaired": [], "starting": []}}"#)
+check(oldBackend?.capabilities?.paused == nil, "an older backend without `paused` still decodes")
+
 print(failures == 0 ? "\nall passed" : "\n\(failures) FAILED")
 exit(failures == 0 ? 0 : 1)
