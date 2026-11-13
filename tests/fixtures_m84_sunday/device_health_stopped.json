@@ -1,0 +1,319 @@
+{
+ "device": {
+  "accelerator": {
+   "detail": "running on CPU \u2014 accelerator disabled in config",
+   "metrics": {
+    "hailo_present": false,
+    "inferences": 0,
+    "runtime_available": false
+   },
+   "state": "ok"
+  },
+  "camera": {
+   "detail": "capturing",
+   "metrics": {
+    "evidence_losing_stalls_1s": 0,
+    "fps": 20.0,
+    "frame_age_s": 0.0,
+    "frames": 160,
+    "max_ms": 50.0,
+    "p50_ms": 50.0,
+    "p95_ms": 50.0,
+    "p99_ms": 50.0,
+    "stalls_250ms": 0,
+    "stalls_500ms": 0
+   },
+   "state": "ok"
+  },
+  "cloud_connected": true,
+  "config": {
+   "fault": null,
+   "path": "<sim-tmp>/device/config.yaml",
+   "source": "config"
+  },
+  "device_id": "SD-SIM-D505C68A",
+  "inference": {
+   "detail": "analysing (driver_attention)",
+   "metrics": {
+    "loop_age_s": 0.0,
+    "processed_evidence_losing_stalls_1s": 0,
+    "processed_frames": 1,
+    "processed_max_ms": 50.0,
+    "processed_p50_ms": 50.0,
+    "processed_p95_ms": 50.0,
+    "processed_p99_ms": 50.0,
+    "processed_stalls_250ms": 0,
+    "processed_stalls_500ms": 0
+   },
+   "state": "ok"
+  },
+  "monitoring": {
+   "active_preset": "driver_safety",
+   "actuators": [
+    {
+     "audible": true,
+     "commands_failed": 0,
+     "commands_ok": 0,
+     "detail": "SIMULATED buzzer: actuations are recorded, nothing makes a sound",
+     "kind": "buzzer",
+     "name": "sim_buzzer",
+     "physically_verified": false,
+     "ready": true
+    }
+   ],
+   "available": [
+    "alert_output",
+    "audible_alert",
+    "camera"
+   ],
+   "capabilities": {
+    "alert_output": {
+     "reason": null,
+     "state": "available"
+    },
+    "attention": {
+     "reason": "attention: paused while monitoring is stopped",
+     "state": "paused"
+    },
+    "audible_alert": {
+     "reason": null,
+     "state": "available"
+    },
+    "camera": {
+     "reason": null,
+     "state": "available"
+    },
+    "face": {
+     "reason": "face landmarks: paused while monitoring is stopped",
+     "state": "paused"
+    },
+    "hands": {
+     "reason": "hand landmarks: paused while monitoring is stopped",
+     "state": "paused"
+    },
+    "inference": {
+     "reason": "paused while monitoring is stopped",
+     "state": "paused"
+    },
+    "objects": {
+     "reason": "object detector: paused while monitoring is stopped",
+     "state": "paused"
+    }
+   },
+   "custom_rules": [],
+   "impaired": [],
+   "last_frame_age_s": 0.0,
+   "last_inference_age_s": 7.95,
+   "mode": "standard",
+   "model": {
+    "detector": {
+     "backend": "simulated",
+     "name": "sim-scripted-detector",
+     "sha256": null
+    },
+    "status": "running on CPU \u2014 accelerator disabled in config"
+   },
+   "module": "driver_attention",
+   "monitoring": false,
+   "paused": [
+    "attention",
+    "face",
+    "hands",
+    "inference",
+    "objects"
+   ],
+   "perception": {
+    "components": {
+     "face_landmarks": {
+      "consumers": [
+       "driver_attention"
+      ],
+      "errors": 0,
+      "last_run_age_s": 7.95,
+      "model": {
+       "name": "ScriptedFaceMesh"
+      },
+      "reason": "monitoring is stopped",
+      "run_ms": 0.01,
+      "runs": 361,
+      "state": "paused"
+     },
+     "hand_landmarks": {
+      "consumers": [
+       "driver_attention"
+      ],
+      "errors": 0,
+      "last_run_age_s": 8.05,
+      "model": {
+       "name": "ScriptedHands"
+      },
+      "reason": "monitoring is stopped",
+      "run_ms": 0.01,
+      "runs": 120,
+      "state": "paused"
+     },
+     "object_detector": {
+      "consumers": [
+       "driver_attention"
+      ],
+      "errors": 0,
+      "last_run_age_s": 8.05,
+      "model": {
+       "backend": "simulated",
+       "name": "sim-scripted-detector",
+       "sha256": null
+      },
+      "reason": "monitoring is stopped",
+      "run_ms": 0.01,
+      "runs": 120,
+      "state": "paused"
+     },
+     "pose": {
+      "consumers": [],
+      "errors": 0,
+      "last_run_age_s": null,
+      "model": null,
+      "reason": "monitoring is stopped",
+      "run_ms": null,
+      "runs": 0,
+      "state": "paused"
+     }
+    },
+    "nodes": [
+     {
+      "experimental": false,
+      "experimental_features": [
+       {
+        "config_key": "behavior_v2",
+        "enabled": false,
+        "id": "behavior_v2",
+        "includes": [
+         "hand-phone interaction",
+         "long-glance classification",
+         "cumulative glance budgets",
+         "gaze zones",
+         "learned temporal phone/eye reasoning"
+        ],
+        "status": "experimental: not validated; off by default"
+       }
+      ],
+      "id": "driver_safety",
+      "kind": "preset",
+      "missing_capabilities": [],
+      "optional_capabilities": [
+       "objects",
+       "hands"
+      ],
+      "reason": "monitoring stopped",
+      "required_capabilities": [
+       "camera",
+       "inference",
+       "face",
+       "audible_alert"
+      ],
+      "state": "inactive",
+      "title": "Driver Safety",
+      "validation": "synthetic_tests",
+      "version": "3"
+     }
+    ],
+    "schema": "sd-perception/1",
+    "simulated": true,
+    "tracking": {
+     "confirm_hits": 2,
+     "confirmed": 1,
+     "created": 1,
+     "dropped_detections": 0,
+     "evicted": 0,
+     "live": 1,
+     "lost_grace_s": 2.0,
+     "max_tracks": 64,
+     "retired": 0,
+     "tracker": "iou_centroid",
+     "update_ms": 0.006,
+     "updates": 120
+    }
+   },
+   "policies": [
+    {
+     "can_evaluate": true,
+     "id": "preset:driver_safety",
+     "kind": "preset",
+     "name": "driver_safety",
+     "operational": true,
+     "reasons": [],
+     "unavailable_events": []
+    }
+   ],
+   "reasons": [
+    "monitoring stopped from the app"
+   ],
+   "role": "driver_safety",
+   "state": "stopped",
+   "versions": {
+    "model": "sim-scripted-detector",
+    "software": "0.2"
+   }
+  },
+  "monitoring_active": false,
+  "network": {
+   "detail": "SIMULATED: host network, no Wi-Fi radio",
+   "metrics": {},
+   "state": "ok"
+  },
+  "protection": {
+   "by": "uplink",
+   "last_command_id": "9275c2a22bf3",
+   "monitoring_state": "stopped",
+   "reasons": [
+    "monitoring was stopped explicitly"
+   ],
+   "role": "driver_safety",
+   "since": 1794577182.511324,
+   "state": "stopped"
+  },
+  "reported_at": 1794577182.555797,
+  "saved_state": {
+   "faults": []
+  },
+  "simulated": true,
+  "simulation": {
+   "faults": [],
+   "not_simulated": [
+    "camera sensor",
+    "Hailo NPU",
+    "BLE provisioning",
+    "GPIO buzzer",
+    "Wi-Fi",
+    "thermals"
+   ],
+   "perception": "scripted (no camera, no models)",
+   "scenario": "sunday",
+   "scenario_time_s": 26.0,
+   "scene": "attentive"
+  },
+  "stamp": {
+   "boot_id": "4f032a2cc9feeeb7",
+   "generated_mono": 1026.0,
+   "generated_wall": 1794577182.556086,
+   "generation": 15,
+   "revision": 0,
+   "schema": "sd-health-v1"
+  },
+  "system": {
+   "detail": "nominal",
+   "metrics": {
+    "load_1m": 3.67
+   },
+   "state": "ok"
+  },
+  "uplink_backlog": {
+   "capacity": 500,
+   "dropped": 0,
+   "persistent": true,
+   "queued": 0,
+   "restored": 0
+  }
+ },
+ "state": "ok"
+}

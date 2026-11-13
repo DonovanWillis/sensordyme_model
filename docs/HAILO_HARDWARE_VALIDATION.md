@@ -24,6 +24,7 @@ Still **not executed on hardware**. What M8.3 added on top of the steps below:
   - `--fake` runs a stage against stand-ins (`fake_hailo.py`, a fake GPIO, a synthetic soak CSV) and can never exit 0.
   - The stage table, commands and provisional criteria are in `docs/MONDAY_HARDWARE_SESSION.md` §6.2.
   - The stages wrap the scripts below. They do not replace steps 1 to 12.
+* **`sunday_preflight.py`** (M8.4): the one read-only preflight that runs the read-only checks and stages in order and writes one evidence summary; **`check_live_status.py`** checks live status and stream headers against the state model. The first hardware session moved to **Sunday 2026-11-15**: start from `docs/SUNDAY_DEVICE_ACTIVATION.md`.
 * **Known-good inputs** (`known_good/`). Six 640×480 frames with no people:
   - Four photos: a cat, a cup, a clock and a rocket. All are scikit-image v0.24.0 sample data, CC0 or public domain, verified against scikit-image's own sha256 registry and pasted unscaled.
   - Two generated frames: flat grey 114 and a test card.

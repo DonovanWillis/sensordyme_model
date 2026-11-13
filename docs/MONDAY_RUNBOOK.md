@@ -1,4 +1,10 @@
-# Monday hardware runbook — Raspberry Pi 5 + Hailo-8L + Camera Module 3 Wide NoIR
+# Hardware runbook ("Monday runbook") — Raspberry Pi 5 + Hailo-8L + Camera Module 3 Wide NoIR
+
+> **M8.4 date change (2026-11-13):** the device arrives **Sunday 2026-11-15**, not Monday.
+> "Monday" below means *the first hardware session*, now Sunday. Start from
+> **`docs/SUNDAY_DEVICE_ACTIVATION.md`** (25 steps, the read-only `sunday_preflight.py`,
+> the compatibility checklist); it cites this runbook as RB-x. The file name is kept so
+> existing links work. The release candidate is now `feat/m8.4-leapfrog` (§0).
 
 > **STATUS: NOT EXECUTED — requires the physical device.** Every command, expected
 > output and pass criterion below was written on a Mac on 2026-11-11 from the code
@@ -28,7 +34,7 @@ Reuses, does not duplicate:
 ```bash
 # On the Mac (repo checkout at the release candidate):
 export PI=<user>@<pi-host-or-ip>      # e.g. pi@sensordyme.local. The user may NOT be `pi` (Bookworm)
-export RC=feat/m8.3-hardware-truth  # M8.3 integrated candidate (pending owner approval); record `git rev-parse $RC`
+export RC=feat/m8.4-leapfrog  # M8.4 candidate (pending owner approval; was feat/m8.3-hardware-truth); the integrator records `git rev-parse $RC`
 export REL=~/sensordyme-release        # manifest + tarball + evidence on the Mac
 export VENV=$HOME/.venvs/sensordyme-m01/bin  # M8.1: the Makefile defaults to .venv/bin, which this checkout does not have
 
@@ -48,7 +54,7 @@ Rules:
 
 ---
 
-## A. Before Monday (Mac; no device needed)
+## A. Before the hardware session (Mac; no device needed)
 
 **A0. One-command offline release verification** (read-only; M6.5; ~15 s on the Mac):
 ```bash
@@ -564,7 +570,7 @@ systemctl is-active sensordyme.service && sha256sum /etc/systemd/system/sensordy
 ```
 The previous unit has no `OnFailure=`, so the recovery unit stays installed and inert. `config.yaml` and `data/` changed after the swap (for example a token set in §L1) live in the failed tree: copy them back deliberately if wanted.
 
-**O2. To the exact pre-Monday state:** restore E1. Stop the service, then `tar -xzf sensordyme_tree.tgz -C $(dirname $D)` (the venv is not in the archive, so keep the existing `.venv` or recreate it with setup_pi.sh), then `sudo tar -xzf system_glue.tgz -C /`, `sudo systemctl daemon-reload`, and start the service.
+**O2. To the exact pre-session state:** restore E1. Stop the service, then `tar -xzf sensordyme_tree.tgz -C $(dirname $D)` (the venv is not in the archive, so keep the existing `.venv` or recreate it with setup_pi.sh), then `sudo tar -xzf system_glue.tgz -C /`, `sudo systemctl daemon-reload`, and start the service.
 
 **O3. Total:** write the E5 image back to the card. On the Mac: `diskutil unmountDisk /dev/diskN && sudo dd if=$REL/pi-sd-<date>.img of=/dev/rdiskN bs=4m status=progress`. Check the disk number twice.
 
