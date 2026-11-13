@@ -40,6 +40,7 @@ import re
 import shutil
 import subprocess
 import sys
+import tempfile
 import time
 from collections.abc import Callable
 from dataclasses import dataclass, field
@@ -838,7 +839,8 @@ def main(argv: Optional[list[str]] = None, *, system: Optional[RealSystem] = Non
     if args.with_buzzer:
         args.with_stopped_stages = True
     if args.out is None:
-        args.out = Path.home() / "hwval" / ("sunday-fake" if args.fake else "sunday")
+        # As hwv_stage.py: a dry run's reports go to a temp dir, never beside real evidence.
+        args.out = Path(tempfile.gettempdir()) / "hwval-sunday-fake" if args.fake else Path.home() / "hwval" / "sunday"
     ok, why = hc.ensure_outside(args.out, args.install_dir)
     if not ok:
         print(f"REFUSED: {why}", file=sys.stderr)
