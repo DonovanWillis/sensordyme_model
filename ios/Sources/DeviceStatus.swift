@@ -53,15 +53,18 @@ struct DeviceStatus: Codable, Hashable {
         var available: [String]?
         var impaired: [Impaired]?
         var starting: [String]?
+        /// Not running because monitoring was stopped on purpose (M8.2): never a fault.
+        var paused: [String]?
         /// Per-capability evaluation status (`validated_on_device`, ...), when
         /// the backend reports one. Optional in the contract.
         var evaluation: [String: String]?
 
         init(available: [String]? = nil, impaired: [Impaired]? = nil, starting: [String]? = nil,
-             evaluation: [String: String]? = nil) {
+             paused: [String]? = nil, evaluation: [String: String]? = nil) {
             self.available = available
             self.impaired = impaired
             self.starting = starting
+            self.paused = paused
             self.evaluation = evaluation
         }
 
@@ -70,6 +73,7 @@ struct DeviceStatus: Codable, Hashable {
             available = try? c.decodeIfPresent([String].self, forKey: .available)
             impaired = try? c.decodeIfPresent([Impaired].self, forKey: .impaired)
             starting = try? c.decodeIfPresent([String].self, forKey: .starting)
+            paused = try? c.decodeIfPresent([String].self, forKey: .paused)
             evaluation = try? c.decodeIfPresent([String: String].self, forKey: .evaluation)
         }
     }
@@ -414,7 +418,7 @@ struct MonitoringStatusPresentation: Equatable {
 /// One capability on the health card: what it is, whether it works, and how
 /// far its results have been checked.
 struct CapabilityHealthRow: Equatable, Identifiable {
-    enum State: Equatable { case available, starting, impaired }
+    enum State: Equatable { case available, starting, paused, impaired }
 
     let name: String
     let title: String
@@ -446,6 +450,11 @@ enum CapabilityHealth {
         for name in capabilities.starting ?? [] {
             rows.append(.init(name: name, title: title(name), state: .starting,
                               detail: startingDetail(name), tone: .caution))
+        }
+        for name in capabilities.paused ?? [] {
+            // Stopped on purpose (M8.2): neither working nor broken.
+            rows.append(.init(name: name, title: title(name), state: .paused,
+                              detail: pausedDetail, tone: .neutral))
         }
         for name in capabilities.available ?? [] {
             var detail = vocabulary[name]?.available.map { "\($0) · producing results" } ?? "Producing results"
@@ -494,6 +503,9 @@ enum CapabilityHealth {
     ]
 
     /// What a starting capability is doing, for its row.
+    /// What a capability says while monitoring is stopped on purpose (M8.2).
+    static let pausedDetail = "Paused — monitoring is stopped"
+
     static func startingDetail(_ name: String) -> String {
         vocabulary[name]?.starting ?? "Starting — getting ready, not a failure"
     }

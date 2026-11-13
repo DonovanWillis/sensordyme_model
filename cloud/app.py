@@ -1129,10 +1129,13 @@ def _role_facts(monitoring: dict, health_monitoring: dict, protection: dict):
 
 
 def _capabilities_summary(raw) -> Optional[dict]:
-    """{available, impaired: [{name, reason}], starting} from the device's map."""
+    """{available, impaired: [{name, reason}], starting, paused} from the device's map.
+
+    `paused` (M8.2, additive): not running because monitoring was stopped on
+    purpose; never a fault. Older apps ignore the key."""
     if not isinstance(raw, dict):
         return None
-    available, impaired, starting = [], [], []
+    available, impaired, starting, paused = [], [], [], []
     for name, cap in sorted(raw.items()):
         if not isinstance(name, str) or not isinstance(cap, dict):
             continue
@@ -1144,7 +1147,9 @@ def _capabilities_summary(raw) -> Optional[dict]:
             impaired.append({"name": name, "reason": str(reason)[:500] if reason else None})
         elif state == "starting":
             starting.append(name)
-    return {"available": available, "impaired": impaired, "starting": starting}
+        elif state == "paused":
+            paused.append(name)
+    return {"available": available, "impaired": impaired, "starting": starting, "paused": paused}
 
 
 def _rejection(raw) -> Optional[dict]:
@@ -1204,7 +1209,7 @@ def _new_refusal(raw, kind: str, baseline_json: Optional[str]) -> Optional[dict]
 
 # ---------------------------------------------------------------- M7 perception (device truth)
 #: docs/M7_IMPLEMENTATION_MAP.md wire contract, `monitoring.perception`.
-_COMPONENT_STATES = ("ok", "stale", "failed", "unavailable", "idle")
+_COMPONENT_STATES = ("ok", "stale", "failed", "unavailable", "idle", "paused")  # paused: M8.2
 _NODE_STATES = ("active", "degraded", "inactive", "failed")
 #: Which product capability kind each shared perception component provides.
 COMPONENT_CAPABILITY = {
@@ -3061,6 +3066,7 @@ def _reported_preset(row: sqlite3.Row) -> tuple[Optional[str], Optional[str], di
 _COMPONENT_TO_CAPABILITY_STATE = {
     "ok": "available", "idle": "idle", "stale": "impaired", "failed": "impaired",
     "unavailable": "unsupported", "unknown": "unknown",
+    "paused": "paused",  # M8.2: monitoring stopped on purpose; not a fault
 }
 
 
@@ -3068,7 +3074,7 @@ def capability_states(status: dict) -> dict[str, dict]:
     """{capability kind: {state, reason, source}} from what the device REPORTS.
 
     States: available | idle (the device has it, nothing uses it now) | starting
-    | impaired | unsupported | unknown. A kind the device does not report is
+    | paused (monitoring stopped on purpose, M8.2) | impaired | unsupported | unknown. A kind the device does not report is
     `unknown` -- a device reports only what its current mode uses, so silence
     is not evidence that a preset it is not running would work."""
     out: dict[str, dict] = {}
@@ -3077,6 +3083,8 @@ def capability_states(status: dict) -> dict[str, dict]:
         out[name] = {"state": "available", "reason": None, "source": "monitoring"}
     for name in caps.get("starting") or []:
         out[name] = {"state": "starting", "reason": None, "source": "monitoring"}
+    for name in caps.get("paused") or []:
+        out[name] = {"state": "paused", "reason": "monitoring is stopped", "source": "monitoring"}
     for item in caps.get("impaired") or []:
         if isinstance(item, dict) and item.get("name"):
             reason = item.get("reason")
@@ -3094,6 +3102,10 @@ def capability_states(status: dict) -> dict[str, dict]:
         # The module's own impairment verdict wins over a healthy component: the
         # component may be fine while the module cannot use it.
         if known and known["state"] in ("impaired", "unsupported") and state in ("available", "idle"):
+            continue
+        # Stopped on purpose (M8.2): a component that is merely stale or idle
+        # because nothing runs stays "paused"; a failed one is still a fault.
+        if known and known["state"] == "paused" and comp.get("state") in ("stale", "idle", "ok"):
             continue
         out[kind] = {"state": state, "reason": comp.get("reason"), "source": "perception"}
     return out

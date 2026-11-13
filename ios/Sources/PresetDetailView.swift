@@ -220,6 +220,7 @@ struct PresetDetailView: View {
             case .unavailable(let why): return ("Not working — \(why)", SD.Colors.danger, "xmark.octagon.fill")
             case .unknown(let why): return ("Unknown — \(why)", SD.Colors.textTertiary, "questionmark.circle")
             case .starting(let what): return (what, SD.Colors.warning, "hourglass")
+            case .paused(let what): return (what, SD.Colors.textSecondary, "pause.circle")
             }
         }()
         return HStack(alignment: .firstTextBaseline, spacing: SD.Space.xs) {

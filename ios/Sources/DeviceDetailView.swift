@@ -487,6 +487,7 @@ struct DeviceDetailView: View {
         switch state {
         case .available: "waveform.path.ecg"
         case .starting: "hourglass"
+        case .paused: "pause.circle"
         case .impaired: "exclamationmark.triangle"
         }
     }

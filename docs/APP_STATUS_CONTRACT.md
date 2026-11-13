@@ -206,3 +206,33 @@ are fields of `GET /v1/devices/{id}/presets`. See docs/PRESET_LIBRARY.md.
 - `allowed_presets` comes from the backend's role table when it knows the role,
   and otherwise from the device's own role description. A role that neither
   knows is treated as having no restriction.
+
+## M8.2: `paused` capabilities while monitoring is stopped
+
+When the owner stops monitoring (`protection: stopped`, `monitoring_state: stopped`), nothing is analysed, so models produce no fresh results. That is intended, not a fault. Before M8.2 those capabilities were reported `impaired` ("face landmarks stale"), and the app showed them as "Not working".
+
+**Device**
+- A capability that is only idle because the device is stopped is reported `{"state": "paused", "reason": "<name>: paused while monitoring is stopped"}`. This covers stale or missing results, the inference loop alive but not analysing, and module capabilities still starting (e.g. the driver calibration).
+- In `monitoring.perception.components`, an `ok`, `stale` or `idle` component is reported `{"state": "paused", "reason": "monitoring is stopped"}`.
+- Real faults keep their state:
+  - camera faults;
+  - a failed or unavailable component;
+  - a module's own impairment;
+  - an unavailable detector;
+  - an unresponsive loop;
+  - consecutive analysis failures.
+
+**Backend**
+- `status.capabilities.paused`: a new, additive list.
+- `capability_states` and the preset readiness rows map it to `"state": "paused"`.
+- A paused capability is never overridden by a merely stale component.
+
+**App**
+- The row reads "Paused — monitoring is stopped" in a neutral tone with a pause symbol, never "Not working".
+- Paused components are not in the "Detection is impaired" banner.
+
+**Compatibility**
+- Older apps don't read `paused`, so a paused capability appears in none of `available`, `impaired` or `starting`, and is never shown as working. The headline still says stopped.
+- An older backend sends no `paused`, and the new app decodes that as nil.
+
+Tests: `tests/test_m82_paused_capabilities.py` (3 of 4 fail on `15bf35b`) and `ios/Tests/PerceptionStatusTests.swift` ("a stopped device is paused").
