@@ -337,7 +337,11 @@ enum Onboarding {
     /// The backend's refusal of a claim, in the person's terms.
     static func claimMessage(status: Int?, code: String?, detail: String?) -> String {
         if code == "device_already_claimed" || status == 409 {
-            return "That SensorDyme belongs to another account. Its owner has to remove it first."
+            // M8.4: "its owner has to remove it first" named a step that exists
+            // nowhere -- neither the app nor the server can release a device.
+            return "This SensorDyme is already on another account, so it can't be added to this one. "
+                + "If it's yours, sign in with the account that first added it. Its Wi-Fi is set up "
+                + "either way, so you can close setup."
         }
         switch status {
         case 404: return "That claim code isn't one the server knows. Check it against the card that came with your SensorDyme."

@@ -55,7 +55,8 @@ struct ShopView: View {
                     Text("SensorDyme Unit")
                         .font(SD.Typography.title)
                         .foregroundStyle(SD.Colors.textPrimary)
-                    Text("IR night vision · edge AI · every mode")
+                    // Not "every mode": a unit's role (how it is mounted) rules some out (M8.4).
+                    Text("IR night vision · on-device AI")
                         .sdEyebrowFont()
                         .tracking(1)
                         .multilineTextAlignment(.center)

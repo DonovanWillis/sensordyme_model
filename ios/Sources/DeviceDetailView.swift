@@ -144,6 +144,7 @@ struct DeviceDetailView: View {
                     .padding(.top, SD.Space.lg)
 
                 recentActivity
+                    .id("activity")
                     .padding(.top, SD.Space.xl)
 
                 modeLibrary
@@ -355,9 +356,15 @@ struct DeviceDetailView: View {
         .task {
             await reload()
             if DebugLaunch.openJupiter {
+                // After the push settles: a sheet presented mid-transition is dropped.
+                try? await Task.sleep(for: .seconds(1.5))
                 jupiterSheet = JupiterSheet(prompt: DebugLaunch.jupiterPrompt ?? "")
             } else if DebugLaunch.openHistory {
+                try? await Task.sleep(for: .seconds(1.5))  // after the push settles, as above
                 showHistory = true
+            } else if let which = DebugLaunch.openEvent {
+                try? await Task.sleep(for: .seconds(1.5))
+                selectedEvent = which == "experimental" ? events.first(where: \.isExperimental) : events.first
             } else if DebugLaunch.openCamera || DebugLaunch.openMode != nil {
                 // A beat on the device screen first, so a recording shows the
                 // zoom out of its source.
@@ -686,7 +693,45 @@ struct DeviceDetailView: View {
             }
 
             capabilitiesCard
+
+            aboutDevice
         }
+    }
+
+    /// Which unit this is, as the server knows it (M8.4): the device screen
+    /// named the device but never said which physical unit, how it is set up
+    /// to be used, or when it last reported. Only stored fields; a field the
+    /// device has not sent says so.
+    private var aboutDevice: some View {
+        VStack(alignment: .leading, spacing: SD.Space.xs) {
+            SDEyebrow("About this device")
+                .accessibilityAddTraits(.isHeader)
+                .padding(.top, SD.Space.md)
+            aboutRow("Device ID", device.hardwareId ?? "Not reported yet")
+            aboutRow("Set up for", device.status?.roleTitle ?? "Not reported yet")
+            aboutRow("Last report", device.lastSeen.map {
+                Self.relative.localizedString(for: Date(timeIntervalSince1970: $0), relativeTo: now)
+            } ?? "Never")
+        }
+        .accessibilityIdentifier("detail.about")
+    }
+
+    private func aboutRow(_ label: String, _ value: String) -> some View {
+        ViewThatFits(in: .horizontal) {
+            HStack(alignment: .firstTextBaseline) {
+                Text(label).font(SD.Typography.caption).foregroundStyle(SD.Colors.textTertiary)
+                Spacer(minLength: SD.Space.xs)
+                Text(value).font(SD.Typography.caption.monospacedDigit()).foregroundStyle(SD.Colors.textSecondary)
+                    .textSelection(.enabled)
+            }
+            VStack(alignment: .leading, spacing: 1) {
+                Text(label).font(SD.Typography.caption).foregroundStyle(SD.Colors.textTertiary)
+                Text(value).font(SD.Typography.caption.monospacedDigit()).foregroundStyle(SD.Colors.textSecondary)
+                    .fixedSize(horizontal: false, vertical: true)
+                    .textSelection(.enabled)
+            }
+        }
+        .accessibilityElement(children: .combine)
     }
 
     /// What the device can detect right now, from `status.capabilities`:
@@ -1718,7 +1763,9 @@ struct DeviceDetailView: View {
             settleProtection()
             let fetchedEvents = try await state.backend.events(deviceID: device.id, limit: 200)
             guard reloadGuard.isLatest(token) else { return }
-            events = fetchedEvents
+            // Merged like Activity (M8.3 EventFeed): one copy per event, a
+            // newer alert report never replaced by a stale poll, newest first.
+            events = EventFeed.merge(events, fetchedEvents)
             // The library, the device's availability and its rules. Each says
             // "not supported by this server" on its own when the endpoint is
             // missing, and none of them fails the screen.

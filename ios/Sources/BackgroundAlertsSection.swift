@@ -30,10 +30,11 @@ struct BackgroundAlertsSection: View {
     private var saved: Bool { !topic.isEmpty && topic == savedTopic }
 
     var body: some View {
-        Section("Alerts when the app is closed") {
+        // Headed by what it is, not by the page's own title said again (M8.4).
+        Section("Push alerts through ntfy") {
             VStack(alignment: .leading, spacing: SD.Space.xs) {
                 Label(
-                    "ORYN EDGE's own notifications only arrive while the app is open. These arrive whenever your device is powered on.",
+                    "ORYN EDGE's own notifications only arrive while the app is open. These reach your phone even when it's closed, as long as your SensorDyme is on and online and the ntfy app is subscribed to your channel.",
                     systemImage: "bell.badge"
                 )
                 .font(SD.Typography.callout)

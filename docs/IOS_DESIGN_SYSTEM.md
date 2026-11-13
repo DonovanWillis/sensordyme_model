@@ -404,3 +404,39 @@ n = 120 samples per cell. Evidence: `m83-evidence/ios/perf/interleaved/`.
 - Everything else is within the run-to-run noise. The spikes on every screen
   are the 4 s (device) and 10 s (list) polls. Instruments on an iPhone
   (SwiftUI, Animation Hitches) remains the hardware follow-up.
+
+## 10. M8.4 product completeness
+
+Evidence: `~/sensordyme-audit/2026-11-10/m84-evidence/ios/` (`before/`,
+`after/`, default and Accessibility XXXL for each screen).
+
+### Activity and evidence (`EventEvidence`, `TimelineRow`, `EventDetailView`)
+
+- An event is split the way a person asks about it: **observed** (the
+  device's own words), **the device's conclusion** (its event type), the
+  **confidence it recorded** (only when recorded; for a measured condition it is
+  not a detector score), whether an **alert was requested** (alerted, merged,
+  held back, not reported), what the **output** reported (M8.3
+  `AlertDeliveryEvidence`), and what the record **lacks** (no signals, no
+  confidence, no alert report, an arrival-time clock, a late delivery).
+- **Experimental observations** (`experimental: true`, `severity: "log"`):
+  a ring marker and the word "Experimental", never an alert colour; no
+  notification; not counted as alerts or in Reports; "Experimental observation
+  (not an alert)" in the row, the sheet and VoiceOver. Absent field: unchanged.
+- Rows: the badges on their own line and the device's words under them; at
+  accessibility sizes the time sits under the title. The sheet is titled
+  "Event" unless the event alerted or was asked for.
+
+### Ask Jupiter
+
+- Every refusal has one headline from the backend's typed `code`
+  (`JupiterRefusal`); a policy refusal says **why** (nothing enables it), any
+  other **what it would take**. "Nothing to activate" says when rewording
+  cannot help.
+- The typed policy decides "Uses your area" vs "Draw the area named ... in
+  Detection areas", and each rule folds out what it watches and doesn't.
+
+### Device screen
+
+- "About this device": Device ID, what it is set up for, last report.
+- Recent activity merges each poll into what it shows (`EventFeed.merge`).

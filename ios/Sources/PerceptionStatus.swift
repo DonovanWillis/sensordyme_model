@@ -351,7 +351,9 @@ enum CapabilityChecks {
                              verdict: .starting(CapabilityHealth.startingDetail(name)))
             }
             return .init(name: name, title: title, required: required,
-                         verdict: .unknown("not reported by the device while it runs another mode"))
+                         // Said as what is known (M8.4): "while it runs another
+                         // mode" was shown for the mode the device was running.
+                         verdict: .unknown("not reported by the device"))
         }
         return required.map { check($0, required: true) }
             + optional.filter { !required.contains($0) }.map { check($0, required: false) }

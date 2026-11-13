@@ -2781,6 +2781,7 @@ def _beside_a_mode_unsupported(rules: list, additive: bool = False) -> list[dict
                         "or device support for rules beside a mode",
             "support": "unsupported",
             "alternatives": [],
+            "code": "not_beside_mode",
         })
     return entries
 
@@ -4036,7 +4037,9 @@ _AI_FALLBACKS = [
     (("security", "intruder", "door", "burglar", "lurk", "linger", "trespass"), "security_monitoring",
      ("Security: person-count changes, plus restricted-zone and lingering alerts once you draw "
       "zones in the app.")),
-    (("drive", "driving", "car", "phone", "drowsy", "road"), "driver_safety",
+    # Not "car" or "phone": "a car pulls into the driveway" and "someone picks
+    # up my phone" are not requests to watch a driver.
+    (("drive", "driving", "driver", "drowsy", "road"), "driver_safety",
      "Driver Safety: loud alerts for phone use while looking away and sustained eye closure."),
 ]
 
@@ -4045,11 +4048,18 @@ def _ai_fallback(prompt: str) -> dict:
     """Deterministic keyword configuration when the model is unavailable. Returns
     the same structured shape, honestly labeled with source=fallback: a mode,
     and no rules (see _AI_FALLBACKS for why)."""
+    # Whole words and their plain inflections (M8.4): substring matching read
+    # "careful" as a car, "outdoor" as a door and "waterfall" as a fall, and
+    # proposed a mode for each.
     lowered = prompt.lower()
     for keywords, preset, explanation in _AI_FALLBACKS:
-        if any(k in lowered for k in keywords):
+        if any(re.search(rf"\b{k}(?:s|es|ed|ing|en|ly)?\b", lowered) for k in keywords):
             return {
-                "preset": preset, "variant": "", "explanation": explanation,
+                "preset": preset, "variant": "",
+                # Said up front: this is the closest MODE, not the request read.
+                "explanation": ("No custom rule was set up: the language service that reads requests "
+                                "isn't configured on your backend, so this is the closest built-in mode. "
+                                + explanation),
                 "rules": [], "settings": {}, "unsupported": [], "source": "fallback",
             }
     # No keyword matched. Historically this returned security_monitoring as a
@@ -4070,6 +4080,7 @@ def _ai_fallback(prompt: str) -> dict:
             "requires": "set ANTHROPIC_API_KEY on the backend and restart it",
             "support": "unsupported",
             "alternatives": [],
+            "code": "interpreter_unavailable",
         }],
         "source": "unavailable",
     }
@@ -4124,6 +4135,7 @@ def _validate_proposal(data: dict, role=None, device: Optional[sqlite3.Row] = No
                 "requires": "an object, posture or activity from the capability sheet",
                 "support": caps.Support.UNSUPPORTED.value,
                 "alternatives": [],
+                "code": "no_target",
             })
             continue
 
@@ -4157,6 +4169,7 @@ def _validate_proposal(data: dict, role=None, device: Optional[sqlite3.Row] = No
                 "requires": "a zone the user draws in the app",
                 "support": "unsupported",
                 "alternatives": [],
+                "code": "needs_area",
             })
             continue
         if predicate in ("near", "holding", "near_mouth") and not secondary:
@@ -4166,6 +4179,7 @@ def _validate_proposal(data: dict, role=None, device: Optional[sqlite3.Row] = No
                 "requires": "a second object for the relation",
                 "support": "unsupported",
                 "alternatives": [],
+                "code": "needs_second_object",
             })
             continue
 
@@ -4215,7 +4229,7 @@ def _validate_proposal(data: dict, role=None, device: Optional[sqlite3.Row] = No
         if problem:
             unsupported.append({
                 "request": described, "reason": problem, "requires": "a rule the device can evaluate as written",
-                "support": "unsupported", "alternatives": [],
+                "support": "unsupported", "alternatives": [], "code": "invalid_rule",
             })
             continue
         valid_rules.append(rule)
@@ -4246,6 +4260,15 @@ def _policy_problem(rule: dict, reg=None) -> Optional[str]:
     except PolicyError as exc:
         return str(exc)
     return None
+
+
+def _typed_unsupported(entries: list) -> list[dict]:
+    """`entries` with a typed `code` each (jupiter/policy.py), or as they are."""
+    try:
+        from jupiter.policy import typed_unsupported
+    except ImportError:
+        return entries
+    return typed_unsupported(entries)
 
 
 def _policies_for(rules: list, zone_names: list[str]) -> list[dict]:
@@ -4408,6 +4431,9 @@ def ai_configure(body: AIConfigureBody, uid: int = Depends(current_user)):
     # later toggle (Activate keeps ids it is given).
     result["rules"] = _with_rule_ids(result.get("rules") or [])
     result["policies"] = _policies_for(result["rules"], zone_names)
+    # Every refusal carries a typed `code` (jupiter/policy.py UNSUPPORTED_CODES)
+    # the app renders as one consistent headline (M8.4).
+    result["unsupported"] = _typed_unsupported(result.get("unsupported") or [])
     # Persist the validated proposal as a DRAFT, so the app's Activate
     # (set_preset) has it to promote.
     #

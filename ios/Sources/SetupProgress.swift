@@ -184,6 +184,13 @@ extension SetupStep {
             return "this can take up to a minute"
         case (.online, .waitingForDevice(let elapsed)):
             return elapsed > 0 ? "waiting for it to reach the server (\(elapsed) s)" : "waiting for it to reach the server"
+        // What setup actually did about the mode (M8.4): the server accepted a
+        // request; the device screen is where it says it is running.
+        case (.mode, .finished(let outcome)) where outcome.onAccount:
+            guard let mode = outcome.mode else { return "left as it was" }
+            let name = mode.split(separator: ":").first.map(String.init) ?? mode
+            return "\(name.replacingOccurrences(of: "_", with: " ").capitalized) requested; "
+                + "the device screen shows when it's running"
         default:
             return nil
         }

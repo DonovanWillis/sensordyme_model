@@ -54,6 +54,11 @@ final class AppStateOnboardingAccount: OnboardingAccount {
 
     func explain(_ error: Error, claiming: Bool) -> String {
         guard let api = error as? APIError else { return error.localizedDescription }
+        if claiming, api.status == 0 {
+            // Offline (M8.4): nothing reached the server, so nothing was added.
+            return "Couldn't reach the server, so the device wasn't added. Check this phone's connection, "
+                + "then enter the claim code again. (\(api.message))"
+        }
         if claiming, api.status != 0 {
             return Onboarding.claimMessage(status: api.status, code: api.code, detail: api.message)
         }

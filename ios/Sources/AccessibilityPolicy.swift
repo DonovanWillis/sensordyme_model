@@ -37,7 +37,8 @@ enum EventAccessibility {
     static func severity(_ severity: String?) -> String {
         switch severity {
         case "loud": "Urgent alert"
-        case "soft": "Alert"
+        case "soft": "Warning"
+        case "experimental": "Experimental observation, not an alert"
         default: "Event"
         }
     }

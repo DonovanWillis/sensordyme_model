@@ -508,7 +508,7 @@ struct ValidationPresentation: Equatable {
                          isValidated: false)
         case .benchmarkedOffline:
             return .init(chip: "Not yet validated",
-                         detail: "Benchmarked offline on a public dataset only. Not yet validated on a device or in a real home or car.",
+                         detail: "Only measured offline on a public dataset. Not checked on a device, or in a real home or car.",
                          isValidated: false)
         case .unevaluated:
             return .init(chip: "Not yet validated",
