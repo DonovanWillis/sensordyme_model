@@ -222,10 +222,11 @@ struct PresetDetailView: View {
         let label = presentation?.label ?? "Status unknown"
         return VStack(alignment: .leading, spacing: SD.Space.xs) {
             HStack(spacing: SD.Space.xs) {
-                Image(systemName: tone == .ok ? "checkmark.shield" : (tone == .critical ? "xmark.octagon"
-                      : (tone == .caution ? "exclamationmark.triangle" : "questionmark.circle")))
+                // The device screen's readout symbols: a stopped device is
+                // paused on purpose, not a caution.
+                Image(systemName: Self.readoutSymbol(presentation?.phase))
                     .font(.system(size: 17, weight: .medium))
-                    .foregroundStyle(tone.tint)
+                    .foregroundStyle(presentation?.phase == .stopped ? SD.Colors.textSecondary : tone.tint)
                 Text(label)
                     .font(SD.Typography.readout)
                     .foregroundStyle(SD.Colors.textPrimary)
@@ -250,6 +251,17 @@ struct PresetDetailView: View {
             RoundedRectangle(cornerRadius: SD.Radius.camera, style: .continuous)
                 .fill(SD.Colors.surface)
         )
+    }
+
+    private static func readoutSymbol(_ phase: MonitoringStatusPresentation.Phase?) -> String {
+        switch phase {
+        case .ready?: InstrumentState.symbol(.ready)
+        case .starting?: InstrumentState.symbol(.starting)
+        case .degraded?: InstrumentState.symbol(.degraded)
+        case .stopped?: InstrumentState.symbol(.stopped)
+        case .failed?: InstrumentState.symbol(.failed)
+        case .unknown?, nil: InstrumentState.symbol(.unknown)
+        }
     }
 
     /// What it needs, each checked against what THIS device reports: working,
