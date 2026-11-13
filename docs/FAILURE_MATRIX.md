@@ -1,0 +1,54 @@
+# Failure matrix (M8.3)
+
+For each failure: what every layer must show (device → backend → app),
+the deterministic test that proves it on the virtual device (`sim/`, sim
+clock, no sleeps), the result at M8.3, and what only the Pi can prove. The
+state names are `docs/STATE_MODEL.md`'s. Every M8.3 virtual-device test runs
+with `sim/invariants.InvariantMonitor` attached, so besides its own
+assertions no uplink cycle may break a truth invariant or a state-model edge.
+
+Abbreviations: **M83** = `tests/test_m83_truth_failure_matrix.py`,
+**ACK** = `tests/test_m83_truth_protection_ack.py`, **INV** =
+`tests/test_m83_truth_invariants.py`, **E2E** = `tests/test_sim_e2e.py`,
+**REL** = `tests/test_sim_reliability.py`, **M81S** =
+`tests/test_m81_health_freshness_sim.py`, **M81** =
+`tests/test_m81_health_freshness.py`, Swift tests in `ios/Tests/`.
+"Hardware" = cannot be proven without the Pi (Monday 2026-11-16 runbook).
+
+| # | Case | Device | Backend (`status`) | App | Test | Result | Hardware-only part |
+|---|---|---|---|---|---|---|---|
+| 1 | Camera disconnected while monitoring | camera impaired after max(2 s, 5 frames); every analysis capability impaired ("no analysis: camera unavailable", M8.3); `failed` on a role needing the camera; capture keeps retrying | `failed`, `not_protecting`, reason names the camera; nothing analysing in `available` | Faulted, "Not monitoring — camera: …"; no row "producing results" | M83 `test_f1_camera_lost_while_monitoring_…`; E2E `test_camera_freeze_fails_with_reasons_and_recovers_to_ready`; `tests/test_m02_monitoring_state.py` frozen camera | PASS (failed on 66cf6b6: `attention` stayed available) | real CSI/USB unplug timing and the Picamera2 reopen path |
+| 2 | Accelerator unavailable | detector impaired with backoff (1 s → 60 s); `degraded` (driver: phone use lost, face kept) or `failed` when required; a model that cannot load boots `failed`, reachable | `degraded`/`failed` with reasons; `objects` impaired, never available; a missing component `unsupported` in preset readiness | Degraded / Faulted with the reason | M83 `test_f2_detector_failing_…`; E2E `test_detector_failure_degrades_then_recovers`, `test_a_model_that_cannot_be_loaded_boots_failed_and_reachable`; INV `test_a_failed_model_is_never_available_…` | PASS | Hailo absent / `.hef` sha mismatch / NPU dying mid-run (`hw_validation`, HARDWARE stream) |
+| 3 | Process crash | nothing runs; on restart a new `boot_id`, generation restarts; a stop is not persisted (comes back protecting) | after 30 s `online: false`, everything `unknown`/null; then fresh with the new boot | Offline, then Ready | M83 `test_f3_f4_…[crash]`; REL `test_a_restart_over_damaged_state_files_boots_protecting_without_a_reboot`; M81S `test_device_reboot_restarts_the_generation_…` | PASS | systemd `Restart=`, watchdog, start-limit (runbook §K) |
+| 4 | Device restart | as 3, orderly shutdown | as 3; `protection_command` keeps the latched outcome of a stop that preceded the restart, `last_command_id` null | Offline → Ready; a stop confirmed before the restart is not shown as current | M83 `test_f3_f4_…[restart]`; ACK `test_a_later_local_change_does_not_rewrite_…`; E2E `test_restart_keeps_identity_pairing_mode_and_rules` | PASS | real reboot time to READY (runbook) |
+| 5 | Backend unreachable | keeps monitoring and alerting locally; events queued (bounded), backoff to 30 s | after 30 s `online: false`, `stale`, all claims withheld | Offline, "Status unknown"; never the last "All clear" | M83 `test_f5_f7_…`; E2E `test_backend_outage_goes_stale_…`; REL `test_a_device_that_boots_with_no_backend_…`, `test_outage_recovery_on_the_production_backoff` | PASS | — |
+| 6 | Wi-Fi drop | same as 5 from the device's side; BLE provisioning window opens | same as 5 | same as 5 | as 5 (the sim cuts the link at the uplink, not the radio) | PASS (software) | the radio: NetworkManager, provisioning window (`services/provisioning.py`) |
+| 7 | Network return | next poll delivers the current sample and the backlog exactly once | fresh within one poll; `online: true` | Ready again; presence online only with a fresh reply | M83 `test_f5_f7_…`; REL `test_network_flapping_never_goes_stale_and_loses_nothing`; `tests/test_sim_stress.py` | PASS | — |
+| 8 | Delayed telemetry | sample `age_s` grows on the monotonic clock | a sample ≥ 30 s old is `health_stale` on arrival even with `online: true`; claims withheld | Stale ("Connected — monitoring status not updated"), never Ready | M83 `test_f8_a_sample_that_arrives_old_…`; M81S `test_delayed_observation_…`; INV `test_online_with_old_health_is_stale_…` | PASS | — |
+| 9 | App backgrounded / reopened | — | — | a reply older than 30 s is `unknown(.notRefreshed)`; nothing claimed until a refresh; a failed refresh is `unknown(.refreshFailed)` | `ios/Tests/ConnectionTruthTests.swift` (notRefreshed, refreshFailed); `ios/Tests/PresentationInvariantsTests.swift` P1 over generated reply ages | PASS | real iOS suspension / scene phase (XCUITest, IOS-PRODUCT) |
+| 10 | Stop timeout | never receives it (or receives it within 30 s and applies it) | `protection_command.outcome: timed_out` at 45 s; delivery withdrawn at 30 s: never applied late | `failed`: "didn't confirm the stop in time, so it was cancelled. It is still monitoring." | ACK `test_a_stop_the_device_cannot_receive_times_out_…`; `ProtectionControlTests` "stop timeout" | PASS (new in M8.3; 66cf6b6 delivered the stop whenever the device returned) | — |
+| 11 | Resume timeout | still stopped; resume applied when the link returns | `timed_out` with `delivering: true`; `confirmed` once applied | `overdue`: "It is still stopped and not monitoring"; then confirmed | ACK `test_a_resume_that_times_out_…`; `ProtectionControlTests` "resume timeout" | PASS | — |
+| 12 | Device confirms a different state | echoes the id of a refused request (`_apply_protection`) with its real state and a `last_rejection` | `outcome: mismatch`, `reported_state`, `reason` (the device's) | `mismatch`: "The device didn't stop — reason. It is still monitoring." Never "Stopped." | ACK `test_the_device_confirming_a_different_state_…`; `ProtectionControlTests` "an echo is an answer, not a success" | PASS (66cf6b6 app: an echo alone read "Stopped.") | — |
+| 13 | Video continues while inference stopped | camera available; inference impaired after 10 s ("loop unresponsive"); analysis capabilities impaired; `failed` | `failed`, camera available, inference impaired, no analysis available | Faulted; no capability "producing results" | M83 `test_f13_frames_keep_arriving_while_inference_is_dead_…` | PASS (failed on 66cf6b6: `attention` stayed available) | a real wedged Hailo call (watchdog withholds the systemd ping) |
+| 14 | Inference alive but detections stale | loop alive (inference available); the stale model's capability impaired with "stale: no result for N s"; `failed` if required, else `degraded` | as the device; component `stale` | Faulted / Degraded with the reason | M83 `test_f14_a_model_with_no_fresh_result_…`; M83 `test_f2_…` | PASS | — |
+| 15 | Duplicate messages | — | a re-sent health sample is `repeat` (no refresh); a re-delivered stop/resume takes effect once (`no_duplicate_effect`) | — | M81 `test_backend_decisions_new_repeat_revised_out_of_order_reboot_retired`; REL `test_lost_responses_and_lost_requests_still_apply_each_command_once`; ACK `test_a_newer_request_supersedes_and_duplicates_take_effect_once`. **Events**: EVENTS stream (event dedupe / ingest) | PASS (status, commands); events: EVENTS stream | — |
+| 16 | Reversed event order | — | an older generation is `out_of_order`, ignored; a pre-reboot boot is `retired_boot` | — | M81S `test_reordered_reports_never_overwrite_newer_health`, `test_device_reboot_…`. **Events**: EVENTS stream (timeline ordering) | PASS (status); events: EVENTS stream | — |
+| 17 | Stale telemetry replaced by fresh | a new generation | `fresh`, claims restored | Stale → Ready | M81S `test_frozen_snapshot_with_successful_polling_goes_unknown_then_recovers`; M83 `test_f8_…` (second half) | PASS | — |
+| 18 | BLE provisioning interrupted | the window stays open; a refused/timed-out handshake spends the challenge; lockout survives reconnecting | — | Setup resumes with a fresh handshake | `tests/test_m8_onboarding_peripheral.py` (`test_a_refused_passphrase_keeps_the_window_open_…`, `test_timeouts_spend_the_challenge_and_the_proof`, `test_lockout_reports_the_wait_survives_reconnecting_and_lifts`); `tests/test_m8_onboarding_e2e.py`; `ios/Tests/BLEProvisioningTests.swift` | PASS (owned by onboarding/SECURITY) | the real BlueZ peripheral and the phone's CoreBluetooth |
+| 19 | Low-resource streaming | frames dropped or in bursts: drops hold READY; stalls make the camera stale → failed; the evidence clock caps gaps | as the device | as the device; the live view's own liveness is the STREAM stream's | E2E `test_frame_drops_and_stalls_are_told_apart`; **stream liveness**: STREAM stream (`/stream`, MJPEG) | PASS (monitoring side); stream: STREAM stream | CPU contention between MJPEG encode and inference on the Pi |
+| 20 | Sustained high SoC temperature | `degraded` with "device: SoC at 84.0°C … analysis may be slower" at ≥ 80 °C or any live throttle bit; holds until < 75 °C (no flapping); never `failed`; health `system: warning` | `degraded`, `protection: protecting`, the reason | Degraded with the reason; still protecting | M83 `test_f20_sustained_heat_…`, `test_f20_a_live_throttle_bit_…`, `test_thermal_condition_uses_the_published_limits_unchanged` | PASS (on 66cf6b6 nothing fed temperature or throttling into the monitoring state, so a throttling device read READY) | the real sysfs / `vcgencmd get_throttled` values, fan behaviour, and how much the frame rate actually drops |
+
+## Cross-cutting
+
+- **Every sample is coherent.** The device builds the health sample's
+  monitoring and protection blocks from one evaluation (M8.3); before, two
+  evaluations a moment apart could straddle a threshold. M83
+  `test_every_sample_the_device_sends_is_coherent_across_a_fault_tour`
+  checks every sample the device sends through a fault tour.
+- **Every backend row is coherent.** INV generates 800 reports (half
+  contradictory: torn samples, pre-M8.2 capability lists, missing models) and
+  checks every row: 123 violations on 66cf6b6, 0 at M8.3
+  (`~/sensordyme-audit/2026-11-10/m83-evidence/truth/property_violation_counts_base_vs_m83.txt`).
+- **Every screen claim is supported.** `ios/Tests/PresentationInvariantsTests.swift`
+  generates 20,000 replies per run; 8 unsupported claims on 66cf6b6's app
+  code, 0 at M8.3 (`…/truth/app_claims_base_vs_m83.txt`).
