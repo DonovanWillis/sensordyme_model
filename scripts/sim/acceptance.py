@@ -54,7 +54,7 @@ class Suite:
 SUITES: tuple[Suite, ...] = (
     # ---- M8.4 (this stream)
     Suite("twin_journeys", "full user journeys through the app's API, invariants attached",
-          ("tests/test_m84_twin_journeys.py",)),
+          ("tests/test_m84_twin_journeys.py", "tests/test_m84_twin_fidelity.py")),
     Suite("twin_faults", "lossy/duplicate/reordered link, malformed NPU tensors, ack loss, backend restart, "
                          "read-only data dir", ("tests/test_m84_twin_faults.py",)),
     Suite("reliability_recovery", "repeated inference failure, fault storms, no duplicate actuation",
@@ -203,6 +203,16 @@ def _script_facts(suite: Suite, out: Path) -> dict:
     return {}
 
 
+def _fidelity() -> dict:
+    """The twin's fidelity map (sim/fidelity.py): what was real, what was a stand-in."""
+    sys.path.insert(0, str(REPO))
+    from sim import fidelity
+
+    return {"by_kind": fidelity.summary(),
+            "stand_ins": {name: entry["fakes"] for name, entry in fidelity.FIDELITY.items()
+                          if entry["code"] != "real"}}
+
+
 def main(argv: Optional[list[str]] = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
     parser.add_argument("--out", default=str(REPO / "data" / "acceptance"))  # data/ is git-ignored
@@ -233,6 +243,7 @@ def main(argv: Optional[list[str]] = None) -> int:
         "started": time.strftime("%Y-%m-%dT%H:%M:%S%z", time.localtime(started)),
         "duration_s": round(time.time() - started, 1),
         "ok": all(r["result"] != "failed" for r in results),
+        "fidelity": _fidelity(),
         "totals": {k: sum(int(r.get(k, 0) or 0) for r in results) for k in ("passed", "failed", "skipped", "xfailed")},
         "suites": results,
     }

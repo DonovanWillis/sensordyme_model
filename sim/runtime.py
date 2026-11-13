@@ -29,6 +29,7 @@ from core.alerts import AlertCategory, AlertLevel, AlertPattern
 from core.events import Event
 from services.runtime import DeviceRuntime
 from sim import perception
+from sim.fidelity import STAND_INS
 
 log = logging.getLogger("sensordyme.sim")
 
@@ -182,6 +183,8 @@ class SimRuntime(DeviceRuntime):
             "faults": faults.describe(),
             "perception": "scripted (no camera, no models)" if self._scripted()
                           else "not simulated for this module (real code, no models on this host)",
+            # M8.4: every component this device fakes (sim/fidelity.py, docs/DIGITAL_TWIN.md).
+            "stand_ins": sorted(STAND_INS),
             "not_simulated": ["camera sensor", "Hailo NPU", "BLE provisioning", "GPIO buzzer", "Wi-Fi",
                               *(() if faults.soc_temp_c is not None or faults.throttle else ("thermals",))],
         }
