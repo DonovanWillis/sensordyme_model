@@ -22,12 +22,14 @@ from __future__ import annotations
 import contextlib
 import hmac
 import json
+import secrets
 import select
 import socket
 import threading
 import time
 from collections import Counter, deque
 from collections.abc import Callable
+from dataclasses import dataclass
 from datetime import UTC, datetime
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Optional
@@ -55,6 +57,14 @@ _MAX_RISK_POINTS = 360  # ~6 minutes at 1 sample/s
 # 1 sample/s. services/runtime.py tracks the same duration independently for
 # the baked-in MJPEG/cv2 overlay; this one drives the web page's own flash.
 FLASH_DURATION_S = 1.5
+
+#: How long a /stream write may block before the viewer is dropped. Each viewer
+#: has its own handler thread writing from the ONE shared latest-frame slot, so a
+#: slow client only ever blocks itself (frames it cannot take are skipped, never
+#: queued); this bounds how long a client that stopped reading entirely keeps
+#: its thread and its viewer slot. Generous: phones on weak Wi-Fi are slow,
+#: not dead. Same value the handler used for every socket operation before.
+_STREAM_SEND_TIMEOUT_S = 30.0
 
 #: Most connections served at once. Each one is a thread for as long as it lasts
 #: (a /stream viewer for as long as it watches), and the server is reachable --
@@ -121,8 +131,100 @@ def _peer_closed(sock) -> bool:
         return True
 
 
+@dataclass
+class _StreamFrame:
+    """The one shared latest-frame slot every /stream viewer reads from."""
+
+    jpeg: bytes
+    seq: int  # dashboard-wide, strictly increasing across annotated + camera frames
+    captured_at: float  # time.monotonic() of the CAMERA capture this frame shows
+    source: str  # "annotated" (the runtime's analysed view) | "camera" (fallback, unanalysed)
+
+
+@dataclass
+class _StreamClient:
+    """Per-viewer counters; never holds frames (the slot is shared)."""
+
+    opened_at: float
+    frames_sent: int = 0
+    frames_skipped: int = 0  # frames published while this viewer was busy: dropped, not queued
+    heartbeats: int = 0
+    bytes_sent: int = 0
+    last_seq: int = 0
+
+
+def _part_header(frame: _StreamFrame, stream_id: str, now: float) -> bytes:
+    """One multipart part header for a JPEG.
+
+    The first three lines are exactly what the stream always sent, so a client
+    that predates M8.3 (the old iOS reader, a browser <img>) parses it as before
+    and ignores the rest. The X- lines are the evidence the app checks before it
+    may say LIVE (docs/VIDEO_TRANSPORT.md):
+
+      X-Frame-Seq      strictly increasing for this stream id; a repeat or a
+                       stall means nothing new was captured
+      X-Frame-Age-Ms   capture -> this write, on the device's own monotonic
+                       clock (no clock sync needed); network transit is extra
+      X-Frame-Source   "annotated" = the analysed view; "camera" = the camera
+                       without analysis (monitoring stopped, module degraded or
+                       not drawing) -- video can be live while monitoring is not
+      X-Stream-Id      random per dashboard process: a change means the device
+                       restarted and the seq started again
+    """
+    age_ms = max(0, int((now - frame.captured_at) * 1000))
+    return (
+        "--frame\r\n"
+        "Content-Type: image/jpeg\r\n"
+        f"Content-Length: {len(frame.jpeg)}\r\n"
+        f"X-Frame-Seq: {frame.seq}\r\n"
+        f"X-Frame-Age-Ms: {age_ms}\r\n"
+        f"X-Frame-Source: {frame.source}\r\n"
+        f"X-Stream-Id: {stream_id}\r\n"
+        "\r\n"
+    ).encode()
+
+
+def _heartbeat_part(stream_id: str, status: str, camera_age_ms: Optional[int], last_seq: int) -> bytes:
+    """An empty part that says the connection is alive and why no frame is coming.
+
+    Sent only to a client that asked for it (`X-Stream-Heartbeat: 1` on the
+    request): a browser <img> fed a non-image part may show a broken image, and
+    the pre-M8.3 app simply discards bytes outside a JPEG, but there is no
+    reason to send either of them anything new.
+    """
+    lines = [
+        "--frame",
+        "Content-Type: text/plain",
+        "Content-Length: 0",
+        "X-Stream-Heartbeat: 1",
+        f"X-Stream-Id: {stream_id}",
+        f"X-Stream-Status: {status}",
+        f"X-Frame-Seq: {last_seq}",
+    ]
+    if camera_age_ms is not None:
+        lines.append(f"X-Camera-Age-Ms: {camera_age_ms}")
+    return ("\r\n".join(lines) + "\r\n\r\n\r\n").encode()
+
+
 class DashboardServer:
     """Threaded local web app fed by the main loop; never blocks the camera."""
+
+    #: A frame captured longer ago than this is never sent: not to a new viewer
+    #: (the slot can hold a picture from before a stop or a freeze) and not
+    #: mid-stream. Generous against a loaded Pi's capture -> annotate -> encode
+    #: latency; the APP decides what is fresh enough to call LIVE (2 s,
+    #: ios/Sources/StreamLiveness.swift), this only stops the device from
+    #: serving pictures nobody should mistake for the present.
+    MAX_FRAME_AGE_S = 5.0
+    #: The camera itself counts as stale once its newest frame is this old
+    #: (heartbeat status `camera_stale`).
+    CAMERA_STALE_S = 2.0
+    #: With no frame sent for this long, a viewer that opted in gets a heartbeat.
+    HEARTBEAT_INTERVAL_S = 1.0
+    #: The runtime counts as "not drawing" once it has pushed no annotated frame
+    #: for this long; the camera fallback starts then (if a source is attached).
+    #: Above the slowest healthy push cadence (the Pi on CPU inference, ~3/s).
+    ANNOTATION_GAP_S = 1.5
 
     def __init__(
         self,
@@ -136,6 +238,8 @@ class DashboardServer:
         jpeg_quality: int = _JPEG_QUALITY,
         stream_fps: float = _STREAM_FPS,
         health_provider=None,
+        camera_fallback: bool = True,
+        stream_send_timeout_s: float = _STREAM_SEND_TIMEOUT_S,
     ) -> None:
         self._host = host
         self._port = port
@@ -165,8 +269,23 @@ class DashboardServer:
         #: Set by the runtime: (preset name) -> reason it would weaken the role, or None.
         self.preset_guard: Optional[Callable[[str], Optional[str]]] = None
         self._lock = threading.Lock()
-        self._jpeg: Optional[bytes] = None
+        #: The ONE latest-frame slot (see _StreamFrame). Replaced, never queued.
+        self._frame: Optional[_StreamFrame] = None
         self._jpeg_seq = 0
+        #: monotonic time of the runtime's last annotated push (fallback gate).
+        self._annotated_at = 0.0
+        #: Random per process: lets a viewer see a restart even though the seq
+        #: restarts from 1 (docs/VIDEO_TRANSPORT.md).
+        self._stream_id = secrets.token_hex(4)
+        #: Optional camera source (a FrameBus): heartbeat camera age, and the
+        #: unannotated fallback while the runtime is not drawing.
+        self._frame_source = None
+        self._camera_fallback = bool(camera_fallback)
+        self._fallback_lock = threading.Lock()  # one encoder at a time, shared by all viewers
+        self._fallback_bus_seq = 0
+        self._stream_send_timeout_s = max(0.1, float(stream_send_timeout_s))
+        self._clients: dict[int, _StreamClient] = {}
+        self._stream_counts: Counter = Counter()
         self._viewers = 0
         self._events: deque[dict] = deque(maxlen=_MAX_EVENTS)
         self._counts: Counter = Counter()
@@ -366,34 +485,27 @@ class DashboardServer:
                             with contextlib.suppress(ValueError):
                                 limit = min(2000, int(self.path.rsplit("limit=", 1)[1].split("&")[0]))
                         self._json({"events": dashboard.history(limit)})
+                    elif self.path.startswith("/api/stream/stats"):
+                        self._json(dashboard.stream_stats())
                     elif self.path.startswith("/stream"):
+                        heartbeat = self.headers.get("X-Stream-Heartbeat", "") == "1"
                         self.send_response(200)
                         self.send_header(
                             "Content-Type", "multipart/x-mixed-replace; boundary=frame"
                         )
+                        self.send_header("Cache-Control", "no-store")
+                        self.send_header("X-Stream-Id", dashboard._stream_id)
+                        self.send_header("X-Stream-Max-Frame-Age-Ms", str(int(dashboard.MAX_FRAME_AGE_S * 1000)))
+                        if heartbeat:
+                            self.send_header(
+                                "X-Stream-Heartbeat-Interval-Ms", str(int(dashboard.HEARTBEAT_INTERVAL_S * 1000))
+                            )
                         self.end_headers()
-                        # Registering as a viewer is what makes the main loop start
-                        # annotating and encoding at all -- see has_viewers().
-                        dashboard.viewer_joined()
-                        try:
-                            last_seq = -1
-                            # `not self._peer_gone()`, not `while True`: the loop used
-                            # to learn that a client had left ONLY by having a write
-                            # fail, and during any window with no fresh frames -- a
-                            # camera stall, a degraded detector, or simply the gap
-                            # before the first frame is encoded for a newly connected
-                            # viewer -- there is no write to fail. See _peer_gone().
-                            while not self._peer_gone():
-                                jpeg, seq = dashboard.latest_jpeg()
-                                if jpeg is not None and seq != last_seq:
-                                    last_seq = seq
-                                    self.wfile.write(b"--frame\r\nContent-Type: image/jpeg\r\n")
-                                    self.wfile.write(f"Content-Length: {len(jpeg)}\r\n\r\n".encode())
-                                    self.wfile.write(jpeg)
-                                    self.wfile.write(b"\r\n")
-                                time.sleep(dashboard.stream_interval)
-                        finally:
-                            dashboard.viewer_left()
+                        # Bounded writes: a client that stops reading blocks only
+                        # its own thread, and only this long (_STREAM_SEND_TIMEOUT_S).
+                        with contextlib.suppress(OSError):
+                            self.connection.settimeout(dashboard._stream_send_timeout_s)
+                        dashboard.serve_stream(self.wfile.write, self._peer_gone, heartbeat=heartbeat)
                     else:
                         self.send_response(404)
                         self.end_headers()
@@ -476,14 +588,195 @@ class DashboardServer:
         with self._lock:
             return self._viewers > 0
 
+    # ------------------------------------------------------------------ the live stream
+    def attach_frame_source(self, source) -> None:
+        """Give the stream the camera itself (a core.frame_bus.FrameBus).
+
+        Two uses, both only while someone is watching: the heartbeat reports
+        the camera's own frame age (so the app can say "camera not sending"
+        rather than "stream stalled"), and while the runtime is not drawing --
+        monitoring stopped, a degraded module, annotate() failing -- the newest
+        camera frame is encoded unannotated (X-Frame-Source: camera) instead
+        of the stream freezing on its last picture with the connection open.
+        """
+        self._frame_source = source
+
+    def serve_stream(self, write: Callable[[bytes], object], peer_gone: Callable[[], bool],
+                     heartbeat: bool = False) -> None:
+        """Feed one viewer until it leaves. Runs on that viewer's handler thread.
+
+        Latest-frame-only by construction: each pass reads the ONE shared slot
+        and sends it if it is newer than what this viewer last got. A viewer
+        that is slow (its send blocks) simply misses the frames published
+        meanwhile -- counted in `frames_skipped` -- so nothing is queued per
+        client and a slow client never slows the producer (push_frame only
+        swaps a reference under a lock). A viewer that stops reading entirely
+        is dropped by the socket send timeout.
+        """
+        client = _StreamClient(opened_at=time.monotonic())
+        key = id(client)
+        with self._lock:
+            self._clients[key] = client
+            self._stream_counts["connections_total"] += 1
+        # Registering as a viewer is what makes the main loop start annotating
+        # and encoding at all -- see has_viewers().
+        self.viewer_joined()
+        last_write = time.monotonic()
+        try:
+            # `not peer_gone()`, not `while True`: the loop used to learn that a
+            # client had left ONLY by having a write fail, and during any window
+            # with no fresh frames -- a camera stall, a degraded detector, or the
+            # gap before the first frame is encoded for a newly connected viewer
+            # -- there is no write to fail. See _Handler._peer_gone().
+            while not peer_gone():
+                frame = self._current_frame()
+                now = time.monotonic()
+                if frame is not None and frame.seq != client.last_seq:
+                    if now - frame.captured_at > self.MAX_FRAME_AGE_S:
+                        # Never serve a picture from the past as the present.
+                        with self._lock:
+                            self._stream_counts["stale_frames_withheld"] += 1
+                        client.last_seq = frame.seq  # count it once, not every pass
+                    else:
+                        # One write per part: header, JPEG and trailer together
+                        # (the handler's wfile is unbuffered -- four writes were
+                        # four syscalls per frame).
+                        payload = b"".join((_part_header(frame, self._stream_id, now), frame.jpeg, b"\r\n"))
+                        write(payload)
+                        skipped = max(0, frame.seq - client.last_seq - 1) if client.last_seq else 0
+                        client.last_seq = frame.seq
+                        client.frames_sent += 1
+                        client.frames_skipped += skipped
+                        client.bytes_sent += len(payload)
+                        last_write = now
+                        with self._lock:
+                            self._stream_counts["frames_sent"] += 1
+                            self._stream_counts["frames_skipped"] += skipped
+                            self._stream_counts["bytes_sent"] += len(payload)
+                elif heartbeat and now - last_write >= self.HEARTBEAT_INTERVAL_S:
+                    status, camera_age_ms = self._stream_status(now)
+                    payload = _heartbeat_part(self._stream_id, status, camera_age_ms, client.last_seq)
+                    write(payload)
+                    client.heartbeats += 1
+                    last_write = now
+                    with self._lock:
+                        self._stream_counts["heartbeats"] += 1
+                time.sleep(self.stream_interval)
+        except TimeoutError:
+            # The viewer stopped reading for _STREAM_SEND_TIMEOUT_S: drop it,
+            # free the thread and the viewer slot.
+            with self._lock:
+                self._stream_counts["client_send_timeouts"] += 1
+        except (BrokenPipeError, ConnectionResetError):
+            pass  # the viewer went away mid-write
+        finally:
+            with self._lock:
+                self._clients.pop(key, None)
+            self.viewer_left()
+
+    def _current_frame(self) -> Optional[_StreamFrame]:
+        """The slot's frame, refreshed from the camera when the runtime is not drawing."""
+        with self._lock:
+            frame, annotated_at = self._frame, self._annotated_at
+        source = self._frame_source
+        if source is None or not self._camera_fallback:
+            return frame
+        now = time.monotonic()
+        if annotated_at and now - annotated_at < self.ANNOTATION_GAP_S:
+            return frame  # the runtime is drawing: its analysed view wins
+        if frame is not None and frame.source == "camera" and now - frame.captured_at < self.stream_interval:
+            return frame  # a fallback frame newer than one stream interval: reuse it
+        # Shared encoder: whichever viewer thread gets here first encodes, the
+        # others serve what is already in the slot. Non-blocking, so a viewer
+        # never waits behind another viewer's encode.
+        if not self._fallback_lock.acquire(blocking=False):
+            return frame
+        try:
+            camera_frame, bus_seq, published_at = source.latest_stamped()
+            if camera_frame is None or bus_seq == self._fallback_bus_seq:
+                return frame
+            if now - published_at > self.CAMERA_STALE_S:
+                return frame  # the camera itself is stale: nothing live to show
+            ok, buf = cv2.imencode(".jpg", camera_frame, [int(cv2.IMWRITE_JPEG_QUALITY), self._jpeg_quality])
+            if not ok:
+                return frame
+            self._fallback_bus_seq = bus_seq
+            with self._lock:
+                if self._annotated_at and time.monotonic() - self._annotated_at < self.ANNOTATION_GAP_S:
+                    return self._frame  # the runtime resumed while we encoded
+                self._jpeg_seq += 1
+                self._frame = _StreamFrame(buf.tobytes(), self._jpeg_seq, published_at, "camera")
+                self._stream_counts["camera_fallback_encodes"] += 1
+                return self._frame
+        finally:
+            self._fallback_lock.release()
+
+    def _stream_status(self, now: float) -> tuple[str, Optional[int]]:
+        """Why no frame is going out: the heartbeat's X-Stream-Status."""
+        source = self._frame_source
+        if source is None:
+            return "no_fresh_frames", None
+        _frame, bus_seq, published_at = source.latest_stamped()
+        if bus_seq == 0:
+            return "camera_not_started", None
+        age = now - published_at
+        if age > self.CAMERA_STALE_S:
+            return "camera_stale", int(age * 1000)
+        return "no_fresh_frames", int(age * 1000)
+
+    def stream_stats(self) -> dict:
+        """Live-stream counters (GET /api/stream/stats; tests and soak runs).
+
+        `max_pending_frames_per_client` is structural, not measured: viewers
+        read one shared slot, so no client can have more than one frame waiting.
+        """
+        with self._lock:
+            counts = self._stream_counts
+            return {
+                "stream_id": self._stream_id,
+                "viewers": self._viewers,
+                "connections_total": counts["connections_total"],
+                "frames_sent": counts["frames_sent"],
+                "frames_skipped": counts["frames_skipped"],
+                "bytes_sent": counts["bytes_sent"],
+                "heartbeats": counts["heartbeats"],
+                "stale_frames_withheld": counts["stale_frames_withheld"],
+                "client_send_timeouts": counts["client_send_timeouts"],
+                "camera_fallback_encodes": counts["camera_fallback_encodes"],
+                "latest_seq": self._jpeg_seq,
+                "max_pending_frames_per_client": 1,
+                "clients": [
+                    {
+                        "open_s": round(time.monotonic() - c.opened_at, 1),
+                        "frames_sent": c.frames_sent,
+                        "frames_skipped": c.frames_skipped,
+                        "heartbeats": c.heartbeats,
+                        "bytes_sent": c.bytes_sent,
+                        "last_seq": c.last_seq,
+                    }
+                    for c in self._clients.values()
+                ],
+            }
+
     # ------------------------------------------------------------------ feeders (main loop)
-    def push_frame(self, annotated_bgr: np.ndarray) -> None:
-        """Encode the annotated frame to an in-memory JPEG for the live stream."""
+    def push_frame(self, annotated_bgr: np.ndarray, captured_at: Optional[float] = None) -> None:
+        """Encode the annotated frame to an in-memory JPEG for the live stream.
+
+        `captured_at` is the time.monotonic() at which the camera captured the
+        frame this view was drawn from (the FrameBus publish time the runtime
+        already carries). It becomes X-Frame-Age-Ms. Omitted, the encode time is
+        used -- which under-reports the age by the inference latency, so the
+        runtime passes it.
+        """
         ok, buf = cv2.imencode(".jpg", annotated_bgr, [int(cv2.IMWRITE_JPEG_QUALITY), self._jpeg_quality])
         if ok:
+            now = time.monotonic()
             with self._lock:
-                self._jpeg = buf.tobytes()
                 self._jpeg_seq += 1
+                self._frame = _StreamFrame(
+                    buf.tobytes(), self._jpeg_seq, now if captured_at is None else float(captured_at), "annotated"
+                )
+                self._annotated_at = now
 
     def push_event(self, event, severity: str = "log") -> None:
         """Record one Event for the timeline. severity: 'loud' | 'soft' | 'log'.
@@ -655,7 +948,8 @@ class DashboardServer:
     # ------------------------------------------------------------------ readers (handler)
     def latest_jpeg(self) -> tuple[Optional[bytes], int]:
         with self._lock:
-            return self._jpeg, self._jpeg_seq
+            frame = self._frame
+            return (None, self._jpeg_seq) if frame is None else (frame.jpeg, frame.seq)
 
     def state(self) -> dict:
         with self._lock:
