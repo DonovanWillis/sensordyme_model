@@ -233,7 +233,7 @@ struct AIConfigureView: View {
                 }
                 suggestionRow(JupiterSuggestions.refused, refused: true)
             }
-            Text("Jupiter turns your words into rules for this device. Nothing changes until you review and activate them, and the device confirms it. Requests about who someone is, what they feel or intend, or sounds are refused, with the reason.")
+            Text("Jupiter turns your words into rules for this device. Nothing changes until you review and activate them, and the device confirms it. Requests about who someone is, what they feel or intend, sounds, medical conditions or the experimental driver signals are refused, with the reason.")
                 .font(SD.Typography.caption)
                 .foregroundStyle(SD.Colors.textTertiary)
                 .fixedSize(horizontal: false, vertical: true)
@@ -358,12 +358,27 @@ struct AIConfigureView: View {
                             .fixedSize(horizontal: false, vertical: true)
                     }
                     if !binding.wrappedValue.zone.isEmpty {
-                        Label("Draw the \"\(binding.wrappedValue.zone)\" area on the device to activate this",
-                              systemImage: "pencil.and.outline")
-                            .font(SD.Typography.caption)
-                            .foregroundStyle(SD.Colors.textSecondary)
-                            .fixedSize(horizontal: false, vertical: true)
-                            .accessibilityIdentifier("jupiter.zoneRequirement")
+                        // From the backend's typed policy when it sent one
+                        // (M8.4): "Draw the area" was said even when the area
+                        // was already drawn.
+                        if proposal?.policy(at: index)?.zone?.drawn == true {
+                            Label("Uses your \"\(binding.wrappedValue.zone)\" area",
+                                  systemImage: "checkmark.circle")
+                                .font(SD.Typography.caption)
+                                .foregroundStyle(SD.Colors.textSecondary)
+                                .fixedSize(horizontal: false, vertical: true)
+                                .accessibilityIdentifier("jupiter.zoneRequirement")
+                        } else {
+                            Label("Draw the \"\(binding.wrappedValue.zone)\" area on the device to activate this",
+                                  systemImage: "pencil.and.outline")
+                                .font(SD.Typography.caption)
+                                .foregroundStyle(SD.Colors.textSecondary)
+                                .fixedSize(horizontal: false, vertical: true)
+                                .accessibilityIdentifier("jupiter.zoneRequirement")
+                        }
+                    }
+                    if let explanation = proposal?.policy(at: index)?.explanation {
+                        policyScope(explanation)
                     }
 
                     Divider().overlay(SD.Colors.border)
@@ -423,6 +438,47 @@ struct AIConfigureView: View {
         }
     }
 
+    /// What the rule watches and what it does not, in the backend's typed
+    /// policy's own words (jupiter/policy.py explain): folded, one tap away.
+    @ViewBuilder
+    private func policyScope(_ explanation: AIPolicyPreview.Explanation) -> some View {
+        let watches = explanation.monitors ?? []
+        let ignores = explanation.does_not_monitor ?? []
+        if !watches.isEmpty || !ignores.isEmpty {
+            DisclosureGroup {
+                VStack(alignment: .leading, spacing: SD.Space.xs) {
+                    if !watches.isEmpty {
+                        scopeList("Watches", watches)
+                    }
+                    if !ignores.isEmpty {
+                        scopeList("Doesn't watch", ignores)
+                    }
+                }
+                .padding(.top, SD.Space.xxs)
+            } label: {
+                Text("What this rule watches")
+                    .font(SD.Typography.caption.weight(.medium))
+                    .foregroundStyle(SD.Colors.textSecondary)
+            }
+            .accessibilityIdentifier("jupiter.policyScope")
+        }
+    }
+
+    private func scopeList(_ title: String, _ items: [String]) -> some View {
+        VStack(alignment: .leading, spacing: 2) {
+            Text(title)
+                .font(SD.Typography.caption.weight(.semibold))
+                .foregroundStyle(SD.Colors.textTertiary)
+            ForEach(items, id: \.self) { item in
+                Text("– \(item)")
+                    .font(SD.Typography.caption)
+                    .foregroundStyle(SD.Colors.textSecondary)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+        }
+        .accessibilityElement(children: .combine)
+    }
+
     /// A label and its control side by side, or stacked at accessibility sizes
     /// where a segmented control beside a label would squeeze both.
     @ViewBuilder
@@ -451,7 +507,10 @@ struct AIConfigureView: View {
     /// it would need. Open rows under a section label, not another box.
     private func limitationsSection(_ items: [AIUnsupported]) -> some View {
         VStack(alignment: .leading, spacing: SD.Space.sm) {
-            SDSectionHeader(title: "Not yet possible")
+            // "Not yet possible" promised a later version for requests that are
+            // refused by policy (identity, sound, intent): said as they are.
+            SDSectionHeader(title: items.allSatisfy { JupiterRefusal.isPolicy(code: $0.code) }
+                            ? "Won't be set up" : "Not possible yet")
                 .accessibilityIdentifier("jupiter.limitations")
             ForEach(items) { item in
                 HStack(alignment: .firstTextBaseline, spacing: SD.Space.sm) {
@@ -466,14 +525,15 @@ struct AIConfigureView: View {
                             .foregroundStyle(SD.Colors.textPrimary)
                             .fixedSize(horizontal: false, vertical: true)
                         Text(item.route)
-                            .font(SD.Typography.caption)
+                            .font(SD.Typography.caption.weight(.semibold))
                             .foregroundStyle(SD.Colors.warning)
                             .fixedSize(horizontal: false, vertical: true)
+                            .accessibilityIdentifier("jupiter.refusal.\(item.code ?? "untyped")")
                         Text(item.reason)
                             .font(SD.Typography.caption)
                             .foregroundStyle(SD.Colors.textSecondary)
                             .fixedSize(horizontal: false, vertical: true)
-                        Text("To enable: \(item.requires)")
+                        Text(item.requiresLine)
                             .font(SD.Typography.caption)
                             .foregroundStyle(SD.Colors.textTertiary)
                             .fixedSize(horizontal: false, vertical: true)
@@ -611,9 +671,9 @@ struct AIConfigureView: View {
         init(proposal: AIProposal, device: Device) {
             let additive = MonitoringStatusPresentation.rulesAdditive(device.status)
             if proposal.isCustom {
-                will = proposal.rules.map { rule in
-                    rule.zone.isEmpty ? rule.headline
-                        : "\(rule.headline) — once the \u{201C}\(rule.zone)\u{201D} area is drawn"
+                will = proposal.rules.enumerated().map { index, rule in
+                    if rule.zone.isEmpty || proposal.policy(at: index)?.zone?.drawn == true { return rule.headline }
+                    return "\(rule.headline) — once the \u{201C}\(rule.zone)\u{201D} area is drawn"
                 }
                 if additive {
                     notes.append("Runs alongside \(Preset.title(for: device.activePreset)), which keeps running.")
