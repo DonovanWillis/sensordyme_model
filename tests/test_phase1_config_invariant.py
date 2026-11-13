@@ -181,10 +181,21 @@ def test_a_migrated_deployed_config_is_as_loud_as_a_fresh_checkout(deployed_conf
     `distraction` and `eyes_up`, made loud in the repo after this config
     shipped, stayed soft (no push) on every deployed unit while the preset
     check passed. Stated over the whole list instead: a unit migrated forward
-    from the oldest field config tags exactly what a fresh checkout tags."""
+    from the oldest field config tags exactly what a fresh checkout tags.
+
+    M8.4 (owner decision A): EFFECTIVELY loud. The old config still lists
+    high_risk/elevated_risk (migration never removes a device's own list
+    members); they are inert because every reader gates them
+    (core/behavior/experimental.gate_alert_lists, AlertManager.permits), and
+    migration writes the explicit `experimental_alerts_audible: false`."""
+    from core.behavior.experimental import gate_alert_lists
+
     migrate(deployed_config)
-    device_loud = set(load_config(deployed_config)["alerts"]["loud_types"])
-    repo_loud = set(load_config(REPO_ROOT / "config.yaml")["alerts"]["loud_types"])
+    device_alerts = load_config(deployed_config)["alerts"]
+    assert "high_risk" in device_alerts["loud_types"], "the device's own list is left as it was"
+    assert device_alerts["experimental_alerts_audible"] is False
+    device_loud = set(gate_alert_lists(device_alerts)[0]["loud_types"])
+    repo_loud = set(gate_alert_lists(load_config(REPO_ROOT / "config.yaml")["alerts"])[0]["loud_types"])
     assert device_loud == repo_loud, (
         f"missing on a migrated device: {sorted(repo_loud - device_loud)}; "
         f"extra: {sorted(device_loud - repo_loud)}"

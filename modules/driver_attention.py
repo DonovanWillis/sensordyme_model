@@ -102,7 +102,11 @@ import numpy as np
 
 from core import perception as shared_perception
 from core.behavior import BehaviorFrame, BehaviorReasoner, parse_behavior
+from core.behavior import signals as sig
+from core.behavior.association import DriverAssociation, associate_driver
 from core.behavior.camera_model import CameraIntrinsics
+from core.behavior.engine import BehaviorEngine, EngineConfig, FrameEvidence, frame_quality
+from core.behavior.experimental import observation_detail
 from core.behavior.eye_state import CLOSED as EYE_CLOSED
 from core.behavior.eye_state import LOOKING_DOWN as EYE_LOOKING_DOWN
 from core.behavior.eye_state import (
@@ -112,7 +116,15 @@ from core.behavior.eye_state import (
     classify_eye_state,
     eye_patch_occluded,
 )
-from core.behavior.phone import DETECTOR_FAILED, DETECTOR_NOT_STARTED, DETECTOR_OK, PhoneDetection
+from core.behavior.phone import (
+    DETECTOR_FAILED,
+    DETECTOR_NOT_STARTED,
+    DETECTOR_OK,
+    PhoneConfig,
+    PhoneDetection,
+    gaze_toward,
+)
+from core.behavior.phone_evidence import PhoneEvidence, PhoneEvidenceInput, phone_risk_for
 from core.confidence import (
     NoiseEstimator,
     clamp_unit,
@@ -265,8 +277,27 @@ def _extrapolated(confidence: float) -> float:
 
 def _risk_event(event_type: str, score: float, module_name: str) -> Event:
     """A fused-risk event. The fusion score is a weighted risk index (how bad),
-    not a certainty (how sure), so it travels in the signals, not as confidence."""
-    return Event.now(event_type, 0.0, None, module_name, f"risk score {score:.2f}")
+    not a certainty (how sure), so it travels in the signals, not as confidence.
+
+    M8.4 owner decision A: elevated_risk / high_risk are EXPERIMENTAL
+    OBSERVATIONS, said so in the text itself (core/behavior/experimental.py)."""
+    return Event.now(event_type, 0.0, None, module_name, observation_detail(f"risk score {score:.2f}"))
+
+
+#: Hand-model scheduling (M8.4 B5). MediaPipe Hands is the largest host cost
+#: (docs/research/M83_INFERENCE_PATH.md: p50 ~32 ms vs FaceMesh ~3 ms on host
+#: CPUs). Every consumer of hand boxes that can change a VALIDATED decision --
+#: PhoneHoldEvidence, i.e. phone_use's set-down skip -- reads them only on a
+#: detector tick that has a phone box, so under "phone_visible" Hands runs on
+#: exactly those ticks (identical phone_use decisions), and otherwise whenever
+#: `hands_max_interval_s` of evidence time has passed since it last ran -- a
+#: liveness sample kept under the perception engine's freshness bar
+#: (core/perception.py DEFAULT_MAX_AGE_S = 1.0 s), so the hands capability
+#: never reads as stale while it is merely scheduled. On a tick it does not run,
+#: hand evidence is UNKNOWN (stale), never "no hand": nothing is fed to the hold
+#: evidence, and the experimental erratic-hand tracker is reset rather than told
+#: "not erratic". "every_tick" is the pre-M8.4 behaviour.
+HANDS_POLICIES = ("phone_visible", "every_tick")
 
 
 def _saturating_ratio(value: float, threshold: float) -> float:
@@ -1434,11 +1465,35 @@ class DriverAttentionModule(VisionModule):
         # A gap between frames longer than this is a stall, not evidence (F4);
         # a stall credits one frame interval, not the cap (StallAwareEvidenceClock).
         self._evidence_clock = StallAwareEvidenceClock(float(config.get("max_evidence_gap_s", 0.5)))
+        self._current_frame_t = 0.0  # this frame's capture time (process())
         # Is the driver's phone held? (PhoneHoldEvidence; hand boxes on detector ticks.)
         self._phone_hold = PhoneHoldEvidence(
             hold_ticks=int(config.get("phone_hold_ticks", 3)),
             static_s=float(config.get("phone_static_s", 2.0)),
         )
+        # --- M8.4 behaviour engine (core/behavior/engine.py): typed evidence,
+        # abstention, driver association, and SHADOW verdicts for the validated
+        # alerts. It changes no validated event; it owns the phone evidence level
+        # risk fusion reads (owner decision B: a visible phone is not risk).
+        self._engine = BehaviorEngine(EngineConfig.from_module_config(config))
+        behavior_section = config.get("behavior") if isinstance(config.get("behavior"), dict) else {}
+        region = behavior_section.get("driver_region") if behavior_section else None
+        self._seat_region_norm: Optional[tuple[float, float, float, float]] = (
+            tuple(float(v) for v in region) if isinstance(region, (list, tuple)) and len(region) == 4 else None)
+        self._driver: Optional[DriverAssociation] = None
+        self._phone_evidence: PhoneEvidence = self._engine.phone_evidence
+        self._last_detection_at: Optional[float] = None  # evidence time of the last successful detector tick
+        self._last_face_box: Optional[Box] = None
+        self._eyes_occluded = False
+        # --- hand-model scheduling (B5): see HANDS_POLICIES ---
+        policy = str(config.get("hands_policy", "phone_visible"))
+        self._hands_policy = policy if policy in HANDS_POLICIES else "phone_visible"
+        self._hands_max_interval_s = max(0.0, float(config.get("hands_max_interval_s", 0.5)))
+        self._hands_ran_at: Optional[float] = None  # evidence time Hands last ran
+        self._hands_ran_last_tick = False
+        self._hands_runs = 0
+        self._hands_skips = 0
+
         # --- behaviour reasoning v2 (core/behavior/): EXPERIMENTAL, OFF by default ---
         # With behavior_v2 false nothing below changes a single event or flag;
         # with it true, drowsiness / phone_use / phone_detected / frequent_glancing
@@ -1608,6 +1663,7 @@ class DriverAttentionModule(VisionModule):
         self._object_detection_failures = 0
         self._object_detection_retry_at = None
         self._detection_tick += 1
+        self._last_detection_at = self._evidence_clock.now
 
     def _eating_boxes_near_face(
         self, eating_boxes: list[Box], person_boxes: list[Box]
@@ -1712,8 +1768,13 @@ class DriverAttentionModule(VisionModule):
         eating_boxes = self._eating_boxes_near_face(eating_boxes, person_boxes)
 
         hand_boxes: list[Box] = []
-        hands_ran = self._hands is not None
-        if self._hands is not None:
+        hands_ran = self._hands is not None and self._should_run_hands(bool(phone_boxes))
+        self._hands_ran_last_tick = hands_ran
+        if self._hands is not None and not hands_ran:
+            self._hands_skips += 1
+        if self._hands is not None and hands_ran:
+            self._hands_runs += 1
+            self._hands_ran_at = self._evidence_clock.now
             rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
             hand_results = self._hands.process(rgb)
             if hand_results.multi_hand_landmarks:
@@ -1749,12 +1810,20 @@ class DriverAttentionModule(VisionModule):
         # applied to pixels it inflated horizontal speed and reversal amplitude
         # by w/h (1.33x at 640x480).
         aspect = 1.0
+        if not hands_ran:
+            # Hands did not run this tick (B5): the trajectory has a hole, and a
+            # hole is not "steady hands". The trail restarts; nothing is claimed.
+            self._hand_tracker.reset()
+            self._hands_erratic_raw = False
+            self._finish_detection_tick(phone_boxes, eating_boxes)
+            return
         hand_detections = [("hand", box, 1.0) for box in hand_boxes]
-        # Shipped: wall time, while every other tracker here runs on evidence
-        # time (EvidenceClock). behavior_v2 puts the hand tracker on the same
-        # evidence clock, so a stall cannot read as a fast hand.
-        hand_t = self._evidence_clock.now if self._behavior_v2 else time.monotonic()
-        matched_hands = self._hand_tracker.update(hand_detections, hand_t, aspect)
+        # The frame's CAPTURE time (M8.4; it was the wall clock at processing
+        # time): speed is distance over the real time between the two frames,
+        # so a processing delay cannot read as a fast hand. (Evidence time is
+        # wrong here: it shrinks a stall to one frame interval, which would make
+        # a slow hand look fast.)
+        matched_hands = self._hand_tracker.update(hand_detections, self._current_frame_t, aspect)
         erratic = False
         for track in matched_hands:
             # PEAK instantaneous speed, not net displacement over the trail:
@@ -1769,7 +1838,15 @@ class DriverAttentionModule(VisionModule):
                     >= self._erratic_hand_min_reversals):
                 erratic = True
         self._hands_erratic_raw = erratic
+        self._finish_detection_tick(phone_boxes, eating_boxes)
 
+    def _should_run_hands(self, phone_seen: bool) -> bool:
+        """Whether MediaPipe Hands runs on this detector tick (HANDS_POLICIES)."""
+        if self._hands_policy == "every_tick" or phone_seen or self._hands_ran_at is None:
+            return True
+        return self._evidence_clock.now - self._hands_ran_at >= self._hands_max_interval_s
+
+    def _finish_detection_tick(self, phone_boxes: list[Box], eating_boxes: list[Box]) -> None:
         phone_now_visible = bool(phone_boxes)
         if phone_now_visible and not self._phone_visible_prev:
             self._pending_phone_detected_edge = True
@@ -1899,6 +1976,140 @@ class DriverAttentionModule(VisionModule):
         ), self._looking_down_cfg)
         return assessment.state == EYE_LOOKING_DOWN
 
+    # ------------------------------------------------------------------ M8.4 behaviour engine
+    def _engine_eye_evidence(
+        self, frame: np.ndarray, points: list[Point], now: float, *, left_ear: float, right_ear: float,
+        ear: float, threshold: float, iris_ratio: Optional[float], iris_veto: bool,
+        rotation: Optional[np.ndarray], gaze_offset: Optional[tuple[float, float]],
+    ) -> sig.SignalEvidence:
+        """Eye state for the engine: open / closed / looking_down, or MISSING with why.
+
+        Unlike the shipped closure test, an eye patch that is dark and flat (a
+        sunglasses lens to a visible-light camera) is unreadable: the engine
+        abstains on drowsiness instead of trusting whatever EAR the landmarks
+        guessed. One occluded eye leaves the other to decide."""
+        cfg = self._looking_down_cfg
+        h, w = frame.shape[:2]
+        occluded: list[Optional[bool]] = []
+        for indices in (LEFT_EYE, RIGHT_EYE):
+            xs = [points[i][0] for i in indices]
+            ys = [points[i][1] for i in indices]
+            pad = 0.25 * (max(xs) - min(xs))
+            x1, x2 = int(max(0.0, min(xs) - pad)), int(min(float(w), max(xs) + pad))
+            y1, y2 = int(max(0.0, min(ys) - pad)), int(min(float(h), max(ys) + pad))
+            crop = frame[y1:y2, x1:x2]
+            patch = cv2.cvtColor(crop, cv2.COLOR_BGR2GRAY) if crop.size else crop
+            occluded.append(eye_patch_occluded(patch, cfg.occlusion_max_mean, cfg.occlusion_max_std))
+        self._eyes_occluded = all(bool(o) for o in occluded)
+        if not any(occluded):
+            eyes: tuple[EyeObservation, ...] = (EyeObservation(ear, False),)
+        else:
+            eyes = (EyeObservation(left_ear, occluded[0]), EyeObservation(right_ear, occluded[1]))
+        head_pitch: Optional[float] = None
+        eye_pitch: Optional[float] = None
+        if rotation is not None and self._calibrator.is_calibrated:
+            head_pitch = relative_yaw_pitch_deg(self._calibrator.baseline_rotation, rotation)[1]
+            if abs(head_pitch) > MAX_PLAUSIBLE_GAZE_DEG:
+                head_pitch = None
+            eye_baseline = self._calibrator.baseline_eye_offset
+            if gaze_offset is not None and eye_baseline is not None:
+                eye_pitch = gaze_offset[1] - eye_baseline[1]
+        assessment = classify_eye_state(EyeFrame(
+            face_present=True, eyes=eyes, closure_threshold=threshold,
+            deep_threshold=threshold * self._perclos_closure_ratio / max(self._ear_threshold_ratio, 1e-6),
+            iris_openness=iris_ratio, iris_vetoes_closure=iris_veto,
+            head_pitch_deg=head_pitch, eye_pitch_deg=eye_pitch,
+        ), cfg)
+        if not assessment.known:
+            return sig.missing(sig.EYE_STATE, assessment.reason, now, provenance="face_mesh:ear+iris+patch")
+        return sig.observed(sig.EYE_STATE, assessment.state, now, provenance="face_mesh:ear+iris+patch",
+                            uncertainty=self._ear_noise.sigma)
+
+    def _engine_step(
+        self, frame: np.ndarray, frame_t: float, now: float, *, face_found: bool,
+        eye: Optional[sig.SignalEvidence], gaze: Optional[tuple[float, float]], gaze_reason: str,
+        eyes_off_road: Optional[bool],
+    ) -> None:
+        """Hand this frame's evidence to the engine (shadow verdicts, abstentions,
+        phone evidence level, driver association). Never adds or removes an event."""
+        h, w = frame.shape[:2]
+        thumb = cv2.cvtColor(cv2.resize(frame, (32, 24), interpolation=cv2.INTER_AREA), cv2.COLOR_BGR2GRAY)
+        quality = frame_quality(float(thumb.mean()), float(thumb.std()))
+        detector_ok = (self._object_detection_error is None and self._object_detection_ready
+                       and self._last_detection_at is not None and now - self._last_detection_at <= 1.0)
+        if self._object_detection_error is not None:
+            detector_reason = f"object detection failed: {self._object_detection_error}"
+        elif not self._object_detection_ready:
+            detector_reason = "object detector not started"
+        elif not detector_ok:
+            detector_reason = "object-detector result stale"
+        else:
+            detector_reason = ""
+        seat = None
+        if self._seat_region_norm is not None:
+            x1, y1, x2, y2 = self._seat_region_norm
+            seat = (x1 * w, y1 * h, x2 * w, y2 * h)
+        face_box = self._last_face_box if face_found else None
+        driver = (associate_driver(list(self._last_person_boxes), face_box, seat) if detector_ok
+                  else DriverAssociation("unknown", None, 0, None, detector_reason))
+        self._driver = driver
+        driver_box = driver.driver_box
+        driver_phones = [] if driver_box is None else [
+            b for b in self._last_phone_boxes
+            if driver_box[0] <= (b[0] + b[2]) / 2.0 <= driver_box[2]
+            and driver_box[1] <= (b[1] + b[3]) / 2.0 <= driver_box[3]]
+        # PhoneHoldEvidence is about the LARGEST person's phone (the shipped
+        # proxy); it speaks for the engine's driver only when the two agree.
+        hold = self._phone_hold.state if driver.agrees_with_largest else "unknown"
+        toward: Optional[bool] = None
+        if gaze is not None and face_box is not None and driver_phones:
+            toward = gaze_toward(gaze, driver_phones[0], face_box, PhoneConfig())
+        signals = {
+            sig.FACE: sig.observed(sig.FACE, face_found, now, provenance="face_mesh"),
+            sig.FRAME: sig.observed(sig.FRAME, quality, now, provenance="thumbnail 32x24 mean/std"),
+            sig.GAZE: (sig.observed(sig.GAZE, gaze, now, provenance="solvePnP+iris, calibrated, median",
+                                    calibrated=True,
+                                    uncertainty=max(self._yaw_noise.sigma, self._pitch_noise.sigma))
+                       if gaze is not None else
+                       sig.missing(sig.GAZE, gaze_reason, now,
+                                   calibrated=self._calibrator.is_calibrated or None)),
+        }
+        if eye is not None:
+            signals[sig.EYE_STATE] = eye
+        else:
+            signals[sig.EYE_STATE] = sig.missing(sig.EYE_STATE, "face not detected", now)
+        if detector_ok:
+            signals[sig.PERSON] = sig.SignalEvidence(sig.PERSON, len(self._last_person_boxes), now,
+                                                     self._last_detection_at, "objects", "detector:person")
+            signals[sig.PHONE] = sig.SignalEvidence(sig.PHONE, bool(self._last_phone_boxes), now,
+                                                    self._last_detection_at, "objects", "detector:cell phone",
+                                                    confidence=clamp_unit(self._last_phone_score))
+            signals[sig.DRIVER] = sig.observed(sig.DRIVER, driver.method, now, provenance="association")
+        else:
+            for name in (sig.PERSON, sig.PHONE, sig.DRIVER):
+                signals[name] = sig.missing(name, detector_reason, now, self._last_detection_at,
+                                            capability_valid=False)
+        if self._enable_hands and self._hands_ran_at is not None:
+            signals[sig.HAND] = sig.SignalEvidence(
+                sig.HAND, self._phone_hold.state, now, self._hands_ran_at, "hands",
+                "mediapipe_hands" + ("" if self._hands_ran_last_tick else " (skipped last tick: stale)"))
+        else:
+            signals[sig.HAND] = sig.missing(sig.HAND, "hand model has not run" if self._enable_hands
+                                            else "hand tracking disabled", now)
+        self._engine.update(FrameEvidence(
+            t=frame_t, signals=signals, driver=driver, eyes_occluded=self._eyes_occluded,
+            phone=PhoneEvidenceInput(
+                detector_ok=detector_ok, detector_reason=detector_reason, any_phone=bool(self._last_phone_boxes),
+                driver_known=driver.known, driver_phone=bool(driver_phones), hold=hold,
+                eyes_off_road=eyes_off_road, gaze_toward_phone=toward,
+            ),
+        ))
+        self._phone_evidence = self._engine.phone_evidence
+
+    def behavior_abstentions(self) -> dict[str, str]:
+        """Every claim the M8.4 engine cannot currently decide, with why (always on)."""
+        return self._engine.abstentions()
+
     def behavior_uncertainty(self) -> dict[str, str]:
         """v2 components that currently cannot make a claim, with why ({} when v2 is off)."""
         return self._behavior.uncertainty() if self._behavior is not None else {}
@@ -1909,6 +2120,7 @@ class DriverAttentionModule(VisionModule):
         # The raw capture time is kept for behaviour reasoning v2, which must SEE
         # stalls (it credits nothing across them) rather than receive them clamped.
         frame_t = self.frame_time()
+        self._current_frame_t = frame_t
         now = self._evidence_clock.advance(frame_t)
         events: list[Event] = []
         h, w = frame.shape[:2]
@@ -1944,7 +2156,7 @@ class DriverAttentionModule(VisionModule):
         if fired is not None:
             events.append(Event.now(
                 "erratic_hand_movement", fired, None, self.name,
-                "sustained rapid, chaotic hand motion",
+                observation_detail("sustained rapid, chaotic hand motion"),
             ))
 
         if not results.multi_face_landmarks:
@@ -2054,6 +2266,9 @@ class DriverAttentionModule(VisionModule):
             # mount while the driver's head is turned for an unrelated reason. Same idea
             # for face-lost risk itself: a corroborated turn (body still visible) is real
             # but lesser risk, not the full weight of no evidence at all.
+            self._last_face_box = None
+            self._engine_step(frame, frame_t, now, face_found=False, eye=None, gaze=None,
+                              gaze_reason="face not detected", eyes_off_road=None)
             face_lost_risk = 0.0
             if self._face_lost_active:
                 face_lost_risk = 1.0 if not self._face_lost_tracker.corroborated else 0.5
@@ -2069,7 +2284,11 @@ class DriverAttentionModule(VisionModule):
             score, risk_event = self._risk_fusion.update(
                 eye_risk=0.0,
                 gaze_risk=gaze_risk,
-                phone_risk=1.0 if self._phone_use_active else 0.5 if phone_candidate else 0.0,
+                # Owner decision B (M8.4): was 1.0 for phone_use active / 0.5 for a
+                # visible candidate. Without a face there is no attention evidence
+                # this frame, so only an already-established held + off-road
+                # episode (engine level active_distraction_evidence) counts.
+                phone_risk=phone_risk_for(self._phone_evidence, None),
                 eating_risk=eating_risk,
                 face_lost_risk=face_lost_risk,
                 now=now,
@@ -2078,6 +2297,7 @@ class DriverAttentionModule(VisionModule):
             if risk_event is not None:
                 events.append(_risk_event(risk_event, score, self.name))
             self._last_fired_event_types = [e.type for e in events]
+            self._engine.record_production(self._last_fired_event_types)
             return events
 
         self._face_lost_tracker.update(False, corroborated=self._last_person_visible, now=now)
@@ -2097,6 +2317,9 @@ class DriverAttentionModule(VisionModule):
         self._last_face_proto = face_proto
         landmarks = face_proto.landmark
         points = [(lm.x * w, lm.y * h) for lm in landmarks]
+        face_xs = [p[0] for p in points]
+        face_ys = [p[1] for p in points]
+        self._last_face_box = (min(face_xs), min(face_ys), max(face_xs), max(face_ys))
 
         # --- raw signals: EAR + head pose (both feed calibration before any thresholding) ---
         left_ear = eye_aspect_ratio(*(points[i] for i in LEFT_EYE))
@@ -2420,6 +2643,24 @@ class DriverAttentionModule(VisionModule):
         # ZeroDivisionError raised once per frame inside the video loop. A
         # threshold of 0 means "any amount at all already counts as fully
         # there", which is the limit these ratios approach anyway.
+        if gaze_delta is not None:
+            engine_gaze_reason = ""
+        elif not self._calibrator.is_calibrated:
+            engine_gaze_reason = "calibration not complete"
+        elif rotation is None:
+            engine_gaze_reason = "head pose fit failed"
+        else:
+            engine_gaze_reason = "implausible head pose fit"
+        self._engine_step(
+            frame, frame_t, now, face_found=True,
+            eye=self._engine_eye_evidence(
+                frame, points, now, left_ear=left_ear, right_ear=right_ear, ear=ear,
+                threshold=effective_threshold, iris_ratio=iris_ratio, iris_veto=iris_vetoes_closure,
+                rotation=rotation, gaze_offset=gaze_offset),
+            gaze=(self._last_yaw, self._last_pitch) if gaze_delta is not None else None,
+            gaze_reason=engine_gaze_reason,
+            eyes_off_road=eyes_off_road if gaze_delta is not None else None,
+        )
         eye_risk = 1.0 if self._drowsy_active else _saturating_ratio(perclos, self._perclos_threshold) * 0.6
         gaze_risk = (
             1.0
@@ -2431,15 +2672,12 @@ class DriverAttentionModule(VisionModule):
             else 0.6 if self._distracted_active
             else _saturating_ratio(self._glance_counter.count, self._glance_min_count) * 0.5
         )
-        phone_risk = (
-            1.0
-            if self._phone_use_active
-            else 0.6
-            if (phone_candidate and (self._phone_hold.state == PHONE_HELD or self._hand_overlaps_phone))
-            else 0.3
-            if phone_candidate
-            else 0.0
-        )
+        # Owner decision B (M8.4). Was: 1.0 while phone_use was active, 0.6 for a
+        # hand overlap whatever the eyes did, 0.3 for ANY visible driver-box phone
+        # -- so a mounted phone, a phone on the seat or the passenger's phone
+        # raised the score with the eyes on the road. Now only a phone HELD by the
+        # driver, with the eyes off the road, counts (core/behavior/phone_evidence.py).
+        phone_risk = phone_risk_for(self._phone_evidence, eyes_off_road if gaze_delta is not None else None)
         score, risk_event = self._risk_fusion.update(
             eye_risk=eye_risk,
             gaze_risk=gaze_risk,
@@ -2453,6 +2691,7 @@ class DriverAttentionModule(VisionModule):
             events.append(_risk_event(risk_event, score, self.name))
 
         self._last_fired_event_types = [e.type for e in events]
+        self._engine.record_production(self._last_fired_event_types)
         return events
 
     def get_detections(self) -> DetectionFrame:
@@ -2505,6 +2744,11 @@ class DriverAttentionModule(VisionModule):
             "hand_count": len(self._last_hand_boxes),
             "eating_visible": bool(self._last_eating_boxes),
             "erratic_hands": self._erratic_hands_active,
+            # M8.4: whether Hands ran on the last detector tick (hand_count 0 on a
+            # skipped tick means "not looked for", never "no hands"), and the
+            # engine's shadow verdicts / phone evidence / driver association.
+            "hands_ran_last_tick": self._hands_ran_last_tick,
+            **self._engine.snapshot(),
             **(self._behavior.snapshot() if self._behavior is not None else {}),
         }
 
@@ -2602,6 +2846,20 @@ class DriverAttentionModule(VisionModule):
             "state": self._state_label(),
             "alert_active": self.is_alert_active(),
             "events_fired_this_frame": list(self._last_fired_event_types),
+            # M8.4: typed-evidence engine in SHADOW (no alert depends on it), the
+            # experimental observations' status, and hand-model scheduling.
+            "engine": self._engine.report(),
+            "experimental_observations": {
+                "high_risk_active": self._risk_fusion.is_high_risk_active,
+                "erratic_hands_active": self._erratic_hands_active,
+                "audible": "never without alerts.experimental_alerts_audible: true",
+            },
+            "hands": {
+                "policy": self._hands_policy, "max_interval_s": self._hands_max_interval_s,
+                "runs": self._hands_runs, "skips": self._hands_skips,
+                "last_ran_s_ago": (None if self._hands_ran_at is None
+                                   else round(self._evidence_clock.now - self._hands_ran_at, 2)),
+            },
         }
         if self._behavior is not None:
             state["behavior"] = {
@@ -2806,6 +3064,8 @@ class DriverAttentionModule(VisionModule):
             # whether they actually ran. Never a copy of the detector's state.
             status["hands"] = (Capability() if self._hands is not None
                                else Capability(STARTING, "hand landmarks load with the object detector"))
+            # Scheduled, not idle (B5): "phone_visible" runs Hands on detector
+            # ticks with a phone, and at least every hands_max_interval_s.
         # Distraction, eyes down/up, glancing and phone use are measured against
         # this driver's calibrated forward gaze; until the calibration window has
         # settled none of them can fire, so they are not reported as running
@@ -2832,7 +3092,10 @@ class DriverAttentionModule(VisionModule):
         return frozenset({*self._yolo_class_map, "person"})
 
     def is_alert_active(self) -> bool:
-        """True while any currently-active condition warrants the full-screen alert flash."""
+        """True while any currently-active condition warrants the full-screen alert flash.
+
+        M8.4 owner decision A: erratic hands and sustained high risk are
+        experimental observations, not alerts, so they no longer flash."""
         return (
             self._drowsy_active
             or self._distracted_active
@@ -2840,6 +3103,4 @@ class DriverAttentionModule(VisionModule):
             or self._eyes_up_active
             or self._phone_use_active
             or self._face_lost_active
-            or self._erratic_hands_active
-            or self._risk_fusion.is_high_risk_active
         )

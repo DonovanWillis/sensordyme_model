@@ -123,9 +123,14 @@ ROLES: dict[str, Role] = {
             "driver_safety", "Driver safety",
             mandatory_modules=frozenset({"driver_attention"}),
             allowed_presets=frozenset({"driver_safety"}),
+            # high_risk left this set in M8.4 by owner decision A: it is an
+            # experimental observation (core/behavior/experimental.py), refused by
+            # the alert policy without an explicit opt-in, so requiring it loud
+            # would require an alert the product must not sound. Every VALIDATED
+            # driver alert is still mandatory, loud, and its timing floor unchanged.
             mandatory_alert_types=frozenset({
                 "drowsiness", "attention_lost", "distraction", "eyes_down", "eyes_up",
-                "phone_use", "high_risk",
+                "phone_use",
             }),
             critical_types=frozenset({"drowsiness", "attention_lost"}),
             parameter_floors=_DRIVER_FLOORS,

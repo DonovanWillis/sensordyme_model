@@ -203,6 +203,8 @@ def build_alert_manager(alert_cfg: dict, is_pi: bool,
             print(f"SensorDyme: unknown alert sink '{sink_name}', skipping")
             sinks.append(UnavailableSink(str(sink_name), "unknown", False, "unknown alert sink type"))
 
+    from core.behavior.experimental import opted_in as experimental_opted_in
+
     fixed_levels = {}
     type_categories: dict[str, str] = {}
     for event_type in alert_cfg.get("loud_types", []):
@@ -225,6 +227,9 @@ def build_alert_manager(alert_cfg: dict, is_pi: bool,
         categories=alert_categories(alert_cfg),
         type_categories=type_categories,
         duplicate_window_s=float(alert_cfg.get("duplicate_window_s", 2.0)),
+        # M8.4 owner decision A: experimental families sound only on an explicit
+        # boolean opt-in (core/behavior/experimental.py), whatever the lists say.
+        experimental_audible=experimental_opted_in(alert_cfg),
     )
 
 

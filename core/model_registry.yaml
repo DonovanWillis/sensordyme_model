@@ -90,7 +90,10 @@ monitoring_nodes:
       Drowsiness, gaze and phone events are exercised on the virtual device and
       in unit tests; no in-cabin event-level evidence exists. behavior_v2
       (hand-phone interaction, long glances, glance budgets, gaze zones) is
-      experimental and off by default.
+      experimental and off by default. M8.4: the composite risk score
+      (high_risk, elevated_risk) and erratic_hand_movement are EXPERIMENTAL
+      observations -- logged, never audible or pushed without an explicit owner
+      opt-in -- and the M8.4 behaviour engine's verdicts run in shadow only.
   elderly_monitoring:
     kind: preset
     preset: elderly_monitoring

@@ -55,10 +55,14 @@ def test_alerts_config_has_the_escalation_type_map():
     assert "drowsiness" in alerts_config["loud_types"]
     assert "phone_use" in alerts_config["loud_types"]
     assert "attention_lost" in alerts_config["loud_types"]
-    assert "high_risk" in alerts_config["loud_types"]
     assert "fatigue_warning" in alerts_config["soft_types"]
     assert "frequent_glancing" in alerts_config["soft_types"]
-    assert "elevated_risk" in alerts_config["soft_types"]
+    # M8.4 owner decision A: the experimental families are observations, in no
+    # alert list, and not opted in (core/behavior/experimental.py).
+    for experimental in ("high_risk", "elevated_risk", "erratic_hand_movement"):
+        for key in ("loud_types", "soft_types", "critical_types"):
+            assert experimental not in alerts_config[key]
+    assert alerts_config["experimental_alerts_audible"] is False
 
 
 def test_every_presets_alert_types_can_actually_notify():

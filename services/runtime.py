@@ -40,6 +40,7 @@ from core import monitoring_state as ms
 from core import nodes as monitoring_nodes
 from core import perception as pc
 from core.alerts import AlertLevel, AlertManager
+from core.behavior.experimental import is_experimental
 from core.camera import Camera, CameraError
 from core.dataset import CaptureStore
 from core.events import Event
@@ -2801,7 +2802,11 @@ class DeviceRuntime:
                 self.alert_manager.notify(event, now=now)
             self.logger.log(event)
             severity = (
-                "loud" if event.type in self.loud_types
+                # M8.4 owner decision A: an experimental family the policy will not
+                # actuate is an observation, "log", whatever loud/soft_types say
+                # (deployed configs still list them; core/behavior/experimental.py).
+                "log" if is_experimental(event.type) and not getattr(self.alert_manager, "experimental_audible", False)
+                else "loud" if event.type in self.loud_types
                 else "soft" if event.type in self.soft_types or event.type in self.alert_event_types
                 else "log"
             )
@@ -2835,6 +2840,11 @@ class DeviceRuntime:
         nothing.
         """
         missing = (set(active) & set(tracked) & set(self.alert_event_types)) - self.alert_manager.open_keys("module")
+        # An episode the policy refuses (an experimental observation) would be
+        # "missing" on every frame: there is nothing to re-open.
+        permits = getattr(self.alert_manager, "permits", None)
+        if callable(permits):
+            missing = {t for t in missing if permits(t)}
         for event_type in sorted(missing):
             event = Event.now(event_type, 0.0, None, getattr(module, "name", self.module_name),
                               "condition still active")

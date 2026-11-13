@@ -296,7 +296,11 @@ def test_profile_component_costs_on_the_virtual_device(stack):
         f"{k}={runs[k]} ({components[k]['run_ms']} ms)" for k in pc.COMPONENTS))
     assert runs["face_landmarks"] == frames, "face landmarks once per frame"
     assert runs["object_detector"] <= frames / 3 + 2, "detector on the driver stride, shared with the node"
-    assert runs["hand_landmarks"] == runs["object_detector"], "hands ride the detector ticks"
+    # M8.4 B5 (hands_policy: phone_visible): Hands rides the detector ticks that
+    # have a phone, plus a liveness run at least every hands_max_interval_s
+    # (0.5 s) -- never more often than the detector, never stale (<= 1.0 s).
+    assert 0 < runs["hand_landmarks"] <= runs["object_detector"], "hands ride (some) detector ticks"
+    assert runs["hand_landmarks"] >= 20.0 / 1.0, "hands stays fresh: at least one run per second"
     assert runs["pose"] == 0
     for name in pc.COMPONENTS:
         assert components[name]["state"] in pc.STATES

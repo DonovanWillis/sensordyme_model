@@ -41,6 +41,14 @@ rendered ("played"), raised ("failed") or was never rendered ("skipped"); an
 output that cannot report is "unconfirmed", never "played". The uplink sends
 the summary with the event, so the app can say "the alert sounded on the
 device" only when the device itself said so.
+
+Experimental observations (M8.4, owner decision A). The experimental alert
+families (core/behavior/experimental.py: high_risk, elevated_risk,
+erratic_hand_movement) are REFUSED by this policy unless it was built with
+`experimental_audible=True` (main.build_alert_manager passes it only for an
+explicit `alerts.experimental_alerts_audible: true`). A refused event opens no
+episode, commands no sink, records no delivery and returns SUPPRESSED -- so no
+config list, preset, variant, migration or reset can make one sound.
 """
 
 from __future__ import annotations
@@ -57,6 +65,7 @@ from dataclasses import dataclass, field
 from enum import Enum
 from typing import Any, ClassVar, Optional, Protocol
 
+from core.behavior.experimental import is_experimental
 from core.events import Event
 from core.logging_setup import get_logger
 from core.monitoring_state import Actuator
@@ -722,6 +731,7 @@ class AlertManager:
         categories: Optional[dict[str, AlertCategory]] = None,
         type_categories: Optional[dict[str, str]] = None,
         duplicate_window_s: float = 2.0,
+        experimental_audible: bool = False,
     ) -> None:
         """Create the policy.
 
@@ -738,13 +748,27 @@ class AlertManager:
                 one from their level: CONTINUOUS -> "warning", SOFT -> "notice".
             duplicate_window_s: An untracked episode (a one-off event) is closed
                 this long after it started; a duplicate inside it is merged.
+            experimental_audible: The owner's explicit opt-in for the experimental
+                alert families (core/behavior/experimental.py). False (default):
+                they are refused, whatever fixed_levels/type_categories say.
         """
+        self.experimental_audible = experimental_audible is True
+        fixed_levels = dict(fixed_levels or {})
+        type_categories = dict(type_categories or {})
+        if not self.experimental_audible:
+            gated = sorted({t for t in (*fixed_levels, *type_categories) if is_experimental(t)})
+            for event_type in gated:
+                fixed_levels.pop(event_type, None)
+                type_categories.pop(event_type, None)
+            if gated:
+                log.info("alerts: experimental type(s) %s are observations only (not audible); "
+                         "alerts.experimental_alerts_audible: true opts in", ", ".join(gated))
         self._sinks = sinks
         self._cooldown_s = cooldown_s
         self._escalation_window_s = escalation_window_s
-        self._fixed_levels = fixed_levels or {}
+        self._fixed_levels = fixed_levels
         self._categories = dict(DEFAULT_CATEGORIES if categories is None else categories)
-        self._type_categories = dict(type_categories or {})
+        self._type_categories = type_categories
         self._duplicate_window_s = max(0.0, float(duplicate_window_s))
         self._last_start: dict[str, float] = {}
         self._open: dict[str, _Episode] = {}
@@ -766,6 +790,11 @@ class AlertManager:
             fixed = level if level is not None else self._fixed_levels.get(event_type)
             name = "notice" if fixed is AlertLevel.SOFT else "warning"
         return self._categories.get(name) or DEFAULT_CATEGORIES[name]
+
+    def permits(self, event_type: str) -> bool:
+        """Whether this policy may actuate for `event_type` at all (False only for
+        an experimental family without the owner's opt-in)."""
+        return self.experimental_audible or not is_experimental(event_type)
 
     def open_episodes(self) -> list[dict]:
         with self._lock:
@@ -827,6 +856,9 @@ class AlertManager:
         Returns:
             The legacy level dispatched, or SUPPRESSED when merged/de-duplicated.
         """
+        if not self.permits(event.type):
+            # An experimental observation: logged by the caller, never actuated.
+            return AlertLevel.SUPPRESSED
         now = time.monotonic() if now is None else now
         episode_key = event.type if key is None else key
         with self._lock:
