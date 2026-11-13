@@ -41,18 +41,41 @@ class SimBuzzerSink:
     """
 
     name, kind, audible = "sim_buzzer", "buzzer", True
+    #: Reports each actuation like the GPIO buzzer does (M8.3 delivery evidence),
+    #: and says it is simulated: its "played" can never read as a real sound.
+    reports_completion = True
+    simulated = True
 
     def __init__(self, echo: bool = False) -> None:
         self.played: list[tuple[str, str, str]] = []
         self._echo = echo
+        #: Fault injection: the next actuations report this error instead of playing.
+        self.fail: Optional[str] = None
+        #: Hold reports until release() (an output still rendering its pattern).
+        self.hold = False
+        self._held: list = []
 
     def readiness(self) -> tuple[bool, str]:
         return True, "SIMULATED buzzer: actuations are recorded, nothing makes a sound"
 
-    def play(self, pattern: AlertPattern, event: Event, category: AlertCategory) -> None:
-        self.played.append((event.type, category.name, pattern.name))
+    def play(self, pattern: AlertPattern, event: Event, category: AlertCategory, report=None) -> None:
+        if self.fail is None:
+            self.played.append((event.type, category.name, pattern.name))
         if self._echo:
             print(f"[SIM BUZZER] {category.name}/{pattern.name}: {event.type}")
+        if report is None:
+            return
+        outcome = ("failed", self.fail) if self.fail is not None else ("played", None)
+        if self.hold:
+            self._held.append((report, outcome))
+        else:
+            report(*outcome)
+
+    def release(self) -> None:
+        """Deliver the held reports (the patterns finished rendering)."""
+        held, self._held = self._held, []
+        for report, outcome in held:
+            report(*outcome)
 
     def emit(self, event: Event, level: AlertLevel) -> None:
         self.played.append((event.type, level.value, level.value))

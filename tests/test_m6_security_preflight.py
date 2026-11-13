@@ -73,8 +73,11 @@ def test_the_uplink_payload_has_no_image_field():
     uplink._run()
     body = sent[0]
     assert set(body) == {"events", "active_preset", "rules_version", "zones_version", "health", "monitoring"}
+    # M8.3 added only scalars: age_s (seconds since queued), alert (the alert
+    # outputs' delivery report: names, counts, a short error) and simulated.
     assert set(body["events"][0]) <= {"event_key", "model", "timestamp", "type", "confidence", "signals",
-                                      "duration", "severity", "source", "notify"}
+                                      "duration", "severity", "source", "notify", "age_s", "alert",
+                                      "simulated"}
 
 
 def test_the_repo_config_keeps_frame_capture_and_frame_upload_off():
