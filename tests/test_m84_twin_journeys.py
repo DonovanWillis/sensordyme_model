@@ -156,7 +156,11 @@ def test_the_whole_product_journey_from_first_boot_to_sign_out(stack):
     preview = stack.ai_configure("tell me when a phone is visible")
     assert preview.status_code == 200, preview.text
     draft = preview.json()
-    assert draft["draft_version"] and not draft.get("unsupported"), draft
+    # The twin has no language model, so since M8.4 the backend says so instead of guessing a
+    # mode from the word "phone": the draft is still reviewable, and its only refusal is the
+    # honest `interpreter_unavailable`. The rule activated below is the reviewed one.
+    assert draft["draft_version"], draft
+    assert {u.get("code") for u in draft.get("unsupported") or []} <= {"interpreter_unavailable"}, draft
     activated = stack.set_preset("", draft_version=draft["draft_version"], rules=[PHONE_RULE])
     assert activated.status_code == 200 and activated.json()["rules_active"] == 1, activated.text
     assert not stack.status()["rules"]["active"], "activation is not confirmed before the device runs it"

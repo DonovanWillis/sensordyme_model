@@ -1130,7 +1130,8 @@ class DeviceRuntime:
         read-only card used to leave every health component "ok" while the
         device's only permanent record stopped growing. Two syscalls, no write.
         """
-        csv_path = Path(str((self.config.get("logging", {}) or {}).get("csv_path", "data/events.csv")))
+        config = getattr(self, "config", None) or {}
+        csv_path = Path(str((config.get("logging", {}) or {}).get("csv_path", "data/events.csv")))
         directory = csv_path.parent
         metrics: dict[str, Any] = {"path": str(directory)}
         problems: list[str] = []
