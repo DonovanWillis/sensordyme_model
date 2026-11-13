@@ -1169,13 +1169,31 @@ struct DeviceDetailView: View {
     /// switch at once, sending the base name and so dropping a running variant.
     private func modeRowButton(_ preset: CatalogPreset, state: ModeRowState, featured: Bool) -> some View {
         Button { presetSheet = preset } label: {
-            HStack(alignment: featured ? .top : .center, spacing: SD.Space.sm) {
-                modeGlyph(preset.id, featured: featured, active: state.isSelected, unavailable: state.isUnavailable)
-                modeRowText(preset, state: state, featured: featured)
-                Spacer(minLength: SD.Space.xxs)
-                modeStateGlyph(state)
+            Group {
+                if featured {
+                    // The featured mode reads as a title block: its symbol and
+                    // state on one line, then its name and words at full width.
+                    VStack(alignment: .leading, spacing: SD.Space.sm) {
+                        HStack(alignment: .center, spacing: SD.Space.sm) {
+                            modeGlyph(preset.id, featured: true, active: state.isSelected,
+                                      unavailable: state.isUnavailable)
+                            modeStateGlyph(state)
+                            Spacer(minLength: 0)
+                        }
+                        modeRowText(preset, state: state, featured: true)
+                            .frame(maxWidth: .infinity, alignment: .leading)
+                    }
+                } else {
+                    HStack(alignment: .center, spacing: SD.Space.sm) {
+                        modeGlyph(preset.id, featured: false, active: state.isSelected,
+                                  unavailable: state.isUnavailable)
+                        modeRowText(preset, state: state, featured: false)
+                        Spacer(minLength: SD.Space.xxs)
+                        modeStateGlyph(state)
+                    }
+                    .padding(.vertical, SD.Space.sm)
+                }
             }
-            .padding(.vertical, featured ? 0 : SD.Space.sm)
             .contentShape(Rectangle())
         }
         .buttonStyle(SDUndimmedButtonStyle())
@@ -1203,7 +1221,8 @@ struct DeviceDetailView: View {
             modeRowDetail(preset, state: state, featured: featured)
             // How far it has been validated, from the catalog. Only "validated
             // on device" is ever green; said quietly, once.
-            if let validation = validation(preset) {
+            // Not for a mode this device can't run: its reason is the news.
+            if let validation = validation(preset), !state.isUnavailable {
                 Label(validation.chip, systemImage: validation.isValidated ? "checkmark.seal" : "seal")
                     .font(SD.Typography.caption.weight(.medium))
                     .foregroundStyle(validation.isValidated ? SD.Colors.success : SD.Colors.warning)

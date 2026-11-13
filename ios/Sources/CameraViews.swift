@@ -142,20 +142,21 @@ struct CameraPlaceholder: View {
                 // address any more; the device is found over Bonjour, and the
                 // only thing a person can do about an empty address is get the
                 // device powered on and onto this Wi-Fi.
+                // Wraps in full and the viewport grows with it: shrinking the
+                // sentence to fit the camera's shape clipped it (audit).
                 Text("The picture comes straight from your SensorDyme, so it needs to be switched on and on this Wi-Fi. ORYN EDGE finds it by itself.")
                     .font(SD.Typography.caption)
                     .multilineTextAlignment(.center)
-                    .foregroundStyle(SD.Colors.textTertiary)
-                    // The camera keeps its shape at every text size; the
-                    // sentence shrinks to fit rather than being cut off.
-                    .minimumScaleFactor(0.5)
+                    .foregroundStyle(SD.Colors.textSecondary)
+                    .fixedSize(horizontal: false, vertical: true)
             }
             .padding(.horizontal, SD.Space.xl)
             .padding(.vertical, SD.Space.lg)
             .accessibilityElement(children: .combine)
         }
-        .frame(minHeight: 200)
-        .aspectRatio(16 / 10, contentMode: .fit)
+        // The camera's proportions at the default size, taller when the
+        // reader's text needs it.
+        .frame(minHeight: 216)
     }
 }
 

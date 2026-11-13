@@ -422,7 +422,8 @@ struct DeviceCard: View {
                 Spacer(minLength: SD.Space.xs)
                 Image(systemName: "chevron.right")
                     .font(.system(size: 13, weight: .semibold))
-                    .foregroundStyle(SD.Colors.textTertiary)
+                    .foregroundStyle(SD.Colors.textSecondary)
+                    .accessibilityHidden(true)
             }
             .padding(.horizontal, SD.Space.xxs)
         }
@@ -439,12 +440,10 @@ struct DeviceCard: View {
             SD.Colors.canvas
             RadialGradient(colors: [Color.white.opacity(live ? 0.05 : 0.02), .clear],
                            center: .center, startRadius: 4, endRadius: 240)
-            ViewfinderCorners()
-                .stroke(Color.white.opacity(live ? 0.2 : 0.1), style: StrokeStyle(lineWidth: 1.5, lineCap: .round))
-                .padding(SD.Space.md)
             Image(systemName: modeIcon)
                 .font(.system(size: 30, weight: .ultraLight))
                 .foregroundStyle(live ? SD.Colors.textSecondary : SD.Colors.textTertiary)
+                .accessibilityHidden(true)
             VStack {
                 // Side by side normally; stacked at accessibility sizes, where the
                 // pill was cut to "ONLI…" beside the wrapping id.
