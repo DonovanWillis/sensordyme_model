@@ -213,7 +213,9 @@ struct EventDetailView: View {
     private func answerCard(_ explanation: AlertExplanation) -> some View {
         SDCard(raised: true) {
             VStack(alignment: .leading, spacing: SD.Space.xs) {
-                SDSectionHeader(title: "Why you got this")
+                // "You got this" only for what alerted or was asked for (M8.4).
+                SDSectionHeader(title: event.isCritical || event.isConfigured ? "Why you got this"
+                                : "Why this was recorded")
                 Text(explanation.narrative)
                     .font(SD.Typography.body)
                     .foregroundStyle(SD.Colors.textPrimary)

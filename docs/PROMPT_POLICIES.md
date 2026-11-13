@@ -16,6 +16,11 @@ already runs.
    known or unknown person), intent (suspicious), emotion, sound (crying,
    barking, shouting), intoxication, medical states, or repeated occurrences
    in a window ("3 times") are refused **before** any interpreter sees them.
+   So are the driver module's **experimental** families (M8.4: the combined
+   risk score `high_risk` / `elevated_risk`, `erratic_hand_movement`; "high
+   risk", "risk score", "erratic hands", "hand movement", "fidgeting"):
+   they are recorded as experimental observations and never sound or notify,
+   and no interpreter may offer them back as an alert (`experimental_signal`).
    The reason comes from `core/taxonomy.py REFUSALS`, with `support:
    "unsupported"` and `category`. Nothing is set up (`rules: []`,
    `source: "policy_guard"`). This order is what guarantees "a stranger at the
@@ -32,6 +37,22 @@ schema** (`policy_from_rule`). A rule that does not fit the schema (a dwell
 with no area, a condition the device does not evaluate, an object it cannot
 detect) moves to `unsupported` with the reason. That holds for model output
 too.
+
+**Typed reasons (M8.4).** Every `unsupported` entry the preview returns
+carries a `code` from `jupiter/policy.py UNSUPPORTED_CODES`, whatever produced
+it: the refusal categories above (`identity`, `emotion`, `intent`, `audio`,
+`intoxication`, `medical`, `repetition_window`, `experimental_signal`),
+`not_detectable` (the detector does not know it; `support` says what it would
+take), `needs_area`, `needs_second_object`, `no_target`, `invalid_rule`,
+`not_beside_mode`, `interpreter_unavailable`, and `not_supported` for anything
+else. The app renders one headline per code (`ios/Sources/JupiterRefusal.swift`)
+and, for a policy refusal, says why rather than "to enable". The field is
+additive; an older app ignores it.
+
+The keyword fallback (step 4) matches whole words and their plain
+inflections only, never "car" or "phone" (a car in the driveway is not a
+driver to watch), and its explanation starts "No custom rule was set up ...
+this is the closest built-in mode".
 
 The owner confirms before anything runs. The response is a draft
 (`draft_version`), and only Activate (`POST .../preset` with `preset: ""`)
@@ -74,16 +95,27 @@ links them):
 
 ## Grammar the parser reads
 
-Each clause starts with a trigger: `alert me | notify me | tell me | warn me |
-let me know | send me an alert` + `if | when | whenever`, or a bare
-`if | when`. Clauses are split on sentence ends and on `and` + a new trigger.
+Each clause starts with a trigger: an optional `please` / `can you` / `could
+you`, then `alert me | notify me | tell me | warn me | ping me | buzz me | let me
+know | I want to know | I want an alert | send me an alert / a notification /
+a push` + `if | when | whenever | as soon as | any time | every time`, or a
+bare `if | when`. Clauses are split on sentence ends and on `and` + a new
+trigger. M8.4 widened the phrasings, never the capabilities: every row below
+still compiles to the same four conditions.
 
 | Clause | Policy |
 |---|---|
-| `<subject> stays / remains / lingers / waits / is  in / inside / at / on  <area>  for [more than / longer than / at least] N s/min/h` | `lingering` + `dwell_s` |
-| `<subject> enters <area>` / `goes into <area>` / `is in <area>` | `in_zone`, sustain 2 s |
-| `nobody / no one is in <area> [for N]` / `<area> is empty [for N]` | `absent` person, zone |
-| `more than N / at least N / N or more <things> are in <area> [for N]` | `count` |
+| `<subject> stays / remains / lingers / waits / is  in / inside / at / on  <area>  [for] [more than / longer than / at least] N s/min/h [or longer]` | `lingering` + `dwell_s` |
+| `<subject> stays / spends / lingers [more than] N s/min/h in <area>` | `lingering` + `dwell_s` |
+| `<subject> enters <area>` / `goes into <area>` / `is in <area>` / `shows up at <area>` / `arrives at <area>` / `is seen / detected / spotted in <area>` | `in_zone`, sustain 2 s |
+| `there is / there's <subject> in <area>` | `in_zone`, sustain 2 s |
+| `[there is] nobody / no one in <area> [for N]` / `<area> is empty [for N]` | `absent` person, zone |
+| `[there are] more than N / at least N / N or more <things> [are] in <area> [for N]` | `count` |
+
+Not read (left to the model, whose output is validated): posture verbs ("sits
+in the kitchen"), relations to an object ("near the car", "on the couch"),
+time qualifiers ("after dark"). Tests: `tests/test_m84_jupiter_grammar.py`
+(including every suggestion the app offers).
 
 `<subject>` is someone / anyone / a person / people (`person`) or `a|an|any|the
 <label>` for a label the device detects. A label the registry declares but

@@ -497,7 +497,7 @@ final class MockAPI: BackendAPI {
              ("drowsiness", "sustained_eye_closure 2.3s", "loud", 160),
              ("eyes_down", "looking down for 2.6s", "loud", 25),
              // Experimental (M8.4): recorded, never an alert.
-             ("elevated_risk", "combined risk score 0.46 (phone visible, gaze off road)", "log", 70)]
+             ("elevated_risk", "risk_score 0.46 + phone_visible + gaze_off_road", "log", 70)]
         }
     }
 
@@ -987,8 +987,9 @@ final class MockAPI: BackendAPI {
             return refused("experimental_signal",
                            "An experimental driver observation (the combined risk score or erratic hand movement) "
                            + "is not something SensorDyme can alert on.",
-                           "validation on real in-cabin footage first. These are recorded in Activity as "
-                           + "experimental observations and never sound or notify")
+                           "they haven't been validated on real in-cabin footage, so they are recorded in "
+                           + "Activity as experimental observations and never sound or notify. Ask for something "
+                           + "observable instead (someone in an area you draw, nobody in view)")
         }
         if has("cry", "bark", "sound", "noise", "hear", "scream", "shout") {
             return refused("audio", "Sounds are not something SensorDyme can monitor.",
@@ -1005,18 +1006,24 @@ final class MockAPI: BackendAPI {
             let drawn = demoZones.contains { $0.name == zone }
             let description = prompt.trimmingCharacters(in: .whitespacesAndNewlines)
             let proposed: AIRule
+            let summary: String  // jupiter/policy.py explain()'s summary, for the same rule
             if has("nobody", "no one", "empty") {
                 proposed = rule("person", "absent", description, zone: zone, persist: 300)
+                summary = "Alert when no person is inside the area '\(zone)' for 5 minutes."
             } else if has("more than 3 people") {
                 proposed = rule("person", "count", description, zone: zone, persist: 2, minCount: 4)
+                summary = "Alert when at least 4 of 'person' are inside the area '\(zone)' (the count must hold for 2 seconds)."
             } else if has("stays", "longer than") {
                 var dwell = rule("person", "lingering", description, zone: zone, persist: 10)
                 dwell.extra["dwell_s"] = .number(10)
                 proposed = dwell
+                summary = "Alert when a person stays inside the area '\(zone)' for 10 seconds or longer without leaving."
             } else if has("dog") {
                 proposed = rule("dog", "in_zone", description, zone: zone, persist: 2)
+                summary = "Alert when a dog is inside the area '\(zone)' for 2 seconds."
             } else {
                 proposed = rule("person", "in_zone", description, zone: zone, persist: 2)
+                summary = "Alert when a person is inside the area '\(zone)' for 2 seconds."
             }
             let policy = AIPolicyPreview(
                 rule_id: nil, status: drawn ? "ready" : "needs_zone", zone: .init(name: zone, drawn: drawn),
@@ -1029,7 +1036,7 @@ final class MockAPI: BackendAPI {
                     status: drawn ? nil : "Waiting: draw an area named '\(zone)' in the app."))
             return AIProposal(
                 preset: "", variant: "",
-                explanation: "\(proposed.headline). Read exactly by Jupiter's rule grammar; no model was needed.",
+                explanation: summary + " Severity: warning; notification: push.",
                 rules: [proposed], settings: [:], unsupported: [], source: "demo", mode: "custom",
                 policies: [policy])
         }

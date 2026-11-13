@@ -362,14 +362,15 @@ struct AIConfigureView: View {
                         // (M8.4): "Draw the area" was said even when the area
                         // was already drawn.
                         if proposal?.policy(at: index)?.zone?.drawn == true {
-                            Label("Uses your \"\(binding.wrappedValue.zone)\" area",
+                            Label("Uses your area \u{201C}\(binding.wrappedValue.zone)\u{201D}",
                                   systemImage: "checkmark.circle")
                                 .font(SD.Typography.caption)
                                 .foregroundStyle(SD.Colors.textSecondary)
                                 .fixedSize(horizontal: false, vertical: true)
                                 .accessibilityIdentifier("jupiter.zoneRequirement")
                         } else {
-                            Label("Draw the \"\(binding.wrappedValue.zone)\" area on the device to activate this",
+                            // Areas are drawn in the app (Detection areas), not on the device.
+                            Label("Draw the area named \u{201C}\(binding.wrappedValue.zone)\u{201D} in Detection areas to turn this on",
                                   systemImage: "pencil.and.outline")
                                 .font(SD.Typography.caption)
                                 .foregroundStyle(SD.Colors.textSecondary)
@@ -562,7 +563,12 @@ struct AIConfigureView: View {
             SDEmptyState(
                 icon: "questionmark.circle",
                 title: "Nothing to activate",
-                message: "Jupiter couldn't turn that into something this device can watch for. Try describing it differently, or see what it would need above."
+                // A policy refusal is not a phrasing problem (M8.4): rephrasing
+                // "a stranger" or "high risk" will never make it possible.
+                message: !proposal.unsupported.isEmpty
+                    && proposal.unsupported.allSatisfy({ JupiterRefusal.isPolicy(code: $0.code) })
+                    ? "That can't be set up, however it's worded. Ask for something the camera can observe, like someone entering or staying in an area you draw."
+                    : "Jupiter couldn't turn that into something this device can watch for. Try describing it differently, or see what it would need above."
             )
         } else if applied {
             appliedStatus(proposal)

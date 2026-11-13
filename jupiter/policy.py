@@ -271,8 +271,8 @@ _REFUSAL_PATTERNS: tuple[tuple[str, re.Pattern], ...] = (
 _EXTRA_REFUSALS = {
     "experimental_signal": (
         "An experimental driver observation (the combined risk score or erratic hand movement)",
-        ("validation on real in-cabin footage first. These are recorded in Activity as experimental "
-         "observations and never sound or notify; ask for an observable condition instead "
+        ("they haven't been validated on real in-cabin footage, so they are recorded in Activity as "
+         "experimental observations and never sound or notify. Ask for something observable instead "
          "(someone in an area you draw, nobody in view)"),
     ),
 }

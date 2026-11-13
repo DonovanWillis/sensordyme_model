@@ -692,7 +692,45 @@ struct DeviceDetailView: View {
             }
 
             capabilitiesCard
+
+            aboutDevice
         }
+    }
+
+    /// Which unit this is, as the server knows it (M8.4): the device screen
+    /// named the device but never said which physical unit, how it is set up
+    /// to be used, or when it last reported. Only stored fields; a field the
+    /// device has not sent says so.
+    private var aboutDevice: some View {
+        VStack(alignment: .leading, spacing: SD.Space.xs) {
+            SDEyebrow("About this device")
+                .accessibilityAddTraits(.isHeader)
+                .padding(.top, SD.Space.md)
+            aboutRow("Device ID", device.hardwareId ?? "Not reported yet")
+            aboutRow("Set up for", device.status?.roleTitle ?? "Not reported yet")
+            aboutRow("Last report", device.lastSeen.map {
+                Self.relative.localizedString(for: Date(timeIntervalSince1970: $0), relativeTo: now)
+            } ?? "Never")
+        }
+        .accessibilityIdentifier("detail.about")
+    }
+
+    private func aboutRow(_ label: String, _ value: String) -> some View {
+        ViewThatFits(in: .horizontal) {
+            HStack(alignment: .firstTextBaseline) {
+                Text(label).font(SD.Typography.caption).foregroundStyle(SD.Colors.textTertiary)
+                Spacer(minLength: SD.Space.xs)
+                Text(value).font(SD.Typography.caption.monospacedDigit()).foregroundStyle(SD.Colors.textSecondary)
+                    .textSelection(.enabled)
+            }
+            VStack(alignment: .leading, spacing: 1) {
+                Text(label).font(SD.Typography.caption).foregroundStyle(SD.Colors.textTertiary)
+                Text(value).font(SD.Typography.caption.monospacedDigit()).foregroundStyle(SD.Colors.textSecondary)
+                    .fixedSize(horizontal: false, vertical: true)
+                    .textSelection(.enabled)
+            }
+        }
+        .accessibilityElement(children: .combine)
     }
 
     /// What the device can detect right now, from `status.capabilities`:

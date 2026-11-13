@@ -321,7 +321,9 @@ struct Preset: Identifiable, Hashable {
                           .init(name: "teen_driver", title: "Teen Driver"),
                           .init(name: "long_haul", title: "Long Haul")]),
         Preset(name: "baby_monitoring", title: "Baby Monitoring",
-               subtitle: "Face covered, crying, movement", icon: "figure.child",
+               // presets.yaml's own description (M8.4): nothing here detects a
+               // covered face, and with no microphone nothing hears crying.
+               subtitle: "Presence, safe zones, stillness & frantic movement", icon: "figure.child",
                // Must match presets.yaml. "newborn" and "toddler" were offered
                // here and exist on no device — tapping them queued a variant
                // the device could never apply, which the backend then re-sent
@@ -330,7 +332,7 @@ struct Preset: Identifiable, Hashable {
                           .init(name: "nap_time", title: "Nap Time"),
                           .init(name: "play_area", title: "Play Area")]),
         Preset(name: "elderly_monitoring", title: "Elderly Monitoring",
-               subtitle: "Fall detection & inactivity", icon: "figure.fall",
+               subtitle: "Falls & unusual stillness", icon: "figure.fall",
                variants: [.init(name: "standard", title: "Standard"),
                           .init(name: "post_surgery", title: "Post-Surgery"),
                           .init(name: "active_senior", title: "Active Senior")]),
