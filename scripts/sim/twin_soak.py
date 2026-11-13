@@ -423,6 +423,9 @@ def run_live(args: argparse.Namespace) -> dict:
             "tracemalloc_frames": args.tracemalloc_frames if args.mem_profile == "tracemalloc" else 0})
     if args.malloc_arena_max:
         device_env["MALLOC_ARENA_MAX"] = str(args.malloc_arena_max)
+    for item in args.device_env:  # e.g. MALLOC_MMAP_THRESHOLD_=131072 (glibc tunables, M8.5)
+        key, _, value = item.partition("=")
+        device_env[key] = value
 
     def start_backend() -> Proc:
         proc = Proc([py, "-m", "sim.backend", "--port", str(backend_port), "--data-dir", str(backend_dir)],
@@ -665,7 +668,7 @@ def run_live(args: argparse.Namespace) -> dict:
         "stream": viewers[0].summary() if viewers else None,
         "viewers": args.viewers, "stop_resume": args.stop_resume, "quiet_timeline": args.quiet_timeline,
         "driver_attention_override": args.driver_attention_override, "mem_profile": args.mem_profile,
-        "malloc_arena_max": args.malloc_arena_max,
+        "malloc_arena_max": args.malloc_arena_max, "device_env": args.device_env,
         "invariant_violations": dict(violations), "invariant_examples": violation_examples,
         "false_protecting_samples": len(false_protecting), "false_protecting_examples": false_protecting[:10],
         "detector_fault_shown_ready_samples": len(missed_degraded),
@@ -888,6 +891,8 @@ def _parse(argv: Optional[list[str]]) -> argparse.Namespace:
     live.add_argument("--tracemalloc-frames", type=int, default=1)
     live.add_argument("--malloc-arena-max", type=int, default=0,
                       help="MALLOC_ARENA_MAX for the device process (glibc); 0 = unset")
+    live.add_argument("--device-env", action="append", default=[], metavar="KEY=VALUE",
+                      help="extra environment for the device process (repeatable)")
     simc = sub.add_parser("simclock")
     simc.add_argument("--hours", type=float, default=6.0)
     simc.add_argument("--out", required=True)
