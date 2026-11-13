@@ -116,4 +116,7 @@ def test_make_deploy_runs_the_preflight_first():
     assert re.search(r"^deploy: deploy-preflight\b", makefile, re.MULTILINE)
     recipe = makefile.split("deploy-preflight:", 1)[1].split("\ndeploy:", 1)[0]
     assert "scripts/deploy_preflight.py" in recipe
-    assert "rsync" not in recipe and "scp -q pi@" in recipe, "the preflight reads, never writes"
+    # M8.5: the device is DEVICE=/DIR= (no longer hard-wired to pi@sensordyme.local).
+    assert "rsync" not in recipe and "scp -q $(DEVICE):$(DIR)/config.yaml" in recipe, "the preflight reads, never writes"
+
+

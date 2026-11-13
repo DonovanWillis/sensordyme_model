@@ -253,23 +253,24 @@ def test_preflight_details_are_collapsed_to_one_line():
 # ------------------------------------------------------------------- deployment
 
 def test_deploy_ships_no_data_bearing_files():
-    """`--exclude='data'` covers the data/ DIRECTORY and nothing else.
+    """The old rsync's `--exclude='data'` covered the data/ DIRECTORY and nothing else.
 
     A dry run of the real rsync was carrying `cloud/sensordyme.db` (the
-    backend's own database, 639KB) plus `e.csv`, `events.csv`, `t.csv` and
-    `telemetry.csv` from the repo root onto every device. Shipping a developer's
-    event history and a backend DB to a customer is a privacy problem before it
-    is a tidiness one, and nothing about it was visible in `make deploy`'s
-    output.
+    backend's own database) plus `e.csv`, `events.csv`, `t.csv` and
+    `telemetry.csv` from the repo root onto every device. M8.5: a release is the
+    manifest's deploy set (git objects, these excludes) and the device refuses a
+    bundle member that matches them.
     """
-    makefile = (REPO / "Makefile").read_text()
-    deploy = makefile[makefile.index("deploy:") :]
-    deploy = deploy[: deploy.index("\n\n")] if "\n\n" in deploy else deploy
-    for pattern in ("'*.db'", "'*.sqlite3'", "'*.csv'"):
-        assert f"--exclude={pattern}" in deploy, (
-            f"make deploy does not exclude {pattern} — developer data would ship "
-            "to customer hardware"
-        )
+    import sys
+
+    sys.path.insert(0, str(REPO / "scripts" / "hw_validation"))
+    import integrity_manifest as im
+
+    from scripts.release import release_guard as rg
+
+    for path in ("cloud/sensordyme.db", "x.sqlite3", "events.csv", "telemetry.csv", "data/events.csv"):
+        assert im.should_exclude(path), f"a release would carry {path}"
+        assert rg._excluded(Path(path)), f"the device would accept {path} in a bundle"
 
 
 def test_no_shipped_comment_promises_a_cpu_fallback():
