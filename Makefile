@@ -2,7 +2,7 @@
         bench accuracy accuracy-dataset accuracy-gate report deploy deploy-preflight \
         release-manifest release-verify verify-release \
         test test-cov test-ios lint lint-fix fmt-check typecheck audit check mutants \
-        setup-dev hooks clean sim sim-backend sim-device sim-scenarios sim-e2e
+        setup-dev hooks clean sim sim-backend sim-device sim-scenarios sim-e2e acceptance
 
 VENV := .venv/bin
 
@@ -68,6 +68,11 @@ sim-scenarios: ## List the virtual device's scenarios
 sim-e2e: ## Deterministic end-to-end tests: virtual device x real backend (seconds, no sleeps)
 	PYTHONDONTWRITEBYTECODE=1 $(SIM_PY) -m pytest -p no:cacheprovider -q \
 		tests/test_sim_e2e.py tests/test_sim_units.py tests/test_sim_seams.py
+
+ACCEPTANCE_OUT ?= data/acceptance
+
+acceptance: ## M8.4: every digital-twin suite + short soaks + BLE harness; evidence in $(ACCEPTANCE_OUT)/acceptance.{json,md}
+	PYTHONDONTWRITEBYTECODE=1 $(SIM_PY) scripts/sim/acceptance.py --out $(ACCEPTANCE_OUT) $(ACCEPTANCE_ARGS)
 
 # =============================================================================
 # Benchmarks and reports
