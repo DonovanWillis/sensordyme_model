@@ -56,7 +56,10 @@ struct DeviceDetailView: View {
     /// camera alone and never this screen.
     @State private var feedSession = LiveFeedSession()
     @State private var showCamera = false
-    @State private var showHealth = false
+    /// Device health opens itself when there is something to see (the device
+    /// isn't reporting, or a component isn't working) and stays folded to one
+    /// line while everything works. A tap overrides either way.
+    @State private var healthOverride: Bool?
     @State private var expandedEventID: String?
     /// Counts transitions INTO ready, for one quiet acknowledgement.
     @State private var readyAck = 0
@@ -553,7 +556,7 @@ struct DeviceDetailView: View {
         VStack(alignment: .leading, spacing: SD.Space.sm) {
             Button {
                 withAnimation(SD.Motion.resolved(SD.Motion.spatial, reduceMotion: reduceMotion)) {
-                    showHealth.toggle()
+                    healthOverride = !showHealth
                 }
             } label: {
                 HStack(alignment: .center, spacing: SD.Space.sm) {
@@ -587,6 +590,16 @@ struct DeviceDetailView: View {
                     .transition(.opacity)
             }
         }
+    }
+
+    private var showHealth: Bool { healthOverride ?? healthNeedsAttention }
+
+    /// Anything short of "reporting, and every component working".
+    private var healthNeedsAttention: Bool {
+        guard deviceLive, let health = device.health else { return true }
+        let parts = [health.camera, health.accelerator, monitoringComponent(health), health.network].compactMap { $0 }
+        if parts.contains(where: { $0.state != "ok" }) { return true }
+        return PerceptionPresentation.degradedSummary(device.status?.perception, live: deviceLive) != nil
     }
 
     /// One line from what the device reported this cycle: how many of its
