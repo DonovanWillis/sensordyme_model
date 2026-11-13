@@ -126,14 +126,14 @@ def hostquant(scores: Path, out: Path) -> None:
     rows = []
     for v in variants:
         for d in ("reference", "legacy"):
-            files = list(scores.glob(f"score_hq_{v}_{d}_val.json"))
+            files = sorted(scores.glob(f"score_hq*_{v}_{d}_val.json"))
             if not files:
                 continue
             s = json.loads(files[0].read_text())
             for c in ("person", "phone"):
                 cd = s.get("classes", s).get(c) or {}
                 ap = cd.get("ap50")
-                ci = cd.get("ap50_ci95") or cd.get("ci95") or [None, None]
+                ci = (cd.get("bootstrap") or {}).get("ap50_ci95") or [None, None]
                 rows.append([v, d, c, ap, *ci[:2], cd.get("ap50_95") or cd.get("ap")])
     with (out / "b2_hostquant.csv").open("w", newline="") as f:
         w = csv.writer(f)
