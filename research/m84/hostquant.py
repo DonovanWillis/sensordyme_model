@@ -108,7 +108,10 @@ def quantise(heads: Path, work: Path, data: Path, calib_items, input_name: str) 
             continue
         t0 = time.perf_counter()
         items = calib_items[: n or len(calib_items)]
-        extra = {"CalibMaxIntermediateOutputs": 8} if method == "minmax" else {"CalibPercentile": 99.999}
+        # ORT's MinMax calibrator flushes every k batches and raises "No data is collected" when the
+        # image count is an exact multiple of k (nothing left at the end), so pick k that leaves a rest.
+        k = next(k for k in (8, 7, 9, 6, 10, 5) if len(items) % k)
+        extra = {"CalibMaxIntermediateOutputs": k} if method == "minmax" else {"CalibPercentile": 99.999}
         quantize_static(str(src), str(target), Reader(data, items, input_name), quant_format=QuantFormat.QDQ,
                         per_channel=per_channel, activation_type=QuantType.QUInt8, weight_type=QuantType.QInt8,
                         calibrate_method=CalibrationMethod.MinMax if method == "minmax" else CalibrationMethod.Percentile,
