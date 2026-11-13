@@ -71,6 +71,9 @@ struct DeviceDetailView: View {
     /// `.sheet(isPresented:)` could be captured stale, opening the screen with an
     /// empty prompt that never got an answer (XCUITest journey 10).
     @State private var jupiterSheet: JupiterSheet?
+    /// Where the page is, for the Ask Jupiter dock only. Held, never read
+    /// here, so scrolling does not re-evaluate this screen.
+    @State private var dockModel = JupiterDockModel()
     @State private var showHistory = false
     @State private var renameError: String?
 
@@ -144,6 +147,7 @@ struct DeviceDetailView: View {
                     .padding(.top, SD.Space.xl)
 
                 modeLibrary
+                    .id("modes")
                     .padding(.top, SD.Space.xl)
 
                 CustomRulesCard(
@@ -161,20 +165,30 @@ struct DeviceDetailView: View {
             .padding(.horizontal, SD.Space.md)
             .padding(.bottom, SD.Space.xl)
         }
+        // The page's position, to the dock alone (it steps aside while the
+        // page is read; JupiterDockBehavior).
+        .modifier(JupiterDockScrollTracking(model: dockModel))
         .task {
-            guard DebugLaunch.scrollToBottom else { return }
-            try? await Task.sleep(for: .seconds(1))
-            withAnimation { proxy.scrollTo("health", anchor: .bottom) }
+            if DebugLaunch.scrollToBottom {
+                try? await Task.sleep(for: .seconds(1))
+                withAnimation { proxy.scrollTo("health", anchor: .bottom) }
+            } else if let target = DebugLaunch.scrollTarget {
+                try? await Task.sleep(for: .seconds(1))
+                withAnimation { proxy.scrollTo(target, anchor: .top) }
+            }
         }
         }
         .scrollDismissesKeyboard(.interactively)
         // Ask Jupiter floats above the tab bar and rises with the keyboard.
+        // As the bottom safe-area inset, so the page always ends above it.
         .safeAreaInset(edge: .bottom, spacing: 0) {
             JupiterDock(
                 deviceName: device.name,
+                model: dockModel,
+                zoomNamespace: zoomNS,
+                zoomEnabled: zoomEnabled,
                 onSubmit: { jupiterSheet = JupiterSheet(prompt: $0) },
                 onOpenFull: { jupiterSheet = JupiterSheet(prompt: "") })
-                .sdZoomSource(.jupiter, in: zoomNS, cornerRadius: 26, enabled: zoomEnabled)
                 .padding(.horizontal, SD.Space.md)
                 .padding(.top, SD.Space.xs)
                 .padding(.bottom, SD.Space.xs)

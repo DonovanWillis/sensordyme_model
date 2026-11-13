@@ -29,6 +29,8 @@ enum DebugLaunch {
     static var tab: String? { value(after: "-orynTab") }
     /// Text to pre-fill (and send) in Ask Jupiter.
     static var jupiterPrompt: String? { value(after: "-orynPrompt") }
+    /// Scroll the device screen to a section (`-orynScrollTo modes`).
+    static var scrollTarget: String? { value(after: "-orynScrollTo") }
     /// Open Add device (`wizard`) or Bluetooth setup (`bluetooth`) from the device list.
     static var openSetup: String? { value(after: "-orynOpenSetup") }
     /// Put the keyboard in the device screen's Ask Jupiter dock.
@@ -61,6 +63,7 @@ enum DebugLaunch {
     static let tab: String? = nil
     static let jupiterPrompt: String? = nil
     static let openSetup: String? = nil
+    static let scrollTarget: String? = nil
     static let focusJupiter = false
     static let session: (token: String, email: String)? = nil
     static let noPermissionPrompt = false
