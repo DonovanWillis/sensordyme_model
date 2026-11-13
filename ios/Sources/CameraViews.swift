@@ -106,8 +106,12 @@ struct CameraViewport: View {
             case .demo:
                 SimulatedFeedView(preset: device.activePreset ?? "driver_safety", alert: instrument.kind == .alert)
                     .aspectRatio(4 / 3, contentMode: .fit)
+                    // Chips over footage: capped, never truncated (M8.4 AX audit).
+                    .dynamicTypeSize(...DynamicTypeSize.xxxLarge)
+                    .accessibilityShowsLargeContentViewer()
             case .live(let url):
                 MJPEGView(url: url, session: session)
+                CameraOffCover(reader: session.reader)
             case .none:
                 CameraPlaceholder(interrupted: instrument.isInterrupted)
             }
@@ -118,6 +122,8 @@ struct CameraViewport: View {
         .overlay(alignment: .topLeading) {
             if case .live = source.kind {
                 MJPEGLiveIndicator(reader: session.reader, monitoringStopped: instrument.kind == .stopped)
+                    .dynamicTypeSize(...DynamicTypeSize.xxxLarge)
+                    .accessibilityShowsLargeContentViewer()
                     .padding(SD.Space.sm)
             }
         }
@@ -151,41 +157,87 @@ struct CameraPlaceholder: View {
     var interrupted = false
 
     var body: some View {
+        // No longer "set the device address in Settings": nobody types an
+        // address any more; the device is found over Bonjour, and the only
+        // thing a person can do about an empty address is get the device
+        // powered on and onto this Wi-Fi.
+        ViewportMessage(symbol: interrupted ? "video.slash" : "video",
+                        full: CameraTextPolicy.placeholder, short: CameraTextPolicy.placeholderShort,
+                        cornerOpacity: interrupted ? 0.12 : 0.22)
+    }
+}
+
+/// The words inside the camera's frame, sized to stay inside it (M8.4 AX
+/// audit: at AX5 the long sentence ran past the viewport and under the tab
+/// bar). At an accessibility size the short wording is used; what remains may
+/// scale to `CameraTextPolicy.minimumScale` and is bounded to `maxLines`.
+struct ViewportMessage: View {
+    let symbol: String
+    let full: CameraTextPolicy.Copy
+    let short: CameraTextPolicy.Copy
+    var cornerOpacity: Double = 0.12
+
+    @Environment(\.dynamicTypeSize) private var typeSize
+
+    var body: some View {
+        let copy = CameraTextPolicy.copy(full, short: short, accessibilitySize: typeSize.isAccessibilitySize)
         ZStack {
             // Flat canvas: a vignette behind the words made the audit measure
             // them against a gradient and fail them.
             SD.Colors.canvas
             ViewfinderCorners()
-                .stroke(Color.white.opacity(interrupted ? 0.12 : 0.22),
-                        style: StrokeStyle(lineWidth: 1.5, lineCap: .round))
+                .stroke(Color.white.opacity(cornerOpacity), style: StrokeStyle(lineWidth: 1.5, lineCap: .round))
                 .padding(SD.Space.md)
             VStack(spacing: SD.Space.xs) {
-                Image(systemName: interrupted ? "video.slash" : "video")
+                Image(systemName: symbol)
                     .font(.system(size: 22, weight: .light))
                     .foregroundStyle(SD.Colors.textTertiary)
                     .accessibilityHidden(true)
-                Text("Live picture on your Wi-Fi")
+                Text(copy.headline)
                     .font(SD.Typography.label)
                     .foregroundStyle(SD.Colors.textSecondary)
-                // No longer "set the device address in Settings": nobody types an
-                // address any more; the device is found over Bonjour, and the
-                // only thing a person can do about an empty address is get the
-                // device powered on and onto this Wi-Fi.
-                // Wraps in full and the viewport grows with it: shrinking the
-                // sentence to fit the camera's shape clipped it (audit).
-                Text("The picture comes straight from your SensorDyme, so it needs to be switched on and on this Wi-Fi. ORYN EDGE finds it by itself.")
+                    .multilineTextAlignment(.center)
+                    .lineLimit(2)
+                    .minimumScaleFactor(CameraTextPolicy.minimumScale)
+                Text(copy.detail)
                     .font(SD.Typography.callout)
                     .multilineTextAlignment(.center)
                     .foregroundStyle(SD.Colors.textSecondary)
-                    .fixedSize(horizontal: false, vertical: true)
+                    .lineLimit(CameraTextPolicy.maxLines)
+                    .minimumScaleFactor(CameraTextPolicy.minimumScale)
             }
             .padding(.horizontal, SD.Space.xl)
             .padding(.vertical, SD.Space.lg)
-            .accessibilityElement(children: .combine)
+            // VoiceOver reads the FULL wording whatever the visible size.
+            .accessibilityElement(children: .ignore)
+            .accessibilityLabel("\(full.headline). \(full.detail)")
         }
         // The camera's proportions at the default size, taller when the
-        // reader's text needs it.
+        // reader's text needs it -- bounded by the line limits above.
         .frame(minHeight: 216)
+    }
+}
+
+/// M8.4 (owner Decision C): while monitoring is stopped the device sends no
+/// picture unless the owner turned camera-only on. When the device says so
+/// (`FeedLiveness.cameraOffWhileStopped`), this covers the picture area
+/// completely -- the last frame from before the stop is not left on screen,
+/// faded or otherwise -- and says why, in the camera's own shape. Observes
+/// the liveness model only (it changes on transitions, not per frame).
+struct CameraOffCover: View {
+    @ObservedObject private var model: FeedLivenessModel
+
+    init(reader: MJPEGReader) {
+        _model = ObservedObject(wrappedValue: reader.livenessModel)
+    }
+
+    var body: some View {
+        if model.liveness.hidesLastPicture {
+            ViewportMessage(symbol: "video.slash", full: CameraTextPolicy.cameraOff,
+                            short: CameraTextPolicy.cameraOffShort)
+                .accessibilityIdentifier("camera.offWhileStopped")
+                .transition(.opacity)
+        }
     }
 }
 
@@ -232,6 +284,7 @@ struct LiveCameraView: View {
     let session: LiveFeedSession
 
     @State private var drag: CGFloat = 0
+    @Environment(\.dynamicTypeSize) private var typeSize
 
     var body: some View {
         let source = CameraSource(state: state, device: device)
@@ -243,8 +296,13 @@ struct LiveCameraView: View {
                     SimulatedFeedView(preset: device.activePreset ?? "driver_safety",
                                       alert: instrument.kind == .alert)
                         .aspectRatio(4 / 3, contentMode: .fit)
+                        .dynamicTypeSize(...DynamicTypeSize.xxxLarge)
+                        .accessibilityShowsLargeContentViewer()
                 case .live(let url):
-                    MJPEGView(url: url, session: session)
+                    ZStack {
+                        MJPEGView(url: url, session: session)
+                        CameraOffCover(reader: session.reader)
+                    }
                 case .none:
                     CameraPlaceholder(interrupted: true)
                 }
@@ -271,6 +329,8 @@ struct LiveCameraView: View {
         HStack(alignment: .center, spacing: SD.Space.sm) {
             if case .live = CameraSource(state: state, device: device).kind {
                 MJPEGLiveIndicator(reader: session.reader, monitoringStopped: instrument.kind == .stopped)
+                    .dynamicTypeSize(...DynamicTypeSize.xxxLarge)
+                    .accessibilityShowsLargeContentViewer()
             }
             Spacer()
             Button { dismiss() } label: {
@@ -290,23 +350,43 @@ struct LiveCameraView: View {
         .padding(.top, SD.Space.xs)
     }
 
+    /// "All clear · Online" on one line; at AX sizes the presence word goes on
+    /// its own line under the readout -- joined with " · " it broke mid-word
+    /// ("On-/line", M8.4 AX audit, camera_ax5.png).
+    @ViewBuilder private var statusLine: some View {
+        let readout = HStack(alignment: .firstTextBaseline, spacing: SD.Space.xs) {
+            Image(systemName: instrument.symbol)
+                .foregroundStyle(instrument.kind.tint)
+                .accessibilityHidden(true)
+            Text(instrument.word)
+                .foregroundStyle(SD.Colors.textPrimary)
+                .fixedSize(horizontal: false, vertical: true)
+        }
+        if CameraTextPolicy.stacksStatusLine(accessibilitySize: typeSize.isAccessibilitySize) {
+            VStack(alignment: .leading, spacing: SD.Space.xxs) {
+                readout
+                Text(presence)
+                    .foregroundStyle(SD.Colors.textSecondary)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+        } else {
+            HStack(spacing: SD.Space.xs) {
+                readout
+                Text("·").foregroundStyle(SD.Colors.textTertiary).accessibilityHidden(true)
+                Text(presence)
+                    .foregroundStyle(SD.Colors.textSecondary)
+            }
+        }
+    }
+
     private var bottomBar: some View {
         VStack(alignment: .leading, spacing: SD.Space.xxs) {
             Text(device.name)
                 .font(SD.Typography.headline)
                 .foregroundStyle(SD.Colors.textPrimary)
                 .fixedSize(horizontal: false, vertical: true)
-            HStack(spacing: SD.Space.xs) {
-                Image(systemName: instrument.symbol)
-                    .foregroundStyle(instrument.kind.tint)
-                    .accessibilityHidden(true)
-                Text(instrument.word)
-                    .foregroundStyle(SD.Colors.textPrimary)
-                Text("·").foregroundStyle(SD.Colors.textTertiary).accessibilityHidden(true)
-                Text(presence)
-                    .foregroundStyle(SD.Colors.textSecondary)
-            }
-            .font(SD.Typography.callout)
+            statusLine
+                .font(SD.Typography.callout)
         }
         .frame(maxWidth: .infinity, alignment: .leading)
         .padding(.horizontal, SD.Space.lg)

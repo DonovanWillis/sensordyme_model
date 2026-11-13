@@ -30,6 +30,11 @@ enum FeedLiveness: Equatable {
     /// The device answered and says its camera is not producing frames
     /// (heartbeat `camera_stale` / `camera_not_started`).
     case cameraUnavailable
+    /// M8.4 (owner Decision C): monitoring is stopped and the owner has not
+    /// turned on camera-only, so the device sends no picture at all (heartbeat
+    /// `camera_off_while_stopped`). Deliberate privacy, not a fault: never
+    /// "stalled", and the last picture is not kept on screen.
+    case cameraOffWhileStopped
     /// The device cannot be reached right now; `reason` says why if known.
     case unreachable(reason: String?)
     /// Needs a person: a refused token, or an address that is not one.
@@ -39,6 +44,22 @@ enum FeedLiveness: Equatable {
     case disabled
 
     var isLive: Bool { self == .live }
+
+    /// Whether the last decoded picture must be removed rather than faded:
+    /// the device withheld the camera on purpose, so a picture from before
+    /// the stop is neither live nor something to keep showing.
+    var hidesLastPicture: Bool { self == .cameraOffWhileStopped }
+}
+
+/// Values the device sends about camera access (core/camera_privacy.py).
+enum CameraAccess {
+    /// Heartbeat `X-Stream-Status` while frames are withheld for privacy.
+    static let offWhileStoppedStatus = "camera_off_while_stopped"
+    /// `X-Frame-Source` values.
+    static let sourceAnnotated = "annotated"
+    static let sourceCamera = "camera"
+    static let sourceCameraOnly = "camera_only"
+    static let sourceCameraLocal = "camera_local"
 }
 
 // MARK: - The decision
@@ -207,6 +228,12 @@ struct FeedLivenessTracker {
             break
         }
         guard let connectedAt else { return .connecting }
+        // M8.4: a fresh "camera off" heartbeat newer than the last frame wins
+        // over that frame -- the device withheld the camera at the stop.
+        if let status = heartbeatStatus, status == CameraAccess.offWhileStoppedStatus,
+           let at = heartbeatAt, now - at <= config.heartbeatValidFor, at >= (lastAdvanceAt ?? -.infinity) {
+            return .cameraOffWhileStopped
+        }
         if let advanced = lastAdvanceAt, now - advanced <= config.staleAfter {
             return .live
         }
@@ -312,14 +339,22 @@ struct FeedIndicator: Equatable {
         switch liveness {
         case .live:
             let detail: String?
-            if monitoringStopped {
+            // The device's label for the frame wins over the app's own idea of
+            // the monitoring state (M8.4): it says what the device actually did.
+            if frameSource == CameraAccess.sourceCameraOnly {
+                detail = "Camera only — not monitoring"
+            } else if frameSource == CameraAccess.sourceCameraLocal {
+                detail = "Local view — not monitoring"
+            } else if monitoringStopped {
                 detail = "Monitoring paused"
-            } else if frameSource == "camera" {
+            } else if frameSource == CameraAccess.sourceCamera {
                 detail = "Not analysed"
             } else {
                 detail = nil
             }
             return FeedIndicator(label: "LIVE", detail: detail, tone: .live, isLive: true)
+        case .cameraOffWhileStopped:
+            return FeedIndicator(label: "CAMERA OFF", detail: "Monitoring stopped", tone: .neutral, isLive: false)
         case .stalled(let seconds):
             return FeedIndicator(label: "NO NEW FRAMES", detail: "\(DevicePresenceDuration.short(seconds)) old",
                                  tone: .warning, isLive: false)
@@ -334,6 +369,133 @@ struct FeedIndicator: Equatable {
 
     var accessibilityText: String {
         [isLive ? "Live video" : label.capitalized, detail].compactMap { $0 }.joined(separator: ", ")
+    }
+}
+
+// MARK: - Text inside the camera viewport (M8.4, AX sizes)
+
+/// Text drawn inside the camera's frame has a fixed box to live in: at the
+/// accessibility sizes the full sentences ran past the viewport and under the
+/// tab bar, and the chips over the picture truncated to "SIMU…" (IOS audit,
+/// m84-evidence/ios/before/home_ax5.png). The rule, for every camera state
+/// (placeholder, camera off while stopped, camera only):
+///   * at an accessibility size, the short wording replaces the long one --
+///     shorter words at the reader's size beat the long words shrunk away;
+///   * whatever is left may scale down to `minimumScale`, never further, and
+///     is bounded to `maxLines`, so it can never spill out of the viewport;
+///   * chips over footage are capped at xxxLarge (CameraViews.swift) and offer
+///     the Large Content Viewer instead.
+enum CameraTextPolicy {
+    static let minimumScale: Double = 0.7
+    static let maxLines = 4
+
+    struct Copy: Equatable {
+        let headline: String
+        let detail: String
+    }
+
+    static func copy(_ full: Copy, short: Copy, accessibilitySize: Bool) -> Copy {
+        accessibilitySize ? short : full
+    }
+
+    /// The full-screen camera's status line ("All clear · Online"): one line
+    /// joined by " · " at standard sizes; at AX sizes the presence word goes on
+    /// its own line under the readout (joined, it broke mid-word: "On-/line").
+    static func stacksStatusLine(accessibilitySize: Bool) -> Bool { accessibilitySize }
+
+    /// No picture: the device is not reachable from this phone.
+    static let placeholder = Copy(
+        headline: "Live picture on your Wi-Fi",
+        detail: "The picture comes straight from your SensorDyme, so it needs to be switched on and on this Wi-Fi. ORYN EDGE finds it by itself.")
+    static let placeholderShort = Copy(headline: "Live picture on your Wi-Fi",
+                                       detail: "Switch the device on and join this Wi-Fi.")
+    /// Decision C: monitoring stopped, camera-only off.
+    static let cameraOff = Copy(
+        headline: "Camera off — monitoring stopped",
+        detail: "Resume monitoring to see the picture again. The owner can allow the camera while stopped in Settings.")
+    static let cameraOffShort = Copy(headline: "Camera off — monitoring stopped",
+                                     detail: "Resume monitoring to see it.")
+}
+
+// MARK: - Camera access the device reports (M8.4, owner Decision C)
+
+/// `status.camera_mode` from GET /v1/devices (cloud/app.py `_camera_mode_status`).
+/// Every field optional: a backend before M8.4 sends none of it.
+struct DeviceCameraMode: Codable, Equatable {
+    /// The device's software understands the setting (reports a camera block).
+    var supported: Bool?
+    /// What the DEVICE reports: camera-only on. Nil when unknown/unsupported.
+    var cameraOnly: Bool?
+    /// What a remote viewer gets right now: "monitoring" | "camera_only" |
+    /// "off_while_stopped" | "unavailable"; nil when stale or unknown.
+    var remoteStream: String?
+    /// What the owner asked for (the backend's record), shown beside the truth.
+    var desiredCameraOnly: Bool?
+    /// The owner's request has not been reported back by the device yet.
+    var pending: Bool?
+    var commandID: String?
+    var stale: Bool?
+
+    enum CodingKeys: String, CodingKey {
+        case supported, stale, pending
+        case cameraOnly = "camera_only"
+        case remoteStream = "remote_stream"
+        case desiredCameraOnly = "desired_camera_only"
+        case commandID = "command_id"
+    }
+}
+
+/// What the app says about camera access while monitoring is stopped -- from
+/// what the DEVICE reports, never from the request alone.
+struct CameraModePresentation: Equatable {
+    enum Kind: Equatable {
+        /// Camera off while stopped (the default).
+        case offWhileStopped
+        /// The owner turned camera-only on; the device confirmed it.
+        case cameraOnly
+        /// The device's software predates the setting (M8.3 or older).
+        case unsupported
+        /// Nothing reported (backend before M8.4, device never seen).
+        case unknown
+    }
+    let kind: Kind
+    let title: String
+    let detail: String
+    /// The owner asked for a change the device has not reported yet.
+    let pending: Bool
+    /// The toggle's position: the request while pending, else the DEVICE's value.
+    let toggleOn: Bool
+    /// Whether the app may offer the toggle at all.
+    let canChange: Bool
+
+    static func resolve(_ mode: DeviceCameraMode?) -> CameraModePresentation {
+        guard let mode, let supported = mode.supported else {
+            return CameraModePresentation(kind: .unknown, title: "Camera while stopped",
+                                          detail: "Not reported by this device yet.",
+                                          pending: false, toggleOn: false, canChange: false)
+        }
+        guard supported else {
+            return CameraModePresentation(
+                kind: .unsupported, title: "Camera while stopped",
+                detail: "This device's software can't turn the camera off while monitoring is stopped. Update it.",
+                pending: false, toggleOn: false, canChange: false)
+        }
+        let pending = mode.pending == true
+        let reportedOn = mode.cameraOnly == true
+        let wanted = mode.desiredCameraOnly ?? reportedOn
+        let staleNote = mode.stale == true ? " (last reported)" : ""
+        if reportedOn {
+            return CameraModePresentation(
+                kind: .cameraOnly, title: "Camera only — not monitoring",
+                detail: (pending ? "Turning off — waiting for the device to confirm."
+                         : "While monitoring is stopped, you can still watch the live camera.") + staleNote,
+                pending: pending, toggleOn: pending ? wanted : true, canChange: true)
+        }
+        return CameraModePresentation(
+            kind: .offWhileStopped, title: "Camera off while stopped",
+            detail: (pending ? "Turning on — waiting for the device to confirm."
+                     : "While monitoring is stopped, the camera is not shown in the app.") + staleNote,
+            pending: pending, toggleOn: pending ? wanted : false, canChange: true)
     }
 }
 
