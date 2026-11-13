@@ -340,6 +340,15 @@ struct DeviceDetailView: View {
                 jupiterSheet = JupiterSheet(prompt: DebugLaunch.jupiterPrompt ?? "")
             } else if DebugLaunch.openHistory {
                 showHistory = true
+            } else if DebugLaunch.openCamera || DebugLaunch.openMode != nil {
+                // A beat on the device screen first, so a recording shows the
+                // zoom out of its source.
+                try? await Task.sleep(for: .seconds(1.5))
+                if DebugLaunch.openCamera {
+                    openCamera()
+                } else if let id = DebugLaunch.openMode, let preset = libraryCatalog.preset(id) {
+                    presetSheet = preset
+                }
             }
         }
         .onReceive(refreshTimer) { tick in

@@ -21,6 +21,10 @@ enum DebugLaunch {
     static var openHistory: Bool { args.contains("-orynOpenHistory") }
     /// Scroll the device screen to its last section.
     static var scrollToBottom: Bool { args.contains("-orynScrollBottom") }
+    /// Open the full-screen camera from the device screen (to record its zoom).
+    static var openCamera: Bool { args.contains("-orynOpenCamera") }
+    /// Open one mode's detail from the device screen (`-orynOpenMode driver_safety`).
+    static var openMode: String? { value(after: "-orynOpenMode") }
     /// Select a tab: devices, shop or settings.
     static var tab: String? { value(after: "-orynTab") }
     /// Text to pre-fill (and send) in Ask Jupiter.
@@ -48,6 +52,8 @@ enum DebugLaunch {
     static let openJupiter = false
     static let openHistory = false
     static let scrollToBottom = false
+    static let openCamera = false
+    static let openMode: String? = nil
     static let tab: String? = nil
     static let jupiterPrompt: String? = nil
     static let session: (token: String, email: String)? = nil
