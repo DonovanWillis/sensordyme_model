@@ -1,4 +1,8 @@
-# Monday operator checklist (M8.1): what each runbook step needs, risks and proves
+# Operator checklist (M8.1, "Monday checklist"): what each runbook step needs, risks and proves
+
+> **M8.4:** the first hardware session is now **Sunday 2026-11-15**; "Monday" below means
+> that session. The step order and the read-only preflight are in
+> `docs/SUNDAY_DEVICE_ACTIVATION.md` (which cites this page as OC). The classes below are unchanged.
 
 This is a one-page companion to `docs/MONDAY_RUNBOOK.md`. The runbook has the commands; this page classifies every step so the operator knows before starting:
 - whether it needs hands on the device;
@@ -99,7 +103,7 @@ Nothing below this line starts until E1 and E5 are verified.
 | O2 E1 backup | O1 tree missing or damaged | about 10 minutes |
 | O3 E5 SD image | OS or card damage; SSH lost | about 30 minutes plus re-imaging |
 
-**Never on Monday:**
+**Never in the first hardware session (Sunday 2026-11-15):**
 - factory reset;
 - flashing before E5;
 - changing the role (except adding the missing `role: driver_safety` at F0, deliberately);

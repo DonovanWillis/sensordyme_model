@@ -1,8 +1,11 @@
-# Monday hardware session (M8.3): the accelerator, the camera, and one end-to-end alert
+# Hardware session (M8.3, "Monday session"): the accelerator, the camera, and one end-to-end alert
 
 > **STATUS: PREPARED, NOT EXECUTED.** Written on 2026-11-13 on a Mac and the compute
 > fleet. The device (Raspberry Pi 5 + AI HAT+ Hailo-8L + Camera Module 3 Wide NoIR)
-> arrives Monday 2026-11-16. No line below is a hardware result. Section A lists what
+> arrives **Sunday 2026-11-15** (M8.4; first planned for Monday 2026-11-16). "Monday"
+> below means that first session. The session order, the one-command preflight
+> (`sunday_preflight.py`) and the pilot decision are in **`docs/SUNDAY_DEVICE_ACTIVATION.md`**,
+> which cites this page as MHS §x. No line below is a hardware result. Section A lists what
 > was checked without the device, and every number there cites a job id or a test.
 
 This page is the session plan for the inference hardware. It adds to the runbook
@@ -29,7 +32,7 @@ What is new here:
 
 ```bash
 # Mac
-export RC=feat/m8.3-hardware-truth   # M8.3 integrated candidate (pending owner approval); record `git rev-parse $RC` (see docs/M8_3_RELEASE_DECISION.md)
+export RC=feat/m8.4-leapfrog   # M8.4 candidate (pending owner approval; was feat/m8.3-hardware-truth, docs/M8_3_RELEASE_DECISION.md); the integrator records `git rev-parse $RC`
 export PI=<user>@<pi-host>  REL=~/sensordyme-release  VENV=$HOME/.venvs/sensordyme-m01/bin
 # Pi (RB-0 / RB-C1 discover U and D first)
 export U=<service user>  D=/home/$U/sensordyme  PY=$D/.venv/bin/python
