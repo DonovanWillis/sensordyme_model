@@ -247,8 +247,10 @@ def test_decision_c_flags_the_camera_fallback_while_stopped():
         assert default["values"]["sources"] == ["camera"]
         failed = [c["check"] for c in default["checks"] if not c["ok"]]
         assert failed and failed[0].startswith("Decision C")
+        # The unlabelled fallback is never the owner's camera-only mode (PRIVSEC labels that
+        # `camera_only`), so it fails even when the owner opted in.
         enabled = cls.check_stream(probe, monitoring_running=False, camera_while_stopped=True)
-        assert all(c["ok"] for c in enabled["checks"])
+        assert not all(c["ok"] for c in enabled["checks"])
     finally:
         server.close()
 
@@ -265,3 +267,28 @@ def test_no_camera_frames_while_stopped_passes_decision_c():
         assert all(c["ok"] for c in result["checks"]), result["checks"]
     finally:
         server.close()
+
+
+def _probe(*sources: str, statuses: tuple = ()) -> dict:
+    parts = [{"t": 0.1 * i, "jpeg": True,
+              "headers": {"content-type": "image/jpeg", "x-frame-seq": str(i + 1), "x-frame-age-ms": "40",
+                          "x-frame-source": s, "x-stream-id": "abc"}}
+             for i, s in enumerate(sources)]
+    parts += [{"t": 1.0, "jpeg": False, "headers": {"content-type": "text/plain", "x-stream-status": st}}
+              for st in statuses]
+    return {"status": 200, "parts": parts, "headers": {"x-stream-camera": "off_while_stopped"}}
+
+
+def test_decision_c_labels_from_privsec_are_judged():
+    """M8.4 PRIVSEC labels: remote camera / camera_only without opt-in FAIL; camera_only with
+    the owner's opt-in passes; camera_local (loopback) is allowed but flagged as not proving
+    the remote case; a heartbeat-only stream passes."""
+    ok = lambda r: all(c["ok"] for c in r["checks"])  # noqa: E731
+    assert not ok(cls.check_stream(_probe("camera_only", "camera_only"), monitoring_running=False))
+    assert ok(cls.check_stream(_probe("camera_only", "camera_only"), monitoring_running=False,
+                               camera_while_stopped=True))
+    local = cls.check_stream(_probe("camera_local", "camera_local"), monitoring_running=False)
+    assert ok(local) and any("re-run from another machine" in c["check"] for c in local["checks"])
+    quiet = cls.check_stream(_probe(statuses=("camera_off_while_stopped",)), monitoring_running=False)
+    assert ok(quiet) and quiet["values"]["stream_statuses"] == ["camera_off_while_stopped"]
+    assert not ok(cls.check_stream(_probe("camera"), monitoring_running=False, camera_while_stopped=True))

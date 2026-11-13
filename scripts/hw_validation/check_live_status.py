@@ -311,15 +311,36 @@ def check_stream(probe: dict, *, monitoring_running: Optional[bool], camera_whil
             check("after the warm-up every part is `annotated` (analysed) while monitoring runs",
                   late == ["annotated"], late)
     elif monitoring_running is False:
-        camera_parts = [p for p in parts if p["headers"].get("x-frame-source") == "camera"]
-        annotated = [p for p in parts if p["headers"].get("x-frame-source") == "annotated"]
+        # M8.4 Decision C (core/dashboard.py, core/camera_privacy.py): while the
+        # owner has stopped monitoring, a REMOTE viewer gets no picture unless the
+        # owner enabled camera-only mode (frames labelled `camera_only`); a viewer
+        # on the device itself (loopback) may get `camera_local` frames for
+        # maintenance. `camera` = the not-drawing fallback, never allowed remotely.
+        def source(part: dict) -> Optional[str]:
+            return part["headers"].get("x-frame-source")
+        annotated = [p for p in parts if source(p) == "annotated"]
+        remote_camera = [p for p in parts if source(p) == "camera"]
+        camera_only = [p for p in parts if source(p) == "camera_only"]
+        local = [p for p in parts if source(p) == "camera_local"]
+        statuses = sorted({p["headers"].get("x-stream-status") for p in probe.get("parts", [])
+                           if p["headers"].get("x-stream-status")})
+        values["stream_statuses"] = statuses
+        values["x_stream_camera"] = (probe.get("headers") or {}).get("x-stream-camera")
         check("no analysed (annotated) frame while stopped", not annotated, len(annotated))
         if camera_while_stopped:
-            check("owner-enabled camera-only view: camera frames flow, labelled `camera`", bool(camera_parts),
-                  len(camera_parts))
+            check("owner-enabled camera-only mode: frames flow, labelled `camera_only`", bool(camera_only),
+                  f"{len(camera_only)} camera_only part(s)")
+            check("no unlabelled camera fallback frame while stopped", not remote_camera, len(remote_camera))
         else:
-            check("Decision C: no camera picture leaves the device while stopped (camera-only view off)",
-                  not camera_parts, f"{len(camera_parts)} camera part(s)")
+            check("Decision C: no remote camera picture while stopped (camera-only mode off)",
+                  not remote_camera and not camera_only,
+                  f"{len(remote_camera)} camera + {len(camera_only)} camera_only part(s)")
+        if local:
+            # Allowed (local maintenance), but it proves nothing about remote viewers:
+            # run this check from another machine for the Decision C verdict.
+            check("loopback viewer: frames labelled `camera_local` (local maintenance, allowed); "
+                  "re-run from another machine to verify Decision C remotely", True,
+                  f"{len(local)} camera_local part(s)")
     return {"source": "stream", "checks": checks, "values": values}
 
 

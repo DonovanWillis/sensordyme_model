@@ -164,7 +164,8 @@ real stage decides.
 
 Everything below must be recorded; the left four must **match** the approved candidate.
 The compatibility matrix across app / backend / device / model versions is owned by
-**PRIVSEC** (TODO-INTEGRATOR: link PRIVSEC's matrix document here once merged). On any
+**PRIVSEC**: `docs/SECURITY_REVIEW_M6.md` §7 (compatibility matrix; each row pinned by
+`tests/test_m84_privsec_compat.py`), with camera privacy in `docs/PRIVACY.md` §1. On any
 mismatch: stop, record it, and resolve against that matrix with PRIVSEC/the integrator;
 never "fix" it on the device by hand.
 
@@ -373,13 +374,28 @@ Only inductions that are safe and reversible:
 - **Rollback:** uncover; restore Wi-Fi; RB-K4 restore line; RB-O1 on a boot loop.
 
 ### 3.22 Step 22: privacy, camera off while stopped (Mission 8.4 Decision C)
-Decision C: **by default no camera picture leaves the device while monitoring is stopped**;
-an owner-enabled camera-only mode may exist.
-- **Do:** stop monitoring from the app (step 16), then `$PY $V/sunday_preflight.py --install-dir $D --only privacy --out $EV/preflight` or `$PY $V/check_live_status.py --device http://localhost:8899 --stream-seconds 6 --out $EV/SUN-22_privacy.json`; watch `/api/stream/stats` `camera_fallback_encodes` (must not rise); look at the app's feed. If the owner enables the camera-only view, repeat with `--camera-while-stopped`: frames must then be labelled `X-Frame-Source: camera`, never `annotated`.
-- **Expect (Decision C):** no part with `X-Frame-Source: camera` and none `annotated` while stopped (empty stream, or heartbeats only for clients that ask), the app shows no live picture and "Monitoring paused". **At `c9029fa` this check FAILS by design**: the M8.3 camera fallback streams unannotated video while stopped and is on by default (`core/dashboard.py` `camera_fallback=True`; `docs/M8_3_RELEASE_DECISION.md` risks). It passes once PRIVSEC's change is merged.
-- **TODO-INTEGRATOR:** replace "camera-only view" with PRIVSEC's actual setting/field name (config key and/or app control) and the API/health field that reports it, and make `--camera-while-stopped` read it instead of being an operator flag.
+Decision C (merged in M8.4; `docs/PRIVACY.md` §1, `docs/VIDEO_TRANSPORT.md` §2a): **by default no camera
+picture reaches a REMOTE viewer while monitoring is stopped** (`protection.state == "stopped"`). The owner can
+enable a separate **camera-only mode** from the app: Settings → device → Live feed → "Camera only while
+stopped" (backend `POST /v1/devices/{id}/camera-mode {camera_only, confirm}`, delivered to the device as a
+signed `set_camera_mode` command; reported as `monitoring.camera` on the device and `status.camera_mode` in
+`GET /v1/devices`). A viewer ON the device (loopback) may still see `camera_local` frames for maintenance
+(`dashboard.local_camera_while_stopped`, default true).
+- **Do (remote check, from the Mac on the LAN, NOT from the Pi):** stop monitoring from the app (step 16),
+  then on the Mac `python scripts/hw_validation/check_live_status.py --device http://<pi-ip>:8899 --stream-seconds 6 --out $REL/SUN-22_privacy.json`
+  (token via `$SENSORDYME_TOKEN`). Then the same from the Pi over loopback for the maintenance case.
+- **Expect, camera-only OFF (the default):** remote: no JPEG part at all (no `camera`, `camera_only` or `annotated`);
+  a client that asks for heartbeats gets `X-Stream-Status: camera_off_while_stopped`; the response carries
+  `X-Stream-Camera: off_while_stopped`; `GET /v1/devices` → `status.camera_mode.camera_only == false`; the app shows
+  "CAMERA OFF · Monitoring stopped" with the last picture hidden. Loopback on the Pi: `camera_local` frames
+  (allowed; the checker says it cannot prove the remote case from loopback).
+- **Then (owner-approved, optional):** enable "Camera only while stopped" in the app (confirmation sheet); wait
+  until `status.camera_mode.camera_only == true` and `pending == false` (device-reported); repeat the remote
+  check with `--camera-while-stopped`: frames flow labelled `X-Frame-Source: camera_only`, never `annotated` or
+  `camera`; the app says "LIVE · Camera only — not monitoring". Turn it OFF again and confirm remote frames stop.
+- **Restart persistence:** with camera-only OFF, restart the service and repeat the remote check: still no frames.
 - **Result:** `SUN-22 | ____ |` **Evidence:** the JSON (headers only: no frames are saved by the probe).
-- **If it fails:** with PRIVSEC merged, any camera part while stopped and the setting off is a privacy FAIL: stop the session's remote viewing; record.
+- **If it fails:** any remote JPEG part while stopped with camera-only OFF is a privacy FAIL: stop the session's remote viewing; record.
 - **Rollback:** Resume monitoring.
 
 ### 3.23 Step 23: run the relevant existing runbook sections
@@ -491,8 +507,8 @@ present). It is **never** on-road use. Decision options:
 
 | Decision | All of these hold |
 |---|---|
-| **GO** | (1) steps 1–5 PASS (identity, inventory, OS, access, revisions = `$RC`, `.hef` = pin); (2) steps 7–9 PASS (model loads; inputs bit-identical; production == offline); (3) step 10 PASS (latency within budget) and step 11 PASS (no throttling); (4) steps 12–16 PASS with **zero** invariant violations; (5) step 17: B1 drowsiness, B2 distraction, B4 phone use and B8 attention_lost each fire as expected in ≥ 3 of 3 trials, and **no loud false alert** in B3, B5, B7; (6) step 18 PASS (one stored event per alert) and step 19 PASS (every pattern heard); (7) step 20 PASS (local alert during the outage, delivered once); (8) step 21: no case shows "All clear" while blind; (9) step 22 PASS **with PRIVSEC's Decision C change merged**; (10) the pilot protocol, consent form and data path are approved in writing (protocol §0) |
-| **GO-WITH-LIMITS** | (1)–(4), (6), (8) and (10) hold; a non-safety item is BLOCKED or FAIL with a written limit (e.g. step 22 FAIL at `c9029fa` → the pilot runs with no remote viewing while stopped; step 14 app feed unverified → the operator uses the device dashboard; B6 sunglasses unvalidated → excluded from the pilot script; parity tolerance miss explained by the worker report) |
+| **GO** | (1) steps 1–5 PASS (identity, inventory, OS, access, revisions = `$RC`, `.hef` = pin); (2) steps 7–9 PASS (model loads; inputs bit-identical; production == offline); (3) step 10 PASS (latency within budget) and step 11 PASS (no throttling); (4) steps 12–16 PASS with **zero** invariant violations; (5) step 17: B1 drowsiness, B2 distraction, B4 phone use and B8 attention_lost each fire as expected in ≥ 3 of 3 trials, and **no loud false alert** in B3, B5, B7; (6) step 18 PASS (one stored event per alert) and step 19 PASS (every pattern heard); (7) step 20 PASS (local alert during the outage, delivered once); (8) step 21: no case shows "All clear" while blind; (9) step 22 PASS (remote check from the Mac); (10) the pilot protocol, consent form and data path are approved in writing (protocol §0) |
+| **GO-WITH-LIMITS** | (1)–(4), (6), (8) and (10) hold; a non-safety item is BLOCKED or FAIL with a written limit (e.g. step 14 app feed unverified → the operator uses the device dashboard; B6 sunglasses unvalidated → excluded from the pilot script; parity tolerance miss explained by the worker report) |
 | **NO-GO** | any of: no audible alert (step 19); drowsiness not detected (B1); a state contradiction (steps 15/16); the model not the pin or not loading (steps 5, 8); production ≠ offline decoder (step 9); throttling under load (step 11); an alert lost or duplicated (steps 18, 20); camera video leaving the device while stopped with Decision C merged and the setting off (step 22); the protocol not approved |
 
 A dry run, the virtual device or `--fake` output never satisfies any criterion. The owner
@@ -503,8 +519,8 @@ signs the decision line in `$EV/LOG.md`.
 ## 7. TODO-INTEGRATOR
 
 1. Record the M8.4 candidate commit: `git rev-parse feat/m8.4-leapfrog` → §0.1, `--expect-commit`, §2.
-2. Step 22 / `--camera-while-stopped`: replace with PRIVSEC's setting/field name for the owner-enabled camera-only mode and the field that reports it; update the expected result once Decision C is merged (at `c9029fa` the check fails by design).
-3. §2: link PRIVSEC's compatibility matrix and align the rows.
+2. ~~Step 22: PRIVSEC's names~~ (done: `status.camera_mode`, `POST /v1/devices/{id}/camera-mode`, `camera_only` / `camera_local` labels; `check_live_status.py` judges them).
+3. ~~§2: link PRIVSEC's matrix~~ (done: `docs/SECURITY_REVIEW_M6.md` §7).
 4. §5 rows B1, B3, B4 (and every `elevated_risk` / `high_risk` / `erratic_hand_movement` mention): re-read against ALPHA's merge (Decision A: experimental alerts non-audible; Decision B: a visible phone contributes no risk; phone hold logic).
 5. If BETA changes the model artifact or decoder for Sunday (not expected), update §2's pin row and MHS §3.
 6. `docs/FAILURE_MATRIX.md` and `docs/BLE_PROOF_OF_POSSESSION.md` (other owners) still say "Monday 2026-11-16": add a Sunday pointer if wanted.
