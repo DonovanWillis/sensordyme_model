@@ -275,6 +275,16 @@ struct APIClient {
     func capabilityTiers() async throws -> CapabilityTiersResponse {
         try decode(CapabilityTiersResponse.self, from: try await request("GET", "v1/capability-tiers"))
     }
+
+    func setCameraMode(deviceID: Int, cameraOnly: Bool, confirm: Bool) async throws {
+        _ = try await request("POST", "v1/devices/\(deviceID)/camera-mode",
+                              body: ["camera_only": cameraOnly, "confirm": confirm])
+    }
+
+    func deleteAccount(password: String) async throws -> AccountDeletionResult {
+        let data = try await request("POST", "v1/account/delete", body: ["password": password, "confirm": true])
+        return (try? decode(AccountDeletionResult.self, from: data)) ?? AccountDeletionResult()
+    }
 }
 
 /// App-wide session: backend URL, auth token, and a configured client.
@@ -1091,6 +1101,24 @@ final class AppState: ObservableObject {
             AlertNotifier.shared.forgetAnnounced()
         }
         localStateOwner = owner
+    }
+
+    /// The account was deleted on the server (M8.4): forget everything this
+    /// phone kept for it -- the paired camera and its token, the saved alert
+    /// channel and phone number, announced alert ids -- then sign out. The
+    /// session itself was already ended by the server.
+    func forgetDeletedAccount(notice: String) {
+        deviceLocalURL = ""
+        linkedDeviceID = ""
+        deviceToken = ""
+        accountHardwareIDsRaw = ""
+        UserDefaults.standard.removeObject(forKey: "alertPhone")
+        UserDefaults.standard.removeObject(forKey: "smsOnLoud")
+        Keychain.delete(BackgroundAlertsSection.savedTopicKey)
+        AlertNotifier.shared.forgetAnnounced()
+        localStateOwner = ""
+        signOut(explicit: true)
+        signOutNotice = notice
     }
 
     func enterDemo() {

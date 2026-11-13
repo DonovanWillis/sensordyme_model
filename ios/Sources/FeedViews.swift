@@ -543,6 +543,10 @@ final class MJPEGReader: NSObject, ObservableObject, URLSessionDataDelegate {
         let now = Self.now()
         let liveness = tracker.liveness(transport: state, now: now)
         if livenessModel.liveness != liveness { livenessModel.liveness = liveness }
+        // M8.4 (owner Decision C): with the camera off while monitoring is
+        // stopped, the last picture is not kept in memory either -- the
+        // viewport already hides it (hidesLastPicture); this drops it.
+        if liveness.hidesLastPicture, image != nil { image = nil }
         if livenessModel.frameSource != tracker.lastSource { livenessModel.frameSource = tracker.lastSource }
     }
 

@@ -371,8 +371,7 @@ def test_the_app_decodes_every_status_field(backend):
     # (kind "nodes"). These three are forwarded for completeness but not shown yet;
     # every other field must be decoded.
     pending_app_decode = {"nodes_rejection", "policies", "actuators"}
-    # M8.4: `camera_mode` has its decoder (DeviceCameraMode, StreamLiveness.swift);
-    # wiring it into DeviceStatus.swift belongs to the IOS stream.
-    pending_app_decode |= {"camera_mode"}
+    # M8.4: `camera_mode` is decoded (DeviceStatus.cameraMode, a DeviceCameraMode
+    # from StreamLiveness.swift) and shown on Settings -> Live feed.
     assert "perception" in decoded, "the app must decode the device's perception report"
     assert set(status) - decoded - pending_app_decode == set(), sorted(set(status) - decoded)

@@ -1,7 +1,7 @@
 import Foundation
 
 // Run with ios/Tests/run.sh
-// run.sh deps: ConnectionTruth DevicePresence DeviceStatus PerceptionStatus CapabilityTier PresetLibrary InstrumentState ProtectionControl
+// run.sh deps: ConnectionTruth DevicePresence DeviceStatus PerceptionStatus CapabilityTier PresetLibrary InstrumentState ProtectionControl StreamLiveness MJPEGStream
 //
 // M8.3 property test: generate status replies -- consistent ones the backend
 // sends and contradictory ones an older backend or device could -- and check

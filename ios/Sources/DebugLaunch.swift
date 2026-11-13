@@ -32,7 +32,7 @@ enum DebugLaunch {
     static var tab: String? { value(after: "-orynTab") }
     /// Text to pre-fill (and send) in Ask Jupiter.
     static var jupiterPrompt: String? { value(after: "-orynPrompt") }
-    /// Open a Settings page: live, text, alerts or doctor.
+    /// Open a Settings page: live, text, alerts, doctor or delete.
     static var settingsPage: String? { value(after: "-orynSettingsPage") }
     /// Scroll the device screen to a section (`-orynScrollTo modes`).
     static var scrollTarget: String? { value(after: "-orynScrollTo") }
@@ -50,6 +50,15 @@ enum DebugLaunch {
     /// without typing. The token comes from a real /v1/login; nothing is bypassed.
     static var session: (token: String, email: String)? {
         guard let index = args.firstIndex(of: "-orynSession"), args.indices.contains(index + 2) else { return nil }
+        return (args[index + 1], args[index + 2])
+    }
+
+    /// Point the live feed at a device (`-orynDeviceFeed <url> <token>`), e.g. the
+    /// virtual device's own feed (scripts/sim/uitest_control.py
+    /// --device-dashboard-port), for renders of the camera states. Applied after
+    /// sign-in (a new account clears the paired camera).
+    static var deviceFeed: (url: String, token: String)? {
+        guard let index = args.firstIndex(of: "-orynDeviceFeed"), args.indices.contains(index + 2) else { return nil }
         return (args[index + 1], args[index + 2])
     }
 
@@ -73,6 +82,7 @@ enum DebugLaunch {
     static let settingsPage: String? = nil
     static let focusJupiter = false
     static let session: (token: String, email: String)? = nil
+    static let deviceFeed: (url: String, token: String)? = nil
     static let noPermissionPrompt = false
     static let signOut = false
     #endif

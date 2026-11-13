@@ -309,6 +309,27 @@ protocol BackendAPI {
     /// GET /v1/capability-tiers: how far each product capability has been
     /// validated, from the model registry (CapabilityTier.swift).
     func capabilityTiers() async throws -> CapabilityTiersResponse
+    /// POST /v1/devices/{id}/camera-mode (M8.4, owner Decision C). Turning it
+    /// ON needs `confirm: true`; refusals: 400 confirmation_required, 409
+    /// firmware_unsupported. Accepted means queued: the device's own report
+    /// (`status.camera_mode`) is the only proof it applied.
+    func setCameraMode(deviceID: Int, cameraOnly: Bool, confirm: Bool) async throws
+    /// POST /v1/account/delete (M8.4, docs/PRIVACY.md §5). Refusals: 403
+    /// wrong_password, 400 confirmation_required.
+    func deleteAccount(password: String) async throws -> AccountDeletionResult
+}
+
+/// What `POST /v1/account/delete` reported doing. Every count optional.
+struct AccountDeletionResult: Codable, Equatable {
+    var devicesReleased: Int?
+    var eventsDeleted: Int?
+    var ordersDeleted: Int?
+
+    enum CodingKeys: String, CodingKey {
+        case devicesReleased = "devices_released"
+        case eventsDeleted = "events_deleted"
+        case ordersDeleted = "orders_deleted"
+    }
 }
 
 /// A rehearsable demo event. Waiting ~20s for a synthesised alert is not a
@@ -950,6 +971,16 @@ final class MockAPI: BackendAPI {
         return AlertExplanation(
             headline: event.title, severity: severity, when: when, facts: facts, rule: "",
             confidence: event.confidence, source: "facts", narrative: event.title + "." + saw)
+    }
+
+    /// The demo device reports no camera_mode (CameraModePresentation: unknown,
+    /// no switch), so this is never offered; refused plainly if reached.
+    func setCameraMode(deviceID: Int, cameraOnly: Bool, confirm: Bool) async throws {
+        throw APIError(message: "The demo device has no camera to allow.", status: 409, code: "firmware_unsupported")
+    }
+
+    func deleteAccount(password: String) async throws -> AccountDeletionResult {
+        throw APIError(message: "The demo has no account to delete. Exit the demo instead.", status: 400)
     }
 
     func aiConfigure(deviceID: Int, prompt: String) async throws -> AIProposal {

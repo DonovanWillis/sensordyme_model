@@ -55,6 +55,10 @@ struct DeviceStatus: Codable, Hashable {
     /// M8.3: claims the backend withdrew because the device's report
     /// contradicted itself (docs/STATE_MODEL.md). Empty normally.
     var corrections: [String]? = nil
+    /// M8.4 (owner Decision C): camera access while monitoring is stopped, as
+    /// the device reports it (DeviceCameraMode, StreamLiveness.swift). nil from
+    /// a backend before M8.4. Presented through CameraModePresentation.resolve.
+    var cameraMode: DeviceCameraMode? = nil
 
     struct Capabilities: Codable, Hashable {
         var available: [String]?
@@ -137,6 +141,7 @@ struct DeviceStatus: Codable, Hashable {
         case healthFreshness = "health_freshness"
         case protectionCommand = "protection_command"
         case corrections
+        case cameraMode = "camera_mode"
     }
 
     init(
@@ -147,7 +152,8 @@ struct DeviceStatus: Codable, Hashable {
         presetRejection: PresetRejection? = nil, stale: Bool? = nil, reportedAt: Double? = nil,
         lastCommandID: String? = nil, perception: PerceptionReport? = nil,
         linkStale: Bool? = nil, healthStale: Bool? = nil, healthFreshness: HealthFreshness? = nil,
-        protectionCommand: ProtectionCommandStatus? = nil, corrections: [String]? = nil
+        protectionCommand: ProtectionCommandStatus? = nil, corrections: [String]? = nil,
+        cameraMode: DeviceCameraMode? = nil
     ) {
         self.monitoringState = monitoringState
         self.monitoringActive = monitoringActive
@@ -171,6 +177,7 @@ struct DeviceStatus: Codable, Hashable {
         self.healthFreshness = healthFreshness
         self.protectionCommand = protectionCommand
         self.corrections = corrections
+        self.cameraMode = cameraMode
     }
 
     init(from decoder: Decoder) throws {
@@ -197,6 +204,7 @@ struct DeviceStatus: Codable, Hashable {
         healthFreshness = try? c.decodeIfPresent(HealthFreshness.self, forKey: .healthFreshness)
         protectionCommand = try? c.decodeIfPresent(ProtectionCommandStatus.self, forKey: .protectionCommand)
         corrections = try? c.decodeIfPresent([String].self, forKey: .corrections)
+        cameraMode = try? c.decodeIfPresent(DeviceCameraMode.self, forKey: .cameraMode)
     }
 
     func encode(to encoder: Encoder) throws {
@@ -224,6 +232,7 @@ struct DeviceStatus: Codable, Hashable {
         try c.encodeIfPresent(healthFreshness, forKey: .healthFreshness)
         try c.encodeIfPresent(protectionCommand, forKey: .protectionCommand)
         try c.encodeIfPresent(corrections, forKey: .corrections)
+        try c.encodeIfPresent(cameraMode, forKey: .cameraMode)
     }
 
     /// Online and reporting: the only time anything below is current. Also false
@@ -625,5 +634,19 @@ enum CapabilityHealth {
         let parts = reason.split(separator: ":", maxSplits: 1).map { $0.trimmingCharacters(in: .whitespaces) }
         guard parts.count == 2, parts[1] == "starting", !parts[0].isEmpty, !parts[0].contains(" ") else { return reason }
         return "\(title(parts[0])): \(startingDetail(parts[0]).prefix(1).lowercased() + startingDetail(parts[0]).dropFirst())"
+    }
+}
+
+// DeviceStatus is Hashable; DeviceCameraMode (StreamLiveness.swift) is only
+// Equatable, and Hashable cannot be synthesised from another file.
+extension DeviceCameraMode: Hashable {
+    func hash(into hasher: inout Hasher) {
+        hasher.combine(supported)
+        hasher.combine(cameraOnly)
+        hasher.combine(remoteStream)
+        hasher.combine(desiredCameraOnly)
+        hasher.combine(pending)
+        hasher.combine(commandID)
+        hasher.combine(stale)
     }
 }
