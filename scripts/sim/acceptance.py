@@ -150,7 +150,9 @@ def run_suite(suite: Suite, out: Path, py: str) -> dict:
             junit = out / "junit" / f"{Path(test).stem}.xml"
             junit.parent.mkdir(parents=True, exist_ok=True)
             with open(log, "a") as handle:
-                code = subprocess.run([py, "-m", "pytest", "-p", "no:cacheprovider", "-q", "-rs",
+                # --timeout: pytest.ini's 60 s per-test watchdog is a hang detector, and under a
+                # loaded host the 20-minute sim scenarios exceed it without anything being wrong.
+                code = subprocess.run([py, "-m", "pytest", "-p", "no:cacheprovider", "-q", "-rs", "--timeout=1200",
                                        f"--junitxml={junit}", test], cwd=REPO, env=env, stdout=handle,
                                       stderr=subprocess.STDOUT, check=False).returncode
             codes.append(code)
