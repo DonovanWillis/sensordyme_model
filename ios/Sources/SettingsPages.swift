@@ -245,7 +245,7 @@ struct TextAlertsSettingsView: View {
                 } header: {
                     Text("Phone number")
                 } footer: {
-                    Text("On a serious alert (distracted driving, a fall, a covered face, an intruder) the server texts this number, if SMS is set up on the server. The number and the switch are saved together.")
+                    Text("On a serious alert (such as sustained eyes off the road or eyes closed while driving) the server texts this number, if SMS is set up on the server. The number and the switch are saved together.")
                 }
 
                 Section {

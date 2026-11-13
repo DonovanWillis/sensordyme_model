@@ -317,13 +317,13 @@ struct DemoScenario: Identifiable, Hashable, CaseIterable {
 
     static let distractedDriving = DemoScenario(
         id: "distraction", title: "Distracted driving",
-        detail: "Phone in hand with eyes off the road", icon: "car.fill",
-        type: "phone_use", signals: "phone + hand_overlap + gaze_off", severity: "loud")
+        detail: "Phone visible while eyes are off the road", icon: "car.fill",
+        type: "phone_use", signals: "phone_visible + gaze_off_road (sustained)", severity: "loud")
 
     static let drowsyDriving = DemoScenario(
         id: "drowsy", title: "Drowsy driver",
-        detail: "Sustained eye closure at speed", icon: "eye.slash.fill",
-        type: "drowsiness", signals: "sustained_closure + head_nod", severity: "loud")
+        detail: "Eyes closed for longer than a blink", icon: "eye.slash.fill",
+        type: "drowsiness", signals: "sustained_eye_closure", severity: "loud")
 
     static let poolSafety = DemoScenario(
         id: "pool", title: "Child near pool",
@@ -475,10 +475,10 @@ final class MockAPI: BackendAPI {
              ("person_detected", "entry zone", "log", 45),
              ("unknown_person_lingering", "entry zone 40s", "loud", 200)]
         default:
-            [("eyes_off_road", "gaze yaw 31deg for 2.4s", "soft", 45),
-             ("phone_use_while_distracted", "phone + hand_overlap + gaze_off", "loud", 120),
+            [("eyes_off_road", "head turned away from the road for 2.4s", "soft", 45),
+             ("phone_use", "phone visible while eyes off the road for 3.1s", "loud", 120),
              ("drowsiness", "sustained_eye_closure 1.8s", "loud", 160),
-             ("vlm_judgment", "vlm:attentive — eyes forward, hands on wheel", "log", 25)]
+             ("eyes_down", "looking down for 2.2s", "soft", 25)]
         }
     }
 
@@ -712,8 +712,8 @@ final class MockAPI: BackendAPI {
                     setting("chime", "Chime on the device", .bool, .bool(true)),
                 ]
                 presets[index].validation = PresetValidation(
-                    status: .benchmarkedOffline,
-                    evidence: ["Benchmarked offline on a public driver dataset (demo figure)."])
+                    status: .unevaluated,
+                    evidence: ["Not yet validated: checked only in synthetic tests (the demo device is simulated)."])
                 presets[index].limitations = ["Sunglasses can hide the eyes.", "Needs the face in view."]
             case "baby_monitoring":
                 presets[index].requiredCapabilities = ["pose", "audio"]
@@ -963,9 +963,9 @@ final class MockAPI: BackendAPI {
         if has("drive", "driving", "car", "phone", "drowsy", "road") {
             return AIProposal(
                 preset: "driver_safety", variant: "strict",
-                explanation: "Switching to Driver Distraction (Strict). Phone use while looking away alerts within a second; quick mirror checks never alarm.",
-                rules: [rule("cell phone", "present", "Alert on phone use while driving",
-                             persist: 1, severity: "critical", cooldown: 30)],
+                explanation: "Switching to Driver Safety (Strict). It alerts when a phone is visible while the driver's eyes are off the road for a sustained moment; a quick mirror check gets more patience than a glance away.",
+                rules: [rule("cell phone", "present", "Phone visible in the cabin",
+                             persist: 1, severity: "warning", cooldown: 30)],
                 settings: [:], unsupported: [], source: "demo", mode: "preset")
         }
         return AIProposal(
