@@ -214,7 +214,25 @@ xcodebuild invocation with no retries; evidence in
 | B | f41bea2 | alphabetical | 27/28: journey 08's tap missed (fixed above) |
 | C | f22564e | alphabetical | 28/28 |
 | D | f22564e | alphabetical (random was asked for; the script missed the build's format-1 .xctestrun, fixed) | 27/28: journey 06's Resume tap changed nothing (no resume reached the device) |
-| E | (same build as C and D) | random | <!-- M81-RUN-E --> |
+| E | f22564e build (scripts b4aa2c5) | random | 26/28: 06 (reveal overshoot), 16 (outage-window race), both fixed |
+| F | 72aa192 | alphabetical | 28/28 |
+| G | 72aa192 | random | 28/28 |
+
+Runs F and G, back to back on the same build, each passed every test
+(both audits and journeys 01–20 and 23–28) in one invocation with no
+retries. Journey 28's recovery took 13 s (F) and 8 s (G) after the thaw.
+
+`reveal()` in the journeys used to swipe up only, and each swipe glided
+about 400 pt. In the stopped-device layout one swipe could carry the Resume
+button from below the window to above it: the tap then hit the navigation
+bar (run D), or the button was never reachable again (run E). It now drags
+the page by the exact distance that centres the element between the
+navigation bar and the tab bar, in either direction and with no glide. An
+element that dragging cannot move (a sheet's pinned action bar, the end of
+a page) is taken where it is if it can be hit. Journey 16 no longer waits
+for "All clear" before the scripted outage. That state fits only in the gap
+between the restarted device's first report and the outage being noticed,
+and run E's device made its first report 1 s before the outage.
 
 <!-- M81-RESULTS -->
 
