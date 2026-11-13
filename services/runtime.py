@@ -649,6 +649,9 @@ class DeviceRuntime:
                 cloud_cfg = {**cloud_cfg,
                              "spool_path": str(Path(events_csv).parent / "uplink_spool.jsonl")}
             self.uplink = self._make_uplink(cloud_cfg)
+            # M8.3: every event pushed carries what the alert policy did with it
+            # and what the in-cabin outputs reported (docs/EVENT_PIPELINE.md).
+            self.uplink.delivery_lookup = getattr(self.alert_manager, "delivery", None)
             self.uplink.set_active_preset(self.active_preset)
             # Report the restored configuration at startup too, not only when a
             # new one arrives — otherwise a device that rebooted into a custom
