@@ -27,6 +27,10 @@ enum ModeRowState: Equatable {
     /// The device runs this mode but is NOT monitoring (failed, or stopped),
     /// with what it says. Never a green checkmark: selected is not protected.
     case activeNotMonitoring(String)
+    /// The device runs this mode, but whether it is monitoring can't be
+    /// confirmed right now (stale health, or the status is unknown). Never the
+    /// green check, and not a failure either (M8.1).
+    case activeUnconfirmed(String)
     /// A switch to this mode was requested and did not succeed — either the
     /// request itself failed, or it never confirmed before the timeout.
     case failed(String)
@@ -42,7 +46,7 @@ enum ModeRowState: Equatable {
     /// The device runs this mode, whether or not it is monitoring.
     var isSelected: Bool {
         switch self {
-        case .active, .activeNotMonitoring: true
+        case .active, .activeNotMonitoring, .activeUnconfirmed: true
         default: false
         }
     }
@@ -56,6 +60,7 @@ enum ModeRowState: Equatable {
         case .queuedOffline: "Waiting for the device to reconnect"
         case .active: "Active"
         case .activeNotMonitoring: "Selected, not monitoring"
+        case .activeUnconfirmed: "Selected, status unknown"
         case .failed: "Switch failed"
         case .unavailable: "Not available on this device"
         }
@@ -110,7 +115,8 @@ enum ModeSwitchState {
         failure: PendingSwitch?,
         now: Date,
         unavailable: String? = nil,
-        notMonitoring: String? = nil
+        notMonitoring: String? = nil,
+        unconfirmed: String? = nil
     ) -> ModeRowState {
         // A failure is scoped to the specific mode it happened for. Once the
         // user taps a DIFFERENT mode, the old failure is superseded (the
@@ -135,6 +141,7 @@ enum ModeSwitchState {
         // handling, unchanged by this state machine.
         if !customMonitoringActive && activeBase == presetName {
             if let notMonitoring { return .activeNotMonitoring(notMonitoring) }
+            if let unconfirmed { return .activeUnconfirmed(unconfirmed) }
             return .active
         }
 

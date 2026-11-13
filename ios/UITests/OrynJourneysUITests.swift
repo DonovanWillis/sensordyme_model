@@ -579,6 +579,12 @@ final class OrynJourneysUITests: XCTestCase {
                            "nothing on the device screen says '\(claim)' on frozen health")
         }
         XCTAssertNotEqual(monitoring.label, "All clear")
+        // The running mode's row is selected but unconfirmed: never the green
+        // "Active" check on frozen health (M8.1 integrator finding).
+        let modeRow = reveal(app.buttons["preset.row.driver_safety"])
+        XCTAssertEqual(modeRow.value as? String, "Selected, status unknown",
+                       "the running mode never reads Active on frozen health")
+        shot("28c2_frozen_mode_row")
 
         // The samples flow again: the next device report is fresh, and the app's
         // next poll (4 s on this screen) shows it.

@@ -691,6 +691,12 @@ struct DeviceDetailView: View {
         default: return nil
         }
     }
+    /// The status can't be confirmed (stale health, unknown): the row the
+    /// device runs must not read green (M8.1 frozen-health finding).
+    private var unconfirmedReason: String? {
+        guard let presentation = monitoringPresentation, presentation.phase == .unknown else { return nil }
+        return "Status unknown — \(presentation.detail)"
+    }
     private var activeVariant: String? { Preset.split(device.activePreset).variant }
 
     private var modeCard: some View {
@@ -908,7 +914,8 @@ struct DeviceDetailView: View {
         let rowState = ModeSwitchState.state(
             for: preset.id, activeBase: activeBase, customMonitoringActive: customReplacesModes,
             pending: pendingSwitch, deviceOnline: deviceLive, failure: failedSwitch, now: .now,
-            unavailable: unavailableReason(preset.id), notMonitoring: notMonitoringReason
+            unavailable: unavailableReason(preset.id), notMonitoring: notMonitoringReason,
+            unconfirmed: unconfirmedReason
         )
         let isActive = rowState.isSelected
         let isUnavailable = rowState.isUnavailable
@@ -955,6 +962,11 @@ struct DeviceDetailView: View {
                                 .font(SD.Typography.caption)
                                 .foregroundStyle(SD.Colors.danger)
                                 .fixedSize(horizontal: false, vertical: true)
+                        case .activeUnconfirmed(let message):
+                            Text(message)
+                                .font(SD.Typography.caption)
+                                .foregroundStyle(SD.Colors.warning)
+                                .fixedSize(horizontal: false, vertical: true)
                         case .inactive, .switching, .active:
                             Text(preset.description)
                                 .font(SD.Typography.caption)
@@ -986,6 +998,10 @@ struct DeviceDetailView: View {
                         // Selected, not protecting: never the green check.
                         Image(systemName: "exclamationmark.circle.fill")
                             .foregroundStyle(SD.Colors.danger)
+                    case .activeUnconfirmed:
+                        // Selected, but not confirmed: neither green nor a failure.
+                        Image(systemName: "questionmark.circle.fill")
+                            .foregroundStyle(SD.Colors.warning)
                     case .inactive, .unavailable:
                         EmptyView()
                     }
