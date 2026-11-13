@@ -14,7 +14,7 @@ accuracy, or a Hailo measurement. The frozen test split has never been used.
 
 | ID | Question | Status |
 |---|---|---|
-| RQ1 | Does fine-tuning DAMO-YOLO-T to {person, phone, hand} lose person accuracy because the fine-tune loader re-initialises the class-agnostic box regressor, rather than because of class interference? | tested by EXP-09 (§6 of the audit) |
+| RQ1 | Does fine-tuning DAMO-YOLO-T to {person, phone, hand} lose person accuracy because the fine-tune loader re-initialises the class-agnostic box regressor, rather than because of class interference? | tested by EXP-09 (audit §6): **answered no**: keeping the pretrained head did not close the gap (person R@P0.80 −0.047 vs pretrained, −0.013 vs EXP-08), so head re-initialisation is not the main cause; class interference / training data remain open |
 | RQ2 | How large is the accuracy cost of 8-bit post-training quantisation of this detector, and where does it come from (weights/activations vs the uint8 outputs the `.hef` returns)? | L2 host simulation done (audit §5.5); L3/L4 pending |
 | RQ3 | Can a detector-predicted hand box gate "phone present" into "phone held" without losing in-hand phones? | M8.1: yes on OI (false-phone images 33% → 2.4%, in-hand recall unchanged at 0.81; 21 in-hand phones) |
 | RQ4 | Which failure modes dominate (size, occlusion, darkness proxy, look-alikes, localisation)? | audit §5 |
