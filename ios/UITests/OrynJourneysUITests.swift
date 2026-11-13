@@ -715,16 +715,25 @@ final class OrynJourneysUITests: XCTestCase {
                                             : (f.midY >= top + 22 && f.midY <= bottom - 22)
         }
         var drags = 0
+        // Pinned in place (a sheet's bottom action bar, outside any scroll view, with
+        // no tab bar over it): dragging the page does not move it, and it is taken
+        // where it is if it can be hit there.
+        var pinned = false
         while element.exists && !inWindow() && drags < 12 {
+            let before = element.frame
             let limit = (bottom - top) / 2 - 12
-            let dy = max(-limit, min(limit, (top + bottom) / 2 - element.frame.midY))  // > 0 moves content down
+            let dy = max(-limit, min(limit, (top + bottom) / 2 - before.midY))  // > 0 moves content down
             let start = app.coordinate(withNormalizedOffset: .zero)
                 .withOffset(CGVector(dx: 10, dy: (top + bottom) / 2 - dy / 2))
             start.press(forDuration: 0.05, thenDragTo: start.withOffset(CGVector(dx: 0, dy: dy)),
                         withVelocity: .slow, thenHoldForDuration: 0.3)
             drags += 1
+            if element.frame == before && element.isHittable {
+                pinned = true
+                break
+            }
         }
-        XCTAssertTrue(inWindow(), "\(element) is reachable on screen, between the bars: \(element.frame)",
+        XCTAssertTrue(pinned || inWindow(), "\(element) is reachable on screen, between the bars: \(element.frame)",
                       file: file, line: line)
         settle(element)
         return element
