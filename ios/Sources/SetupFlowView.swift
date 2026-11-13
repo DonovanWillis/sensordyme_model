@@ -30,8 +30,10 @@ struct SetupFlowView: View {
     @State private var codeProblem: String?
     @State private var claimCode = ""
     @State private var chosenMode: String?
+    /// The clock, for the device's lockout countdown only. It ticks while a
+    /// lockout runs (`.task(id: lockedUntil)` below); a 1 Hz timer used to
+    /// redraw this whole screen every second of setup for it.
     @State private var now = Date()
-    private let tick = Timer.publish(every: 1, on: .main, in: .common).autoconnect()
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
 
     init(onFinished: (() async -> Void)? = nil) {
@@ -67,12 +69,25 @@ struct SetupFlowView: View {
                 flow.stop()
                 setupCode = ""
             }
-            .onReceive(tick) { now = $0 }
+            .task(id: lockedUntil) {
+                guard let until = lockedUntil else { return }
+                while !Task.isCancelled, Date() < until.addingTimeInterval(1) {
+                    now = Date()
+                    try? await Task.sleep(for: .seconds(1))
+                }
+                now = Date()
+            }
             .onChange(of: flow.recommendedMode) { _, mode in
                 if chosenMode == nil { chosenMode = mode }
             }
         }
         .tint(SD.Colors.accent)
+    }
+
+    /// The device's refusal of codes until this time, while it lasts.
+    private var lockedUntil: Date? {
+        if case .enteringSetupCode(_, let until?) = flow.state { return until }
+        return nil
     }
 
     // MARK: Bluetooth itself
