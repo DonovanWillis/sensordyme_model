@@ -194,9 +194,43 @@ Reading:
   that are at or above 0.40 in float); and the parity stage should
   compare detections at matched *precision*, not at a fixed raw score.
 
-## 6. EXP-09: head-preserving fine-tune
+## 6. EXP-09: head-preserving fine-tune (REJECTED)
 
-(filled from job `20261113-084342-27ed4d`; see below)
+**Run.** Oryn job `20261113-084342-27ed4d`: 60 epochs, 3.2 h wall, seed applied (`SD_SEED_FIX=1`),
+head-preserving load (rows 0/67/-1). Output checkpoint sha256 `d07e89ee2491d563…`, which stays on oryn.
+
+**Verdict.** The integrator ran the pre-registered criteria with `research/m84/exp09_verdict.py`, because the
+BETA stream was stopped before it reported. Evidence: `m84-evidence/beta/exp09/verdict.txt`. Val split only.
+
+| Criterion | Result | |
+|---|---|---|
+| G1: person R@P0.80 gap to pretrained ≤ 0.010 | 0.614 vs 0.661: **+0.047 [0.030, 0.066]** | **FAIL** |
+| G2: phone AP50 ≥ 0.79 | 0.842 [0.772, 0.896] | pass |
+| G3: hand AP50 ≥ 0.70 | 0.724 [0.697, 0.754] | pass |
+| S1 person P@R0.70 ≥ 0.66 / S2 person AP50 ≥ 0.703 | 0.552 / 0.682 | fail / fail |
+| S3 phone R@P0.80 ≥ 0.75 / S4 false-phone images ≤ pretrained | 0.781 / 0.357 vs 0.476 | pass / pass |
+
+**Compared with EXP-08:**
+- person R@P0.80: −0.013 [−0.027, −0.000];
+- phone AP50: +0.035 [−0.003, +0.067];
+- hand: unchanged.
+
+**Large people, recall at precision 0.80:**
+
+| Model | Recall |
+|---|---|
+| Pretrained | 0.733 |
+| EXP-08 | 0.714 |
+| EXP-09 | 0.703 |
+
+EXP-09's gap is 0.030, over the 0.02 bar.
+
+**Decision: reject.** Keeping the pretrained head did not close the person regression, and EXP-09 is no better
+than EXP-08. The head re-initialisation (§7) is therefore **not** the main cause. Implications:
+- The single 3-class network does not meet the person bar.
+- By the M8 rule, Arch B (pretrained person + 3-class phone/hand) is now the candidate route. It still needs the
+  Pi INT8 and two-network throughput checks, and a decoder change for the hand channel (§8).
+- The production `.hef` is unchanged and is not affected.
 
 ## 7. Prior attempts and what M8.4 found in them
 
