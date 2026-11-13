@@ -183,7 +183,7 @@ There is never a success haptic or animation on "sent".
 | Ready ("All clear") | green check-shield; the camera frame stays neutral (a green box around a picture reads as "safe") | one-shot symbol bounce on the transition *into* ready from another state; nothing continuous |
 | Monitoring alert (event < 60 s) | red bell, "Alert", camera frame danger 2 pt | the frame cross-fades in, with no pulsing |
 | Degraded | amber triangle, camera frame tint goes amber | status cross-fade only |
-| Stopped | steel pause, "Stopped" | status cross-fade; Resume becomes the primary key |
+| Stopped | steel pause, "Stopped"; capability lines read "Paused — monitoring is stopped" with a pause glyph (M8.2), real faults still show as faults | status cross-fade; Resume becomes the primary key |
 | Failed ("Not monitoring") | red octagon | status cross-fade |
 | Offline / stale / unknown | steel wifi.slash / clock / questionmark; camera placeholder desaturated and dimmed; the LIVE badge is removed | cross-fade; active visuals are interrupted at once |
 
