@@ -87,9 +87,16 @@ def derive(row: dict, now: Optional[float] = None) -> DerivedState:
         return DerivedState(RESUMING if resume_unapplied else STOPPED, False, evidence)
     if state == "starting":
         applied = command.get("applied_at")
+        # Only on the boot the resume took effect on (M8.4): a restart inside the settle
+        # window is a new boot STARTING, not the old resume settling. A backend that does
+        # not record `applied_boot` (pre-M8.4) keeps the time-only rule.
+        applied_boot = command.get("applied_boot")
+        freshness = status.get("health_freshness") if isinstance(status.get("health_freshness"), dict) else {}
+        current_boot = freshness.get("boot_id")
+        same_boot = applied_boot is None or current_boot is None or applied_boot == current_boot
         just_resumed = (command.get("action") == "resume" and command.get("outcome") == "confirmed"
                         and isinstance(applied, (int, float)) and now is not None
-                        and now - applied <= RESUME_SETTLE_S)
+                        and now - applied <= RESUME_SETTLE_S and same_boot)
         return DerivedState(RESUMING if just_resumed else ACTIVATION_PENDING, False, evidence)
     if state == "failed":
         return DerivedState(FAULTED, False, evidence)

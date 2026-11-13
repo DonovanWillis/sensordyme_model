@@ -1623,6 +1623,7 @@ def _protection_command(row: sqlite3.Row, now: float) -> Optional[dict]:
     return {"id": command_id[:64], "action": action, "requested_at": requested,
             "age_s": None if age is None else round(age, 1), "timeout_s": PROTECTION_ACK_TIMEOUT_S,
             "outcome": outcome, "delivering": delivering, "applied_at": applied_at,
+            "applied_boot": record.get("applied_boot") if isinstance(record.get("applied_boot"), str) else None,
             "reported_state": applied_state, "reason": str(reason)[:500] if reason else None}
 
 
@@ -1636,12 +1637,17 @@ def _record_protection_ack(conn: sqlite3.Connection, device_id: int, reported_bl
     """
     if not reported_block or not isinstance(reported_block.get("last_command_id"), str):
         return
-    stored = conn.execute("SELECT protection_request FROM devices WHERE id = ?", (device_id,)).fetchone()
+    stored = conn.execute("SELECT protection_request, health_boot FROM devices WHERE id = ?",
+                          (device_id,)).fetchone()
     record = _loads_dict(stored["protection_request"] if stored is not None else None)
     if record.get("id") != reported_block["last_command_id"] or record.get("applied_at") is not None:
         return
     state = reported_block.get("state")
     record["applied_at"] = time.time()
+    # The boot the request took effect on (M8.4): a device that restarts soon after a
+    # resume is starting its NEW boot, not still settling from the resume.
+    boot = stored["health_boot"] if stored is not None else None
+    record["applied_boot"] = boot if isinstance(boot, str) else None
     record["applied_state"] = state if state in _PROTECTION_STATES else None
     refusal = _new_refusal((monitoring or {}).get("last_rejection"), "protection",
                            json.dumps({"protection": record.get("refusal_baseline")}))

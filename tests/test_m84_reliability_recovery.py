@@ -156,11 +156,8 @@ def test_a_reconnect_never_re_sounds_an_alert_or_stores_it_twice(tmp_path):
 
 
 # ---------------------------------------------------------------------- state-model edge found by M8.4
-@pytest.mark.xfail(strict=True, reason=(
-    "M8.4 finding, owner: state model (core/state_model.py + ios InstrumentState.swift): a device that "
-    "restarts within RESUME_SETTLE_S (60 s) of a confirmed resume reports `starting` for its new boot, "
-    "which derive() reads as RESUMING (the old resume's settle window), and ready -> resuming is not an "
-    "edge of the model. Nothing is claimed protecting; the label is wrong. Flips to XPASS when fixed."))
+# M8.4 finding, fixed by the integrator: the resume is tied to the boot it took effect on
+# (protection_command.applied_boot), so a restart inside RESUME_SETTLE_S reads as starting.
 def test_a_restart_shortly_after_a_resume_reads_as_starting_not_resuming(stack):
     monitor = InvariantMonitor(stack)
     device = stack.boot(sc.get("attentive"))
