@@ -11,6 +11,8 @@ import json
 import sys
 from pathlib import Path
 
+import pytest
+
 REPO = Path(__file__).resolve().parents[1]
 
 
@@ -99,3 +101,14 @@ def test_malloc_info_is_glibc_only():
         assert info is None or {"arena_mb", "inuse_mb", "free_mb", "mmap_mb"} <= set(info)
     else:
         assert info is None
+
+
+@pytest.mark.skipif(not sys.platform.startswith("linux"), reason="/proc is Linux")
+def test_watch_reads_another_process_from_proc():
+    import os
+
+    row = mp.proc_sample(os.getpid())
+    assert row is not None and row["pid"] == os.getpid()
+    assert row["rss_mb"] > 0 and row["rss_anon_mb"] is not None and row["threads_os"] >= 1
+    assert row["t"] >= 0  # the process's age
+    assert mp.proc_sample(2**22 + 7) is None  # no such process

@@ -18,6 +18,10 @@ Three parts:
                  slopes (MB/h) of RSS, Python heap and malloc in-use, before and
                  after warm-up, in halves and over the last 30 min.
 
+  watch          python3 memory_profile.py watch --unit sensordyme.service --minutes 30 --out OUT
+                 Another process from /proc, read-only, stdlib only (the Pi): RSS split
+                 into anonymous (heap) and file-backed, threads, fds; t = process age.
+
   simclock       python scripts/sim/memory_profile.py simclock --hours 2 --out OUT
                  The device alone on the SimClock (the backend is in-process, as in
                  tests): the soak timeline with stop/resume each cycle, sampled once
@@ -337,7 +341,7 @@ def lifetimes(rows: list[dict]) -> list[list[dict]]:
     return list(out.values())
 
 
-SERIES = ("rss_mb", "py_heap_mb", "malloc.inuse_mb", "malloc.free_mb", "malloc.arena_mb", "malloc.mmap_mb",
+SERIES = ("rss_mb", "rss_anon_mb", "rss_file_mb", "py_heap_mb", "malloc.inuse_mb", "malloc.free_mb", "malloc.arena_mb", "malloc.mmap_mb",
           "gc_objects", "threads", "threads_os", "fds")
 
 
@@ -419,6 +423,67 @@ def _dig(row: dict, key: str) -> Any:
     return value
 
 
+# ====================================================================== watch (a Pi)
+def proc_sample(pid: int) -> Optional[dict]:
+    """Another process's memory from /proc (Linux, stdlib only): read-only.
+
+    rss_anon_mb is the heap side (Python objects, malloc arenas, model arenas);
+    rss_file_mb is mapped files (shared libraries, mmapped models)."""
+    base = Path(f"/proc/{pid}")
+    try:
+        status = (base / "status").read_text()
+        stat = (base / "stat").read_text()
+        uptime = float(Path("/proc/uptime").read_text().split()[0])
+    except OSError:
+        return None
+    fields = {}
+    for line in status.splitlines():
+        key, _, value = line.partition(":")
+        fields[key] = value.strip()
+
+    def kb(name: str) -> Optional[float]:
+        raw = fields.get(name, "").split()
+        return round(int(raw[0]) / 1024, 2) if raw else None
+
+    # Field 22 of /proc/PID/stat (after the parenthesised comm) is the start time in clock ticks.
+    start_ticks = int(stat.rsplit(")", 1)[1].split()[19])
+    age = uptime - start_ticks / os.sysconf("SC_CLK_TCK")
+    fds: Optional[int] = None
+    with contextlib.suppress(OSError):
+        fds = len(os.listdir(base / "fd"))
+    return {"t": round(age, 1), "wall": round(time.time(), 1), "pid": pid, "label": "watch",
+            "rss_mb": kb("VmRSS"), "rss_anon_mb": kb("RssAnon"), "rss_file_mb": kb("RssFile"),
+            "swap_mb": kb("VmSwap"), "threads_os": int(fields.get("Threads", "0") or 0), "fds": fds}
+
+
+def _unit_pid(unit: str) -> Optional[int]:
+    import subprocess
+
+    with contextlib.suppress(Exception):
+        out = subprocess.run(["systemctl", "show", "-p", "MainPID", "--value", unit],
+                             capture_output=True, text=True, timeout=10).stdout.strip()
+        if out.isdigit() and int(out) > 0:
+            return int(out)
+    return None
+
+
+def run_watch(args: argparse.Namespace) -> dict:
+    """Sample a running process (a unit's MainPID, followed across restarts) for --minutes."""
+    out = Path(args.out)
+    out.mkdir(parents=True, exist_ok=True)
+    deadline = time.time() + args.minutes * 60.0
+    while time.time() < deadline:
+        pid = args.pid or (_unit_pid(args.unit) if args.unit else None)
+        row = proc_sample(pid) if pid else None
+        if row is not None:
+            _append(out / SAMPLES, row)
+        else:
+            print(f"memory_profile watch: no process ({args.unit or args.pid}) at {time.strftime('%H:%M:%S')}",
+                  file=sys.stderr)
+        time.sleep(args.interval)
+    return analyze(out, warmup_s=args.warmup_s, plot=False)
+
+
 # ====================================================================== simclock
 def run_simclock(args: argparse.Namespace) -> dict:
     """The soak timeline on the SimClock, sampled once per cycle (see module doc)."""
@@ -484,9 +549,19 @@ def main(argv: Optional[list[str]] = None) -> int:
     s.add_argument("--snapshot-h", type=float, default=0.5, help="sim hours between tracemalloc diffs")
     s.add_argument("--tracemalloc-frames", type=int, default=1)
     s.add_argument("--no-stop-resume", dest="stop_resume", action="store_false")
+    w = sub.add_parser("watch", help="sample another process from /proc (Linux; read-only)")
+    who = w.add_mutually_exclusive_group(required=True)
+    who.add_argument("--unit", help="a systemd unit (its MainPID, re-read every sample)")
+    who.add_argument("--pid", type=int)
+    w.add_argument("--minutes", type=float, default=30.0)
+    w.add_argument("--interval", type=float, default=10.0)
+    w.add_argument("--warmup-s", type=float, default=600.0, help="process age before slopes count as steady state")
+    w.add_argument("--out", required=True)
     args = parser.parse_args(argv)
     if args.cmd == "analyze":
         summary = analyze(Path(args.run_dir), args.warmup_s, plot=not args.no_plot)
+    elif args.cmd == "watch":
+        summary = run_watch(args)
     else:
         summary = run_simclock(args)
     print(json.dumps(summary, indent=1))
