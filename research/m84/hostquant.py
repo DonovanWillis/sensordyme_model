@@ -100,9 +100,21 @@ def quantise(heads: Path, work: Path, data: Path, calib_items, input_name: str) 
     except Exception as e:  # noqa: BLE001 - pre-processing is an optimisation, not required
         print("quant_pre_process skipped:", repr(e), flush=True)
         src = heads
+    # The zoo graph is opset 11; per-channel DequantizeLinear needs the `axis` attribute (opset >= 13).
+    import onnx
+    from onnx import version_converter
+
+    m = onnx.load(str(src))
+    opset = next(o.version for o in m.opset_import if o.domain in ("", "ai.onnx"))
+    if opset < 13:
+        src13 = work / "heads.op13.onnx"
+        if not src13.exists():
+            onnx.save(version_converter.convert_version(m, 13), str(src13))
+        print(f"converted opset {opset} -> 13 for quantisation", flush=True)
+        src = src13
     out = {}
     for name, (per_channel, method, n) in QUANT_VARIANTS.items():
-        target = work / f"heads.{name}.onnx"
+        target = work / f"heads.{name}.op13.c{len(calib_items[: n or len(calib_items)])}.onnx"
         out[name] = target
         if target.exists():
             continue
