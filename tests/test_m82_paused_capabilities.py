@@ -69,8 +69,7 @@ def test_a_stopped_device_reports_paused_not_failing_and_resumes_ready(stack):
     assert stack.protection("resume").status_code == 200
     device.advance(C + 10.0)
     status = stack.status()
-    assert status["monitoring_state"] == "ready", status["monitoring_reasons"] \
-        if "monitoring_reasons" in status else status
+    assert status["monitoring_state"] == "ready", status
     assert status["capabilities"]["paused"] == []
     assert "face" in status["capabilities"]["available"]
 

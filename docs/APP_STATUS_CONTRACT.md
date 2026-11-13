@@ -30,6 +30,7 @@ for it treats a missing `status` (an older backend) as "no truth available".
 | `capabilities.available` | [string] | Capabilities producing results now. "Available" is not a claim that the results are accurate. |
 | `capabilities.impaired` | [{`name`, `reason`}] | Capabilities that are not working, each with the device's reason. |
 | `capabilities.starting` | [string] | Capabilities still starting up. |
+| `capabilities.paused` | [string] | M8.2, additive. Capabilities not running because monitoring was stopped on purpose; never a fault. Real faults found while stopped stay in `impaired`. |
 | `rules` | object | Custom rules as the DEVICE runs them. |
 | `rules.active` | [string] \| null | Rule ids the device reports running now. Null when stale. Never computed from what the backend accepted. |
 | `rules.additive` | bool \| null | Whether this role runs custom rules beside its mode instead of replacing the mode. Null when no role is known. |
