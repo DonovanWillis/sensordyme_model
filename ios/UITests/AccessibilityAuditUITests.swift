@@ -107,8 +107,12 @@ final class AccessibilityAuditUITests: XCTestCase {
                                                          && issue.element?.elementType == .staticText
                                                      : label.hasPrefix($0.label))
                 }
+                // Element type and frame too (M8.4): an unlabelled finding was otherwise
+                // impossible to locate; "unresolved" when XCTest gives no element.
+                let where_ = issue.element.map { "\($0.elementType.rawValue)@\(Int($0.frame.minX)),\(Int($0.frame.minY)),"
+                    + "\(Int($0.frame.width))x\(Int($0.frame.height))" } ?? "unresolved"
                 let line = "\(screen)\t\(Self.name(issue.auditType))\t\(known == nil ? "NEW" : "known")\t"
-                    + "\(issue.compactDescription)\t\(label)\t\(issue.element?.identifier ?? "")"
+                    + "\(issue.compactDescription)\t\(label)\t\(issue.element?.identifier ?? "")\t\(where_)"
                 lines.append(line)
                 return known != nil  // a known issue is handled; anything else fails the test
             }
