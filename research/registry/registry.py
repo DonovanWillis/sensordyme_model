@@ -10,7 +10,9 @@ Rules the validator enforces (docs/research/M84_RESEARCH_PACKAGE.md, "Reproducib
   * ``split`` may never be ``test``: the frozen test split is not used for any decision;
   * ``decision`` is one of pending / retain / reject / inconclusive / not_run, and anything other
     than pending / not_run must cite at least one job id and one result artifact;
-  * ``preregistered_at`` must not be later than ``started_at`` (criteria are fixed first).
+  * ``preregistered_at`` must not be later than ``started_at`` (criteria are fixed first), unless the
+    entry says ``retrospective: true``, which marks a hypothesis written after the run: such an
+    entry is a record, never a pre-registered test.
 A registry line is a record of what happened, not a claim of production readiness: no entry
 promotes a model (that is the model registry under config/, which this file never touches).
 """
@@ -51,8 +53,12 @@ def validate(entries: list[dict]) -> list[str]:
         if d not in ("pending", "not_run") and (not e.get("jobs") or not e.get("artifacts")):
             problems.append(f"{tag}: decision {d} must cite jobs and artifacts")
         pre, start = e.get("preregistered_at"), e.get("started_at")
-        if pre and start and pre > start:
-            problems.append(f"{tag}: criteria registered after the run started")
+        if pre and start and pre > start and not e.get("retrospective"):
+            problems.append(f"{tag}: criteria registered after the run started (mark it retrospective)")
+        if e.get("retrospective") and not (pre and start and pre > start):
+            problems.append(f"{tag}: retrospective entries must show criteria recorded after the start")
+        if e.get("kind") == "training" and not start and e.get("status") not in ("preregistered", "not_run"):
+            problems.append(f"{tag}: a run that started must record started_at")
     return problems
 
 
