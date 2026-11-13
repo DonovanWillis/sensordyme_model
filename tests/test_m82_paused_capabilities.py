@@ -49,6 +49,13 @@ def test_a_stopped_device_reports_paused_not_failing_and_resumes_ready(stack):
     assert caps["impaired"] == [], f"nothing is broken, only stopped: {caps['impaired']}"
     assert {"face", "inference"} <= set(caps["paused"]), caps
     assert "camera" in caps["available"], "the camera keeps capturing while stopped"
+    # Nothing that analyses is "producing results" while stopped, including the
+    # driver's calibrated attention; the hardware outputs keep their real state.
+    assert not ({"face", "objects", "hands", "inference", "attention"} & set(caps["available"])), caps
+    assert "attention" in caps["paused"], caps
+    assert not ({"camera", "audible_alert", "alert_output"} & set(caps["paused"])), caps
+    reasons = device.runtime.monitoring_report().to_dict()["reasons"]
+    assert reasons == ["monitoring stopped from the app"], reasons
 
     report = device.runtime.monitoring_report().to_dict()
     for name in caps["paused"]:

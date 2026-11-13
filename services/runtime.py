@@ -93,6 +93,11 @@ _ANNOTATE_FAILURE_LOG_EVERY = 300
 _FLASH_DURATION_S = 1.5
 #: Longest a module swap may run before the inference check treats it as hung.
 #: Model loading on a Pi CPU fallback has been measured in tens of seconds.
+#: Capabilities that are hardware, not analysis: they keep their real state while
+#: monitoring is stopped (the camera still captures; the outputs still work).
+_NOT_PAUSED_WHEN_STOPPED = frozenset({"camera", "audible_alert", "alert_output"})
+#: The stop reason in words for the app ("by uplink" was internal jargon).
+_STOP_SOURCE_WORDS = {"uplink": "from the app", "dashboard": "from the device's dashboard"}
 _MAX_SWAP_S = 120.0
 #: Quiet time after which a run of last-resort reboots counts as over.
 _REBOOT_CAMPAIGN_RESET_S = 24 * 3600.0
@@ -2185,10 +2190,14 @@ class DeviceRuntime:
         caps["inference"] = self._inference_capability(now, caps["camera"].available)
         caps.update(self._module_capabilities(module))
         if getattr(self, "_stopped", None) is not None:
-            # Nothing starts while stopped (e.g. the driver calibration waits for
-            # frames): paused, not "not ready after 30 s" (M8.2).
+            # Nothing starts or analyses while stopped (e.g. the driver calibration
+            # waits for frames): paused, not "not ready after 30 s", and an
+            # analysis capability is not "producing results" (M8.2). Real faults
+            # (impaired) and the hardware outputs (camera, alerts) keep their state.
             return {name: ms.Capability(ms.PAUSED, f"{name}: paused while monitoring is stopped")
-                    if cap.state == ms.STARTING else cap for name, cap in caps.items()}
+                    if cap.state == ms.STARTING
+                    or (cap.state == ms.AVAILABLE and name not in _NOT_PAUSED_WHEN_STOPPED)
+                    else cap for name, cap in caps.items()}
         if now - self._ready_grace_from >= _INFERENCE_STARTING_GRACE_S:
             # Bounded: a capability "starting" past the grace never came up.
             caps = {
@@ -2247,7 +2256,8 @@ class DeviceRuntime:
         """The device's monitoring state from what is observed right now."""
         now = time.monotonic()
         module = getattr(self, "module", None)
-        stopped = None if self._stopped is None else f"monitoring stopped by {self._stopped['by']}"
+        stopped = None if self._stopped is None else (
+            f"monitoring stopped {_STOP_SOURCE_WORDS.get(self._stopped['by'], 'by ' + str(self._stopped['by']))}")
         return ms.evaluate(
             stopped=stopped,
             capabilities=self._capabilities(now, module),
