@@ -94,9 +94,16 @@ final class AccessibilityAuditUITests: XCTestCase {
         // Such a finding is not accepted: the element is scrolled into the clear
         // band and audited again, and fails the test if it still fails there.
         var obscured: [Seen] = []
+        var unresolvedContrast = 0
         do {
             try app.performAccessibilityAudit(for: .all) { issue in
                 let label = issue.element?.label ?? ""
+                if issue.auditType == .contrast, issue.element == nil {
+                    // XCTest gave no element, so it cannot be located or re-checked in
+                    // place: re-audited below with the page moved (M8.4).
+                    unresolvedContrast += 1
+                    return true
+                }
                 if issue.auditType == .contrast, let element = issue.element, self.obscuredByBars(element.frame) {
                     obscured.append(Seen(label: label, frame: element.frame))
                     return true
@@ -126,6 +133,9 @@ final class AccessibilityAuditUITests: XCTestCase {
             lines.append(recheckContrastInClearBand(item.label, frame: item.frame, screen: screen,
                                                     pageOffset: &pageOffset))
         }
+        if unresolvedContrast > 0 {
+            lines.append(recheckUnresolvedContrast(count: unresolvedContrast, screen: screen))
+        }
         let report = lines.isEmpty ? "\(screen)\tno issues" : lines.joined(separator: "\n")
         let attachment = XCTAttachment(string: report)
         attachment.name = "audit_\(screen).txt"
@@ -154,6 +164,40 @@ final class AccessibilityAuditUITests: XCTestCase {
     private func obscuredByBars(_ frame: CGRect) -> Bool {
         let band = clearBand
         return frame.minY < band.top || frame.maxY > band.bottom
+    }
+
+    /// A contrast finding XCTest reported with NO element (M8.4): it cannot be
+    /// scrolled clear like a located one. Seen only with the device name's last
+    /// line under the translucent tab bar. Move the page by half the clear band
+    /// and audit contrast again: if no unresolved (or located, clear-of-the-bars)
+    /// finding remains, it was the bar's material; otherwise it fails as NEW.
+    private func recheckUnresolvedContrast(count: Int, screen: String) -> String {
+        let band = clearBand
+        dragPage(by: -(band.bottom - band.top) / 2, within: band)
+        _ = stillTexts()  // contrast is sampled from pixels: a still screen
+        var remaining = 0
+        do {
+            try app.performAccessibilityAudit(for: .contrast) { issue in
+                if let element = issue.element {
+                    if self.obscuredByBars(element.frame) { return true }
+                    let known = self.knownIssues.first {
+                        $0.screen == screen.components(separatedBy: "_").first && $0.type == issue.auditType
+                            && ($0.label.hasPrefix("=") ? element.label == String($0.label.dropFirst())
+                                                         : element.label.hasPrefix($0.label))
+                    }
+                    if known != nil { return true }
+                }
+                remaining += 1
+                return true
+            }
+        } catch {
+            XCTFail("\(screen): \(error)")
+        }
+        if remaining > 0 {
+            XCTFail("\(screen): \(remaining) contrast finding(s) remain after moving the page (first audit: \(count) unresolved)")
+            return "\(screen)\tcontrast\tNEW\tContrast failed (unresolved element; still failing with the page moved)\t\t\tunresolved"
+        }
+        return "\(screen)\tcontrast\tunresolved-bar-artefact\tGone when re-audited with the page moved\t\t\tunresolved x\(count)"
     }
 
     /// Scroll the text found at `frame` (where the audit saw it, `pageOffset`
