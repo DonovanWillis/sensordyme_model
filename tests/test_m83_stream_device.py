@@ -27,10 +27,10 @@ import urllib.error
 import urllib.request
 
 import numpy as np
-from m83_stream_client import StreamClient
 
 from core.dashboard import DashboardServer
 from core.frame_bus import FrameBus
+from sim.stream_client import StreamClient
 
 TOKEN = "m83-token"
 
@@ -403,6 +403,20 @@ def test_reconnect_keeps_the_stream_id_and_a_restart_resets_it():
         assert third.jpeg_parts()[0].int_header("X-Frame-Seq") < first.jpeg_parts()[-1].int_header("X-Frame-Seq")
     finally:
         rebooted.close()
+
+
+def test_closing_the_server_ends_open_streams_so_viewers_reconnect():
+    """close() used to stop only ACCEPTING: an open viewer kept a silent socket
+    to a server nobody fed (a health-monitor dashboard restart, the sim's
+    in-process reboot) until its own idle timeout."""
+    server = _server()
+    with _Pusher(server, fps=30):
+        client = StreamClient(server._port, TOKEN, heartbeat=True)
+        assert client.read_until(lambda c: len(c.jpeg_parts()) >= 2)
+        server.close()
+        assert client.read_until(lambda c: c.closed_by_peer, timeout=5), "the stream outlived its server"
+    client.close()
+    assert _wait(lambda: not server.has_viewers())
 
 
 def test_stream_stats_count_concurrent_connections():

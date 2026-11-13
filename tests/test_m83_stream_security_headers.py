@@ -17,9 +17,9 @@ import urllib.error
 import urllib.request
 
 import pytest
-from m83_stream_client import StreamClient
 
 from core.dashboard import DashboardServer
+from sim.stream_client import StreamClient
 
 TOKEN = "m83-headers-token"
 

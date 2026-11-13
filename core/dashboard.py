@@ -284,6 +284,9 @@ class DashboardServer:
         self._fallback_lock = threading.Lock()  # one encoder at a time, shared by all viewers
         self._fallback_bus_seq = 0
         self._stream_send_timeout_s = max(0.1, float(stream_send_timeout_s))
+        #: Set by close(): every open /stream loop ends, so viewers reconnect to
+        #: whatever serves next instead of holding a socket to a dead server.
+        self._closing = threading.Event()
         self._clients: dict[int, _StreamClient] = {}
         self._stream_counts: Counter = Counter()
         self._viewers = 0
@@ -532,6 +535,7 @@ class DashboardServer:
                 self._host,
             )
 
+        self._closing = threading.Event()  # a restart() serves streams again
         self._httpd = _BoundedThreadingHTTPServer(
             (self._host, self._port), _Handler, max_connections=_MAX_CONNECTIONS
         )
@@ -547,6 +551,11 @@ class DashboardServer:
         return f"http://{host}:{self._port}"
 
     def close(self) -> None:
+        # End the open streams too. shutdown() below only stops ACCEPTING: each
+        # viewer's handler thread kept looping on a server nobody fed any more,
+        # so after a dashboard restart (health monitor) the app held a silent
+        # socket until its idle timeout instead of reconnecting at once.
+        self._closing.set()
         if self._httpd is not None:
             self._httpd.shutdown()
             # Release the socket and forget the server. Without this, `_httpd`
@@ -636,7 +645,7 @@ class DashboardServer:
             # with no fresh frames -- a camera stall, a degraded detector, or the
             # gap before the first frame is encoded for a newly connected viewer
             # -- there is no write to fail. See _Handler._peer_gone().
-            while not peer_gone():
+            while not peer_gone() and not self._closing.is_set():
                 frame = self._current_frame()
                 now = time.monotonic()
                 if frame is not None and frame.seq != client.last_seq:

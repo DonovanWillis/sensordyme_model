@@ -17,13 +17,13 @@ import threading
 import time
 
 import numpy as np
-from m83_stream_client import StreamClient
 
 import services.runtime as runtime_module
 from core.alerts import AlertManager
 from core.dashboard import DashboardServer
 from modules.base import VisionModule
 from services.runtime import DeviceRuntime
+from sim.stream_client import StreamClient
 
 TOKEN = "m83-runtime-token"
 

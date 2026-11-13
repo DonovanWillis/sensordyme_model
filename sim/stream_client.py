@@ -3,8 +3,7 @@
 Reads the device's multipart/x-mixed-replace stream the way the app does
 (raw socket, one connection, header token) and splits it into parts with
 their headers, so a test can assert on X-Frame-Seq / X-Frame-Age-Ms /
-X-Stream-Id and on heartbeat parts. Not a test module itself (no test_
-prefix); imported by tests/test_m83_stream_*.py and scripts/sim/stream_soak.py.
+X-Stream-Id and on heartbeat parts. Imported by tests/test_m83_stream_*.py and scripts/sim/stream_soak.py.
 """
 
 from __future__ import annotations
@@ -63,7 +62,12 @@ class StreamClient:
         query_token: Optional[str] = None,
         recv_buffer: Optional[int] = None,
         host: str = "127.0.0.1",
+        keep_bodies: bool = True,
     ) -> None:
+        #: False for long runs: keep each part's headers and timing, not its JPEG.
+        self.keep_bodies = keep_bodies
+        #: Largest unparsed buffer seen (the client-side buffer bound).
+        self.max_buffer = 0
         self.sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         if recv_buffer is not None:
             self.sock.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, recv_buffer)
@@ -98,6 +102,7 @@ class StreamClient:
             return False
         self.raw_bytes += len(chunk)
         self._buffer += chunk
+        self.max_buffer = max(self.max_buffer, len(self._buffer))
         return True
 
     def _drain(self) -> None:
@@ -123,7 +128,7 @@ class StreamClient:
                 return
             body = self._buffer[body_start:body_start + length]
             self._buffer = self._buffer[body_start + length:]
-            self.parts.append(Part(headers, body, time.monotonic()))
+            self.parts.append(Part(headers, body if self.keep_bodies else b"", time.monotonic()))
 
     def read_for(self, seconds: float) -> "StreamClient":
         deadline = time.monotonic() + seconds
