@@ -81,6 +81,13 @@ class SimStack:
         self.power_cut()
         return self.boot(scenario, **kwargs)
 
+    def restart_backend(self) -> None:
+        """The backend process restarts (M8.4): same database, a fresh import of
+        cloud/app.py, no in-memory state carried over. The device keeps its link."""
+        self.backend.close()
+        self.backend = InProcessBackend(self.root / "backend", self.clock)
+        self.transport.retarget(self.backend.client)
+
     def close(self) -> None:
         try:
             self.power_off()

@@ -218,7 +218,12 @@ class VirtualDevice:
         text = yaml.safe_dump(self.config(), sort_keys=False)
         if self.config_damage is not None:
             text = CONFIG_DAMAGE[self.config_damage](text)
-        path.write_text(text)
+        try:
+            unchanged = path.read_text() == text
+        except (OSError, UnicodeDecodeError):
+            unchanged = False
+        if not unchanged:  # a reboot onto a read-only card still boots (M8.4)
+            path.write_text(text)
         return path
 
     # ------------------------------------------------------------------ build
