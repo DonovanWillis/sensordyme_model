@@ -214,7 +214,29 @@ Reading:
 
 ## 8. B4: Hailo deployment preparation
 
-(filled after the export job; see below)
+Filled by the integrator from the committed tooling and fleet artifacts, because the BETA stream was stopped
+before it reported.
+
+- **Tooling probe (oryn job `20261113-090503-dc1833`).** No Hailo SDK, Dataflow Compiler,
+  `hailo_platform` or zoo on the fleet: only `onnxruntime` and `onnx`, on x86_64.
+  - **Compiled-artifact validation:** NOT DONE.
+  - **Hailo runtime:** NOT DONE, needs the Pi.
+  - Installing the proprietary DFC needs owner approval.
+- **Device-layout export of EXP-08 (oryn job `20261113-090349-6d22e9`, `research/m84/device_export.py`).** It
+  writes 6 heads in the device's layout (80/40/20 grids, 68-channel box heads), with person, phone and hand in
+  class slots 0/67/80 of an 81-channel class head:
+  - ONNX sha `f591a6b6…a609`, heads81 sha `a0327a25…aa1`.
+  - **Parity:** torch vs ONNX |Δ| max 6.5e-5 (box) and 1.5e-6 (cls); heads81 vs heads3 identical; unused
+    channels exactly 0.
+  - **Product decoders drop channel 80 (hand).** Both `legacy` and `reference` keep 80 COCO classes, so a 3-class
+    model on the device would report person and phone but never hand until the decoder is changed. That is a
+    product-code change, not made here.
+  - **The job was a smoke run (`--limit 30`).** Its `score_exp08_device_*_val.json` files score 30 images
+    against the full val ground truth (4,008 persons), so their "AP50" values (person 0.011, phone 0.039) are
+    an artefact of coverage. **They are not accuracy and must not be cited.**
+  - A full-val device-path run of the export was not completed.
+- **Float fixtures** for a future compiled `.hef`: `exp08_known_good_expected_float.json` and
+  `exp08_oi_val_expected_float.json`, in the job's artifacts (`~/sensordyme-fleet/runs/20261113-090349-6d22e9/`).
 
 ## 9. Artifacts (hashes; large files stay on the workers)
 
