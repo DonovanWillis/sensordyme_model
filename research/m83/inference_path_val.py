@@ -266,7 +266,12 @@ def main(argv=None) -> int:
                                                                             "device_legacy_native_res")}
     stats = {"images": 0, "input_identical": 0, "legacy_parity": 0, "candidate_parity": 0,
              "legacy_max_diff": 0.0, "candidate_max_diff": 0.0, "mismatch_examples": [],
-             "dets_at_floor": 0, "dets_at_product_conf": 0}
+             "dets_at_floor": 0, "dets_at_product_conf": 0,
+             # The ONNX class heads have 81 channels too, so channel 80 is the model's own
+             # (mmdet-style background slot), not Hailo padding. Every decoder drops it;
+             # record what it holds so that is a measured statement.
+             "class_channel_80_max": 0.0, "class_channel_80_mean_sum": 0.0,
+             "class_head_min": 1.0, "class_head_max": 0.0, "box_head_min": 0.0, "box_head_max": 0.0}
     timing = {"predict_total_ms": [], "infer_ms": [], "decode_ms_conf020": [], "preprocess_ms": [],
               "decode_reference_ms_conf020": []}
     t_start = time.perf_counter()
@@ -285,6 +290,16 @@ def main(argv=None) -> int:
         (res,) = model.predict(bgr, conf=FLOOR)
         batch, heads = captured["batch"], captured["heads"]
         stats["images"] += 1
+        for arr in heads.values():
+            if arr.shape[-1] == 81:
+                ch80 = arr[..., 80]
+                stats["class_channel_80_max"] = max(stats["class_channel_80_max"], float(ch80.max()))
+                stats["class_channel_80_mean_sum"] += float(ch80.mean()) / 3
+                stats["class_head_min"] = min(stats["class_head_min"], float(arr[..., :80].min()))
+                stats["class_head_max"] = max(stats["class_head_max"], float(arr[..., :80].max()))
+            else:
+                stats["box_head_min"] = min(stats["box_head_min"], float(arr.min()))
+                stats["box_head_max"] = max(stats["box_head_max"], float(arr.max()))
         ref_batch = independent_letterbox(rgb)
         same_input = np.array_equal(batch, ref_batch)
         stats["input_identical"] += int(same_input)

@@ -15,7 +15,11 @@ What it models, and where each property comes from:
   output layout  six outputs, NHWC float32 (1, G, G, C): grids 80/40/20 with a
                  68-channel box head (4 sides x 17 DFL bins, raw logits) and an
                  81-channel class head (80 COCO sigmoid probabilities + 1
-                 padding channel) at each grid, no on-chip NMS. Source: the
+                 extra channel) at each grid, no on-chip NMS. The float ONNX
+                 class heads are 81 channels as well (fleet job
+                 20261113-043758-b69ebe), so the 81st is the network's own
+                 mmdet-style background slot, not compiler padding; every
+                 decoder drops it. Source: the
                  `hailortcli parse-hef` expectation in
                  docs/HAILO_HARDWARE_VALIDATION.md (step 6: "six outputs at grids
                  80/40/20 with 68 and 81 channels") and core/accel.py's notes
