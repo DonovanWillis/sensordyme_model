@@ -37,6 +37,8 @@ ACCOUNT = {
     ("POST", "/v1/logout"), ("POST", "/v1/account/ntfy"), ("POST", "/v1/account/phone"),
     ("POST", "/v1/orders"), ("GET", "/v1/orders"), ("GET", "/v1/devices"),
     ("POST", "/v1/devices/claim"), ("GET", "/v1/presets"), ("GET", "/v1/capability-tiers"),
+    # M8.4: deletes the CALLER's account only (password re-checked; tests/test_m84_privsec_account.py).
+    ("POST", "/v1/account/delete"),
 }
 #: Routes that name a device in the body rather than the path.
 DEVICE_IN_BODY = {("POST", "/v1/ai/configure")}

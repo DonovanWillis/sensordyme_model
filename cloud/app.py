@@ -2604,6 +2604,71 @@ def logout(payload: dict = Depends(current_token)) -> dict:
     return {"ok": True}
 
 
+class DeleteAccountBody(BaseModel):
+    """M8.4: deleting an account needs the password again and an explicit confirm."""
+
+    password: str = Field(max_length=MAX_PASSWORD_LEN)
+    confirm: bool = False
+
+
+#: Device columns that hold what the OWNER configured or said (names, areas,
+#: typed instructions, AI rules, pending commands). Cleared when the account is
+#: deleted; the device's own identity, key and health stay with the device.
+_OWNER_DEVICE_COLUMNS = (
+    "zones", "ai_rules", "ai_rules_draft", "ai_rules_promoted_from", "desired_preset", "desired_protection",
+    "protection_request", "desired_nodes", "preset_rejection", "nodes_rejection", "rejection_baseline",
+    "monitoring",
+)
+
+
+@app.post("/v1/account/delete")
+def delete_account(body: DeleteAccountBody, request: Request, payload: dict = Depends(current_token)) -> dict:
+    """Delete the caller's account and the data it owns (M8.4, docs/PRIVACY.md §5).
+
+    One transaction: every event of every device the account owns, its orders
+    and the user row are deleted; each device is released (owner cleared, the
+    owner's configuration cleared, its name reset, camera-only explicitly OFF)
+    so it can be claimed again and never carries the old owner's settings.
+    Every session ends: `current_token` refuses a token whose user row is gone.
+
+    NOT done (stated, not hidden): the device's own copies -- data/events.csv,
+    saved rules, zones and the camera-only setting on the device itself -- stay
+    until the device is reset by hand (docs/PRIVACY.md); the database file may
+    keep deleted rows in free pages until SQLite reuses them (no VACUUM here).
+    """
+    if not body.confirm:
+        raise CodedError(400, "confirmation_required", "deleting the account requires confirm: true")
+    if not LOGIN_LIMITER.allow(_client_ip(request)):
+        raise HTTPException(429, "too many attempts — try again in a few minutes")
+    uid = payload["uid"]
+    with db() as conn:
+        user = conn.execute("SELECT * FROM users WHERE id = ?", (uid,)).fetchone()
+        if user is None or not hmac.compare_digest(_hash_pw(body.password, user["salt"]), user["pw_hash"]):
+            LOGIN_FAILURE_LIMITER.record(str(payload.get("email") or uid))
+            raise CodedError(403, "wrong_password", "the password is not correct")
+        devices = [r["id"] for r in conn.execute("SELECT id FROM devices WHERE owner_id = ?", (uid,))]
+        events = 0
+        columns = {r["name"] for r in conn.execute("PRAGMA table_info(devices)")}
+        cleared = ", ".join(f"{c} = NULL" for c in _OWNER_DEVICE_COLUMNS if c in columns)
+        for device_id in devices:
+            events += conn.execute("DELETE FROM events WHERE device_id = ?", (device_id,)).rowcount
+            conn.execute(
+                f"UPDATE devices SET owner_id = NULL, name = 'SensorDyme', {cleared}, "  # noqa: S608 - fixed column names
+                "custom_monitoring_wanted = 0, ai_rules_activation = 0, camera_mode = ? WHERE id = ?",
+                (json.dumps({"camera_only": False, "id": secrets.token_hex(6), "requested_at": time.time()}),
+                 device_id),
+            )
+        orders = conn.execute("DELETE FROM orders WHERE user_id = ?", (uid,)).rowcount
+        conn.execute("DELETE FROM users WHERE id = ?", (uid,))
+        jti = payload.get("jti")
+        if jti is not None:
+            conn.execute("INSERT OR REPLACE INTO revoked_tokens (jti, exp) VALUES (?, ?)",
+                         (jti, float(payload.get("exp", time.time() + JWT_TTL_S))))
+    log.info("account deleted: %d device(s) released, %d event(s) and %d order(s) deleted",
+             len(devices), events, orders)
+    return {"ok": True, "devices_released": len(devices), "events_deleted": events, "orders_deleted": orders}
+
+
 #: What ntfy itself accepts as a topic name, and nothing else.
 #
 # The topic IS the credential: ntfy has no accounts, so anyone who knows the
