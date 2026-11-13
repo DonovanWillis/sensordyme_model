@@ -152,8 +152,11 @@ def test_the_runtime_stamps_where_the_sample_is_generated():
 
     runtime = DeviceRuntime.__new__(DeviceRuntime)  # no hardware: only the stamping path
     runtime._collect_component_health = lambda caller: {"camera": {"state": "ok"}}
-    runtime.monitoring_report = lambda: types.SimpleNamespace(to_dict=lambda: {"state": "ready"}, monitoring=True)
-    runtime.protection_state = lambda: {"state": "protecting"}
+    # M8.3: both blocks come from one evaluation, passed to each.
+    runtime._evaluate_monitoring = lambda: "one evaluation"
+    runtime.monitoring_report = lambda evaluation=None: types.SimpleNamespace(
+        to_dict=lambda: {"state": "ready"}, monitoring=True)
+    runtime.protection_state = lambda evaluation=None: {"state": "protecting"}
     runtime._config_report = dict
     runtime.uplink = None
     first = runtime._collect_health("uplink")["stamp"]

@@ -203,6 +203,17 @@ enum PerceptionPresentation {
 
     /// The component rows for the health card, worst first. Empty when the
     /// device isn't reporting: an old "working" is never repeated.
+    /// The rows for a device's status (M8.3): as below, and while monitoring is
+    /// stopped a component still reported working (a device before M8.2) reads
+    /// paused -- nothing is analysed.
+    static func componentRows(status: DeviceStatus?, live: Bool) -> [PerceptionComponentRow] {
+        let stopped = status?.monitoringState == "stopped" || status?.protection == "stopped"
+        return componentRows(status?.perception, live: live).map { row in
+            guard stopped, row.tone == .ok || row.tone == .caution else { return row }
+            return .init(name: row.name, title: row.title, detail: CapabilityHealth.pausedDetail, tone: .neutral)
+        }
+    }
+
     static func componentRows(_ report: PerceptionReport?, live: Bool) -> [PerceptionComponentRow] {
         guard live, let report else { return [] }
         let order = ["object_detector", "face_landmarks", "hand_landmarks", "pose"]
@@ -297,9 +308,23 @@ enum CapabilityChecks {
                              verdict: .unavailable(node.reason.flatMap { $0.isEmpty ? nil : $0 }
                                                    ?? "missing on this device"))
             }
-            if caps?.paused?.contains(name) == true {
+            if caps?.paused?.contains(name) == true
+                || (status?.monitoringState == "stopped" && CapabilityHealth.analysisCapabilities.contains(name)) {
                 return .init(name: name, title: title, required: required,
                              verdict: .paused(CapabilityHealth.pausedDetail))
+            }
+            // M8.3: the module's own impairment wins over a healthy component (as
+            // the backend's capability_states does): the model may be fine while
+            // the module cannot use it. And nothing is analysed without frames
+            // or a running inference loop.
+            if let impaired = caps?.impaired?.first(where: { $0.name == name }) {
+                return .init(name: name, title: title, required: required,
+                             verdict: .unavailable(impaired.reason.flatMap { $0.isEmpty ? nil : $0 } ?? "not working"))
+            }
+            if CapabilityHealth.analysisCapabilities.contains(name),
+               let down = caps?.impaired?.first(where: { $0.name == "camera" || $0.name == "inference" }) {
+                return .init(name: name, title: title, required: required,
+                             verdict: .unavailable("no analysis while \(down.name) is unavailable"))
             }
             if let componentName = PerceptionPresentation.componentForCapability[name],
                let component = report?.components[componentName] {

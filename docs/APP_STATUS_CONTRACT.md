@@ -39,7 +39,18 @@ for it treats a missing `status` (an older backend) as "no truth available".
 | `preset_rejection` | {`preset`, `code`, `reason`, `at`} \| null | A stored mode request that will not run, and why. `code` is `role_forbids_preset` when the backend dropped it for the device's role, or the device's own code (`device_refused` when it gave none) when the DEVICE refused it (M7: unknown mode, module build failure, role). Either way the request is no longer re-sent. The next accepted mode request clears it. |
 | `nodes_rejection` | {`node`, `code`, `reasons`, `at`} \| null | A companion-node request (`POST /v1/devices/{id}/nodes`) the device refused; the request is no longer re-sent. The next node request for that node clears it. |
 | `perception` | object \| null | M7 shared perception, exactly as the device reports it (`docs/M7_IMPLEMENTATION_MAP.md` wire contract): `schema`, `simulated`, `components` {name: {`state` `ok`\|`stale`\|`failed`\|`unavailable`\|`idle`\|`unknown`, `model`, `last_run_age_s`, `runs`, `errors`, `reason`, `consumers`}} and `nodes` [{`id`, `kind`, `version`, `preset`, `state` `active`\|`degraded`\|`inactive`\|`failed`\|`unknown`, `required_capabilities`, `missing_capabilities`, `validation`, `experimental`, `reason`}]. Null when stale or not reported by this software; never filled in by the backend. A state outside the vocabulary reads `unknown`. |
-| `last_command_id` | string \| null | The id of the last protection command the device applied (`POST .../protection` returns it). Null when stale or not reported. |
+| `last_command_id` | string \| null | The id of the last protection command the device handled, applied or refused (`POST .../protection` returns it). Null when stale or not reported. An echo is an answer, not a success: compare the state, or read `protection_command.outcome`. |
+| `protection_command` | object \| null | M8.3, additive. The last stop/resume asked for on this device and what the DEVICE did with it; null when none was ever sent. Not withheld when stale: it is a record of an acknowledgement, with its time. Fields below. |
+| `protection_command.id` | string | The `command_id` `POST .../protection` returned. |
+| `protection_command.action` | `stop` \| `resume` | |
+| `protection_command.outcome` | `pending` \| `confirmed` \| `mismatch` \| `timed_out` | `confirmed`: the device echoed this id with the requested state (`stopped` for a stop, anything else for a resume). `mismatch`: it echoed this id with another state (it refused, or something changed it first). `timed_out`: no echo within `timeout_s`. Latched from the first report carrying the echo; a later restart or local change does not rewrite it. |
+| `protection_command.delivering` | bool | Whether the backend still sends it. A stop is delivered for 30 s (`PROTECTION_STOP_DELIVERY_S`) and then withdrawn, so a stop is never applied minutes after the person gave up on it; a resume is delivered until applied (late protection is the safe direction). |
+| `protection_command.age_s` | number \| null | Seconds since the request, backend clock. |
+| `protection_command.timeout_s` | number | 45 (`PROTECTION_ACK_TIMEOUT_S`, the app's `ProtectionControl.timeout`). |
+| `protection_command.applied_at` | number \| null | Backend receipt time of the first report echoing this id. |
+| `protection_command.reported_state` | string \| null | The protection state that report carried. |
+| `protection_command.reason` | string \| null | For `mismatch`: the device's refusal reason (a new `last_rejection` of kind `protection`), else the state it reported. |
+| `corrections` | [string] | M8.3, additive. Claims the backend withdrew because the device's report contradicted its own rules (see "Coherence" below). Empty for a coherent report and whenever `stale`. |
 | `policies` | [{`id`, `kind`, `name`, `can_evaluate`, `operational`, `unavailable_events`, `reasons`}] \| null | Each active policy (the mode, each custom rule) and whether the device can evaluate it now. Null when stale. |
 | `actuators` | [{`name`, `kind`, `audible`, `ready`, `detail`, `commands_ok`, `commands_failed`, `physically_verified`}] \| null | Configured alert outputs, as far as software can tell (`physically_verified` is false until a person confirmed it). Null when stale. |
 | `stale` | bool | True when the status's evidence cannot be trusted now: `link_stale` (the device has sent nothing for 30 s, `_HEALTH_STALE_S`, the same window as `online`, or has never reported) **or** `health_stale` (M8.1: the device is polling, but the health sample it sends is 30 s old or more). Before M8.1 only the first half existed; an app that reads only `stale` therefore falls to "unknown" on a frozen sample, which is the safe direction. |
@@ -67,6 +78,45 @@ polling while re-sending a frozen sample is never "protecting". The `reasons`
 then say "the device is connected, but its monitoring status has not been
 updated for N s". `GET /v1/devices` `health` is withheld (null) on the same
 rule; `online` stays link-only.
+
+## Coherence (M8.3)
+
+The backend invents no state, but it never forwards a claim the device's own
+rules forbid (`_make_coherent` in `cloud/app.py`; the rules are
+`core/monitoring_state.py` and `services/runtime.py`). Every correction only
+WITHDRAWS a claim, is listed in `corrections`, and is applied only to a live
+status:
+
+| Report says | Status says | Device rule |
+|---|---|---|
+| `stopped` in one block, something else in the other | `stopped` in both | an explicit stop is authoritative |
+| stopped, with an analysis capability (`face`, `objects`, `hands`, `pose`, `attention`, `inference`) `available` | moved to `paused`; perception components `ok`/`stale`/`idle` read `paused` | M8.2: nothing analyses while stopped |
+| `camera` or `inference` impaired, an analysis capability `available` | moved to `impaired` ("no analysis: camera unavailable …") | nothing produces results without frames or a running loop |
+| a perception component `failed` / `unavailable`, its capability `available` | removed from `available` (`failed`: into `impaired`; `unavailable`: left to the perception report, which `capability_states` reads as `unsupported`) | a missing model produces nothing |
+| `ready` / `degraded` with `camera` or `inference` impaired | `failed`, with the reason | `BASE_REQUIREMENTS`: no policy can evaluate |
+| `protecting` while not `ready`/`degraded` | `not_protecting`, reason "monitoring state is X" | `MonitoringReport.monitoring` |
+
+`monitoring_active` is re-derived from the corrected state. A current device
+sends coherent reports (the M8.3 device computes the monitoring and protection
+blocks from ONE evaluation), so `corrections` is normally empty; it is there
+for older firmware and torn samples. Tests: `tests/test_m83_truth_invariants.py`.
+
+## Stop / resume acknowledgement (M8.3)
+
+`POST /v1/devices/{id}/protection` answers `{ok, desired_protection, command_id, timeout_s}`.
+Nothing is a success until the device echoes `command_id` with the requested
+state; `status.protection_command` carries the outcome:
+
+    pending ──echo + requested state──▶ confirmed
+       │    ──echo + another state────▶ mismatch (reason)
+       └────no echo within 45 s───────▶ timed_out
+                                          stop: withdrawn after 30 s, never applied late
+                                          resume: still delivered; confirmed if it lands later
+
+The app (`ios/Sources/ProtectionControl.swift`) shows pending → confirmed /
+mismatch / failed (a timed-out stop) / overdue (a timed-out resume, "still
+stopped"). Tests: `tests/test_m83_truth_protection_ack.py`,
+`ios/Tests/ProtectionControlTests.swift`.
 
 ## Health freshness (M8.1)
 

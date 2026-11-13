@@ -707,7 +707,7 @@ struct DeviceDetailView: View {
             }
             // The shared perception engine's components, as the device
             // reports them: one model run feeds every mode that needs it.
-            let components = PerceptionPresentation.componentRows(device.status?.perception, live: deviceLive)
+            let components = PerceptionPresentation.componentRows(status: device.status, live: deviceLive)
             ForEach(components) { row in
                 healthRow(row.title, systemImage: "cpu",
                           HealthComponent(state: row.tone.healthState, detail: row.detail, metrics: nil))
@@ -1496,8 +1496,7 @@ struct DeviceDetailView: View {
     // MARK: Stop / resume
 
     private var protectionReport: ProtectionReport {
-        ProtectionReport(protection: device.status?.protection, monitoringState: device.status?.monitoringState,
-                         lastCommandID: device.status?.lastCommandID, live: deviceLive)
+        ProtectionReport(status: device.status, live: deviceLive)
     }
 
     /// The control the device's state calls for, beside the readout: Stop
@@ -1517,7 +1516,7 @@ struct DeviceDetailView: View {
             switch phase {
             case .pending: return "Waiting for \(device.name) to confirm"
             case .overdue: return "Not confirmed yet — tap to send again"
-            case .confirmed(let text): return text
+            case .confirmed(let text), .failed(let text), .mismatch(let text): return text
             case .idle: break
             }
             if let notice = protectionNotice, Date().timeIntervalSince(notice.at) < 20 { return notice.text }
@@ -1570,6 +1569,7 @@ struct DeviceDetailView: View {
         case .pending(let text): return (text, SD.Colors.textSecondary)
         case .overdue(let text): return (text, SD.Colors.warning)
         case .confirmed(let text): return (text, SD.Colors.textSecondary)
+        case .failed(let text), .mismatch(let text): return (text, SD.Colors.warning)
         case .idle: break
         }
         if let notice = protectionNotice, Date().timeIntervalSince(notice.at) < 20 {
@@ -1614,8 +1614,10 @@ struct DeviceDetailView: View {
     /// tracking it: a later stop or resume from elsewhere must not be read
     /// against this one.
     private func settleProtection() {
+        // Any final outcome (M8.3: confirmed, failed, mismatch) ends the wait.
         guard let request = protectionRequest,
-              case .confirmed(let text) = ProtectionControl.phase(request, report: protectionReport, now: Date())
+              case let phase = ProtectionControl.phase(request, report: protectionReport, now: Date()),
+              phase.isFinal, let text = phase.text
         else { return }
         protectionRequest = nil
         protectionNotice = (text, Date())
