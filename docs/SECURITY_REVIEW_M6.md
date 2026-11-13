@@ -122,3 +122,113 @@ The documented limits stand: offline guessing from a recorded session, a lockout
 * the `auth_nonces` write cost at fleet poll rates on the deployed backend;
 * BLE PoP over a physical link;
 * `revoke-device` and `require-signed` exercised on a deployed backend.
+
+## 6. Mission 8.3 review (authorization, logs, client storage, evidence)
+
+Base `66cf6b6`. Scope: every `/v1` route's authorization, stream access, credential storage on the
+device, the backend and the phone, token handling, BLE provisioning logs, transport, log contents,
+evidence retention and the in-app diagnostics. Replay resistance (§5) was spot-checked only: the M8
+suites pass unchanged. Each fix has a test that fails on `66cf6b6`. Evidence is in
+`~/sensordyme-audit/2026-11-10/m83-evidence/security/`, and it holds no secrets.
+
+| # | Finding | Severity | Fix | Proving tests |
+|---|---|---|---|---|
+| M83-1 | A failed ntfy push logged `%r` of the `requests` exception. Its text is the request URL `https://ntfy.sh/<topic>`, and the topic is the whole credential of the account's alert channel. A failed Twilio send logged the account SID the same way. | Medium (backend log readers can subscribe to an account's alerts) | `core.logging_setup.describe_failure` logs only the exception type and HTTP status. | `tests/test_m83_security_logs.py::test_a_failed_push_never_logs_the_ntfy_topic`, `::test_a_failed_sms_never_logs_the_twilio_account` |
+| M83-2 | With no Twilio configured, the backend's log-only SMS path printed every account's phone number on every serious alert. | Low (PII in logs) | `mask_phone` keeps the last two digits. | `::test_the_log_only_sms_masks_the_phone_number` |
+| M83-3 | `subprocess.TimeoutExpired` quotes nmcli's argv. `WifiManager._roll_back` logged `could not restore the previous network: %s`, which put the restored Wi-Fi passphrase in the journal when `connection modify … wifi-sec.psk` stalled. | Medium (PSK in journald) | `core.network._run` re-raises the timeout with every passphrase argument replaced by `<redacted>`. The join paths already caught the timeout and are now pinned. | `::test_a_stalled_rollback_never_logs_the_restored_passphrase`, `::test_a_stalled_join_never_returns_or_logs_the_passphrase[connect,provision]`, `::test_the_redaction_keeps_the_rest_of_the_command` |
+| M83-4 | `/v1` answers carried no `Cache-Control`. The app sends everything through `URLSession.shared`, whose default `URLCache` stores GET answers on disk. Reproduced on Foundation: the answer is cached without the header and not cached with `no-store`. A device list, an alert history or an explanation outlived sign-out and an account change on a shared phone, and an HTTP cache in front of the backend could replay them. | Low–Medium (privacy at rest) | `_NoStore`, a pure ASGI middleware, sets `Cache-Control: no-store` on every `/v1` response. | `tests/test_m83_security_routes.py::test_every_v1_answer_is_marked_no_store` |
+| M83-5 | The phone's Keychain items (the 30-day session JWT, the device dashboard token that opens the camera, the ntfy topic) were `AfterFirstUnlock`. An encrypted iCloud or Finder backup restores that class onto any phone. | Low–Medium (backup holder gets a live session and the camera) | `AfterFirstUnlockThisDeviceOnly`, which background polling can still read. Never synchronizable. Updates carry the class, and `get()` re-classes an older item on first read. The cost: a restore to a new phone signs in once and re-enters the device token. | `ios/Tests/KeychainTests.swift` (attributes only, no real keychain) |
+
+**Route-authorization matrix.** `tests/test_m83_security_routes.py` enumerates FastAPI's routes:
+26 routes, 3 public, 1 device key, 9 account, and 13 device-scoped (12 by path, plus
+`/v1/ai/configure` by body). A route that nobody has classified fails the suite. Every non-public
+route must depend on `current_token` or `current_device`. Each device-scoped route is driven with a
+valid body three ways:
+
+* as a second account on the owner's device;
+* as that account on a missing device;
+* anonymously.
+
+All 13 answer 404, 404 and 401. The two 404s carry identical details, so there is no ownership
+oracle, and nothing is written. Further pins cover four cases:
+
+* `explain` through the caller's own device id with another account's event;
+* `GET /v1/devices` and `/v1/orders` show only the caller's rows, never a claim code or key;
+* claiming another account's code is a 409 and ownership does not move;
+* a device key reaches no account route.
+
+**No defect found** in authorization. Every scoped handler goes through `_owned_device` in the
+transaction it writes in. `ai_configure` re-checks `owner_id` in its UPDATE. No transfer or unclaim
+endpoint exists, which leaves no TOCTOU window.
+
+**Log sweep.** Signup, both login outcomes, claim (unknown and valid), ntfy and phone settings,
+ingest (good key, wrong key, stale sd-auth-v1), logout and a revoked-session request are captured
+from `uvicorn.error` and stdout. None of the following appears: the password, the email, the claim
+code, the device key, the session JWT, the topic or the phone number (`::test_representative_backend_paths_log_no_credentials`).
+The device side was reviewed by reading the code:
+
+* the uplink prints reason codes, never keys or command bodies;
+* BLE logs the SSID clipped with `%r` and never the passphrase, the setup code or the tag (M6 tests);
+* the dashboard silences per-request logging, so `/stream?token=` is not logged on the device;
+* `secret_store` messages name paths and fields, never values.
+
+SSIDs are still logged at INFO, which is accepted: an SSID is not a credential.
+`cloud/manage.py` and `scripts/ble_setup_code.py` print keys and codes by design. They are operator
+provisioning output.
+
+**Reviewed, unchanged by design (documented):**
+
+* *JWT.* The TTL is 30 days with no refresh token. `exp`, `jti`, `uid` and `email` are required, and
+  logout revokes the current `jti`. The app deletes `authToken` on sign-out and on any 401
+  (`expireSession`). It keeps the device token and the ntfy topic until a *different* account signs
+  in (`claimLocalState`), so that an expired session does not force a re-pair. On a shared phone,
+  sign-out alone leaves the camera token in the Keychain.
+* *Transport.* `NSAllowsArbitraryLoads: true` is unscoped, and it has to be: ATS has no key for LAN
+  IP literals. Adding `NSAllowsLocalNetworking` makes iOS ignore `NSAllowsArbitraryLoads`, and the
+  public-range campus addresses measured in `ios/project.yml` would then be blocked. The rule is enforced in the
+  app: `BackendResolution.cleartextPermitted` refuses plain HTTP to any internet DNS name before a
+  password or token leaves (`API.swift`, `BackendAPI.swift`, Settings).
+* *MJPEG over http on the LAN.* The app sends `X-Device-Token` in a header, through an ephemeral
+  session with no URL cache, and never in a URL. The token and the video still cross the Wi-Fi in
+  cleartext. Anyone on the same network who can sniff it (open Wi-Fi, a shared PSK, a compromised
+  AP) can take both. This needs device TLS, which is a production item.
+* *`?token=` URLs.* `/stream` still accepts `?token=` (GET only, since M6) for the browser
+  dashboard's `<img>`, and the browser dashboard and the legacy hotspot `/setup?token=` page put the
+  token in the page URL, where it lands in browser history. The iOS app opens `/setup?token=` in
+  Safari only on the legacy hotspot path. BLE is the default.
+* *Device keys* are stored in plaintext in the backend's SQLite, which is 0600 (M8). The nmcli argv
+  exposure via `/proc/*/cmdline` stands (§3).
+* *Diagnostics.* `DiagnosticsView` shows the account email and backend address, and never a token.
+  `SetupDebugPanel` shows the BLE phase, the device id and the credential *mode*, never a code,
+  token or PSK. Neither copies or shares anything. No release-build change is needed.
+
+**Evidence retention (report only; no user files changed).** A scan of the text files under
+`~/sensordyme-audit/2026-11-10` found no real credentials. Counts and file names only are in
+`evidence_retention_scan.json`. The findings:
+
+* `scripts/sim/ios_uitest.sh` runs its throwaway stack *inside* the evidence directory
+  (`--work "$OUT/stack"`) and leaves the following behind in `design-evidence/*`,
+  `m8-evidence/ios/*` and `m81-evidence/ios/*`:
+  * `backend/.jwt_secret` and `backend/sensordyme.db`, both 0600;
+  * `backend/factory.json`, 0644, holding device keys, claim codes and the fixed demo password;
+  * `device/config.yaml` and `identity.json`, 0644, holding the device key.
+
+  These credentials are generated for each run and only ever served on a local sim backend, so
+  they are worthless once it stops. If the evidence is ever shared, they are key material in
+  readable files.
+* The backend, device and xcodebuild logs hold sim claim codes. The xcresult screenshots show only
+  `@sensordyme.local` demo accounts.
+* A pytest failure trace in `m82-evidence` prints a fixture JWT signed by a temp test secret.
+* `evidence/` and `m01-evidence/` (`freeze.txt`, `sdrun-state.json`) contain compute-fleet
+  addresses (Tailscale 100.64/10 and campus addresses).
+* The public `docs/audit` redaction (afee07a) holds: only placeholders (`$TOKEN`, `?token=…`)
+  appear in `docs/`.
+
+**For other streams (not changed here).** STREAM (`core/dashboard.py`): send
+`Cache-Control: no-store` on `/api/*` JSON and `/stream`, and `Referrer-Policy: no-referrer` on the
+`/` and `/setup` pages, whose URLs carry `?token=`. IOS-PRODUCT: refuse redirects that change host or
+drop to `http` in `APIClient` (a `URLSessionTaskDelegate`), because `cleartextPermitted` checks only
+the first URL. Optionally, clear `deviceToken` on an explicit `signOut()` but not on `expireSession`.
+Sim tooling: run `uitest_control.py --work` under `mktemp -d` and copy only `*.log` into `$OUT`,
+or delete `stack/backend/{.jwt_secret,sensordyme.db,factory.json}` and `stack/device/config.yaml`
+at the end of `ios_uitest.sh`.
