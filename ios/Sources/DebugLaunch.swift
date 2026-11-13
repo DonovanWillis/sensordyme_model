@@ -19,6 +19,9 @@ enum DebugLaunch {
     static var openJupiter: Bool { args.contains("-orynOpenJupiter") }
     /// Open the device's event history.
     static var openHistory: Bool { args.contains("-orynOpenHistory") }
+    /// Open one event's detail sheet: `latest`, or `experimental` (the newest
+    /// experimental observation), e.g. `-orynOpenEvent experimental`.
+    static var openEvent: String? { value(after: "-orynOpenEvent") }
     /// Scroll the device screen to its last section.
     static var scrollToBottom: Bool { args.contains("-orynScrollBottom") }
     /// Open the full-screen camera from the device screen (to record its zoom).
@@ -59,6 +62,7 @@ enum DebugLaunch {
     static let openDevice = false
     static let openJupiter = false
     static let openHistory = false
+    static let openEvent: String? = nil
     static let scrollToBottom = false
     static let openCamera = false
     static let openMode: String? = nil
