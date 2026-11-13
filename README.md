@@ -396,5 +396,5 @@ The suite covers EAR math and the blink-proof drowsiness state machine (syntheti
 | `make dev-max`  | Runs `main.py --profile mac_max --debug` — the Mac-only high-accuracy profile |
 | `make bench`    | Runs `benchmarks/run_benchmarks.py` for all registered modules       |
 | `make report`   | Generates the weekly summary PDF from `data/events.csv`              |
-| `make deploy`   | rsyncs the repo to `pi@sensordyme.local` and restarts the service    |
+| `make deploy`   | stages REF on `DEVICE=`/`DIR=`, verifies, switches atomically, confirms or rolls back (docs/DEPLOYMENT.md) |
 | `make test`     | Runs the pytest suite                                                |

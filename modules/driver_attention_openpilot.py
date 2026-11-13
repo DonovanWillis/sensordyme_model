@@ -670,6 +670,52 @@ _MODEL_URL = (
     "https://media.githubusercontent.com/media/commaai/openpilot/v0.9.7/"
     "selfdrive/modeld/models/dmonitoring_model.onnx"
 )
+#: sha256 of the file at _MODEL_URL (openpilot v0.9.7), identical to the repo copy
+#: (m85 evidence openpilot_dmonitoring_onnx_sha256.txt). M8.5 (M84-5): a download
+#: is verified before it is moved into place, and the file is verified before
+#: every load; a mismatch is refused (the module then cannot be built and the
+#: device reports why). This module is a benchmark comparison, not the product
+#: path, but it must not execute whatever a mirror or a stray file supplies.
+_MODEL_SHA256 = "3dd3982940d823c4fbb0429b733a0b78b0688d7d67aa76ff7b754a3e2f3d8683"
+
+
+def _file_sha256(path) -> str:
+  import hashlib
+  digest = hashlib.sha256()
+  with open(path, "rb") as handle:
+    for chunk in iter(lambda: handle.read(1 << 20), b""):
+      digest.update(chunk)
+  return digest.hexdigest()
+
+
+def _fetch_pinned_model(path, url: str = _MODEL_URL, sha256: str = _MODEL_SHA256, timeout_s: float = 60.0) -> None:
+  """Download `url` to `path` only if its bytes hash to `sha256` (else nothing is left behind)."""
+  import os
+  import urllib.request
+  from pathlib import Path
+  path = Path(path)
+  part = path.with_name(path.name + ".part")
+  try:
+    with urllib.request.urlopen(url, timeout=timeout_s) as response, open(part, "wb") as out:  # noqa: S310 - fixed https URL
+      while True:
+        chunk = response.read(1 << 20)
+        if not chunk:
+          break
+        out.write(chunk)
+    got = _file_sha256(part)
+    if got != sha256:
+      raise RuntimeError(f"dmonitoring_model.onnx from {url} has sha256 {got}, not the pinned {sha256}; refused")
+    os.replace(part, path)
+  finally:
+    part.unlink(missing_ok=True)
+
+
+def _verify_pinned_model(path, sha256: str = _MODEL_SHA256) -> None:
+  got = _file_sha256(path)
+  if got != sha256:
+    raise RuntimeError(f"{path}: sha256 {got} is not the pinned openpilot v0.9.7 model {sha256}; "
+                       "refusing to load it (delete it to re-download the pinned file)")
+
 
 #: Most DriverMonitoring ticks (DT_DMON each) run for one camera frame: 2s of
 #: policy time. Backlog beyond this is dropped, not replayed (see process()).
@@ -685,9 +731,9 @@ class _OnnxDMModel:
     from pathlib import Path
     path = Path(model_path)
     if not path.exists():
-      print("driver_attention_openpilot: downloading dmonitoring_model.onnx (~16MB, one-time)")
-      import urllib.request
-      urllib.request.urlretrieve(_MODEL_URL, path)
+      print("driver_attention_openpilot: downloading dmonitoring_model.onnx (~16MB, one-time, sha256-pinned)")
+      _fetch_pinned_model(path)
+    _verify_pinned_model(path)
     # Provider list comes from the environment so deployments can opt into other
     # execution providers without a code change (default: CPU, the only provider
     # bundled with the pip onnxruntime wheel on both Mac and Pi).

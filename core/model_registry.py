@@ -39,16 +39,31 @@ and pending bindings are kept for the record and support nothing.
 Pure: yaml + the standard library + core.roles/core.presets (both pure), so the
 backend can import it exactly as the device does. No clock is read unless the
 caller passes `today`.
+
+Bundled model files (M8.5, M84-5): `verify_bundled_artifacts()` hashes every
+model file the registry pins inside an installed package (the MediaPipe
+.tflite files in the mediapipe wheel) against its pin. The staged install runs
+it before a release may be switched to (`python -m core.model_registry
+verify-artifacts`), and main.py runs `enforce_bundled_artifacts()` at every boot,
+before any module builds a graph: a file that does not match keeps its MediaPipe
+solution from loading at all (the only point that imports mediapipe) and the
+runtime reports that capability impaired with the reason.
 """
 
 from __future__ import annotations
 
+import argparse
 import datetime as _dt
+import hashlib
+import importlib.util
+import json
 import re
+import sys
 from collections.abc import Iterable, Mapping
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from enum import Enum
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any, Optional, Union
 
 import yaml
@@ -1352,6 +1367,215 @@ def as_dict(registry: ModelRegistry) -> dict:
     }
 
 
+# ---------------------------------------------------------------------- bundled artifacts (M8.5, M84-5)
+#: The MediaPipe solution class that loads each capability's model files, and the
+#: fields its result carries (all None = "nothing found", which every module
+#: already handles). A capability whose files fail the check gets a stand-in that
+#: never loads a model.
+MEDIAPIPE_SOLUTIONS: dict[str, tuple[str, str, tuple[str, ...]]] = {
+    "face": ("face_mesh", "FaceMesh", ("multi_face_landmarks",)),
+    "hands": ("hands", "Hands", ("multi_hand_landmarks", "multi_hand_world_landmarks", "multi_handedness")),
+    "pose": ("pose", "Pose", ("pose_landmarks", "pose_world_landmarks", "segmentation_mask")),
+}
+ARTIFACT_OK, ARTIFACT_MISMATCH, ARTIFACT_MISSING, ARTIFACT_UNREADABLE, ARTIFACT_ABSENT = (
+    "ok", "mismatch", "missing", "unreadable", "package_absent")
+
+
+@dataclass(frozen=True)
+class ArtifactCheck:
+    """One pinned model file inside an installed package, hashed where it is loaded from."""
+
+    model: str
+    path: str
+    expected: str
+    status: str
+    found: Optional[str] = None
+    location: Optional[str] = None
+    capabilities: tuple[str, ...] = field(default_factory=tuple)
+
+    @property
+    def fault(self) -> bool:
+        return self.status in (ARTIFACT_MISMATCH, ARTIFACT_MISSING, ARTIFACT_UNREADABLE)
+
+    def reason(self) -> str:
+        name = self.path.rsplit("/", 1)[-1]
+        if self.status == ARTIFACT_MISMATCH:
+            return (f"model integrity: {name} sha256 {str(self.found)[:12]}... is not the pinned "
+                    f"{self.expected[:12]}... ({self.model}); refused")
+        if self.status == ARTIFACT_MISSING:
+            return f"model integrity: {name} is missing from the installed package ({self.model}); refused"
+        if self.status == ARTIFACT_UNREADABLE:
+            return f"model integrity: {name} could not be read ({self.model}); refused"
+        if self.status == ARTIFACT_ABSENT:
+            return f"{self.path.split('/', 1)[0]} is not installed"
+        return "verified"
+
+    def to_dict(self) -> dict:
+        return {"model": self.model, "path": self.path, "expected": self.expected, "found": self.found,
+                "status": self.status, "location": self.location, "capabilities": list(self.capabilities)}
+
+
+def _package_root(package: str) -> Optional[Path]:
+    """The directory an installed package's files are read from, WITHOUT importing it."""
+    try:
+        spec = importlib.util.find_spec(package)
+    except (ImportError, ValueError):
+        return None
+    locations = list(spec.submodule_search_locations or []) if spec is not None else []
+    return Path(locations[0]).parent if locations else None
+
+
+def _file_sha256(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as handle:
+        for chunk in iter(lambda: handle.read(1 << 20), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def verify_bundled_artifacts(registry: Optional[ModelRegistry] = None, *,
+                             site_root: Optional[Path] = None) -> list[ArtifactCheck]:
+    """Hash every pinned .tflite the registry lists inside an installed package
+    (path = `<package>/...`) where Python would load it from, against its pin.
+
+    `site_root` overrides where packages are looked up (tests). A package that is
+    not installed at all is reported ABSENT, not a fault: nothing can load it."""
+    registry = registry if registry is not None else load_registry(validate=False)
+    roots: dict[str, Optional[Path]] = {}
+    checks: list[ArtifactCheck] = []
+    for card in registry.models:
+        for artifact in card.artifacts:
+            if artifact.format != "tflite" or not artifact.sha256:
+                continue
+            package = artifact.path.split("/", 1)[0]
+            if site_root is not None:
+                root: Optional[Path] = site_root if (site_root / package).is_dir() else None
+            else:
+                if package not in roots:
+                    roots[package] = _package_root(package)
+                root = roots[package]
+            expected = artifact.sha256.lower()
+            caps = tuple(card.provides_capabilities)
+            if root is None:
+                checks.append(ArtifactCheck(card.id, artifact.path, expected, ARTIFACT_ABSENT, capabilities=caps))
+                continue
+            location = root / artifact.path
+            if not location.is_file():
+                checks.append(ArtifactCheck(card.id, artifact.path, expected, ARTIFACT_MISSING,
+                                            location=str(location), capabilities=caps))
+                continue
+            try:
+                found = _file_sha256(location)
+            except OSError:
+                checks.append(ArtifactCheck(card.id, artifact.path, expected, ARTIFACT_UNREADABLE,
+                                            location=str(location), capabilities=caps))
+                continue
+            status = ARTIFACT_OK if found == expected else ARTIFACT_MISMATCH
+            checks.append(ArtifactCheck(card.id, artifact.path, expected, status, found=found,
+                                        location=str(location), capabilities=caps))
+    return checks
+
+
+def artifact_faults(checks: Iterable[ArtifactCheck]) -> dict[str, str]:
+    """Capability -> why its model is refused (first failing file per capability)."""
+    faults: dict[str, str] = {}
+    for check in checks:
+        if check.fault:
+            for capability in check.capabilities:
+                faults.setdefault(capability, check.reason())
+    return faults
+
+
+def _refusing_solution(reason: str, fields: tuple[str, ...]) -> type:
+    class IntegrityRefusedGraph:
+        """Stands in for a MediaPipe solution whose model file failed verification:
+        loads nothing, runs nothing, finds nothing. The capability is reported
+        impaired with `refused_reason` (services/runtime.py)."""
+
+        refused_reason = reason
+
+        def __init__(self, *args: Any, **kwargs: Any) -> None:
+            del args, kwargs
+
+        def process(self, image: Any) -> SimpleNamespace:
+            del image
+            return SimpleNamespace(**dict.fromkeys(fields))
+
+        def close(self) -> None:
+            return None
+
+        def __enter__(self) -> "IntegrityRefusedGraph":
+            return self
+
+        def __exit__(self, *exc: object) -> None:
+            return None
+
+    return IntegrityRefusedGraph
+
+
+_BOOT_CHECKS: list[ArtifactCheck] = []
+_BOOT_FAULTS: dict[str, str] = {}
+
+
+def enforce_bundled_artifacts(checks: Optional[list[ArtifactCheck]] = None) -> dict[str, str]:
+    """Boot (main.py, before any module is built): verify, and fail closed for each
+    capability whose model file does not match -- its MediaPipe solution class is
+    replaced by a stand-in, so the unverified file is never parsed or run. If the
+    check itself cannot run, every MediaPipe capability is refused. Returns (and
+    remembers, for the runtime's health report) capability -> reason."""
+    try:
+        found = list(checks) if checks is not None else verify_bundled_artifacts()
+        faults = artifact_faults(found)
+    except Exception as exc:  # noqa: BLE001 - an unverifiable model is an unverified one
+        found = []
+        faults = dict.fromkeys(MEDIAPIPE_SOLUTIONS, f"model integrity could not be checked ({exc}); refused")
+    _BOOT_CHECKS[:] = found
+    _BOOT_FAULTS.clear()
+    _BOOT_FAULTS.update(faults)
+    for capability, reason in faults.items():
+        solution = MEDIAPIPE_SOLUTIONS.get(capability)
+        if solution is None:
+            continue
+        module_name, class_name, fields = solution
+        try:
+            import mediapipe as mp  # only on a fault: the stand-in must replace the real class
+
+            setattr(getattr(mp.solutions, module_name), class_name, _refusing_solution(reason, fields))
+        except Exception:  # noqa: BLE001, S112 - no mediapipe: nothing can load the model anyway
+            continue
+    return dict(faults)
+
+
+def boot_artifact_faults() -> dict[str, str]:
+    """What enforce_bundled_artifacts() refused at this boot (empty if it never ran)."""
+    return dict(_BOOT_FAULTS)
+
+
+def boot_artifact_checks() -> list[dict]:
+    return [c.to_dict() for c in _BOOT_CHECKS]
+
+
+def main(argv: Optional[list[str]] = None) -> int:
+    """`python -m core.model_registry verify-artifacts [--json-out F] [--allow-absent]`:
+    exit 1 when a pinned bundled model file is missing or not its pin (or, unless
+    --allow-absent, its package is not installed). The staged install runs this in
+    the new release's venv before the release may be switched to."""
+    parser = argparse.ArgumentParser(prog="python -m core.model_registry")
+    parser.add_argument("command", choices=["verify-artifacts"])
+    parser.add_argument("--json-out", default=None)
+    parser.add_argument("--allow-absent", action="store_true")
+    args = parser.parse_args(argv)
+    checks = verify_bundled_artifacts()
+    bad = [c for c in checks if c.fault or (c.status == ARTIFACT_ABSENT and not args.allow_absent)]
+    for check in checks:
+        print(f"  [{check.status.upper():>14}] {check.path}  {check.found or '-'}")
+    if args.json_out:
+        Path(args.json_out).write_text(json.dumps({"checks": [c.to_dict() for c in checks],
+                                                   "ok": not bad}, indent=2) + "\n")
+    print(f"bundled model artifacts: {'OK' if not bad else 'FAIL'} ({len(checks)} checked, {len(bad)} bad)")
+    return 1 if bad else 0
+
+
 __all__ = [
     "BINDING_STATUSES",
     "CAPABILITY_KINDS",
@@ -1360,9 +1584,11 @@ __all__ = [
     "EVIDENCE_LEVELS",
     "HARDWARE_TARGETS",
     "LADDER",
+    "MEDIAPIPE_SOLUTIONS",
     "PERCEPTION_KINDS",
     "TIERS",
     "Approval",
+    "ArtifactCheck",
     "CapabilityLink",
     "ChainView",
     "EvaluationStatus",
@@ -1375,8 +1601,11 @@ __all__ = [
     "MonitoringNodeEntry",
     "ProductCapability",
     "RegistryError",
+    "artifact_faults",
     "as_dict",
     "binding_violations",
+    "boot_artifact_checks",
+    "boot_artifact_faults",
     "capability_evidence",
     "capability_link",
     "capability_tiers",
@@ -1385,6 +1614,7 @@ __all__ = [
     "chain_for",
     "component_violations",
     "display_state",
+    "enforce_bundled_artifacts",
     "load_registry",
     "node_tier",
     "node_violations",
@@ -1399,5 +1629,10 @@ __all__ = [
     "role_views",
     "roles_using",
     "tier_rank",
+    "verify_bundled_artifacts",
     "weakest",
 ]
+
+
+if __name__ == "__main__":
+    sys.exit(main())

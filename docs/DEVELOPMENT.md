@@ -353,7 +353,7 @@ codes — was committed and had to be purged from history on 2026-08-06. And
 ## 9. Deploying
 
 ```bash
-make deploy      # rsync → install deps → migrate config → restart the service
+make deploy DEVICE=user@host   # bundle from git → stage + verify on the device → switch → confirm or roll back (docs/DEPLOYMENT.md)
 ```
 
 Read [TESTING.md](TESTING.md) for what to verify after a deploy.

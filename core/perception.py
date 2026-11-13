@@ -322,6 +322,9 @@ class _Component:
     last_attempt_at: Optional[float] = None
     error: Optional[str] = None  # set by a failed attempt, cleared by a success
     unavailable: Optional[str] = None
+    #: M8.5 (M84-5): refused for good (its model file failed the integrity check
+    #: at boot). Unlike `unavailable`, a run never clears it.
+    blocked: Optional[str] = None
     run_ms: Optional[float] = None
     model: Optional[dict] = None
     consumers: dict[str, float] = field(default_factory=dict)
@@ -350,7 +353,9 @@ class _Component:
     def status(self, now: float, max_age_s: float) -> ComponentStatus:
         active = tuple(sorted(c for c, t in self.consumers.items() if now - t <= _CONSUMER_TTL_S))
         age = None if self.last_ok_at is None else max(0.0, now - self.last_ok_at)
-        if self.unavailable is not None:
+        if self.blocked is not None:
+            state, reason = UNAVAILABLE, self.blocked
+        elif self.unavailable is not None:
             state, reason = UNAVAILABLE, self.unavailable
         elif self.error is not None:
             state, reason = FAILED, self.error
@@ -640,6 +645,13 @@ class PerceptionEngine:
         """A component that cannot run on this device at all (None clears it)."""
         with self._lock:
             self._components[component].unavailable = reason
+
+    def block(self, component: str, reason: str) -> None:
+        """Refused for the life of the process (M8.5: its model file failed the boot
+        integrity check, core/model_registry.py). Reported UNAVAILABLE with the reason
+        whatever runs; core.model_registry also keeps the model itself from loading."""
+        with self._lock:
+            self._components[component].blocked = reason
 
     # ------------------------------------------------------------------ demands
     def demand(self, demand: Demand) -> None:

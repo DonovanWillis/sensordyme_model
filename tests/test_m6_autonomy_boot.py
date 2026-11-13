@@ -199,9 +199,16 @@ def test_install_units_refuses_root(tmp_path):
 
 
 def test_make_deploy_installs_the_units_before_restarting():
+    """M8.5: the staged activation (release_guard.py, run by make deploy via deploy.sh)
+    installs the new release's units, rendered for the service path, before the restart."""
     makefile = (REPO / "Makefile").read_text()
     recipe = makefile.split("\ndeploy: ", 1)[1].split("\n\n", 1)[0]
-    assert "scripts/release/install_units.sh" in recipe
-    assert recipe.index("install_units.sh") < recipe.index("systemctl restart sensordyme.service")
+    assert "scripts/release/deploy.sh" in recipe
+    guard = (REPO / "scripts" / "release" / "release_guard.py").read_text()
+    activate = guard[guard.index("    def _activate("):guard.index("    # ------------------------------------------------------------------ health")]
+    assert activate.index("self._units_argv(release)") < activate.index('"systemctl", "restart"')
+    assert "install_units.sh" in guard and '"--app-dir", str(self.layout.link)' in guard
     assert "release-manifest:" in makefile and "release-verify:" in makefile
-    assert "RELEASE_DIR ?= $(HOME)/" in makefile, "a manifest inside the checkout would be rsynced to the device"
+    assert "RELEASE_DIR ?= $(HOME)/" in makefile, "a manifest is kept out of the checkout"
+
+

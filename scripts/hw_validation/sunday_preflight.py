@@ -359,7 +359,7 @@ class Preflight:
             problems.append(f"venv differs from requirements-device.txt: {mismatched}")
         self.add(c, FAIL if problems else PASS, "; ".join(problems) or
                  f"{len(pins)} pins match; {hailortcli or 'hailortcli ?'}",
-                 "RB-C3 / RB-F2 (pip install -r requirements-device.txt) -- a deliberate CHANGE" if problems else "",
+                 "RB-C3 / RB-F2 (pip install --require-hashes --only-binary=:all: -r requirements-device.lock; docs/DEPLOYMENT.md) -- a deliberate CHANGE" if problems else "",
                  debs=debs, hailortcli=hailortcli, pins_checked=len(pins), mismatched=mismatched)
 
     def revision_check(self) -> None:
@@ -786,9 +786,11 @@ def _sha(path: Path) -> Optional[str]:
 
 
 def _requirement_pins() -> dict[str, str]:
-    from scripts.release.check_device_deps import requirement_pins
+    # M8.5: the pins that apply ON THE DEVICE (markers evaluated for Linux/aarch64/3.11):
+    # simpleaudio is a non-Linux pin, gpiozero/lgpio are device pins.
+    from scripts.release.check_device_deps import device_pins
 
-    return requirement_pins(REPO_ROOT / "requirements-device.txt")
+    return device_pins(REPO_ROOT / "requirements-device.txt")
 
 
 def markdown(report: dict) -> str:

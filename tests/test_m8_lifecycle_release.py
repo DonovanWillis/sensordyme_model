@@ -212,16 +212,20 @@ def test_the_guard_runs_from_stdin_as_make_deploy_streams_it(tmp_path):
     assert (root / "data" / "release" / "pending.json").exists()
 
 
-def test_make_deploy_snapshots_first_and_rolls_back_on_any_failure():
+def test_make_deploy_stages_verifies_then_activates_on_the_device_with_rollback():
+    """M8.5 replaced the M8 in-place rsync (snapshot, rsync, `||` rollback over the same
+    SSH) with staged releases; the M8 confirm-or-rollback semantics are kept, on the
+    device. Behaviour: tests/test_m85_deploy_staged.py and tests/test_m85_deploy_e2e.py."""
     makefile = (REPO / "Makefile").read_text()
     recipe = makefile.split("\ndeploy: ", 1)[1].split("\n\n", 1)[0]
-    snapshot = recipe.index("- snapshot --root .' < scripts/release/release_guard.py")
-    assert snapshot < recipe.index("rsync -av"), "the running release is captured before anything changes"
-    restart = recipe.index("systemctl restart sensordyme.service")
-    assert restart < recipe.index("confirm-or-rollback"), "health is judged after the restart"
-    chain = recipe[recipe.index("rsync -av"):]
-    # Every step after the snapshot is one && chain whose failure runs the rollback.
-    for step in ("pip install", "migrate_config.py", "install_units.sh", "systemctl restart", "confirm-or-rollback"):
-        line = next(ln for ln in chain.splitlines() if step in ln)
-        assert line.rstrip().endswith("&& \\") or "confirm-or-rollback" in line, line
-    assert "|| { ssh pi@sensordyme.local" in chain and "release_guard.py rollback" in chain and "exit 1; }" in chain
+    assert "rsync" not in recipe and "pi@sensordyme.local" not in recipe
+    assert "scripts/release/deploy.sh" in recipe and "DEVICE='$(DEVICE)'" in recipe and "DIR='$(DIR)'" in recipe
+    script = (REPO / "scripts" / "release" / "deploy.sh").read_text()
+    code = [ln for ln in script.splitlines() if not ln.lstrip().startswith("#")]
+    order = [next(i for i, ln in enumerate(code) if needle in ln)
+             for needle in ("make_release_manifest.py\" bundle", "scp -q", "python3 - stage", " activate ",
+                            "status --root")]
+    assert order == sorted(order), "bundle -> upload -> stage (verify) -> activate -> wait"
+    activate = next(ln for ln in code if " activate " in ln) + next(ln for ln in code if "--attempt $ATTEMPT --detach" in ln)
+    assert "--detach" in activate, "the switch and any rollback run on the device, not over the SSH session"
+    assert "rsync" not in script

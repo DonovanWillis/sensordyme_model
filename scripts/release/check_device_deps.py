@@ -12,6 +12,13 @@ must be satisfied by one of:
 And requirements-device.txt must not carry test, development or research
 tooling (FORBIDDEN_ON_DEVICE). Exit status 1 lists every violation.
 
+M8.5 (M84-4): the hashed lock is what a device actually installs
+(`pip install --require-hashes --only-binary=:all: -r requirements-device.lock`),
+so it is checked too: every pin that applies on the device (environment markers
+evaluated for DEVICE_ENV: Linux, aarch64, CPython 3.11) is in the lock at the
+same version with a hash; every device import a pin covers is in the lock; a pin
+whose marker keeps it off the device is NOT in the lock; nothing forbidden is.
+
 Static (ast) and offline: nothing is imported or installed. Lazy imports inside
 functions count, on purpose: a lazy import is still code the device can reach.
 """
@@ -27,6 +34,12 @@ from pathlib import Path
 
 REPO = Path(__file__).resolve().parents[2]
 DEVICE_REQUIREMENTS = REPO / "requirements-device.txt"
+DEVICE_LOCK = REPO / "requirements-device.lock"
+
+#: The one environment a device install targets (Pi OS Bookworm on a Pi 5). Markers
+#: in requirements-device.txt are evaluated against it; the lock is compiled for it.
+DEVICE_ENV = {"sys_platform": "linux", "platform_machine": "aarch64", "python_version": "3.11",
+              "platform_system": "Linux", "os_name": "posix", "implementation_name": "cpython"}
 DEVICE_ROOTS = ("main.py", "scripts/preflight.py", "core", "services", "modules")
 FIRST_PARTY = {"core", "services", "modules", "hardware", "sim", "cloud", "research", "evaluation",
                "scripts", "benchmarks", "jupiter", "tests", "main", "third_party", "typings"}
@@ -76,11 +89,43 @@ FORBIDDEN_ON_DEVICE = {
     "torchvision", "tensorboard", "timm", "thop", "pycocotools", "fiftyone",
 }
 
-_REQ = re.compile(r"^\s*([A-Za-z0-9][A-Za-z0-9._-]*)\s*(?:\[[^\]]*\])?\s*==\s*([^\s;#]+)")
+_REQ = re.compile(r"^\s*([A-Za-z0-9][A-Za-z0-9._-]*)\s*(?:\[[^\]]*\])?\s*==\s*([^\s;#]+)\s*(?:;([^#]*))?")
+_MARKER_TERM = re.compile(r"""^\s*([a-z_]+)\s*(==|!=)\s*["']([^"']*)["']\s*$""")
+_LOCKED = re.compile(r"^([A-Za-z0-9][A-Za-z0-9._-]*)==([^\s\\]+)", re.MULTILINE)
 
 
 def normalise(name: str) -> str:
     return re.sub(r"[-_.]+", "-", name).lower()
+
+
+def marker_applies(marker: str | None, env: dict[str, str] | None = None) -> bool:
+    """Whether a requirement marker holds in `env` (default DEVICE_ENV).
+
+    Deliberately tiny: `name ==|!= "value"` terms joined by `and`, which is all
+    requirements-device.txt uses. Anything else raises, so a marker this cannot
+    judge fails the check instead of being guessed."""
+    if not marker or not marker.strip():
+        return True
+    env = DEVICE_ENV if env is None else env
+    result = True
+    for term in re.split(r"\s+and\s+", marker.strip()):
+        match = _MARKER_TERM.match(term)
+        if not match or match.group(1) not in env:
+            raise ValueError(f"unsupported requirement marker: {marker.strip()!r}")
+        name, op, value = match.groups()
+        result = result and ((env[name] == value) if op == "==" else (env[name] != value))
+    return result
+
+
+def requirement_markers(path: Path = DEVICE_REQUIREMENTS) -> dict[str, str | None]:
+    """Pinned distribution -> its environment marker (None when unconditional)."""
+    out: dict[str, str | None] = {}
+    for line in path.read_text().splitlines():
+        match = _REQ.match(line)
+        if match:
+            marker = (match.group(3) or "").strip() or None
+            out[normalise(match.group(1))] = marker
+    return out
 
 
 def requirement_pins(path: Path = DEVICE_REQUIREMENTS) -> dict[str, str]:
@@ -90,6 +135,56 @@ def requirement_pins(path: Path = DEVICE_REQUIREMENTS) -> dict[str, str]:
         if match:
             pins[normalise(match.group(1))] = match.group(2)
     return pins
+
+
+def device_pins(path: Path = DEVICE_REQUIREMENTS) -> dict[str, str]:
+    """The pins that apply on the device (markers evaluated for DEVICE_ENV)."""
+    markers = requirement_markers(path)
+    return {name: version for name, version in requirement_pins(path).items() if marker_applies(markers[name])}
+
+
+def lock_entries(text: str) -> dict[str, dict]:
+    """Locked distribution -> {version, hashes} from a `--generate-hashes` lock."""
+    out: dict[str, dict] = {}
+    for block in re.split(r"\n(?=[A-Za-z0-9])", text):
+        match = _LOCKED.match(block)
+        if match:
+            out[normalise(match.group(1))] = {"version": match.group(2),
+                                              "hashes": re.findall(r"--hash=sha256:([0-9a-f]{64})", block)}
+    return out
+
+
+def check_lock(requirements: Path = DEVICE_REQUIREMENTS, lock: Path = DEVICE_LOCK,
+               covered: dict[str, str] | None = None) -> dict:
+    """Is the hashed lock complete and consistent for what the device installs and imports?"""
+    if not lock.exists():
+        return {"ok": False, "problems": [f"{lock.name} is missing"]}
+    entries = lock_entries(lock.read_text())
+    markers = requirement_markers(requirements)
+    pins = requirement_pins(requirements)
+    problems: list[str] = []
+    for name, version in sorted(pins.items()):
+        try:
+            on_device = marker_applies(markers[name])
+        except ValueError as exc:
+            problems.append(f"{name}: {exc}")
+            continue
+        entry = entries.get(name)
+        if on_device and entry is None:
+            problems.append(f"{name}=={version} is a device pin but is not in the lock")
+        elif on_device and entry is not None and entry["version"] != version:
+            problems.append(f"{name}: lock {entry['version']} != pin {version}")
+        elif not on_device and entry is not None:
+            problems.append(f"{name} is locked but its marker ({markers[name]}) keeps it off the device")
+    for name, entry in sorted(entries.items()):
+        if not entry["hashes"]:
+            problems.append(f"{name} has no --hash in the lock")
+        if name in FORBIDDEN_ON_DEVICE:
+            problems.append(f"{name} is forbidden on the device but is in the lock")
+    for top, dist in sorted((covered or {}).items()):
+        if dist not in entries and marker_applies(markers.get(dist)):
+            problems.append(f"device import {top} ({dist}) is not in the lock")
+    return {"ok": not problems, "problems": problems, "packages": len(entries)}
 
 
 def device_files(repo: Path = REPO) -> list[Path]:
@@ -156,8 +251,10 @@ def check(repo: Path = REPO, requirements: Path = DEVICE_REQUIREMENTS) -> dict:
         else:
             missing[top] = sorted(files)
     forbidden = sorted(dist for dist in pins if dist in FORBIDDEN_ON_DEVICE)
+    lock = check_lock(requirements, requirements.with_name(DEVICE_LOCK.name), covered)
     return {"pins": pins, "covered": covered, "apt": apt, "dev_only": dev_only,
-            "missing": missing, "forbidden": forbidden, "ok": not missing and not forbidden}
+            "missing": missing, "forbidden": forbidden, "lock": lock,
+            "ok": not missing and not forbidden and lock["ok"]}
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -174,6 +271,11 @@ def main(argv: list[str] | None = None) -> int:
             print(f"MISSING  {top}: imported by {', '.join(files[:4])} but not in requirements-device.txt")
         for dist in result["forbidden"]:
             print(f"FORBIDDEN  {dist} is pinned in requirements-device.txt")
+        lock = result["lock"]
+        print(f"device lock: {lock.get('packages', 0)} hashed packages; "
+              f"{'complete and consistent' if lock['ok'] else 'PROBLEMS'}")
+        for problem in lock["problems"]:
+            print(f"LOCK  {problem}")
         print("device dependencies OK" if result["ok"] else "device dependencies FAIL")
     return 0 if result["ok"] else 1
 
