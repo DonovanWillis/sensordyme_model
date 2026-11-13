@@ -224,6 +224,7 @@ def test_f4_phone_use_coasts_like_the_gaze_it_depends_on(tmp_path, clock):
     module, frame = _make_module(tmp_path, clock)
     module._last_phone_boxes = [(500, 380, 600, 470)]
     module._last_phone_score = 0.7
+    module._hand_overlaps_phone = True  # M8.5: phone_use needs a handled phone; this one is in a hand
     _feed(module, frame, clock, pitch_deg=30.0, seconds=1.0)
     module._last_person_visible = True
     module._update_object_detections = lambda frame: None
