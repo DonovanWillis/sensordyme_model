@@ -117,7 +117,7 @@ struct CameraViewport: View {
         .overlay(shape.strokeBorder(frameColor, lineWidth: instrument.kind == .alert ? 2 : 1))
         .overlay(alignment: .topLeading) {
             if case .live = source.kind {
-                MJPEGLiveIndicator(reader: session.reader)
+                MJPEGLiveIndicator(reader: session.reader, monitoringStopped: instrument.kind == .stopped)
                     .padding(SD.Space.sm)
             }
         }
@@ -270,7 +270,7 @@ struct LiveCameraView: View {
     private var topBar: some View {
         HStack(alignment: .center, spacing: SD.Space.sm) {
             if case .live = CameraSource(state: state, device: device).kind {
-                MJPEGLiveIndicator(reader: session.reader)
+                MJPEGLiveIndicator(reader: session.reader, monitoringStopped: instrument.kind == .stopped)
             }
             Spacer()
             Button { dismiss() } label: {

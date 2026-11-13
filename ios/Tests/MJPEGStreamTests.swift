@@ -408,5 +408,18 @@ do {
           "but not again within the recheck interval")
 }
 
+// ------------------------------------------------- M8.3: heartbeats and bounded connect
+print("\nM8.3: the request asks for heartbeats; connecting is bounded:")
+do {
+    let request = MJPEGStreamRequest.make(base: "http://11.33.0.129:8899", token: "pi-secret")
+    check(request?.value(forHTTPHeaderField: "X-Stream-Heartbeat") == "1",
+          "every /stream request asks for heartbeat parts (old firmware ignores the header)")
+    check(request?.value(forHTTPHeaderField: "X-Device-Token") == "pi-secret",
+          "and still carries the token in the header: the opt-in grants nothing by itself")
+    check(MJPEGReaderPolicy.connectTimeout < MJPEGReaderPolicy.idleTimeout,
+          "a connect attempt is abandoned well before the 15 s idle timeout")
+    check(MJPEGReaderPolicy.livenessTick <= 0.5, "liveness is re-evaluated at least twice a second")
+}
+
 print(failures == 0 ? "\nPASSED" : "\n\(failures) FAILURE(S)")
 exit(failures == 0 ? 0 : 1)
