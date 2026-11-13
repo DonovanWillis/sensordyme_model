@@ -29,7 +29,7 @@ What is new here:
 
 ```bash
 # Mac
-export RC=<release ref chosen by the integrator>      # PLACEHOLDER: the integrator sets it; record `git rev-parse $RC`
+export RC=feat/m8.3-hardware-truth   # M8.3 integrated candidate (pending owner approval); record `git rev-parse $RC` (see docs/M8_3_RELEASE_DECISION.md)
 export PI=<user>@<pi-host>  REL=~/sensordyme-release  VENV=$HOME/.venvs/sensordyme-m01/bin
 # Pi (RB-0 / RB-C1 discover U and D first)
 export U=<service user>  D=/home/$U/sensordyme  PY=$D/.venv/bin/python

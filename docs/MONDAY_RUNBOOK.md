@@ -28,7 +28,7 @@ Reuses, does not duplicate:
 ```bash
 # On the Mac (repo checkout at the release candidate):
 export PI=<user>@<pi-host-or-ip>      # e.g. pi@sensordyme.local. The user may NOT be `pi` (Bookworm)
-export RC=feat/m8-product-intelligence  # the approved release ref (or its merged successor); record `git rev-parse $RC`
+export RC=feat/m8.3-hardware-truth  # M8.3 integrated candidate (pending owner approval); record `git rev-parse $RC`
 export REL=~/sensordyme-release        # manifest + tarball + evidence on the Mac
 export VENV=$HOME/.venvs/sensordyme-m01/bin  # M8.1: the Makefile defaults to .venv/bin, which this checkout does not have
 
