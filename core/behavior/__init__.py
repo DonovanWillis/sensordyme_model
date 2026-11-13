@@ -13,6 +13,15 @@ inputs cannot support a claim:
   reasoner.py   BehaviorReasoner: the above composed per frame
   config.py     parse/validate ``modules.driver_attention.behavior_v2`` / ``.behavior``
 
+M8.4 (always on, SHADOW: changes no validated alert; docs/BEHAVIOR_ENGINE.md):
+
+  signals.py         typed per-signal evidence (freshness, provenance, missing reason) + Verdict
+  engine.py          BehaviorEngine: shadow verdicts with abstention, phone evidence level
+  phone_evidence.py  owner decision B: phone evidence levels; only held + eyes-off-road is risk
+  association.py     which person is the driver, stated as a method (unevaluated)
+  experimental.py    owner decision A: experimental alert families are observations
+  evaluation.py      event-level metrics over labelled (synthetic) traces
+
 Enabled only by ``behavior_v2: true`` in modules.driver_attention; nothing
 here is validated on in-cabin data. See docs/BEHAVIOUR_REASONING.md.
 """

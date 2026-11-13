@@ -566,6 +566,13 @@ modules:
     # never for a phone hand tracking shows set down (still, hands seen elsewhere) -- see PhoneHoldEvidence
     enable_hands: true # MediaPipe Hands: a hand on the phone marks it held; hands seen elsewhere + a still phone mark it set down
     hand_phone_iou_threshold: 0.2 # hand/phone box IoU above this counts as "holding it"
+    # M8.4 B5: when MediaPipe Hands (the largest host cost) runs. phone_visible = on detector ticks
+    # that have a phone box (the only ticks the phone_use set-down skip reads hands on, so phone_use
+    # decisions are identical), else at most every hands_max_interval_s (kept under the perception
+    # engine's 1.0 s freshness bar, so hands never reads stale); a tick it skips is "hand evidence
+    # stale/unknown", never "no hand". every_tick = the pre-M8.4 behaviour.
+    hands_policy: phone_visible
+    hands_max_interval_s: 0.5
 
     # --- erratic hand movement (hands leaving the wheel / frantic motion) ---
     # Reuses the SAME hand boxes already computed above (no added inference), tracked

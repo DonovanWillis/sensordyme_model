@@ -78,6 +78,11 @@ def _hand_box_points(cx, cy):
 
 def _hand_module(tmp_path, clock, monkeypatch, **overrides):
     monkeypatch.setattr(driver_attention_module, "get_yolo_model", lambda weights: _FakeYoloModel())
+    # The erratic-hand detector needs Hands on EVERY detector tick (a trajectory).
+    # M8.4 B5's default hands_policy (phone_visible) samples Hands only around a
+    # phone and as a liveness check, so erratic_hand_movement -- an experimental
+    # observation -- is judged only there; these tests pin the detector itself.
+    overrides = {"hands_policy": "every_tick", **overrides}
     module, frame = _make_module(tmp_path, clock, enable_hands=True, **overrides)
     module._ensure_object_detectors_loaded()  # real (but network-free) YOLO + Hands construction
     return module, frame
@@ -113,7 +118,8 @@ def test_moderate_oscillation_fires_erratic_at_shipped_thresholds(tmp_path, cloc
     module, frame = _hand_module(tmp_path, clock, monkeypatch)
     fired = _feed_hand_positions(module, frame, clock, _oscillation(0.04))
     assert "erratic_hand_movement" in fired
-    assert module.is_alert_active()
+    # M8.4 owner decision A: an experimental observation, never the alert flash.
+    assert module._erratic_hands_active and not module.is_alert_active()
     assert module._state_label() == "ERRATIC_HANDS"
 
 
@@ -262,7 +268,8 @@ def test_erratic_hands_resolves_when_motion_settles(tmp_path, clock):
     for _ in range(6):
         module.process(frame)
         clock["now"] += 0.1
-    assert module.is_alert_active()
+    # M8.4 owner decision A: an experimental observation, never the alert flash.
+    assert module._erratic_hands_active and not module.is_alert_active()
 
     module._hands_erratic_raw = False
     for _ in range(5):
