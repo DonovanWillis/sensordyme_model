@@ -120,6 +120,68 @@ enum MJPEGStreamState: Equatable {
     }
 }
 
+// MARK: - What the device says about each part (M8.3)
+
+/// The evidence the device attaches to each part of `/stream`
+/// (core/dashboard.py `_part_header` / `_heartbeat_part`). Every field is
+/// optional: firmware before M8.3 sends bare JPEG parts, and the app must keep
+/// working with it -- it just cannot prove as much (see FeedLivenessTracker).
+struct MJPEGPartMeta: Equatable {
+    /// `X-Frame-Seq`: strictly increasing per stream id.
+    var seq: Int?
+    /// `X-Frame-Age-Ms`: camera capture -> device write, on the device's clock.
+    var ageMs: Int?
+    /// `X-Frame-Source`: "annotated" (the analysed view) or "camera" (unanalysed).
+    var source: String?
+    /// `X-Stream-Id`: changes when the device process restarts (seq resets).
+    var streamID: String?
+    /// `X-Stream-Heartbeat: 1`: an empty part meaning "alive, no new frame".
+    var isHeartbeat = false
+    /// `X-Stream-Status` on a heartbeat: why no frame is coming.
+    var status: String?
+    /// `X-Camera-Age-Ms` on a heartbeat: how old the camera's own newest frame is.
+    var cameraAgeMs: Int?
+
+    /// Header names, spelled once (they must match core/dashboard.py).
+    enum Header {
+        static let seq = "x-frame-seq"
+        static let age = "x-frame-age-ms"
+        static let source = "x-frame-source"
+        static let streamID = "x-stream-id"
+        static let heartbeat = "x-stream-heartbeat"
+        static let status = "x-stream-status"
+        static let cameraAge = "x-camera-age-ms"
+    }
+
+    /// Parse one part's header block. Lines that are not `Name: value` (the
+    /// boundary, stray CRLFs) are ignored; names are case-insensitive.
+    static func parse(headerBlock: Data) -> (meta: MJPEGPartMeta, contentType: String?, contentLength: Int?) {
+        var fields: [String: String] = [:]
+        let text = String(decoding: headerBlock, as: UTF8.self)
+        for line in text.split(whereSeparator: \.isNewline) {  // "\r\n" is ONE Character in Swift
+            guard let colon = line.firstIndex(of: ":"), !line.hasPrefix("--") else { continue }
+            let name = line[..<colon].trimmingCharacters(in: .whitespaces).lowercased()
+            let value = line[line.index(after: colon)...].trimmingCharacters(in: .whitespaces)
+            if !name.isEmpty { fields[name] = value }
+        }
+        var meta = MJPEGPartMeta()
+        meta.seq = fields[Header.seq].flatMap { Int($0) }
+        meta.ageMs = fields[Header.age].flatMap { Int($0) }
+        meta.source = fields[Header.source]
+        meta.streamID = fields[Header.streamID]
+        meta.isHeartbeat = fields[Header.heartbeat] == "1"
+        meta.status = fields[Header.status]
+        meta.cameraAgeMs = fields[Header.cameraAge].flatMap { Int($0) }
+        return (meta, fields["content-type"], fields["content-length"].flatMap { Int($0) })
+    }
+}
+
+/// One complete thing the stream delivered.
+enum MJPEGPart: Equatable {
+    case frame(Data, MJPEGPartMeta)
+    case heartbeat(MJPEGPartMeta)
+}
+
 // MARK: - Framing JPEGs out of a multipart byte stream
 
 /// Extracts complete JPEGs from an `multipart/x-mixed-replace` byte stream.
@@ -127,10 +189,20 @@ enum MJPEGStreamState: Equatable {
 /// Kept as a value type with no I/O so the framing rules can be tested against
 /// awkward inputs -- split markers, leading boundary headers, garbage, a frame
 /// larger than the cap -- which is where MJPEG parsers actually go wrong.
+///
+/// M8.3: it also reads each part's header block (the text between parts that
+/// used to be discarded unread) so a frame arrives with the device's evidence
+/// -- seq, capture age, source, stream id -- and heartbeat parts (no JPEG) are
+/// recognised instead of being dropped as noise. Image framing is unchanged:
+/// SOI to EOI.
 struct MJPEGFrameParser {
     /// Start of Image / End of Image markers.
     private static let soi = Data([0xFF, 0xD8])
     private static let eoi = Data([0xFF, 0xD9])
+    private static let headerEnd = Data("\r\n\r\n".utf8)
+    /// A header block longer than this is not one; a non-image body longer
+    /// than this is not a heartbeat. Both are discarded rather than held.
+    static let maxHeaderBytes = 4096
 
     /// Hard ceiling on retained bytes. A stream that never yields a complete
     /// frame -- a wrong endpoint, a truncated encoder, a corrupted link -- must
@@ -141,6 +213,11 @@ struct MJPEGFrameParser {
     /// Bytes thrown away because they could never become a frame. Surfaced so a
     /// caller can tell "nothing is arriving" from "nonsense is arriving".
     private(set) var discardedBytes = 0
+    /// Largest the buffer has been after a chunk (instrumentation; bounded by
+    /// `maxBufferBytes` + one chunk).
+    private(set) var highWaterBytes = 0
+    /// The header block of the image part whose JPEG is in flight.
+    private var pendingMeta: MJPEGPartMeta?
 
     init(maxBufferBytes: Int = 4_000_000) {
         self.maxBufferBytes = max(1, maxBufferBytes)
@@ -148,16 +225,52 @@ struct MJPEGFrameParser {
 
     /// Feed one chunk; get back every complete JPEG it completed, in order.
     mutating func append(_ data: Data) -> [Data] {
+        appendParts(data).compactMap { part in
+            if case let .frame(jpeg, _) = part { return jpeg }
+            return nil
+        }
+    }
+
+    /// Feed one chunk; get back every complete part -- frames with their
+    /// metadata, and heartbeats -- in order.
+    mutating func appendParts(_ data: Data) -> [MJPEGPart] {
         buffer.append(data)
-        var frames: [Data] = []
+        highWaterBytes = max(highWaterBytes, buffer.count)
+        var parts: [MJPEGPart] = []
 
         while true {
-            guard let start = buffer.range(of: Self.soi) else {
-                // No frame has begun. Everything held is multipart boundary text
-                // or noise, so keep only a marker's worth in case an SOI is split
-                // across this chunk boundary -- dropping it whole would lose the
-                // first byte of the next frame roughly once per stream.
-                trimToTail(keeping: Self.soi.count - 1)
+            let start = buffer.range(of: Self.soi)
+            // A header block counts only if it ends BEFORE the next JPEG starts:
+            // JPEG bytes can contain CRLFCRLF, header text cannot contain an SOI.
+            let searchEnd = start?.lowerBound ?? buffer.endIndex
+            if let end = buffer.range(of: Self.headerEnd, in: buffer.startIndex..<searchEnd) {
+                let block = buffer.subdata(in: buffer.startIndex..<end.lowerBound)
+                let (meta, contentType, contentLength) = MJPEGPartMeta.parse(headerBlock: block)
+                let isImage = contentType.map { $0.lowercased().hasPrefix("image/") } ?? !meta.isHeartbeat
+                if isImage {
+                    // The header of the JPEG that follows: remember it, consume it.
+                    pendingMeta = meta
+                    discardedBytes += buffer.distance(from: buffer.startIndex, to: end.upperBound)
+                    buffer.removeSubrange(..<end.upperBound)
+                    continue
+                }
+                // A part with no JPEG: consume its (bounded) body as well.
+                let bodyLength = min(max(contentLength ?? 0, 0), Self.maxHeaderBytes)
+                let bodyEnd = buffer.index(end.upperBound, offsetBy: bodyLength, limitedBy: buffer.endIndex)
+                guard let bodyEnd, buffer.distance(from: end.upperBound, to: buffer.endIndex) >= bodyLength else {
+                    break  // body still in flight
+                }
+                if meta.isHeartbeat { parts.append(.heartbeat(meta)) }
+                discardedBytes += buffer.distance(from: buffer.startIndex, to: bodyEnd)
+                buffer.removeSubrange(..<bodyEnd)
+                continue
+            }
+            guard let start else {
+                // No frame has begun and no header block is complete. Keep a
+                // bounded tail: a header block (or an SOI) split across this
+                // chunk boundary must survive to the next chunk -- dropping it
+                // would lose the first byte of the next frame, or its metadata.
+                trimToTail(keeping: min(Self.maxHeaderBytes, maxBufferBytes))
                 break
             }
             // Anything before the SOI is boundary/header text, never image data.
@@ -170,12 +283,13 @@ struct MJPEGFrameParser {
             guard let end = buffer.range(of: Self.eoi, in: start.upperBound..<buffer.endIndex) else {
                 break  // frame still in flight
             }
-            frames.append(buffer.subdata(in: start.lowerBound..<end.upperBound))
+            parts.append(.frame(buffer.subdata(in: start.lowerBound..<end.upperBound), pendingMeta ?? MJPEGPartMeta()))
+            pendingMeta = nil
             buffer.removeSubrange(..<end.upperBound)
         }
 
         enforceBufferCap()
-        return frames
+        return parts
     }
 
     /// Drop everything held. Used when a connection is replaced, so bytes from a
@@ -184,6 +298,7 @@ struct MJPEGFrameParser {
     /// to nothing, and looks exactly like "the camera is broken".
     mutating func reset() {
         buffer.removeAll(keepingCapacity: true)
+        pendingMeta = nil
     }
 
     private mutating func trimToTail(keeping count: Int) {
@@ -265,8 +380,19 @@ enum MJPEGStreamRequest {
         if !cleaned.isEmpty {
             request.setValue(cleaned, forHTTPHeaderField: tokenHeader)
         }
+        // M8.3: ask for heartbeat parts. A device that predates them ignores an
+        // unknown request header; one that knows them answers with
+        // X-Stream-Heartbeat-Interval-Ms. It grants nothing: auth is the token.
+        request.setValue("1", forHTTPHeaderField: heartbeatHeader)
         return request
     }
+
+    /// Request header asking the device for heartbeat parts (core/dashboard.py).
+    static let heartbeatHeader = "X-Stream-Heartbeat"
+    /// Response header a heartbeat-capable device answers with.
+    static let heartbeatIntervalHeader = "X-Stream-Heartbeat-Interval-Ms"
+    /// Response header naming the device's stream (changes on restart).
+    static let streamIDHeader = "X-Stream-Id"
 }
 
 /// Turns a transport failure into something the person watching can act on.
@@ -340,6 +466,18 @@ enum MJPEGReaderPolicy {
     /// The device pushes at `dashboard.stream_fps` (12/s by default), so silence
     /// this long means the stream is not coming back on its own.
     static let idleTimeout: TimeInterval = 15
+    /// How long a connection attempt may take to get the device's answer
+    /// (response headers) before it is abandoned. URLSession has no separate
+    /// connect timeout -- the idle timeout above also governed connecting, so
+    /// a blackholed address held "connecting…" for 15 s per attempt. On a LAN
+    /// a live device answers in milliseconds.
+    static let connectTimeout: TimeInterval = 6
+    static let connectTimeoutReason = "the device didn't answer within 6 seconds"
+    static let silenceReason = "the device stopped sending anything — reconnecting"
+    /// How often the reader re-evaluates liveness (FeedLivenessTracker). Twice
+    /// a second: a stall shows within ~0.5 s of the 2 s threshold, and nothing
+    /// redraws unless the answer changed.
+    static let livenessTick: TimeInterval = 0.5
     /// Transport failures in a row before the address is worth re-resolving.
     static let failuresBeforeReresolving = 3
     /// The least time between two re-resolves, so an absent device cannot turn
