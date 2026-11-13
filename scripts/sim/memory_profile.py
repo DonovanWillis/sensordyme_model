@@ -223,6 +223,9 @@ class MemorySampler(threading.Thread):
         malloc = malloc_info()
         if malloc is not None:
             row["malloc"] = malloc
+            proc = proc_sample(self.pid)  # glibc implies Linux: /proc's anon/file split
+            if proc is not None:
+                row["rss_anon_mb"], row["rss_file_mb"] = proc["rss_anon_mb"], proc["rss_file_mb"]
         if marks:
             row["marks"] = marks
         if t >= self._next_types:
