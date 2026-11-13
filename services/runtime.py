@@ -21,6 +21,7 @@ from __future__ import annotations
 
 import json
 import os
+import shutil
 import signal
 import subprocess
 import threading
@@ -1110,10 +1111,50 @@ class DeviceRuntime:
         backlog = getattr(self.uplink, "backlog", None)
         if callable(backlog):
             report["uplink_backlog"] = backlog()
+        report["storage"] = self._storage_report(report.get("uplink_backlog"))
         # Stamped HERE, where the sample is taken, not where it is sent (M8.1): a
         # snapshot re-sent unchanged keeps its generation, so the backend can tell
         # a frozen report from a new one whatever the device's wall clock says.
         return self._stamper().stamp(report)
+
+    #: Free space below which the data card is reported failed / nearly full (M8.4).
+    _STORAGE_FAILED_BYTES = 1 << 20
+    _STORAGE_LOW_BYTES = 50 << 20
+
+    def _storage_report(self, backlog: Optional[dict] = None) -> dict:
+        """Can the device still write its data directory (M8.4)?
+
+        events.csv, the undelivered-event spool and the saved state all live
+        there, and every one of them fails quietly by design (losing a log row
+        must not cost an alert). Quietly is not the same as invisibly: a full or
+        read-only card used to leave every health component "ok" while the
+        device's only permanent record stopped growing. Two syscalls, no write.
+        """
+        csv_path = Path(str((self.config.get("logging", {}) or {}).get("csv_path", "data/events.csv")))
+        directory = csv_path.parent
+        metrics: dict[str, Any] = {"path": str(directory)}
+        problems: list[str] = []
+        free: Optional[int] = None
+        try:
+            free = int(shutil.disk_usage(directory).free)
+            metrics["free_mb"] = round(free / 2**20, 1)
+        except OSError as exc:
+            problems.append(f"data directory unavailable ({exc.strerror or exc})")
+        writable = os.access(directory, os.W_OK) and (not csv_path.exists() or os.access(csv_path, os.W_OK))
+        metrics["writable"] = writable
+        if not writable:
+            problems.append("data directory is not writable: the spool, saved state and new log files cannot be written")
+        if free is not None and free < self._STORAGE_FAILED_BYTES:
+            problems.append(f"data card full ({metrics['free_mb']} MB free): local records are being lost")
+        fault = backlog.get("spool_fault") if isinstance(backlog, dict) else None
+        if fault:
+            problems.append(f"undelivered-event spool not on disk ({fault}); kept in memory only")
+        if problems:
+            return {"state": "failed", "detail": "; ".join(problems), "metrics": metrics}
+        if free is not None and free < self._STORAGE_LOW_BYTES:
+            return {"state": "warning", "detail": f"data card nearly full ({metrics['free_mb']} MB free)",
+                    "metrics": metrics}
+        return {"state": "ok", "detail": "data directory writable", "metrics": metrics}
 
     def _stamper(self) -> health_stamp.HealthStamper:
         stamper = getattr(self, "_health_stamper", None)

@@ -249,6 +249,9 @@ class CloudUplink:
         #: An append failed part-way: the file may end in a torn line, and the next
         #: append would be glued onto it. The next write rewrites the file instead.
         self._spool_dirty = False
+        #: Why the spool could not be written (M8.4: a full or read-only card),
+        #: None once a write succeeds again. Reported in health, never raised.
+        self._spool_fault: Optional[str] = None
         self.restored_events = 0
         if self._spool_path is not None:
             self._load_spool()
@@ -924,11 +927,21 @@ class CloudUplink:
 
     # ------------------------------------------------------------------ backlog spool (M8)
     def backlog(self) -> dict:
-        """The undelivered-event backlog, for health: depth, bound, losses, persistence."""
+        """The undelivered-event backlog, for health: depth, bound, losses, persistence.
+
+        `persistent` is whether the backlog is ON DISK now (M8.4), not whether a
+        spool is configured: after a failed write (a full or read-only card) it
+        is False, with the reason in `spool_fault`, until a write succeeds --
+        retried here, at most once per health sample, so a card that recovers
+        stops being reported failed without waiting for the next event.
+        """
         with self._lock:
+            if self._spool_dirty:
+                self._spool_rewrite()
             return {"queued": len(self._queue), "capacity": self._queue.maxlen,
                     "dropped": self.dropped_events, "restored": self.restored_events,
-                    "persistent": self._spool_path is not None}
+                    "persistent": self._spool_path is not None and not self._spool_dirty,
+                    **({"spool_fault": self._spool_fault} if self._spool_fault else {})}
 
     def _load_spool(self) -> None:
         """Re-queue events a previous run recorded but never delivered.
@@ -998,6 +1011,7 @@ class CloudUplink:
         except (OSError, TypeError, ValueError) as exc:
             # Losing durability is bad; losing the event or the alert is worse.
             self._spool_dirty = True
+            self._spool_fault = str(exc)[:200]
             print(f"cloud_uplink: could not record a queued event on disk ({exc}); kept in memory")
 
     def _spool_rewrite(self) -> None:
@@ -1017,6 +1031,7 @@ class CloudUplink:
                     self._spool_path.unlink()
                 self._spool_lines = 0
                 self._spool_dirty = False
+                self._spool_fault = None
                 return
             from core.config_lkg import atomic_write_bytes
 
@@ -1025,8 +1040,13 @@ class CloudUplink:
             if atomic_write_bytes(self._spool_path, body.encode("utf-8"), mode=0o600):
                 self._spool_lines = len(backlog)
                 self._spool_dirty = False
+                self._spool_fault = None
+            else:
+                self._spool_dirty = True
+                self._spool_fault = "the spool could not be rewritten"
         except (OSError, TypeError, ValueError) as exc:
             self._spool_dirty = True
+            self._spool_fault = str(exc)[:200]
             print(f"cloud_uplink: could not rewrite the undelivered-event spool ({exc})")
 
     def next_delay(self) -> float:

@@ -67,6 +67,10 @@ class TestClientTransport:
     def __init__(self, client) -> None:
         self._client = client
 
+    def retarget(self, client) -> None:
+        """Point at another TestClient (a restarted backend) without rebuilding the link."""
+        self._client = client
+
     def post(self, url: str, *, json=None, data=None, headers=None, timeout=None, verify=None,
              allow_redirects: bool = True):
         del timeout, verify  # meaningless in-process
@@ -87,9 +91,15 @@ class SimUplink(CloudUplink):
     #: backend stores it and the app labels it, so a rehearsal is never shown
     #: as a real detection.
     SIMULATED = True
+    #: M8.4: when set (a sim.faults.EventLedger), every event any SimUplink
+    #: queues is recorded there -- "generated on the device", for comparing with
+    #: what the backend stored (soaks, data-integrity tests).
+    LEDGER: Optional[Any] = None
 
     def __init__(self, config: dict, *, transport: Optional[Any] = None, manual: bool = False) -> None:
         super().__init__(config)
+        if self.LEDGER is not None:
+            self.LEDGER.attach(self)
         if transport is not None:
             self._requests = transport
         self.manual = manual
