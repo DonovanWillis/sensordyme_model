@@ -83,6 +83,16 @@ fi
 if [ "$PARTIAL" = "1" ]; then
   "$P" "$SRC/research/pilot/partial_labels_patch.py" "$RUN" | tee "$O/patch.txt"
 fi
+# EXP-09 (docs/research/M84_MODEL_AUDIT.md): keep the pretrained head instead of re-initialising it.
+# HEAD_PRESERVE=1 copies gfl_reg/scales and the gfl_cls rows in HEAD_ROWS (default person<-0,
+# phone<-67, hand new); the loader verifies the copy and refuses to train if it is not exact.
+# SEED_FIX=1 (default with HEAD_PRESERVE) applies cfg.miscs.seed, which stock DAMO never does.
+if [ "${HEAD_PRESERVE:-0}" = "1" ]; then
+  "$P" "$SRC/research/m84/head_preserve_patch.py" "$RUN" | tee -a "$O/patch.txt"
+  export SD_HEAD_PRESERVE=1 SD_HEAD_ROWS="${HEAD_ROWS:-0,67,-1}" SD_HEAD_PRESERVE_REPORT="$O/head_preserve.json"
+  export SD_SEED_FIX="${SEED_FIX:-1}"
+  echo "head_preserve rows=$SD_HEAD_ROWS seed_fix=$SD_SEED_FIX" | tee -a "$O/experiment.txt"
+fi
 DAMO="$RUN"
 
 echo "== data (train/val only; test is never exported)"
@@ -141,6 +151,9 @@ echo "train rc=$rc in $(( $(date +%s)-t0 ))s"
 grep -E "Error|error|Traceback" "$O/train.log" | tail -15 || true
 grep -E "epoch|iter_time|AP" "$O/train.log" | tail -25 || true
 [ "$rc" -eq 0 ] || exit $rc
+if [ "${HEAD_PRESERVE:-0}" = "1" ]; then
+  "$P" -c "import json,sys; r=json.load(open(sys.argv[1])); print('head_preserve ok:', r['ok']); sys.exit(0 if r['ok'] else 4)" "$O/head_preserve.json"
+fi
 
 echo "== checkpoint and validation scoring (val only)"
 EPOCH_LOG="$WORK/workdirs/$EXP/sd_epochs.jsonl"
