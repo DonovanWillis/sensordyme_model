@@ -15,7 +15,8 @@ $P -u -m research.m84.device_export --damo "$D/src/$CAND-DAMO-YOLO-$C" --config 
   --zoo "$D/models/damoyolo_tinynasL20_T.onnx" --data "$OI" --work "$W" --out "$O" --name "$CAND" --threads 4 2>&1 \
   | grep -v -E "TracerWarning|^  (if|image_sizes)"
 echo "device_export rc=${PIPESTATUS[0]}"
-cp "$W/$CAND.heads81.onnx" "$O/" 2>/dev/null && sha256sum "$O/$CAND.heads81.onnx"   # ~32 MB: the compile input
+# The ONNX files are model weights: they stay on oryn ($W); only their hashes travel.
+sha256sum "$W/$CAND.onnx" "$W/$CAND.heads3.onnx" "$W/$CAND.heads81.onnx" | tee "$O/onnx.sha256"
 $P -u -m research.m84.hostquant --data "$OI" --models "$D/models" --work "$W/hostquant" --out "$O/hostquant" \
   --heads "$W/$CAND.heads3.onnx" --labels person,phone,hand --threads 4
 echo "hostquant rc=$?"
