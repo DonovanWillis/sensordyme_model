@@ -197,3 +197,24 @@ def test_a_device_key_cannot_reach_account_routes(two_accounts):
     for headers in ({"X-Device-Key": KEY_A}, {"Authorization": f"Bearer {KEY_A}"}):
         assert s.client.get("/v1/devices", headers=headers).status_code == 401
         assert s.client.get(f"/v1/devices/{s.alice}/events", headers=headers).status_code == 401
+
+
+# ------------------------------------------------------------------ what a client may keep
+def test_every_v1_answer_is_marked_no_store(two_accounts):
+    """The app's URLSession.shared kept GET answers in its on-disk URLCache when
+    no Cache-Control came back (reproduced on Foundation: cached without the
+    header, not cached with no-store), where they outlived sign-out. Every /v1
+    answer -- success, refusal, device poll -- now says no-store."""
+    s = two_accounts
+    answers = [
+        s.client.get("/v1/health"),
+        s.client.post("/v1/login", json={"email": "alice@example.com", "password": "password1"}),
+        s.client.get("/v1/devices", headers=s.auth["alice"]),
+        s.client.get(f"/v1/devices/{s.alice}/events", headers=s.auth["alice"]),
+        s.client.get(f"/v1/devices/{s.alice}/events", headers=s.auth["bob"]),
+        s.client.get("/v1/devices"),
+        s.client.post("/v1/ingest", json={"events": []}, headers={"X-Device-Key": KEY_A}),
+    ]
+    assert [r.status_code for r in answers] == [200, 200, 200, 200, 404, 401, 200]
+    for answer in answers:
+        assert answer.headers.get_list("cache-control") == ["no-store"], answer.request.url

@@ -295,6 +295,36 @@ class _BodySizeLimit:
 app.add_middleware(_BodySizeLimit, limit=MAX_BODY_BYTES)
 
 
+class _NoStore:
+    """`Cache-Control: no-store` on every /v1 answer (M8.3, SECURITY_REVIEW_M6 §6).
+
+    The answers are one account's cameras, alert history and explanations, and
+    the commands a device is to obey. Without a cache header the app's
+    URLSession.shared kept each GET answer in its on-disk URLCache (reproduced:
+    cached with no header, not cached with no-store), where it outlived sign-out
+    and an account change on a shared phone; any HTTP cache in front of the
+    backend could equally serve one account's answer to another request.
+    """
+
+    def __init__(self, app) -> None:
+        self.app = app
+
+    async def __call__(self, scope, receive, send) -> None:
+        if scope["type"] != "http" or not scope.get("path", "").startswith("/v1/"):
+            await self.app(scope, receive, send)
+            return
+
+        async def send_no_store(message) -> None:
+            if message["type"] == "http.response.start":
+                headers = [(k, v) for k, v in message.get("headers", []) if k.lower() != b"cache-control"]
+                message = {**message, "headers": [*headers, (b"cache-control", b"no-store")]}
+            await send(message)
+
+        await self.app(scope, receive, send_no_store)
+
+
+app.add_middleware(_NoStore)
+
 
 @app.exception_handler(RequestValidationError)
 async def _validation_error(_request: Request, exc: RequestValidationError) -> JSONResponse:
