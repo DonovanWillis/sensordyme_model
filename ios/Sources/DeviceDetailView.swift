@@ -775,7 +775,12 @@ struct DeviceDetailView: View {
                         .font(SD.Typography.caption.monospacedDigit())
                         .foregroundStyle(SD.Colors.textSecondary)
                 }
-                if component.isKnown {
+                if component.detail == CapabilityHealth.pausedDetail {
+                    // Stopped on purpose (M8.2): paused, not unknown and not a fault.
+                    Image(systemName: "pause.circle")
+                        .font(.caption)
+                        .foregroundStyle(SD.Colors.textTertiary)
+                } else if component.isKnown {
                     Circle().fill(component.status.tint).frame(width: 7, height: 7)
                 } else {
                     Image(systemName: "questionmark.circle")
