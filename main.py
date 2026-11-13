@@ -437,6 +437,15 @@ def build_runtime(argv: Optional[list[str]] = None, *, runtime_cls=None, module_
 
     _accel.configure(config.get("accelerator", {}))
 
+    # M8.5 (M84-5): the MediaPipe model files are verified against their registry
+    # pins BEFORE any module builds a graph. A file that does not match keeps its
+    # solution from loading at all (fail closed for that model only) and the
+    # runtime reports the capability impaired with this reason.
+    from core import model_registry as _registry
+
+    for _capability, _reason in _registry.enforce_bundled_artifacts().items():
+        print(f"SensorDyme: {_capability} model REFUSED -- {_reason}")
+
     try:
         module = module_cls(module_config) if module_factory is None else module_factory(module_cls, module_config)
     except Exception as exc:  # noqa: BLE001 - any failure: boot FAILED with the reason, never crash

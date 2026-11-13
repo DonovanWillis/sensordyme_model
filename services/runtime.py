@@ -350,6 +350,15 @@ class DeviceRuntime:
             max_age_s=float(perception_cfg.get("max_age_s", pc.DEFAULT_MAX_AGE_S)))
         self.perception.set_detector_loader(self._load_shared_detector)
         self.perception.adopt(module)
+        # M8.5 (M84-5): a model file main.py refused at boot (sha256 not its registry
+        # pin) is reported for the life of the process: the component UNAVAILABLE
+        # with the reason, so the capability is IMPAIRED in health, whatever runs.
+        from core import model_registry as _registry
+
+        self._artifact_faults = _registry.boot_artifact_faults()
+        for capability, reason in self._artifact_faults.items():
+            if capability in pc.COMPONENT_OF:
+                self.perception.block(pc.COMPONENT_OF[capability], reason)
         #: Where analysed frames come from (the simulator says "sim").
         self._perception_source = "camera"
         self._perception_simulated = False
@@ -804,6 +813,9 @@ class DeviceRuntime:
                                    f"({self.config_fault.fallback_path}): {self.config_fault.reason}")
         for fault in getattr(self, "_state_faults", []) or []:
             self._log_system_event("saved_state_fault", fault)
+        for capability, reason in (getattr(self, "_artifact_faults", None) or {}).items():
+            log.error("[MODEL INTEGRITY] %s: %s", capability, reason)
+            self._log_system_event("model_integrity_fault", f"{capability}: {reason}")
 
         # ---- supervisor -----------------------------------------------------------
         self.supervisor = Supervisor(self.health)

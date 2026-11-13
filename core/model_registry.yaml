@@ -252,8 +252,14 @@ models:
     task: face_landmarks
     artifacts:
       # Bundled inside the mediapipe==0.10.14 wheel; refine_landmarks=True
-      # selects the attention model. Hashes are of the macOS arm64 wheel's
-      # copies (2026-11-11); the Pi's aarch64 wheel copies are not yet hashed.
+      # selects the attention model. The same bytes ship in the macOS arm64
+      # wheel (2026-11-11, m84 evidence) and in the Pi's cp311 aarch64 wheel
+      # (whose own sha256 is pinned in requirements-device.lock; extracted
+      # 2026-11-13, m85 evidence mediapipe_tflite_sha256_aarch64_wheel.txt), so
+      # one pin per file serves both platforms. Verified at install (staged
+      # release) and at every boot (core/model_registry.py
+      # verify_bundled_artifacts; a mismatch refuses that graph and reports
+      # the capability impaired). Same for the hands and pose cards below.
       - path: mediapipe/modules/face_detection/face_detection_short_range.tflite
         sha256: "bbff11cebd1eb27a1e004cae0b0e63ec8c551cbf34a4451148b4908b8db3eca8"
         size: 229714
