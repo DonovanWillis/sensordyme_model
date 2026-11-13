@@ -97,9 +97,15 @@ struct DevicesView: View {
             .orynScreen()
             // Said once; gone after the person moves on, not pinned to the home screen.
             .onDisappear { alertOpenProblem = nil }
-            .navigationDestination(for: Device.self) { device in
-                DeviceDetailView(device: device)
-                    .sdZoomDestination(.device(device.id), in: zoomNS, enabled: !reduceMotion)
+            // Pushed by id, not by the Device value: the value changes on every
+            // 10 s refresh (receivedAt, telemetry), and a pushed screen keyed by
+            // a value the list no longer holds was popped back to the list
+            // (journey 26, after stale telemetry turned fresh).
+            .navigationDestination(for: DeviceRoute.self) { route in
+                if let device = devices.first(where: { $0.id == route.id }) ?? route.opened {
+                    DeviceDetailView(device: device)
+                        .sdZoomDestination(.device(device.id), in: zoomNS, enabled: !reduceMotion)
+                }
             }
             .navigationDestination(item: $launchTarget) { DeviceDetailView(device: $0) }
             // A tapped notification opens its device, which then consumes
@@ -171,7 +177,7 @@ struct DevicesView: View {
                     )
 
                     ForEach(devices) { device in
-                        NavigationLink(value: device) {
+                        NavigationLink(value: DeviceRoute(device)) {
                             DeviceCard(device: device, zoomNS: zoomNS, zoomEnabled: !reduceMotion,
                                        lastRefreshFailed: errorMessage != nil, now: now)
                         }
@@ -475,6 +481,22 @@ struct DeviceCard: View {
                 .strokeBorder(Color.white.opacity(0.08), lineWidth: 1)
         )
     }
+}
+
+/// A device screen in the navigation path: equal by id only, so the path entry
+/// stays the same while the device's reported values change underneath it.
+/// Carries the device as it was when opened, for a moment the list is empty.
+struct DeviceRoute: Hashable {
+    let id: Int
+    let opened: Device?
+
+    init(_ device: Device) {
+        id = device.id
+        opened = device
+    }
+
+    static func == (lhs: DeviceRoute, rhs: DeviceRoute) -> Bool { lhs.id == rhs.id }
+    func hash(into hasher: inout Hasher) { hasher.combine(id) }
 }
 
 /// A faint rule-of-thirds grid — a viewfinder, so a
