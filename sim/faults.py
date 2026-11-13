@@ -32,7 +32,7 @@ import sys
 import tempfile
 import threading
 from collections.abc import Callable, Iterator
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Optional
 
@@ -46,8 +46,10 @@ class LinkStats:
     duplicated: int = 0
     held: int = 0
     delivered_late: int = 0
-    #: Each POST the backend actually received: (path, number of events in it).
-    deliveries: list[tuple[str, int]] = field(default_factory=list)
+    #: POSTs the backend actually received, and the events they carried (counts,
+    #: not a list: a day-long soak must not grow the harness).
+    delivered: int = 0
+    events_delivered: int = 0
 
 
 class LinkFaults:
@@ -85,7 +87,8 @@ class LinkFaults:
 
     def _deliver(self, url: str, kwargs: dict):
         events = (kwargs.get("json") or {}).get("events") if isinstance(kwargs.get("json"), dict) else None
-        self.stats.deliveries.append((url.rsplit("/", 1)[-1], len(events or [])))
+        self.stats.delivered += 1
+        self.stats.events_delivered += len(events or [])
         return self._inner.post(url, **kwargs)
 
     def release_held(self, *, force: bool = False) -> int:

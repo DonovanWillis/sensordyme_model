@@ -644,6 +644,8 @@ def run_simclock(args: argparse.Namespace) -> dict:
     samples: list[dict] = []
     commands = {"stop": 0, "resume": 0, "stop_confirmed": 0, "resume_confirmed": 0}
     restarts = power_cuts = backend_restarts = 0
+    unconfirmed: list[dict] = []
+    disruptions: list[dict] = []
     with tempfile.TemporaryDirectory(prefix="m84-simsoak-", dir=args.work_dir) as tmp, SimStack(Path(tmp)) as stack:
         monitor = InvariantMonitor(stack)
         link = LinkFaults(stack.transport, seed=args.seed, loss=args.loss, answer_loss=args.answer_loss,
@@ -677,22 +679,33 @@ def run_simclock(args: argparse.Namespace) -> dict:
             st = stack.status()
             if (st.get("protection_command") or {}).get("outcome") == "confirmed":
                 commands["stop_confirmed"] += 1
+            else:
+                unconfirmed.append({"cycle": cycle, "action": "stop", "after_s": RESUME_AT - STOP_AT,
+                                    "command": st.get("protection_command"), "stale": st.get("stale"),
+                                    "state": st.get("monitoring_state")})
             if stack.protection("resume").status_code == 200:
                 commands["resume"] += 1
             run_to(base + DISRUPT_AT)
             st = stack.status()
             if (st.get("protection_command") or {}).get("outcome") == "confirmed":
                 commands["resume_confirmed"] += 1
+            else:
+                unconfirmed.append({"cycle": cycle, "action": "resume", "after_s": DISRUPT_AT - RESUME_AT,
+                                    "command": st.get("protection_command"), "stale": st.get("stale"),
+                                    "state": st.get("monitoring_state")})
             if cycle % 7 == 3:
                 device = boot("restart")
                 restarts += 1
+                disruptions.append({"cycle": cycle, "kind": "restart"})
             elif cycle % 11 == 6:
                 device = boot("cold")
                 power_cuts += 1
+                disruptions.append({"cycle": cycle, "kind": "power_cut"})
             elif cycle % 13 == 9:
                 stack.restart_backend()
                 link._inner = stack.transport
                 backend_restarts += 1
+                disruptions.append({"cycle": cycle, "kind": "backend_restart"})
             run_to(base + CYCLE_S)
             gc.collect()
             samples.append({"t": round(stack.clock.monotonic() - origin), "wall_s": round(time.time() - wall0, 1),
@@ -725,14 +738,21 @@ def run_simclock(args: argparse.Namespace) -> dict:
             "sim_hours": args.hours, "sim_seconds_completed": round(stack.clock.monotonic() - origin),
             "wall_s": round(time.time() - wall0, 1), "cycles": cycle,
             "link": {"seed": args.seed, "loss": args.loss, "answer_loss": args.answer_loss,
-                     "duplicate": args.duplicate, "hold": args.hold, **{k: v for k, v in vars(link.stats).items()
-                                                                         if k != "deliveries"}},
+                     "duplicate": args.duplicate, "hold": args.hold, **vars(link.stats)},
             "commands": commands, "device_restarts": restarts, "power_cuts": power_cuts,
             "backend_restarts": backend_restarts,
             "events": {k: (len(v) if isinstance(v, list) else v) for k, v in integrity.items()},
             "events_lost_keys": integrity["lost"][:20],
             "event_types": dict(collections.Counter(r["type"] for r in stored)),
             "invariants": monitor.summary(), "violations": [str(v) for v in monitor.violations[:20]],
+            "violations_by_invariant": dict(collections.Counter(v.invariant for v in monitor.violations)),
+            "violations_by_detail": dict(collections.Counter(v.detail.split(" without ")[0].split(" is not ")[0]
+                                                             for v in monitor.violations)),
+            "violation_cycles_vs_disruptions": _violation_cycles(monitor.violations, origin, disruptions),
+            "commands_unconfirmed": unconfirmed[:20],
+            "harness_growth": {"ledger_entries": len(ledger.entries), "monitor_transitions": len(monitor.transitions),
+                               "monitor_user_states": len(monitor.user_states),
+                               "protection_effects": len(monitor.protection_effects)},
             "user_states_seen": sorted(set(monitor.user_states)),
             "final_state": final.get("monitoring_state"),
             "rss_mb_first_last": [samples[0]["rss_mb"], samples[-1]["rss_mb"]] if samples else None,
@@ -744,6 +764,14 @@ def run_simclock(args: argparse.Namespace) -> dict:
     SimUplink.LEDGER = None
     _write(out, summary, samples)
     return summary
+
+
+def _violation_cycles(violations, origin: float, disruptions: list[dict]) -> dict:
+    """Which cycles the violations fell in, and what disruption ended the cycle before."""
+    by_cycle = collections.Counter(int((v.sim_time - origin - CALIBRATION_S) // CYCLE_S) for v in violations)
+    kinds = {d["cycle"]: d["kind"] for d in disruptions}
+    after = collections.Counter(kinds.get(c, kinds.get(c - 1, "none")) for c in by_cycle)
+    return {"cycles_with_violations": len(by_cycle), "disruption_in_or_before_that_cycle": dict(after)}
 
 
 # ====================================================================== output
