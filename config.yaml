@@ -260,7 +260,13 @@ alerts:
   # Alert episodes (M0.1): every new episode alerts immediately; a sustained one
   # repeats and escalates within the bounds in core/alerts.py DEFAULT_CATEGORIES.
   # cooldown_s below now de-duplicates only the rolling-window notices (soft_types).
-  loud_types: [drowsiness, phone_use, eyes_down, eyes_up, attention_lost, high_risk, # always the loud/continuous tone
+  # M8.4 owner decision A: the experimental families high_risk, elevated_risk and
+  # erratic_hand_movement are OBSERVATIONS (logged, severity "log", labelled
+  # experimental in the app), never in loud/soft/critical_types. Listing them
+  # anyway changes nothing: core/alerts.py refuses them, and services/runtime.py
+  # tags them "log", unless this is the boolean true (core/behavior/experimental.py).
+  experimental_alerts_audible: false
+  loud_types: [drowsiness, phone_use, eyes_down, eyes_up, attention_lost, # always the loud/continuous tone
                distraction, # sustained sideways head turn (3s+). Was in NEITHER list: locally it
                # escalated by repetition (a deliberate mechanism), but its severity tag fell back to
                # "soft", so it never pushed to the phone — while eyes_down (looking down 2.5s) was
@@ -300,7 +306,7 @@ alerts:
                # of promoted here -- it fires on every person entering/leaving frame, and as a loud type
                # would interrupt constantly rather than never; matches baby_monitoring's own
                # person_count_change, log-only by the same reasoning.)
-  soft_types: [fatigue_warning, frequent_glancing, elevated_risk, erratic_hand_movement, # always the soft chime
+  soft_types: [fatigue_warning, frequent_glancing, # always the soft chime
                promptDriverDistracted, promptDriverUnresponsive, # openpilot prompt (orange) alerts -- chime, as in the car
                distractionDetected, # openpilot module's additive instant chime (fires ~0.3s after detection)
                skinnemoen_calibration_complete, # skinnemoen calibration-done chime (the original beeped here)
@@ -576,8 +582,11 @@ modules:
     risk_ema_alpha: 0.3 # smoothing for the composite score; higher = reacts faster but noisier.
     # Weight per 1/30 s (one frame at the device's measured 30 fps), applied by elapsed time, so the
     # score reacts in the same wall-clock time at any frame rate
-    risk_elevated_threshold: 0.4 # composite score above this fires the soft "elevated_risk" event
-    risk_high_threshold: 0.75 # composite score above this, sustained, fires the loud "high_risk" event
+    # M8.4: elevated_risk / high_risk (and erratic_hand_movement) are EXPERIMENTAL observations:
+    # logged, never audible or pushed unless alerts.experimental_alerts_audible is true. A merely
+    # visible phone adds nothing to this score (core/behavior/phone_evidence.py).
+    risk_elevated_threshold: 0.4 # composite score above this logs the experimental "elevated_risk" observation
+    risk_high_threshold: 0.75 # composite score above this, sustained, logs the experimental "high_risk" observation
     risk_confirm_seconds: 1.0 # composite score must stay above risk_high_threshold this long to fire "high_risk"
 
     # --- behaviour reasoning v2 (core/behavior/; EXPERIMENTAL, NOT VALIDATED) ---

@@ -53,6 +53,23 @@ MIGRATIONS: list[tuple[str, str, str]] = [
         ("opt-in TLS: skips certificate verification entirely when true -- genuinely"
          " insecure, dev-only. See config.yaml's fuller comment on this key."),
     ),
+    # M8.4 owner decision A. The explicit "no" written down on every unit, so the
+    # opt-in is visible where an owner would look for it. The SAFETY does not
+    # depend on this line: a unit configured before M8.4 still lists high_risk
+    # in alerts.loud_types and elevated_risk / erratic_hand_movement in
+    # soft_types, and this script never removes list members (a device's own
+    # values are left exactly as they are). Those entries are inert: the alert
+    # policy refuses the experimental families (core/alerts.py
+    # AlertManager.permits) and the runtime and uplink tag them "log"
+    # (core/behavior/experimental.py), unless this key is the boolean `true`.
+    # Deleting the key, resetting config.yaml or rebooting therefore all land
+    # on "not audible".
+    (
+        "alerts.experimental_alerts_audible",
+        "  experimental_alerts_audible: false",
+        ("M8.4: high_risk / elevated_risk / erratic_hand_movement are experimental observations"
+         " (logged, never sounded or pushed) unless this is true -- an explicit owner opt-in"),
+    ),
 ]
 
 # A NEW MEMBER of an EXISTING flow-sequence value, as (dotted path to the key,

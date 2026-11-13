@@ -30,6 +30,7 @@ from urllib.parse import urlsplit
 
 from core import command_auth as auth
 from core import health_stamp
+from core.behavior.experimental import is_experimental
 
 #: Upper bound on the backlog. It must not exceed the backend's MAX_INGEST_EVENTS
 #: (cloud/app.py): the whole backlog goes up in one POST, so a queue larger than
@@ -497,6 +498,13 @@ class CloudUplink:
                 "_boot": self._boot,
                 "_mono": time.monotonic(),
             }
+            if is_experimental(event.type):
+                # M8.4 owner decision A (integrator contract): an experimental
+                # family travels as an OBSERVATION -- top-level `experimental:
+                # true` and severity "log", whatever severity it was given, so no
+                # backend can read it as an alert. Absent for every other event.
+                item["experimental"] = True
+                item["severity"] = "log"
             if notify is not None:
                 item["notify"] = str(notify)
             if self.SIMULATED:

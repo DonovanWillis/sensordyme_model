@@ -54,7 +54,7 @@ presets:
   # comma.ai's model. It is simply no longer a product decision.
   driver_safety:
     title: Driver Safety
-    description: Drowsiness, eyes off the road, and phone use while looking away. Hand tracking and the combined risk score are experimental.
+    description: Drowsiness, eyes off the road, and phone use while looking away. Hand tracking and the combined risk score are experimental observations, never alerts.
     module: driver_attention
     variants:
       standard: { title: Standard }
@@ -70,7 +70,9 @@ presets:
     # 3 (M8): phone_use judges only the driver's phone and never one hand
     # tracking shows set down; a downward look that lowers the lids is
     # eyes_down, not closure; a camera stall credits one frame of evidence.
-    version: 3
+    # 4 (M8.4): high_risk / elevated_risk / erratic_hand_movement are experimental
+    # observations, no longer alerts; a visible phone no longer raises the risk score.
+    version: 4
     product_mode: driver_safety
     # Face landmarks carry drowsiness, distraction and attention-lost, and a
     # driver alert nobody in the cabin hears protects no one. Objects (phone,
@@ -91,8 +93,12 @@ presets:
       - { event: frequent_glancing, description: repeated off-road glances within a rolling window, window_s: 45.0 }
     alert_patterns:
       - { tone: critical, events: [drowsiness, attention_lost], description: "continuous alarm; repeats while the condition lasts (bounded)" }
-      - { tone: loud, events: [distraction, eyes_down, eyes_up, phone_use, high_risk], description: "loud tone; repeats while the condition lasts (bounded)" }
-      - { tone: soft, events: [fatigue_warning, frequent_glancing, elevated_risk, erratic_hand_movement], description: "soft chime, once per episode" }
+      - { tone: loud, events: [distraction, eyes_down, eyes_up, phone_use], description: "loud tone; repeats while the condition lasts (bounded)" }
+      - { tone: soft, events: [fatigue_warning, frequent_glancing], description: "soft chime, once per episode" }
+    # M8.4 owner decision A: high_risk, elevated_risk and erratic_hand_movement are
+    # EXPERIMENTAL OBSERVATIONS -- logged (severity "log", `experimental: true` in the
+    # app), in no tone above, never pushed. Only alerts.experimental_alerts_audible:
+    # true (an explicit owner opt-in in config.yaml) makes them audible again.
     settings:
       - { key: drowsy_seconds, title: Eyes-closed time before alert, type: number, default: 2.0, min: 1.0, max: 3.0, step: 0.1, unit: s }
       - { key: distraction_seconds, title: Looking-away time before alert, type: number, default: 3.0, min: 1.0, max: 5.0, step: 0.1, unit: s }
@@ -111,7 +117,8 @@ presets:
       - Cannot tell texting from reading, or see the road; sunglasses and night driving are untested
       - Hand-on-phone and looking-down rules are tested on synthetic scenes only; the hand model often misses a gripping hand, so a phone with no hand found is still judged as in use
       - A visible phone is not phone use; phone_detected is logged, never alerted
-      - "Experimental and unvalidated, though they sound by default: the combined risk score (high_risk, elevated_risk; it counts a visible phone even with eyes on the road) and erratic_hand_movement (hand tracking)"
+      - "Experimental and unvalidated, logged as observations and never sounded or pushed: the combined risk score (high_risk, elevated_risk) and erratic_hand_movement (hand tracking). A merely visible or mounted phone no longer adds to the risk score; only a phone hand tracking sees held, with the eyes off the road, does"
+      - "Which person is the driver is assumed (the person whose face is measured, else the largest person box); driver-vs-passenger association is unevaluated"
     evidence:
       - docs/MODEL_REGISTRY.md
       - docs/DETECTION_THRESHOLDS.md

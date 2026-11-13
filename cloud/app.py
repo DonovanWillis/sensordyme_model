@@ -62,6 +62,7 @@ from cloud.ratelimit import (
 )
 from core import command_auth as sd_auth
 from core import health_stamp
+from core.behavior.experimental import is_experimental as _is_experimental_type
 from core.logging_setup import describe_failure, mask_phone
 from core.presets import (
     SETTINGS_SEPARATOR,
@@ -648,6 +649,10 @@ def init_db() -> None:
             # "received" (the device clock was implausible; arrival time).
             "ALTER TABLE events ADD COLUMN occurred_at REAL",
             "ALTER TABLE events ADD COLUMN time_basis TEXT",
+            # M8.4 owner decision A: 1 for an experimental observation (high_risk,
+            # elevated_risk, erratic_hand_movement), 0 for any other event this
+            # backend stored since; NULL for history (never back-filled).
+            "ALTER TABLE events ADD COLUMN experimental INTEGER",
         ):
             try:
                 conn.execute(statement)
@@ -2702,7 +2707,7 @@ def device_events(device_id: int, limit: int = 100, before_id: Optional[int] = N
         # `id` is included so the app can ask why a specific alert fired.
         # Without it an event is unaddressable and /explain is unreachable.
         columns = ("SELECT id, timestamp, type, confidence, signals, severity, source, duration, model,"
-                   " event_key, received_at, occurred_at, time_basis, alert, simulated FROM events ")
+                   " event_key, received_at, occurred_at, time_basis, alert, simulated, experimental FROM events ")
         if before_id is not None:
             rows = conn.execute(
                 columns + "WHERE device_id = ? AND id < ? ORDER BY id DESC LIMIT ?",
@@ -4664,7 +4669,20 @@ def _event_row(r) -> dict:
     # firmware, a log-only event). The app says "sounded" only from this.
     out["alert"] = _stored_alert(r["alert"])
     out["simulated"] = bool(r["simulated"]) if r["simulated"] is not None else None
+    # M8.4 owner decision A: an experimental observation, which the app labels
+    # "Experimental observation" (never an alert); its severity is always "log".
+    out["experimental"] = _row_experimental(r)
     return out
+
+
+def _row_experimental(r) -> bool:
+    """From the stored column only. History (NULL) is not relabelled: an old
+    high_risk row did sound and notify then, and its row says what happened."""
+    try:
+        stored = r["experimental"]
+    except (IndexError, KeyError):  # a query that did not select it
+        stored = None
+    return stored == 1
 
 
 #: A device's hardware id. `SD-SIM-` marks the virtual device (sim/); it is kept so
@@ -4924,12 +4942,19 @@ def ingest(body: IngestBody, background_tasks: BackgroundTasks, request: Request
                 alert = _alert_report(e.get("alert"))
                 occurred_at, time_basis = _event_time(e, now)
                 simulated = _event_simulated(e, model, body.health, body.monitoring)
+                # M8.4 owner decision A: an experimental observation is stored as
+                # severity "log" whatever the device said (older firmware tags
+                # high_risk "loud"), and the notification loop skips it.
+                experimental = e.get("experimental") is True or _is_experimental_type(e.get("type"))
+                if experimental:
+                    e["severity"] = "log"
                 stored_key = str(event_key) if event_key not in (None, "") else None
                 cursor = conn.execute(
                     "INSERT OR IGNORE INTO events (device_id, timestamp, type, confidence, signals,"
                     " severity, source, received_at, event_key, duration, model,"
-                    " alert, alert_output, alert_rev, episode, simulated, occurred_at, time_basis)"
-                    " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                    " alert, alert_output, alert_rev, episode, simulated, occurred_at, time_basis,"
+                    " experimental)"
+                    " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
                     (
                         device["id"],
                         str(e.get("timestamp", "")),
@@ -4949,6 +4974,7 @@ def ingest(body: IngestBody, background_tasks: BackgroundTasks, request: Request
                         1 if simulated else 0,
                         occurred_at,
                         time_basis,
+                        1 if experimental else 0,
                     ),
                 )
                 if cursor.rowcount == 0 and stored_key is not None and alert is not None:
@@ -4974,7 +5000,7 @@ def ingest(body: IngestBody, background_tasks: BackgroundTasks, request: Request
                 # gate exists to prevent, just moved from "database row" to
                 # "notification".
                 if cursor.rowcount > 0:
-                    newly_inserted_events.append({**e, "_simulated": simulated})
+                    newly_inserted_events.append({**e, "_simulated": simulated, "_experimental": experimental})
             except (TypeError, ValueError, OverflowError) as exc:
                 # Only what is wrong with THIS EVENT. A storage failure (a full
                 # disk, an I/O error) is not: it used to be caught here too, so
@@ -5179,6 +5205,10 @@ def ingest(body: IngestBody, background_tasks: BackgroundTasks, request: Request
     # about); the cooldown then rate-limits distinct, genuinely-new alerts
     # against each other. Both are always active together.
     for e in newly_inserted_events:
+        if e.get("_experimental"):
+            # An experimental observation (owner decision A) never interrupts
+            # anyone, and never uses up the account's cooldown.
+            continue
         owner_id = owner["id"] if owner is not None else None
         push, sms = _notify_channels(e)
         if not (push or sms):
