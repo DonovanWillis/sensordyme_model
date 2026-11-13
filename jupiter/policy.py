@@ -256,7 +256,26 @@ _REFUSAL_PATTERNS: tuple[tuple[str, re.Pattern], ...] = (
         r"(?:stomach|tummy|front|face)|fever|overheat\w*)\b")),
     ("repetition_window", re.compile(
         r"\b(?:\d+|two|three|four|five|six|seven|eight|nine|ten|several|multiple) times\b")),
+    # M8.4: the driver module's experimental families -- the combined risk
+    # score (high_risk, elevated_risk) and hand-motion tracking
+    # (erratic_hand_movement) -- are recorded as observations, never offered
+    # as alerts. No interpreter may turn a request for them back into an
+    # alert, nor approximate one as "a person is present" or a raised hand.
+    ("experimental_signal", re.compile(
+        r"\b(high[- ]risk|elevated[- ]risk|risk (?:score|level|rating)s?|risky driving|"
+        r"erratic (?:hand|hands|hand movements?|movements?|driving)|hand (?:movements?|motion)|"
+        r"(?:hands?|arms?) (?:moving|flailing|waving around)|fidget\w*)\b")),
 )
+
+#: Refusals that are not core/taxonomy.py categories: (title, requires).
+_EXTRA_REFUSALS = {
+    "experimental_signal": (
+        "An experimental driver observation (the combined risk score or erratic hand movement)",
+        ("validation on real in-cabin footage first. These are recorded in Activity as experimental "
+         "observations and never sound or notify; ask for an observable condition instead "
+         "(someone in an area you draw, nobody in view)"),
+    ),
+}
 
 
 def refusal_for(text: str) -> list[dict]:
@@ -272,22 +291,73 @@ def refusal_for(text: str) -> list[dict]:
         match = pattern.search(lowered)
         if not match:
             continue
-        detection = REFUSALS[category]
+        if category in _EXTRA_REFUSALS:
+            title, requires = _EXTRA_REFUSALS[category]
+            reason = f"{title} is not something SensorDyme can alert on ('{match.group(0)}')."
+        else:
+            detection = REFUSALS[category]
+            title, requires = detection.title, detection.requires
+            reason = f"{title} is not something SensorDyme can monitor ('{match.group(0)}')."
         entries.append({
             "request": str(text)[:500],
-            "reason": f"{detection.title} is not something SensorDyme can monitor ('{match.group(0)}').",
-            "requires": detection.requires,
+            "reason": reason,
+            "requires": requires,
             "support": "unsupported",
             "alternatives": [],
             "category": category,
+            "code": category,
         })
     return entries
 
 
+# ---------------------------------------------------------------------- typed reasons
+#: The closed set of `code`s every `unsupported` entry carries (M8.4), so the
+#: app says WHY in one consistent headline instead of parsing prose. The
+#: refusal categories above are codes too.
+UNSUPPORTED_CODES = frozenset({
+    *(category for category, _ in _REFUSAL_PATTERNS),
+    "not_detectable",           # the detector does not recognise it (needs training data / a model / hardware)
+    "not_supported",            # the device cannot evaluate it as asked
+    "no_target",                # the request names nothing the camera could watch
+    "needs_area",               # an area rule with no area
+    "needs_second_object",      # a relation (near, holding) with one object
+    "invalid_rule",             # a rule shape the typed policy schema refuses
+    "not_beside_mode",          # a rule that came with a mode switch
+    "interpreter_unavailable",  # nothing could interpret the request; nothing was guessed
+})
+
+_SUPPORT_CODES = {"needs_training_data": "not_detectable", "needs_model": "not_detectable",
+                  "needs_hardware": "not_detectable"}
+
+
+def unsupported_code(entry: dict) -> str:
+    """The typed reason for one `unsupported` entry: its own `code` when it is
+    a known one, else its refusal category, else what its `support` implies."""
+    for key in ("code", "category"):
+        value = str(entry.get(key) or "")
+        if value in UNSUPPORTED_CODES:
+            return value
+    return _SUPPORT_CODES.get(str(entry.get("support") or ""), "not_supported")
+
+
+def typed_unsupported(entries) -> list[dict]:
+    """`entries` with a `code` from UNSUPPORTED_CODES on every one. Additive:
+    nothing else in an entry changes, and a non-object entry is dropped."""
+    return [{**entry, "code": unsupported_code(entry)} for entry in entries or [] if isinstance(entry, dict)]
+
+
 # ---------------------------------------------------------------------- the parser
+# M8.4 widened the phrasings below -- never the capabilities: every one still
+# compiles to the same three conditions (in_zone, lingering, absent/count) on
+# a label the registry serves. Lead-ins ("can you", "I want to know", "as soon
+# as"), "there is/are", "shows up / is seen in", a duration without "for" or
+# before the area, and "or longer" are read; anything else still goes on.
 _TRIGGER = re.compile(
-    r"^(?:please\s+)?(?:(?:(?:alert|notify|tell|warn|ping|text|message)\s+me|let\s+me\s+know|"
-    r"send\s+(?:me\s+)?an?\s+(?:alert|notification))\s+)?(?:if|when|whenever)\s+")
+    r"^(?:please\s+)?(?:(?:can|could|would|will)\s+you\s+(?:please\s+)?)?"
+    r"(?:(?:(?:alert|notify|tell|warn|ping|text|message|buzz)\s+me|let\s+me\s+know|i\s+want\s+to\s+know|"
+    r"i\s+(?:want|need|would like)\s+(?:an?\s+)?(?:alert|notification)|"
+    r"send\s+(?:me\s+)?an?\s+(?:alert|notification|push(?:\s+notification)?))\s+)?"
+    r"(?:if|when|whenever|as\s+soon\s+as|any\s*time|every\s+time)\s+")
 _PERSON = re.compile(
     r"^(?:someone|somebody|anyone|anybody|a person|any person|a man|a woman|a kid|a child|people|persons)\b")
 _COUNT = re.compile(
@@ -295,17 +365,29 @@ _COUNT = re.compile(
     r"(?P<noun>[a-z]+)\b")
 _ARTICLE = re.compile(r"^(?:a|an|any|the)\s+(?P<noun>[a-z]+(?: [a-z]+)?)\b")
 _NOBODY = re.compile(r"^(?:no ?one|nobody|no person|no people)\b")
-_DURATION = (r"for\s+(?:longer than|more than|over|at least|)\s*(?P<n>\d+(?:\.\d+)?|a|an|one|two|three|four|five|"
-             r"six|seven|eight|nine|ten|fifteen|twenty|thirty|forty|forty-five|sixty|ninety)\s*"
-             r"(?P<unit>seconds?|secs?|s|minutes?|mins?|m|hours?|hrs?|h)")
+#: "there is / there are / there's" before a count, nobody or a thing.
+_THERE = re.compile(r"^there(?:'s|\s+is|\s+are)\s+")
+_AMOUNT = (r"(?P<n>\d+(?:\.\d+)?|a|an|one|two|three|four|five|six|seven|eight|nine|ten|fifteen|twenty|thirty|"
+           r"forty|forty-five|sixty|ninety)\s*(?P<unit>seconds?|secs?|s|minutes?|mins?|m|hours?|hrs?|h)"
+           r"(?:\s+or\s+(?:more|longer))?")
+_DURATION = (r"(?:for\s+(?:(?:longer than|more than|over|at least)\s+)?|(?:longer than|more than|over|at least)\s+)"
+             + _AMOUNT)
 _PREP = r"(?:inside|in|into|within|at|on)"
 _ZONE = r"(?P<zone>(?:the |this |that |my |our )?[a-z][a-z0-9 '_-]{0,40}?)"
 _DWELL_VERB = re.compile(
     rf"^(?:stays?|remains?|lingers?|loiters?|waits?|hangs? around|is|are|spends? time)\s+{_PREP}\s+{_ZONE}\s+"
     rf"{_DURATION}$")
+#: The duration before the area: "spends more than 5 minutes in the kitchen".
+_DWELL_LEADING = re.compile(
+    rf"^(?:stays?|remains?|lingers?|loiters?|waits?|hangs? around|spends?)\s+"
+    rf"(?:(?:longer than|more than|over|at least)\s+)?{_AMOUNT}\s+{_PREP}\s+{_ZONE}$")
 _ENTER_VERB = re.compile(
     rf"^(?:enters?\s+|(?:goes|walks|comes|steps|gets|go|walk|come|step|get)\s+(?:into|in)\s+|"
+    rf"(?:shows?|turns?)\s+up\s+{_PREP}\s+|arrives?\s+(?:in|at)\s+|"
+    rf"(?:is|are)\s+(?:seen|detected|spotted)\s+{_PREP}\s+|"
     rf"(?:is|are|appears?)\s+{_PREP}\s+){_ZONE}$")
+#: After "there is a dog": just where.
+_THERE_TAIL = re.compile(rf"^{_PREP}\s+{_ZONE}$")
 _COUNT_TAIL = re.compile(rf"^(?:are\s+)?{_PREP}\s+{_ZONE}(?:\s+{_DURATION})?$")
 _ABSENT_TAIL = re.compile(rf"^(?:is\s+)?{_PREP}\s+{_ZONE}(?:\s+{_DURATION})?$")
 _EMPTY = re.compile(rf"^{_ZONE}\s+is empty(?:\s+{_DURATION})?$")
@@ -385,6 +467,7 @@ def _label(noun: str, reg) -> tuple[Optional[str], Optional[dict]]:
             return None, {
                 "request": noun, "reason": verdict.reason, "requires": verdict.requires,
                 "support": verdict.support.value, "alternatives": list(verdict.alternatives),
+                "code": "not_detectable",
             }
     raise _NotClaimedError(noun)
 
@@ -446,6 +529,9 @@ def _parse_clause(clause: str, zones: list[str], reg) -> tuple[Optional[dict], O
         raise _NotClaimedError(clause)
     body = clause[trigger.end():].strip()
     description = body[:1].upper() + body[1:]
+    there = _THERE.match(body)
+    if there:
+        body = body[there.end():].strip()
 
     nobody = _NOBODY.match(body)
     if nobody:
@@ -497,7 +583,14 @@ def _parse_clause(clause: str, zones: list[str], reg) -> tuple[Optional[dict], O
         if unsupported:
             return None, unsupported
 
-    dwell = _DWELL_VERB.match(rest)
+    if there:
+        # "there is a dog in the kitchen": presence in the area, nothing else.
+        bare = _THERE_TAIL.match(rest)
+        if not bare:
+            raise _NotClaimedError(clause)
+        zone, _ = _zone(bare.group("zone"), zones, reg)
+        return _rule(target, "in_zone", zone, description), None
+    dwell = _DWELL_VERB.match(rest) or _DWELL_LEADING.match(rest)
     if dwell:
         zone, _ = _zone(dwell.group("zone"), zones, reg)
         seconds = _seconds_of(dwell)
@@ -544,5 +637,5 @@ def parse(text: str, *, zones: Iterable[str] = (), reg=None) -> Optional[ParseRe
             policies.append(policy_from_rule(rule, zones=zones, reg=reg))
         except PolicyError as exc:  # the parser and the schema disagree: refuse, never guess
             unsupported.append({"request": rule["description"], "reason": str(exc), "requires": "",
-                                "support": Support.UNSUPPORTED.value, "alternatives": []})
+                                "support": Support.UNSUPPORTED.value, "alternatives": [], "code": "invalid_rule"})
     return ParseResult(policies=policies, unsupported=unsupported)
