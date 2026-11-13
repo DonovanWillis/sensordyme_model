@@ -176,6 +176,9 @@ struct ViewportMessage: View {
     let full: CameraTextPolicy.Copy
     let short: CameraTextPolicy.Copy
     var cornerOpacity: Double = 0.12
+    /// The viewfinder marks. Off under the live-indicator chips (camera off
+    /// while stopped), whose top-left chip sat on the top-left mark.
+    var showsCorners = true
 
     @Environment(\.dynamicTypeSize) private var typeSize
 
@@ -185,9 +188,11 @@ struct ViewportMessage: View {
             // Flat canvas: a vignette behind the words made the audit measure
             // them against a gradient and fail them.
             SD.Colors.canvas
-            ViewfinderCorners()
-                .stroke(Color.white.opacity(cornerOpacity), style: StrokeStyle(lineWidth: 1.5, lineCap: .round))
-                .padding(SD.Space.md)
+            if showsCorners {
+                ViewfinderCorners()
+                    .stroke(Color.white.opacity(cornerOpacity), style: StrokeStyle(lineWidth: 1.5, lineCap: .round))
+                    .padding(SD.Space.md)
+            }
             VStack(spacing: SD.Space.xs) {
                 Image(systemName: symbol)
                     .font(.system(size: 22, weight: .light))
@@ -233,8 +238,10 @@ struct CameraOffCover: View {
 
     var body: some View {
         if model.liveness.hidesLastPicture {
+            // No viewfinder marks: the "Camera off · Monitoring stopped" chips
+            // sit along the top edge, and one sat on the top-left mark (M8.4).
             ViewportMessage(symbol: "video.slash", full: CameraTextPolicy.cameraOff,
-                            short: CameraTextPolicy.cameraOffShort)
+                            short: CameraTextPolicy.cameraOffShort, showsCorners: false)
                 .accessibilityIdentifier("camera.offWhileStopped")
                 .transition(.opacity)
         }
