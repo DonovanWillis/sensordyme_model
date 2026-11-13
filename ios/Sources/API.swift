@@ -96,7 +96,9 @@ struct APIClient {
         let data: Data
         let response: URLResponse
         do {
-            (data, response) = try await URLSession.shared.data(for: req)
+            // A redirect is followed only on the same host and never out of
+            // https (RedirectPolicy): the check above covers the first URL only.
+            (data, response) = try await URLSession.shared.data(for: req, delegate: RedirectGuard.shared)
         } catch let error as URLError {
             throw APIError(
                 message: Self.explain(error, host: base.host ?? "the server"),
@@ -189,7 +191,8 @@ struct APIClient {
     /// used to let a raw URLError through: "Could not connect to the server."
     static func perform(_ request: URLRequest, host: String) async throws -> (Data, Int) {
         do {
-            let (data, response) = try await URLSession.shared.data(for: request)
+            // Redirects as in `send`: same host, never out of https (RedirectPolicy).
+            let (data, response) = try await URLSession.shared.data(for: request, delegate: RedirectGuard.shared)
             return (data, (response as? HTTPURLResponse)?.statusCode ?? 0)
         } catch let error as URLError {
             throw APIError(message: explain(error, host: host), isUnreachable: isUnreachable(error))
@@ -1101,7 +1104,11 @@ final class AppState: ObservableObject {
         signOutNotice = nil
     }
 
-    func signOut() {
+    /// - Parameter explicit: the person chose to sign out (Settings → Log out).
+    ///   The device token, a credential for the camera, is then forgotten too.
+    ///   An expired session (`expireSession`) keeps it: the same person signs
+    ///   back in and their camera must not need pairing again.
+    func signOut(explicit: Bool = true) {
         // Revoke the token server-side too, not just forget it locally --
         // without this, "sign out" on this device left the same token still
         // valid anywhere else it existed (another device, a log, an
@@ -1117,6 +1124,8 @@ final class AppState: ObservableObject {
             AlertNotifier.shared.forgetAnnounced()  // leaving the demo: drop its ids
         }
         let wasDemo = isDemo
+        // Not when leaving the demo: the demo never had the real account's token.
+        if explicit && !wasDemo { deviceToken = "" }
         storedToken = ""
         accountEmail = ""
         storedDemo = false
@@ -1134,7 +1143,7 @@ final class AppState: ObservableObject {
     /// every few seconds forever, showing nothing to explain why data went stale.
     func expireSession(_ reason: String) {
         guard isSignedIn, !isDemo else { return }
-        signOut()
+        signOut(explicit: false)
         signOutNotice = reason
     }
 }
