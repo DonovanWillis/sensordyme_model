@@ -91,7 +91,7 @@ struct CameraViewport: View {
                     .padding(SD.Space.sm)
             }
         }
-        .overlay(alignment: .topTrailing) {
+        .overlay(alignment: .bottomTrailing) {
             if source.hasPicture {
                 Button(action: onExpand) {
                     Image(systemName: "arrow.up.left.and.arrow.down.right")

@@ -100,9 +100,14 @@ struct PresetDetailView: View {
         .presentationBackground(SD.Colors.background)
         .onAppear {
             values = PresetSettingsForm.initialValues(preset.settings, current: deviceState?.settings ?? [:])
-            revealed = true
         }
         .task { tiers = try? await state.backend.capabilityTiers() }
+        // After the zoom has settled: lines that animate while the sheet is
+        // still scaling read as scattered text (seen in the recording).
+        .task {
+            if !reduceMotion { try? await Task.sleep(for: .milliseconds(450)) }
+            revealed = true
+        }
         // Feedback follows the DEVICE: success only once it confirms, an error
         // when it (or the server) refuses. Never on "sent".
         .sensoryFeedback(trigger: outcome) { _, new in
@@ -255,7 +260,6 @@ struct PresetDetailView: View {
             ForEach(Array(checks.enumerated()), id: \.element.id) { index, check in
                 capabilityLine(check)
                     .opacity(revealed ? 1 : 0)
-                    .offset(y: revealed || reduceMotion ? 0 : 6)
                     .animation(reduceMotion ? nil
                                : SD.Motion.reveal.delay(SD.Motion.revealDelay(index, reduceMotion: false)),
                                value: revealed)
