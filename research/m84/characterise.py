@@ -178,11 +178,15 @@ def slices(data: Path, split: str, stats_path: Path, specs: list[str]) -> dict:
             per_q = {}
             for qname in ("Q1_dark", "Q2", "Q3", "Q4_bright"):
                 per_q[qname] = _ap_ci(_subset(res, {i for i, q in quart.items() if q == qname}))
+            for cut in (60, 40):  # absolute darkness (mean luma out of 255), not quartiles
+                per_q[f"luma_lt{cut}"] = _ap_ci(_subset(res, {i for i in all_ids if stats.get(i, {}).get("luma_mean", 255) < cut}))
             m["classes"][label] = {
                 "overall": _ap_ci(res),
                 "ap50_by_luma_quartile": per_q,
                 "threshold_at_p0.80": thr,
-                "recall_at_p0.80_by_luma_quartile": _recall_slices(res, thr, lambda i, g: [quart.get(i, "na")]),
+                "recall_at_p0.80_by_luma_quartile": _recall_slices(
+                    res, thr, lambda i, g: [quart.get(i, "na"), *(f"luma_lt{c}" for c in (60, 40)
+                                                                  if stats.get(i, {}).get("luma_mean", 255) < c)]),
                 "recall_at_p0.80_by_attribute": _recall_slices(
                     res, thr, lambda i, g: [f"size_{g.size}", *(k for k in ("occluded", "truncated", "depiction")
                                                                    if getattr(g, k)), "all"]),
