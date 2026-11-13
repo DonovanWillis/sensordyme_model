@@ -224,8 +224,9 @@ def small_volume(size_kb: int = 2048, *, root: Optional[Path] = None) -> Iterato
         raise RuntimeError("small_volume needs macOS hdiutil")
     base = Path(tempfile.mkdtemp(prefix="sdvol-", dir=str(root) if root else None))
     image, mount = base / "vol.dmg", base / "mnt"
-    subprocess.run([HDIUTIL, "create",  # noqa: S603 - fixed argv, our own temp paths "-size", f"{int(size_kb)}k", "-fs", "HFS+", "-volname", "sdtwin",
-                    "-layout", "NONE", str(image), "-quiet"], check=True, timeout=60)
+    subprocess.run([HDIUTIL, "create", "-size", f"{int(size_kb)}k",  # noqa: S603 - fixed argv, our temp paths
+                    "-fs", "HFS+", "-volname", "sdtwin", "-layout", "NONE", str(image), "-quiet"],
+                   check=True, timeout=60)
     mount.mkdir()
     subprocess.run([HDIUTIL, "attach", str(image), "-mountpoint", str(mount),  # noqa: S603 - fixed argv
                     "-nobrowse", "-quiet"],

@@ -115,6 +115,7 @@ class VirtualDevice:
         honour_backoff: bool = False,
         config_overrides: Optional[dict] = None,
         config_damage: Optional[str] = None,
+        supervise_inference: bool = False,
     ) -> None:
         self.state_dir = Path(state_dir).resolve()
         self.state_dir.mkdir(parents=True, exist_ok=True)
@@ -140,6 +141,13 @@ class VirtualDevice:
         if config_damage is not None and config_damage not in CONFIG_DAMAGE:
             raise ValueError(f"unknown config damage {config_damage!r}; one of {sorted(CONFIG_DAMAGE)}")
         self.config_damage = config_damage
+        #: M8.4: an inference pass that raises (a module failing past its
+        #: consecutive-failure budget re-raises on purpose) is handled the way
+        #: services/supervisor.Service handles the thread: a new loop generation
+        #: (restart backoff and the reboot ladder are not modelled). Off by
+        #: default, so an unexpected exception still fails every other test.
+        self.supervise_inference = bool(supervise_inference)
+        self.inference_restarts = 0
         self.log_level = log_level
         self.buzzer = SimBuzzerSink(echo=echo_alerts)
         monotonic = clock.monotonic if clock is not None else time.monotonic
@@ -274,7 +282,15 @@ class VirtualDevice:
             frame = self.camera.grab()
             if frame is not None:
                 self.runtime.bus.publish(frame)
-            self.runtime._inference_pass(self._loop, _NoWait())
+            try:
+                self.runtime._inference_pass(self._loop, _NoWait())
+            except Exception:
+                if not self.supervise_inference:
+                    raise
+                self.inference_restarts += 1
+                self.runtime._consecutive_process_failures = 0  # what _inference_loop does on start
+                self._loop = self.runtime._new_inference_loop_state()
+                self._loop.frame_timeout_s = 0.0
             now = self.clock.monotonic()
             if now >= self._next_check:
                 self.runtime._monitoring_check()
