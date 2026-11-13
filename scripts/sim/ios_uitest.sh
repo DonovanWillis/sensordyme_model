@@ -60,6 +60,13 @@ done
 cleanup() {
   curl -sf -X POST http://127.0.0.1:8790/shutdown >/dev/null 2>&1 || true
   [ -n "${CTL:-}" ] && wait "$CTL" 2>/dev/null || true
+  # M8.3 security: the throwaway stack (backend DB, .jwt_secret, factory.json
+  # with device keys and claim codes, device config) never lands in the
+  # evidence folder; only its logs are kept.
+  if [ -n "${STACK:-}" ] && [ -d "$STACK" ]; then
+    find "$STACK" -name '*.log' -exec cp {} "$OUT/" \; 2>/dev/null || true
+    rm -rf "$STACK"
+  fi
   xcrun simctl shutdown "$SIM" 2>/dev/null || true
   [ "${KEEP_DD:-0}" = 1 ] || rm -rf "$OUT/dd"
   rm -rf ios/SensorDyme.xcodeproj ios/Info.plist
@@ -69,8 +76,8 @@ trap cleanup EXIT
 echo "== backend + virtual device + fault proxy"
 # Each test asks for its own fresh backend (POST /fresh); this one only has to
 # be there for the controller to answer.
-rm -rf "$OUT/stack"
-"$PY" scripts/sim/uitest_control.py --work "$OUT/stack" --python "$PY" > "$OUT/control.out" 2>&1 &
+STACK="$(mktemp -d "${TMPDIR:-/tmp}/sd-uitest-stack.XXXXXX")"
+"$PY" scripts/sim/uitest_control.py --work "$STACK" --python "$PY" > "$OUT/control.out" 2>&1 &
 CTL=$!
 for _ in $(seq 120); do curl -sf http://127.0.0.1:8790/state >/dev/null && break; sleep 0.5; done
 curl -sf http://127.0.0.1:8790/state >/dev/null || { cat "$OUT/control.out"; exit 1; }
@@ -135,7 +142,7 @@ TEST_RUNNER_ORYN_UITEST_REQUIRE_STACK=1 \
   > "$OUT/xcodebuild.log" 2>&1
 rc=$?
 set -e
-cp "$OUT"/stack/*.log "$OUT/" 2>/dev/null || true
+find "$STACK" -name '*.log' -exec cp {} "$OUT/" \; 2>/dev/null || true
 
 expected_only=""
 [ ${#ONLY[@]} -gt 0 ] && expected_only="${ONLY[*]}"
