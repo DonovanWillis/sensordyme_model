@@ -116,10 +116,13 @@ struct TimelineRow: View {
             // device's own words on their own line under them (M8.4). In one
             // row, a wrapping signals line squeezed "Urgent" until the two
             // overlapped.
+            // A list at accessibility sizes, so no word is squeezed or clipped
+            // (the M8.4 audit flagged fixed-size words in a measured row).
             if hasBadges {
-                ViewThatFits(in: .horizontal) {
-                    HStack(spacing: SD.Space.xs) { badges }
+                if typeSize.isAccessibilitySize {
                     VStack(alignment: .leading, spacing: 2) { badges }
+                } else {
+                    HStack(spacing: SD.Space.xs) { badges }
                 }
             }
             if let signals = event.signals, !signals.isEmpty {
@@ -169,14 +172,14 @@ struct TimelineRow: View {
             Text(style.word)
                 .font(SD.Typography.caption.weight(.semibold))
                 .foregroundStyle(event.isExperimental ? SD.Colors.textSecondary : style.color)
-                .fixedSize()
+                .fixedSize(horizontal: false, vertical: true)
                 .accessibilityIdentifier(event.isExperimental ? "event.experimental" : "event.severity")
         }
         if event.isConfigured {
             Text("Your rule")
                 .font(SD.Typography.caption.weight(.medium))
                 .foregroundStyle(SD.Colors.textSecondary)
-                .fixedSize()
+                .fixedSize(horizontal: false, vertical: true)
         }
         // Real vs rehearsal, on the row itself (M8.3): a simulated or
         // demo event must never pass for a real detection.
@@ -184,7 +187,7 @@ struct TimelineRow: View {
             Text("Simulated")
                 .font(SD.Typography.caption.weight(.semibold))
                 .foregroundStyle(SD.Colors.textTertiary)
-                .fixedSize()
+                .fixedSize(horizontal: false, vertical: true)
                 .accessibilityIdentifier("event.simulated")
         }
     }
@@ -306,19 +309,15 @@ struct ActivityTimeline: View {
                                     onExplain: { onExplain(event) })
                     }
                 } header: {
-                    // Side by side when they fit, the count under the day when not.
-                    ViewThatFits(in: .horizontal) {
-                        HStack(alignment: .firstTextBaseline) {
-                            dayLabel(day.label)
-                            Spacer()
-                            daySummary(day.events)
-                        }
-                        VStack(alignment: .leading, spacing: 2) {
-                            dayLabel(day.label)
-                            daySummary(day.events, wraps: true)
-                        }
+                    HStack(alignment: .firstTextBaseline) {
+                        Text(day.label)
+                            .font(SD.Typography.headline)
+                            .foregroundStyle(SD.Colors.textPrimary)
+                        Spacer()
+                        Text(summary(day.events))
+                            .font(SD.Typography.caption.monospacedDigit())
+                            .foregroundStyle(SD.Colors.textTertiary)
                     }
-                    .frame(maxWidth: .infinity, alignment: .leading)
                     .padding(.top, SD.Space.lg)
                     .padding(.bottom, SD.Space.sm)
                     .accessibilityElement(children: .combine)
@@ -327,20 +326,6 @@ struct ActivityTimeline: View {
             }
         }
         .animation(SD.Motion.resolved(SD.Motion.standard, reduceMotion: reduceMotion), value: expandedID)
-    }
-
-    private func dayLabel(_ label: String) -> some View {
-        Text(label)
-            .font(SD.Typography.headline)
-            .foregroundStyle(SD.Colors.textPrimary)
-            .fixedSize()
-    }
-
-    private func daySummary(_ events: [EventItem], wraps: Bool = false) -> some View {
-        Text(summary(events))
-            .font(SD.Typography.caption.monospacedDigit())
-            .foregroundStyle(SD.Colors.textTertiary)
-            .fixedSize(horizontal: !wraps, vertical: true)
     }
 
     private func toggle(_ event: EventItem) {
