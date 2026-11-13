@@ -12,7 +12,9 @@ scenarios through the real module (`sim/perception.py` `run_cabin`). None of
 it is real-world accuracy. Nothing here was run on the Pi, the Hailo or the
 camera (the device arrives 2026-11-15).
 
-Line numbers refer to this branch at the M8.4 ALPHA commits.
+Line numbers in sections 1-9 refer to this branch at the M8.4 ALPHA commits;
+section 10's refer to the M8.5 phone-handling commit (M8.5 shifted
+`modules/driver_attention.py` by about 70 lines).
 
 ## 1. Pipeline map (frame -> alert)
 
@@ -39,8 +41,8 @@ Line numbers refer to this branch at the M8.4 ALPHA commits.
 
 | Assumption | Where it lives | Status after M8.4 |
 |---|---|---|
-| The largest person box is the driver | `phones_for_driver`, eating gate, face-loss corroboration | Unchanged for production (validated phone_use). The engine uses the person box containing the **measured face** and reports when that disagrees with the largest box (`agrees_with_largest_person`). Unevaluated. |
-| A phone box near the driver + eyes off road = phone use | `phone_use_condition` `:2599` | Production unchanged (validated). Engine: needs a phone HELD (hand overlap); unheld -> ABSTAIN, mounted -> NOT_SUPPORTED. Risk no longer counts a visible phone (decision B). |
+| The largest person box is the driver | `phones_for_driver`, eating gate, face-loss corroboration | **M8.5:** production phone_use now relates a phone to the person `associate_driver` picks (seat region, else the box holding the measured face, else the largest box); eating gate and face-loss corroboration unchanged. The engine uses the same association and reports disagreement with the largest box (`agrees_with_largest_person`). Unevaluated. |
+| A phone box near the driver + eyes off road = phone use | `phone_use_condition` | **M8.5:** production needs the phone HANDLED (held, or a handling cue with holding unobserved; section 10). Engine: needs a phone HELD (hand overlap); unheld -> ABSTAIN, mounted -> NOT_SUPPORTED. Risk no longer counts a visible phone (decision B). |
 | Head orientation = gaze | fused head pose + iris offset | Iris offset is fused; no gaze-target geometry. `gaze_toward` compares directions only. |
 | Glance vs sustained | trackers' sustain times | Engine reports `glance` vs `sustained` explicitly; same bars. |
 | Missing face = risk / no eye state = open | face-lost risk; drowsiness resets on face loss | Engine: eye state / gaze MISSING -> ABSTAIN, bounded coast (1 s), never "open"/"on road". |
@@ -142,6 +144,10 @@ Shadow vs production on the scripted set, all 24 scenarios
 - No shadow-only episodes.
 - Promoting the shadow phone gate to production would change a validated
   alert. That needs an owner decision; it is not made here.
+- **M8.5 (owner decision taken, section 10):** production no longer fires
+  `phone_use` in the first three cases above; in `hands_out_of_view_phone` it
+  keeps it on the lap-zone handling cue (production-only by design: the shadow
+  still requires a hand). The shadow gate itself was not promoted.
 
 ## 6. Driver association
 
@@ -221,3 +227,198 @@ scenarios.
 - Real mount-phone stillness and hand recall: when does the not-held latch
   form?
 - The buzzer: no physical sound is verified by any test here.
+
+## 10. M8.5 phone handling vs off-road attention
+
+Owner-requested fix. On 06dbca3 / 87d91b3 production fired the validated
+`phone_use` on a long look at a phone in a dash/vent mount when (a) the look
+began before `PhoneHoldEvidence` latched "not held" (about 2 s of stillness with
+hands seen elsewhere), or (b) hand tracking saw no hands, so the hold stayed
+"unknown". Decision B already gave that phone 0 risk, and the shadow engine
+never called it phone use. M8.5 separates the two questions in production:
+
+- **Is the driver's phone being handled?** That decides `phone_use`.
+- **Are the eyes off the road?** That is judged by `eyes_down`, `distraction`
+  and `eyes_up` with their existing rules, constants and timings. M8.5 does
+  not touch them.
+
+A mounted or unheld phone therefore never produces `phone_use`. A long look at
+it still gets the off-road alert the look warrants. Nothing is silenced.
+
+### 10.1 The rule
+
+`phone_use` = `phone_use_seconds` (2.0 s, unchanged) of sustained eyes-off-road
+(the same OR of yaw / pitch-down / pitch-up conditions, same tracker, same
+release grace, same face-loss coast) **while** `supports_phone_use(level)` holds
+for the driver's phone. The level comes from the shared M8.4 phone-evidence
+classifier, `core/behavior/phone_evidence.classify_handling`, which the shadow
+engine's `classify_phone` also calls. One source of truth:
+
+| hold (`PhoneHoldEvidence`, unchanged) | handling cue | level | `supports_phone_use` |
+|---|---|---|---|
+| `held` (hand box overlaps the phone on one of the last 3 ticks, or on this tick) | not consulted | `phone_held` | **yes** (unchanged: same time, same detail) |
+| `not_held` (still >= `phone_static_s`, hands seen elsewhere, none on it) | not consulted | `phone_mounted` | no (unchanged) |
+| `unknown` (no hand found, hand model off or not run, or latch not formed yet) | `phone_moving` / `phone_at_face` / `phone_in_lap_zone` | `phone_near_driver` + cue | **yes**, detail says "possible handling: ... (unvalidated phone-handling evidence)" |
+| `unknown` | none | `phone_near_driver` | **no** (was yes): the look is left to eyes_down / distraction |
+| no driver phone: none in frame, the passenger's, an ambiguous driver, or detector failed | – | – | no |
+
+The handling cues (`handling_cue`, first match wins) are positive evidence that
+the phone may be in a hand. None of them is a hand.
+
+| cue | evidence | constant (all reused, none new) |
+|---|---|---|
+| `phone_moving` | `PhonePlacement`: the phone box centre moved more than 10 % of its diagonal from where it was first seen or last came to rest, within the last 2 s of evidence time. The first sighting is not a move. Detector flicker is remembered for 2 s, so a phone reappearing in place is not a move and one reappearing elsewhere is | `phone_static_s` 2.0 s and 0.10 x diagonal: `PhoneHoldEvidence`'s own stillness bar, so "moving" is exactly "not still" in the latch's sense |
+| `phone_at_face` | phone centre vertically within the measured face box and horizontally within the face box widened by half a face width per side (phone to the ear, or held up in front of the face) | 0.5 face widths = `PhoneConfig.face_margin_face_widths` |
+| `phone_in_lap_zone` | phone centre below the chin AND inside the face's horizontal span, AND the eyes_down condition holds this frame (calibrated pitch < `pitch_threshold_deg`) | none: the face box and the existing pitch threshold |
+
+Where the cue's face comes from: the current face box. During a face-loss
+coast it is the last face box seen, and the coasted eyes_down condition stands
+in for the gaze.
+
+### 10.2 Code (this branch)
+
+- `core/behavior/phone_evidence.py`: `CUE_*`, `STILL_S` / `STILL_TOLERANCE` /
+  `AT_FACE_MARGIN_FW`, `PhonePlacement`, `handling_cue`, `classify_handling`,
+  `supports_phone_use`; `PhoneEvidenceInput.handling_cue`;
+  `PhoneEvidence.handling_cue`, emitted in `to_dict` only when set.
+  `classify_phone` delegates its unheld branch to `classify_handling`. Without a
+  cue, levels and reasons are byte-identical to M8.4. `phone_risk_for` is
+  unchanged: a cue adds **no** risk (Decision B stands).
+- `modules/driver_attention.py`:
+  - `phones_for_associated_driver` (`:1076`);
+  - on each detector tick, `associate_driver` relates phones to the driver
+    (`:1870`) and `PhonePlacement` (built at `:1507`) is fed;
+  - `_phone_handling_now` (`:1747`) is the per-frame gate, called at the
+    phone_use decision (`:2694`) and in the face-loss coast (`:2319`);
+  - `_phone_use_detail` states the cue;
+  - `get_debug_state()["phone_handling"]` (`:2929`) gives level, cue,
+    `supports_phone_use` and `evidence: "unvalidated"`;
+  - the engine is handed the same hold and cue only when its driver box is the
+    one production associated (`:2147`; was `agrees_with_largest`).
+- `presets.yaml` `driver_safety` **version 4 -> 5**: phone_use
+  `temporal_policies` text, a new "Unvalidated phone-handling evidence (M8.5)"
+  limitation, the hand-tracking limitation no longer says "a phone with no hand
+  found is still judged as in use", and the driver-association limitation
+  covers phone use.
+
+### 10.3 Changed rules (complete list)
+
+1. A phone with hold `unknown` and no handling cue no longer arms phone_use.
+   This was the old "UNKNOWN keeps the old behaviour" clause of
+   `PhoneHoldEvidence`.
+2. Production relates a phone to the driver by `associate_driver`, not by the
+   largest person box. With no person box every phone counts, as before. With
+   an AMBIGUOUS association none does.
+3. A hand overlapping the phone on the current tick counts as held for the
+   gate. It always did for the event detail; in real runs it implies `held`
+   anyway.
+
+No threshold, sustain time, release grace, coast, or validated non-phone rule
+changed. No new tunable was added.
+
+### 10.4 Scenarios, before (87d91b3) vs after
+
+Scripted, deterministic, through the real module (`run_cabin`, 10 fps). All
+validated alerts (`type@scenario-seconds`). Evidence:
+`~/sensordyme-audit/2026-11-10/m85-evidence/phone/scenarios_{before_87d91b3,after}.json`.
+The "before" run is 87d91b3's module and core with this branch's scenario files.
+
+| scenario | before | after |
+|---|---|---|
+| phone_mounted_unused (hands visible, eyes on road, 1.2 s glance) | – | – |
+| phone_mounted_hands_unseen (eyes on road) | – | – |
+| m85_mount_unseen_short_glance (1.5 s look) | – | – |
+| phone_mounted_look_before_latch | phone_use@2.2, eyes_down@2.7 | **eyes_down@2.7** |
+| phone_mounted_look_down (hands unseen) | phone_use@7.2, eyes_down@7.7 | **eyes_down@7.7** |
+| m85_mount_unseen_long_look_side (40 deg, 4 s) | phone_use@7.2, distraction@8.2 | **distraction@8.2** |
+| phone_mounted_long_look_latched | eyes_down@12.7 | eyes_down@12.7 |
+| m85_mount_flicker_long_look (detector recall 60 %) | eyes_down@7.7, phone_use@8.2 | **eyes_down@7.7** |
+| m85_sunglasses_mount_long_look | phone_use@7.2, eyes_down@7.7 | **eyes_down@7.7** |
+| m85_stall_mount_long_look (1 s stalls) | phone_use@12.9, eyes_down@14.4 | **eyes_down@14.4** |
+| m85_mount_detector_fails_mid_look | eyes_down@7.7 | eyes_down@7.7 |
+| detector_failure_look_down | eyes_down@4.7 | eyes_down@4.7 |
+| passenger_holding_phone | – | – |
+| passenger_leaning_with_phone (passenger box largest) | phone_use@7.2, distraction@8.2 | **distraction@8.2** |
+| held_phone_eyes_off_road | phone_use@4.2, eyes_down@4.7 | phone_use@4.2, eyes_down@4.7 |
+| m85_held_phone_eyes_on_road | – | – |
+| m85_sunglasses_held_phone | phone_use@4.2, eyes_down@4.7 | phone_use@4.2, eyes_down@4.7 |
+| m85_stall_held_phone | phone_use@9.0, eyes_down@11.5 | phone_use@9.0, eyes_down@11.5 |
+| m85_mount_then_picked_up (hands visible) | phone_use@7.2, eyes_down@7.7 | phone_use@7.2, eyes_down@7.7 |
+| m85_mount_then_picked_up_hands_unseen | phone_use@7.2, eyes_down@7.7 | phone_use@7.2 (moved, then lap zone), eyes_down@7.7 |
+| m85_mount_look_then_pick_up (moved mount -> hand mid-look) | eyes_down@7.7, phone_use@8.5 | eyes_down@7.7, phone_use@8.5 |
+| m85_held_then_mounted_mid_look (hand -> mount mid-look) | phone_use@4.2, eyes_down@4.7 | phone_use@4.2 (moving), eyes_down@4.7 |
+| hands_out_of_view_phone (lap, hands unseen, looking down) | phone_use@4.2, eyes_down@4.7 | phone_use@4.2 (lap zone), eyes_down@4.7 |
+| m85_moving_phone_hands_unseen (beside the lap, moving) | phone_use@5.2, eyes_down@5.7 | phone_use@5.2 (moving), eyes_down@5.7 |
+| m85_phone_at_ear_look_away (call, 40 deg look) | phone_use@6.2, distraction@7.2 | phone_use@6.2 (at face), distraction@7.2 |
+
+The other 19 scenarios (no phone) are identical. Across all 39, every
+non-phone validated event is identical before and after: type, time and
+detail. So are the experimental observations and the risk peaks.
+
+**Lap phone, hands unseen, looking down: `phone_use` (decided).** The phone is
+directly below the face, inside the face's horizontal span, and the driver is
+looking down at it. That is where a hand-held phone is read, not where a dash
+or vent mount sits relative to a driver-facing camera. The hand model's recall
+is too low for "no hand found" to clear it: MediaPipe Hands found a hand in
+8/152 web images (docs/research/M8_1_CV_FOLLOWUP.md). `eyes_down` fires as
+well, 0.5 s later. The shadow still abstains ("holding unknown") because it
+requires a hand. This is the one production-only phone_use left, and it is
+deliberate.
+
+### 10.5 Evaluation (synthetic, labelled by the scripts)
+
+`scripts/eval_behavior.py` now runs both sets (`--set m84|m85|all`, default
+all). Evidence: `eval_{before_87d91b3,after}_{m84,all}.json`. Evidence classes:
+synthetic 39, human-labelled 0, model-generated 0. **Not real-world accuracy.**
+
+| production | before (87d91b3) | after |
+|---|---|---|
+| M8.4 set (24): TP / FP / FN | 11 / 4 / 0 | 11 / 1 / 0 |
+| M8.4 set: precision (Wilson 95 %) | 0.733 (0.48-0.89) | 0.917 (0.65-0.99) |
+| M8.4 set: false alerts / scripted hour | 27.96 | 6.99 |
+| all (39): TP / FP / FN | 31 / 8 / 0 | 31 / 1 / 0 |
+| all: precision (Wilson 95 %) | 0.795 (0.64-0.89) | 0.969 (0.84-0.99) |
+| all: recall (Wilson 95 %) | 1.0 (0.89-1.0) | 1.0 (0.89-1.0) |
+| all: false alerts / scripted hour | 40.06 | 5.01 |
+| all: detection delay mean / max | 3.2 s / 9.5 s | 3.2 s / 9.5 s |
+
+- The remaining false positive is `camera_shifted`'s distraction, unrelated to
+  phones.
+- The shadow is unchanged on the 39 scenarios: 26 / 2 / 5. Its 5 misses are the
+  stall and no-hand cases, where it abstains by design.
+- Experimental observations: 8 before, 8 after.
+
+### 10.6 Limits (stated, not fixed)
+
+- **A phone held still away from below the face, with no hand seen, reads as
+  mount-like.** The look then gets `eyes_down` at 2.5 s or `distraction` at
+  3.0 s instead of `phone_use` at 2.0 s. Examples: beside the wheel, or on the
+  thigh to one side. This is the recall price of "prefer the attention alert
+  when the evidence is insufficient". It is never silence.
+- A mount whose image position is directly below the face, or at face height
+  within half a face width of it, reads as a lap / face phone. That gives
+  `phone_use`, the pre-M8.5 behaviour.
+- Mount vibration or detector box jitter larger than 10 % of the box diagonal
+  reads as `phone_moving`, so a look can be `phone_use`, the pre-M8.5
+  behaviour. The same jitter already stops the not-held latch from forming.
+- All cues are 2-D image geometry from one camera. There is no depth and no
+  cabin model, and they assume a driver-facing camera.
+- Eyes-off-road that alternates between down and sideways without either
+  condition sustaining used to be caught by phone_use's OR when a phone was
+  visible. With an unhandled phone it is now caught only by the individual
+  rules. This gap already exists with no phone.
+- The face-anchored driver association is unevaluated, like every association
+  method (section 6).
+
+### 10.7 Hardware-only questions (Sunday)
+
+- Mount stillness on the Pi + Camera Module 3: does a phone in a dash/vent
+  mount stay within 10 % of its box diagonal, tick to tick, with the engine on?
+  Does it pass 2 s still?
+- Where do a real dash mount, a vent mount and a lap phone fall relative to
+  the face box in the installed camera's image? Is the mount ever directly
+  below the face?
+- Hand recall on a gripping hand in the cabin (B4 with the hand hidden vs
+  visible). Which detail string appears?
+- B3b: the look at the mount right after placing it, and with hands out of
+  view. Expected `eyes_down` / `distraction` only.

@@ -17,7 +17,8 @@ M8.4 (always on, SHADOW: changes no validated alert; docs/BEHAVIOR_ENGINE.md):
 
   signals.py         typed per-signal evidence (freshness, provenance, missing reason) + Verdict
   engine.py          BehaviorEngine: shadow verdicts with abstention, phone evidence level
-  phone_evidence.py  owner decision B: phone evidence levels; only held + eyes-off-road is risk
+  phone_evidence.py  owner decision B: phone evidence levels; only held + eyes-off-road is risk;
+                     M8.5: handling cues + supports_phone_use, the PRODUCTION phone_use gate
   association.py     which person is the driver, stated as a method (unevaluated)
   experimental.py    owner decision A: experimental alert families are observations
   evaluation.py      event-level metrics over labelled (synthetic) traces

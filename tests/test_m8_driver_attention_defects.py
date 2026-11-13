@@ -106,28 +106,48 @@ def test_d1_a_grip_seen_on_one_tick_in_three_still_counts_as_held(tmp_path, cloc
     assert module._phone_hold.state == PHONE_HELD
 
 
-def test_d1_without_hand_tracking_phone_use_degrades_to_the_visible_phone_rule_and_says_so(
+def test_d1_without_hand_tracking_a_still_mount_phone_leaves_the_look_to_eyes_down(
         tmp_path, clock, yolo):  # noqa: F811
+    """M8.5 (owner-requested; was: phone_use, "judged as before"). Hand tracking
+    off: holding is unobserved, the phone has not moved and sits neither at the
+    face nor in the lap zone, so it is not handled -- the look is eyes_down."""
     yolo.phones = [MOUNTED_IN_VIEW]
     module, frame = _make(tmp_path, clock, v2=False, enable_hands=False)
     module._hands = None  # enable_hands: false -- the owner turned hand tracking off
     _run(module, frame, clock, 3.0, landmarks())
     events = _run(module, frame, clock, 3.0, landmarks(**LOOK_DOWN))
-    phone = [e for e in events if e.type == "phone_use"]
-    assert len(phone) == 1, "nothing to tell held from mounted: judged as before"
-    assert "hand tracking unavailable" in phone[0].contributing_signals
+    assert "phone_use" not in _types(events)
+    assert "eyes_down" in _types(events)
     assert module._phone_hold.state == PHONE_HOLD_UNKNOWN
 
 
-def test_d1_no_hand_found_anywhere_is_not_evidence_the_phone_is_mounted(tmp_path, clock, yolo):  # noqa: F811
-    """The hand model ran and found nothing: weak evidence, so the phone is unknown
-    and phone use is still judged (recall is not traded on missing evidence)."""
+def test_d1_no_hand_found_anywhere_on_a_still_mount_phone_leaves_the_look_to_eyes_down(
+        tmp_path, clock, yolo):  # noqa: F811
+    """M8.5 (owner-requested; was: phone_use). The hand model ran and found
+    nothing: still weak evidence of "no hand", so the phone is never called set
+    down on it -- but a still phone outside the face / lap zone shows no handling
+    either, and the look is judged by eyes_down, not phone_use."""
     yolo.phones = [MOUNTED_IN_VIEW]
     module, frame = _make(tmp_path, clock, v2=False, hands=_FakeHands())
     _run(module, frame, clock, 3.0, landmarks())
     events = _run(module, frame, clock, 3.0, landmarks(**LOOK_DOWN))
+    assert "phone_use" not in _types(events)
+    assert "eyes_down" in _types(events)
+    assert module._phone_hold.state == PHONE_HOLD_UNKNOWN
+
+
+def test_d1_no_hand_found_on_a_lap_phone_under_a_downward_gaze_is_still_phone_use(
+        tmp_path, clock, yolo):  # noqa: F811
+    """Recall kept where the evidence supports handling: a phone in the lap zone
+    (below the chin, inside the face's span) looked down at, no hand found."""
+    yolo.phones = [LAP_PHONE]
+    module, frame = _make(tmp_path, clock, v2=False, hands=_FakeHands())
+    _run(module, frame, clock, 3.0, landmarks())
+    events = _run(module, frame, clock, 3.0, landmarks(**LOOK_DOWN))
     phone = [e for e in events if e.type == "phone_use"]
-    assert len(phone) == 1 and phone[0].contributing_signals == "phone visible; no hand confirmed on it"
+    assert len(phone) == 1
+    assert phone[0].contributing_signals.startswith("phone visible; no hand confirmed on it; possible handling")
+    assert "unvalidated" in phone[0].contributing_signals
 
 
 def test_d1_hold_evidence_unlatches_when_the_phone_moves_or_a_hand_reaches_it():

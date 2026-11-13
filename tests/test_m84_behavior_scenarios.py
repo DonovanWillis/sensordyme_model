@@ -8,7 +8,8 @@ accuracy.
 
 What is pinned:
   * every VALIDATED alert fires exactly as on c9029fa (same types, same times),
-    in every scenario, under both hands policies (owner rule: no hidden change);
+    in every scenario, under both hands policies (owner rule: no hidden change),
+    except the three phone_use onsets M8.5 removes on purpose (named below);
   * decision B: a visible, mounted, passenger's or unheld phone adds nothing to
     the risk score, and the experimental composite events it used to trigger
     no longer appear; a held phone with the eyes off the road still counts;
@@ -30,7 +31,16 @@ VALIDATED = {"drowsiness", "distraction", "eyes_down", "eyes_up", "phone_use", "
              "fatigue_warning", "frequent_glancing"}
 
 #: Validated alerts per scenario on c9029fa (scripts/eval_behavior.py run on that
-#: commit; ~/sensordyme-audit/2026-11-10/m84-evidence/alpha/eval_before_c9029fa.json).
+#: commit; ~/sensordyme-audit/2026-11-10/m84-evidence/alpha/eval_before_c9029fa.json),
+#: except the three phone_use onsets M8.5 removes on purpose (owner-requested:
+#: a mounted / unheld / passenger's phone is not the driver's phone use), listed
+#: in M85_REMOVED_PHONE_USE and pinned in tests/test_m85_phone_handling.py. Every
+#: other alert, and every time, is the c9029fa value.
+M85_REMOVED_PHONE_USE = {
+    "passenger_leaning_with_phone": "phone_use@7.2",
+    "phone_mounted_look_before_latch": "phone_use@2.2",
+    "phone_mounted_look_down": "phone_use@7.2",
+}
 BASELINE_ALERTS = {
     "camera_blocked": ["attention_lost@4.5"],
     "camera_shifted": ["distraction@3.2"],
@@ -45,11 +55,11 @@ BASELINE_ALERTS = {
     "mirror_checks": [],
     "partial_face_occlusion": [],
     "passenger_holding_phone": [],
-    "passenger_leaning_with_phone": ["phone_use@7.2", "distraction@8.2"],
+    "passenger_leaning_with_phone": ["distraction@8.2"],
     "phone_mounted_hands_unseen": [],
     "phone_mounted_long_look_latched": ["eyes_down@12.7"],
-    "phone_mounted_look_before_latch": ["phone_use@2.2", "eyes_down@2.7"],
-    "phone_mounted_look_down": ["phone_use@7.2", "eyes_down@7.7"],
+    "phone_mounted_look_before_latch": ["eyes_down@2.7"],
+    "phone_mounted_look_down": ["eyes_down@7.7"],
     "phone_mounted_unused": [],
     "poor_lighting": [],
     "stream_stall": [],
@@ -149,17 +159,19 @@ def test_sunglasses_and_a_dark_cabin_abstain_on_drowsiness(traces):
 
 
 def test_unheld_phone_while_looking_down_is_an_abstention_not_phone_use(traces):
-    for name in ("hands_out_of_view_phone", "phone_mounted_look_down"):
+    # M8.5: production now agrees on the mounted phone (no phone_use); on the lap
+    # phone it keeps phone_use on its in-the-lap-zone handling cue (production-only).
+    for name, production_only in (("hands_out_of_view_phone", 1), ("phone_mounted_look_down", 0)):
         comparison = traces[name]["engine"]["comparison"]["phone_use"]
-        assert comparison["shadow"] == 0 and comparison["production_only"] == 1
+        assert comparison["shadow"] == 0 and comparison["production_only"] == production_only
         assert "holding unknown" in " ".join(comparison["abstain_reasons"])
 
 
 def test_mounted_phone_is_never_shadow_phone_use_and_the_look_is_still_eyes_down(traces):
-    """SUNDAY B1/B3/B4: a long look at a MOUNTED phone, hands visible. Production
-    fires phone_use when the look starts before the set-down latch (validated
-    behaviour, unchanged); the engine never calls it phone use; eyes_down fires
-    in both by its own rule."""
+    """SUNDAY B1/B3/B4: a long look at a MOUNTED phone, hands visible. Since M8.5
+    production no longer fires phone_use when the look starts before the
+    set-down latch (tests/test_m85_phone_handling.py); the engine never called
+    it phone use; eyes_down fires in both by its own rule."""
     for name in ("phone_mounted_look_before_latch", "phone_mounted_long_look_latched"):
         shadow = [e["type"] for e in traces[name]["shadow_events"]]
         assert "phone_use" not in shadow and "eyes_down" in shadow

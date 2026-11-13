@@ -72,7 +72,11 @@ presets:
     # eyes_down, not closure; a camera stall credits one frame of evidence.
     # 4 (M8.4): high_risk / elevated_risk / erratic_hand_movement are experimental
     # observations, no longer alerts; a visible phone no longer raises the risk score.
-    version: 4
+    # 5 (M8.5): phone_use needs the driver's phone HANDLED (a hand on it, or, with
+    # holding unobserved, the phone moving / at the face / in the lap zone under a
+    # downward gaze); a look at a mounted or unheld phone is eyes_down / distraction,
+    # never phone_use; a larger passenger's phone is not the driver's.
+    version: 5
     product_mode: driver_safety
     # Face landmarks carry drowsiness, distraction and attention-lost, and a
     # driver alert nobody in the cabin hears protects no one. Objects (phone,
@@ -87,7 +91,7 @@ presets:
       - { event: drowsiness, description: "eyes closed continuously (lids lowered by a downward look are not closure)", sustain_s: 2.0, setting: drowsy_seconds }
       - { event: distraction, description: head turned away from the road, sustain_s: 3.0, setting: distraction_seconds }
       - { event: eyes_down, description: "looking down, away from the road (for example at a phone in the lap)", sustain_s: 2.5, setting: eyes_down_seconds }
-      - { event: phone_use, description: "a phone near the driver visible while the gaze is off the road; a phone that hand tracking judges set down (still, hands elsewhere) is skipped (hand tracking is experimental)", sustain_s: 2.0, setting: phone_use_seconds }
+      - { event: phone_use, description: "the gaze off the road while the driver's phone is handled: a hand on it, or, when no hand is seen, the phone moving, at the face, or in the lap below the face with the gaze down (hand tracking is experimental; the phone-handling evidence is unvalidated). A mounted or unheld phone is never phone use: a long look at it is eyes_down or distraction", sustain_s: 2.0, setting: phone_use_seconds }
       - { event: attention_lost, description: face lost and no person detected, sustain_s: 2.5 }
       - { event: fatigue_warning, description: eyes closed for more than the PERCLOS share of a rolling window, window_s: 60.0 }
       - { event: frequent_glancing, description: repeated off-road glances within a rolling window, window_s: 45.0 }
@@ -115,10 +119,11 @@ presets:
       - Face landmarks (MediaPipe Face Mesh) are unevaluated on in-cabin NoIR footage; the model card excludes life-critical use
       - The object detector gives a false phone box on about 60% of phone-free public validation images at the shipped threshold
       - Cannot tell texting from reading, or see the road; sunglasses and night driving are untested
-      - Hand-on-phone and looking-down rules are tested on synthetic scenes only; the hand model often misses a gripping hand, so a phone with no hand found is still judged as in use
-      - A visible phone is not phone use; phone_detected is logged, never alerted
+      - Hand-on-phone and looking-down rules are tested on synthetic scenes only; the hand model often misses a gripping hand
+      - "Unvalidated phone-handling evidence (M8.5): with no hand seen, a phone counts as handled only if it moved in the last 2 s, is at the face, or sits in the lap below the face while the driver looks down. A phone held perfectly still elsewhere (for example beside the wheel) with no hand seen reads as mounted: the look still alerts as eyes_down or distraction, 0.5-1 s later than phone_use would have. The thresholds are image geometry and timing tested on synthetic scenes only"
+      - A visible or mounted phone is not phone use; phone_detected is logged, never alerted
       - "Experimental and unvalidated, logged as observations and never sounded or pushed: the combined risk score (high_risk, elevated_risk) and erratic_hand_movement (hand tracking). A merely visible or mounted phone no longer adds to the risk score; only a phone hand tracking sees held, with the eyes off the road, does"
-      - "Which person is the driver is assumed (the person whose face is measured, else the largest person box); driver-vs-passenger association is unevaluated"
+      - "Which person is the driver is assumed (the person whose face is measured, else the largest person box) for phone use as well; driver-vs-passenger association is unevaluated"
     evidence:
       - docs/MODEL_REGISTRY.md
       - docs/DETECTION_THRESHOLDS.md
