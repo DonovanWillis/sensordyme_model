@@ -228,13 +228,23 @@ class Guard:
         kept = {Path(p) for p in manifest.get("files", [])}
         # 1. Files the failed release added: removed, but only ones that appeared
         #    after the snapshot -- never anything that was already there.
+        #
+        #    M8.4: judged by the inode's CHANGE time, not st_mtime alone. `make
+        #    deploy` copies with `rsync -a`, which stamps every file with its
+        #    mtime on the developer's machine -- a module written yesterday lands
+        #    with yesterday's mtime, so the old test kept it, and modules/
+        #    auto-imports every sibling: the rolled-back release imported the
+        #    failed release's leftover and could crash-loop on it. ctime is set
+        #    by the kernel when the file is created or written here and cannot
+        #    be carried over by a copy.
         removed = 0
         for rel in release_files(self.root):
             if rel in kept:
                 continue
             path = self.root / rel
             try:
-                if path.stat().st_mtime >= snapshot_at - 1.0:
+                stat = path.stat()
+                if max(stat.st_mtime, stat.st_ctime) >= snapshot_at - 1.0:
                     path.unlink()
                     removed += 1
             except OSError:
