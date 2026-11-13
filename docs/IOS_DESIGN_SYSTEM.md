@@ -180,7 +180,7 @@ There is never a success haptic or animation on "sent".
 |---|---|---|
 | Connecting (nothing loaded) | steel readout "Connecting", camera placeholder | indeterminate hairline sweep under the readout; it stops as soon as there is an answer |
 | Starting | amber hourglass, "Starting" | none (the device has not confirmed) |
-| Ready ("All clear") | green check-shield, live hairline in success | one-shot symbol bounce on the transition *into* ready from another state; nothing continuous |
+| Ready ("All clear") | green check-shield; the camera frame stays neutral (a green box around a picture reads as "safe") | one-shot symbol bounce on the transition *into* ready from another state; nothing continuous |
 | Monitoring alert (event < 60 s) | red bell, "Alert", camera frame danger 2 pt | the frame cross-fades in, with no pulsing |
 | Degraded | amber triangle, camera frame tint goes amber | status cross-fade only |
 | Stopped | steel pause, "Stopped" | status cross-fade; Resume becomes the primary key |
@@ -202,7 +202,9 @@ and deep links hold).
    readout** (presence, monitoring state, mode, contextual Stop/Resume) →
    degraded/perception notice → action keys (Activity, Areas, Report) →
    recent activity (three latest) → **Monitoring modes** (flagship + library)
-   → running-on-device nodes → custom rules → device health (expand in place).
+   → running-on-device nodes → custom rules → device health (expand in place;
+   folded to one line only while the device reports and every component
+   works, open by itself otherwise).
    The **Ask Jupiter dock** floats above the tab bar.
 3. **Mode detail** (sheet, zooms from the row): identity, live state if
    running, capabilities as the device reports them (staggered reveal),
@@ -260,10 +262,38 @@ because text scrolled under it is sampled through it, exactly like the tab bar
 - **No continuous animation** on the device screen, apart from the connecting
   hairline while nothing has loaded (it stops on the first answer) and the demo
   feed (demo mode only, paused under Reduce Motion).
-- **Measured**, not assumed: in the Simulator, `xcrun simctl io <udid>
-  recordVideo` of each transition (frame sequence inspection), and
-  `Self._printChanges()` was used temporarily, not committed, on the device
-  screen to confirm body evaluations per poll rather than per frame. Instruments'
-  SwiftUI and Hitches templates are the device-side follow-up (hardware only).
-  Results are in the design evidence folder
-  (`~/sensordyme-audit/2026-11-10/design-evidence/`).
+- **Measured**, not assumed:
+  - transitions: `xcrun simctl io <udid> recordVideo` while the journeys (and
+    DEBUG launch hooks `-orynOpenCamera`, `-orynOpenMode <id>`) drive them, then
+    frame sequences (`ffmpeg … fps=N,tile=8x2`) inspected frame by frame. That
+    is how the capability reveal animating *during* the mode zoom was caught
+    (it read as scattered text) and moved to after the zoom settles;
+  - idle cost: the app's CPU sampled every 0.5 s for 20 s on each screen
+    against the real backend and virtual device (results below);
+  - Instruments' SwiftUI and Animation Hitches templates on a real iPhone are
+    the hardware follow-up.
+  Evidence: `~/sensordyme-audit/2026-11-10/design-evidence/` (`transitions/`,
+  `perf/`, `after/`).
+
+Results (iPhone Simulator, iOS 26.1, real backend + virtual device, app CPU
+sampled every 0.5 s for 20 s after the screen settled):
+
+| Screen | Mean | Median | Max |
+|---|---|---|---|
+| Your Devices (10 s poll) | 0.3 % | 0.0 % | 6.5 % |
+| Device home, ready (4 s poll, Jupiter dock, camera placeholder) | 1.3 % | 0.1 % | 8.3 % |
+| Demo device home (simulated feed, 30 fps then) | 9.0 % | 8.8 % | 22.8 % |
+| Demo full-screen camera (same feed) | 14.3 % | 15.4 % | 22.2 % |
+
+The device home is idle between polls: no continuous animation and no
+per-telemetry redraw (the spikes are the 4 s poll). The only continuous cost
+is the demo's simulated feed, which has since been halved to 15 fps; it is
+paused under Reduce Motion. A real MJPEG stream redraws only `MJPEGFrame`.
+
+Transitions verified frame by frame in the Simulator: device card → home
+(zoom), camera → full screen (zoom, shared stream), mode row → detail (zoom),
+Jupiter dock collapsed → expanded (keyboard-avoiding) and review sheet → back
+into the dock, policy preview → "Sent… waiting for the device" (never active
+before the device confirms), timeline row → in-place details, stale →
+interrupted visuals (banner, dimmed camera, Stale pill, "Status unknown") →
+recovered, stopped → "Resuming…" → device-confirmed "All clear".

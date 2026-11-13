@@ -444,6 +444,28 @@ struct DeviceDetailView: View {
         customReplacesModes ? (device.monitoring?.title ?? "AI Custom Monitoring") : presetTitle(device.activePreset)
     }
 
+    /// The status word and its symbol: one element whose label is the word
+    /// (what VoiceOver and the journeys read) and whose value is the device's
+    /// sentence.
+    private func readout(_ state: InstrumentState, wraps: Bool) -> some View {
+        HStack(spacing: SD.Space.xs) {
+            Image(systemName: state.symbol)
+                .font(.system(size: 19, weight: .medium))
+                .foregroundStyle(readoutTint(state.kind))
+                .contentTransition(.symbolEffect(.replace))
+                .symbolEffect(.bounce, value: readyAck)
+            Text(state.word)
+                .font(SD.Typography.readout)
+                .foregroundStyle(SD.Colors.textPrimary)
+                .contentTransition(.opacity)
+                .fixedSize(horizontal: !wraps, vertical: true)
+        }
+        .accessibilityElement(children: .ignore)
+        .accessibilityLabel(state.word)
+        .accessibilityValue(readoutDetail ?? "")
+        .accessibilityIdentifier("detail.monitoring")
+    }
+
     /// The device's identity and its one status readout, with the action the
     /// state calls for beside it (Stop while monitoring, Resume when stopped).
     private var instrumentPanel: some View {
@@ -478,29 +500,26 @@ struct DeviceDetailView: View {
                 .fixedSize(horizontal: false, vertical: true)
                 .accessibilityAddTraits(.isHeader)
 
-            (accessible
-                ? AnyLayout(VStackLayout(alignment: .leading, spacing: SD.Space.sm))
-                : AnyLayout(HStackLayout(alignment: .center, spacing: SD.Space.sm))) {
-                HStack(spacing: SD.Space.xs) {
-                    Image(systemName: state.symbol)
-                        .font(.system(size: 19, weight: .medium))
-                        .foregroundStyle(readoutTint(state.kind))
-                        .contentTransition(.symbolEffect(.replace))
-                        .symbolEffect(.bounce, value: readyAck)
-                    Text(state.word)
-                        .font(SD.Typography.readout)
-                        .foregroundStyle(SD.Colors.textPrimary)
-                        .contentTransition(.opacity)
-                        .fixedSize(horizontal: false, vertical: true)
+            // Side by side when the word and the control fit on one line;
+            // stacked otherwise ("Status unknown" beside "Stop monitoring"
+            // wrapped the word) and always at accessibility sizes.
+            if accessible {
+                VStack(alignment: .leading, spacing: SD.Space.sm) {
+                    readout(state, wraps: true)
+                    protectionControl
                 }
-                // Its own element: the word is what VoiceOver and the journeys
-                // read, the device's sentence its value.
-                .accessibilityElement(children: .ignore)
-                .accessibilityLabel(state.word)
-                .accessibilityValue(readoutDetail ?? "")
-                .accessibilityIdentifier("detail.monitoring")
-                if !accessible { Spacer(minLength: SD.Space.xs) }
-                protectionControl
+            } else {
+                ViewThatFits(in: .horizontal) {
+                    HStack(alignment: .center, spacing: SD.Space.sm) {
+                        readout(state, wraps: false)
+                        Spacer(minLength: SD.Space.xs)
+                        protectionControl.fixedSize()
+                    }
+                    VStack(alignment: .leading, spacing: SD.Space.sm) {
+                        readout(state, wraps: true)
+                        protectionControl
+                    }
+                }
             }
 
             if let sentence = readoutDetail {

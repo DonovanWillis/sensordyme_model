@@ -64,7 +64,7 @@ struct SimulatedFeedView: View {
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
 
     var body: some View {
-        TimelineView(.animation(minimumInterval: 1 / 30,
+        TimelineView(.animation(minimumInterval: 1 / 15,
                                 paused: !MotionPolicy.animates(true, reduceMotion: reduceMotion))) { context in
             let t = context.date.timeIntervalSinceReferenceDate
             ZStack {
