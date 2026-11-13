@@ -82,6 +82,14 @@ dashboard:
   # Lower either value if detection framerate drops while the app's feed is open.
   jpeg_quality: 60 # 1-100; 80 was the old default, 50-60 is fine on a phone screen
   stream_fps: 12 # frames/sec pushed to a viewer; detection still runs at full camera fps
+  # M8.4 owner Decision C (docs/PRIVACY.md): while monitoring is STOPPED, /stream
+  # sends no camera frame to a remote viewer (the phone) unless the OWNER turned
+  # on camera-only mode in the app -- a setting kept by the backend and the
+  # device (data/device_state.json), deliberately NOT a key in this file, so
+  # nobody with the dashboard token can turn the camera back on. This key only
+  # decides whether a viewer on the device itself (loopback, local maintenance)
+  # still sees the camera while stopped; it never affects remote viewers.
+  local_camera_while_stopped: true
 
 # AI accelerator (Raspberry Pi AI HAT+ / Hailo). Detected at startup and verified
 # before inference. On a DEVICE there is no CPU fallback -- ultralytics (AGPL-3.0)

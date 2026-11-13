@@ -315,6 +315,100 @@ do {
     }
 }
 
+// ------------------------------------------------------------------ M8.4 Decision C
+print("\nM8.4: camera off while stopped is a truthful state, not a stall:")
+do {
+    var t = FeedLivenessTracker()
+    t.connectionOpened(now: 0, heartbeatCapable: true)
+    var hb = MJPEGPartMeta(); hb.isHeartbeat = true; hb.status = CameraAccess.offWhileStoppedStatus
+    t.heartbeatReceived(hb, now: 1.0)
+    check(t.liveness(transport: .waitingForFrames, now: 1.1) == .cameraOffWhileStopped,
+          "a camera_off_while_stopped heartbeat: camera off, not connecting")
+    t.heartbeatReceived(hb, now: 4.0)
+    check(t.liveness(transport: .waitingForFrames, now: 4.5) == .cameraOffWhileStopped,
+          "still off seconds later: never 'stalled' / 'NO NEW FRAMES'")
+    check(!t.shouldForceReconnect(now: 8.0), "heartbeats keep the connection: no reconnect churn")
+    check(t.liveness(transport: .waitingForFrames, now: 7.5) != .cameraOffWhileStopped,
+          "a camera-off heartbeat older than its validity says nothing any more")
+
+    var live = FeedLivenessTracker()
+    live.connectionOpened(now: 0, heartbeatCapable: true)
+    live.frameReceived(meta(seq: 1), now: 0.2)
+    live.frameReceived(meta(seq: 2), now: 0.4)
+    check(live.liveness(transport: .streaming, now: 0.5) == .live, "frames flowing: live")
+    live.heartbeatReceived(hb, now: 1.5)  // monitoring stopped mid-stream
+    check(live.liveness(transport: .streaming, now: 1.6) == .cameraOffWhileStopped,
+          "a stop mid-stream: the newer camera-off heartbeat wins over the last frame at once")
+    check(FeedLiveness.cameraOffWhileStopped.hidesLastPicture && !FeedLiveness.stalled(seconds: 3).hidesLastPicture,
+          "the last picture is removed for camera-off, only faded for a stall")
+    live.frameReceived(meta(seq: 3), now: 2.0)  // resumed
+    check(live.liveness(transport: .streaming, now: 2.1) == .live, "resume: frames newer than the heartbeat are live")
+
+    let off = FeedIndicator.resolve(.cameraOffWhileStopped, monitoringStopped: true, frameSource: nil)
+    check(off == FeedIndicator(label: "CAMERA OFF", detail: "Monitoring stopped", tone: .neutral, isLive: false),
+          "the badge: CAMERA OFF · Monitoring stopped, never LIVE")
+    let only = FeedIndicator.resolve(.live, monitoringStopped: true, frameSource: CameraAccess.sourceCameraOnly)
+    check(only?.label == "LIVE" && only?.detail == "Camera only — not monitoring",
+          "camera-only frames: LIVE · Camera only — not monitoring")
+    let lagging = FeedIndicator.resolve(.live, monitoringStopped: false, frameSource: CameraAccess.sourceCameraOnly)
+    check(lagging?.detail == "Camera only — not monitoring",
+          "the device's frame label wins even before the app's monitoring state catches up")
+    check(FeedIndicator.resolve(.live, monitoringStopped: true, frameSource: CameraAccess.sourceCameraLocal)?.detail
+          == "Local view — not monitoring", "a local maintenance view is named as such")
+}
+
+print("\nM8.4: the camera-mode setting shows what the DEVICE reports:")
+do {
+    func decode(_ json: String) -> DeviceCameraMode? {
+        try? JSONDecoder().decode(DeviceCameraMode.self, from: Data(json.utf8))
+    }
+    let off = decode(#"{"supported":true,"camera_only":false,"remote_stream":"off_while_stopped","desired_camera_only":false,"pending":false,"command_id":"abc","stale":false}"#)
+    check(off?.remoteStream == "off_while_stopped" && off?.commandID == "abc", "decodes the backend's block")
+    let p = CameraModePresentation.resolve(off)
+    check(p.kind == .offWhileStopped && p.title == "Camera off while stopped" && !p.toggleOn && p.canChange,
+          "the default: camera off while stopped, toggle off")
+
+    let asked = CameraModePresentation.resolve(decode(#"{"supported":true,"camera_only":false,"desired_camera_only":true,"pending":true}"#))
+    check(asked.kind == .offWhileStopped && asked.pending && asked.toggleOn
+          && asked.detail.contains("waiting for the device"),
+          "requested but not confirmed: still OFF (the device's truth), shown as pending")
+
+    let on = CameraModePresentation.resolve(decode(#"{"supported":true,"camera_only":true,"remote_stream":"camera_only","desired_camera_only":true,"pending":false}"#))
+    check(on.kind == .cameraOnly && on.title == "Camera only — not monitoring" && on.toggleOn,
+          "the device confirmed: camera only — not monitoring")
+
+    let old = CameraModePresentation.resolve(decode(#"{"supported":false,"camera_only":null,"desired_camera_only":false}"#))
+    check(old.kind == .unsupported && !old.canChange && old.detail.contains("Update"),
+          "an M8.3 device cannot honour it: said plainly, no toggle")
+    check(CameraModePresentation.resolve(nil).kind == .unknown && !CameraModePresentation.resolve(nil).canChange,
+          "a backend before M8.4 (no block): unknown, no toggle")
+    check(CameraModePresentation.resolve(decode("{}")).kind == .unknown, "an empty block is unknown, not 'off'")
+    let stale = CameraModePresentation.resolve(decode(#"{"supported":true,"camera_only":false,"stale":true}"#))
+    check(stale.detail.hasSuffix("(last reported)"), "a stale report is labelled as such")
+}
+
+print("\nM8.4: text inside the camera viewport stays inside it at accessibility sizes:")
+do {
+    for (full, short) in [(CameraTextPolicy.placeholder, CameraTextPolicy.placeholderShort),
+                          (CameraTextPolicy.cameraOff, CameraTextPolicy.cameraOffShort)] {
+        check(CameraTextPolicy.copy(full, short: short, accessibilitySize: false) == full,
+              "\(full.headline): the full wording at standard sizes")
+        let ax = CameraTextPolicy.copy(full, short: short, accessibilitySize: true)
+        check(ax == short && ax.detail.count * 2 < full.detail.count,
+              "\(full.headline): a much shorter detail at AX sizes")
+        check(ax.headline == full.headline, "\(full.headline): the headline (the state itself) never changes")
+        check(ax.detail.count <= 48, "\(full.headline): the AX detail fits a few lines at AX5")
+    }
+    check(CameraTextPolicy.cameraOff.headline == "Camera off — monitoring stopped",
+          "the camera-off words are the ones the device's state means")
+    check(CameraTextPolicy.minimumScale >= 0.7 && CameraTextPolicy.minimumScale < 1,
+          "text may shrink a little to fit, never into illegibility")
+    check(CameraTextPolicy.maxLines >= 3 && CameraTextPolicy.maxLines <= 4, "bounded lines: it cannot spill out")
+    check(CameraTextPolicy.stacksStatusLine(accessibilitySize: true)
+          && !CameraTextPolicy.stacksStatusLine(accessibilitySize: false),
+          "full screen: the presence word gets its own line at AX sizes, one joined line otherwise")
+}
+
 // ------------------------------------------------------------------ metrics
 print("\nrolling instrumentation:")
 do {

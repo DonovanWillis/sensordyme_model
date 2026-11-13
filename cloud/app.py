@@ -629,6 +629,10 @@ def init_db() -> None:
             # Unlike desired_protection it is never cleared, so the status can
             # say confirmed / mismatch / timed_out after delivery ends.
             "ALTER TABLE devices ADD COLUMN protection_request TEXT",
+            # M8.4 Decision C: the OWNER's camera-only choice (JSON {camera_only,
+            # id, requested_at}). NULL -- every existing row after this
+            # migration -- means OFF: no live camera while monitoring is stopped.
+            "ALTER TABLE devices ADD COLUMN camera_mode TEXT",
             # M8.3 event integrity (docs/EVENT_PIPELINE.md). NULL for history and
             # for firmware that predates each field -- never back-filled.
             # What the device's alert policy did and what its in-cabin outputs
@@ -1528,6 +1532,55 @@ def _make_coherent(status: dict) -> list[str]:
     return fixes
 
 
+def _desired_camera_mode(row) -> dict:
+    """The owner's camera-only choice for a device row; OFF when never set (M8.4)."""
+    columns = row.keys() if hasattr(row, "keys") else ()
+    record = _loads_dict(row["camera_mode"] if "camera_mode" in columns else None)
+    return {"camera_only": record.get("camera_only") is True,
+            "id": record.get("id") if isinstance(record.get("id"), str) else None,
+            "requested_at": _reported_at(record.get("requested_at"))}
+
+
+def _reported_camera(monitoring: Optional[dict]) -> Optional[dict]:
+    """The device's own camera block (core/camera_privacy.py report), or None for
+    firmware that predates M8.4 (it cannot honour camera-only at all)."""
+    block = (monitoring or {}).get("camera")
+    if not isinstance(block, dict) or block.get("schema") != 1:
+        return None
+    return block
+
+
+_REMOTE_STREAM_STATES = ("monitoring", "camera_only", "off_while_stopped", "unavailable")
+
+
+def _camera_mode_status(row: sqlite3.Row, monitoring: dict, stale: bool) -> dict:
+    """What the app shows about camera access (docs/PRIVACY.md, APP_STATUS_CONTRACT).
+
+    The device's report is the truth; the owner's choice is shown beside it so
+    "pending" is visible. `supported: false` = firmware before M8.4: such a
+    device (M8.3) streams the raw camera while stopped and cannot be told not
+    to -- the app must say so rather than claim the camera is off.
+    """
+    desired = _desired_camera_mode(row)
+    reported = _reported_camera(monitoring)
+    if reported is None:
+        return {"supported": False, "camera_only": None, "remote_stream": None,
+                "desired_camera_only": desired["camera_only"], "pending": False,
+                "command_id": desired["id"], "stale": bool(stale)}
+    camera_only = reported.get("camera_only") is True
+    remote = reported.get("remote_stream")
+    return {
+        "supported": True,
+        "camera_only": camera_only,
+        # Only while live: a stale report says nothing about the stream NOW.
+        "remote_stream": remote if (remote in _REMOTE_STREAM_STATES and not stale) else None,
+        "desired_camera_only": desired["camera_only"],
+        "pending": camera_only != desired["camera_only"],
+        "command_id": desired["id"],
+        "stale": bool(stale),
+    }
+
+
 def _protection_command(row: sqlite3.Row, now: float) -> Optional[dict]:
     """The last stop/resume the app asked for, and its outcome (M8.3).
 
@@ -1724,6 +1777,8 @@ def _device_status(row: sqlite3.Row, now: float) -> dict:
         "health_freshness": freshness,
         # M8.3: the last stop/resume and its acknowledged outcome.
         "protection_command": _protection_command(row, now),
+        # M8.4 Decision C: camera access while stopped, as the DEVICE reports it.
+        "camera_mode": _camera_mode_status(row, monitoring, stale),
     }
     # M8.3: never a claim the device's own rules forbid (see _make_coherent).
     status["corrections"] = _make_coherent(status)
@@ -2307,6 +2362,13 @@ class ProtectionBody(BaseModel):
     confirm: bool = False
 
 
+class CameraModeBody(BaseModel):
+    """M8.4 Decision C: the owner's camera-only mode. Turning it ON must be confirmed."""
+
+    camera_only: bool
+    confirm: bool = False
+
+
 class PresetBody(BaseModel):
     # Re-sent to the device on every poll until it converges, so its size is
     # paid on every ingest response, not once.
@@ -2542,6 +2604,71 @@ def logout(payload: dict = Depends(current_token)) -> dict:
     return {"ok": True}
 
 
+class DeleteAccountBody(BaseModel):
+    """M8.4: deleting an account needs the password again and an explicit confirm."""
+
+    password: str = Field(max_length=MAX_PASSWORD_LEN)
+    confirm: bool = False
+
+
+#: Device columns that hold what the OWNER configured or said (names, areas,
+#: typed instructions, AI rules, pending commands). Cleared when the account is
+#: deleted; the device's own identity, key and health stay with the device.
+_OWNER_DEVICE_COLUMNS = (
+    "zones", "ai_rules", "ai_rules_draft", "ai_rules_promoted_from", "desired_preset", "desired_protection",
+    "protection_request", "desired_nodes", "preset_rejection", "nodes_rejection", "rejection_baseline",
+    "monitoring",
+)
+
+
+@app.post("/v1/account/delete")
+def delete_account(body: DeleteAccountBody, request: Request, payload: dict = Depends(current_token)) -> dict:
+    """Delete the caller's account and the data it owns (M8.4, docs/PRIVACY.md §5).
+
+    One transaction: every event of every device the account owns, its orders
+    and the user row are deleted; each device is released (owner cleared, the
+    owner's configuration cleared, its name reset, camera-only explicitly OFF)
+    so it can be claimed again and never carries the old owner's settings.
+    Every session ends: `current_token` refuses a token whose user row is gone.
+
+    NOT done (stated, not hidden): the device's own copies -- data/events.csv,
+    saved rules, zones and the camera-only setting on the device itself -- stay
+    until the device is reset by hand (docs/PRIVACY.md); the database file may
+    keep deleted rows in free pages until SQLite reuses them (no VACUUM here).
+    """
+    if not body.confirm:
+        raise CodedError(400, "confirmation_required", "deleting the account requires confirm: true")
+    if not LOGIN_LIMITER.allow(_client_ip(request)):
+        raise HTTPException(429, "too many attempts — try again in a few minutes")
+    uid = payload["uid"]
+    with db() as conn:
+        user = conn.execute("SELECT * FROM users WHERE id = ?", (uid,)).fetchone()
+        if user is None or not hmac.compare_digest(_hash_pw(body.password, user["salt"]), user["pw_hash"]):
+            LOGIN_FAILURE_LIMITER.record(str(payload.get("email") or uid))
+            raise CodedError(403, "wrong_password", "the password is not correct")
+        devices = [r["id"] for r in conn.execute("SELECT id FROM devices WHERE owner_id = ?", (uid,))]
+        events = 0
+        columns = {r["name"] for r in conn.execute("PRAGMA table_info(devices)")}
+        cleared = ", ".join(f"{c} = NULL" for c in _OWNER_DEVICE_COLUMNS if c in columns)
+        for device_id in devices:
+            events += conn.execute("DELETE FROM events WHERE device_id = ?", (device_id,)).rowcount
+            conn.execute(
+                f"UPDATE devices SET owner_id = NULL, name = 'SensorDyme', {cleared}, "  # noqa: S608 - fixed column names
+                "custom_monitoring_wanted = 0, ai_rules_activation = 0, camera_mode = ? WHERE id = ?",
+                (json.dumps({"camera_only": False, "id": secrets.token_hex(6), "requested_at": time.time()}),
+                 device_id),
+            )
+        orders = conn.execute("DELETE FROM orders WHERE user_id = ?", (uid,)).rowcount
+        conn.execute("DELETE FROM users WHERE id = ?", (uid,))
+        jti = payload.get("jti")
+        if jti is not None:
+            conn.execute("INSERT OR REPLACE INTO revoked_tokens (jti, exp) VALUES (?, ?)",
+                         (jti, float(payload.get("exp", time.time() + JWT_TTL_S))))
+    log.info("account deleted: %d device(s) released, %d event(s) and %d order(s) deleted",
+             len(devices), events, orders)
+    return {"ok": True, "devices_released": len(devices), "events_deleted": events, "orders_deleted": orders}
+
+
 #: What ntfy itself accepts as a topic name, and nothing else.
 #
 # The topic IS the credential: ntfy has no accounts, so anyone who knows the
@@ -2638,6 +2765,12 @@ def claim_device(body: ClaimBody, request: Request, uid: int = Depends(current_u
         )
         if claimed.rowcount == 0:
             raise CodedError(409, "device_already_claimed", "device already claimed by another account")
+        if row["owner_id"] is None:
+            # M8.4: a new owner never inherits camera access someone else turned
+            # on. Explicitly OFF (delivered only if the device reports otherwise).
+            conn.execute("UPDATE devices SET camera_mode = ? WHERE id = ?",
+                         (json.dumps({"camera_only": False, "id": secrets.token_hex(6),
+                                      "requested_at": time.time()}), row["id"]))
     return {"ok": True, "device_id": row["id"], "name": row["name"]}
 
 
@@ -2932,6 +3065,34 @@ def set_protection(device_id: int, body: ProtectionBody, uid: int = Depends(curr
         )
     return {"ok": True, "desired_protection": body.action, "command_id": command_id,
             "timeout_s": PROTECTION_ACK_TIMEOUT_S}
+
+
+@app.post("/v1/devices/{device_id}/camera-mode")
+def set_camera_mode(device_id: int, body: CameraModeBody, uid: int = Depends(current_user)):
+    """Turn the device's camera-only mode on or off (M8.4, owner Decision C).
+
+    Off (the default): while monitoring is stopped the device sends NO camera
+    frames to the app. On: the owner can watch the camera while monitoring is
+    stopped, labelled "Camera only -- not monitoring". Separate from stop/resume
+    on purpose; turning it on must carry `confirm: true`. Owner-scoped
+    (_owned_device); delivered to the device as a signed `set_camera_mode`
+    command, which the device refuses to turn ON unless the signature verifies.
+    The app shows what the device REPORTS (status.camera_mode), not this request.
+    """
+    if body.camera_only and not body.confirm:
+        raise CodedError(400, "confirmation_required", "turning on camera-only mode requires confirm: true")
+    with db() as conn:
+        device = _owned_device(conn, device_id, uid)
+        reported = _monitoring_payload(device["monitoring"])
+        if reported and _reported_camera(reported) is None:
+            raise CodedError(409, "firmware_unsupported",
+                             "this device's software cannot turn the camera off while monitoring is "
+                             "stopped; update it first")
+        command_id = secrets.token_hex(6)
+        conn.execute("UPDATE devices SET camera_mode = ? WHERE id = ?",
+                     (json.dumps({"camera_only": body.camera_only, "id": command_id,
+                                  "requested_at": time.time()}), device_id))
+    return {"ok": True, "camera_only": body.camera_only, "command_id": command_id}
 
 
 @app.post("/v1/devices/{device_id}/preset")
@@ -5019,10 +5180,12 @@ def ingest(body: IngestBody, background_tasks: BackgroundTasks, request: Request
                 continue
         row = conn.execute(
             "SELECT desired_preset, ai_rules, zones, custom_monitoring_wanted, ai_rules_activation,"
-            " desired_protection, desired_nodes, rejection_baseline, monitoring FROM devices WHERE id = ?",
+            " desired_protection, desired_nodes, rejection_baseline, monitoring, camera_mode"
+            " FROM devices WHERE id = ?",
             (device["id"],),
         ).fetchone()
         desired, ai_rules_json, zones_json = row["desired_preset"], row["ai_rules"], row["zones"]
+        camera_mode = _desired_camera_mode(row)
         desired_protection = _loads_dict(row["desired_protection"]) if row["desired_protection"] else {}
         reported_block = (body.monitoring or {}).get("protection")
         reported_block = reported_block if isinstance(reported_block, dict) else None
@@ -5300,6 +5463,13 @@ def ingest(body: IngestBody, background_tasks: BackgroundTasks, request: Request
             node_id: {"enabled": bool(want.get("enabled")), "settings": want.get("settings") or {}}
             for node_id, want in sorted(desired_nodes.items()) if isinstance(want, dict)
         }
+
+    # M8.4: the owner's camera-only choice, until the device reports the same
+    # value. Only to firmware that reports a camera block (it understands it).
+    reported_camera = _reported_camera(body.monitoring)
+    if reported_camera is not None and (reported_camera.get("camera_only") is True) != camera_mode["camera_only"]:
+        command = dict(command or {})
+        command["set_camera_mode"] = {"camera_only": camera_mode["camera_only"], "id": camera_mode["id"]}
 
     # An explicit, confirmed stop/resume, until the device reports it (one-shot).
     if protection_action in ("stop", "resume"):

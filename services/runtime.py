@@ -35,6 +35,7 @@ from typing import Any, Optional, cast
 import cv2
 
 from core import accel, device_health, device_state, health_stamp, monitoring_mode, roles, sdnotify
+from core import camera_privacy as cprivacy
 from core import monitoring_state as ms
 from core import nodes as monitoring_nodes
 from core import perception as pc
@@ -575,6 +576,9 @@ class DeviceRuntime:
         )
 
         dash_cfg = self.config.get("dashboard", {})
+        # M8.4 Decision C: the owner's camera-only setting, OFF unless saved ON
+        # (core/camera_privacy.py). Loaded even without a dashboard: it is reported.
+        self.camera_privacy = cprivacy.CameraPrivacy.load()
         if bool(dash_cfg.get("enabled", False)):
             from core.dashboard import DashboardServer
 
@@ -602,6 +606,8 @@ class DeviceRuntime:
                 # made each consume the other's window and report ~0 fps.
                 health_provider=lambda: {**self.health.snapshot(),
                                          "device": self._collect_health("dashboard")},
+                camera_privacy=self.camera_privacy,
+                local_camera_while_stopped=dash_cfg.get("local_camera_while_stopped", True) is not False,
             )
             # Refuse a role-violating preset at the request, with the reason, rather
             # than accept it and silently drop it in the inference loop.
@@ -2419,7 +2425,25 @@ class DeviceRuntime:
             # settings, dwell rules): the backend sends those only to a device
             # that reports them (core/presets.py DEVICE_POLICY_FEATURES).
             "features": list(DEVICE_POLICY_FEATURES),
+            # M8.4 Decision C: who may see the camera while stopped. Its presence
+            # is what tells the backend this firmware understands set_camera_mode.
+            "camera": self._camera_report(),
         }
+
+    def _camera_report(self) -> dict:
+        privacy = getattr(self, "camera_privacy", None) or cprivacy.CameraPrivacy(persist=False)
+        dashboard = getattr(self, "dashboard", None)
+        local = getattr(dashboard, "_local_camera_while_stopped", True) if dashboard is not None else False
+        return privacy.report(stopped=self._stopped is not None, dashboard=dashboard is not None,
+                              local_while_stopped=bool(local))
+
+    def _apply_camera_mode(self, request: dict, source: str) -> None:
+        """The owner's camera-only setting (M8.4). Validated and authenticated by the uplink."""
+        privacy = getattr(self, "camera_privacy", None)
+        if privacy is None:
+            return
+        privacy.apply(request["camera_only"] is True, command_id=request.get("id"), by=source)
+        self._publish_monitoring()
 
     def _publish_monitoring(self) -> None:
         """Tell the backend what runs, the role, the protection state and the last refusal."""
@@ -2710,6 +2734,11 @@ class DeviceRuntime:
                     module = self.module
                 self._push_zones_to(module)
                 print(f"zones: {len(zones)} area(s) active ({', '.join(z.name for z in zones) or 'none'})")
+
+            pop_camera = getattr(self.uplink, "pop_pending_camera_mode", None)
+            camera_request = pop_camera() if callable(pop_camera) else None
+            if isinstance(camera_request, dict):
+                self._apply_camera_mode(camera_request, source="owner")
 
             pop_nodes = getattr(self.uplink, "pop_pending_nodes", None)
             new_nodes = pop_nodes() if callable(pop_nodes) else None

@@ -206,6 +206,12 @@ class CloudUplink:
         #: Companion monitoring nodes from the backend (M7, core/nodes.py):
         #: {node_id: {enabled, settings}}; applied by the main loop.
         self._pending_nodes: Optional[Any] = None
+        #: The owner's camera-only setting from the backend (M8.4 Decision C,
+        #: core/camera_privacy.py); applied by the main loop.
+        self._pending_camera_mode: Optional[dict] = None
+        #: Whether the command being handled arrived under a VERIFIED sd-auth-v1
+        #: envelope (set by _authenticated_command).
+        self._command_verified = False
         self._stop = threading.Event()
         self._connected = False
         self._explained_failure = False
@@ -331,7 +337,13 @@ class CloudUplink:
             print(f"cloud_uplink: refused a remote command ({reason}); it was not applied")
 
     def _authenticated_command(self, data: dict, command: dict, nonce: Optional[str], health) -> dict:
-        """`command` if it may be applied under the configured mode, else {}."""
+        """`command` if it may be applied under the configured mode, else {}.
+
+        Sets `_command_verified` (M8.4): True only when a signed envelope was
+        checked and passed, so a privacy-weakening command (camera-only ON)
+        can demand one even in `permissive` / `off` mode.
+        """
+        self._command_verified = False
         if not command or self._auth_mode == "off":
             return command
         envelope = data.get("command_auth")
@@ -365,6 +377,7 @@ class CloudUplink:
             self._refuse_command("duplicate_command")
             return {}
         self._last_rejection = None
+        self._command_verified = True
         return command
 
     def _learn_clock_offset(self, exc, nonce: Optional[str]) -> None:
@@ -787,6 +800,8 @@ class CloudUplink:
                         self._pending_nodes = nodes
                 else:
                     print("cloud_uplink: ignored a malformed set_nodes command")
+            if "set_camera_mode" in command:
+                self._accept_camera_mode(command.get("set_camera_mode"))
             if "set_zones" in command:
                 zones = command.get("set_zones")
                 with self._lock:
@@ -1009,6 +1024,36 @@ class CloudUplink:
     def next_delay(self) -> float:
         """How long the worker waits before its next sync (see backoff_delay)."""
         return backoff_delay(self._failures, self._poll_interval_s, self._backoff_cap_s)
+
+    def _accept_camera_mode(self, raw) -> None:
+        """Queue the owner's camera-only setting (M8.4 Decision C).
+
+        Turning camera-only ON lets the camera be watched while monitoring is
+        stopped, so it is accepted ONLY under a verified signed envelope --
+        whatever `cloud.command_auth` says. Turning it OFF is the safe
+        direction and is accepted like any other command.
+        """
+        from core import camera_privacy
+
+        request = camera_privacy.parse_command(raw)
+        if request is None:
+            print("cloud_uplink: ignored a malformed set_camera_mode command")
+            return
+        if request["camera_only"] and not getattr(self, "_command_verified", False):
+            self._refuse_command("camera_only_requires_signed_command")
+            return
+        with self._lock:
+            self._pending_camera_mode = request
+
+    def pop_pending_camera_mode(self) -> Optional[dict]:
+        """The owner's camera-only setting awaiting the main loop, if any.
+
+        Acknowledged by the device reporting `monitoring.camera` with this
+        `last_command_id` (services/runtime.py `_camera_report`).
+        """
+        with self._lock:
+            pending, self._pending_camera_mode = getattr(self, "_pending_camera_mode", None), None
+            return pending
 
     def _accept_protection(self, protection: dict) -> None:
         """Queue a stop/resume for the main loop, at most once per command id.

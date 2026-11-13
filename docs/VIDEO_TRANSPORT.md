@@ -103,13 +103,73 @@ whose URL can carry `?token=` (`/`, `/setup`) send `Referrer-Policy: no-referrer
 | Rule | Constant | Why |
 |---|---|---|
 | Never send a frame captured > 5 s ago | `DashboardServer.MAX_FRAME_AGE_S` | the slot held the last picture from before a stop / freeze and handed it to every new viewer, which called it LIVE |
-| While the runtime pushes no annotated frame for 1.5 s, stream the camera unannotated (`X-Frame-Source: camera`), encoded **once** for all viewers, non-blocking | `ANNOTATION_GAP_S`, `_current_frame()` | monitoring stopped (the inference loop returns before reading frames, `services/runtime.py:2822`), a degraded module, `annotate()` failing — the stream froze with the socket open. Video can be live while monitoring is stopped; the header says so |
+| While the runtime pushes no annotated frame for 1.5 s, stream the camera unannotated (`X-Frame-Source: camera`), encoded **once** for all viewers, non-blocking | `ANNOTATION_GAP_S`, `_current_frame()` | a degraded module or `annotate()` failing while monitoring runs: the stream froze with the socket open. **M8.4: no longer while monitoring is stopped.** See §2a |
+| **M8.4** Monitoring stopped: a remote viewer is sent no frame at all, the camera is not even encoded for it, and it gets the heartbeat `camera_off_while_stopped`. The exceptions are owner camera-only (`camera_only`) and a loopback viewer (`camera_local`) | `stream_access()`, `core/camera_privacy.py` | owner Decision C (`docs/PRIVACY.md`) |
 | `camera_stale` once the camera's newest frame is > 2 s old | `CAMERA_STALE_S` | device reachable, camera not producing ≠ network problem |
 | One shared latest-frame slot; a viewer thread sends the newest frame newer than its last; frames published while it was blocked are **skipped** (`frames_skipped`), never queued | `serve_stream()` | a slow phone must not grow memory or slow capture; `push_frame` only swaps a reference under a lock |
 | A write blocked for 30 s drops the viewer (thread + slot freed) | `_STREAM_SEND_TIMEOUT_S` | a client that stopped reading entirely |
 | `close()` ends every open stream | `_closing` | after a dashboard restart viewers reconnect at once instead of holding a silent socket |
 | One write per part (header + JPEG + CRLF) | | the handler's `wfile` is unbuffered: four writes were four syscalls per frame |
 | Counters at `GET /api/stream/stats` (token header) | `stream_stats()` | viewers, connections, frames sent/skipped, heartbeats, stale withheld, send timeouts, fallback encodes |
+
+## 2a. Camera privacy while monitoring is stopped (M8.4, owner Decision C)
+
+M8.3's fallback streamed the raw camera to every token holder whenever the runtime was
+not drawing. That included an explicit stop, it was on by default, and no owner switch
+existed. M8.4 reverses the default for the stopped case. `docs/PRIVACY.md` §1 has the
+full table.
+
+| Monitoring | Owner camera-only | Remote viewer | Loopback viewer |
+|---|---|---|---|
+| not stopped | any | unchanged: `annotated`, or `camera` while a running module cannot draw | same |
+| stopped | **off (default)** | **no frames.** Heartbeat `X-Stream-Status: camera_off_while_stopped` | `camera_local` (unless `dashboard.local_camera_while_stopped: false`) |
+| stopped | on | `X-Frame-Source: camera_only` | same as remote |
+
+* **Gate.** "Stopped" is the runtime's explicit, confirmed stop
+  (`protection.state == "stopped"` in `set_policy_state`). The gate is checked on
+  **every pass** of each viewer's loop. A stop therefore cuts the frames of an open
+  connection at once; nothing is held back and sent later. A resume restores frames
+  on the same connection.
+* **Nothing from the slot is sent either.** A frame taken before the stop and still
+  under 5 s old is not sent.
+* **New response header.**
+  `X-Stream-Camera: monitoring | camera_only | off_while_stopped | local_maintenance`
+  says what this viewer may see at connect time. Heartbeats carry any change.
+* **Owner setting.** The backend `POST /v1/devices/{id}/camera-mode` (owner-scoped,
+  `confirm` to turn it on) sends a signed `set_camera_mode` to the device.
+  * The device turns it ON only under a verified envelope.
+  * The device persists the value in `data/device_state.json`, and an absent value
+    means OFF.
+  * The device reports it as `monitoring.camera` (`camera_only`, `remote_stream`,
+    `last_command_id`, `local_while_stopped`, `persisted`, `schema: 1`).
+  * The backend serves it as `status.camera_mode`.
+* **Counters.** `/api/stream/stats` adds `privacy_heartbeats` and `remote_stream`.
+  `/api/state` adds `camera`.
+
+**App** (`ios/Sources/StreamLiveness.swift`, `CameraViews.swift`):
+
+* **The camera-off state.**
+  * A fresh `camera_off_while_stopped` heartbeat that is newer than the last frame
+    makes `FeedLiveness.cameraOffWhileStopped`.
+  * The badge reads "CAMERA OFF · Monitoring stopped". It is never "NO NEW FRAMES" and
+    never LIVE.
+  * `CameraOffCover` replaces the picture with "Camera off — monitoring stopped". The
+    last frame is removed, not faded (`hidesLastPicture`).
+* **Live badge.** A `camera_only` frame reads "LIVE · Camera only — not monitoring".
+  The device's frame label wins over the app's own monitoring state.
+* **The setting.** `DeviceCameraMode` / `CameraModePresentation` render
+  `status.camera_mode` from what the device reports.
+
+**Compatibility** (rows pinned by `tests/test_m84_privsec_compat.py`):
+
+| Client / device | Behaviour while stopped |
+|---|---|
+| M8.4 app + M8.4 device | "Camera off — monitoring stopped", or "Camera only — not monitoring" |
+| **M8.3 app** + M8.4 device | No frames. The heartbeat status is unknown to it, so it shows **"NO NEW FRAMES"** after 2 s. That is wrong in tone (stalled) but leaks nothing. The connection is kept, with no reconnect churn. |
+| pre-M8.3 app or browser `<img>` + M8.4 device | Silence on an open connection. The old app's 15 s idle timeout reconnects; the browser shows no picture. The dashboard page's subtitle says "camera off — monitoring stopped". |
+| M8.4 app + **M8.3 device** | The device still streams `camera` frames while stopped. The app shows "LIVE · Monitoring paused" (truthful about the picture). Settings show "can't turn the camera off — update it", and the backend refuses the setting with `409 firmware_unsupported`. |
+| M8.4 app + backend before M8.4 | No `status.camera_mode`. The setting is shown as unknown and no toggle is offered. The stream itself follows the device. |
+| M8.4 device + backend before M8.4 | `set_camera_mode` never arrives, so camera-only stays OFF. |
 
 Overhead of the metadata: ~120 bytes per part (the four `X-` lines), against
 a 640×480 q60 JPEG of tens of KB — measured below. CPU: one f-string per part.
@@ -122,7 +182,8 @@ device's evidence and decides:
 
 | `FeedLiveness` | When | Badge (`FeedIndicator`) |
 |---|---|---|
-| `.live` | connected and a frame advanced (new seq, `X-Frame-Age-Ms` ≤ 2000) within the last 2 s | **LIVE**; + "Monitoring paused" when the device reports an explicit stop; + "Not analysed" when frames are `camera` while monitoring runs |
+| `.live` | connected and a frame advanced (new seq, `X-Frame-Age-Ms` ≤ 2000) within the last 2 s | **LIVE**; + "Camera only — not monitoring" for `camera_only` frames (M8.4); + "Local view — not monitoring" for `camera_local`; + "Monitoring paused" when the device reports an explicit stop; + "Not analysed" when frames are `camera` while monitoring runs |
+| `.cameraOffWhileStopped` (M8.4) | a fresh heartbeat `camera_off_while_stopped`, newer than the last frame | "CAMERA OFF · Monitoring stopped"; the picture is **replaced** (`CameraOffCover`), not faded |
 | `.stalled(seconds)` | connected, no advancing frame for > 2 s: no part, the **same seq** repeated (frozen source), or frames too old | "NO NEW FRAMES · N s old"; the last picture is faded |
 | `.cameraUnavailable` | connected, a recent heartbeat says `camera_stale` / `camera_not_started` | "CAMERA NOT SENDING" |
 | `.unreachable(reason)` | the transport is reconnecting (the reason from `MJPEGStreamDiagnosis`) | the picture area's own message ("reconnecting… — …") |
@@ -131,8 +192,10 @@ device's evidence and decides:
 | `.idle` / `.disabled` | not watching / no live source for this device (`CameraSource.none` → `CameraPlaceholder`) | placeholder |
 
 Only `.live` may say LIVE (`FeedIndicator.resolve`, tested for every other
-state). Video and monitoring are separate facts: **video can be live while
-monitoring is stopped**, and the badge says "Monitoring paused" (the stop comes
+state). Video and monitoring are separate facts. Since M8.4, video is live while
+monitoring is stopped **only** if the owner enabled camera-only (§2a) or the device is
+an M8.3 one. The badge then says "Camera only — not monitoring" or "Monitoring paused"
+(the stop comes
 from the device's monitoring state, `InstrumentState.Kind.stopped`, passed by
 `CameraViews.swift:120/:273`).
 

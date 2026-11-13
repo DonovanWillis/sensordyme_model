@@ -37,6 +37,8 @@ ACCOUNT = {
     ("POST", "/v1/logout"), ("POST", "/v1/account/ntfy"), ("POST", "/v1/account/phone"),
     ("POST", "/v1/orders"), ("GET", "/v1/orders"), ("GET", "/v1/devices"),
     ("POST", "/v1/devices/claim"), ("GET", "/v1/presets"), ("GET", "/v1/capability-tiers"),
+    # M8.4: deletes the CALLER's account only (password re-checked; tests/test_m84_privsec_account.py).
+    ("POST", "/v1/account/delete"),
 }
 #: Routes that name a device in the body rather than the path.
 DEVICE_IN_BODY = {("POST", "/v1/ai/configure")}
@@ -105,6 +107,8 @@ def _request(s, method: str, path: str, device_id: int, headers: dict):
     bodies = {
         ("POST", "/v1/devices/{device_id}/name"): {"name": "taken over"},
         ("POST", "/v1/devices/{device_id}/protection"): {"action": "stop", "confirm": True},
+        # M8.4 Decision C: the camera-only setting is the owner's alone.
+        ("POST", "/v1/devices/{device_id}/camera-mode"): {"camera_only": True, "confirm": True},
         ("POST", "/v1/devices/{device_id}/preset"): {"preset": "fall_detection"},
         ("POST", "/v1/devices/{device_id}/zones"): {"zones": [{"name": "door", "polygon": [[0, 0], [1, 0], [1, 1]]}]},
         ("POST", "/v1/devices/{device_id}/nodes"): {"node": node, "enabled": True},
@@ -145,7 +149,7 @@ def test_every_non_public_route_depends_on_an_authenticator(two_accounts):
 def test_no_device_scoped_route_answers_another_account(two_accounts):
     s = two_accounts
     scoped = sorted(_device_scoped(s.app))
-    assert len(scoped) >= 13, scoped  # the inventory, not an empty loop
+    assert len(scoped) >= 14, scoped  # the inventory, not an empty loop
     before = _snapshot(s.app)
     matrix = {}
     for method, path in scoped:

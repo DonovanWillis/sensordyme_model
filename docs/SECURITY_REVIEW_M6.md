@@ -232,3 +232,100 @@ the first URL. Optionally, clear `deviceToken` on an explicit `signOut()` but no
 Sim tooling: run `uitest_control.py --work` under `mktemp -d` and copy only `*.log` into `$OUT`,
 or delete `stack/backend/{.jwt_secret,sensordyme.db,factory.json}` and `stack/device/config.yaml`
 at the end of `ios_uitest.sh`.
+
+## 7. Mission 8.4 review (camera privacy, privacy, safe updates)
+
+**Base and evidence.**
+* Base: `c9029fa`.
+* Owner Decision C is implemented as specified (`docs/PRIVACY.md` §1, `docs/VIDEO_TRANSPORT.md` §2a).
+* Each fix below has a test that fails on `c9029fa`.
+* Evidence (no secrets): `~/sensordyme-audit/2026-11-10/m84-evidence/privsec/`.
+
+### 7.1 Confirmed issues
+
+| # | Finding | Severity | Status | Proving tests |
+|---|---|---|---|---|
+| M84-1 | While monitoring was stopped, `/stream` sent the raw camera to every token holder. The M8.3 fallback was on by default and had no owner control. A stop left a live camera on the LAN. | High (privacy) | **Fixed.** Remote viewers get no frames while stopped. The owner-only camera-only mode can be turned ON only through a signed command, and its state is persisted, defaults off and is reported by the device. A loopback viewer keeps the camera for maintenance. | `tests/test_m84_privsec_camera_device.py` (remote, slot, mid-stream, loopback, opt-in, persistence, migration, uplink signature), `tests/test_m84_privsec_camera_backend.py` (owner-only, confirm, firmware 409, delivery, device truth, claim reset, e2e restart), `ios/Tests/StreamLivenessTests.swift` (M8.4 sections) |
+| M84-2 | No way to delete an account: no route, no admin command, no app control. Events, typed instructions, areas, phone number, ntfy topic and order addresses stayed in the backend for good, and devices stayed bound to the account. | Medium (privacy, data-subject rights) | **Fixed in the backend** with `POST /v1/account/delete` (password + confirm), which runs as one transaction. **Gaps remain:** the copies on the device itself, SQLite free pages, backups, and the app UI (IOS) (`PRIVACY.md` §5). | `tests/test_m84_privsec_account.py`, route matrix |
+| M84-3 | A rollback did not remove a module the failed release added. It judged "added" by `st_mtime`, which `rsync -a` copies from the developer's machine, and `modules/__init__.py` imports every sibling module. | Medium (safe updates: a rollback could crash-loop) | **Fixed.** Uses `max(st_mtime, st_ctime)`, and ctime cannot be carried by a copy. Reproduced in `rsync_mtime_rollback_repro.txt`. | `tests/test_m84_privsec_release.py::test_a_file_the_failed_release_added_is_removed_even_with_an_old_mtime` |
+| M84-4 | The hash-locked `requirements-device.lock` is never installed. `setup_pi.sh:63`, `Makefile` deploy and `release_guard.py` rollback all run unhashed `pip install -r requirements-device.txt`. A compromised index or mirror therefore reaches the device, and the MediaPipe `.tflite` files ship inside the mediapipe wheel. | Medium (supply chain) | **Not changed (hardware-pending).** The lock itself says it must be installed once on a real Pi first. Fix after that run: `.venv/bin/pip install --require-hashes -r requirements-device.lock` in all three places, and in `release_guard.py` the rollback step. Owner: HARDWARE/deploy. | — |
+| M84-5 | MediaPipe model files are not verified at load. The 6 `.tflite` hashes in `core/model_registry.yaml` are only format-checked; the macOS copies match the registry (`mediapipe_tflite_sha256_local_venv.txt`), and the aarch64 copies are unhashed. The openpilot comparison module downloads `dmonitoring_model.onnx` with `urlretrieve` and no hash (`modules/driver_attention_openpilot.py:669-700`). | Low–Medium | **Documented.** The `.hef` *is* pinned at download and at load (`core/accel.py`). Fixes: (a) M84-4 covers the wheel; (b) `core/model_registry.py: verify_bundled_artifacts()` called once at startup after the Pi hashes are recorded (owner: model registry); (c) pin a sha256 beside `_MODEL_URL` and verify it after the download (owner: ALPHA). | — |
+| M84-6 | `make deploy` is `rsync` of the working tree over the live tree. It is not atomic, nothing is signed, the manifest is never verified on the device, and there is no `--delete`. A dropped SSH session mid-rsync leaves a mixed tree, and the `\|\|` rollback over the same SSH also fails. | Medium (operational) | **Documented** (runbook §O is the recovery path). Fix: stage into `releases/<id>/` and switch a symlink, verified against `make release-manifest`. Owner: deploy. | — |
+| M84-7 | `protobuf 4.25.9` in the device lock: PYSEC-2026-1805 / CVE-2026-0994 (DoS through `json_format.ParseDict` recursion). | Low (not reachable: no first-party protobuf/`ParseDict`, and mediapipe parses its own bundled graphs) | **Not upgraded.** mediapipe 0.10.14 requires `protobuf<5`, and both fixed versions are ≥5. It needs a mediapipe bump and re-validation on the Pi. | `pip_audit_device_lock.txt` |
+| M84-8 | `pytest 8.3.3` (dev and CI only): PYSEC-2026-1845 (predictable `/tmp/pytest-of-<user>`). | Low (multi-user dev hosts) | **Not changed** (outside ownership). Bump to 9.0.3 in `requirements.txt` and `requirements-dev.txt`; it is not in the device lock. Owner: integrator. | `pip_audit_requirements*.out` |
+
+### 7.2 Theoretical risks (not demonstrated)
+
+* **Loopback.** A future reverse proxy on the device (none exists today) would make
+  remote viewers look local. If one is ever added, set
+  `dashboard.local_camera_while_stopped: false`.
+* **The camera-only setting in permissive mode.** Turning it ON needs a verified
+  envelope, but turning it OFF is accepted unsigned. An on-path attacker could
+  therefore only turn the camera *off*.
+* **Disabling camera-only after a failed write.** If the write of "off" fails, the
+  device would come back ON after a restart until the backend re-sends OFF on its
+  first poll (`persisted: false` is reported).
+* **No ingest backpressure on a refusal.** A backend that does not sign would re-send
+  a camera-only ON to a device that refuses it on every poll. The device logs the
+  reason once; it does no harm.
+
+Other theoretical risks are listed in §5 and §6 and are unchanged: cleartext LAN video
+and token, and device keys in plaintext in SQLite.
+
+### 7.3 Dependency audit
+
+The audit used `pip-audit` (the fallback; `make audit`'s uvx venv aborted in
+`ensurepip` on this host, see `make_audit.txt`):
+
+* device lock: protobuf (M84-7);
+* `cloud/requirements.txt`: none;
+* `requirements.txt` and `requirements-dev.txt`: pytest (M84-8).
+
+The CI audit step is `continue-on-error: true`.
+
+### 7.4 Model artifact integrity
+
+| Artifact | At download | At load |
+|---|---|---|
+| `damoyolo_tinynasL20_T.hef` | sha256-pinned (`setup_pi.sh`) | verified (`core/accel.py`, `accelerator.yolo_hef_sha256`); a mismatch is refused and the device goes DEGRADED |
+| 6 MediaPipe `.tflite` (in the mediapipe wheel) | no (unhashed pip, M84-4) | **no** (M84-5) |
+| openpilot `.onnx` (comparison module only) | **no** | **no** |
+| `yolo11n.pt` (dev only, never on a device) | no | no |
+
+### 7.5 Compatibility matrix (Decision C; `tests/test_m84_privsec_compat.py` checks every id is here)
+
+| Id | Pairing | Behaviour |
+|---|---|---|
+| old-device/new-backend | M8.3 device + M8.4 backend | `409 firmware_unsupported`; `status.camera_mode.supported=false`; nothing is ever sent. The app says "update it" (the device still streams while stopped). |
+| future-device/new-backend | camera schema 2 + M8.4 backend | treated as unsupported (fail closed) |
+| new-device/old-backend | M8.4 device + older backend | no command, so camera-only OFF: the safe default |
+| new-backend/new-device-extra-fields | unknown command fields | ignored; known fields strictly typed |
+| m83-app/new-device | M8.3 app | no frames while stopped; it shows "NO NEW FRAMES" (it does not know the new status); no leak |
+| pre-m83-client/new-device | old app, browser `<img>` | silence while stopped; never a non-JPEG part |
+| auth-contract | unknown sd-auth version | `unsupported_version`, never executed |
+
+**Existing version fields** (from code, not changed):
+* **Explicit failures.** `sd-auth-v1`, `sd-health-v1`, BLE PoP v1 and the model registry
+  `schema_version: 1` fail explicitly on a mismatch. The capability `features` list
+  (`DEVICE_POLICY_FEATURES`) gives `409 firmware_unsupported`.
+* **Fields nobody reads.** `versions.software`/`model` in the monitoring report,
+  `backend_api` 0.1, `ios_app` 1.0 and `api_prefix` /v1 are recorded (release manifest,
+  health JSON) but **never compared at runtime**.
+* **No negotiation.** No minimum-app-version check exists. An old app against a new
+  backend fails silently on any removed field.
+
+This is a **gap**, not fixed here. The proposal:
+* `/v1/health` returns `{"api": "0.1", "min_app": "1.0"}`;
+* the app compares it and shows "update the app".
+
+Owner: integrator / IOS.
+
+### 7.6 Other Z1/Z2 items reviewed (no new defect)
+
+* Dashboard auth, command envelopes and replay: the §5 and §6 suites pass unchanged.
+* Event access: route matrix, 14 device-scoped routes.
+* The new `camera-mode` route is owner-scoped, and `/v1/account/delete` is
+  account-scoped (both in `tests/test_m83_security_routes.py`).
+* `core/secret_store.py` and `core/command_auth.py` were reviewed; nothing changed.
+  `command_auth` already signs any `set_*` type, so `set_camera_mode` needed no
+  contract change.
