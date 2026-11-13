@@ -416,17 +416,7 @@ struct DeviceDetailView: View {
         withTransaction(transaction) { showCamera = true }
     }
 
-    /// The colour of the readout's symbol. By kind, not tone alone: a stopped
-    /// device is not "caution amber" on the instrument, it is simply off.
-    private func readoutTint(_ kind: InstrumentState.Kind) -> Color {
-        switch kind {
-        case .ready: SD.Colors.success
-        case .alert, .failed: SD.Colors.danger
-        case .starting, .degraded, .stale: SD.Colors.warning
-        case .stopped: SD.Colors.textSecondary
-        case .offline, .unknown, .connecting: SD.Colors.textTertiary
-        }
-    }
+    private func readoutTint(_ kind: InstrumentState.Kind) -> Color { kind.tint }
 
     /// The sentence under the readout: the device's own words for its state.
     private var readoutDetail: String? {
@@ -656,7 +646,9 @@ struct DeviceDetailView: View {
                 OrynRowDivider(inset: 22 + SD.Space.sm)
                 healthRow("AI", systemImage: "cpu", health.accelerator)
                 OrynRowDivider(inset: 22 + SD.Space.sm)
-                healthRow("Monitoring", systemImage: "eye", monitoringComponent(health))
+                // Stopped on purpose: the pause glyph, not a caution dot.
+                healthRow("Monitoring", systemImage: "eye", monitoringComponent(health),
+                          paused: monitoringPresentation?.phase == .stopped)
                 OrynRowDivider(inset: 22 + SD.Space.sm)
                 healthRow("Network", systemImage: "wifi", health.network)
             } else {
@@ -749,7 +741,8 @@ struct DeviceDetailView: View {
         systemImage: String,
         _ component: HealthComponent?,
         metric: String? = nil,
-        suffix: String = ""
+        suffix: String = "",
+        paused: Bool = false
     ) -> some View {
         if let component {
             HStack(spacing: SD.Space.sm) {
@@ -775,7 +768,7 @@ struct DeviceDetailView: View {
                         .font(SD.Typography.caption.monospacedDigit())
                         .foregroundStyle(SD.Colors.textSecondary)
                 }
-                if component.detail == CapabilityHealth.pausedDetail {
+                if paused || component.detail == CapabilityHealth.pausedDetail {
                     // Stopped on purpose (M8.2): paused, not unknown and not a fault.
                     Image(systemName: "pause.circle")
                         .font(.caption)

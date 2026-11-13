@@ -218,15 +218,15 @@ struct PresetDetailView: View {
         let presentation = MonitoringStatusPresentation.make(status: device.status, online: device.isLive())
         let impaired = PerceptionPresentation.degradedSummary(
             device.status?.perception, live: device.isLive())
-        let tone = presentation?.tone ?? .neutral
         let label = presentation?.label ?? "Status unknown"
+        // The device screen's readout symbol and colour: a stopped device is
+        // paused on purpose (steel pause), not a caution.
+        let kind = presentation?.phase.instrumentKind ?? .unknown
         return VStack(alignment: .leading, spacing: SD.Space.xs) {
             HStack(spacing: SD.Space.xs) {
-                // The device screen's readout symbols: a stopped device is
-                // paused on purpose, not a caution.
-                Image(systemName: Self.readoutSymbol(presentation?.phase))
+                Image(systemName: InstrumentState.symbol(kind))
                     .font(.system(size: 17, weight: .medium))
-                    .foregroundStyle(presentation?.phase == .stopped ? SD.Colors.textSecondary : tone.tint)
+                    .foregroundStyle(kind.tint)
                 Text(label)
                     .font(SD.Typography.readout)
                     .foregroundStyle(SD.Colors.textPrimary)
@@ -251,17 +251,6 @@ struct PresetDetailView: View {
             RoundedRectangle(cornerRadius: SD.Radius.camera, style: .continuous)
                 .fill(SD.Colors.surface)
         )
-    }
-
-    private static func readoutSymbol(_ phase: MonitoringStatusPresentation.Phase?) -> String {
-        switch phase {
-        case .ready?: InstrumentState.symbol(.ready)
-        case .starting?: InstrumentState.symbol(.starting)
-        case .degraded?: InstrumentState.symbol(.degraded)
-        case .stopped?: InstrumentState.symbol(.stopped)
-        case .failed?: InstrumentState.symbol(.failed)
-        case .unknown?, nil: InstrumentState.symbol(.unknown)
-        }
     }
 
     /// What it needs, each checked against what THIS device reports: working,

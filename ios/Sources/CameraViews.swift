@@ -19,6 +19,36 @@ extension StatusTone {
     }
 }
 
+extension InstrumentState.Kind {
+    /// The readout symbol's colour, wherever monitoring state is shown. By
+    /// kind, not tone alone: a deliberate stop is not a warning, it is simply
+    /// off (steel, with the pause symbol). Failed and degraded keep theirs.
+    var tint: Color {
+        switch self {
+        case .ready: SD.Colors.success
+        case .alert, .failed: SD.Colors.danger
+        case .starting, .degraded, .stale: SD.Colors.warning
+        case .stopped: SD.Colors.textSecondary
+        case .offline, .unknown, .connecting: SD.Colors.textTertiary
+        }
+    }
+}
+
+extension MonitoringStatusPresentation.Phase {
+    /// The instrument's kind for a live device in this phase (symbols and
+    /// tints shared with the device screen's readout).
+    var instrumentKind: InstrumentState.Kind {
+        switch self {
+        case .ready: .ready
+        case .starting: .starting
+        case .degraded: .degraded
+        case .stopped: .stopped
+        case .failed: .failed
+        case .unknown: .unknown
+        }
+    }
+}
+
 /// Whether this phone can show a device's live picture, and from where. The
 /// same rule FeedCard has always used (FeedLink), in one place.
 struct CameraSource {
@@ -268,7 +298,7 @@ struct LiveCameraView: View {
                 .fixedSize(horizontal: false, vertical: true)
             HStack(spacing: SD.Space.xs) {
                 Image(systemName: instrument.symbol)
-                    .foregroundStyle(instrument.tone.tint)
+                    .foregroundStyle(instrument.kind.tint)
                     .accessibilityHidden(true)
                 Text(instrument.word)
                     .foregroundStyle(SD.Colors.textPrimary)
