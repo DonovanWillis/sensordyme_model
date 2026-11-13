@@ -94,7 +94,7 @@ then prints the **next manual step**:
 | `identity` | 1 | `/proc/device-tree/model`, `/proc/cpuinfo` (Revision; Serial present, never recorded), `core.identity.device_id()` / `display_name()`, the avahi TXT `id=` |
 | `power` | 1 | `vcgencmd get_throttled` (expects `throttled=0x0`), `vcgencmd pmic_read_adc EXT5V_V` |
 | `os` | 3 | `/etc/os-release` (bookworm), `uname -rm` (aarch64), `$D/.venv/bin/python --version` (3.11) |
-| `packages` | 3 | `dpkg-query -W` (hailo-all, hailort, rpicam-apps, python3-picamera2, …), `hailortcli --version`, every `requirements-device.txt` pin vs the install venv |
+| `packages` | 3 | `dpkg-query -W` (hailo-all, hailort, rpicam-apps, python3-picamera2, …), `hailortcli --version`, every device pin (the hashed lock; simpleaudio is not installed on Linux) vs the install venv |
 | `software_revision` | 5 | the package's commit (`HWVAL_COMMIT` or git) vs `--expect-commit` |
 | `pins` | 5 | `hwv_stage.py pins` (config / `setup_pi.sh` / `model_registry.yaml` agree; decoder `legacy`) |
 | `model_artifact` | 5 | sha256 of `$D/models/damoyolo_tinynasL20_T.hef` vs `accelerator.yolo_hef_sha256` (hash only, no load) |
@@ -178,7 +178,7 @@ never "fix" it on the device by hand.
 | Decoder | `accelerator.yolo_decoder: legacy` | preflight `pins` | `legacy` | do not switch on Sunday |
 | Model capability schema | perception `sd-perception/1`, health stamp `sd-health-v1` | preflight `perception` / `health_truth` (`stamp.schema`) | equal | an app/backend that does not know the schema shows "unknown": record, coordinate with PRIVSEC |
 | Device config | schema-valid, `role: driver_safety`, pins the model, not edited by the session | Mac: `make deploy-preflight VENV=$VENV ROLE=driver_safety` or the RB-F0 manual block; Pi: preflight `config_unchanged`; `/api/health` → `device.config.source == "config"` | `OK to deploy`; unchanged | REFUSED for no `role` → owner adds it deliberately (RB-F0); others: stop |
-| Python packages | `requirements-device.txt` pins | preflight `packages` | all pins match | RB-F2 `pip install -r requirements-device.txt` (CHANGE) |
+| Python packages | device pins (hashed `requirements-device.lock`) | preflight `packages` | all pins match | RB-F2 `.venv/bin/python -m pip install --require-hashes --only-binary=:all: -r requirements-device.lock` (CHANGE) |
 | HailoRT / firmware | the 4.x `hailo-all` installs | preflight `packages` (`hailortcli --version`); `hailortcli fw-control identify` in the stopped window (RB-F1) | recorded; `HAILO8L` | MHS §9 "Hailo init failed" |
 | Backend | the backend built from `$RC` (M8.3+ status contract: `status.protection_command`, `health_freshness`) | `curl -s https://<backend>/v1/health` (`{"ok": true, "service": "sensordyme-cloud", "id": …}`); `check_live_status.py --backend …` shows `freshness` and `protection_command` fields; backend before device (RB-R7) | fields present | an older backend lacks stop/resume outcomes: record; RB-R7 order |
 | iOS app | built from `$RC` (or the documented fall-back, `docs/M8_3_RELEASE_DECISION.md`) | the builder records the commit and `CURRENT_PROJECT_VERSION` (`ios/project.yml`; e.g. `CURRENT_PROJECT_VERSION=20261115.0900`); on the Mac, Xcode → Window → Devices and Simulators lists the installed version/build. The app does not report its version to the backend. | commit recorded | an app from another commit: record; the status contract is additive (older apps tolerate new fields) |
@@ -237,7 +237,7 @@ Each step below: **Do** (commands or references), **Expect**, **Result**, **Evid
 
 ### 3.3 Step 3: OS / runtime compatibility
 - **Do:** preflight `--only os packages`; RB-C1 (unit, user, directory), RB-C3, RB-B3 (storage).
-- **Expect:** `VERSION_CODENAME=bookworm`, `aarch64`, venv Python 3.11.x, `hailo-all`/`hailort` present, every `requirements-device.txt` pin installed, ≥ 4 GB free, no I/O errors.
+- **Expect:** `VERSION_CODENAME=bookworm`, `aarch64`, venv Python 3.11.x, `hailo-all`/`hailort` present, every device pin (the hashed lock; simpleaudio is not installed on Linux) installed, ≥ 4 GB free, no I/O errors.
 - **Result:** `SUN-03 | ____ |` **Evidence:** preflight JSON; `$EV/pip_freeze_before.txt` (RB-C3).
 - **If it fails:** not Bookworm 64-bit / filesystem errors → RB-E6 clean-install criteria (decision recorded, owner approval); pin mismatches → RB-F2 (CHANGE, after backups).
 - **Rollback:** none (read-only); RB-O for anything installed later.

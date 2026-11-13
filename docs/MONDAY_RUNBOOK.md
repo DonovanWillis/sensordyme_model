@@ -160,7 +160,7 @@ dpkg -l | grep -E 'hailo|hailort|rpicam|libcamera0|python3-picamera2|bluez|netwo
 hailortcli --version
 $PY -m pip freeze > $EV/pip_freeze_before.txt
 sha256sum $D/models/*.hef
-cd $D && git rev-parse HEAD 2>/dev/null || echo "not a git checkout (expected: make deploy rsyncs files)"
+cd $D && git rev-parse HEAD 2>/dev/null || echo "not a git checkout (expected: deployed from a release tarball)"; readlink $D || true   # M8.5: a symlink to sensordyme.releases/<id> once adopted (§R6)
 ```
 Expect: hailo-all / HailoRT 4.x installed; the `.hef` sha256 is `e69136d3…960e` (pinned) or `4c71eab8…add2` ("evaluated": unverified provenance, which the runtime refuses).
 
@@ -260,7 +260,7 @@ Clean install (fresh Raspberry Pi OS Bookworm 64-bit + `setup_pi.sh`) **only if 
 - OS is not Bookworm 64-bit, or `hailo-all` cannot be installed or upgraded on it;
 - the install tree cannot be identified (C4 matches no revision, with large unexplained drift) **and** the backup (E1) is complete;
 - unknown users, keys, services or cron jobs that cannot be explained (possible compromise);
-- the service user is root, or the venv is broken beyond `pip install -r requirements-device.txt`.
+- the service user is root, or the venv is broken beyond a hashed reinstall (`.venv/bin/python -m pip install --require-hashes --only-binary=:all: -r requirements-device.lock`).
 
 Otherwise **upgrade in place** (§F). It keeps NetworkManager, BlueZ, avahi and the identity untouched. A clean install loses NetworkManager profiles unless restored, and needs the backend device key and the dashboard token re-entered from the E1 backup.
 
@@ -301,7 +301,7 @@ cp -a $D/.venv $STAGE/.venv              # same final path, so the venv's absolu
 ```bash
 PREV=$(dirname $D)/sensordyme.prev-$(date +%Y%m%dT%H%M%S)
 mv $D $PREV && mv $STAGE $D && echo "$PREV" > ~/m6-previous-release-path
-cd $D && .venv/bin/pip install -q -r requirements-device.txt && .venv/bin/pip install -q gpiozero==2.0.1 lgpio==0.2.2.0
+cd $D && .venv/bin/python -m pip install --require-hashes --only-binary=:all: --disable-pip-version-check --no-input -r requirements-device.lock   # M8.5: the hashed lock (gpiozero/lgpio are in it; simpleaudio is not on Linux: sound uses aplay)
 python3 scripts/migrate_config.py config.yaml             # prints added keys; never removes any
 sudo bash scripts/release/install_units.sh --user $U      # installs sensordyme.service + the recovery unit + guard
 systemctl cat sensordyme.service | grep -E 'StartLimitAction|OnFailure'   # expect: none / sensordyme-recover.service
@@ -311,9 +311,10 @@ sha256sum $D/models/*.hef                                 # expect: e69136d3…9
 
 > M6.5 notes for F2. `requirements-device.txt` no longer contains `pytest` or `anthropic`; pip
 > does not uninstall them, so an existing venv keeps them (harmless; `release-verify` compares
-> only the pins). Do not switch to `requirements-device.lock` (`--require-hashes`) or to the
-> least-privilege unit (`deploy/systemd/sensordyme.service.hardened`) on Monday: both are
-> hardware-pending and are a separate, later session (`docs/LEAST_PRIVILEGE.md`). F2 installs
+> only the pins). M8.5: F2 now installs the hashed `requirements-device.lock` (wheels only;
+> `docs/DEPLOYMENT.md`). Do not switch to the least-privilege unit
+> (`deploy/systemd/sensordyme.service.hardened`) in the first session: it is hardware-pending and a
+> separate, later session (`docs/LEAST_PRIVILEGE.md`). F2 installs
 > the **stock** unit, as before. No identity changes: device id, device key and claim code are
 > carried over by F1 unchanged, and no key is rotated.
 
@@ -729,26 +730,23 @@ Known limits (documented, not defects):
 - the lockout counter resets on a power cycle;
 - offline guessing from a recorded session is possible; the 60-bit code and PBKDF2 are the defence.
 
-### R6. Rollback guard (OPTIONAL; last; owner-approved; only if `make deploy` targets this device)
+### R6. Staged releases and rollback (OPTIONAL; last; owner-approved; M8.5)
 
-`make deploy` now:
-1. snapshots the running release (`data/release/previous/`, with config.yaml at 0600);
-2. deploys and restarts;
-3. rolls back by itself if the unit is not stably `active` within the settle time, or if any step fails (`scripts/release/release_guard.py`).
+The first session installs by the manual tree swap (F1/F2, rollback O1). The M8.5 staged-release path
+(`docs/DEPLOYMENT.md`) is checked here only after everything else passes, because it changes the
+install layout (`$D` becomes a symlink to `sensordyme.releases/<id>`, device state moves to `sensordyme.state/`).
 
-It is hard-wired to `pi@sensordyme.local:~/sensordyme`. Skip R6 if this device's user or directory differs (§C1).
+1. Adopt once: `make deploy-adopt DEVICE=$PI DIR=<dir from §C1>`; service active again; `readlink $D` names a release.
+2. Deploy `$RC` staged: `make verify-release REF=$RC && make deploy DEVICE=$PI DIR=<dir> REF=$RC ROLE=driver_safety` → exit 0
+   (confirmed); `release_guard.py status` shows it live; `ARTIFACTS.json` in the live release has `"ok": true`.
+3. Rollback test: deploy a throwaway commit whose `main.py` exits 1 at import → exit 1; journal shows the switch back;
+   service `active` on the previous release; no pip or network was needed (the rollback is a symlink switch).
+4. Manual rollback: `make deploy-rollback DEVICE=$PI DIR=<dir>` (or on the Pi
+   `python3 $D/scripts/release/release_guard.py switch --root $D --to previous --user $U`).
 
-To test it: deploy a throwaway commit whose `main.py` exits 1 at import. Expect:
-- `make deploy` exits 1;
-- the journal shows the rollback;
-- the service is `active` on the previous release (F3's `release-verify` against the previous manifest passes again);
-- `release_guard.py status` shows no pending deploy.
-
-Things only the Pi can show:
-- whether `Type=notify` and `NRestarts` behave as the guard assumes under systemd 252;
-- whether the rollback's `pip install` of the old pins works offline.
-
-Record both.
+Things only the Pi can show (record each): systemd 252 following the symlink for `WorkingDirectory`/`ExecStart`;
+`Type=notify`/`NRestarts` as the guard assumes; the detached activation surviving an SSH drop; non-interactive sudo
+for the deploying user; disk/time cost of one venv per release. To leave the staged layout: `docs/DEPLOYMENT.md` §2.
 
 ### R7. Security notes (M8)
 
