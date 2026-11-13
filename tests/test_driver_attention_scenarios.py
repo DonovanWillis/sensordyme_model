@@ -341,7 +341,7 @@ def test_phone_use_confidence_is_the_detectors_score_times_gaze_certainty(tmp_pa
     # so the gaze term is ~1 and the joint is the detector's own score.
     assert phone_events[0].confidence == pytest.approx(0.82, abs=0.01)
     assert phone_events[0].confidence <= 0.82, "a joint can never exceed either of its parts"
-    assert "hand on phone" in phone_events[0].contributing_signals
+    assert "hand overlapping the phone" in phone_events[0].contributing_signals
 
 
 def test_face_temporarily_occluded_does_not_instantly_reset_progress(tmp_path, clock):

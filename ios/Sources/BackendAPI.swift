@@ -509,7 +509,10 @@ final class MockAPI: BackendAPI {
             // Demo events come from a preset, not a configured rule. Marking
             // them as configured would make them all notify, which is exactly
             // the spam this distinction exists to prevent.
-            source: "module"
+            source: "module",
+            // Every demo event says it is one (M8.3), so the timeline and the
+            // detail sheet label it, wherever it is shown.
+            simulated: true
         )
     }
 

@@ -1657,7 +1657,9 @@ class DriverAttentionModule(VisionModule):
     def _phone_use_detail(self) -> str:
         """What the hand evidence said about a phone_use, stated, not scored."""
         if self._phone_hold.state == PHONE_HELD or self._hand_overlaps_phone:
-            return "hand on phone"
+            # Hand tracking is experimental (presets.yaml): the overlap is what it
+            # saw, not proof the driver is holding the phone (M8.3 claims audit).
+            return "hand overlapping the phone (experimental hand tracking)"
         if not (self._enable_hands and self._hands is not None):
             return "phone visible; hand tracking unavailable, holding not checked"
         return "phone visible; no hand confirmed on it"

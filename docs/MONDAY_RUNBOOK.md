@@ -413,6 +413,8 @@ Pass: `get_throttled` stays `0x0` throughout (no sticky bits 16/18); ARM clock n
 
 ## K. Autonomy: boot, Wi-Fi loss, reconnection, reboot, restart policy
 
+> **Journal timing (M8.3 check against the code).** Four quoted lines in K and L are written with `print()` to stdout, not the logger: `restored the last selected mode` (main.py), `switched to preset` and `rules: enforcing` (services/runtime.py), and `cloud_uplink: connection lost` / `connected to` (core/uplink.py). The unit runs Python without `-u`, so under systemd these can reach `journalctl` late or out of order with the `[PROTECTION]`/`[MONITORING]` logger lines. If a `grep` for one of them finds nothing, wait 30 s and re-run it before recording a FAIL.
+
 **K1. Reboot and reconnection** (CHANGE: reboot):
 ```bash
 sudo reboot
@@ -493,9 +495,14 @@ Simulate a startup crash, e.g. `sudo systemctl edit sensordyme` with `[Service]`
    ```
    The app shows the live feed, the device's real monitoring state, and the device id equal to the C2 id.
 
-**L2. Presets:** from the app, switch Driver Safety → Elderly Monitoring → Driver Safety. Expect each switch confirmed in the app within ~2 poll intervals, and the journal `switched to preset …`. On a `driver_safety`-role device, a role-violating preset is **refused** with a reason (409 locally / refusal in the app). That refusal is the M0.1 safety floor, not a failure.
+**L2. Presets:** this unit is `role: driver_safety` (config.yaml; `core/roles.py` allows only the `driver_safety` preset on that role). From the app, select Driver Safety (and a variant, e.g. Strict): expect it confirmed within ~2 poll intervals and the journal `switched to preset …`. Then select Elderly Monitoring: on this unit it must be **refused** with the reason `this device's role is 'driver_safety': preset 'elderly_monitoring' would stop driver_attention; allowed: driver_safety` (409 `role_forbids_preset` from the backend / 409 locally / the refusal shown in the app), and Driver Safety keeps running. That refusal is the M0.1 safety floor, not a failure. (Corrected in M8.3: this step used to expect Elderly Monitoring to switch, which the code refuses on this role.)
 
-**L3. Custom rules:** in the app, Configure with AI, e.g. "alert me if a phone is visible for 5 seconds"; review, then activate. Expect: the journal shows the rule set applied (rules version reported upstream); `/api/state` → `policy` shows the custom configuration; holding a phone in view for 5 s produces an alert in the app. Then switch back to Driver Safety and confirm the rules stop. Stop/resume: from the app, stop protection (with confirmation), then resume. Expect `[PROTECTION] STOPPED` / `resumed`, each applied exactly once.
+**L3. Custom rules:** in the app, open **Ask Jupiter** (formerly "Configure with AI"), e.g. "alert me if a phone is visible for 5 seconds"; review, then **Activate**. Expect:
+- journal `rules: enforcing 1 AI-configured rule(s)` and `[MONITORING] mode=standard_plus_custom module=driver_attention base_monitoring=enabled …` (the rules version goes upstream as `rules_version`; it is not logged);
+- `/api/state` → `policy.mode` is `standard_plus_custom` (custom rules run beside Driver Safety on this role; `policy` holds `role`, `protection`, `mode`, `last_rejection`, `features`, not the rules), and `/api/health` → `device.monitoring.custom_rules` lists the rule;
+- holding a phone in view for 5 s produces an alert in the app. This is a custom "phone visible" rule, not the product's `phone_use` alert: a visible phone alone is not phone use.
+
+Then select Driver Safety again and confirm the rules stop (journal `[MONITORING] custom monitoring exited: explicit mode switch`). Stop/resume: from the app, **Stop monitoring** (confirm "Stop monitoring?"), then **Resume monitoring**. Expect `[PROTECTION] STOPPED by …` / `[PROTECTION] resumed by …`, each logged exactly once.
 
 > **M6.5 notes for K and L.**
 >
@@ -504,7 +511,7 @@ Simulate a startup crash, e.g. `sudo systemctl edit sensordyme` with `[Service]`
 >   - Do not run `scripts/migrate_device_key.py` (dry-run by default) and do not rotate keys on Monday.
 > - **BLE provisioning.** It stays `network.provisioning.auth: legacy`, so K2 uses the existing app flow. The proof-of-possession flow (`docs/BLE_PROOF_OF_POSSESSION.md`) needs a setup-code label, an app build with its setup screen, and its own hardware session. Do not set `deployment: production` on Monday: with `legacy` that is a schema error by design.
 > - **Person rules.** Custom rules on `person` now receive the driver's person box (fixed in M6.5; before, "nobody in the seat" fired with the driver seated). If L3 includes a person rule, record whether it fires correctly.
-> - **Ask Jupiter.** In the app use the full Ask Jupiter screen (the "Examples" link or the custom-rules card). The inline Ask Jupiter bar on the device screen failed UI automation: its field did not take keyboard focus. If it works by hand on the phone, record that in `$EV/LOG.md`.
+> - **Ask Jupiter.** In the app use the full Ask Jupiter screen (the "All examples" link or the custom-rules card). The inline Ask Jupiter bar on the device screen failed UI automation: its field did not take keyboard focus. If it works by hand on the phone, record that in `$EV/LOG.md`.
 > - **`calibration.json`.** A `calibration.json` that is not a JSON object is now ignored and the driver recalibrates. Before, the device booted FAILED every time.
 
 
@@ -641,7 +648,7 @@ M8 (`feat/m8-product-intelligence`) changes device behaviour in ways the steps a
 curl -s -H "X-Device-Token: $TOKEN" localhost:8899/api/health | $PY -c '
 import json,sys;d=json.load(sys.stdin)["device"]
 print("config", d.get("config")); print("saved_state", d.get("saved_state")); print("uplink_backlog", d.get("uplink_backlog"))
-acc=[c for c in (d.get("components") or []) if "accel" in json.dumps(c).lower()]; print("accelerator", json.dumps(acc)[:400])'
+print("accelerator", json.dumps(d.get("accelerator"))[:400])'
 ```
 
 Expect:

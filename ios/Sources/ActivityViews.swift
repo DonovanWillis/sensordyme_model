@@ -56,6 +56,7 @@ struct TimelineRow: View {
                     .accessibilityLabel(EventAccessibility.label(
                         title: event.title, severity: event.severity, signals: event.signals,
                         when: event.date.map { Self.spokenAge.localizedString(for: $0, relativeTo: .now) }))
+                    .accessibilityValue(event.isSimulated ? "Simulated" : "")
                     .accessibilityHint(expanded ? "Hides the details" : "Shows the details")
                     .accessibilityAddTraits(expanded ? .isSelected : [])
                     .accessibilityIdentifier(identifier)
@@ -119,6 +120,14 @@ struct TimelineRow: View {
                         .font(SD.Typography.caption.weight(.medium))
                         .foregroundStyle(SD.Colors.textSecondary)
                 }
+                // Real vs rehearsal, on the row itself (M8.3): a simulated or
+                // demo event must never pass for a real detection.
+                if event.isSimulated {
+                    Text("Simulated")
+                        .font(SD.Typography.caption.weight(.semibold))
+                        .foregroundStyle(SD.Colors.textTertiary)
+                        .accessibilityIdentifier("event.simulated")
+                }
                 if let signals = event.signals, !signals.isEmpty {
                     // Wraps in full: two lines clipped the device's reason (audit).
                     Text(signals)
@@ -135,10 +144,22 @@ struct TimelineRow: View {
 
     /// Only what the backend recorded: confidence when the event carries one,
     /// the model that produced it when known. Nothing estimated by the app.
+    /// The device-alert line is what the DEVICE reported about its own alert
+    /// output (M8.3), never inferred from the event existing.
     private var details: some View {
         VStack(alignment: .leading, spacing: SD.Space.xs) {
             if let date = event.date {
-                fact("When", date.formatted(date: .abbreviated, time: .standard))
+                fact(event.timeIsArrival ? "Received" : "When", date.formatted(date: .abbreviated, time: .standard))
+            }
+            if let delay = event.deliveryDelay {
+                fact("Reached the app", "\(Self.duration(delay)) later")
+            }
+            if event.deviceClockError != nil {
+                fact("Device clock", "was wrong; time shown is from the server")
+            }
+            if event.severityStatus != .online || event.alert != nil {
+                fact("Device alert", event.alertEvidence.short)
+                    .accessibilityIdentifier("event.alertEvidence")
             }
             if let confidence = event.confidence {
                 fact("Detector confidence", String(format: "%.2f", confidence))
@@ -173,6 +194,14 @@ struct TimelineRow: View {
                 .fixedSize(horizontal: false, vertical: true)
         }
         .accessibilityElement(children: .combine)
+    }
+
+    /// "3 min", "2 h", "4 d": how late an event arrived.
+    static func duration(_ seconds: TimeInterval) -> String {
+        let formatter = DateComponentsFormatter()
+        formatter.unitsStyle = .abbreviated
+        formatter.maximumUnitCount = 1
+        return formatter.string(from: seconds) ?? "\(Int(seconds)) s"
     }
 
     static let spokenAge: RelativeDateTimeFormatter = {

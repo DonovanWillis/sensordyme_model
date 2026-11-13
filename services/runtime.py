@@ -610,6 +610,9 @@ class DeviceRuntime:
             self.dashboard.preset_guard = lambda name: roles.preset_violation(
                 self.role, resolve_preset(name, self.presets), self.presets)
             self.dashboard.set_policy_state(self._policy_state())
+            # M8.3: the camera itself, for stream heartbeats and the unannotated
+            # fallback while monitoring is stopped (core/dashboard.py).
+            self.dashboard.attach_frame_source(self.bus)
             try:
                 dashboard_url = self.dashboard.start()
             except OSError as exc:
@@ -652,6 +655,9 @@ class DeviceRuntime:
                 cloud_cfg = {**cloud_cfg,
                              "spool_path": str(Path(events_csv).parent / "uplink_spool.jsonl")}
             self.uplink = self._make_uplink(cloud_cfg)
+            # M8.3: every event pushed carries what the alert policy did with it
+            # and what the in-cabin outputs reported (docs/EVENT_PIPELINE.md).
+            self.uplink.delivery_lookup = getattr(self.alert_manager, "delivery", None)
             self.uplink.set_active_preset(self.active_preset)
             # Report the restored configuration at startup too, not only when a
             # new one arrives — otherwise a device that rebooted into a custom
@@ -3052,7 +3058,7 @@ class DeviceRuntime:
                 if now < self._flash_until:
                     view = _apply_alert_overlay(view)
                 if want_stream:
-                    self.dashboard.push_frame(view)
+                    self.dashboard.push_frame(view, captured_at=captured_at)  # M8.3: X-Frame-Age-Ms
                     self._last_stream_push = now
         if self.display and view is not None:
             cv2.imshow(self.window_name, view)

@@ -68,7 +68,7 @@ struct EventHistoryView: View {
         }
         .refreshable { await reload() }
         .task {
-            if events.isEmpty { events = initialEvents }
+            if events.isEmpty { events = EventFeed.ordered(initialEvents) }
             await reload()
         }
     }
@@ -96,7 +96,9 @@ struct EventHistoryView: View {
         do {
             let fetched = try await state.backend.events(deviceID: device.id, limit: 200)
             guard reloadGuard.isLatest(token) else { return }
-            events = fetched
+            // Merged, not replaced (M8.3): one copy per event, a newer alert
+            // report kept over a stale one, ordered by when it happened.
+            events = EventFeed.merge(events, fetched)
             errorMessage = nil
         } catch let error as APIError where error.isAuthFailure {
             guard reloadGuard.isLatest(token) else { return }

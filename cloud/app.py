@@ -34,6 +34,7 @@ import sqlite3
 import threading
 import time
 from contextlib import asynccontextmanager, contextmanager, suppress
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any, Optional
 
@@ -628,6 +629,25 @@ def init_db() -> None:
             # Unlike desired_protection it is never cleared, so the status can
             # say confirmed / mismatch / timed_out after delivery ends.
             "ALTER TABLE devices ADD COLUMN protection_request TEXT",
+            # M8.3 event integrity (docs/EVENT_PIPELINE.md). NULL for history and
+            # for firmware that predates each field -- never back-filled.
+            # What the device's alert policy did and what its in-cabin outputs
+            # reported (JSON, see _alert_report); `alert_output` is its summary
+            # ("sounded" only when a real output said so) and `alert_rev` the
+            # report's revision, so a late, older report never overwrites a newer.
+            "ALTER TABLE events ADD COLUMN alert TEXT",
+            "ALTER TABLE events ADD COLUMN alert_output TEXT",
+            "ALTER TABLE events ADD COLUMN alert_rev INTEGER",
+            # The alert episode the event opened (`<boot>-<n>`): one stored row per episode.
+            "ALTER TABLE events ADD COLUMN episode TEXT",
+            # 1 when the event came from a simulated device or detector (sim/).
+            "ALTER TABLE events ADD COLUMN simulated INTEGER",
+            # When it happened on the BACKEND's clock, and how that was found:
+            # "device_monotonic" (received_at - the device's own age_s),
+            # "device_clock" (the device timestamp, judged plausible) or
+            # "received" (the device clock was implausible; arrival time).
+            "ALTER TABLE events ADD COLUMN occurred_at REAL",
+            "ALTER TABLE events ADD COLUMN time_basis TEXT",
         ):
             try:
                 conn.execute(statement)
@@ -651,6 +671,13 @@ def init_db() -> None:
         conn.execute(
             "CREATE UNIQUE INDEX IF NOT EXISTS idx_events_dedup "
             "ON events(device_id, event_key) WHERE event_key IS NOT NULL"
+        )
+        # One stored alert per alert episode (M8.3): a second event for an
+        # episode already stored -- re-reported after a reconnect, under a new
+        # key -- is not a new alert, so it is neither stored nor notified.
+        conn.execute(
+            "CREATE UNIQUE INDEX IF NOT EXISTS idx_events_episode "
+            "ON events(device_id, episode) WHERE episode IS NOT NULL"
         )
         # For retention (see _prune_events): an age cut-off without this is a
         # full scan of the largest table, on a write transaction.
@@ -2151,7 +2178,7 @@ _EVENT_TITLES = {
     "frequent_glancing": "⚠️ Frequent Glancing Away",
     "phone_use": "📱 Phone Use Detected",
     "phone_detected": "📱 Phone Detected",
-    "phone_in_hand": "📱 Phone In Hand",
+    "phone_in_hand": "📱 Phone Near Hand (experimental)",
     "eating_drinking": "🍔 Eating/Drinking Detected",
     "occupancy_change": "🚶 Occupancy Changed",
     "person_lingering": "🚨 Person Lingering",
@@ -2656,18 +2683,37 @@ def list_devices(uid: int = Depends(current_user)):
 
 
 @app.get("/v1/devices/{device_id}/events")
-def device_events(device_id: int, limit: int = 100, uid: int = Depends(current_user)):
+def device_events(device_id: int, limit: int = 100, before_id: Optional[int] = None,
+                  uid: int = Depends(current_user)):
+    """A device's events, newest stored first (by row id, which only grows).
+
+    `before_id` pages back from a row id the app already has: the id cursor is
+    stable while new events arrive, where an offset would shift under them.
+
+    Each event carries (M8.3, docs/EVENT_PIPELINE.md) its `event_key`, the
+    device's own `timestamp` exactly as reported, `received_at` (this backend's
+    clock), `occurred_at` + `time_basis` (when it happened on this backend's
+    clock, and how that was found), `alert` (what the device reported its alert
+    outputs did -- None when it reported nothing) and `simulated`.
+    """
     limit = max(1, min(limit, 1000))
     with db() as conn:
         _owned_device(conn, device_id, uid)
         # `id` is included so the app can ask why a specific alert fired.
         # Without it an event is unaddressable and /explain is unreachable.
-        rows = conn.execute(
-            "SELECT id, timestamp, type, confidence, signals, severity, source, duration, model FROM events "
-            "WHERE device_id = ? ORDER BY id DESC LIMIT ?",
-            (device_id, limit),
-        ).fetchall()
-    return {"events": [{**dict(r), "model": _stored_model(r["model"])} for r in rows]}
+        columns = ("SELECT id, timestamp, type, confidence, signals, severity, source, duration, model,"
+                   " event_key, received_at, occurred_at, time_basis, alert, simulated FROM events ")
+        if before_id is not None:
+            rows = conn.execute(
+                columns + "WHERE device_id = ? AND id < ? ORDER BY id DESC LIMIT ?",
+                (device_id, before_id, limit),
+            ).fetchall()
+        else:
+            rows = conn.execute(
+                columns + "WHERE device_id = ? ORDER BY id DESC LIMIT ?",
+                (device_id, limit),
+            ).fetchall()
+    return {"events": [_event_row(r) for r in rows]}
 
 
 def _stored_model(raw: Optional[str]) -> Optional[dict]:
@@ -4424,6 +4470,11 @@ def explain_event(device_id: int, event_id: int, uid: int = Depends(current_user
         raise HTTPException(503, "explanations are unavailable on this backend") from None
 
     event = dict(row)
+    # "When" on the backend's clock wherever the device's own clock was not the
+    # evidence (M8.3): a device on a 1970 clock must not explain an alert as
+    # having happened in 1970.
+    if event.get("occurred_at") is not None and event.get("time_basis") in ("device_monotonic", "received"):
+        event["timestamp"] = datetime.fromtimestamp(float(event["occurred_at"]), UTC).isoformat()
     # `signals` disambiguates when several rules watch the same target: the
     # device records the firing rule's own message there.
     rule = parse_rule_for_event(device["ai_rules"], event.get("type", ""), event.get("signals"))
@@ -4489,6 +4540,131 @@ def _model_identity(raw) -> Optional[dict]:
     else:
         out["detector"] = None
     return out if out["module"] or out["detector"] else None
+
+
+# ------------------------------------------------------------------ M8.3 event integrity
+#: core/alerts.py AlertDelivery: summaries and decisions a device may report.
+_ALERT_OUTPUTS = frozenset({"sounded", "simulated", "pending", "unconfirmed", "failed", "none"})
+_ALERT_DECISIONS = frozenset({"alerted", "merged", "suppressed"})
+_EPISODE_RE = re.compile(r"^[0-9a-f]{6,32}-[0-9]{1,12}$")
+#: An event's age (seconds since the device queued it) is believed up to this:
+#: the device's backlog survives restarts, not months.
+_MAX_EVENT_AGE_S = 30 * 86400.0
+#: A device timestamp later than its arrival by more than this is a wrong clock.
+_DEVICE_CLOCK_AHEAD_S = 120.0
+
+
+def _alert_report(raw) -> Optional[dict]:
+    """A device-reported alert delivery (core/alerts.py AlertDelivery.summary),
+    validated at the boundary: known keys and values only, bounded, or None.
+
+    "sounded" is accepted only as the device's own summary of its own outputs;
+    nothing here, or anywhere in the backend, ever derives it."""
+    if not isinstance(raw, dict):
+        return None
+    output = raw.get("output")
+    decision = raw.get("decision")
+    if output not in _ALERT_OUTPUTS or decision not in _ALERT_DECISIONS:
+        return None
+    rev = raw.get("rev")
+    episode = raw.get("episode")
+    category = raw.get("category")
+    outputs = []
+    for item in (raw.get("outputs") or [])[:8] if isinstance(raw.get("outputs"), list) else []:
+        if not isinstance(item, dict):
+            continue
+        entry: dict = {
+            "name": _short(item.get("name"), 32), "kind": _short(item.get("kind"), 16),
+            "audible": item.get("audible") is True,
+        }
+        for count in ("played", "failed", "skipped", "pending", "unconfirmed"):
+            value = item.get(count)
+            entry[count] = int(value) if isinstance(value, int) and not isinstance(value, bool) \
+                and 0 <= value <= 10_000 else 0
+        if item.get("visual") is True:
+            entry["visual"] = True
+        if item.get("simulated") is True:
+            entry["simulated"] = True
+        error = _short(item.get("error"), 160)
+        if error:
+            entry["error"] = error
+        outputs.append(entry)
+    return {
+        "decision": decision, "output": output,
+        "rev": rev if isinstance(rev, int) and not isinstance(rev, bool) and 0 <= rev < 1_000_000 else 0,
+        "episode": episode if isinstance(episode, str) and _EPISODE_RE.match(episode) else None,
+        "category": _short(category, 16) or None,
+        "outputs": outputs,
+    }
+
+
+def _event_time(e: dict, received_at: float) -> tuple[float, str]:
+    """When an event happened, on THIS backend's clock, and how that was found.
+
+    The device's wall clock is its own: a Pi has no RTC and can run for minutes
+    on a 1970 or last-shutdown clock before NTP, and a backlog can arrive an
+    hour late. Neither may put an alert at the wrong time in the app.
+
+    device_monotonic  received_at - age_s: the device's own monotonic age of the
+                      event, sent by firmware that queued it in this boot (M8.3)
+    device_clock      the device timestamp, when it is not in the future of its
+                      arrival and not older than the backlog can be
+    received          neither: the arrival time, and the app says so
+    """
+    age = e.get("age_s")
+    if isinstance(age, (int, float)) and not isinstance(age, bool) and math.isfinite(age) \
+            and 0 <= age <= _MAX_EVENT_AGE_S:
+        return received_at - float(age), "device_monotonic"
+    stamp = e.get("timestamp")
+    if isinstance(stamp, str) and stamp:
+        try:
+            parsed = datetime.fromisoformat(stamp.replace("Z", "+00:00"))
+            if parsed.tzinfo is None:
+                parsed = parsed.replace(tzinfo=UTC)
+            device_time = parsed.timestamp()
+        except (ValueError, OverflowError, OSError):
+            device_time = None
+        if device_time is not None and \
+                received_at - _MAX_EVENT_AGE_S <= device_time <= received_at + _DEVICE_CLOCK_AHEAD_S:
+            return device_time, "device_clock"
+    return received_at, "received"
+
+
+def _event_simulated(e: dict, model: Optional[dict], health, monitoring) -> bool:
+    """Whether an event came from a simulated device or detector (sim/).
+
+    Said by the event itself (the virtual device's uplink), by the report it
+    arrived with (the virtual device's health/monitoring), or by the model that
+    produced it (a scripted detector's backend is "simulated")."""
+    if e.get("simulated") is True:
+        return True
+    for block in (health, monitoring):
+        if isinstance(block, dict) and block.get("simulated") is True:
+            return True
+    detector = (model or {}).get("detector")
+    return isinstance(detector, dict) and detector.get("backend") == "simulated"
+
+
+def _stored_alert(raw: Optional[str]) -> Optional[dict]:
+    if not raw:
+        return None
+    try:
+        value = json.loads(raw)
+    except ValueError:
+        return None
+    return value if isinstance(value, dict) else None
+
+
+def _event_row(r) -> dict:
+    """One stored event as GET /v1/devices/{id}/events returns it."""
+    out = {k: r[k] for k in ("id", "timestamp", "type", "confidence", "signals", "severity", "source",
+                              "duration", "event_key", "received_at", "occurred_at", "time_basis")}
+    out["model"] = _stored_model(r["model"])
+    # Exactly what the device reported about its alert outputs, or None (older
+    # firmware, a log-only event). The app says "sounded" only from this.
+    out["alert"] = _stored_alert(r["alert"])
+    out["simulated"] = bool(r["simulated"]) if r["simulated"] is not None else None
+    return out
 
 
 #: A device's hardware id. `SD-SIM-` marks the virtual device (sim/); it is kept so
@@ -4741,10 +4917,19 @@ def ingest(body: IngestBody, background_tasks: BackgroundTasks, request: Request
                 model = _model_identity(e.get("model"))
                 if duration is not None and not math.isfinite(duration):
                     duration = None
+                # M8.3 (docs/EVENT_PIPELINE.md): the device's alert-delivery
+                # report, the episode it opened, real vs simulated, and when it
+                # happened on this backend's clock. All additive: NULL when an
+                # older device does not send them.
+                alert = _alert_report(e.get("alert"))
+                occurred_at, time_basis = _event_time(e, now)
+                simulated = _event_simulated(e, model, body.health, body.monitoring)
+                stored_key = str(event_key) if event_key not in (None, "") else None
                 cursor = conn.execute(
                     "INSERT OR IGNORE INTO events (device_id, timestamp, type, confidence, signals,"
-                    " severity, source, received_at, event_key, duration, model)"
-                    " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                    " severity, source, received_at, event_key, duration, model,"
+                    " alert, alert_output, alert_rev, episode, simulated, occurred_at, time_basis)"
+                    " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
                     (
                         device["id"],
                         str(e.get("timestamp", "")),
@@ -4754,11 +4939,30 @@ def ingest(body: IngestBody, background_tasks: BackgroundTasks, request: Request
                         str(e.get("severity", "log")),
                         str(e.get("source") or "module"),
                         now,
-                        str(event_key) if event_key not in (None, "") else None,
+                        stored_key,
                         duration,
                         json.dumps(model, sort_keys=True) if model is not None else None,
+                        json.dumps(alert, sort_keys=True) if alert is not None else None,
+                        alert["output"] if alert is not None else None,
+                        alert["rev"] if alert is not None else None,
+                        alert["episode"] if alert is not None else None,
+                        1 if simulated else 0,
+                        occurred_at,
+                        time_basis,
                     ),
                 )
+                if cursor.rowcount == 0 and stored_key is not None and alert is not None:
+                    # Already stored: this is the same event re-sent -- a retry
+                    # after a lost response, a spool replay, or the device's
+                    # later report of what its alert outputs did. Only a NEWER
+                    # report (by its revision) replaces the stored one; nothing
+                    # else about the row changes, and it is never re-notified.
+                    conn.execute(
+                        "UPDATE events SET alert = ?, alert_output = ?, alert_rev = ?"
+                        " WHERE device_id = ? AND event_key = ? AND COALESCE(alert_rev, -1) < ?",
+                        (json.dumps(alert, sort_keys=True), alert["output"], alert["rev"],
+                         device["id"], stored_key, alert["rev"]),
+                    )
                 # rowcount is 0 when OR IGNORE silently dropped a retry of an
                 # event_key already stored — that upload is not new information,
                 # so it must not reach the notification loop below. Without this
@@ -4770,7 +4974,7 @@ def ingest(body: IngestBody, background_tasks: BackgroundTasks, request: Request
                 # gate exists to prevent, just moved from "database row" to
                 # "notification".
                 if cursor.rowcount > 0:
-                    newly_inserted_events.append(e)
+                    newly_inserted_events.append({**e, "_simulated": simulated})
             except (TypeError, ValueError, OverflowError) as exc:
                 # Only what is wrong with THIS EVENT. A storage failure (a full
                 # disk, an I/O error) is not: it used to be caught here too, so
@@ -4987,6 +5191,9 @@ def ingest(body: IngestBody, background_tasks: BackgroundTasks, request: Request
         if not send:
             continue
         title = _readable_title(str(e.get("type", "alert")))
+        if e.get("_simulated"):
+            # A rehearsal must never reach a lock screen as a real detection (M8.3).
+            title += " (simulated)"
         detail = _notification_detail(e)
         if held:
             detail += f" (and {held} more in the last {int(NOTIFY_COOLDOWN_S)}s)"

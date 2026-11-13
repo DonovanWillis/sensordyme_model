@@ -50,6 +50,35 @@ def sha256_bytes(data: bytes) -> str:
 
 
 # ------------------------------------------------------------------ safety gates
+#: Modules that exist only on the Pi image. Missing one means "not on the device".
+HARDWARE_MODULES = ("hailo_platform", "picamera2", "gpiozero", "libcamera")
+
+
+def run_cli(main, argv=None) -> int:
+    """Run a script's main() so that a missing input or missing hardware is a
+    one-line REFUSED with exit 2, never a traceback (M8.3).
+
+    Only these are translated: a file or directory that does not exist or
+    cannot be read (the install tree, a bundle, an image directory) and an
+    import of a Pi-only module. Anything else is a genuine fault and keeps its
+    traceback, so a bug cannot hide behind a tidy message.
+    """
+    try:
+        return main(argv)
+    except (FileNotFoundError, NotADirectoryError, PermissionError) as exc:
+        print(f"REFUSED: cannot read {getattr(exc, 'filename', None) or exc}: {exc.strerror or exc}. "
+              "On a Pi, check --install-dir / the input path; on a Mac this step needs the device.",
+              file=sys.stderr)
+        return 2
+    except ImportError as exc:
+        name = getattr(exc, "name", "") or ""
+        if name.split(".")[0] in HARDWARE_MODULES:
+            print(f"BLOCKED: {name} is not importable ({exc}); this step runs only on the Pi image "
+                  "(sudo apt install hailo-all / python3-picamera2 / python3-gpiozero).", file=sys.stderr)
+            return 2
+        raise
+
+
 def operator_commands(service: str = SERVICE) -> str:
     """The reversible stop/start an OPERATOR runs. Printed, never executed."""
     return "\n".join([

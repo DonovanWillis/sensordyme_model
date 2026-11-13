@@ -83,6 +83,11 @@ class TestClientTransport:
 
 
 class SimUplink(CloudUplink):
+    #: Every event this device sends carries `simulated: true` (M8.3): the
+    #: backend stores it and the app labels it, so a rehearsal is never shown
+    #: as a real detection.
+    SIMULATED = True
+
     def __init__(self, config: dict, *, transport: Optional[Any] = None, manual: bool = False) -> None:
         super().__init__(config)
         if transport is not None:

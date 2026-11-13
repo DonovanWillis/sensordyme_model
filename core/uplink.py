@@ -22,9 +22,10 @@ import random
 import threading
 import time
 import uuid
-from collections import deque
+from collections import OrderedDict, deque
+from collections.abc import Callable
 from pathlib import Path
-from typing import Any, Optional
+from typing import Any, Optional, cast
 from urllib.parse import urlsplit
 
 from core import command_auth as auth
@@ -148,8 +149,33 @@ def _finite(value, default: float = 0.0) -> float:
 #: More entries than any device runs is not a command, it is garbage.
 _MAX_NODE_ENTRIES = 32
 
+#: Events whose alert-delivery report may still change, kept so a later report
+#: can be re-sent under the same event_key after the event itself went up (M8.3).
+_ALERT_FOLLOWUP_MEMORY = 128
+
+
+def _wire_item(item: dict, boot: str, now_mono: float) -> dict:
+    """The event as it goes on the wire: internal `_` keys dropped, and `age_s`
+    -- seconds since it was queued, by this process's monotonic clock -- when it
+    was queued in this boot (M8.3). The backend places the event on its own
+    clock with it (received_at - age_s), so a device whose wall clock is wrong
+    (a Pi has no RTC) or a backlog delivered an hour late never puts an alert
+    at the wrong time. An event restored from the spool after a restart has no
+    age (the monotonic origin changed) and is placed by its device timestamp."""
+    out = {k: v for k, v in item.items() if not k.startswith("_")}
+    queued = item.get("_mono")
+    if item.get("_boot") == boot and isinstance(queued, (int, float)) and math.isfinite(queued):
+        out["age_s"] = round(max(0.0, now_mono - float(queued)), 3)
+    return out
+
+
 class CloudUplink:
     """Background sync loop between this device and the cloud backend."""
+
+    #: Set only by the virtual device's uplink (sim/uplink.py): every event it
+    #: sends says so. Deliberately not a config key -- a real device must never
+    #: be able to label its alerts as simulated.
+    SIMULATED = False
 
     def __init__(self, config: dict) -> None:
         self._base_url = str(config.get("base_url", "")).rstrip("/")
@@ -192,10 +218,30 @@ class CloudUplink:
         #: Events lost for good since start: evicted from a full backlog, or
         #: refused by the backend for their content. Reported in health.
         self.dropped_events = 0
+        #: Events not queued because they joined an alert episode whose event was
+        #: already queued: one episode, one stored event (M8.3).
+        self.merged_events = 0
+        #: This process's identity; an item queued in an earlier boot has no age_s.
+        self._boot = uuid.uuid4().hex[:12]
+        #: The batch handed to the transport and not yet settled. Kept in every
+        #: spool rewrite, so a compaction while it is in flight cannot drop it
+        #: from disk (M8.3).
+        self._inflight: list[dict] = []
+        #: event_key -> queued item, for events whose alert report may still change.
+        self._alert_followups: OrderedDict[str, dict] = OrderedDict()
+        #: Alert episodes (core/alerts.py `<boot>-<n>`) whose event this process
+        #: has queued: a later event merged into one of them is not queued again.
+        self._episodes_queued: OrderedDict[str, None] = OrderedDict()
+        #: Optional `callable(event) -> AlertDelivery | None` (core/alerts.py), set by
+        #: the runtime: what the alert policy did with each event pushed here.
+        self.delivery_lookup: Optional[Callable[[Any], Any]] = None
         #: Where the backlog survives a restart or a power cut (M8); None = memory only.
         spool = config.get("spool_path")
         self._spool_path: Optional[Path] = Path(str(spool)) if spool else None
         self._spool_lines = 0
+        #: An append failed part-way: the file may end in a torn line, and the next
+        #: append would be glued onto it. The next write rewrites the file instead.
+        self._spool_dirty = False
         self.restored_events = 0
         if self._spool_path is not None:
             self._load_spool()
@@ -366,6 +412,7 @@ class CloudUplink:
         source: str = "module",
         model: Optional[dict] = None,
         notify: Optional[str] = None,
+        alert=None,
     ) -> None:
         """Queue one alert event for the next sync cycle.
 
@@ -389,10 +436,38 @@ class CloudUplink:
         `notify` is a rule's own delivery choice (e.g. "push", "sms", "silent"),
         sent only when given so the backend can honour it; events without one
         carry no `notify` key at all, exactly as before.
+
+        M8.3 (docs/EVENT_PIPELINE.md): the key is the Event's own `event_id`
+        when it has one, so the alert policy's record and the stored row share
+        one identity. `alert` (or `delivery_lookup(event)`) is the policy's
+        AlertDelivery for this event: sent as the event's `alert` report, and
+        re-sent under the same key when an output reports later (a buzzer
+        pattern takes up to 3.5 s). An event the policy MERGED into an episode
+        whose own event was already queued is not queued again: one episode is
+        one stored alert and at most one notification, however often the
+        detector re-reports it.
         """
+        delivery = alert if alert is not None else self._lookup_delivery(event)
+        if delivery is not None and not (isinstance(getattr(delivery, "decision", None), str)
+                                         and callable(getattr(delivery, "summary", None))):
+            delivery = None  # not an AlertDelivery (core/alerts.py): send the event without one
+        if delivery is not None and delivery.decision == "merged":
+            with self._lock:
+                already_sent = delivery.episode in self._episodes_queued
+                if already_sent:
+                    self.merged_events += 1
+            if already_sent:
+                return
+            # The episode's own event never came through here (an episode the
+            # runtime re-opened after a recovery has no event of its own): this
+            # one is its record, carrying what the episode actually actuated.
+            delivery = getattr(delivery, "episode_delivery", None) or delivery
+        episode = getattr(delivery, "episode", None) if delivery is not None else None
+        event_id = getattr(event, "event_id", None)
+        event_key = event_id if isinstance(event_id, str) and 0 < len(event_id) <= 64 else uuid.uuid4().hex
         with self._lock:
             item = {
-                "event_key": uuid.uuid4().hex,
+                "event_key": event_key,
                 # Which exact model produced this: module + detector name,
                 # sha256 and backend (DeviceRuntime.model_identity). Taken
                 # NOW, at queue time, so an event queued before a module
@@ -417,13 +492,74 @@ class CloudUplink:
                 "duration": round(_finite(event.duration), 3),
                 "severity": severity,
                 "source": source,
+                # Internal (never sent): which boot queued it, and when by the
+                # monotonic clock, for `age_s` on the wire (see _wire_item).
+                "_boot": self._boot,
+                "_mono": time.monotonic(),
             }
             if notify is not None:
                 item["notify"] = str(notify)
+            if self.SIMULATED:
+                item["simulated"] = True
+            if delivery is not None:
+                item["alert"] = cast(dict, _json_safe(delivery.summary()))
+            if isinstance(episode, str) and episode:
+                self._episodes_queued[episode] = None
+                while len(self._episodes_queued) > _ALERT_FOLLOWUP_MEMORY:
+                    self._episodes_queued.popitem(last=False)
             if self._queue.maxlen is not None and len(self._queue) >= self._queue.maxlen:
                 self.dropped_events += 1  # the deque evicts the oldest
             self._queue.append(item)
             self._spool_append(item)
+            if delivery is not None and not delivery.final:
+                self._alert_followups[event_key] = item
+                while len(self._alert_followups) > _ALERT_FOLLOWUP_MEMORY:
+                    self._alert_followups.popitem(last=False)
+        if delivery is not None and not delivery.final:
+            delivery.subscribe(lambda summary, key=event_key: self._alert_reported(key, summary))
+            # A report that landed between summary() above and subscribe() is not lost.
+            latest = delivery.summary()
+            if latest.get("rev") != cast(dict, item["alert"]).get("rev"):
+                self._alert_reported(event_key, latest)
+
+    def _lookup_delivery(self, event):
+        lookup = self.delivery_lookup
+        if lookup is None:
+            return None
+        try:
+            return lookup(event)
+        except Exception as exc:  # noqa: BLE001 - evidence must never cost the event
+            print(f"cloud_uplink: could not read the alert delivery for an event ({exc})")
+            return None
+
+    def _alert_reported(self, event_key: str, summary: dict) -> None:
+        """An alert output reported after its event was queued (M8.3).
+
+        Still queued: the queued item carries the newer report (and the spool
+        gets the updated line; a restore keeps one entry per key, at its first
+        position, with the latest content). Already sent or in flight: a copy
+        under the SAME event_key is queued; the backend stores no second row
+        for it -- it only updates the stored report when `rev` is newer. Never
+        at the cost of an event: with the backlog full the report is dropped.
+        """
+        report = cast(dict, _json_safe(summary))
+        with self._lock:
+            original = self._alert_followups.get(event_key)
+            if original is None:
+                return
+            if summary.get("output") != "pending":
+                self._alert_followups.pop(event_key, None)
+            for queued in self._queue:
+                if queued.get("event_key") == event_key:
+                    if (queued.get("alert") or {}).get("rev", -1) < report.get("rev", 0):
+                        queued["alert"] = report
+                        self._spool_append(queued)
+                    return
+            if self._queue.maxlen is not None and len(self._queue) >= self._queue.maxlen:
+                return
+            update = {**original, "alert": report}
+            self._queue.append(update)
+            self._spool_append(update)
 
     def set_monitoring(self, described: Optional[dict]) -> None:
         """What custom configuration, if any, is currently in charge.
@@ -572,6 +708,8 @@ class CloudUplink:
             with self._lock:
                 take = min(len(self._queue), self._batch_max)
                 batch = [self._queue.popleft() for _ in range(take)]
+                # Still on disk until settled: see _spool_rewrite (M8.3).
+                self._inflight = batch
                 active = self._active_preset
                 rules_version = self._rules_version
                 zones_version = self._zones_version
@@ -580,10 +718,11 @@ class CloudUplink:
             # How old the held sample is NOW, by this process's monotonic clock
             # (M8.1): a snapshot that stopped being refreshed is re-sent with a
             # growing age instead of passing for current. No wall clock needed.
-            health = health_stamp.with_send_age(health, time.monotonic())
+            now_mono = time.monotonic()
+            health = health_stamp.with_send_age(health, now_mono)
             # 1) push events (an empty batch doubles as the online heartbeat)
             payload = _json_safe({
-                "events": batch,
+                "events": [_wire_item(item, self._boot, now_mono) for item in batch],
                 "active_preset": active,
                 "rules_version": rules_version,
                 "zones_version": zones_version,
@@ -656,11 +795,12 @@ class CloudUplink:
             # A full batch that went through means a backlog: send the next
             # slice now rather than one per poll interval.
             more_waiting = bool(batch) and len(batch) >= self._batch_max
-            if batch:
-                # Delivered: they leave the on-disk backlog too. A power cut
-                # before this line replays them after restart, and the backend
-                # stores each event_key once.
-                with self._lock:
+            with self._lock:
+                self._inflight = []
+                if batch:
+                    # Delivered: they leave the on-disk backlog too. A power cut
+                    # before this line replays them after restart, and the backend
+                    # stores each event_key once.
                     self._spool_rewrite()
             self._failures = 0
             if not self._connected:
@@ -729,8 +869,10 @@ class CloudUplink:
                 self.dropped_events += len(batch)
                 batch = []
                 with self._lock:
+                    self._inflight = []
                     self._spool_rewrite()
             with self._lock:
+                self._inflight = []
                 # Put the batch back in front of anything recorded since,
                 # but never at the cost of those newer events.
                 #
@@ -794,7 +936,9 @@ class CloudUplink:
                     or not isinstance(item.get("type"), str):
                 damaged += 1
                 continue
-            items.pop(item["event_key"], None)  # one entry per key, latest position
+            # One entry per key: the FIRST position (when the event happened,
+            # so a restore never reorders the backlog) with the LATEST content
+            # (a later line is the same event with a newer alert report, M8.3).
             items[item["event_key"]] = item
         restored = list(items.values())
         capacity = self._queue.maxlen
@@ -813,8 +957,12 @@ class CloudUplink:
         if self._spool_path is None:
             return
         capacity = self._queue.maxlen or MAX_QUEUE
-        if self._spool_lines >= 2 * capacity:
-            self._spool_rewrite()  # compaction: evicted events leave the file too
+        if self._spool_dirty or self._spool_lines >= 2 * capacity:
+            # Compaction: evicted events leave the file too. And after a failed
+            # append (M8.3): the file may end in half a line, and appending the
+            # next event onto it would make THAT event unreadable on restore --
+            # one torn write would cost two events. A rewrite replaces it whole.
+            self._spool_rewrite()
             return
         try:
             line = json.dumps(_json_safe(item), allow_nan=False, default=str)
@@ -826,25 +974,36 @@ class CloudUplink:
             self._spool_lines += 1
         except (OSError, TypeError, ValueError) as exc:
             # Losing durability is bad; losing the event or the alert is worse.
+            self._spool_dirty = True
             print(f"cloud_uplink: could not record a queued event on disk ({exc}); kept in memory")
 
     def _spool_rewrite(self) -> None:
-        """Make the spool exactly the in-memory backlog (caller holds the lock). Atomic."""
+        """Make the spool exactly the undelivered backlog (caller holds the lock). Atomic.
+
+        The undelivered backlog is the queue AND the batch in flight (M8.3): a
+        rewrite while a POST is outstanding (a compaction triggered by a new
+        event) used to write the queue alone, so the in-flight batch left the
+        disk before it was delivered -- a failed POST and then a power cut lost it.
+        """
         if self._spool_path is None:
             return
+        backlog = [*self._inflight, *self._queue]
         try:
-            if not self._queue:
+            if not backlog:
                 with contextlib.suppress(FileNotFoundError):
                     self._spool_path.unlink()
                 self._spool_lines = 0
+                self._spool_dirty = False
                 return
             from core.config_lkg import atomic_write_bytes
 
             body = "".join(json.dumps(_json_safe(item), allow_nan=False, default=str) + "\n"
-                           for item in self._queue)
+                           for item in backlog)
             if atomic_write_bytes(self._spool_path, body.encode("utf-8"), mode=0o600):
-                self._spool_lines = len(self._queue)
+                self._spool_lines = len(backlog)
+                self._spool_dirty = False
         except (OSError, TypeError, ValueError) as exc:
+            self._spool_dirty = True
             print(f"cloud_uplink: could not rewrite the undelivered-event spool ({exc})")
 
     def next_delay(self) -> float:

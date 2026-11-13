@@ -29,6 +29,7 @@ struct EventDetailView: View {
             ScrollView {
                 VStack(alignment: .leading, spacing: SD.Space.lg) {
                     header
+                    deviceAlertCard
                     // The detections around the alert, including the ones that
                     // never notified. One interruption, the whole story.
                     if !allEvents.isEmpty {
@@ -88,8 +89,60 @@ struct EventDetailView: View {
             Text(device.name)
                 .font(SD.Typography.callout)
                 .foregroundStyle(SD.Colors.textSecondary)
+            if event.isSimulated {
+                Label("Simulated event, not from a real camera", systemImage: "testtube.2")
+                    .font(SD.Typography.caption.weight(.semibold))
+                    .foregroundStyle(SD.Colors.textSecondary)
+                    .accessibilityIdentifier("eventDetail.simulated")
+            }
         }
         .padding(.top, SD.Space.xs)
+    }
+
+    // MARK: On the device (M8.3)
+
+    /// Detection and warning are different facts. This says what the DEVICE
+    /// reported about its own alert output -- "Alert sounded on the device"
+    /// only when it reported a real output played -- and how the time shown
+    /// was established. Never inferred from the event having been stored.
+    private var deviceAlertCard: some View {
+        let evidence = event.alertEvidence
+        return VStack(alignment: .leading, spacing: SD.Space.xs) {
+            SDSectionHeader(title: "On the device")
+            Label(evidence.headline,
+                  systemImage: evidence.confirmedSound ? "speaker.wave.2.fill" : "speaker.slash")
+                .font(SD.Typography.body.weight(.semibold))
+                .foregroundStyle(SD.Colors.textPrimary)
+                .accessibilityIdentifier("eventDetail.alertEvidence")
+            Text(evidence.detail)
+                .font(SD.Typography.callout)
+                .foregroundStyle(SD.Colors.textSecondary)
+                .fixedSize(horizontal: false, vertical: true)
+            if let note = timeNote {
+                Text(note)
+                    .font(SD.Typography.caption)
+                    .foregroundStyle(SD.Colors.textTertiary)
+                    .fixedSize(horizontal: false, vertical: true)
+                    .accessibilityIdentifier("eventDetail.timeNote")
+            }
+        }
+        .accessibilityElement(children: .combine)
+    }
+
+    /// How the time shown was established, when that is not simply "the device said so".
+    private var timeNote: String? {
+        var notes: [String] = []
+        if event.timeIsArrival {
+            notes.append("The device's clock couldn't be trusted, so the time shown is when the server received this.")
+        } else if let error = event.deviceClockError {
+            let off = TimelineRow.duration(abs(error))
+            notes.append("The device's clock was \(off) \(error > 0 ? "fast" : "slow"); the time shown is from the server.")
+        }
+        if let delay = event.deliveryDelay, let received = event.receivedDate {
+            notes.append("Reached the server \(TimelineRow.duration(delay)) after it happened, at "
+                         + received.formatted(date: .omitted, time: .shortened) + ".")
+        }
+        return notes.isEmpty ? nil : notes.joined(separator: " ")
     }
 
     // MARK: The answer
