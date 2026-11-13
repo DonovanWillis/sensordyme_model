@@ -50,7 +50,6 @@ struct TimelineRow: View {
                 Button(action: onToggle) { header }
                     .buttonStyle(SDUndimmedButtonStyle())
                     // The marker's colour and shape are the severity; say it.
-                    .accessibilityElement(children: .ignore)
                     .accessibilityLabel(EventAccessibility.label(
                         title: event.title, severity: event.severity, signals: event.signals,
                         when: event.date.map { Self.spokenAge.localizedString(for: $0, relativeTo: .now) }))

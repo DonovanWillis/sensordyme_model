@@ -587,11 +587,10 @@ struct DeviceDetailView: View {
                 .contentShape(Rectangle())
             }
             .buttonStyle(SDUndimmedButtonStyle())
-            .accessibilityElement(children: .ignore)
             .accessibilityLabel("Device health")
             .accessibilityValue(healthSummary)
             .accessibilityHint(showHealth ? "Hides the details" : "Shows camera, AI, network and detection capabilities")
-            .accessibilityAddTraits([.isButton, .isHeader])
+            .accessibilityAddTraits(.isHeader)
             .accessibilityIdentifier("detail.health")
 
             if showHealth {
@@ -790,20 +789,16 @@ struct DeviceDetailView: View {
                               badge: alertActive ? "Alert" : nil, badgeColor: SD.Colors.danger)
             }
             .buttonStyle(SDPressStyle())
-            .accessibilityElement(children: .ignore)
             .accessibilityLabel(alertActive ? "Activity, alert in the last minute" : "Activity")
             .accessibilityValue(historyDetail)
-            .accessibilityAddTraits(.isButton)
             .accessibilityIdentifier("detail.history")
 
             Button { showZones = true } label: {
                 InstrumentKey(icon: "square.dashed", title: "Areas")
             }
             .buttonStyle(SDPressStyle())
-            .accessibilityElement(children: .ignore)
             .accessibilityLabel("Detection areas")
             .accessibilityHint("Draw where rules apply")
-            .accessibilityAddTraits(.isButton)
             .accessibilityIdentifier("detail.zones")
 
             NavigationLink {
@@ -812,20 +807,16 @@ struct DeviceDetailView: View {
                 InstrumentKey(icon: "chart.bar", title: "Report")
             }
             .buttonStyle(SDPressStyle())
-            .accessibilityElement(children: .ignore)
             .accessibilityLabel("Report")
             .accessibilityHint("Estimates from recent events")
-            .accessibilityAddTraits(.isButton)
 
             if state.isDemo {
                 Button { showDemoTrigger = true } label: {
                     InstrumentKey(icon: "play.circle", title: "Demo alert")
                 }
                 .buttonStyle(SDPressStyle())
-                .accessibilityElement(children: .ignore)
                 .accessibilityLabel("Run a demo alert")
                 .accessibilityHint("Simulated: see an alert end to end")
-                .accessibilityAddTraits(.isButton)
             }
         }
     }
@@ -1526,9 +1517,7 @@ struct DeviceDetailView: View {
         .buttonStyle(SDPressStyle(scale: 0.96))
         .disabled(disabled)
         .sensoryFeedback(.impact(weight: .light), trigger: protectionTaps)
-        .accessibilityElement(children: .ignore)
         .accessibilityLabel("\(title), \(detail)")
-        .accessibilityAddTraits(.isButton)
         .accessibilityIdentifier("detail.protection")
     }
 

@@ -122,10 +122,9 @@ struct CameraPlaceholder: View {
 
     var body: some View {
         ZStack {
+            // Flat canvas: a vignette behind the words made the audit measure
+            // them against a gradient and fail them.
             SD.Colors.canvas
-            // A faint vignette lifts the centre; static, drawn once.
-            RadialGradient(colors: [Color.white.opacity(interrupted ? 0.02 : 0.05), .clear],
-                           center: .center, startRadius: 4, endRadius: 260)
             ViewfinderCorners()
                 .stroke(Color.white.opacity(interrupted ? 0.12 : 0.22),
                         style: StrokeStyle(lineWidth: 1.5, lineCap: .round))
@@ -145,7 +144,7 @@ struct CameraPlaceholder: View {
                 // Wraps in full and the viewport grows with it: shrinking the
                 // sentence to fit the camera's shape clipped it (audit).
                 Text("The picture comes straight from your SensorDyme, so it needs to be switched on and on this Wi-Fi. ORYN EDGE finds it by itself.")
-                    .font(SD.Typography.caption)
+                    .font(SD.Typography.callout)
                     .multilineTextAlignment(.center)
                     .foregroundStyle(SD.Colors.textSecondary)
                     .fixedSize(horizontal: false, vertical: true)

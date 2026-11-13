@@ -245,7 +245,7 @@ struct DevicesView: View {
             Text("\(devices.count) \(devices.count == 1 ? "device" : "devices")")
                 .foregroundStyle(SD.Colors.textSecondary)
             if !typeSize.isAccessibilitySize {
-                Text("·").foregroundStyle(SD.Colors.textTertiary).accessibilityHidden(true)
+                Circle().fill(SD.Colors.textTertiary).frame(width: 3, height: 3).accessibilityHidden(true)
             }
             HStack(spacing: 6) {
                 Circle()
