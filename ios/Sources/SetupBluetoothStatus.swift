@@ -35,7 +35,8 @@ enum SetupBluetoothStatus {
             case .permissionDenied: "Allow Bluetooth for ORYN EDGE"
             case .restricted: "Bluetooth is restricted on this iPhone"
             case .poweredOff: "Bluetooth is off"
-            case .unsupported: "This device can't use Bluetooth"
+            // "This device" read as the SensorDyme (M8.4): it is the phone.
+            case .unsupported: "This phone can't use Bluetooth"
             }
         }
 
@@ -51,8 +52,8 @@ enum SetupBluetoothStatus {
                 "Turn Bluetooth on in Control Centre or in Settings → Bluetooth. "
                     + "Setup carries on by itself as soon as it is on."
             case .unsupported:
-                "Setting up Wi-Fi needs Bluetooth Low Energy, which this device doesn't have. "
-                    + "Use an iPhone with Bluetooth, or the device's setup network (Add device)."
+                "Setting up Wi-Fi needs Bluetooth Low Energy, which this phone doesn't have. "
+                    + "Use an iPhone with Bluetooth, or your SensorDyme's own setup network (Add device)."
             }
         }
 

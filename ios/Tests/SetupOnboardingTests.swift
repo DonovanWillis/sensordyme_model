@@ -124,6 +124,9 @@ check(Onboarding.normalizeClaimCode(" ab12-cd34 ef56 ") == "AB12-CD34EF56", "cas
 check(Onboarding.normalizeClaimCode("") == nil && Onboarding.normalizeClaimCode("AB;12") == nil, "junk refused")
 check(Onboarding.claimMessage(status: 409, code: "device_already_claimed", detail: nil).contains("another account"),
       "already claimed")
+check(Onboarding.claimMessage(status: 409, code: "device_already_claimed", detail: nil).contains("sign in with the account that first added it")
+      && !Onboarding.claimMessage(status: 409, code: nil, detail: nil).contains("remove it"),
+      "already claimed: a recovery that exists (M8.4), never a removal nobody can do")
 check(Onboarding.claimMessage(status: 404, code: nil, detail: nil).contains("isn't one the server knows"), "unknown code")
 check(Onboarding.claimMessage(status: 429, code: nil, detail: nil).contains("Too many"), "rate limited")
 

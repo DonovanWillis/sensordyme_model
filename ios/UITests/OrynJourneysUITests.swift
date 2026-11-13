@@ -76,7 +76,7 @@ final class OrynJourneysUITests: XCTestCase {
         shot("03a_no_devices")
         app.buttons["devices.add"].tap()
         let next = app.buttons["wizard.next"]
-        for step in ["It's glowing", "I'm connected", "Device joined my Wi-Fi"] {
+        for step in ["It's powered on", "I'm connected", "Device joined my Wi-Fi"] {
             XCTAssertTrue(next.waitForExistence(timeout: 10))
             XCTAssertEqual(next.label, step)
             next.tap()

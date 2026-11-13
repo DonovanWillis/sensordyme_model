@@ -101,7 +101,7 @@ struct SetupWizardView: View {
 
     private var buttonTitle: String {
         switch step {
-        case .power: "It's glowing"
+        case .power: "It's powered on"
         case .hotspot: state.isDemo ? "Connected (demo)" : "I'm connected"
         case .wifi: state.isDemo ? "Wi-Fi joined (demo)" : "Device joined my Wi-Fi"
         case .pair: "Pair device"
@@ -159,7 +159,10 @@ struct SetupWizardView: View {
             stepBody(
                 icon: "power",
                 title: "Power it on",
-                text: "Plug your SensorDyme into power (car charger or wall). Give it ~30 seconds to boot — it glows when it's ready to be set up."
+                // M8.4: not every unit has a status light wired (hardware/hal.py
+                // defaults to none), so "it glows" left people waiting for a
+                // light that never comes on.
+                text: "Plug your SensorDyme into power (car charger or wall) and give it about a minute to start. If yours has a status light, it comes on when it's ready to be set up."
             )
             if !state.isDemo {
                 // Two ways on from here, said as such: Bluetooth (the shipped
@@ -184,7 +187,7 @@ struct SetupWizardView: View {
                         .accessibilityIdentifier("wizard.bluetooth")
                     }
                 }
-                Text("Or use its setup network (older devices): when it glows, continue below.")
+                Text("Or use its setup network (older devices): once it has started, continue below.")
                     .font(SD.Typography.caption)
                     .foregroundStyle(SD.Colors.textTertiary)
                     .fixedSize(horizontal: false, vertical: true)
