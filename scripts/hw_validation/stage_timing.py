@@ -41,6 +41,7 @@ import json
 import os
 import sys
 import time
+import urllib.error
 import urllib.request
 from pathlib import Path
 from typing import Optional
@@ -118,6 +119,17 @@ def cmd_health(args) -> int:
     rows: list[dict] = []
     prev = None
     deadline = time.monotonic() + args.minutes * 60
+    try:
+        _fetch(args.url, token)
+    except urllib.error.URLError as exc:
+        if isinstance(getattr(exc, "reason", None), ConnectionRefusedError):
+            # Nothing listening at all is not a data point, it is "the service is not
+            # running": polling a dead port for --minutes measured nothing (M8.3).
+            print(f"BLOCKED: nothing is listening at {args.url} ({exc.reason}). Start sensordyme.service "
+                  "first; this measurement reads the running service's own health.", file=sys.stderr)
+            return 2
+    except Exception as exc:  # noqa: BLE001 - any other first-poll failure is recorded by the loop below
+        print(f"first poll failed ({exc!r}); continuing: later polls record it", flush=True)
     with out.open("w") as fh:
         while time.monotonic() < deadline:
             try:
@@ -428,4 +440,4 @@ def main(argv: Optional[list[str]] = None) -> int:
 
 
 if __name__ == "__main__":
-    raise SystemExit(main())
+    raise SystemExit(hc.run_cli(main))

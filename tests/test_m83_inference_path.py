@@ -333,7 +333,9 @@ def test_the_reference_decoder_equals_the_independent_reference_semantics(fake):
 def test_the_default_decoder_is_still_legacy_and_reference_stays_opt_in():
     config = yaml.safe_load((REPO / "config.yaml").read_text())
     assert config["accelerator"]["yolo_decoder"] == "legacy"
-    assert (HailoYOLO.__init__.__defaults__ or ())[-1] == "legacy"
+    import inspect
+
+    assert inspect.signature(HailoYOLO.__init__).parameters["decoder"].default == "legacy"
 
 
 # ------------------------------------------------------------------ failure states: explicit, never silent-empty
