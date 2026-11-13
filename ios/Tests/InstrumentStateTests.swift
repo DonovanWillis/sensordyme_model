@@ -24,7 +24,7 @@ func state(_ presence: ConnectionTruth.Presence, _ monitoring: String?, alert: B
 }
 
 let notLive: [ConnectionTruth.Presence] = [
-    .stale(age: 90), .offline(age: 300), .offline(age: nil),
+    .stale(age: 90), .monitoringStale(age: 120), .monitoringStale(age: nil), .offline(age: 300), .offline(age: nil),
     .unknown(.refreshFailed), .unknown(.notRefreshed(age: 60)), .unknown(.notLoaded),
 ]
 

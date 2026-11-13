@@ -353,9 +353,23 @@ struct SDButtonStyle: ButtonStyle {
     var kind: Kind = .primary
     var fullWidth = true
 
+    func makeBody(configuration: Configuration) -> some View {
+        SDButtonBody(configuration: configuration, kind: kind, fullWidth: fullWidth)
+    }
+}
+
+/// The button's drawing, as a View so `@Environment(\.isEnabled)` is installed.
+/// Read on the ButtonStyle itself it was "accessed outside of being installed on
+/// a View" (XCUITest runtime warning, M8.1), so a disabled button could draw at
+/// full opacity.
+private struct SDButtonBody: View {
+    let configuration: ButtonStyleConfiguration
+    let kind: SDButtonStyle.Kind
+    let fullWidth: Bool
+
     @Environment(\.isEnabled) private var isEnabled
 
-    func makeBody(configuration: Configuration) -> some View {
+    var body: some View {
         configuration.label
             .font(SD.Typography.label.weight(.semibold))
             .foregroundStyle(foreground)
@@ -459,7 +473,7 @@ extension SDStatus {
     init(_ presence: ConnectionTruth.Presence) {
         switch presence {
         case .online: self = .online
-        case .stale: self = .warning
+        case .stale, .monitoringStale: self = .warning
         case .offline: self = .offline
         case .unknown: self = .unknown
         }

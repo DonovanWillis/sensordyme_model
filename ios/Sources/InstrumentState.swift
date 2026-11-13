@@ -71,7 +71,7 @@ struct InstrumentState: Equatable {
         } else {
             switch presence {
             case .offline: kind = .offline
-            case .stale: kind = .stale
+            case .stale, .monitoringStale: kind = .stale
             case .unknown(.notLoaded): kind = loaded ? .unknown : .connecting
             case .unknown: kind = .unknown
             case .online:

@@ -91,26 +91,30 @@ class EvaluationStatus(str, Enum):  # noqa: UP042 - str() of members is part of 
     def rank(self) -> int:
         return _LADDER.index(self)
 
-    def _cmp(self, other: object) -> int:
-        if not isinstance(other, EvaluationStatus):
-            return NotImplemented  # type: ignore[return-value]
-        return self.rank - other.rank
-
+    # Each comparison returns NotImplemented (not False) for anything that is not
+    # an EvaluationStatus, so Python falls back to the other operand. Spelled out
+    # per operator: NotImplemented may be returned from a `-> bool` dunder, but
+    # threading it through an `-> int` helper made every one of these return
+    # `int | bool`.
     def __lt__(self, other: object) -> bool:
-        diff = self._cmp(other)
-        return diff if diff is NotImplemented else diff < 0
+        if not isinstance(other, EvaluationStatus):
+            return NotImplemented
+        return self.rank < other.rank
 
     def __le__(self, other: object) -> bool:
-        diff = self._cmp(other)
-        return diff if diff is NotImplemented else diff <= 0
+        if not isinstance(other, EvaluationStatus):
+            return NotImplemented
+        return self.rank <= other.rank
 
     def __gt__(self, other: object) -> bool:
-        diff = self._cmp(other)
-        return diff if diff is NotImplemented else diff > 0
+        if not isinstance(other, EvaluationStatus):
+            return NotImplemented
+        return self.rank > other.rank
 
     def __ge__(self, other: object) -> bool:
-        diff = self._cmp(other)
-        return diff if diff is NotImplemented else diff >= 0
+        if not isinstance(other, EvaluationStatus):
+            return NotImplemented
+        return self.rank >= other.rank
 
     __hash__ = str.__hash__
 

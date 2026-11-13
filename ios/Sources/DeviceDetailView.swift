@@ -874,6 +874,12 @@ struct DeviceDetailView: View {
         default: return nil
         }
     }
+    /// The status can't be confirmed (stale health, unknown): the row the
+    /// device runs must not read green (M8.1 frozen-health finding).
+    private var unconfirmedReason: String? {
+        guard let presentation = monitoringPresentation, presentation.phase == .unknown else { return nil }
+        return "Status unknown — \(presentation.detail)"
+    }
     private var activeVariant: String? { Preset.split(device.activePreset).variant }
 
     /// The mode leading the library: the one the device runs, else the
@@ -1111,7 +1117,8 @@ struct DeviceDetailView: View {
         ModeSwitchState.state(
             for: preset.id, activeBase: activeBase, customMonitoringActive: customReplacesModes,
             pending: pendingSwitch, deviceOnline: deviceLive, failure: failedSwitch, now: .now,
-            unavailable: unavailableReason(preset.id), notMonitoring: notMonitoringReason
+            unavailable: unavailableReason(preset.id), notMonitoring: notMonitoringReason,
+            unconfirmed: unconfirmedReason
         )
     }
 
@@ -1207,6 +1214,8 @@ struct DeviceDetailView: View {
             detailLine("Device offline — will apply when it reconnects", SD.Colors.warning)
         case .activeNotMonitoring(let message):
             detailLine(message, SD.Colors.danger)
+        case .activeUnconfirmed(let message):
+            detailLine(message, SD.Colors.warning)
         case .switching:
             detailLine("Switching — waiting for \(device.name) to confirm", SD.Colors.textSecondary)
         case .inactive, .active:
@@ -1320,6 +1329,10 @@ struct DeviceDetailView: View {
             // Selected, not protecting: never the green check.
             Image(systemName: "exclamationmark.circle.fill")
                 .foregroundStyle(SD.Colors.danger)
+        case .activeUnconfirmed:
+            // Selected, but not confirmed: neither green nor a failure.
+            Image(systemName: "questionmark.circle.fill")
+                .foregroundStyle(SD.Colors.warning)
         case .inactive, .unavailable:
             EmptyView()
         }

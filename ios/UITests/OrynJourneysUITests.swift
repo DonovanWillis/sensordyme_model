@@ -9,15 +9,23 @@ import XCTest
 /// (`-orynSession`, DebugLaunch.swift); sign-in itself is typed. Waits are for
 /// conditions, each with a bound — no sleeps.
 ///
-/// The journeys run in name order and share one backend: 03 claims the device
-/// that every later journey uses. Each one sets the device state it needs.
+/// Every journey starts from its own fresh world (Stack.fresh, from setUp): a
+/// new backend, account and device — claimed and ready, except for 03, which
+/// pairs an unclaimed one — so no journey depends on another having run, and
+/// any order passes. Each launch starts signed out (`-orynSignOut`) and signs
+/// in to that test's own account, which also clears the previous account's
+/// phone-local state in the app (AppState.claimLocalState).
 final class OrynJourneysUITests: XCTestCase {
     private var app: XCUIApplication!
+
+    /// Journeys that start with the device NOT on the account.
+    private static let startUnclaimed: Set<String> = ["test03_Discovery"]
 
     override func setUpWithError() throws {
         continueAfterFailure = false
         app = XCUIApplication()
-        try XCTSkipUnless(Stack.reachable, "the scenario controller is not running (scripts/sim/ios_uitest.sh)")
+        try Stack.requireController()
+        try Stack.fresh(for: self, claimed: !Self.startUnclaimed.contains(Stack.testName(self)))
     }
 
     /// Set by `record(_:)`. `testRun.hasSucceeded` is not final during tearDown, so it
@@ -25,7 +33,10 @@ final class OrynJourneysUITests: XCTestCase {
     private var failed = false
 
     override func record(_ issue: XCTIssue) {
-        failed = true
+        // Only what fails the test: a warning-severity issue (Xcode 26 records
+        // SwiftUI runtime warnings, e.g. journey 03's "Accessing Environment<Bool>'s
+        // value outside of being installed on a View") left a FAIL_ shot on a pass.
+        if issue.severity == .error { failed = true }
         super.record(issue)
     }
 
@@ -57,7 +68,8 @@ final class OrynJourneysUITests: XCTestCase {
     }
 
     func test03_Discovery() throws {
-        try XCTSkipIf(Stack.state()["device_id"] is Int, "the device is already claimed on this backend")
+        // Unclaimed by construction (setUp); said, never skipped, if it is not.
+        XCTAssertNil(Stack.state()["device_id"] as? Int, "the fresh account starts with no device")
         launch()
         XCTAssertTrue(app.descendants(matching: .any)["state.empty"].waitForExistence(timeout: 30),
                       "an empty account says so, not 'loading' forever")
@@ -84,7 +96,6 @@ final class OrynJourneysUITests: XCTestCase {
     }
 
     func test04_Ready() throws {
-        Stack.prepare()
         launch()
         let card = app.buttons["device.card"]
         XCTAssertTrue(card.waitForExistence(timeout: 30))
@@ -96,7 +107,6 @@ final class OrynJourneysUITests: XCTestCase {
     }
 
     func test05_Stop() throws {
-        Stack.prepare()
         launch(["-orynOpenDevice"])
         waitFor(monitoring, label: "All clear", timeout: 90)
         let protection = reveal(app.buttons["detail.protection"])
@@ -111,7 +121,6 @@ final class OrynJourneysUITests: XCTestCase {
     }
 
     func test06_Resume() throws {
-        Stack.prepare()
         Stack.post("/protection?action=stop")
         launch(["-orynOpenDevice"])
         waitFor(monitoring, label: "Stopped", timeout: 60)
@@ -124,7 +133,6 @@ final class OrynJourneysUITests: XCTestCase {
     }
 
     func test07_PresetBrowse() throws {
-        Stack.prepare()
         launch(["-orynOpenDevice"])
         waitFor(monitoring, label: "All clear", timeout: 90)
         let driver = reveal(app.buttons["preset.row.driver_safety"])
@@ -140,7 +148,6 @@ final class OrynJourneysUITests: XCTestCase {
     }
 
     func test08_PresetActivate() throws {
-        Stack.prepare()
         launch(["-orynOpenDevice"])
         waitFor(monitoring, label: "All clear", timeout: 90)
         let strict = reveal(app.buttons["preset.variant.strict"])
@@ -154,7 +161,6 @@ final class OrynJourneysUITests: XCTestCase {
     }
 
     func test09_PresetReject() throws {
-        Stack.prepare()
         launch(["-orynOpenDevice"])
         waitFor(monitoring, label: "All clear", timeout: 90)
         let security = reveal(app.buttons["preset.row.security_monitoring"])
@@ -170,7 +176,6 @@ final class OrynJourneysUITests: XCTestCase {
     }
 
     func test10_JupiterPrompt() throws {
-        Stack.prepare()
         launch(["-orynOpenDevice"])
         waitFor(monitoring, label: "All clear", timeout: 90)
         // Clear of the floating tab bar first: a tap there lands on the tab bar
@@ -204,7 +209,6 @@ final class OrynJourneysUITests: XCTestCase {
     }
 
     func test11_PolicyPreview() throws {
-        Stack.prepare()
         openJupiter(prompt: Self.dwellPrompt)
         let preview = reveal(element("jupiter.preview"))
         XCTAssertTrue(preview.exists)
@@ -215,7 +219,6 @@ final class OrynJourneysUITests: XCTestCase {
     }
 
     func test12_ZoneRequirement() throws {
-        Stack.prepare()
         openJupiter(prompt: Self.dwellPrompt)
         let zone = reveal(element("jupiter.zoneRequirement"))
         XCTAssertTrue(zone.label.contains("Draw the"), zone.label)
@@ -224,7 +227,6 @@ final class OrynJourneysUITests: XCTestCase {
     }
 
     func test13_RuleEnableDisable() throws {
-        Stack.prepare()
         openJupiter(prompt: Self.dwellPrompt)
         let activate = reveal(app.buttons["jupiter.activate"])
         activate.tap()
@@ -246,7 +248,6 @@ final class OrynJourneysUITests: XCTestCase {
     }
 
     func test14_MonitoringStatus() throws {
-        Stack.prepare()
         Stack.post("/device/start?scenario=detector_failure")
         launch(["-orynOpenDevice"])
         waitFor(monitoring, label: "Degraded", timeout: 120)
@@ -258,7 +259,6 @@ final class OrynJourneysUITests: XCTestCase {
     }
 
     func test15_Offline() throws {
-        Stack.prepare()
         launch()
         let card = app.buttons["device.card"]
         XCTAssertTrue(card.waitForExistence(timeout: 30))
@@ -274,10 +274,14 @@ final class OrynJourneysUITests: XCTestCase {
     }
 
     func test16_Stale() throws {
-        Stack.prepare()
-        Stack.post("/device/start?scenario=backend_outage")  // the device loses the server for 60 s
+        // The device (claimed and ready, setUp) restarts and loses the server 17 s
+        // later, for 60 s. Not waited for: "All clear" before the outage. That
+        // fits only in the gap between the restarted device's first report and
+        // the outage being noticed, and in M8.1 run E the first report came 1 s
+        // before the outage, so the journey waited out the outage and missed it.
+        Stack.post("/device/start?scenario=backend_outage")
         launch(["-orynOpenDevice"])
-        waitFor(monitoring, label: "All clear", timeout: 90)
+        XCTAssertTrue(monitoring.waitForExistence(timeout: 30), "the device screen is open")
         let banner = element("banner.message")
         waitFor(banner, labelContains: "isn't reporting", timeout: 90)
         XCTAssertNotEqual(monitoring.label, "All clear", "a stale device is never healthy")
@@ -289,7 +293,6 @@ final class OrynJourneysUITests: XCTestCase {
     }
 
     func test17_Recovery() throws {
-        Stack.prepare()
         Stack.post("/device/stop")
         launch(["-orynOpenDevice"])
         waitFor(monitoring, label: "Status unknown", timeout: 90)
@@ -300,7 +303,6 @@ final class OrynJourneysUITests: XCTestCase {
     }
 
     func test18_AlertHistory() throws {
-        Stack.prepare()
         let before = Stack.state()["events"] as? Int ?? 0
         Stack.post("/device/start?scenario=drowsy")
         XCTAssertTrue(Stack.waitUntil(timeout: 120) { (Stack.state()["events"] as? Int ?? 0) > before },
@@ -315,7 +317,6 @@ final class OrynJourneysUITests: XCTestCase {
     }
 
     func test19_InvalidResponses() throws {
-        Stack.prepare()
         launch()
         let card = app.buttons["device.card"]
         XCTAssertTrue(card.waitForExistence(timeout: 30))
@@ -336,7 +337,6 @@ final class OrynJourneysUITests: XCTestCase {
     }
 
     func test20_ErrorMessaging() throws {
-        Stack.prepare()
         launch(signedIn: false)
         signIn(password: "not-the-password")
         let error = element("auth.error")
@@ -366,7 +366,6 @@ final class OrynJourneysUITests: XCTestCase {
     /// distraction, find it in history, break the detector, see degraded, recover.
     /// (The failed component named under the status is journey 25.)
     func test23_DriverSafetyCard() throws {
-        Stack.prepare()
         launch(["-orynOpenDevice"])
         waitFor(monitoring, label: "All clear", timeout: 90)
 
@@ -410,15 +409,12 @@ final class OrynJourneysUITests: XCTestCase {
     /// The occupancy companion runs beside Driver Safety on the same detections:
     /// the switch follows the device's report, both ways.
     func test24_CompanionNode() throws {
-        Stack.prepare()
         launch(["-orynOpenDevice"])
         waitFor(monitoring, label: "All clear", timeout: 90)
         try requirePerception()
         let toggle = reveal(app.switches["node.toggle.people_counter"])
-        if (toggle.value as? String) == "1" {  // left on by an earlier run
-            flip(toggle)
-            waitFor(toggle, value: "0", timeout: 60)
-        }
+        // A fresh device (setUp) runs no companion: nothing left on by another test.
+        waitFor(toggle, value: "0", timeout: 30)
         flip(toggle)
         waitFor(toggle, value: "1", timeout: 60)  // the device reports the node running
         let node = element("node.people_counter")
@@ -440,7 +436,6 @@ final class OrynJourneysUITests: XCTestCase {
     /// A failing perception component is named under the status, in the
     /// device's words, and disappears when it recovers.
     func test25_PerceptionDegraded() throws {
-        Stack.prepare()
         launch(["-orynOpenDevice"])
         waitFor(monitoring, label: "All clear", timeout: 90)
         try requirePerception()
@@ -463,7 +458,6 @@ final class OrynJourneysUITests: XCTestCase {
     /// keep saying ONLINE: the card, the count and the device screen go Stale
     /// together, and recover together.
     func test26_StaleTelemetry() throws {
-        Stack.prepare()
         launch()
         let card = app.buttons["device.card"]
         XCTAssertTrue(card.waitForExistence(timeout: 30))
@@ -495,7 +489,6 @@ final class OrynJourneysUITests: XCTestCase {
     /// HTML, never "request failed (502)", never silence. Ask Jupiter (its own
     /// request path) says the same.
     func test27_UnreadableReplies() throws {
-        Stack.prepare()
         launch()
         let card = app.buttons["device.card"]
         XCTAssertTrue(card.waitForExistence(timeout: 30))
@@ -532,6 +525,78 @@ final class OrynJourneysUITests: XCTestCase {
         XCTAssertTrue(error.label.contains("database is locked"), error.label)
         XCTAssertFalse(error.label.contains("{"), error.label)
         shot("27e_jupiter_server_error")
+    }
+
+    // MARK: Mission 8.1: health freshness
+
+    /// The device keeps polling, so the link is live, but its health sample
+    /// stops changing (a wedged sampling thread re-sending one snapshot:
+    /// `/health?freeze=1`). A successful poll proves the link, not the
+    /// monitoring: after the backend's 30 s threshold (`_HEALTH_STALE_S`) the
+    /// app says Connected but not updated, Stale, Status unknown — never
+    /// "All clear" or "Protecting" — and recovers on the next poll after the
+    /// samples flow again.
+    func test28_FrozenHealthSnapshot() throws {
+        launch()
+        let card = app.buttons["device.card"]
+        XCTAssertTrue(card.waitForExistence(timeout: 30))
+        waitFor(card, labelContains: "Online", timeout: 60)
+        XCTAssertTrue(label(containing: "1 ONLINE").exists || label(containing: "1 online").exists,
+                      "the summary counts the live device")
+        let frozen = Stack.post("/health?freeze=1")
+        XCTAssertEqual(frozen["health_frozen"] as? Bool, true, "the device took the freeze: \(frozen)")
+        defer { Stack.post("/health?freeze=0") }
+
+        // Threshold 30 s, plus the device's sampling interval, plus the list's 10 s poll.
+        waitFor(card, labelContains: "Connected, monitoring status not updated for", timeout: 75)
+        XCTAssertTrue(card.label.contains("Connected — monitoring status not updated for"),
+                      "the card line says so: \(card.label)")
+        for claim in ["Online", "All clear", "Protecting"] {
+            XCTAssertFalse(card.label.contains(claim), "frozen health never reads as '\(claim)': \(card.label)")
+        }
+        XCTAssertTrue(label(containing: "0 ONLINE").exists || label(containing: "0 online").exists,
+                      "the summary counts it out")
+        XCTAssertTrue(Stack.state()["device_running"] as? Bool == true, "the device is still running and polling")
+        shot("28a_frozen_card")
+
+        card.tap()
+        // The pill reads STALE; VoiceOver hears what it means (its label).
+        let presence = element("detail.online")
+        waitFor(presence, labelContains: "Connected, monitoring status not updated for", timeout: 30)
+        waitFor(monitoring, label: "Status unknown", timeout: 30)
+        let banner = element("banner.message")
+        waitFor(banner, labelContains: "It is connected, but its monitoring status hasn't been updated for",
+                timeout: 30)
+        XCTAssertTrue(banner.label.contains("so whether it is watching is unknown"), banner.label)
+        shot("28b_frozen_detail")
+        XCTAssertTrue(reveal(label(containing: "Health appears here while the device is reporting")).exists,
+                      "the health card is withheld")
+        XCTAssertTrue(reveal(label(containing: "Unknown — the device isn't reporting, so no capability")).exists,
+                      "no capability row is shown as working")
+        shot("28c_frozen_capabilities")
+        for claim in ["All clear", "Protecting"] {
+            XCTAssertFalse(app.staticTexts.containing(NSPredicate(format: "label CONTAINS %@", claim)).firstMatch.exists,
+                           "nothing on the device screen says '\(claim)' on frozen health")
+        }
+        XCTAssertNotEqual(monitoring.label, "All clear")
+        // The running mode's row is selected but unconfirmed: never the green
+        // "Active" check on frozen health (M8.1 integrator finding).
+        let modeRow = reveal(app.buttons["preset.row.driver_safety"])
+        XCTAssertEqual(modeRow.value as? String, "Selected, status unknown",
+                       "the running mode never reads Active on frozen health")
+        shot("28c2_frozen_mode_row")
+
+        // The samples flow again: the next device report is fresh, and the app's
+        // next poll (4 s on this screen) shows it.
+        let thawed = Stack.post("/health?freeze=0")
+        XCTAssertEqual(thawed["health_frozen"] as? Bool, false, "the device took the thaw: \(thawed)")
+        let started = Date()
+        waitFor(presence, label: "Online", timeout: 30)
+        waitFor(monitoring, label: "All clear", timeout: 30)
+        waitForAbsence(banner, timeout: 15)
+        Stack.saveText("recovered \(Int(Date().timeIntervalSince(started))) s after the thaw",
+                       name: "28_recovery_time", test: self)
+        shot("28d_recovered")
     }
 
     // MARK: Helpers
@@ -630,20 +695,76 @@ final class OrynJourneysUITests: XCTestCase {
         submit.tap()
     }
 
-    /// Scroll until the element is on screen and clear of the floating tab bar
-    /// (bounded), and return it. `isHittable` alone passed for a chip lying under
-    /// the tab bar, and the tap landed on the tab bar.
+    /// Scroll until the element sits between the bars, still, and return it.
+    /// `isHittable` alone passed for a chip under the floating tab bar, and for
+    /// a button under the translucent navigation bar: the tap landed on the bar.
+    ///
+    /// Exact drags, either way, instead of swipes up: a slow swipe glides ~400 pt,
+    /// and in the stopped-device layout one carried the Resume button from below
+    /// the window to above it; the loop could only swipe further up (M8.1 run E:
+    /// "not reachable" after 10 swipes; run D: the tap hit the navigation bar).
+    /// Each drag is a press-drag-hold (no glide) in the page's left gutter, so
+    /// no control is pressed, by the distance that centres the element.
     @discardableResult
-    private func reveal(_ element: XCUIElement, timeout: TimeInterval = 15) -> XCUIElement {
-        XCTAssertTrue(element.waitForExistence(timeout: timeout), "\(element) exists")
-        let limit = app.frame.maxY * 0.78
-        var swipes = 0
-        while (!element.isHittable || element.frame.maxY > limit) && swipes < 10 {
-            app.swipeUp(velocity: .slow)
-            swipes += 1
+    private func reveal(_ element: XCUIElement, timeout: TimeInterval = 15,
+                        file: StaticString = #filePath, line: UInt = #line) -> XCUIElement {
+        XCTAssertTrue(element.waitForExistence(timeout: timeout), "\(element) exists", file: file, line: line)
+        let nav = app.navigationBars.firstMatch
+        let top = (nav.exists && nav.frame.height > 0 ? nav.frame.maxY : app.frame.minY + 100) + 16
+        let bottom = app.frame.maxY * 0.78
+        // Wholly inside the window; an element taller than it (a section), its centre,
+        // which is where a tap goes.
+        let inWindow = { () -> Bool in
+            guard element.isHittable else { return false }
+            let f = element.frame
+            return f.height <= bottom - top ? (f.minY >= top && f.maxY <= bottom)
+                                            : (f.midY >= top + 22 && f.midY <= bottom - 22)
         }
-        XCTAssertTrue(element.isHittable, "\(element) is reachable on screen")
+        var drags = 0
+        // Pinned in place (a sheet's bottom action bar, outside any scroll view, with
+        // no tab bar over it): dragging the page does not move it, and it is taken
+        // where it is if it can be hit there.
+        var pinned = false
+        while element.exists && !inWindow() && drags < 12 {
+            let before = element.frame
+            let limit = (bottom - top) / 2 - 12
+            let dy = max(-limit, min(limit, (top + bottom) / 2 - before.midY))  // > 0 moves content down
+            let start = app.coordinate(withNormalizedOffset: .zero)
+                .withOffset(CGVector(dx: 10, dy: (top + bottom) / 2 - dy / 2))
+            start.press(forDuration: 0.05, thenDragTo: start.withOffset(CGVector(dx: 0, dy: dy)),
+                        withVelocity: .slow, thenHoldForDuration: 0.3)
+            drags += 1
+            if element.frame == before && element.isHittable {
+                pinned = true
+                break
+            }
+        }
+        XCTAssertTrue(pinned || inWindow(), "\(element) is reachable on screen, between the bars: \(element.frame)",
+                      file: file, line: line)
+        settle(element)
         return element
+    }
+
+    /// Until the element has stayed put for a second (at most 10 s). XCUITest
+    /// resolves a tap's point, then synthesizes it ~0.6 s later: content that
+    /// arrives late above the element (a banner after its network search, a
+    /// card filling in) can move the target in between, and the tap lands
+    /// beside it (M8.1 run B, journey 08: the Strict chip "tapped", nothing
+    /// sent). Not a retry: the tap still happens once, on a still screen.
+    private func settle(_ element: XCUIElement) {
+        var last = element.frame
+        var stillSince = Date()
+        let deadline = Date().addingTimeInterval(10)
+        while Date() < deadline {
+            _ = XCTWaiter().wait(for: [XCTestExpectation(description: "still")], timeout: 0.25)
+            let now = element.frame
+            if now != last {
+                last = now
+                stillSince = Date()
+            } else if Date().timeIntervalSince(stillSince) >= 1 {
+                return
+            }
+        }
     }
 
     private func waitFor(_ element: XCUIElement, label: String, timeout: TimeInterval,
