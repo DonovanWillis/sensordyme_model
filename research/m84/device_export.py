@@ -91,6 +91,22 @@ def find_heads(onnx_path: Path) -> tuple[list[str], dict]:
     return nodes, {"grids": grids, "cls_convs": {g: cls[g][1] for g in grids}, "nodes": nodes}
 
 
+def cut(src: Path, node_names: list[str], dst: Path) -> Path:
+    """A true subgraph (onnx.utils.extract_model): only the nodes the six heads need, typed outputs.
+    Unlike research/detector_bench/models.py _with_outputs it drops the zoo's post-processing nodes,
+    so graph statistics compare like with like."""
+    import onnx
+    from onnx.utils import extract_model
+
+    m = onnx.load(str(src))
+    by_name = {n.name: n for n in m.graph.node}
+    outs = [by_name[n].output[0] for n in node_names]
+    inits = {i.name for i in m.graph.initializer}
+    ins = [i.name for i in m.graph.input if i.name not in inits]
+    extract_model(str(src), str(dst), ins, outs, check_model=True)
+    return dst
+
+
 def embed81(heads3: Path, heads81: Path, cls_convs: dict) -> None:
     import onnx
     from onnx import numpy_helper
@@ -110,7 +126,7 @@ def embed81(heads3: Path, heads81: Path, cls_convs: dict) -> None:
         inits[w_name].CopyFrom(numpy_helper.from_array(w81, w_name))
         inits[b_name].CopyFrom(numpy_helper.from_array(b81, b_name))
     del m.graph.value_info[:]  # stale 3-channel shapes downstream of the class convs
-    for o in m.graph.output:  # _with_outputs leaves outputs untyped; a compiler parser wants float32 heads
+    for o in m.graph.output:  # a compiler parser wants typed float32 heads
         o.type.tensor_type.elem_type = onnx.TensorProto.FLOAT
         o.type.tensor_type.ClearField("shape")
     m = onnx.shape_inference.infer_shapes(m)
@@ -182,11 +198,10 @@ def main(argv=None) -> int:
     final = work / f"{a.name}.onnx"
     native.replace(final)
     nodes, info = find_heads(final)
-    heads3 = Path(dm._with_outputs(str(final), nodes))  # <name>.heads.onnx
-    heads3 = heads3.replace(work / f"{a.name}.heads3.onnx")
+    heads3 = cut(final, nodes, work / f"{a.name}.heads3.onnx")
     heads81 = work / f"{a.name}.heads81.onnx"
     embed81(heads3, heads81, info["cls_convs"])
-    zoo_heads = Path(dm._with_outputs(str(zoo), list(dm.DamoYolo.HEAD_NODES)))
+    zoo_heads = cut(zoo, list(dm.DamoYolo.HEAD_NODES), work / "zoo.heads.extracted.onnx")
     rep["export"] = {"onnx_sha256": _sha(final), "heads3_sha256": _sha(heads3), "heads81_sha256": _sha(heads81),
                      "head_nodes": nodes, "grids": info["grids"], "model_info": extra.get("model_info"),
                      "opset": zoo_g["opset"],

@@ -161,6 +161,15 @@ def _dfl_dist(box: np.ndarray) -> np.ndarray:
     return (d * np.arange(17, dtype=np.float32)).sum(axis=2)
 
 
+def _norm(boxes: np.ndarray, scale: float, left: int, top: int, w: int, h: int) -> list:
+    out = []
+    for x1, y1, x2, y2 in boxes:
+        nb = [min(max((x1 - left) / scale, 0.0), w) / w, min(max((y1 - top) / scale, 0.0), h) / h,
+              min(max((x2 - left) / scale, 0.0), w) / w, min(max((y2 - top) / scale, 0.0), h) / h]
+        out.append(nb if nb[2] > nb[0] and nb[3] > nb[1] else None)
+    return out
+
+
 def head_errors(ref: list, other: list) -> dict:
     """Class-score abs error at anchors the float model scores >= 0.05, and DFL distance error (in
     stride units x stride = input px) at anchors the float model scores >= 0.20, pooled over grids."""
@@ -191,12 +200,21 @@ def main(argv=None) -> int:
     p.add_argument("--calib", type=int, default=256)
     p.add_argument("--limit", type=int)
     p.add_argument("--threads", type=int, default=8)
+    p.add_argument("--heads", help="a heads ONNX to quantise instead of the shipping zoo graph (e.g. a 3-class "
+                                   "<name>.heads3.onnx from research/m84/device_export.py)")
+    p.add_argument("--labels", help="class names of --heads, in channel order; decoded with the research "
+                                    "decoder (offset 0, multilabel, NMS 0.5 = reference semantics) for every class")
     a = p.parse_args(argv)
     data, work, out = Path(a.data), Path(a.work), Path(a.out)
     work.mkdir(parents=True, exist_ok=True)
     out.mkdir(parents=True, exist_ok=True)
-    model = ensure_model(Path(a.models))
-    heads = Path(dm._with_outputs(str(model), list(dm.DamoYolo.HEAD_NODES)))
+    labels = a.labels.split(",") if a.labels else None
+    if a.heads:
+        model = heads = Path(a.heads)
+    else:
+        model = ensure_model(Path(a.models))
+        heads = Path(dm._with_outputs(str(model), list(dm.DamoYolo.HEAD_NODES)))
+    decoders = ("reference",) if labels else ("legacy", "reference")
     manifest = mf.load(data / "manifest.json")
     train = sorted(manifest.split("train"), key=lambda i: i.id)
     random.Random(84).shuffle(train)  # noqa: S311 - a reproducible sample, not security
@@ -223,7 +241,7 @@ def main(argv=None) -> int:
                     "calibration": {"split": "train", "images": len(calib), "seed": 84},
                     "output_ranges": dict(zip(names, ranges, strict=True)), "manifest_id": manifest.id,
                     "val_images": len(val), "decode_floor": FLOOR, "nms_iou": NMS_IOU}
-    files = {(v, d): (work / f"preds_{v}_{d}_val.jsonl").open("w") for v in EVAL for d in ("legacy", "reference")}
+    files = {(v, d): (work / f"preds_{v}_{d}_val.jsonl").open("w") for v in EVAL for d in decoders}
     err: dict[str, dict] = {v: {"cls": [], "box": [], "flips": {0.2: 0, 0.4: 0}, "anchors": {0.2: 0, 0.4: 0}}
                             for v in EVAL if v != "float"}
     ms: dict[str, list[float]] = {n: [] for n in sessions}
@@ -241,9 +259,18 @@ def main(argv=None) -> int:
                     "pt_minmax_o8": _o8(raw["pt_minmax"], ranges), "pc_pct_o8": _o8(raw["pc_pct"], ranges)}
         heads_by = {v: dm.split_heads(o, 640) for v, o in variants.items()}
         for v, h in heads_by.items():
-            for d in ("legacy", "reference"):
-                boxes, scores, classes = dm.device_decode(h, d, FLOOR, NMS_IOU, 640)
-                for det in normalize(boxes[:MAX_DETS], scores[:MAX_DETS], classes[:MAX_DETS], sx, left, top, *image.size):
+            for d in decoders:
+                if labels:
+                    boxes, scores, classes = dm.decode_dfl(h, conf=FLOOR, offset=0.0, multilabel=True, nms_iou=NMS_IOU,
+                                                           num_classes=len(labels))
+                    order = np.argsort(-scores)[:MAX_DETS]
+                    dets = [{"label": labels[int(c)], "score": float(sc), "box": [float(x) for x in b]}
+                            for b, sc, c in zip(*(_norm(boxes[order], sx, left, top, *image.size), scores[order],
+                                                  classes[order]), strict=True) if b is not None]
+                else:
+                    boxes, scores, classes = dm.device_decode(h, d, FLOOR, NMS_IOU, 640)
+                    dets = normalize(boxes[:MAX_DETS], scores[:MAX_DETS], classes[:MAX_DETS], sx, left, top, *image.size)
+                for det in dets:
                     files[(v, d)].write(json.dumps({"id": item.id, **det}) + "\n")
             if v != "float":
                 e = head_errors(heads_by["float"], h)
