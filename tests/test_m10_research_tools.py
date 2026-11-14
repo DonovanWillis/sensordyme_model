@@ -13,6 +13,7 @@ import pytest
 
 from research.detector_bench import oid_eval as oe
 from research.m10 import compare as cmp
+from research.m10 import export_contract as ec
 
 
 def _result(preds: dict, truths: list[oe.ImageTruth]) -> oe.ClassResult:
@@ -91,3 +92,79 @@ def test_class_row_reports_the_precision_080_operating_point():
     row = cmp.class_row(_result(preds, _truths()), "phone", n_boot=20)
     assert row["r_at_p080"] == 1.0 and row["threshold_p080"] == 0.9
     assert row["false_phone_images_at_p080"]["with_false"] == 0 and row["npos"] == 2
+
+
+# ------------------------------------------------------------------ research/m10/export_contract.py
+def _heads(class_channels: int = 81, end_ops=("Mul", "Sigmoid")):
+    outs = []
+    for g in (80, 40, 20):
+        outs.append({"name": f"box{g}", "shape": [1, 68, g, g], "op": end_ops[0]})
+        outs.append({"name": f"cls{g}", "shape": [1, class_channels, g, g], "op": end_ops[1]})
+    return outs
+
+
+def _graph(**kw):
+    g = {"input": {"name": "images", "shape": [1, 3, 640, 640], "elem_type": "FLOAT"},
+         "ops_before_first_conv": [], "outputs": _heads(),
+         "class_convs": {"s0": {"channels": 81, "live_rows": [0, 67, 80], "dead_row_bias": [-20.0]}}}
+    g.update(kw)
+    return g
+
+
+def _status(findings, item):
+    (hit,) = [f for f in findings if f["item"] == item]
+    return hit["status"]
+
+
+def test_the_product_side_is_read_from_the_shipped_source():
+    p = ec.product_contract()
+    assert p["camera"]["picamera2_format"] == "RGB888" and p["camera"]["pi_read_converts_colour"] is False
+    assert p["preprocess"]["colour_conversion"] == "BGR->RGB"
+    assert p["preprocess"]["letterbox"] == {"scale": 1.0, "resized": [640, 480], "left": 0, "top": 80,
+                                            "right": 0, "bottom": 80}
+    assert p["preprocess"]["pad_value"] == [114, 114, 114] and p["preprocess"]["interpolation"] == "cv2.INTER_LINEAR"
+    assert p["decode"]["reg_max"] == 16 and p["decode"]["nms_iou"] == 0.5
+    assert p["decode"]["decoder_default"] == "legacy" and p["decode"]["extra_classes_configured"] is None
+    assert p["hef"]["sha256_pinned"] == ec.PRODUCTION_HEF_SHA256
+
+
+def test_a_clean_heads_graph_matches_the_device_contract():
+    f = ec.compare(ec.product_contract(), {"exp08_heads81": _graph()}, None, None)
+    assert _status(f, "colour: camera -> host") == "match"
+    assert _status(f, "normalisation: exp08_heads81") == "match"
+    assert _status(f, "outputs: exp08_heads81") == "match"
+    assert _status(f, "DFL reg_max: exp08_heads81") == "match"
+    assert _status(f, "head end ops: exp08_heads81") == "match"
+    # the default product decode drops the hand channel: recorded as a mismatch until the opt-in map is set
+    assert _status(f, "class map: exp08_heads81") == "MISMATCH unless opt-in map"
+
+
+@pytest.mark.parametrize(("graph", "item"), [
+    (_graph(ops_before_first_conv=["Sub", "Div"]), "normalisation: g"),
+    (_graph(input={"name": "x", "shape": [1, 640, 640, 3], "elem_type": "FLOAT"}), "input tensor: g"),
+    (_graph(outputs=_heads(end_ops=("Mul", "Identity"))), "head end ops: g"),
+    (_graph(outputs=[o for o in _heads() if o["name"] != "cls20"]), "outputs: g"),
+])
+def test_contract_breaks_are_reported_as_findings(graph, item):
+    f = ec.compare(ec.product_contract(), {"g": graph}, None, None)
+    assert _status(f, item) == "MISMATCH"
+
+
+def test_a_wrong_dfl_width_is_a_finding():
+    outs = [dict(o, shape=[1, 64, *o["shape"][2:]]) if o["name"].startswith("box") else o for o in _heads()]
+    f = ec.compare(ec.product_contract(), {"g": _graph(outputs=outs)}, None, None)
+    assert _status(f, "outputs: g") == "MISMATCH"  # 64 channels is not a 68-ch box head
+
+
+def test_colour_sensitivity_result_is_reported():
+    rt = {"colour": {"m": {"rgb_as_shipped": {"person": 0.7}, "bgr_swapped": {"person": 0.6}, "rgb_better": True}}}
+    f = ec.compare(ec.product_contract(), {}, None, rt)
+    assert _status(f, "colour: m trained order") == "match"
+    rt["colour"]["m"]["rgb_better"] = False
+    assert _status(ec.compare(ec.product_contract(), {}, None, rt), "colour: m trained order") == "MISMATCH"
+
+
+def test_head_roles_from_shapes():
+    roles = ec.head_roles(_heads())
+    assert sorted((r["role"], r["stride"]) for r in roles) == sorted(
+        [("box", 8), ("class", 8), ("box", 16), ("class", 16), ("box", 32), ("class", 32)])
