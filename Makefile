@@ -3,7 +3,7 @@
         deploy-adopt deploy-status deploy-rollback demo-check demo-cycle \
         release-manifest release-verify verify-release \
         test test-cov test-ios lint lint-fix fmt-check typecheck audit check mutants \
-        setup-dev hooks clean sim sim-backend sim-device sim-scenarios sim-e2e acceptance
+        setup-dev hooks clean sim sim-backend sim-device sim-scenarios sim-e2e acceptance acceptance-full
 
 VENV := .venv/bin
 
@@ -72,8 +72,15 @@ sim-e2e: ## Deterministic end-to-end tests: virtual device x real backend (secon
 
 ACCEPTANCE_OUT ?= data/acceptance
 
-acceptance: ## M8.4: every digital-twin suite + short soaks + BLE harness; evidence in $(ACCEPTANCE_OUT)/acceptance.{json,md}
+acceptance: ## M8.5: every software suite + 30-journey matrix + short soaks + BLE harness; evidence in $(ACCEPTANCE_OUT)/acceptance.{json,md}
 	PYTHONDONTWRITEBYTECODE=1 $(SIM_PY) scripts/sim/acceptance.py --out $(ACCEPTANCE_OUT) $(ACCEPTANCE_ARGS)
+
+# The full acceptance additionally runs every XCUITest journey (the real iPhone
+# app) via scripts/sim/ios_uitest.sh. It REQUIRES the iOS Simulator and
+# xcodebuild, takes ~25 extra minutes, and must not run while anything else owns
+# the Simulator (ports 8787/8790/8797 must be free). docs/ACCEPTANCE.md.
+acceptance-full: ## M8.5: acceptance + the XCUITest journeys (needs the iOS Simulator; ~25 min extra)
+	PYTHONDONTWRITEBYTECODE=1 $(SIM_PY) scripts/sim/acceptance.py --out $(ACCEPTANCE_OUT) --with-ios $(ACCEPTANCE_ARGS)
 
 # =============================================================================
 # Benchmarks and reports

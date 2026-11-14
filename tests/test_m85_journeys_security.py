@@ -100,8 +100,10 @@ def test_manage_create_device_provisions_a_unit_the_backend_claims_and_authentic
 
     manage.create_device("Factory unit (SIMULATED)")
     out = capsys.readouterr().out
-    key = re.search(r"\b(dk_[0-9a-f]{48})\b", out).group(1)
-    code = re.search(r"\b([A-F0-9]{4}-[A-F0-9]{4}-[A-F0-9]{4})\b", out).group(1)
+    key_match = re.search(r"\b(dk_[0-9a-f]{48})\b", out)
+    code_match = re.search(r"\b([A-F0-9]{4}-[A-F0-9]{4}-[A-F0-9]{4})\b", out)
+    assert key_match and code_match, f"create-device must print the key and the claim code: {out!r}"
+    key, code = key_match.group(1), code_match.group(1)
 
     assert stack.api.post("/v1/ingest", json={"events": []}, headers={"X-Device-Key": "bogus"}).status_code == 401
     assert stack.api.post("/v1/ingest", json={"events": []}, headers={"X-Device-Key": key}).status_code == 200
