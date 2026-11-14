@@ -1,0 +1,385 @@
+# In-cabin scenario coverage matrix, version 1 (Mission 10, "Accuracy first").
+#
+# DATA, not prose: evaluation/scenarios.py loads and validates this file, the
+# report generator (python -m evaluation.report) scores every cell against it,
+# and tests/test_eval_m10.py pins its invariants. Change it only by bumping
+# `version`; a report records the version and this file's sha256.
+#
+# Every clip of a consented stationary recording declares the cells it belongs
+# to (annotation v2 `scenarios`) and its tag values (annotation v2 `tags`). A
+# cell's `tags` are the values a clip must carry to count toward it.
+#
+# A cell is CLAIMABLE only when its minimums are met (the power check in
+# evaluation/event_metrics.py). Below the minimum the report prints
+# INSUFFICIENT DATA, never a rate; with nothing recorded it prints NO DATA.
+#
+# Minimums, and why:
+#   subjects 30   docs/research/INCABIN_PILOT_PROTOCOL.md section 9 sizes the real
+#                 collection at >= 30 subjects per stratum. Intervals are bootstrapped
+#                 over SUBJECTS, so subjects (not clips) set the precision.
+#   events 60     per positive event type. At recall 0.9 a Wilson 95% interval on 60
+#                 events is about 0.80-0.95 (half-width ~0.075); fewer events give an
+#                 interval too wide to support any product statement.
+#   negative_events 60  per must-not-alert type (e.g. mirror glances), same reason.
+#   exposure_hours 3.0  evaluated hours per alert type. With zero false alerts in T
+#                 hours, the 95% upper bound is ~3/T per hour (the rule of three):
+#                 3 h bounds the rate at <= 1 per hour, the least a claim can say.
+#   clips 30      at least one clip per subject.
+# The 3-5 person pilot (protocol section 9) cannot meet any of these: every pilot
+# cell reports INSUFFICIENT DATA, by design. Pilot numbers are per-subject
+# diagnostics (--include-diagnostics), never claims.
+
+schema: sensordyme.incabin.scenario_matrix
+version: 1
+annotation_schema: 2  # evaluation/schemas/incabin_v2.json
+
+# Applies to EVERY cell. evaluation/scenarios.py refuses a matrix that weakens any
+# of these, and refuses a cell that claims an exemption.
+safety:
+  stationary_vehicle_only: true       # parked, parking brake on, engine off or accessory power
+  consenting_adults_only: true        # 18+, signed form, opt-in (a) evaluation at minimum
+  children_allowed: false             # no minors in the vehicle, as subjects OR bystanders
+  driving_allowed: false              # no scenario is ever performed while driving
+  impairment_allowed: false           # drowsiness is ACTED; nobody is tired, drunk or medicated for a cell
+  operator_present: true              # an operator outside the driver's seat runs every session
+  stop_any_time: true                 # any participant may stop without reason
+  protocol: docs/research/INCABIN_PILOT_PROTOCOL.md
+  readiness_gates: docs/research/INCABIN_READINESS.md  # G1-G6 must be closed before any recording
+
+defaults:
+  minimums: {subjects: 30, clips: 30, events: 60, negative_events: 60, exposure_hours: 3.0}
+
+# Whole-split rows (every clip of the split, all cells pooled) use these.
+overall:
+  minimums: {subjects: 30, clips: 30, events: 60, negative_events: 60, exposure_hours: 3.0}
+
+# Tag vocabulary. A clip's `tags` may only use these axes and values.
+axes:
+  occupancy: [driver_only, driver_plus_front_passenger, driver_plus_rear_passenger, driver_plus_two_or_more, empty]
+  seat_position: [nominal, forward_high, rearward_low, reclined]
+  eyewear: [none, clear, sunglasses_ir_pass, sunglasses_ir_block]
+  lighting: [day, dusk, night_ir, direct_sun_glare]
+  ir_illuminator: ["off", 850nm, 940nm]
+  mount: [dash_centre, mirror_base, a_pillar, column]
+  phone: [none, visible_unused, handheld_hand, handheld_lap, handheld_ear, mounted, passenger_phone]
+  head_motion: [steady, yaw_sweep, pitch_sweep, mixed]
+  vibration: [none, door_close, mount_tap, engine_idle]
+  occlusion: [none, hand, hat_brim, visor, lens_partial, lens_full]
+  presence: [present, absent, exit_and_return]
+  eye_closure: [natural_blink, short_closure, long_closure]
+  glance: [none, mirrors, cluster, infotainment, passenger]
+
+# Every clip must carry these axes (so strata are never silently missing).
+required_clip_tags: [lighting, eyewear, occupancy, mount]
+
+# How the product's module events are scored against ground truth.
+scoring:
+  module: driver_attention
+  # A missed event is counted as ABSTAINED (the module declined: it reported every
+  # alert that could catch it unavailable/not-ready) when that holds for at least
+  # this fraction of the event's span. Otherwise it is a silent miss.
+  abstain_fraction: 0.5
+  # Alert types scored, each with the config key (config.yaml modules.<module>)
+  # holding its sustain time; latency is also reported as latency minus sustain.
+  # Module events not listed (phone_detected, eating_drinking: log-only) are not scored.
+  alerts:
+    drowsiness: drowsy_seconds
+    distraction: distraction_seconds
+    eyes_down: eyes_down_seconds
+    eyes_up: eyes_up_seconds
+    phone_use: phone_use_seconds
+    attention_lost: face_lost_seconds
+  window: {early_s: 0.0, late_s: 2.0}
+  # role positive: the listed alerts should catch it (recall, latency, missed).
+  # role negative: legitimate behaviour; any listed alert in its window is a false
+  #   alert, ALSO counted as "alert on legitimate behaviour" for that type.
+  # role boundary: outside the validated scope (no product promise either way);
+  #   listed alerts in its window are tallied separately, neither true nor false.
+  # Precedence for one alert: positive match > negative (false) > boundary > false.
+  events:
+    long_closure: {role: positive, alerts: [drowsiness], late_s: 3.0}
+    eyes_off_road: {role: positive, alerts: [distraction, eyes_down, eyes_up, phone_use]}
+    phone_use: {role: positive, alerts: [phone_use]}
+    driver_absent: {role: positive, alerts: [attention_lost]}
+    camera_occluded: {role: positive, alerts: [attention_lost]}
+    glance_mirror_left: {role: negative, alerts: &all_alerts [drowsiness, distraction, eyes_down, eyes_up, phone_use, attention_lost]}
+    glance_mirror_right: {role: negative, alerts: *all_alerts}
+    glance_mirror_rear: {role: negative, alerts: *all_alerts}
+    glance_cluster: {role: negative, alerts: *all_alerts}
+    glance_infotainment: {role: negative, alerts: *all_alerts}
+    glance_passenger: {role: negative, alerts: *all_alerts}
+    passenger_phone_use: {role: negative, alerts: [phone_use]}
+    short_closure: {role: boundary, alerts: [drowsiness]}
+    phone_handling: {role: boundary, alerts: [phone_use]}
+    face_occluded: {role: boundary, alerts: [attention_lost, drowsiness]}
+    yawn: {role: boundary, alerts: [drowsiness]}
+    nod: {role: boundary, alerts: [drowsiness, eyes_down]}
+    eating_drinking: {role: boundary, alerts: [phone_use, eyes_down]}
+
+# The cells. positives/negatives/boundary are annotation v2 event types the
+# cell's clips must label (when they occur). `cases` cross-reference the
+# behavioural cases of docs/SUNDAY_DEVICE_ACTIVATION.md section 5.
+cells:
+  - id: N1_baseline_attentive
+    title: Baseline, attentive driver, day, alone
+    tags: {lighting: [day], occupancy: [driver_only], eyewear: [none, clear], phone: [none]}
+    positives: []
+    negatives: [glance_mirror_left, glance_mirror_right, glance_mirror_rear]
+    cases: [B5, B7]
+    checklist:
+      - 2 min hands on wheel, eyes on the windscreen centre, natural blinking (false-alert exposure)
+      - 30 s hands in lap, below the frame (B7)
+    safety: []
+
+  - id: M1_multiple_people
+    title: Driver plus passenger(s) moving and talking
+    tags: {occupancy: [driver_plus_front_passenger, driver_plus_rear_passenger, driver_plus_two_or_more]}
+    positives: [eyes_off_road, long_closure]
+    negatives: [glance_passenger]
+    cases: []
+    checklist:
+      - passenger is a second consenting adult with their own signed form and pseudonym (listed in clip.occupants)
+      - passenger leans toward the driver, turns, gestures; driver attentive for 2 min
+      - driver performs cued eyes_off_road (3 s, 4 s) and long_closure (2 s, 3 s) with the passenger present
+    safety: [every occupant is a consenting adult; no child seat may be fitted or occupied]
+
+  - id: SP1_seating_positions
+    title: Driver seat adjusted (forward/high, rearward/low, reclined)
+    tags: {seat_position: [forward_high, rearward_low, reclined]}
+    positives: [eyes_off_road, long_closure]
+    negatives: [glance_mirror_left, glance_mirror_right, glance_mirror_rear, glance_cluster]
+    cases: [B2]
+    checklist:
+      - log seat track and recline settings per clip; recalibrate (30 s road gaze) after each adjustment
+      - repeat the glance and closure blocks per seat position
+    safety: [adjust the seat only while parked; keep the steering wheel reachable]
+
+  - id: EW1_clear_glasses
+    title: Clear prescription or plain glasses
+    tags: {eyewear: [clear]}
+    positives: [long_closure, eyes_off_road]
+    negatives: [glance_mirror_left, glance_mirror_right, glance_cluster]
+    cases: [B1]
+    checklist: [record day and night_ir; log frame type (thin metal / thick acetate)]
+    safety: []
+
+  - id: EW2_sunglasses_ir_pass
+    title: Sunglasses that pass 850 nm
+    tags: {eyewear: [sunglasses_ir_pass]}
+    positives: [long_closure, eyes_off_road]
+    negatives: [glance_mirror_left, glance_mirror_right]
+    cases: [B6]
+    checklist: [verify IR transmission with the camera before the session (eyes visible in the NoIR preview)]
+    safety: []
+
+  - id: EW3_sunglasses_ir_block
+    title: Sunglasses that block 850 nm (eyes invisible to the camera)
+    tags: {eyewear: [sunglasses_ir_block]}
+    positives: [long_closure, eyes_off_road]
+    negatives: []
+    boundary: [face_occluded]
+    cases: [B6]
+    checklist:
+      - expected outcome is ABSTENTION (unknown), not a guess - the report shows the unknown rate
+      - eyes open 30 s (a drowsiness alert here is a false alert), then cued 3 s closure
+    safety: []
+
+  - id: L1_day
+    title: Daylight, sun not in frame
+    tags: {lighting: [day]}
+    positives: [long_closure, eyes_off_road, phone_use]
+    negatives: [glance_mirror_left, glance_mirror_right, glance_mirror_rear, glance_cluster]
+    cases: [B1, B2, B4, B5]
+    checklist: [log sun direction relative to the vehicle]
+    safety: []
+
+  - id: L2_dusk
+    title: Dusk or covered windscreen (low light, illuminator off)
+    tags: {lighting: [dusk], ir_illuminator: ["off"]}
+    positives: [long_closure, eyes_off_road]
+    negatives: [glance_mirror_left, glance_mirror_right, glance_cluster]
+    cases: [B1, B2]
+    checklist: [log lux at the face if a meter is available]
+    safety: [the operator keeps a torch; the vehicle is lit from outside if parked in public]
+
+  - id: L3_night_ir
+    title: Night, 850 nm illuminator on, cabin lights off
+    tags: {lighting: [night_ir], ir_illuminator: [850nm, 940nm]}
+    positives: [long_closure, eyes_off_road, phone_use]
+    negatives: [glance_mirror_left, glance_mirror_right, glance_mirror_rear, glance_cluster]
+    cases: [B1, B2, B4, B5]
+    checklist: [log illuminator power; include torch sweeps imitating headlights (protocol section 3)]
+    safety: [illuminator at or beyond its rated eye-safe working distance; never closer]
+
+  - id: L4_direct_sun_glare
+    title: Direct sun on the face or into the lens
+    tags: {lighting: [direct_sun_glare]}
+    positives: [long_closure, eyes_off_road]
+    negatives: [glance_mirror_left, glance_mirror_right]
+    cases: []
+    checklist: [log sun elevation and whether the sun is in frame; expect abstention when the face saturates]
+    safety: [the participant never looks at the sun; sunglasses offered between blocks]
+
+  - id: P1_phone_in_hand
+    title: Handheld phone in the hand, eyes on it (texting posture)
+    tags: {phone: [handheld_hand]}
+    positives: [phone_use, eyes_off_road]
+    negatives: []
+    boundary: [phone_handling]
+    cases: [B4]
+    checklist: [blank prop phone, screen on; hold low and look 3-5 s, x5]
+    safety: [prop phone only, no personal content]
+
+  - id: P2_phone_in_lap
+    title: Handheld phone in the lap, eyes on it
+    tags: {phone: [handheld_lap]}
+    positives: [phone_use, eyes_off_road]
+    negatives: []
+    boundary: [phone_handling]
+    cases: [B4]
+    checklist: [repeat with the hand hidden from the camera (B4 second half)]
+    safety: [prop phone only]
+
+  - id: P3_phone_at_ear
+    title: Phone held at the ear (call posture), eyes on the road
+    tags: {phone: [handheld_ear]}
+    positives: []
+    negatives: []
+    boundary: [phone_handling]
+    cases: []
+    checklist: [left and right ear, 10 s each, x3; label phone_handling with attrs.position ear]
+    safety: [prop phone only, no real call]
+
+  - id: P4_phone_mounted
+    title: Phone in a dash/vent mount, unused then looked at
+    tags: {phone: [mounted, visible_unused]}
+    positives: [eyes_off_road]
+    negatives: []
+    cases: [B3]
+    checklist:
+      - 60 s mounted, screen on, eyes on the road, hands on the wheel (no phone_use may fire)
+      - B3b, a 4 s look at the mounted phone, x3 (eyes_off_road with attrs.target mounted_phone)
+    safety: []
+
+  - id: P5_passenger_phone
+    title: Passenger uses a phone, driver attentive
+    tags: {phone: [passenger_phone], occupancy: [driver_plus_front_passenger, driver_plus_rear_passenger, driver_plus_two_or_more]}
+    positives: []
+    negatives: [passenger_phone_use]
+    cases: []
+    checklist: [passenger holds and looks at a prop phone 10 s, x5; driver hands on wheel]
+    safety: [passenger is a consenting adult with their own form]
+
+  - id: H1_head_orientation
+    title: Head orientation changes (yaw and pitch sweeps, glances, nods)
+    tags: {head_motion: [yaw_sweep, pitch_sweep, mixed]}
+    positives: [eyes_off_road]
+    negatives: [glance_mirror_left, glance_mirror_right, glance_mirror_rear, glance_cluster, glance_passenger]
+    boundary: [nod]
+    cases: [B2, B5]
+    checklist: [cued sweeps to printed targets at 15, 30, 45 and 60 degrees; hold 1 s and 4 s]
+    safety: []
+
+  - id: V1_camera_vibration
+    title: Camera vibration (door close, mount tap, engine idle)
+    tags: {vibration: [door_close, mount_tap, engine_idle]}
+    positives: [long_closure]
+    negatives: [glance_mirror_left, glance_mirror_right]
+    cases: [B3]
+    checklist:
+      - door closes and mount taps every 10 s for 2 min while the driver is attentive (false-alert exposure)
+      - engine_idle only if the approved protocol allows the engine on while parked; otherwise skip the tag
+    safety: [engine idle only outdoors (never in a closed garage), parking brake on, in park/neutral]
+
+  - id: O1_occlusion_hand
+    title: Hand over the face (mouth, eyes, scratching)
+    tags: {occlusion: [hand]}
+    positives: []
+    negatives: []
+    boundary: [face_occluded]
+    cases: []
+    checklist: [hand over mouth 3 s, over eyes 3 s, scratching 2 s, x3 each]
+    safety: []
+
+  - id: O2_occlusion_hat
+    title: Cap brim or visor down
+    tags: {occlusion: [hat_brim, visor]}
+    positives: [long_closure, eyes_off_road]
+    negatives: [glance_mirror_left, glance_mirror_right]
+    boundary: [face_occluded]
+    cases: []
+    checklist: [brim at three heights; visor down; repeat closure and glance blocks]
+    safety: []
+
+  - id: O3_lens_occlusion
+    title: Lens partly or fully covered
+    tags: {occlusion: [lens_partial, lens_full]}
+    positives: [camera_occluded]
+    negatives: []
+    cases: [B8]
+    checklist: [card over the lens 5 s, x5 (full); half the lens 5 s, x5 (partial); never unplug the camera]
+    safety: [cover the lens with a card only; do not touch the illuminator or cabling]
+
+  - id: A1_driver_absence
+    title: Driver leaves the seat or the frame, and returns
+    tags: {presence: [absent, exit_and_return]}
+    positives: [driver_absent]
+    negatives: []
+    cases: [B8]
+    checklist: [lean fully out of frame 5 s, x5; step out and back in once (parked), label driver_absent]
+    safety: [step out only on the kerb side, with the operator checking traffic; parking brake on]
+
+  - id: E1_natural_blinks
+    title: Natural blinking (false-alert exposure for eye closure)
+    tags: {eye_closure: [natural_blink]}
+    positives: []
+    negatives: []
+    cases: [B1]
+    checklist: [2 min attentive, natural blinking; include slow blinks; label the eyes_closed state]
+    safety: []
+
+  - id: E2_microsleep_acted
+    title: Acted microsleep-like closures (0.5 to 1.5 s) and nods
+    tags: {eye_closure: [short_closure]}
+    positives: []
+    negatives: []
+    boundary: [short_closure, nod]
+    cases: [B1]
+    checklist: [cued closures of 0.5 s and 1 s, x3 each; head nods x3]
+    safety: [acted only, the participant is alert; take a break if they report real tiredness]
+
+  - id: E3_sustained_closure
+    title: Sustained eye closure (2 s and 3 s, acted drowsiness)
+    tags: {eye_closure: [long_closure]}
+    positives: [long_closure]
+    negatives: []
+    cases: [B1]
+    checklist: [cued closures of 2 s and 3 s, x3 each, head level]
+    safety: [acted only, parked; stop if the participant is genuinely drowsy]
+
+  - id: G1_mirror_glances
+    title: Natural mirror checks (left, right, rear-view)
+    tags: {glance: [mirrors]}
+    positives: []
+    negatives: [glance_mirror_left, glance_mirror_right, glance_mirror_rear]
+    cases: [B5]
+    checklist: [cued 0.5-1.5 s glances to each mirror, x5, spaced out; then 5 within 45 s (frequent_glancing is designed)]
+    safety: []
+
+  - id: G2_cluster_glances
+    title: Instrument cluster and infotainment glances
+    tags: {glance: [cluster, infotainment]}
+    positives: []
+    negatives: [glance_cluster, glance_infotainment]
+    cases: []
+    checklist: [cued glances under 2 s, x5 each]
+    safety: []
+
+  - id: G3_passenger_glances
+    title: Short glances toward the passenger
+    tags: {glance: [passenger]}
+    positives: [eyes_off_road]
+    negatives: [glance_passenger]
+    cases: [B2]
+    checklist: [cued glances under 2 s, x5; then sustained 3 s and 4 s looks labelled eyes_off_road]
+    safety: []

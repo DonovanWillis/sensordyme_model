@@ -3,15 +3,21 @@
     python -m evaluation.run --manifest m.json --root /data/ds --split val \
         --config config.yaml --out results/run1 [--set drowsy_seconds=2.0] [--target-fps 15]
 
-Writes ``predictions.jsonl`` (every event, per clip) and ``report.json``
-(metrics plus everything needed to reproduce them: commit, config hash,
-overrides, manifest id, backend actually used, replay settings).
+Writes ``predictions.jsonl`` (every event, per clip), ``availability.jsonl``
+(per clip: replayed duration and the spans each alert type could not be
+evaluated, for the M10 event-level report ``python -m evaluation.report``) and
+``report.json`` (metrics plus everything needed to reproduce them: commit,
+config hash, overrides, manifest id, split lock hash, backend actually used,
+replay settings).
 
 Guards:
   * the manifest must validate, its files must match their hashes, and its
     licence must permit evaluation
-  * the held-out ``test`` split needs ``--frozen-test``, and refuses ``--set``:
-    thresholds are tuned on ``val``, never on ``test``
+  * the held-out ``test`` split needs ``--frozen-test`` AND ``--split-lock`` (the
+    lock is verified and the access appended to its access log), and refuses
+    ``--set``: thresholds are tuned on ``val``, never on ``test``
+  * with ``--split-lock``, the manifest must match the lock and pass the
+    subject / session / vehicle-day / co-occupant leakage check (evaluation/leakage.py)
   * the backend is reported as found. Off the Pi the detector is a desktop
     surrogate (ultralytics/CPU or CUDA), not the Hailo .hef, and the report says so.
 """
@@ -36,6 +42,7 @@ import yaml
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))  # repo root, for core/ and modules/
 
 from evaluation import annotations as ann
+from evaluation import leakage
 from evaluation import manifest as mf
 from evaluation.metrics import (
     EventCounts,
@@ -182,6 +189,8 @@ def main(argv: Optional[list[str]] = None) -> int:
     p.add_argument("--late-s", type=float, default=2.0)
     p.add_argument("--limit", type=int, default=None)
     p.add_argument("--source-commit", default=None, help="commit, when the tree has no .git (fleet jobs)")
+    p.add_argument("--split-lock", default=None, help="split lock (evaluation.leakage lock); required for test")
+    p.add_argument("--purpose", default="", help="why the locked test split is being scored (recorded)")
     p.add_argument("--out", required=True)
     args = p.parse_args(argv)
 
@@ -194,17 +203,43 @@ def main(argv: Optional[list[str]] = None) -> int:
         width, height = (int(x) for x in args.resize.split("x"))
         resize = (width, height)
     manifest = mf.load(args.manifest)
+    config_sha = hashlib.sha256(config_text.encode()).hexdigest()
+    commit = _git_commit() or args.source_commit or "unknown"
+    lock_sha, access = None, None
+    if args.split == "test" and not args.split_lock:
+        print("evaluation refused: the test split is scored only against a split lock (--split-lock)",
+              file=sys.stderr)
+        return 2
+    if args.split_lock:
+        lock, problems = leakage.load_lock(args.split_lock)
+        if lock is not None:
+            problems, _ = leakage.verify_lock(manifest, lock)
+            problems += leakage.check(manifest)
+        if problems or lock is None:
+            print(f"evaluation refused: {'; '.join(problems)}", file=sys.stderr)
+            return 2
+        lock_sha = lock["lock_sha256"]
+        if args.split == "test" and args.frozen_test and not overrides:
+            try:
+                access = leakage.authorize_test_access(args.split_lock, frozen_test=True, purpose=args.purpose,
+                                                       commit=commit, config_sha256=config_sha)
+            except leakage.TestAccessRefusedError as exc:
+                print(f"evaluation refused: {exc}", file=sys.stderr)
+                return 2
     out = Path(args.out)
     out.mkdir(parents=True, exist_ok=True)
     started = datetime.now(UTC).isoformat()
     backend = _backend(config)
 
-    with (out / "predictions.jsonl").open("w") as pred_file:
+    with (out / "predictions.jsonl").open("w") as pred_file, (out / "availability.jsonl").open("w") as avail_file:
         def record(item: mf.Item, result: ReplayResult) -> None:
             for e in result.events:
                 pred_file.write(json.dumps({"item": item.id, "t": round(e.t, 4), "type": e.type,
                                             "confidence": e.confidence, "duration": e.duration,
                                             "signals": e.signals}) + "\n")
+            avail_file.write(json.dumps({"item": item.id, "duration_s": result.duration_s,
+                                         "frames": result.frames_read,
+                                         "unavailable": result.unavailable_spans()}) + "\n")
 
         try:
             metrics = evaluate(manifest, args.root, args.split, _module_factory(config, module_name, overrides),
@@ -217,8 +252,9 @@ def main(argv: Optional[list[str]] = None) -> int:
 
     report = {
         "started_at": started, "finished_at": datetime.now(UTC).isoformat(),
-        "commit": _git_commit() or args.source_commit or "unknown",
-        "config_sha256": hashlib.sha256(config_text.encode()).hexdigest(),
+        "commit": commit,
+        "config_sha256": config_sha,
+        "split_lock_sha256": lock_sha, "test_access": access,
         "module": module_name, "overrides": overrides,
         "dataset": {"name": manifest.name, "version": manifest.version, "manifest_id": manifest.id,
                     "licence_class": manifest.licence.get("class"), "split": args.split,
