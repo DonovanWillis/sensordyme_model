@@ -42,7 +42,7 @@ What this means, precisely:
   signed-in Xcode sees the app ID **and a registered device**, which also means
   the iPhone generally has to be connected at least once.
 - The phone itself is known to this Mac but was not connected:
-  `MonishIphone (iOS 26.5.2), UDID 00008150-0006590C2652401C` shows in
+  the owner's iPhone (iOS 26.5.2; its UDID from `xcrun xctrace list devices`) shows in
   `xctrace list devices` under *Devices Offline*.
 
 No certificate was created, nothing was disabled, and signing was not bypassed.
@@ -75,16 +75,16 @@ command to run, not as verified output:
 cd ios && xcodegen generate && cd ..
 xcodebuild -project ios/SensorDyme.xcodeproj -scheme SensorDyme \
   -configuration Debug \
-  -destination 'id=00008150-0006590C2652401C' \
+  -destination 'id=<UDID>' \
   -derivedDataPath /tmp/sd-device-dd \
   -allowProvisioningUpdates build
 
 xcrun devicectl device install app \
-  --device 00008150-0006590C2652401C \
+  --device <UDID> \
   /tmp/sd-device-dd/Build/Products/Debug-iphoneos/SensorDyme.app
 ```
 
-Or simply: open `ios/SensorDyme.xcodeproj` in Xcode, pick *MonishIphone* in
+Or simply: open `ios/SensorDyme.xcodeproj` in Xcode, pick your iPhone in
 the run-destination bar, press **Run** (⌘R). The first launch on the phone
 needs one more tap: Settings → General → VPN & Device Management → trust the
 developer certificate.
