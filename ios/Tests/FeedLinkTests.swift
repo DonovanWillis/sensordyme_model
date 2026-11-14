@@ -77,5 +77,24 @@ check(FeedLink.linkedDeviceIndex(hardwareIDs: [nil, nil], linkedID: mine) == nil
       "several devices and no matching id: ambiguous, not the first one")
 check(FeedLink.linkedDeviceIndex(hardwareIDs: [], linkedID: mine) == nil, "no devices: none")
 
+// ---------------------------------- LAN re-look while the backend sees it (M8.5)
+print("\nthe timed reload re-looks at the LAN while the backend sees the device:")
+let t0 = Date(timeIntervalSince1970: 1_000_000)
+check(FeedLink.shouldRetryLANWhileBackendSeesDevice(linkIsLost: true, anyDeviceOnline: true,
+                                                    lastRetry: .distantPast, now: t0),
+      "lost link + an online device + first look: retry (the Pi finished booting after the app opened)")
+check(!FeedLink.shouldRetryLANWhileBackendSeesDevice(linkIsLost: true, anyDeviceOnline: true,
+                                                     lastRetry: t0, now: t0.addingTimeInterval(30)),
+      "half a minute later: throttled, one browse a minute at most")
+check(FeedLink.shouldRetryLANWhileBackendSeesDevice(linkIsLost: true, anyDeviceOnline: true,
+                                                    lastRetry: t0, now: t0.addingTimeInterval(60)),
+      "a minute later: looks again (the phone may simply be elsewhere -- that costs one browse a minute)")
+check(!FeedLink.shouldRetryLANWhileBackendSeesDevice(linkIsLost: false, anyDeviceOnline: true,
+                                                     lastRetry: .distantPast, now: t0),
+      "a link that is not lost never re-resolves from the reload")
+check(!FeedLink.shouldRetryLANWhileBackendSeesDevice(linkIsLost: true, anyDeviceOnline: false,
+                                                     lastRetry: .distantPast, now: t0),
+      "an offline device is not a reason to browse the LAN")
+
 print("\n\(failures == 0 ? "PASSED" : "\(failures) FAILED")")
 exit(failures == 0 ? 0 : 1)

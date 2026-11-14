@@ -163,7 +163,10 @@ def test_a_revoked_device_cannot_ingest_or_receive_commands_until_reissued(backe
     row = _row(backend)
     assert row["credentials"]["state"] == "revoked"
     assert row["status"]["monitoring_state"] == "unknown"
-    assert any("revoked" in reason for reason in row["status"]["reasons"])
+    # The refusal LEADS the reasons: the app shows only the first one, and
+    # "no report from the device in the last 30 s" hid the actionable cause
+    # behind it indefinitely (M8.5 reconnect audit).
+    assert "revoked" in row["status"]["reasons"][0]
 
     new_key = manage.rotate_key(backend.device_id)
     assert _ingest(backend.client, _signed_headers(key=KEY)).json()["code"] == "device_auth_revoked_key"

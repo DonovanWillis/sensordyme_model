@@ -1711,7 +1711,11 @@ def _device_status(row: sqlite3.Row, now: float) -> dict:
                         f"{int(freshness['age_s'] or 0)} s")]
         refused = _credential_refusal(row)
         if refused is not None:
-            reasons.append(refused["detail"])
+            # The refusal is WHY there is no report, so it leads: the app
+            # presents only the first reason, and "no report from the device
+            # in the last 30 s" hid the actionable cause behind it for as
+            # long as the revocation lasted (M8.5 reconnect audit).
+            reasons.insert(0, refused["detail"])
     else:
         state = live_monitoring.get("state")
         if state not in _MONITORING_STATES:
@@ -2613,6 +2617,22 @@ def logout(payload: dict = Depends(current_token)) -> dict:
             # table that is usually empty or near it.
             conn.execute("DELETE FROM revoked_tokens WHERE exp < ?", (time.time(),))
     return {"ok": True}
+
+
+@app.post("/v1/session/refresh")
+def refresh_session(payload: dict = Depends(current_token)) -> dict:
+    """A fresh 30-day token for the session that called.
+
+    `exp` is fixed at issue and nothing renewed it, so an app opened on day 31
+    landed on the sign-in screen however healthy the setup (M8.5 reconnect
+    audit). The app calls this once per launch; a session used at least once a
+    month therefore never ages out. The old token is NOT revoked here --
+    signing out stays /v1/logout's job, and another signed-in device keeps its
+    own session -- it simply ages out on the expiry it already had.
+    `current_token` has already refused everything this must refuse: a bad or
+    expired token, a signed-out jti, and an account this database does not
+    have."""
+    return {"token": _issue_token(payload["uid"], payload["email"]), "email": payload["email"]}
 
 
 class DeleteAccountBody(BaseModel):

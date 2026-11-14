@@ -208,6 +208,13 @@ struct APIClient {
         try decode(AuthResponse.self, from: try await request("POST", "v1/login", body: ["email": email, "password": password]))
     }
 
+    /// Trade the current session for one with a fresh 30-day expiry
+    /// (`POST /v1/session/refresh`). The old token keeps its own expiry; the
+    /// backend refuses this exactly where it refuses any authenticated route.
+    func refreshSession() async throws -> AuthResponse {
+        try decode(AuthResponse.self, from: try await request("POST", "v1/session/refresh"))
+    }
+
     // MARK: devices
     func devices() async throws -> [Device] {
         let devices = try decode(DevicesResponse.self, from: try await request("GET", "v1/devices")).devices
@@ -785,6 +792,33 @@ final class AppState: ObservableObject {
         retryTask = nil
         Self.log.info("backend connected at \(url, privacy: .public)")
         startHeartbeat()
+        renewSessionSoon()
+    }
+
+    /// Whether this launch already traded its session token for a fresh one.
+    private var sessionRenewed = false
+
+    /// One renewal per launch, the first time a backend is confirmed: the
+    /// token's 30-day expiry is fixed at issue, so without this a healthy,
+    /// regularly-used app still landed on the sign-in screen on day 31 (M8.5
+    /// reconnect audit). Trading the session here means one used at least once
+    /// a month never ages out. Fire and forget: an older backend without the
+    /// route, an offline moment or an already-expired token change nothing —
+    /// the normal request paths already turn a 401 into the explained
+    /// sign-out — and the fresh token is adopted only while still signed in,
+    /// so a sign-out that races the reply is not undone.
+    private func renewSessionSoon() {
+        guard !sessionRenewed, isSignedIn, !isDemo, !storedToken.isEmpty else { return }
+        sessionRenewed = true
+        let client = api
+        Task { [weak self] in
+            guard let auth = try? await client.refreshSession(), !auth.token.isEmpty else { return }
+            await MainActor.run {
+                guard let self, self.isSignedIn, !self.storedToken.isEmpty else { return }
+                self.storedToken = auth.token
+                Self.log.info("session renewed for another 30 days")
+            }
+        }
     }
 
     /// How often to re-check a backend we believe we are connected to.

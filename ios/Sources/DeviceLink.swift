@@ -143,6 +143,27 @@ final class DeviceLink: ObservableObject {
         await resolve(force: false)
     }
 
+    /// When the timed reload last re-looked at the LAN over an online/not-found
+    /// mismatch, so that look happens at most once a minute (FeedLink rule).
+    private var lastOnlineMismatchRetry: Date = .distantPast
+
+    /// Another look at the LAN, from the device list's timed reload, when the
+    /// backend says a device is online but this link last said "can't find
+    /// it": the Pi that finished booting after the app opened. Without this
+    /// the link resolved once on `.task` and then only on a network-path
+    /// change, so the banner stayed at "can't see it" until an app relaunch
+    /// (M8.5 reconnect audit). Throttled to once a minute by the tested
+    /// FeedLink rule; the live feed itself already recovers on its own.
+    func retryWhileBackendSeesDevice(anyDeviceOnline: Bool, now: Date = Date()) async {
+        let lost: Bool = { if case .notFound = state { return true }; return false }()
+        guard FeedLink.shouldRetryLANWhileBackendSeesDevice(
+            linkIsLost: lost, anyDeviceOnline: anyDeviceOnline,
+            lastRetry: lastOnlineMismatchRetry, now: now
+        ) else { return }
+        lastOnlineMismatchRetry = now
+        await resolve(force: false)
+    }
+
     /// Re-discover the device and adopt its current address.
     ///
     /// - Parameter expecting: the SD- id of one specific device (the one setup

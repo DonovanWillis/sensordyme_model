@@ -331,6 +331,10 @@ struct DevicesView: View {
             errorTitle = nil
             now = Date()
             refreshing.succeed()
+            // A Pi that finished booting after the app opened: the backend
+            // sees it online while the local link gave up at "can't find it".
+            // One throttled re-look closes that without a relaunch.
+            await link.retryWhileBackendSeesDevice(anyDeviceOnline: fetched.contains { $0.online })
         } catch let error as APIError where error.isAuthFailure {
             guard reloadGuard.isLatest(token) else { return }
             refreshing.fail()

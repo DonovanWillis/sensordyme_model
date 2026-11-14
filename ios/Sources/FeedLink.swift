@@ -99,6 +99,20 @@ enum FeedLink {
         return hardwareIDs.count == 1 ? 0 : nil
     }
 
+    /// Whether the timed device-list reload should take another look at the
+    /// LAN for a camera the backend says is online while the local link last
+    /// said "can't find it" — the Pi that finished booting after the app
+    /// opened (M8.5 reconnect audit: the link resolved once on `.task` and
+    /// then only on a network-path change, so that banner stayed at "can't
+    /// see it" until the app was relaunched). At most once a minute: a
+    /// mismatch that is real, the phone simply being elsewhere, costs one
+    /// Bonjour browse a minute rather than one per reload tick.
+    static func shouldRetryLANWhileBackendSeesDevice(
+        linkIsLost: Bool, anyDeviceOnline: Bool, lastRetry: Date, now: Date
+    ) -> Bool {
+        linkIsLost && anyDeviceOnline && now.timeIntervalSince(lastRetry) >= 60
+    }
+
     private static func normalised(_ value: String?) -> String {
         (value ?? "").trimmingCharacters(in: .whitespacesAndNewlines).uppercased()
     }
