@@ -101,6 +101,22 @@ def test_a_last_known_good_that_is_itself_broken_is_not_used(tmp_path):
     assert exited.value.code == main.CONFIG_ERROR_EXIT
 
 
+def test_simulated_truncation_always_cuts_mid_line():
+    """The sim's truncation damage stands for a write cut off by a power loss, which the
+    boot path tells apart from a deliberate trailing deletion ONLY by the file stopping
+    mid-line (core/config_lkg.torn_write). When len//3 landed exactly one character into
+    a line, the old lambda handed back whole lines ending in a newline: a valid,
+    schema-passing config that booted with no fault (one M8.5 acceptance run)."""
+    line = "key_%03d: value\n"
+    base = "".join(line % i for i in range(60))
+    for damage in ("truncated", "truncated_early"):
+        for extra in range(64):
+            text = base + "#" * extra + "\n"
+            out = CONFIG_DAMAGE[damage](text)
+            assert text.startswith(out) and 0 < len(out) < len(text), (damage, extra)
+            assert not out.endswith("\n"), (damage, extra)
+
+
 def test_a_deliberate_trailing_deletion_is_not_mistaken_for_a_torn_write(tmp_path):
     from core import config_lkg
 

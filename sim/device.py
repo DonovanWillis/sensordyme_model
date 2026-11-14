@@ -46,10 +46,13 @@ MONITORING_CHECK_S = 2.0
 #: Ways a config.yaml is found damaged at boot (M8): a power cut mid-write, a bad
 #: hand edit, a migration that broke the schema, an emptied file.
 CONFIG_DAMAGE = {
-    # A write cut off by a power loss: a third of the file, stopping mid-line.
-    "truncated": lambda text: text[: len(text) // 3].rstrip("\n")[:-1],
+    # A write cut off by a power loss: a third of the file, stopping mid-line. The final
+    # rstrip matters: when len//3 lands one character into a line, [:-1] alone would hand
+    # back whole lines ending in a newline, which the boot path reads as a deliberate
+    # trailing deletion (core/config_lkg.torn_write), not a torn write.
+    "truncated": lambda text: text[: len(text) // 3].rstrip("\n")[:-1].rstrip("\n"),
     # The same, cut where the result is no longer a mapping with `modules:`.
-    "truncated_early": lambda text: text[: len(text) // 10].rstrip("\n")[:-1],
+    "truncated_early": lambda text: text[: len(text) // 10].rstrip("\n")[:-1].rstrip("\n"),
     "invalid_yaml": lambda text: text + "\nmodule: [unclosed\n",
     "not_mapping": lambda _text: "- just\n- a list\n",
     "schema": lambda text: text + "\nmodules: 7\n",
