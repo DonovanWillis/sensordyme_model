@@ -95,8 +95,10 @@ final class AccessibilityAuditUITests: XCTestCase {
         // band and audited again, and fails the test if it still fails there.
         var obscured: [Seen] = []
         var unresolvedContrast = 0
+        instrumentRetries = []
         do {
-            try audit(for: .all, reset: { lines.removeAll(); obscured.removeAll(); unresolvedContrast = 0 }) { issue in
+            try audit(for: .all, screen: screen,
+                      reset: { lines.removeAll(); obscured.removeAll(); unresolvedContrast = 0 }) { issue in
                 let label = issue.element?.label ?? ""
                 if issue.auditType == .contrast, issue.element == nil {
                     // XCTest gave no element, so it cannot be located or re-checked in
@@ -136,6 +138,8 @@ final class AccessibilityAuditUITests: XCTestCase {
         if unresolvedContrast > 0 {
             lines.append(recheckUnresolvedContrast(count: unresolvedContrast, screen: screen))
         }
+        // Said, never hidden: an audit that needed its instrument run again.
+        lines += instrumentRetries
         let report = lines.isEmpty ? "\(screen)\tno issues" : lines.joined(separator: "\n")
         let attachment = XCTAttachment(string: report)
         attachment.name = "audit_\(screen).txt"
@@ -166,23 +170,55 @@ final class AccessibilityAuditUITests: XCTestCase {
         return frame.minY < band.top || frame.maxY > band.bottom
     }
 
-    /// One audit call, retried ONCE only when XCTest's own audit instrument
-    /// times out before finishing ("Audit failed to complete in time",
-    /// com.apple.xcode.xctest.accessibilityAudit code -56 — first seen on a
-    /// loaded Simulator, M8.5). `reset` clears the caller's accumulators, in
-    /// case the failed attempt delivered some issues before timing out. An
-    /// audit that RAN and reported findings is never retried: the suite's
-    /// no-retries rule is about findings, not about the instrument failing
-    /// to start.
-    private func audit(for types: XCUIAccessibilityAuditType, reset: () -> Void,
+    /// Most times one audit is run again because XCTest's own instrument gave up.
+    private static let maxInstrumentRetries = 2
+
+    /// Every instrument retry on the screen being audited, for its report.
+    private var instrumentRetries: [String] = []
+
+    /// XCTest's audit INSTRUMENT failing to finish, as opposed to an audit that
+    /// ran: "Audit failed to complete in time" (accessibilityAudit -56, M8.5)
+    /// and "Timed out while running accessibility audit" (XCTFuture 1000,
+    /// M10.1). Both were seen only while the whole Simulator was slow (see
+    /// docs/ACCEPTANCE.md "Simulator readiness and the audit instrument"),
+    /// never as a finding.
+    private static func isInstrumentTimeout(_ error: Error) -> Bool {
+        let error = error as NSError
+        if error.domain == "com.apple.xcode.xctest.accessibilityAudit" && error.code == -56 { return true }
+        return error.domain == "com.apple.dt.XCTest.XCTFuture" && error.code == 1000
+            && error.localizedDescription.contains("accessibility audit")
+    }
+
+    /// One audit call, run again (at most `maxInstrumentRetries` times) ONLY
+    /// when XCTest's audit instrument did not finish, after the screen is
+    /// still again. `reset` clears the caller's accumulators, in case the
+    /// failed attempt delivered some issues before timing out. An audit that
+    /// RAN and reported findings is never retried: the suite's no-retries rule
+    /// is about findings, not about the instrument failing to finish. If the
+    /// last attempt also fails, its error is thrown and the test fails; an
+    /// audit that did not complete is never a pass. Every retry is written to
+    /// the screen's report and to the log as "ORYN audit retry", which
+    /// scripts/sim/ios_uitest.sh lists in summary.md.
+    private func audit(for types: XCUIAccessibilityAuditType, screen: String, reset: () -> Void,
                        _ handler: @escaping (XCUIAccessibilityAuditIssue) throws -> Bool) throws {
-        do {
-            try app.performAccessibilityAudit(for: types, handler)
-        } catch let error as NSError
-            where error.domain == "com.apple.xcode.xctest.accessibilityAudit" && error.code == -56 {
-            reset()
-            _ = XCTWaiter().wait(for: [XCTestExpectation(description: "audit instrument settle")], timeout: 2)
-            try app.performAccessibilityAudit(for: types, handler)
+        var attempt = 0
+        while true {
+            do {
+                try app.performAccessibilityAudit(for: types, handler)
+                return
+            } catch where Self.isInstrumentTimeout(error) && attempt < Self.maxInstrumentRetries {
+                attempt += 1
+                let error = error as NSError
+                let what = "\(error.domain) \(error.code): \(error.localizedDescription)"
+                XCTContext.runActivity(named: "ORYN audit retry \(attempt)/\(Self.maxInstrumentRetries) "
+                                       + "\(screen) [\(Self.name(types))]: \(what)") { _ in }
+                instrumentRetries.append("\(screen)\taudit-retry\t\(attempt) of \(Self.maxInstrumentRetries)\t"
+                                         + "XCTest's audit instrument did not finish (\(what)); "
+                                         + "audited again once the screen was still\t\t\t\(Self.name(types))")
+                reset()
+                _ = XCTWaiter().wait(for: [XCTestExpectation(description: "audit instrument settle")], timeout: 5)
+                _ = stillTexts()
+            }
         }
     }
 
@@ -197,7 +233,7 @@ final class AccessibilityAuditUITests: XCTestCase {
         _ = stillTexts()  // contrast is sampled from pixels: a still screen
         var remaining = 0
         do {
-            try audit(for: .contrast, reset: { remaining = 0 }) { issue in
+            try audit(for: .contrast, screen: screen, reset: { remaining = 0 }) { issue in
                 if let element = issue.element {
                     if self.obscuredByBars(element.frame) { return true }
                     let known = self.knownIssues.first {
@@ -275,7 +311,7 @@ final class AccessibilityAuditUITests: XCTestCase {
         let screenshot = XCUIScreen.main.screenshot()
         var finding: String?
         do {
-            try audit(for: .contrast, reset: { finding = nil }) { issue in
+            try audit(for: .contrast, screen: screen, reset: { finding = nil }) { issue in
                 if let f = issue.element?.frame, abs(f.midY - target.midY) < 4, abs(f.midX - target.midX) < 4 {
                     finding = issue.compactDescription
                 }
@@ -358,6 +394,7 @@ final class AccessibilityAuditUITests: XCTestCase {
 
     private static func name(_ type: XCUIAccessibilityAuditType) -> String {
         switch type {
+        case .all: "all"
         case .contrast: "contrast"
         case .elementDetection: "elementDetection"
         case .hitRegion: "hitRegion"

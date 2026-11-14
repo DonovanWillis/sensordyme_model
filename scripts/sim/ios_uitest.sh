@@ -131,6 +131,48 @@ with open(path, "wb") as f:
 PY
 cp "$RUNFILE" "$OUT/run.xctestrun"
 
+# A just-booted Simulator (and one booted straight after a build) can stay many
+# times slower than normal for minutes: in the M8.5 and M10.1 full runs the
+# FIRST test's first app launch took 119 s and 66 s (5-12 s in every passing
+# run), single element queries took 30+ s, and XCTest's accessibility audit
+# instrument timed out (-56) on whichever screens came next -- the sign-in screen
+# in one run, the device screen in the other -- while the next test, 20 minutes
+# later, ran normally. So before the first test, wait (bounded) until the
+# Simulator launches an app at its normal speed: Settings twice in a row in
+# under SIM_READY_LAUNCH_S. This waits for the environment; it changes no test
+# and no check. A Simulator that never settles is recorded, not hidden, and the
+# tests then run anyway and fail on their own terms.
+echo "== Simulator readiness (bounded wait for normal launch speed)"
+"$PY" - "$SIM" "$OUT/sim_ready.txt" <<'PY' || true
+import os, subprocess, sys, time
+sim, path = sys.argv[1:3]
+limit = float(os.environ.get("SIM_READY_MAX_S", "600"))
+quick = float(os.environ.get("SIM_READY_LAUNCH_S", "5"))
+start, streak, lines, verdict = time.monotonic(), 0, [], None
+for attempt in range(1, 1000):
+    t0 = time.monotonic()
+    try:
+        ok = subprocess.run(["xcrun", "simctl", "launch", "--terminate-running-process", sim,
+                             "com.apple.Preferences"], capture_output=True, timeout=180).returncode == 0
+    except subprocess.TimeoutExpired:
+        ok = False
+    took = time.monotonic() - t0
+    subprocess.run(["xcrun", "simctl", "terminate", sim, "com.apple.Preferences"], capture_output=True)
+    lines.append(f"attempt {attempt}: Settings launch {took:.1f} s{'' if ok else ' (failed)'}")
+    streak = streak + 1 if ok and took < quick else 0
+    waited = time.monotonic() - start
+    if streak >= 2:
+        verdict = f"READY after {waited:.0f} s ({attempt} launches; normal is < {quick:g} s each)"
+        break
+    if waited >= limit:
+        verdict = (f"NOT SETTLED after {waited:.0f} s (limit {limit:.0f} s): launches still slower than "
+                   f"{quick:g} s; tests run anyway")
+        break
+    time.sleep(1 if ok and took < quick else 10)
+open(path, "w").write("\n".join(lines + [verdict]) + "\n")
+print("   " + verdict)
+PY
+
 echo "== tests (order: $ORDER)"
 rm -rf "$OUT/result.xcresult"
 need_space 1843 "the test run"
@@ -176,7 +218,26 @@ def selected(cls, test):
 expected = {t for c, t in defined if not only or selected(c, t)}
 ran = [name for name, _, _ in rows]
 missing = sorted(expected - set(ran))
-lines = [f"Commit {commit}; order {order}; one xcodebuild invocation; no retries.", "",
+# Accessibility-audit INSTRUMENT retries (AccessibilityAuditUITests: XCTest's
+# audit did not finish and was run again; a finding is never retried). Listed,
+# with the test each happened in, so a retry is never invisible.
+retries, current = [], None
+for line in log.splitlines():
+    started = re.search(r"Test Case '-\[\S+ (test\w+)\]' started", line)
+    if started:
+        current = started.group(1)
+    retry = re.search(r"ORYN audit retry (\d+/\d+) (\S+) \[(\w+)\]: (.*)", line)
+    if retry:
+        retries.append(f"- {current}: {retry.group(2)} ({retry.group(3)} audit), retry {retry.group(1)}: "
+                       f"{retry.group(4).strip()[:160]}")
+try:
+    ready = open(f"{out}/sim_ready.txt").read().strip().splitlines()[-1]
+except (OSError, IndexError):
+    ready = "not measured"
+lines = [f"Commit {commit}; order {order}; one xcodebuild invocation; no test retries"
+         + (f"; {len(retries)} accessibility-audit instrument retr{'y' if len(retries) == 1 else 'ies'} (listed below)."
+            if retries else "."),
+         f"Simulator readiness before the first test: {ready}", "",
          "| # | Test | Result | Seconds | First failure / skip reason |", "|---|---|---|---|---|"]
 for i, (name, result, secs) in enumerate(rows, 1):
     why = fails.get(name, "") if result == "failed" else skips.get(name, "") if result == "skipped" else ""
@@ -189,6 +250,9 @@ skipped = sum(r == "skipped" for _, r, _ in rows)
 total = sum(float(s) for _, _, s in rows)
 summary = ("\n".join(lines) + f"\n\n{passed}/{len(expected)} passed, {failed} failed, {skipped} skipped, "
            f"{len(missing)} missing; {total / 60:.1f} min of tests\n")
+if retries:
+    summary += ("\nAccessibility-audit instrument retries (XCTest's audit did not finish; run again on a "
+                "still screen; a failed last attempt fails the test):\n" + "\n".join(retries) + "\n")
 open(f"{out}/summary.md", "w").write(summary)
 print(summary)
 sys.exit(0 if passed == len(expected) and not failed and not skipped and not missing else 1)
