@@ -112,3 +112,13 @@ def test_watch_reads_another_process_from_proc():
     assert row["rss_mb"] > 0 and row["rss_anon_mb"] is not None and row["threads_os"] >= 1
     assert row["t"] >= 0  # the process's age
     assert mp.proc_sample(2**22 + 7) is None  # no such process
+
+
+def test_rss_segments_tell_a_staircase_from_a_ramp():
+    # Flat treads with a +6 MB step at a runtime boot: growth, but not with time.
+    life = [{"t": float(t), "rss_mb": 210.0 + (6.0 if t >= 1800 else 0.0),
+             **({"marks": ["runtime boot"]} if t == 1800 else {})} for t in range(0, 3600, 30)]
+    segs = mp.rss_segments(life)
+    assert [s["why"] for s in segs] == ["start", "runtime boot"]
+    assert segs[1]["settled_step_mb"] == 6.0
+    assert all(s["tread_slope_mb_per_h"] == 0.0 for s in segs)

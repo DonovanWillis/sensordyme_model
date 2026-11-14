@@ -348,7 +348,32 @@ SERIES = ("rss_mb", "rss_anon_mb", "rss_file_mb", "py_heap_mb", "malloc.inuse_mb
           "gc_objects", "threads", "threads_os", "fds")
 
 
-def analyze(run_dir: Path, warmup_s: float = 600.0, plot: bool = True) -> dict:
+def rss_segments(life: list[dict], settle_s: float = 300.0) -> list[dict]:
+    """RSS between disruptions: a runtime boot (a mark) or a tracemalloc diff
+    (snapshot_ms) starts a new segment. Per segment: the step into it, and the
+    slope once `settle_s` into it -- growth that is a staircase of steps with
+    flat treads is not growth with time."""
+    bounds = [i for i, r in enumerate(life) if i == 0 or r.get("marks") or "snapshot_ms" in r]
+    out = []
+    for a, b in zip(bounds, [*bounds[1:], len(life)], strict=True):
+        seg = [r for r in life[a:b] if isinstance(r.get("rss_mb"), (int, float))]
+        if not seg:
+            continue
+        before = life[a - 1]["rss_mb"] if a > 0 and isinstance(life[a - 1].get("rss_mb"), (int, float)) else None
+        tread = [(r["t"], r["rss_mb"]) for r in seg if r["t"] >= seg[0]["t"] + settle_s]
+        out.append({"t0": seg[0]["t"], "t1": seg[-1]["t"], "why": ",".join(life[a].get("marks", []))
+                    or ("tracemalloc diff" if "snapshot_ms" in life[a] else "start"),
+                    "step_mb": round(seg[0]["rss_mb"] - before, 2) if before is not None else None,
+                    "rss_settled": tread[0][1] if tread else None, "rss_end": seg[-1]["rss_mb"],
+                    # The whole step: settled level minus where the previous tread ended.
+                    "settled_step_mb": round(tread[0][1] - before, 2) if tread and before is not None else None,
+                    "tread_growth_mb": round(tread[-1][1] - tread[0][1], 2) if tread else None,
+                    "tread_slope_mb_per_h": slope_per_hour(tread)})
+    return out
+
+
+def analyze(run_dir: Path, warmup_s: float = 600.0, plot: bool = True, png: Optional[Path] = None,
+            title: Optional[str] = None) -> dict:
     rows = load_samples(run_dir)
     summary: dict[str, Any] = {"run_dir": str(run_dir), "warmup_s": warmup_s, "samples": len(rows), "lifetimes": []}
     for life in lifetimes(rows):
@@ -368,6 +393,7 @@ def analyze(run_dir: Path, warmup_s: float = 600.0, plot: bool = True) -> dict:
                       for k in set(base["types"]) | set(last["types"])}
             entry["types_growth_since_warmup"] = dict(sorted(growth.items(), key=lambda kv: -abs(kv[1]))[:15])
             entry["census_ms_max"] = max(r.get("census_ms", 0) for r in census)
+        entry["rss_segments"] = rss_segments(life)
         costs = [r.get("cost_ms", 0.0) for r in life]
         entry["sample_cost_ms_p50"] = round(statistics.median(costs), 1) if costs else None
         entry["sample_cost_ms_max"] = max(costs) if costs else None
@@ -384,11 +410,11 @@ def analyze(run_dir: Path, warmup_s: float = 600.0, plot: bool = True) -> dict:
     (run_dir / "memory_summary.json").write_text(json.dumps(summary, indent=1))
     if plot and rows:
         with contextlib.suppress(ImportError):
-            _plot(run_dir, rows)
+            _plot(run_dir, rows, png or run_dir / "memory_profile.png", title or run_dir.name)
     return summary
 
 
-def _plot(run_dir: Path, rows: list[dict]) -> None:
+def _plot(run_dir: Path, rows: list[dict], png: Path, title: str) -> None:
     import matplotlib as mpl
 
     mpl.use("Agg")
@@ -413,9 +439,9 @@ def _plot(run_dir: Path, rows: list[dict]) -> None:
     ax.set_xlabel("minutes since soak start")
     ax.set_ylabel("MB")
     ax.grid(alpha=0.25, lw=0.5)
-    ax.set_title(run_dir.name, fontsize=8)
+    ax.set_title(title, fontsize=8)
     fig.tight_layout()
-    fig.savefig(run_dir / "memory_profile.png")
+    fig.savefig(png)
     plt.close(fig)
 
 
@@ -545,6 +571,8 @@ def main(argv: Optional[list[str]] = None) -> int:
     a.add_argument("run_dir")
     a.add_argument("--warmup-s", type=float, default=600.0)
     a.add_argument("--no-plot", action="store_true")
+    a.add_argument("--png", default=None, help="where the plot goes (default RUN_DIR/memory_profile.png)")
+    a.add_argument("--title", default=None)
     s = sub.add_parser("simclock")
     s.add_argument("--hours", type=float, default=2.0)
     s.add_argument("--out", required=True)
@@ -562,7 +590,8 @@ def main(argv: Optional[list[str]] = None) -> int:
     w.add_argument("--out", required=True)
     args = parser.parse_args(argv)
     if args.cmd == "analyze":
-        summary = analyze(Path(args.run_dir), args.warmup_s, plot=not args.no_plot)
+        summary = analyze(Path(args.run_dir), args.warmup_s, plot=not args.no_plot,
+                          png=Path(args.png) if args.png else None, title=args.title)
     elif args.cmd == "watch":
         summary = run_watch(args)
     else:
