@@ -79,6 +79,17 @@ videos as `SUN-<nn>_*.{jpg,mov}`. At the end, copy to the Mac (step 24). Never c
 - **Never unplug the camera or the HAT with power on.** Physical faults are induced only by covering the lens or by network/config steps the runbook defines.
 - Every **(CHANGE)** step needs the owner's go-ahead at that moment (OC "Appr").
 
+### 0.5 Transfer package (M8.5 PACKAGE)
+
+Everything the Sunday session carries to the device now comes from **one verified
+directory**: `make transfer-package REF=$RC` → `~/sensordyme-release/transfer-<id>/`
+(docs/DEPLOYMENT.md §10). It holds the release bundle + manifest (the RB-A3 tarball),
+the hashed aarch64 wheel set for an offline install (`FIND_LINKS`), the production
+`.hef` already verified against `e69136d3…960e`, the config template, install scripts
+and generated `INSTALL.md`/`MODELS.md`, with a package-wide `SHA256SUMS`
+(`shasum -a 256 -c SHA256SUMS` before leaving the Mac). The §2 rows "Release
+candidate", "Model artifact" and "Python packages" are satisfied from this package.
+
 ---
 
 ## 1. The one entry point: `sunday_preflight.py`

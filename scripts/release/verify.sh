@@ -59,7 +59,8 @@ if "$PY" -c "import pytest" >/dev/null 2>&1; then
   step "5 focused tests" env PYTHONDONTWRITEBYTECODE=1 "$PY" -m pytest -p no:cacheprovider -q --disable-warnings -o addopts="" \
        tests/test_device_dependencies.py tests/test_least_privilege_unit.py \
        tests/test_release_hardening.py tests/test_m6_security_release_manifest.py \
-       tests/test_m85_deploy_lock.py tests/test_m85_deploy_staged.py tests/test_m85_deploy_artifacts.py
+       tests/test_m85_deploy_lock.py tests/test_m85_deploy_staged.py tests/test_m85_deploy_artifacts.py \
+       tests/test_m85_package_transfer.py
 else
   RESULTS+=("SKIP  5 focused tests (no pytest in $PY)")
 fi

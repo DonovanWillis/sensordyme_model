@@ -372,3 +372,42 @@ releases are ever pulled by the device rather than pushed by an operator.
 | Lock and install paths: setup_pi.sh block with a fake pip (hashed argv; no fallback on a Pi; dev-box fallback only on request); guard argv; legacy rollback installs the lock or nothing; gate on this tree and on `87d91b3`; lock completeness with markers; release-verify against the lock | `tests/test_m85_deploy_lock.py` |
 | Model files: verification, fail closed at boot (never constructed), runtime health impaired with reason, openpilot pin at download and at load | `tests/test_m85_deploy_artifacts.py` |
 | End to end on the Mac: `deploy.sh` → fake ssh/scp/sudo/systemctl → adopt, healthy deploy confirmed, crash-looping deploy rolled back, tampered upload refused, re-deploy is a no-op | `tests/test_m85_deploy_e2e.py` (about 30 s; not in verify-release) |
+
+## 10. Transfer package (M8.5 PACKAGE)
+
+One command collects **everything a device needs** — including a device without
+internet — into a single verified directory:
+
+```bash
+make transfer-package REF=$RC        # -> ~/sensordyme-release/transfer-<id>/
+```
+
+(`scripts/release/build_transfer_package.py`; `<id>` = commit[:12].) Contents:
+
+| Path | What it is |
+|---|---|
+| `bundle/` | the §3 release tarball + manifest (`make_release_manifest.py bundle`, git objects only; refused if a release gate FAILs) |
+| `wheels/` | every locked device package as an aarch64/cp311 wheel (`pip download --require-hashes --only-binary=:all:` — pip refuses a wheel whose sha256 is not in the lock), plus a copy of the lock. Use with `FIND_LINKS` (§3) for a fully offline staged install |
+| `models/` | the production `.hef`, downloaded from the setup_pi.sh URL and **refused unless its sha256 equals the pin** — verified before it enters the package |
+| `config/config.yaml.example` | the repo default config at the ref. A template; a device's own `config.yaml` is state and never ships |
+| `install/` | convenience copies of setup_pi.sh, release_guard.py, install_units.sh and the unit templates (canonical copies are inside the bundle) |
+| `INSTALL.md`, `MODELS.md` | generated for this exact release: entrypoints, compatibility floor (Bookworm aarch64, Python 3.11, HailoRT 4.x), rollback, offline install; the model inventory (production pins, and the EXP-08 experimental export clearly marked NOT COMPILED, NOT PRODUCTION) |
+| `PACKAGE.json`, `SHA256SUMS` | what was built with which tools, and sha256 of every file (`sha256sum -c SHA256SUMS`) |
+
+Secrets can never enter the package: the build refuses `.secrets`, `*.pem`,
+`*.key`, `.env*`, a real `config.yaml`, `factory.json`, `device_state*` and
+databases anywhere in the package, and refuses a config template holding any
+filled credential-like value. The build is deterministic per ref and toolchain
+(the bundle is byte-stable, the wheels and the model are hash-pinned, and no
+wall-clock timestamp enters a hashed file), and it ends with one verification
+line after re-hashing everything against `SHA256SUMS`.
+
+**Disposable install test.** `scripts/release/transfer_install_check.py
+--bundle … --manifest …` runs the REAL guard over the REAL bundle in a
+throwaway tree — adopt → stage (per-file verification) → activate → confirm, a
+tampered bundle refused, a crash-looping deploy rolled back automatically, and
+`switch --to previous` — with fake systemd/sudo/pip (an aarch64 lock cannot
+install on x86/macOS), and writes `install_verification.{json,md}` with a
+PASS/FAIL per step, honestly labelled. What stays hardware-only is §8.
+
+Tests: `tests/test_m85_package_transfer.py` (in `make verify-release`).
