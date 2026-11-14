@@ -896,6 +896,13 @@ class GlanceCounter:
     chattered across it and was counted as several glances (one 2 s glance
     settling at 37 deg against a 35 deg threshold counted 3+ times in 13% of
     simulated trials). 0 keeps the old every-rising-edge behaviour.
+
+    The return is measured the way GracedConditionTracker measures a release:
+    over the frames actually seen back on centre (first to last), not from the
+    last off-centre frame to the next one. That gap includes a frame interval
+    of off-centre time on each side, so at 5 fps one centred frame (0.2 s)
+    already "lasted" 0.4 s and split one held look into a new glance per frame
+    (M10, tests/test_m10_temporal_defects.py T5).
     """
 
     def __init__(self, window_s: float, min_count: int, release_s: float = 0.0) -> None:
@@ -904,20 +911,31 @@ class GlanceCounter:
         self._release_s = max(0.0, float(release_s))
         self._episode_starts: deque[float] = deque()
         self._was_off_center = False
-        self._last_off_center_at: Optional[float] = None
+        self._seen_off_center = False
+        self._centred_since: Optional[float] = None  # first centred frame after a glance
+        self._centred_last: Optional[float] = None  # latest centred frame
         self._warned = False
 
     def update(self, off_center: bool, now: float) -> bool:
         """Feed the current off-center boolean. Returns True the moment `min_count` is reached."""
         if off_center and not self._was_off_center:
             continuation = (
-                self._last_off_center_at is not None
-                and now - self._last_off_center_at < self._release_s
+                self._seen_off_center
+                and self._centred_since is not None
+                and self._centred_last is not None
+                # 1e-9: three centred frames 0.2 s apart ARE 0.4 s, whatever the
+                # float sum of the timestamps says.
+                and self._centred_last - self._centred_since < self._release_s - 1e-9
             )
             if not continuation:
                 self._episode_starts.append(now)
         if off_center:
-            self._last_off_center_at = now
+            self._seen_off_center = True
+            self._centred_since = self._centred_last = None
+        else:
+            if self._centred_since is None:
+                self._centred_since = now
+            self._centred_last = now
         self._was_off_center = off_center
 
         cutoff = now - self._window_s

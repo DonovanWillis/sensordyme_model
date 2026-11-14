@@ -23,6 +23,13 @@ designed to on constructed inputs, not that it is accurate in a real cabin.
   T4  The shadow engine (core/behavior/engine.py) credits nothing across a frame
       gap -- correctly -- but then said NOT_SUPPORTED ("closed 0.0s") about eyes
       closed on every frame of a slow stream: "unobserved" silently became "no".
+  T5  GlanceCounter's release grace was measured from the last off-centre frame
+      to the next one, not over the frames that were actually back on centre
+      (as every condition tracker measures it). At 5 fps a single centred frame
+      (0.2 s) between two off-centre ones started a new glance, so a look held
+      near the threshold fired distraction (one continuous look) AND
+      frequent_glancing (five glances in 3.4 s) for the same look; at 30 fps
+      only distraction.
 """
 
 from __future__ import annotations
@@ -38,7 +45,7 @@ from test_m84_behavior_engine import _run as engine_run
 
 from core.behavior import signals as sig
 from core.behavior.engine import DROWSINESS, BehaviorEngine
-from modules.driver_attention import DriverAttentionModule, PerclosTracker
+from modules.driver_attention import DriverAttentionModule, GlanceCounter, PerclosTracker
 
 FPS = (30.0, 10.0, 5.0)
 
@@ -182,3 +189,30 @@ def test_t4_the_shadow_is_unchanged_on_a_steady_stream():
     engine_run(awake, 0.0, 2.0, eye="open")
     assert awake.verdicts[DROWSINESS].state == sig.NOT_SUPPORTED, "no frame gap: a real 'no'"
 
+
+
+# ============================================================ T5 a glance ends on observed return
+def test_t5_one_centred_frame_at_5fps_does_not_split_a_glance():
+    """Repro (pre-fix): off, centred, off, ... at 5 fps counted every off frame
+    after the first centred one as a new glance (5 within 2 s: frequent_glancing)."""
+    counter = GlanceCounter(window_s=45.0, min_count=5, release_s=0.4)
+    fired = [counter.update(i % 2 == 0, i * 0.2) for i in range(12)]
+    assert counter.count == 1 and not any(fired)
+
+
+def test_t5_a_real_return_still_ends_a_glance_at_any_frame_rate():
+    for fps in (30.0, 10.0, 5.0):
+        counter = GlanceCounter(window_s=45.0, min_count=5, release_s=0.4)
+        t, fired = 0.0, []
+        for _ in range(5):  # 1 s away, 0.6 s back on the road (observed for >= 0.4 s)
+            for off, seconds in ((True, 1.0), (False, 0.6)):
+                for _ in range(round(seconds * fps)):
+                    fired.append(counter.update(off, t))
+                    t += 1.0 / fps
+        assert counter.count == 5 and fired.count(True) == 1, fps
+
+
+def test_t5_a_look_held_at_the_threshold_is_one_look_not_frequent_glancing(tmp_path, monkeypatch):
+    chatter = [Seg(0.2, face(yaw=33 if i % 2 else 37)) for i in range(30)]  # 6 s, a frame each at 5 fps
+    r = run(tmp_path, monkeypatch, [Seg(2.0, face()), *chatter, Seg(2.0, face())], fps=5.0)
+    assert "frequent_glancing" not in r.types()
