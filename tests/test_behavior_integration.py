@@ -191,10 +191,12 @@ def test_mounted_phone_and_attentive_driver_is_not_phone_use(tmp_path, clock, yo
 
 
 def test_mounted_phone_while_looking_into_the_lap(tmp_path, clock, yolo):
-    """Shipped rule: any phone box + eyes off road = phone_use. v2: no hand, no relation -> not use."""
+    """Was shipped: any phone box + eyes off road = phone_use. v2: no hand, no relation -> not use.
+    Since M8 the shipped path also requires the phone to be the driver's (inside the
+    driver's person box; modules/driver_attention.py phones_for_driver)."""
     yolo.phones = [MOUNT_PHONE]
     v1, frame = _make(tmp_path, clock, v2=False)
-    assert "phone_use" in _types(_feed(v1, frame, clock, 4.0, landmarks(pitch=-30.0)))
+    assert "phone_use" not in _types(_feed(v1, frame, clock, 4.0, landmarks(pitch=-30.0)))
     v2, frame = _make(tmp_path, clock)
     assert "phone_use" not in _types(_feed(v2, frame, clock, 4.0, landmarks(pitch=-30.0)))
 
@@ -204,7 +206,8 @@ def test_passenger_holding_a_phone_is_not_phone_use(tmp_path, clock, yolo):
     hands = _FakeHands()
     hands.boxes = [PASSENGER_HAND]
     v1, frame = _make(tmp_path, clock, v2=False, hands=hands)
-    assert "phone_use" in _types(_feed(v1, frame, clock, 4.0, landmarks(yaw=-40.0)))
+    # Fixed in the shipped path by M8: a phone outside the driver's person box is not the driver's.
+    assert "phone_use" not in _types(_feed(v1, frame, clock, 4.0, landmarks(yaw=-40.0)))
     v2, frame = _make(tmp_path, clock, hands=hands)
     assert "phone_use" not in _types(_feed(v2, frame, clock, 4.0, landmarks(yaw=-40.0)))
     assert v2._behavior.phone.assessment.reason == "outside driver reach region"
@@ -293,10 +296,11 @@ def test_four_short_off_road_glances_exceed_the_budget(tmp_path, clock, yolo):
 
 # ============================================================ eyes
 def test_looking_down_at_the_lap_is_not_drowsiness(tmp_path, clock, yolo):
-    """Lids lowered ~33% by a downward look: the shipped 0.75 x reference threshold reads it as closure."""
+    """Lids lowered ~33% by a downward look: the 0.75 x reference threshold read it as closure.
+    Since M8 the shipped path uses the same eye-state rule (_closure_is_looking_down)."""
     pose = landmarks(pitch=-30.0, lid=4.0)
     v1, frame = _make(tmp_path, clock, v2=False)
-    assert "drowsiness" in _types(_feed(v1, frame, clock, 3.0, pose))
+    assert "drowsiness" not in _types(_feed(v1, frame, clock, 3.0, pose))
     v2, frame = _make(tmp_path, clock)
     fired = _types(_feed(v2, frame, clock, 3.0, pose))
     assert "drowsiness" not in fired
@@ -372,10 +376,12 @@ def test_long_face_loss_is_attention_lost_and_reported_uncertain(tmp_path, clock
 
 
 def test_stale_frames_accrue_no_evidence(tmp_path, clock, yolo):
-    """Frames 1 s apart: EvidenceClock credits 0.5 s per gap; v2 credits nothing."""
+    """Frames 1 s apart: the base EvidenceClock credited 0.5 s per gap; since M8 the
+    shipped clock (StallAwareEvidenceClock) credits the stream's own frame interval,
+    so 8 frames after a 20 fps stream are not 2 s of closure; v2 credits nothing."""
     shut = landmarks(lid=1.0)
     v1, frame = _make(tmp_path, clock, v2=False)
-    assert "drowsiness" in _types(_feed(v1, frame, clock, 8.0, shut, step=1.0))
+    assert "drowsiness" not in _types(_feed(v1, frame, clock, 8.0, shut, step=1.0))
     v2, frame = _make(tmp_path, clock)
     events = _feed(v2, frame, clock, 8.0, shut, step=1.0)
     events += _feed(v2, frame, clock, 8.0, landmarks(yaw=-30.0, pitch=-20.0), step=1.0)

@@ -116,14 +116,15 @@ struct OrynFieldChrome<Field: View>: View {
         .padding(.horizontal, SD.Space.md - 2)
         .frame(minHeight: 52)
         .background(
-            RoundedRectangle(cornerRadius: SD.Radius.md, style: .continuous)
+            RoundedRectangle(cornerRadius: SD.Radius.lg, style: .continuous)
                 .fill(SD.Colors.field)
         )
         .overlay(
-            RoundedRectangle(cornerRadius: SD.Radius.md, style: .continuous)
+            RoundedRectangle(cornerRadius: SD.Radius.lg, style: .continuous)
                 .strokeBorder(
+                    // An outline only when it says something: focus, or a problem.
                     invalid ? SD.Colors.danger.opacity(0.6)
-                        : focused ? SD.Colors.borderFocus : SD.Colors.borderStrong,
+                        : focused ? SD.Colors.borderFocus : Color.clear,
                     lineWidth: 1
                 )
         )
@@ -134,7 +135,7 @@ struct OrynFieldChrome<Field: View>: View {
 /// Placeholder text in ORYN's disabled grey. SwiftUI's default placeholder is a
 /// system grey that reads blue-ish on ink.
 func orynPrompt(_ text: String) -> Text {
-    Text(text).foregroundStyle(SD.Colors.textDisabled)
+    Text(text).foregroundStyle(SD.Colors.textTertiary)
 }
 
 // MARK: - Ask Jupiter
@@ -161,13 +162,14 @@ struct AskJupiterBar: View {
         VStack(alignment: .trailing, spacing: SD.Space.xxs) {
             HStack(alignment: expands ? .top : .center, spacing: SD.Space.sm) {
                 OrynMark(height: 18, color: focused ? SD.Colors.signal : SD.Colors.textPrimary)
-                    .padding(.top, expands ? 3 : 0)
+                    .padding(.top, expands ? 3 + 7 : 0)
                     .animation(SD.Motion.gentle, value: focused)
 
                 Group {
                     if expands {
                         TextField("", text: $text, prompt: orynPrompt(placeholder), axis: .vertical)
                             .lineLimit(1...5)
+                            .padding(.vertical, 7)  // the margin the bar's padding gave up
                     } else {
                         TextField("", text: $text, prompt: orynPrompt(placeholder))
                             .lineLimit(1)
@@ -187,7 +189,7 @@ struct AskJupiterBar: View {
                         ProgressView()
                             .controlSize(.small)
                             .tint(SD.Colors.textPrimary)
-                            .frame(width: 30, height: 30)
+                            .frame(width: 44, height: 44)
                             .accessibilityLabel("Jupiter is working")
                     } else {
                         Button(action: submit) {
@@ -199,6 +201,9 @@ struct AskJupiterBar: View {
                                     RoundedRectangle(cornerRadius: 8, style: .continuous)
                                         .fill(canSubmit ? SD.Colors.accent : SD.Colors.surfaceRaised)
                                 )
+                                // 30 pt as drawn; 44 pt to touch.
+                                .frame(width: 44, height: 44)
+                                .contentShape(Rectangle())
                         }
                         .buttonStyle(.plain)
                         .disabled(!canSubmit)
@@ -209,16 +214,19 @@ struct AskJupiterBar: View {
                 .animation(SD.Motion.quick, value: canSubmit)
             }
             .padding(.leading, SD.Space.md)
-            .padding(.trailing, SD.Space.sm - 2)
-            .padding(.vertical, SD.Space.sm - 1)
+            // The send button's 44 pt target carries 7 pt of its own margin, so the
+            // padding shrinks by as much and the bar keeps its drawn size.
+            .padding(.trailing, SD.Space.sm - 2 - 7)
+            .padding(.vertical, SD.Space.sm - 1 - 7)
             .frame(minHeight: 54)
             .background(
-                RoundedRectangle(cornerRadius: SD.Radius.lg, style: .continuous)
+                RoundedRectangle(cornerRadius: SD.Radius.xl, style: .continuous)
                     .fill(SD.Colors.field)
             )
+            // An outline only while focused: the field's edge is its surface.
             .overlay(
-                RoundedRectangle(cornerRadius: SD.Radius.lg, style: .continuous)
-                    .strokeBorder(focused ? SD.Colors.borderFocus : SD.Colors.borderStrong, lineWidth: 1)
+                RoundedRectangle(cornerRadius: SD.Radius.xl, style: .continuous)
+                    .strokeBorder(focused ? SD.Colors.borderFocus : Color.clear, lineWidth: 1)
             )
             .animation(SD.Motion.gentle, value: focused)
             .onAppear { if autoFocus { focused = true } }
@@ -236,30 +244,6 @@ struct AskJupiterBar: View {
         guard canSubmit else { return }
         focused = false
         onSubmit()
-    }
-}
-
-/// Three dots breathing in sequence while Jupiter works — quieter than a
-/// spinner, and clearly "thinking" rather than "loading a page".
-struct ThinkingDots: View {
-    @Environment(\.accessibilityReduceMotion) private var reduceMotion
-
-    var body: some View {
-        TimelineView(.animation(minimumInterval: 1 / 20,
-                                paused: !MotionPolicy.animates(true, reduceMotion: reduceMotion))) { context in
-            let t = context.date.timeIntervalSinceReferenceDate
-            HStack(spacing: 4) {
-                ForEach(0..<3, id: \.self) { index in
-                    let phase = (sin((t * 4) - Double(index) * 0.7) + 1) / 2
-                    Circle()
-                        .fill(SD.Colors.signal)
-                        .frame(width: 4, height: 4)
-                        .opacity(0.3 + 0.7 * phase)
-                }
-            }
-        }
-        .frame(height: 8)
-        .accessibilityHidden(true)
     }
 }
 
@@ -405,12 +389,12 @@ enum OrynAppearance {
             layout.normal.iconColor = steel
             layout.normal.titleTextAttributes = [
                 .foregroundColor: steel,
-                .font: UIFont.monospacedSystemFont(ofSize: 10, weight: .medium),
+                .font: UIFont.systemFont(ofSize: 10, weight: .medium),
             ]
             layout.selected.iconColor = bone
             layout.selected.titleTextAttributes = [
                 .foregroundColor: bone,
-                .font: UIFont.monospacedSystemFont(ofSize: 10, weight: .semibold),
+                .font: UIFont.systemFont(ofSize: 10, weight: .semibold),
             ]
         }
         UITabBar.appearance().standardAppearance = tab

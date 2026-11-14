@@ -265,10 +265,13 @@ down window, which production's jitter does not.
 | Config validation, role floors, preset restore, boot-FAILED | **real** `main.py` (`build_runtime`) |
 | Camera | simulated (rendered scene, scripted faults) |
 | FaceMesh / Hands / object detector | scripted (`--video` uses the real models) |
+| MediaPipe Pose (baby monitoring) | scripted to find **no** pose: pose-based signals never fire in the simulator |
+| Room scenes | `Scene.people`: standing people at given positions (sim/perception.py), for counting, tracking, areas and dwell |
 | Buzzer | simulated (recorded, silent) |
 | Network outage | simulated at the uplink transport |
 | Reboot | process restart of the virtual device; the host is never rebooted |
-| Other modules (occupancy, baby, fall, …) on a `general` role | real code, **no** scripted perception: on a Mac they honestly report DEGRADED/FAILED |
+| `shared_perception`, `occupancy` (Property), `baby_monitoring` (Child) on a `general` role | real code on scripted perception (M8) |
+| Other modules (fall detection, …) on a `general` role | real code, **no** scripted perception: on a Mac they honestly report DEGRADED/FAILED |
 
 ### Still needs the physical Pi
 
@@ -305,8 +308,10 @@ Added for the virtual device; every default is the previous code, pinned by
 - The deterministic path runs the monitoring check and uplink on the
   production cadence but not the `HealthMonitor` component ladder (camera
   restart, watchdog); the live path runs all of it.
-- `driver_attention` reports READY during its 10 s calibration (module
-  behaviour, unchanged here).
+- On a first boot (no stored calibration) `driver_attention` reports
+  `starting` (`attention: starting`) during its 10 s gaze calibration, because
+  distraction, eyes down/up, glancing and phone use cannot fire until it
+  settles (M8). A restart loads the stored calibration and skips it.
 - For a module that cannot be built, the top-level `status.reasons` name the
   lost capability (`face: not provided by this device`); the cause is on
   `status.capabilities.impaired[name=module]`.

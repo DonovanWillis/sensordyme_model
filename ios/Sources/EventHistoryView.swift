@@ -38,15 +38,15 @@ struct EventHistoryView: View {
 
     var body: some View {
         ScrollView {
-            VStack(spacing: SD.Space.md) {
+            VStack(alignment: .leading, spacing: SD.Space.lg) {
                 if let errorMessage {
                     ConnectionBanner(message: errorMessage) { await reload() }
                 }
 
+                // The shape of today, on open space: when things happened and
+                // how serious they were. Each mark opens its event.
                 if !events.isEmpty {
-                    SDCard {
-                        EventTimeline(events: events) { selectedEvent = $0 }
-                    }
+                    EventTimeline(events: events) { selectedEvent = $0 }
                 }
 
                 Picker("Show", selection: $filter) {
@@ -68,7 +68,7 @@ struct EventHistoryView: View {
         }
         .refreshable { await reload() }
         .task {
-            if events.isEmpty { events = initialEvents }
+            if events.isEmpty { events = EventFeed.ordered(initialEvents) }
             await reload()
         }
     }
@@ -79,26 +79,15 @@ struct EventHistoryView: View {
                 SDLoadingState(message: "Loading events…")
             } else {
                 SDEmptyState(
-                    icon: filter == .alerts ? "bell.slash" : "checkmark.circle",
+                    icon: filter == .alerts ? "bell.slash" : "clock",
                     title: filter == .alerts ? "No alerts" : "Nothing to report",
                     message: "Events appear here as soon as \(device.name) sees something worth telling you about."
                 )
             }
         } else {
-            SDCard(padding: SD.Space.xs) {
-                LazyVStack(spacing: 0) {
-                    ForEach(visible) { event in
-                        Button { selectedEvent = event } label: {
-                            EventRow(event: event)
-                        }
-                        .buttonStyle(SDRowButtonStyle(minHeight: 52))
-                        if event.id != visible.last?.id {
-                            Rectangle().fill(SD.Colors.border).frame(height: 1)
-                                .padding(.leading, SD.Space.sm + 8 + SD.Space.sm)
-                        }
-                    }
-                }
-            }
+            // A chronological flow grouped by day; a row opens in place and
+            // leads to "why this happened".
+            ActivityTimeline(events: visible) { selectedEvent = $0 }
         }
     }
 
@@ -107,7 +96,9 @@ struct EventHistoryView: View {
         do {
             let fetched = try await state.backend.events(deviceID: device.id, limit: 200)
             guard reloadGuard.isLatest(token) else { return }
-            events = fetched
+            // Merged, not replaced (M8.3): one copy per event, a newer alert
+            // report kept over a stale one, ordered by when it happened.
+            events = EventFeed.merge(events, fetched)
             errorMessage = nil
         } catch let error as APIError where error.isAuthFailure {
             guard reloadGuard.isLatest(token) else { return }

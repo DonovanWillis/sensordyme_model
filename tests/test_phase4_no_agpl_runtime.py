@@ -274,37 +274,54 @@ def test_pi_install_and_deploy_use_the_device_requirements():
 
     setup_pi.sh is the first install; `make deploy` is every install after that.
     Both were installing requirements.txt, so missing either one leaves
-    ultralytics on the device regardless of what the file says.
+    ultralytics on the device regardless of what the file says. M8.5: both now
+    install the hashed DEVICE lock (requirements-device.lock, compiled from
+    requirements-device.txt), never the developer set.
     """
     setup_pi = (REPO_ROOT / "setup_pi.sh").read_text()
-    assert "-r requirements-device.txt" in setup_pi
+    assert "-r requirements-device.lock" in setup_pi and "--require-hashes" in setup_pi
     assert not re.search(r"-r\s+requirements\.txt", setup_pi), (
         "setup_pi.sh still installs the developer requirements onto the device"
     )
 
+    guard = (REPO_ROOT / "scripts" / "release" / "release_guard.py").read_text()
+    assert 'LOCK = "requirements-device.lock"' in guard and '"--require-hashes"' in guard
     makefile = (REPO_ROOT / "Makefile").read_text()
-    deploy = makefile[makefile.index("deploy:") :].split("\n\n")[0]
-    assert "-r requirements-device.txt" in deploy
-    assert not re.search(r"-r\s+requirements\.txt", deploy), (
-        "make deploy still installs the developer requirements onto the device"
-    )
+    deploy = makefile.split("\ndeploy: ", 1)[1].split("\n\n", 1)[0]  # setup-dev may install the dev set
+    assert "scripts/release/deploy.sh" in deploy
+    for path, text in (("make deploy", deploy),
+                       *((p, (REPO_ROOT / p).read_text())
+                         for p in ("scripts/release/deploy.sh", "scripts/release/release_guard.py"))):
+        assert not re.search(r"-r\s+requirements\.txt", text), (
+            f"{path} installs the developer requirements onto the device"
+        )
+    lock = (REPO_ROOT / "requirements-device.lock").read_text()
+    assert not re.search(r"^(ultralytics|torch)==", lock, re.MULTILINE)
 
 
 def test_deploy_does_not_rsync_agpl_model_weights():
     """The hole the pip fix alone does not close.
 
-    A .pt checkpoint is gitignored, but `make deploy` rsyncs the WORKING TREE,
-    not the index — and ultralytics auto-downloads yolo11n.pt into the repo root
-    on any dev run. So before this exclude, a deploy from a developer's Mac put
-    an AGPL-3.0 model weight onto customer hardware even with requirements fixed.
+    A .pt checkpoint is gitignored, but the old `make deploy` rsynced the WORKING
+    TREE -- and ultralytics auto-downloads yolo11n.pt into the repo root on any dev
+    run. M8.5: a release is built from git objects only, filtered by the manifest
+    excludes, and the device refuses a bundle member that matches them.
     Weights carry the licence of the project that trained them (docs/LICENSING.md
-    tables yolo11n → ultralytics/ultralytics → AGPL-3.0).
+    tables yolo11n -> ultralytics/ultralytics -> AGPL-3.0).
     """
-    makefile = (REPO_ROOT / "Makefile").read_text()
-    deploy = makefile[makefile.index("deploy:") :].split("\n\n")[0]
-    rsync = deploy[deploy.index("rsync") :]
-    assert "--exclude='*.pt'" in rsync, "deploy would copy .pt weights onto the device"
+    import sys
+
+    sys.path.insert(0, str(REPO_ROOT / "scripts" / "hw_validation"))
+    import integrity_manifest as im
+
+    from scripts.release import release_guard as rg
+
+    assert "rsync" not in (REPO_ROOT / "scripts" / "release" / "deploy.sh").read_text()
+    assert im.should_exclude("yolo11n.pt") and im.should_exclude("research/x/best.pt")
+    assert rg._excluded(Path("yolo11n.pt")), "the device refuses a .pt in a bundle"
     # openpilot's dmonitoring model is a different licence and the device really
-    # runs it — excluding *.onnx would break driver_attention_openpilot for a
+    # runs it -- excluding *.onnx would break driver_attention_openpilot for a
     # licence problem it does not have.
-    assert "--exclude='*.onnx'" not in rsync
+    assert not im.should_exclude("dmonitoring_model.onnx") and not rg._excluded(Path("dmonitoring_model.onnx"))
+
+

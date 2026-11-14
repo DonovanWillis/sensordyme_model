@@ -53,6 +53,23 @@ MIGRATIONS: list[tuple[str, str, str]] = [
         ("opt-in TLS: skips certificate verification entirely when true -- genuinely"
          " insecure, dev-only. See config.yaml's fuller comment on this key."),
     ),
+    # M8.4 owner decision A. The explicit "no" written down on every unit, so the
+    # opt-in is visible where an owner would look for it. The SAFETY does not
+    # depend on this line: a unit configured before M8.4 still lists high_risk
+    # in alerts.loud_types and elevated_risk / erratic_hand_movement in
+    # soft_types, and this script never removes list members (a device's own
+    # values are left exactly as they are). Those entries are inert: the alert
+    # policy refuses the experimental families (core/alerts.py
+    # AlertManager.permits) and the runtime and uplink tag them "log"
+    # (core/behavior/experimental.py), unless this key is the boolean `true`.
+    # Deleting the key, resetting config.yaml or rebooting therefore all land
+    # on "not audible".
+    (
+        "alerts.experimental_alerts_audible",
+        "  experimental_alerts_audible: false",
+        ("M8.4: high_risk / elevated_risk / erratic_hand_movement are experimental observations"
+         " (logged, never sounded or pushed) unless this is true -- an explicit owner opt-in"),
+    ),
 ]
 
 # A NEW MEMBER of an EXISTING flow-sequence value, as (dotted path to the key,
@@ -331,8 +348,33 @@ def migrate(path: Path) -> list[str]:
     if added:
         stamp = datetime.now().strftime("%Y%m%d-%H%M%S")  # noqa: DTZ005 - local wall-clock stamp for a backup filename
         shutil.copy2(path, path.with_suffix(f".yaml.bak-{stamp}"))
-        path.write_text("".join(lines))
+        _atomic_write(path, "".join(lines))
     return added
+
+
+def _atomic_write(path: Path, text: str) -> None:
+    """Replace `path` so a power cut leaves the old file or the new one, never half (M8).
+
+    `write_text` truncated config.yaml first and then wrote it: a deploy that lost
+    power mid-migration left a device whose config could not be parsed. Same
+    directory (same filesystem, so the rename is atomic), fsync before the rename,
+    the original's mode kept (it holds the device key: 0600).
+    """
+    import os
+    import tempfile
+
+    mode = path.stat().st_mode & 0o777
+    fd, tmp = tempfile.mkstemp(dir=str(path.parent), prefix=f".{path.name}.", suffix=".tmp")
+    try:
+        with os.fdopen(fd, "w") as handle:
+            handle.write(text)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.chmod(tmp, mode)
+        os.replace(tmp, path)
+    except BaseException:
+        Path(tmp).unlink(missing_ok=True)
+        raise
 
 
 def main() -> int:

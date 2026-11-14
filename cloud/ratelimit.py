@@ -170,6 +170,15 @@ LOGIN_LIMITER = RateLimiter(max_attempts=10, window_s=300.0)
 SIGNUP_LIMITER = RateLimiter(max_attempts=10, window_s=300.0)
 CLAIM_LIMITER = RateLimiter(max_attempts=10, window_s=300.0)
 
+# Failed claims per ACCOUNT (M8), whatever address they come from: the per-IP
+# limit above is blind to an account guessing claim codes from many addresses
+# (an IPv4 botnet, or a trusted proxy header naming a different client each
+# time). Only failures count -- an unknown code, or a device another account
+# owns -- so pairing a real device is never slowed. 20 an hour is far above
+# anyone mistyping a label, and holds one account to under 500 guesses a day
+# against a 48-bit code space.
+CLAIM_FAILURE_LIMITER = RateLimiter(max_attempts=20, window_s=3600.0)
+
 # Failed logins per ACCOUNT (normalised email), whatever address they come
 # from. The per-address limit above cannot see a guesser who rotates addresses
 # -- one IPv6 host has a /64 to rotate through, and a botnet has thousands of

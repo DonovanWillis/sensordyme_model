@@ -1,6 +1,12 @@
+import SafariServices
 import SwiftUI
 
-// MARK: - Pairing wizard: plug in -> join hotspot -> Wi-Fi -> claim. Four taps to a live device.
+// MARK: - Adding a device.
+//
+// The first screen offers Bluetooth setup (SetupFlowView: find, prove the setup
+// code, Wi-Fi, claim, mode -- the M8 onboarding) for a new device, and keeps the
+// older path for a device that is already on the network or uses the legacy
+// setup hotspot: plug in -> join hotspot -> Wi-Fi -> claim.
 
 struct SetupWizardView: View {
     @EnvironmentObject private var state: AppState
@@ -15,53 +21,75 @@ struct SetupWizardView: View {
     @State private var claimCode = ""
     @State private var busy = false
     @State private var errorMessage: String?
+    @State private var showBluetoothSetup = false
+    @State private var showSetupPage = false
+    @Environment(\.accessibilityReduceMotion) private var reduceMotion
 
     var body: some View {
         NavigationStack {
-            VStack(spacing: 26) {
-                progressBar
+            // Scrolls: at accessibility text sizes a step is taller than the
+            // screen, and the fixed layout pushed its title under the bar.
+            ScrollView {
+                VStack(alignment: .leading, spacing: SD.Space.lg) {
+                    progressBar
 
-                Spacer()
+                    Group {
+                        switch step {
+                        case .power: powerStep
+                        case .hotspot: hotspotStep
+                        case .wifi: wifiStep
+                        case .pair: pairStep
+                        case .done: doneStep
+                        }
+                    }
+                    .transition(reduceMotion ? .opacity
+                                : .asymmetric(insertion: .move(edge: .trailing).combined(with: .opacity),
+                                              removal: .move(edge: .leading).combined(with: .opacity)))
 
+                    if let errorMessage {
+                        Label(errorMessage, systemImage: "exclamationmark.circle.fill")
+                            .font(SD.Typography.callout)
+                            .foregroundStyle(SD.Colors.danger)
+                            .fixedSize(horizontal: false, vertical: true)
+                            .accessibilityLabel("Error: \(errorMessage)")
+                            .accessibilityIdentifier("wizard.error")
+                    }
+                }
+                .padding(.horizontal, SD.Space.md)
+                .padding(.top, SD.Space.md)
+                .padding(.bottom, SD.Space.xl)
+                .animation(SD.Motion.resolved(SD.Motion.spatial, reduceMotion: reduceMotion), value: step)
+            }
+            .scrollDismissesKeyboard(.interactively)
+            // The step's one action, always in reach above the keyboard and the
+            // home indicator, whatever the text size.
+            .safeAreaInset(edge: .bottom, spacing: 0) {
                 Group {
-                    switch step {
-                    case .power: powerStep
-                    case .hotspot: hotspotStep
-                    case .wifi: wifiStep
-                    case .pair: pairStep
-                    case .done: doneStep
+                    if step != .done {
+                        Button(action: advance) {
+                            if busy { ProgressView().tint(SD.Colors.textOnAccent) } else { Text(buttonTitle) }
+                        }
+                        .accessibilityLabel(busy ? "Pairing" : buttonTitle)
+                        .accessibilityIdentifier("wizard.next")
+                        .buttonStyle(SDButtonStyle(kind: .primary))
+                        .disabled(busy || (step == .pair && claimCode.isEmpty && !state.isDemo))
+                    } else {
+                        Button("Open my device") {
+                            dismiss()
+                        }
+                        .buttonStyle(SDButtonStyle(kind: .primary))
+                        .accessibilityIdentifier("wizard.done")
                     }
                 }
-                .transition(.asymmetric(insertion: .move(edge: .trailing).combined(with: .opacity),
-                                        removal: .move(edge: .leading).combined(with: .opacity)))
-
-                Spacer()
-
-                if step != .done {
-                    Button(action: advance) {
-                        if busy { ProgressView().tint(SD.Colors.textOnAccent) } else { Text(buttonTitle) }
-                    }
-                    .accessibilityLabel(busy ? "Pairing" : buttonTitle)
-                    .accessibilityIdentifier("wizard.next")
-                    .buttonStyle(BrandButtonStyle())
-                    .disabled(busy || (step == .pair && claimCode.isEmpty && !state.isDemo))
-                } else {
-                    Button("Open my device") {
-                        dismiss()
-                    }
-                    .buttonStyle(BrandButtonStyle())
-                    .accessibilityIdentifier("wizard.done")
-                }
-
-                if let errorMessage {
-                    Text(errorMessage).font(.callout).foregroundStyle(SD.Colors.danger)
-                        .accessibilityLabel("Error: \(errorMessage)")
-                        .accessibilityIdentifier("wizard.error")
+                .padding(.horizontal, SD.Space.md)
+                .padding(.vertical, SD.Space.sm)
+                .background(SD.Colors.background)
+            }
+            .sheet(isPresented: $showSetupPage) {
+                if let setup = Self.setupURL(token: state.deviceToken) {
+                    InAppBrowser(url: setup).ignoresSafeArea()
                 }
             }
-            .padding(24)
-            .animation(.spring(duration: 0.45), value: step)
-            .frame(maxWidth: .infinity, maxHeight: .infinity)
             .orynScreen()
             .navigationTitle("Set up device")
             .navigationBarTitleDisplayMode(.inline)
@@ -73,7 +101,7 @@ struct SetupWizardView: View {
 
     private var buttonTitle: String {
         switch step {
-        case .power: "It's glowing"
+        case .power: "It's powered on"
         case .hotspot: state.isDemo ? "Connected (demo)" : "I'm connected"
         case .wifi: state.isDemo ? "Wi-Fi joined (demo)" : "Device joined my Wi-Fi"
         case .pair: "Pair device"
@@ -81,39 +109,96 @@ struct SetupWizardView: View {
         }
     }
 
+    /// Four hairline segments and the step in words: calm, and never ahead
+    /// of what has actually happened.
     private var progressBar: some View {
-        HStack(spacing: 6) {
-            ForEach(0..<4, id: \.self) { index in
-                Capsule()
-                    .fill(index <= min(step.rawValue, 3) ? SD.Colors.accent : SD.Colors.borderStrong)
-                    .frame(height: 5)
+        VStack(alignment: .leading, spacing: SD.Space.xs) {
+            Text(step == .done ? "Paired" : "Step \(min(step.rawValue, 3) + 1) of 4")
+                .font(SD.Typography.caption.weight(.medium).monospacedDigit())
+                .foregroundStyle(SD.Colors.textTertiary)
+            HStack(spacing: 4) {
+                ForEach(0..<4, id: \.self) { index in
+                    Capsule()
+                        .fill(index <= min(step.rawValue, 3) ? SD.Colors.accent : SD.Colors.borderStrong)
+                        .frame(height: 2)
+                }
             }
+            .accessibilityHidden(true)
         }
+        .accessibilityElement(children: .combine)
     }
 
+    /// One step: a symbol on a quiet tile, what to do, why. No animated
+    /// illustration: the person is doing something with their hands.
     private func stepBody(icon: String, title: String, text: String) -> some View {
-        VStack(spacing: 16) {
-            ZStack {
-                Circle().fill(SD.Colors.accent.opacity(0.15)).frame(width: 130, height: 130)
-                Image(systemName: icon)
-                    .font(.system(size: 52))
-                    .foregroundStyle(SD.Colors.accent)
-                    .symbolEffect(.pulse)
-            }
-            Text(title).font(.title2.bold())
+        VStack(alignment: .leading, spacing: SD.Space.md) {
+            Image(systemName: icon)
+                .font(.system(size: 24, weight: .regular))
+                .foregroundStyle(SD.Colors.textPrimary)
+                .frame(width: 60, height: 60)
+                .background(
+                    RoundedRectangle(cornerRadius: SD.Radius.xl, style: .continuous)
+                        .fill(SD.Colors.surfaceRaised)
+                )
+                .accessibilityHidden(true)
+            Text(title)
+                .sdScaledFont(28, relativeTo: .title, weight: .semibold)
+                .foregroundStyle(SD.Colors.textPrimary)
+                .fixedSize(horizontal: false, vertical: true)
+                .accessibilityAddTraits(.isHeader)
             Text(text)
-                .font(.subheadline)
+                .font(SD.Typography.body)
                 .foregroundStyle(SD.Colors.textSecondary)
-                .multilineTextAlignment(.center)
+                .fixedSize(horizontal: false, vertical: true)
         }
+        .frame(maxWidth: .infinity, alignment: .leading)
     }
 
     private var powerStep: some View {
-        stepBody(
-            icon: "power",
-            title: "Power it on",
-            text: "Plug your SensorDyme into power (car charger or wall). Give it ~30 seconds to boot — it glows when it's ready to be set up."
-        )
+        VStack(alignment: .leading, spacing: SD.Space.md) {
+            stepBody(
+                icon: "power",
+                title: "Power it on",
+                // M8.4: not every unit has a status light wired (hardware/hal.py
+                // defaults to none), so "it glows" left people waiting for a
+                // light that never comes on.
+                text: "Plug your SensorDyme into power (car charger or wall) and give it about a minute to start. If yours has a status light, it comes on when it's ready to be set up."
+            )
+            if !state.isDemo {
+                // Two ways on from here, said as such: Bluetooth (the shipped
+                // default) in its own surface, the setup network below it.
+                SDCard {
+                    VStack(alignment: .leading, spacing: SD.Space.sm) {
+                        SDEyebrow("Recommended")
+                        Text("Set up over Bluetooth")
+                            .font(SD.Typography.headline)
+                            .foregroundStyle(SD.Colors.textPrimary)
+                            .accessibilityAddTraits(.isHeader)
+                        Text("For a new SensorDyme: the app finds it, checks the setup code on its label and gives it your Wi-Fi, encrypted.")
+                            .font(SD.Typography.callout)
+                            .foregroundStyle(SD.Colors.textSecondary)
+                            .fixedSize(horizontal: false, vertical: true)
+                        Button {
+                            showBluetoothSetup = true
+                        } label: {
+                            Label("Set up over Bluetooth", systemImage: "dot.radiowaves.left.and.right")
+                        }
+                        .buttonStyle(SDButtonStyle(kind: .secondary))
+                        .accessibilityIdentifier("wizard.bluetooth")
+                    }
+                }
+                Text("Or use its setup network (older devices): once it has started, continue below.")
+                    .font(SD.Typography.caption)
+                    .foregroundStyle(SD.Colors.textTertiary)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+        }
+        .sheet(isPresented: $showBluetoothSetup) {
+            SetupFlowView {
+                await onPaired()
+                dismiss()
+            }
+        }
     }
 
     /// The device's own address while it is serving its first-boot setup
@@ -153,24 +238,34 @@ struct SetupWizardView: View {
     }
 
     private var hotspotStep: some View {
-        VStack(spacing: 14) {
+        VStack(alignment: .leading, spacing: SD.Space.md) {
             stepBody(
-                icon: "wifi.circle.fill",
+                icon: "wifi",
                 title: "Join its setup network",
                 text: "In Settings → Wi-Fi on this phone, join the network named SensorDyme-XXXX. Your device broadcasts it on first boot."
             )
-            if !state.isDemo, let setup = Self.setupURL(token: state.deviceToken) {
-                Link(destination: setup) {
+            if !state.isDemo, Self.setupURL(token: state.deviceToken) != nil {
+                // Opened inside the app (SFSafariViewController), not in Safari:
+                // the address carries the device token when there is one, and
+                // the in-app page is not added to Safari's history.
+                Button { showSetupPage = true } label: {
                     Label("Open device setup page", systemImage: "safari")
-                        .font(.subheadline.bold())
                 }
+                .buttonStyle(SDButtonStyle(kind: .secondary))
+                .accessibilityIdentifier("wizard.setupPage")
+                Text(state.deviceToken.isEmpty
+                     ? "The page is the device's own, at 10.42.0.1 on its setup network. If it asks for a device token, add the device's token in Settings → Live feed first."
+                     : "The page is the device's own, at 10.42.0.1 on its setup network. Its address includes your device token so the page can change the device's Wi-Fi; it opens inside ORYN EDGE and is not added to Safari's history.")
+                    .font(SD.Typography.caption)
+                    .foregroundStyle(SD.Colors.textTertiary)
+                    .fixedSize(horizontal: false, vertical: true)
             }
         }
     }
 
     private var wifiStep: some View {
         stepBody(
-            icon: "house.fill",
+            icon: "house",
             title: "Give it your Wi-Fi",
             text: state.isDemo
                 ? "On the device's setup page you pick your home Wi-Fi and enter the password. In this demo, that just happened — instantly."
@@ -179,7 +274,7 @@ struct SetupWizardView: View {
     }
 
     private var pairStep: some View {
-        VStack(spacing: 16) {
+        VStack(alignment: .leading, spacing: SD.Space.md) {
             stepBody(
                 icon: "qrcode.viewfinder",
                 title: "Pair it to your account",
@@ -190,12 +285,12 @@ struct SetupWizardView: View {
             if !state.isDemo {
                 TextField("1A2B-3C4D-5E6F", text: $claimCode)
                     .font(.title3.monospaced())
-                    .multilineTextAlignment(.center)
+                    .multilineTextAlignment(.leading)
                     .autocapitalization(.allCharacters)
                     .autocorrectionDisabled()
-                    .padding(14)
-                    .background(RoundedRectangle(cornerRadius: SD.Radius.md, style: .continuous).fill(SD.Colors.field))
-                    .overlay(RoundedRectangle(cornerRadius: SD.Radius.md, style: .continuous).strokeBorder(SD.Colors.borderStrong))
+                    .padding(.horizontal, SD.Space.md)
+                    .frame(minHeight: 56)
+                    .background(RoundedRectangle(cornerRadius: SD.Radius.lg, style: .continuous).fill(SD.Colors.field))
                     // Its placeholder is an example code, which VoiceOver read as the field's name.
                     .accessibilityLabel("Claim code")
                     .accessibilityIdentifier("wizard.claimCode")
@@ -203,22 +298,31 @@ struct SetupWizardView: View {
         }
     }
 
+    /// Said as what happened: the claim succeeded. Whether the device is
+    /// reporting and watching is the device screen's to say, from its own
+    /// telemetry; this screen used to promise "online, watching" on a claim.
     private var doneStep: some View {
-        VStack(spacing: 16) {
-            ZStack {
-                Circle().fill(SD.Colors.successMuted).frame(width: 120, height: 120)
-                Circle().strokeBorder(SD.Colors.success.opacity(0.4), lineWidth: 1).frame(width: 120, height: 120)
-                Image(systemName: "checkmark")
-                    .font(.system(size: 44, weight: .semibold))
-                    .foregroundStyle(SD.Colors.success)
-            }
-            .transition(.scale.combined(with: .opacity))
-            Text("You're live").font(.title.bold())
-            Text("Your SensorDyme is online, watching, and fully controllable from this app — modes, alerts, reports, everything.")
-                .font(.subheadline)
+        VStack(alignment: .leading, spacing: SD.Space.md) {
+            Image(systemName: "checkmark")
+                .font(.system(size: 24, weight: .semibold))
+                .foregroundStyle(SD.Colors.textPrimary)
+                .frame(width: 60, height: 60)
+                .background(
+                    RoundedRectangle(cornerRadius: SD.Radius.xl, style: .continuous)
+                        .fill(SD.Colors.surfaceRaised)
+                )
+                .accessibilityHidden(true)
+            Text("Paired to your account")
+                .sdScaledFont(28, relativeTo: .title, weight: .semibold)
+                .foregroundStyle(SD.Colors.textPrimary)
+                .accessibilityAddTraits(.isHeader)
+            Text("Open it to see whether it's reporting and what it's watching for. Modes, alerts and reports are all on its screen.")
+                .font(SD.Typography.body)
                 .foregroundStyle(SD.Colors.textSecondary)
-                .multilineTextAlignment(.center)
+                .fixedSize(horizontal: false, vertical: true)
         }
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .transition(.opacity)
     }
 
     private func advance() {
@@ -244,4 +348,21 @@ struct SetupWizardView: View {
             break
         }
     }
+}
+
+/// The device's setup page inside the app (SFSafariViewController): the same
+/// browser engine as Safari, with Safari's own security, but the page and its
+/// address (which can carry the device token) are not added to Safari's history.
+private struct InAppBrowser: UIViewControllerRepresentable {
+    let url: URL
+
+    func makeUIViewController(context: Context) -> SFSafariViewController {
+        let configuration = SFSafariViewController.Configuration()
+        configuration.entersReaderIfAvailable = false
+        let controller = SFSafariViewController(url: url, configuration: configuration)
+        controller.dismissButtonStyle = .done
+        return controller
+    }
+
+    func updateUIViewController(_ controller: SFSafariViewController, context: Context) {}
 }

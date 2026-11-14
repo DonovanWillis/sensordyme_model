@@ -27,8 +27,10 @@ struct EventDetailView: View {
     var body: some View {
         NavigationStack {
             ScrollView {
-                VStack(alignment: .leading, spacing: SD.Space.md) {
+                VStack(alignment: .leading, spacing: SD.Space.lg) {
                     header
+                    deviceAlertCard
+                    evidenceSection
                     // The detections around the alert, including the ones that
                     // never notified. One interruption, the whole story.
                     if !allEvents.isEmpty {
@@ -44,7 +46,7 @@ struct EventDetailView: View {
                         }
                     } else if let errorMessage {
                         SDErrorState(
-                            title: "Couldn't explain this alert",
+                            title: "Couldn't explain this event",
                             message: errorMessage,
                             retry: { await load() }
                         )
@@ -54,7 +56,9 @@ struct EventDetailView: View {
                 .padding(.bottom, SD.Space.xl)
             }
             .orynScreen()
-            .navigationTitle("Alert")
+            // "Alert" only for what alerted, or was asked for (M8.4): a plain
+            // detection or an experimental observation is an event.
+            .navigationTitle(event.isCritical || event.isConfigured ? "Alert" : "Event")
             .navigationBarTitleDisplayMode(.inline)
             .toolbar {
                 ToolbarItem(placement: .cancellationAction) {
@@ -72,8 +76,9 @@ struct EventDetailView: View {
         VStack(alignment: .leading, spacing: SD.Space.xs) {
             HStack(spacing: SD.Space.xs) {
                 SDStatusPill(
-                    status: event.severityStatus,
-                    text: event.isCritical ? "Critical" : (event.severity == "soft" ? "Warning" : "Info")
+                    status: event.severityStatus == .online ? .unknown : event.severityStatus,
+                    text: event.isExperimental ? "Experimental"
+                        : (event.isCritical ? "Critical" : (event.severity == "soft" ? "Warning" : "Info"))
                 )
                 Spacer()
                 if let date = event.date {
@@ -88,8 +93,119 @@ struct EventDetailView: View {
             Text(device.name)
                 .font(SD.Typography.callout)
                 .foregroundStyle(SD.Colors.textSecondary)
+            if event.isSimulated {
+                Label("Simulated event, not from a real camera", systemImage: "testtube.2")
+                    .font(SD.Typography.caption.weight(.semibold))
+                    .foregroundStyle(SD.Colors.textSecondary)
+                    .accessibilityIdentifier("eventDetail.simulated")
+            }
         }
         .padding(.top, SD.Space.xs)
+    }
+
+    // MARK: On the device (M8.3)
+
+    /// Detection and warning are different facts. This says what the DEVICE
+    /// reported about its own alert output -- "Alert sounded on the device"
+    /// only when it reported a real output played -- and how the time shown
+    /// was established. Never inferred from the event having been stored.
+    private var deviceAlertCard: some View {
+        let evidence = event.alertEvidence
+        return VStack(alignment: .leading, spacing: SD.Space.xs) {
+            SDSectionHeader(title: "On the device")
+            if event.isExperimental {
+                // M8.4: an experimental signal is recorded to evaluate it, never
+                // to warn anyone, and it is no evidence of what anyone was doing.
+                Label("Experimental observation (not an alert)", systemImage: "flask")
+                    .font(SD.Typography.body.weight(.semibold))
+                    .foregroundStyle(SD.Colors.textPrimary)
+                    .accessibilityIdentifier("eventDetail.alertEvidence")
+                Text("An unvalidated signal the device records so it can be evaluated. It never sounds or "
+                     + "notifies, and it isn't evidence of what anyone in view was doing.")
+                    .font(SD.Typography.callout)
+                    .foregroundStyle(SD.Colors.textSecondary)
+                    .fixedSize(horizontal: false, vertical: true)
+            } else {
+                Label(evidence.headline,
+                      systemImage: evidence.confirmedSound ? "speaker.wave.2.fill" : "speaker.slash")
+                    .font(SD.Typography.body.weight(.semibold))
+                    .foregroundStyle(SD.Colors.textPrimary)
+                    .accessibilityIdentifier("eventDetail.alertEvidence")
+                Text(evidence.detail)
+                    .font(SD.Typography.callout)
+                    .foregroundStyle(SD.Colors.textSecondary)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+            if let note = timeNote {
+                Text(note)
+                    .font(SD.Typography.caption)
+                    .foregroundStyle(SD.Colors.textTertiary)
+                    .fixedSize(horizontal: false, vertical: true)
+                    .accessibilityIdentifier("eventDetail.timeNote")
+            }
+        }
+        .accessibilityElement(children: .combine)
+    }
+
+    // MARK: The record (M8.4)
+
+    /// What this event's record supports, from its own fields (EventEvidence):
+    /// what the device measured, what it concluded, the detector's score when
+    /// one was recorded, whether an alert was asked for, and what is missing.
+    private var evidenceSection: some View {
+        let evidence = EventEvidence(event)
+        return VStack(alignment: .leading, spacing: SD.Space.xs) {
+            SDSectionHeader(title: "What the record shows")
+            recordRow("Observed", evidence.observed ?? "Not recorded")
+            recordRow("Device's conclusion", evidence.inferred)
+            recordRow("Confidence the device recorded", evidence.confidence ?? "Not recorded")
+            recordRow("Alert requested", evidence.alertRequested)
+            if !evidence.gaps.isEmpty {
+                VStack(alignment: .leading, spacing: 2) {
+                    ForEach(evidence.gaps, id: \.self) { gap in
+                        Label(gap, systemImage: "info.circle")
+                            .font(SD.Typography.caption)
+                            .foregroundStyle(SD.Colors.textTertiary)
+                            .fixedSize(horizontal: false, vertical: true)
+                    }
+                }
+                .padding(.top, SD.Space.xxs)
+                .accessibilityElement(children: .combine)
+                .accessibilityIdentifier("eventDetail.gaps")
+            }
+        }
+        .accessibilityIdentifier("eventDetail.record")
+    }
+
+    /// A label over its value: at every text size the value has the full width.
+    private func recordRow(_ label: String, _ value: String) -> some View {
+        VStack(alignment: .leading, spacing: 1) {
+            Text(label)
+                .font(SD.Typography.caption)
+                .foregroundStyle(SD.Colors.textTertiary)
+            Text(value)
+                .font(SD.Typography.callout)
+                .foregroundStyle(SD.Colors.textPrimary)
+                .fixedSize(horizontal: false, vertical: true)
+        }
+        .padding(.vertical, 2)
+        .accessibilityElement(children: .combine)
+    }
+
+    /// How the time shown was established, when that is not simply "the device said so".
+    private var timeNote: String? {
+        var notes: [String] = []
+        if event.timeIsArrival {
+            notes.append("The device's clock couldn't be trusted, so the time shown is when the server received this.")
+        } else if let error = event.deviceClockError {
+            let off = TimelineRow.duration(abs(error))
+            notes.append("The device's clock was \(off) \(error > 0 ? "fast" : "slow"); the time shown is from the server.")
+        }
+        if let delay = event.deliveryDelay, let received = event.receivedDate {
+            notes.append("Reached the server \(TimelineRow.duration(delay)) after it happened, at "
+                         + received.formatted(date: .omitted, time: .shortened) + ".")
+        }
+        return notes.isEmpty ? nil : notes.joined(separator: " ")
     }
 
     // MARK: The answer
@@ -97,7 +213,9 @@ struct EventDetailView: View {
     private func answerCard(_ explanation: AlertExplanation) -> some View {
         SDCard(raised: true) {
             VStack(alignment: .leading, spacing: SD.Space.xs) {
-                SDSectionHeader(title: "Why you got this")
+                // "You got this" only for what alerted or was asked for (M8.4).
+                SDSectionHeader(title: event.isCritical || event.isConfigured ? "Why you got this"
+                                : "Why this was recorded")
                 Text(explanation.narrative)
                     .font(SD.Typography.body)
                     .foregroundStyle(SD.Colors.textPrimary)
@@ -123,7 +241,8 @@ struct EventDetailView: View {
     // MARK: Evidence
 
     private func factsCard(_ explanation: AlertExplanation) -> some View {
-        SDCard {
+        // Open space, not a box: the evidence reads as a list of facts.
+        Group {
             VStack(alignment: .leading, spacing: SD.Space.sm) {
                 SDSectionHeader(title: "What the camera saw")
                 if explanation.facts.isEmpty {
@@ -153,7 +272,7 @@ struct EventDetailView: View {
     }
 
     private func ruleCard(_ explanation: AlertExplanation) -> some View {
-        SDCard {
+        Group {
             VStack(alignment: .leading, spacing: SD.Space.xs) {
                 SDSectionHeader(title: "The rule that fired")
                 Text(explanation.rule)
@@ -224,27 +343,32 @@ struct EventTimeline: View {
                 GeometryReader { geometry in
                     ZStack(alignment: .topLeading) {
                         Capsule()
-                            .fill(SD.Colors.border)
-                            .frame(height: 3)
-                            .offset(y: 14)
+                            .fill(SD.Colors.borderStrong)
+                            .frame(height: 1)
+                            .offset(y: 15.5)
 
                         ForEach(todays) { event in
                             if let fraction = position(event) {
                                 Button { onSelect(event) } label: {
                                     Circle()
-                                        .fill(event.severityStatus.tint)
-                                        .frame(width: event.isCritical ? 14 : 10,
-                                               height: event.isCritical ? 14 : 10)
+                                        .fill(event.severityStatus == .online
+                                              ? SD.Colors.textTertiary : event.severityStatus.tint)
+                                        .frame(width: event.isCritical ? 12 : 8,
+                                               height: event.isCritical ? 12 : 8)
                                         .overlay(
                                             Circle().strokeBorder(SD.Colors.background, lineWidth: 2)
                                         )
+                                        // The dot as drawn; a 44 pt target around it
+                                        // (audit: hit area too small).
+                                        .frame(width: 44, height: 44)
+                                        .contentShape(Rectangle())
                                 }
                                 .buttonStyle(.plain)
-                                // Clamped so a midnight event isn't half off-screen.
+                                // Centred on its time, clamped so a midnight event
+                                // isn't half off-screen; on the line at y = 16.
                                 .offset(
-                                    x: min(max(fraction * geometry.size.width - 7, 0),
-                                           geometry.size.width - 14),
-                                    y: event.isCritical ? 9 : 11
+                                    x: min(max(fraction * geometry.size.width, 7), geometry.size.width - 7) - 22,
+                                    y: 16 - 22
                                 )
                                 .accessibilityLabel("\(event.title) at \(event.date.map { $0.formatted(date: .omitted, time: .shortened) } ?? "")")
                             }
@@ -253,14 +377,18 @@ struct EventTimeline: View {
                 }
                 .frame(height: 32)
 
+                // A visual scale: each dot already says its time to VoiceOver.
+                // A text style, not a fixed 10 pt (audit: Dynamic Type unsupported),
+                // and indexed: "12a" twice was a duplicate ForEach id.
                 HStack {
-                    ForEach(["12a", "6a", "12p", "6p", "12a"], id: \.self) { label in
+                    ForEach(Array(["12a", "6a", "12p", "6p", "12a"].enumerated()), id: \.offset) { index, label in
                         Text(label)
-                            .font(.system(size: 10))
+                            .font(.caption2)
                             .foregroundStyle(SD.Colors.textTertiary)
-                        if label != "12a" || true { Spacer(minLength: 0) }
+                        if index < 4 { Spacer(minLength: 0) }
                     }
                 }
+                .accessibilityHidden(true)
             }
         }
     }

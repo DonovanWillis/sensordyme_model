@@ -49,9 +49,39 @@ struct EventItem: Codable, Identifiable, Hashable {
     /// model tracking, and from an older backend that does not send it.
     var model: EventModel? = nil
 
+    // M8.3 (docs/EVENT_PIPELINE.md). Every one optional: an older backend, or
+    // history recorded before M8.3, decodes exactly as before.
+
+    /// The device's own identity for this occurrence (core/events.py event_id).
+    var eventKey: String? = nil
+    /// When the backend received it (seconds since 1970, the backend's clock).
+    var receivedAt: Double? = nil
+    /// When it happened, placed on the backend's clock (see `timeBasis`).
+    var occurredAt: Double? = nil
+    /// How `occurredAt` was found: "device_monotonic" (the device's own age of
+    /// the event, trustworthy whatever its wall clock says), "device_clock"
+    /// (the device's timestamp, judged plausible) or "received" (the device's
+    /// clock was implausible: this is the arrival time).
+    var timeBasis: String? = nil
+    /// What the device REPORTED its alert outputs did. Nil when it reported
+    /// nothing -- which never means an alert sounded.
+    var alert: EventAlertReport? = nil
+    /// True for an event from a simulated device or detector, or the demo.
+    var simulated: Bool? = nil
+    /// M8.4: true for an EXPERIMENTAL observation (the driver module's combined
+    /// risk score, erratic hand movement): recorded with `severity: "log"`,
+    /// never an alert. Absent from older backends and firmware: nil, and the
+    /// event reads exactly as before.
+    var experimental: Bool? = nil
+
     enum CodingKeys: String, CodingKey {
         case eventID = "id"
         case timestamp, type, confidence, signals, severity, source, model
+        case eventKey = "event_key"
+        case receivedAt = "received_at"
+        case occurredAt = "occurred_at"
+        case timeBasis = "time_basis"
+        case alert, simulated, experimental
     }
 
     /// Whether the user asked to be told about this specifically.
@@ -61,21 +91,222 @@ struct EventItem: Codable, Identifiable, Hashable {
     /// someone had asked for was the only one that never arrived.
     var isConfigured: Bool { source == "custom_rule" }
 
-    var id: String { "\(eventID.map(String.init) ?? "")\(timestamp)\(type)\(signals ?? "")" }
+    /// Stable across refreshes: the server row id when there is one (a newer
+    /// alert report for the same row must not read as a different event).
+    var id: String {
+        if let eventID { return "id:\(eventID)" }
+        if let eventKey, !eventKey.isEmpty { return "key:\(eventKey)" }
+        return "\(timestamp)\(type)\(signals ?? "")"
+    }
 
-    /// The device sends `datetime.isoformat()`, which drops the fraction when
-    /// the microseconds happen to be zero; the fractional formatter rejects
-    /// that, so whole seconds are tried as well.
+    /// When it happened, as truthfully as the record allows: on the backend's
+    /// clock when the backend placed it (M8.3), else the device's own timestamp.
+    /// Never the device's claim alone when something better exists: a Pi with
+    /// no RTC can stamp an alert 1970, or three days ago.
     var date: Date? {
+        if let occurredAt { return Date(timeIntervalSince1970: occurredAt) }
+        return deviceDate
+    }
+
+    /// The device's own timestamp, verbatim. The device sends
+    /// `datetime.isoformat()`, which drops the fraction when the microseconds
+    /// happen to be zero; the fractional formatter rejects that, so whole
+    /// seconds are tried as well.
+    var deviceDate: Date? {
         ISO8601DateFormatter.flexible.date(from: timestamp)
             ?? ISO8601DateFormatter.wholeSeconds.date(from: timestamp)
     }
+
+    var receivedDate: Date? { receivedAt.map { Date(timeIntervalSince1970: $0) } }
+
+    var isSimulated: Bool { simulated == true }
+
+    /// An experimental observation: shown, never presented as an alert.
+    var isExperimental: Bool { experimental == true }
+
+    /// How far the device's clock was from when the event really happened, in
+    /// seconds (positive: the device clock was ahead), when that was 2 minutes
+    /// or more and the backend could tell -- i.e. not when the device clock was
+    /// itself the evidence.
+    var deviceClockError: TimeInterval? {
+        guard let occurredAt, let deviceDate, timeBasis == "device_monotonic" || timeBasis == "received"
+        else { return nil }
+        let error = deviceDate.timeIntervalSince1970 - occurredAt
+        return abs(error) >= 120 ? error : nil
+    }
+
+    /// How long after it happened the event reached the backend, when that was
+    /// over a minute (an outage, a backlog sent after a restart).
+    var deliveryDelay: TimeInterval? {
+        guard let receivedAt, let occurredAt, timeBasis != "received" else { return nil }
+        let delay = receivedAt - occurredAt
+        return delay >= 60 ? delay : nil
+    }
+
+    /// The time shown is when the backend received it: the device's clock could not be used.
+    var timeIsArrival: Bool { timeBasis == "received" }
+
+    /// What the app may say about the device's own alert output for this event.
+    var alertEvidence: AlertDeliveryEvidence { AlertDeliveryEvidence(alert, eventSimulated: isSimulated) }
 
     /// "phone_use_while_distracted" -> "Phone use while distracted"
     var title: String {
         let words = type.replacingOccurrences(of: "_", with: " ")
             .replacingOccurrences(of: ":", with: " in ")
         return words.prefix(1).uppercased() + words.dropFirst()
+    }
+}
+
+/// What the device reported its in-cabin alert outputs did for one event
+/// (core/alerts.py AlertDelivery, validated by cloud/app.py `_alert_report`).
+struct EventAlertReport: Codable, Hashable {
+    struct Output: Codable, Hashable {
+        let name: String?
+        let kind: String?
+        let audible: Bool?
+        var played: Int? = nil
+        var failed: Int? = nil
+        var skipped: Int? = nil
+        var pending: Int? = nil
+        var unconfirmed: Int? = nil
+        var simulated: Bool? = nil
+        var error: String? = nil
+    }
+
+    /// "alerted" | "merged" | "suppressed": what the device's alert policy did.
+    let decision: String?
+    /// "sounded" | "simulated" | "pending" | "unconfirmed" | "failed" | "none".
+    let output: String?
+    /// Rises with every newer report from the device for this event.
+    var rev: Int? = nil
+    var episode: String? = nil
+    var category: String? = nil
+    var outputs: [Output]? = nil
+}
+
+/// The one place the app decides what it may say about the device's alert
+/// output. Detection and warning are different facts: a stored event is a
+/// detection, and "the alert sounded" is said ONLY when the device itself
+/// reported that a real output played (M8.3). Everything else reads
+/// "Detected; no alert output confirmed", with the reason when there is one.
+enum AlertDeliveryEvidence: Equatable {
+    /// A real output (buzzer, speaker) reported its whole warning pattern played.
+    case sounded(outputs: [String])
+    /// Only a simulated output recorded it. Nothing made a sound.
+    case simulated
+    /// Sent to the output; it has not reported back yet.
+    case pending
+    /// The output(s) reported failing or could not run; the first reason, if any.
+    case failed(reason: String?)
+    /// Sent to an output that cannot report whether it played.
+    case unconfirmed
+    /// The device reported no alert output for this event (or reported nothing).
+    case none
+
+    init(_ report: EventAlertReport?, eventSimulated: Bool) {
+        guard let report, let output = report.output else { self = .none; return }
+        let outputs = report.outputs ?? []
+        switch output {
+        case "sounded":
+            // A simulated event cannot have sounded a real output, whatever it says.
+            if eventSimulated { self = .simulated; return }
+            let names = outputs.filter { ($0.played ?? 0) > 0 && $0.simulated != true }
+                .map { AlertDeliveryEvidence.spoken($0) }
+            self = .sounded(outputs: names)
+        case "simulated": self = .simulated
+        case "pending": self = .pending
+        case "unconfirmed": self = .unconfirmed
+        case "failed": self = .failed(reason: outputs.compactMap(\.error).first)
+        default: self = .none
+        }
+    }
+
+    /// True only for a real output that reported playing.
+    var confirmedSound: Bool { if case .sounded = self { true } else { false } }
+
+    var headline: String {
+        switch self {
+        case .sounded: "Alert sounded on the device"
+        case .simulated: "Simulated alert (no sound)"
+        default: "Detected; no alert output confirmed"
+        }
+    }
+
+    var detail: String {
+        switch self {
+        case .sounded(let outputs):
+            let what = outputs.isEmpty ? "its alert output" : "its " + outputs.joined(separator: " and ")
+            return "The device reported that \(what) played the warning pattern. "
+                + "It cannot measure whether anyone heard it."
+        case .simulated:
+            return "A simulated device recorded the alert. Nothing made a sound."
+        case .pending:
+            return "The device sent the warning to its alert output and hasn't reported yet whether it played."
+        case .failed(let reason):
+            let base = "The device tried to sound its alert, and its output didn't play it"
+            return reason.map { "\(base): \($0)." } ?? "\(base)."
+        case .unconfirmed:
+            return "The device's alert output can't report whether it played."
+        case .none:
+            return "The device didn't report sounding an alert for this event."
+        }
+    }
+
+    /// A word for a timeline row.
+    var short: String {
+        switch self {
+        case .sounded: "Sounded on device"
+        case .simulated: "Simulated, no sound"
+        case .pending: "Awaiting device"
+        case .failed: "Alert output failed"
+        case .unconfirmed: "Not confirmed"
+        case .none: "No alert output"
+        }
+    }
+
+    private static func spoken(_ output: EventAlertReport.Output) -> String {
+        switch output.kind {
+        case "buzzer": "buzzer"
+        case "speaker": "speaker"
+        default: output.name ?? "alert output"
+        }
+    }
+}
+
+/// Merging what the timeline shows with a freshly fetched page (M8.3).
+///
+/// Refreshes overlap -- pull to refresh, the screen's own reload, a page loaded
+/// while new events arrive -- and an alert's row can be re-fetched with a newer
+/// delivery report. The timeline must never show an event twice, never lose
+/// one it had because a smaller page arrived, never let an older response
+/// replace a newer report, and always read in the order things happened.
+enum EventFeed {
+    /// Most events kept in memory for one timeline.
+    static let capacity = 1000
+
+    static func merge(_ current: [EventItem], _ incoming: [EventItem]) -> [EventItem] {
+        var byID: [String: EventItem] = [:]
+        for event in current { byID[event.id] = event }
+        for event in incoming {
+            if let kept = byID[event.id], (kept.alert?.rev ?? -1) > (event.alert?.rev ?? -1) {
+                continue  // a stale response: keep the newer report already shown
+            }
+            byID[event.id] = event
+        }
+        return Array(ordered(Array(byID.values)).prefix(capacity))
+    }
+
+    /// Newest first by when it happened; the server row id breaks ties (and
+    /// orders events with no usable time, after those with one).
+    static func ordered(_ events: [EventItem]) -> [EventItem] {
+        events.sorted { a, b in
+            switch (a.date, b.date) {
+            case let (x?, y?) where x != y: return x > y
+            case (.some, .none): return true
+            case (.none, .some): return false
+            default: return (a.eventID ?? Int.min) > (b.eventID ?? Int.min)
+            }
+        }
     }
 }
 
@@ -93,4 +324,79 @@ extension ISO8601DateFormatter {
         formatter.formatOptions = [.withInternetDateTime]
         return formatter
     }()
+}
+
+
+/// What one event's record supports, split the way a person asks about it
+/// (M8.4): what the device observed, what it concluded, how sure the detector
+/// was (only when the record says), whether an alert was asked for, whether a
+/// real output confirmed it, and what is missing or stale. Foundation-only and
+/// built only from fields the backend stored -- nothing estimated here.
+struct EventEvidence: Equatable {
+    /// The device's conclusion, as its event type ("Drowsiness").
+    let inferred: String
+    /// What the device recorded measuring, in its own words; nil when it recorded nothing.
+    let observed: String?
+    /// The confidence the device recorded for this event, when it recorded one:
+    /// how sure it was that the condition held (for a measured condition such
+    /// as eye closure, not a detector's score -- jupiter/explain.py).
+    let confidence: String?
+    /// Whether the device's alert policy asked for an alert, in words.
+    let alertRequested: String
+    /// What the device reported its alert output did (AlertDeliveryEvidence).
+    let output: AlertDeliveryEvidence
+    let simulated: Bool
+    let experimental: Bool
+    /// What the record lacks, or why its time is not the device's own.
+    let gaps: [String]
+
+    init(_ event: EventItem) {
+        inferred = event.title
+        let signals = event.signals?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+        observed = signals.isEmpty ? nil : signals
+        confidence = event.confidence.map { String(format: "%.2f", $0) }
+        simulated = event.isSimulated
+        experimental = event.isExperimental
+        output = event.alertEvidence
+        alertRequested = Self.requested(decision: event.alert?.decision, experimental: event.isExperimental)
+        var gaps: [String] = []
+        if observed == nil { gaps.append("The device didn't record what it measured.") }
+        if event.confidence == nil { gaps.append("No confidence was recorded.") }
+        if event.alert == nil && !event.isExperimental {
+            gaps.append("The device didn't report what its alert output did (older firmware reports nothing).")
+        }
+        if event.timeIsArrival {
+            gaps.append("The device's clock couldn't be trusted; the time is when the server received it.")
+        } else if event.deviceClockError != nil {
+            gaps.append("The device's clock was wrong; the time is from the server.")
+        }
+        if let delay = event.deliveryDelay {
+            gaps.append("It reached the server \(Self.minutes(delay)) after it happened.")
+        }
+        self.gaps = gaps
+    }
+
+    /// The headline for the event's kind.
+    var kind: String {
+        if experimental { return "Experimental observation (not an alert)" }
+        return simulated ? "Simulated event" : "Detection"
+    }
+
+    static func requested(decision: String?, experimental: Bool) -> String {
+        switch decision {
+        case "alerted": return "Yes: the device's alert policy raised an alert"
+        case "merged": return "Joined an alert already under way for the same episode"
+        case "suppressed": return "No: recorded only (the device's alert policy held it back)"
+        default:
+            return experimental ? "No: experimental observations never alert"
+                : "Not reported by the device"
+        }
+    }
+
+    private static func minutes(_ seconds: Double) -> String {
+        let minutes = Int((seconds / 60).rounded())
+        if minutes < 60 { return "\(max(1, minutes)) min" }
+        let hours = Int((seconds / 3600).rounded())
+        return hours < 48 ? "\(hours) h" : "\(Int((seconds / 86_400).rounded())) d"
+    }
 }

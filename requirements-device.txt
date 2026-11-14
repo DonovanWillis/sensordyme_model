@@ -27,7 +27,13 @@ numpy==1.26.4
 pyyaml==6.0.2
 matplotlib==3.9.2
 reportlab==4.2.5
-simpleaudio==1.0.4
+# M8.5 (M84-4): not on Linux. simpleaudio 1.0.4 publishes no Linux wheel, so on the
+# Pi it was the one package pip had to BUILD (setup code run at install time, build
+# dependencies fetched without hash checking, ALSA headers setup_pi.sh never
+# installed). The hashed device install is wheels-only (--only-binary=:all:); on the
+# Pi core/alerts.py SoundSink plays through `aplay` (alsa-utils, installed by
+# setup_pi.sh), its documented Linux backend. Still installed on macOS/Windows dev.
+simpleaudio==1.0.4 ; sys_platform != "linux"
 # M6.5 (4E): pytest and anthropic moved to requirements.txt (developer + CI). Nothing
 # the device runs imports pytest, and anthropic is reached only by core/vlm_judge.py
 # from the mac_max profile (require_mps), so on a device it was dead weight and an
@@ -53,11 +59,14 @@ onnxruntime==1.27.0
 # (core/secret_store.py and core/command_auth.py need only the standard library.)
 cryptography==50.0.2
 
-# --- Raspberry Pi only extras ---
-# These are installed separately by setup_pi.sh. picamera2 ships as an apt
-# package on Pi OS (python3-picamera2) and is NOT pip-installable on Mac;
-# gpiozero is likewise Pi-only. Do not add them above this line.
+# --- Raspberry Pi only ---
+# The buzzer (core/alerts.py BuzzerSink): gpiozero over lgpio, the pin factory
+# that works on the Pi 5. M8.5 (M84-4): these used to be a separate, unhashed
+# `pip install gpiozero==2.0.1 lgpio==0.2.2.0` in setup_pi.sh and runbook F2; they
+# are now pinned here and hash-locked in requirements-device.lock like everything
+# else. The marker keeps them off Mac/CI installs (no wheels there).
+gpiozero==2.0.1 ; sys_platform == "linux" and platform_machine == "aarch64"
+lgpio==0.2.2.0 ; sys_platform == "linux" and platform_machine == "aarch64"
 #
-#   picamera2   (apt: python3-picamera2)
-#   gpiozero==2.0.1
-#   lgpio==0.2.2.0
+# picamera2 ships as an apt package on Pi OS (python3-picamera2), is NOT
+# pip-installable, and is reached through the venv's --system-site-packages.

@@ -162,11 +162,27 @@ def nmcli_available() -> bool:
     return shutil.which("nmcli") is not None
 
 
+#: nmcli arguments whose NEXT argument is a Wi-Fi passphrase.
+_SECRET_ARGS = frozenset({"password", "wifi-sec.psk", "802-11-wireless-security.psk"})
+
+
+def _redacted(args: list[str]) -> list[str]:
+    """`args` with every passphrase replaced, for anything that may be logged."""
+    return ["<redacted>" if i and args[i - 1] in _SECRET_ARGS else a for i, a in enumerate(args)]
+
+
 def _run(args: list[str], timeout: float = 10) -> subprocess.CompletedProcess:
-    return subprocess.run(  # noqa: S603 - nmcli with argv built by this module, never a shell
-        ["nmcli", *args],  # noqa: S607 - nmcli is resolved from PATH (nmcli_available())
-        capture_output=True, text=True, timeout=timeout, check=False,
-    )
+    try:
+        return subprocess.run(  # noqa: S603 - nmcli with argv built by this module, never a shell
+            ["nmcli", *args],  # noqa: S607 - nmcli is resolved from PATH (nmcli_available())
+            capture_output=True, text=True, timeout=timeout, check=False,
+        )
+    except subprocess.TimeoutExpired as exc:
+        # str(TimeoutExpired) quotes the whole argv, and a join or a rollback
+        # carries the passphrase there; callers log it ("could not restore the
+        # previous network: %s") or return it to the app. Re-raised with the
+        # passphrase removed (M8.3, SECURITY_REVIEW_M6 §6).
+        raise subprocess.TimeoutExpired(["nmcli", *_redacted(args)], exc.timeout) from None
 
 
 class WifiManager:

@@ -1,8 +1,9 @@
 .PHONY: help dev dev-debug dev-max dev-openpilot dev-skinnemoen dev-dashsentinel \
         bench accuracy accuracy-dataset accuracy-gate report deploy deploy-preflight \
+        deploy-adopt deploy-status deploy-rollback demo-check demo-cycle \
         release-manifest release-verify verify-release \
         test test-cov test-ios lint lint-fix fmt-check typecheck audit check mutants \
-        setup-dev hooks clean sim sim-backend sim-device sim-scenarios sim-e2e
+        setup-dev hooks clean sim sim-backend sim-device sim-scenarios sim-e2e acceptance acceptance-full
 
 VENV := .venv/bin
 
@@ -68,6 +69,18 @@ sim-scenarios: ## List the virtual device's scenarios
 sim-e2e: ## Deterministic end-to-end tests: virtual device x real backend (seconds, no sleeps)
 	PYTHONDONTWRITEBYTECODE=1 $(SIM_PY) -m pytest -p no:cacheprovider -q \
 		tests/test_sim_e2e.py tests/test_sim_units.py tests/test_sim_seams.py
+
+ACCEPTANCE_OUT ?= data/acceptance
+
+acceptance: ## M8.5: every software suite + 30-journey matrix + short soaks + BLE harness; evidence in $(ACCEPTANCE_OUT)/acceptance.{json,md}
+	PYTHONDONTWRITEBYTECODE=1 $(SIM_PY) scripts/sim/acceptance.py --out $(ACCEPTANCE_OUT) $(ACCEPTANCE_ARGS)
+
+# The full acceptance additionally runs every XCUITest journey (the real iPhone
+# app) via scripts/sim/ios_uitest.sh. It REQUIRES the iOS Simulator and
+# xcodebuild, takes ~25 extra minutes, and must not run while anything else owns
+# the Simulator (ports 8787/8790/8797 must be free). docs/ACCEPTANCE.md.
+acceptance-full: ## M8.5: acceptance + the XCUITest journeys (needs the iOS Simulator; ~25 min extra)
+	PYTHONDONTWRITEBYTECODE=1 $(SIM_PY) scripts/sim/acceptance.py --out $(ACCEPTANCE_OUT) --with-ios $(ACCEPTANCE_ARGS)
 
 # =============================================================================
 # Benchmarks and reports
@@ -226,76 +239,51 @@ clean: ## Remove caches and coverage artifacts (never touches data/ or .venv)
 		-name '__pycache__' -type d -print0 | xargs -0 rm -rf
 
 # =============================================================================
-# Deploy
+# Deploy (M8.5: staged releases; docs/DEPLOYMENT.md)
 # =============================================================================
 
+# The device and its service path. DIR is relative to the login directory (or
+# absolute) and is the path the systemd unit names; on a staged device it is a
+# symlink into $(DIR).releases/. Before M8.5 both were hard-wired to
+# pi@sensordyme.local:~/sensordyme; Bookworm images have no default `pi` user.
+DEVICE ?= pi@sensordyme.local
+DIR ?= sensordyme
+# The guard every device-side step runs, streamed from the ref being deployed.
+GUARD_AT_REF = git show $(REF):scripts/release/release_guard.py
+
 # config.yaml is DEVICE STATE, not code: it holds this unit's device_key, its
-# cloud address, its camera orientation and its .hef path. Copying the repo's
-# copy over it silently unpairs the device from the backend and un-rotates the
-# camera, and the failure shows up much later as "the app stopped seeing it".
-# Config changes ship as explicit migrations (scripts/migrate_config.py), never
-# as a side effect of deploying code.
+# cloud address, its camera orientation and its .hef path. A deploy never ships
+# one (the manifest excludes it and the stage refuses a bundle that contains it);
+# the running release's copy is carried into the new release and migrated there
+# (scripts/migrate_config.py), so a rollback runs on the pre-migration copy.
 #
-# CHANGED 2026-08-29: the dependency install below is new. Before it, deploy
-# rsync'd code and restarted the service but never installed anything — so the
-# first deploy that added a line to requirements.txt bricked the device with an
-# ImportError at ExecStartPre and the only symptom was "it stopped coming back
-# after a restart". `.venv/bin/pip install -r requirements-device.txt` is exactly
-# what setup_pi.sh does, inside the same venv the systemd unit runs from
-# (sensordyme.service: ExecStart=.../.venv/bin/python), and it is a no-op when
-# nothing changed.
-#
-# CHANGED (Phase 4): requirements.txt -> requirements-device.txt. requirements.txt
-# pins ultralytics (AGPL-3.0), and this line is how packages land on hardware we
-# convey — so deploying the developer set would put the AGPL package back on the
-# device on the next update even with setup_pi.sh fixed. See docs/LICENSING.md.
-#
-# NOT changed: the host (pi@sensordyme.local) and the rsync flags. rsync still
-# runs WITHOUT --delete, so a file deleted from the repo stays on the device
-# forever — including a module that main.py no longer imports but that a stale
-# config.yaml still names. Adding --delete would also be the fastest way to
-# destroy data/ on a device if an exclude were ever mistyped, so it is flagged
-# here rather than changed unilaterally.
-#
-# `--exclude='*.pt'` is a LICENCE control, not a size one. A .pt checkpoint is
-# gitignored but still sits in the working tree after any dev run (ultralytics
-# auto-downloads yolo11n.pt on first use), and rsync copies the working tree, not
-# the index — so a plain `make deploy` from a developer's Mac was putting an
-# AGPL-3.0 model weight onto the device even with the pip install fixed. The
-# weights carry the same licence as the code that produced them; see
-# docs/LICENSING.md §"Model weights". Deliberately NOT excluding *.onnx:
-# dmonitoring_model.onnx is openpilot's driver-monitoring model, which the device
-# genuinely runs and which is not AGPL.
-#
-# `--exclude='*.hef'` closes the SAME hole for the format that actually matters.
-# A .hef is the only thing the Pi can execute, models/ is gitignored, and
-# docs/ACCELERATOR.md used to tell readers to download yolov11n.hef /
-# yolov8s_h8l.hef into it -- Ultralytics-derived, so AGPL weights in a different
-# wrapper. Excluding .pt while shipping .hef would have been a licence control
-# aimed at the one format the device cannot run.
-#
-# `*.db` / `*.sqlite3` / `*.csv` are a DATA control, the third kind. `--exclude='data'`
-# only covers the data/ DIRECTORY, so a dry run of this rsync was carrying
-# cloud/sensordyme.db -- the backend's own database, 639KB -- plus e.csv,
-# events.csv, t.csv and telemetry.csv from the repo root onto every device.
-# Shipping a developer's event history and a backend DB to a customer is a
-# privacy problem before it is a tidiness one, and nothing about it is visible
-# in `make deploy`'s output.
-#
-# It also makes deployment DETERMINISTIC rather than merely legal: the device's
-# model now comes only from setup_pi.sh, which pins a URL and verifies sha256 and
-# refuses to install a mismatch. A model must never arrive on a device because it
-# happened to be in someone's working tree.
-# `cloud/.jwt_secret` is a SECRET control. It is the key every backend session
-# token is signed with; a device that holds it can mint a valid token for any
-# account. None of the patterns above matched it, so every deploy carried it to
-# the Pi. `cloud/.backend_id` goes with it: the device must not claim to be the
-# backend. `ios/` and `benchmarks/results` are simply not the device's business.
+# History, kept because each line was a real failure:
+# * 2026-08-29: deploys installed no dependencies, so a new requirement bricked
+#   the device with an ImportError at ExecStartPre.
+# * Phase 4: requirements-device.txt, not requirements.txt (ultralytics is
+#   AGPL-3.0; docs/LICENSING.md).
+# * The old rsync copied the WORKING TREE: AGPL *.pt/*.hef weights, the backend's
+#   cloud/sensordyme.db, developer CSVs and cloud/.jwt_secret all reached devices
+#   until each got an --exclude. M8.5 removes that whole class: a release is the
+#   git objects of one commit, filtered by the same excludes as the manifest
+#   (scripts/hw_validation/integrity_manifest.py), never a working tree.
+# * M8.4 (M84-4/5/6): the in-place rsync was not atomic, verified nothing on the
+#   device, had no --delete, and installed unhashed packages; its `||` rollback ran
+#   over the same SSH session that had just failed. M8.5 replaces it:
+#     stage     every file verified against the manifest (sha256 passed over SSH)
+#               before it is written, in releases/<commit12>/ beside the live one;
+#               its own venv from `pip install --require-hashes --only-binary=:all:
+#               -r requirements-device.lock`; MediaPipe model files checked;
+#     activate  detached ON the device: carry + migrate config.yaml, one rename(2)
+#               of the service symlink, units, restart, confirm -- or switch back
+#               (the previous release keeps its venv and config: no network).
+# The model (.hef) still comes only from setup_pi.sh (URL + sha256 pin) and lives
+# in the shared state dir; a model never arrives with a release.
 demo-check: ## run the demo preflight on the device (DEMO READY / NOT READY)
-	ssh pi@sensordyme.local 'cd ~/sensordyme && .venv/bin/python scripts/demo_preflight.py'
+	ssh $(DEVICE) 'cd $(DIR) && .venv/bin/python scripts/demo_preflight.py'
 
 demo-cycle: ## rehearse every demo mode on the device, with restarts
-	ssh pi@sensordyme.local 'cd ~/sensordyme && bash scripts/demo_cycle.sh'
+	ssh $(DEVICE) 'cd $(DIR) && bash scripts/demo_cycle.sh'
 
 # The device's config.yaml is never overwritten (above), so check IT -- not the
 # repo's -- against the code about to land: schema, role floor, what the role
@@ -304,28 +292,28 @@ demo-cycle: ## rehearse every demo mode on the device, with restarts
 # this deployment is for (e.g. `make deploy ROLE=driver_safety`).
 deploy-preflight: ## check the device's own config against this code (ROLE=driver_safety to require it)
 	@tmp=$$(mktemp -d) && trap 'rm -rf "$$tmp"' EXIT && \
-	scp -q pi@sensordyme.local:~/sensordyme/config.yaml "$$tmp/config.yaml" && \
+	scp -q $(DEVICE):$(DIR)/config.yaml "$$tmp/config.yaml" && \
 	hef=$$($(VENV)/python scripts/deploy_preflight.py --config "$$tmp/config.yaml" --print-hef-path) && \
 	if [ -n "$$hef" ]; then \
-		set -- --hef-sha256 "$$(ssh pi@sensordyme.local "cd ~/sensordyme && sha256sum '$$hef' 2>/dev/null | cut -d' ' -f1")"; \
+		set -- --hef-sha256 "$$(ssh $(DEVICE) "cd $(DIR) && sha256sum '$$hef' 2>/dev/null | cut -d' ' -f1")"; \
 	else set --; fi && \
 	$(VENV)/python scripts/deploy_preflight.py --config "$$tmp/config.yaml" $(if $(ROLE),--expect-role $(ROLE)) "$$@"
 
-deploy: deploy-preflight ## preflight, rsync to pi@sensordyme.local, install deps, migrate config, restart
-	rsync -av --exclude='.venv' --exclude='data' --exclude='.git' --exclude='__pycache__' \
-		--exclude='config.yaml' --exclude='*.log' --exclude='.secrets' --exclude='*.pt' \
-		--exclude='*.hef' --exclude='*.db' --exclude='*.sqlite3' --exclude='*.csv' \
-		--exclude='.pytest_cache' --exclude='.ruff_cache' --exclude='.claude*' \
-		--exclude='cloud/.jwt_secret' --exclude='cloud/.backend_id' --exclude='.env' \
-		--exclude='.env.*' --exclude='*.pem' --exclude='*.key' --exclude='logs' \
-		--exclude='ios' --exclude='benchmarks/results' \
-		./ pi@sensordyme.local:~/sensordyme/
-	ssh pi@sensordyme.local 'cd ~/sensordyme && .venv/bin/pip install -q -r requirements-device.txt'
-	ssh pi@sensordyme.local 'cd ~/sensordyme && python3 scripts/migrate_config.py config.yaml'
-	@# M6: rsync never touched /etc/systemd/system, so a release that changed the
-	@# unit (bounded start-limit reboots) landed with the OLD unit still in force.
-	ssh pi@sensordyme.local 'cd ~/sensordyme && sudo bash scripts/release/install_units.sh --user "$$(id -un)"'
-	ssh pi@sensordyme.local 'cd ~/sensordyme && sudo systemctl restart sensordyme.service'
+deploy: deploy-preflight ## stage REF= (default HEAD) on DEVICE=/DIR=, verify, switch atomically, confirm or roll back
+	DEVICE='$(DEVICE)' DIR='$(DIR)' REF='$(REF)' PY='$(VENV)/python' TESTS='$(TESTS)' \
+		FIND_LINKS='$(FIND_LINKS)' bash scripts/release/deploy.sh
+
+deploy-adopt: ## ONE TIME per device: stop, turn DIR into the staged layout, start (docs/DEPLOYMENT.md)
+	ssh $(DEVICE) 'sudo systemctl stop sensordyme.service'
+	$(GUARD_AT_REF) | ssh $(DEVICE) 'python3 - adopt --root $(DIR)' || \
+		{ ssh $(DEVICE) 'sudo systemctl start sensordyme.service'; echo "adopt refused; service restarted unchanged"; exit 1; }
+	ssh $(DEVICE) 'sudo systemctl start sensordyme.service && sleep 30 && systemctl is-active sensordyme.service'
+
+deploy-status: ## the device's releases and the last deploy's outcome
+	$(GUARD_AT_REF) | ssh $(DEVICE) 'python3 - status --root $(DIR)'
+
+deploy-rollback: ## switch DEVICE back to the release before the last confirmed deploy (TO=<id> for another)
+	$(GUARD_AT_REF) | ssh $(DEVICE) 'python3 - switch --root $(DIR) --to $(or $(TO),previous) --user "$$(id -un)"'
 
 # =============================================================================
 # Release candidates (M6). A manifest pins exactly what a ref puts on a device;
@@ -334,8 +322,8 @@ deploy: deploy-preflight ## preflight, rsync to pi@sensordyme.local, install dep
 # See docs/RELEASE_MANIFEST.md and docs/MONDAY_RUNBOOK.md.
 # =============================================================================
 REF ?= HEAD
-# Outside the checkout on purpose: `make deploy` rsyncs the working tree, and a
-# manifest left inside it would land on the device as an unexplained extra file.
+# Outside the checkout on purpose: a manifest left in the working tree is noise in
+# every `git status` (deploys ship git objects only, so it can no longer leak).
 RELEASE_DIR ?= $(HOME)/sensordyme-release
 
 release-manifest: ## write $(RELEASE_DIR)/manifest.{json,md} for REF= (default HEAD); TESTS="..." records a test run
@@ -353,3 +341,14 @@ release-verify: ## compare SNAPSHOT= (device snapshot JSON) against $(RELEASE_DI
 # units, focused tests). Seconds on the Mac; changes nothing. See docs/RELEASE_MANIFEST.md.
 verify-release: ## offline release verification of REF= (default HEAD): deps, gates, units, focused tests
 	bash scripts/release/verify.sh $(REF)
+
+# =============================================================================
+# Transfer package (M8.5 PACKAGE): everything the Pi needs, in one verified
+# directory under $(RELEASE_DIR)/transfer-<id>/ — the release bundle + manifest,
+# the hashed aarch64/cp311 wheel set, the pinned .hef (verified before
+# inclusion), config template, install scripts, generated INSTALL.md/MODELS.md
+# and SHA256SUMS. See docs/DEPLOYMENT.md "Transfer package".
+# =============================================================================
+.PHONY: transfer-package
+transfer-package: ## build the Pi transfer package for REF= (default HEAD) into $(RELEASE_DIR)/transfer-<id>/
+	$(VENV)/python scripts/release/build_transfer_package.py --ref $(REF) --out-root $(RELEASE_DIR)

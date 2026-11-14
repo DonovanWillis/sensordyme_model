@@ -97,6 +97,20 @@ check(availability("x").note == "This device can't do this: no IR camera", "unsu
 check(availability("y").blocksSelection && availability("y").note == "Not available on this device",
       "an unknown code still blocks, with a generic reason")
 check(PresetAvailability.make(nil) == .open, "no per-device answer is open (old server)")
+do {
+    // The real backend's role refusal, which the mode list used to show verbatim.
+    let raw = "this device's role is 'driver_safety': preset 'elderly_monitoring' would stop driver_attention; "
+        + "allowed: driver_safety"
+    let state = DevicePresetState(id: "elderly_monitoring", available: false, code: "role_forbids_preset",
+                                  reason: raw, active: false)
+    let made = PresetAvailability.make(state, roleTitle: "Driver safety")
+    check(made.blocksSelection, "a developer-worded role refusal still blocks")
+    check(made.note == "Not available for this device's role (Driver safety)",
+          "and reads as a sentence, naming the role: \(made.note ?? "nil")")
+    check(PresetAvailability.readableReason("Driver role") == "Driver role", "a short sentence is kept")
+    check(PresetAvailability.readableReason("pose: model missing") == "pose: model missing", "a plain reason is kept")
+    check(PresetAvailability.readableReason("needs face_mesh") == nil, "an identifier is not shown")
+}
 
 print("\nvalidation is never overstated:")
 for status in [ValidationStatus.unevaluated, .benchmarkedOffline, .evaluatedInDomain, .unknown] {

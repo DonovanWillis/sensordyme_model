@@ -1,0 +1,241 @@
+{
+ "devices": [
+  {
+   "active_preset": "driver_safety",
+   "credentials": {
+    "auth": "bearer",
+    "refusal": null,
+    "signature_required": false,
+    "state": "accepted"
+   },
+   "desired_preset": null,
+   "hardware_id": "SD-SIM-D505C68A",
+   "health": null,
+   "id": 1,
+   "last_seen": 1794577225.175632,
+   "monitoring": {
+    "active": false,
+    "base_monitoring_disabled": false,
+    "features": [
+     "dwell_in_zone",
+     "preset_settings"
+    ],
+    "instruction": "",
+    "last_rejection": null,
+    "mode": "standard",
+    "overrides_mode": false,
+    "perception": {
+     "components": {
+      "face_landmarks": {
+       "consumers": [
+        "driver_attention"
+       ],
+       "errors": 0,
+       "last_run_age_s": 0.0,
+       "model": {
+        "name": "ScriptedFaceMesh"
+       },
+       "reason": null,
+       "run_ms": 0.01,
+       "runs": 401,
+       "state": "ok"
+      },
+      "hand_landmarks": {
+       "consumers": [
+        "driver_attention"
+       ],
+       "errors": 0,
+       "last_run_age_s": 0.0,
+       "model": {
+        "name": "ScriptedHands"
+       },
+       "reason": null,
+       "run_ms": 0.01,
+       "runs": 134,
+       "state": "ok"
+      },
+      "object_detector": {
+       "consumers": [
+        "driver_attention"
+       ],
+       "errors": 0,
+       "last_run_age_s": 0.0,
+       "model": {
+        "backend": "simulated",
+        "name": "sim-scripted-detector",
+        "sha256": null
+       },
+       "reason": null,
+       "run_ms": 0.01,
+       "runs": 134,
+       "state": "ok"
+      },
+      "pose": {
+       "consumers": [],
+       "errors": 0,
+       "last_run_age_s": null,
+       "model": null,
+       "reason": null,
+       "run_ms": null,
+       "runs": 0,
+       "state": "idle"
+      }
+     },
+     "nodes": [
+      {
+       "experimental": false,
+       "experimental_features": [
+        {
+         "config_key": "behavior_v2",
+         "enabled": false,
+         "id": "behavior_v2",
+         "includes": [
+          "hand-phone interaction",
+          "long-glance classification",
+          "cumulative glance budgets",
+          "gaze zones",
+          "learned temporal phone/eye reasoning"
+         ],
+         "status": "experimental: not validated; off by default"
+        }
+       ],
+       "id": "driver_safety",
+       "kind": "preset",
+       "missing_capabilities": [],
+       "optional_capabilities": [
+        "objects",
+        "hands"
+       ],
+       "reason": null,
+       "required_capabilities": [
+        "camera",
+        "inference",
+        "face",
+        "audible_alert"
+       ],
+       "state": "active",
+       "title": "Driver Safety",
+       "validation": "synthetic_tests",
+       "version": "3"
+      }
+     ],
+     "schema": "sd-perception/1",
+     "simulated": true,
+     "tracking": {
+      "confirm_hits": 2,
+      "confirmed": 1,
+      "created": 2,
+      "dropped_detections": 0,
+      "evicted": 0,
+      "live": 1,
+      "lost_grace_s": 2.0,
+      "max_tracks": 64,
+      "retired": 1,
+      "tracker": "iou_centroid",
+      "update_ms": 0.007,
+      "updates": 134
+     }
+    },
+    "protection": {
+     "degraded": [],
+     "last_command_id": "8deb53b87e3c",
+     "monitoring_state": "ready",
+     "reasons": [],
+     "role": "driver_safety",
+     "state": "protecting"
+    },
+    "role": {
+     "additive_custom_rules": true,
+     "allowed_presets": [
+      "driver_safety"
+     ],
+     "mandatory_alert_types": [
+      "attention_lost",
+      "distraction",
+      "drowsiness",
+      "eyes_down",
+      "eyes_up",
+      "high_risk",
+      "phone_use"
+     ],
+     "mandatory_modules": [
+      "driver_attention"
+     ],
+     "name": "driver_safety",
+     "required_capabilities": [
+      "audible_alert",
+      "camera",
+      "face",
+      "inference"
+     ],
+     "title": "Driver safety"
+    },
+    "rule_count": 0,
+    "simulated": true,
+    "state": "ready",
+    "updated_at": 0.0,
+    "version": ""
+   },
+   "name": "Virtual SensorDyme (SIMULATED)",
+   "online": false,
+   "status": {
+    "actuators": null,
+    "allowed_presets": [
+     "driver_safety"
+    ],
+    "capabilities": null,
+    "corrections": [],
+    "health_freshness": {
+     "age_s": 33.0,
+     "boot_id": "4f032a2cc9feeeb7",
+     "device_generated_at": 1794577182.857188,
+     "generation": 25,
+     "last_ignored": null,
+     "observed_at": 1794577225.175632,
+     "received_at": 1794577225.175632,
+     "repeats": 0,
+     "state": "stale",
+     "threshold_s": 30,
+     "verified": true
+    },
+    "health_stale": true,
+    "last_command_id": null,
+    "last_rejection": null,
+    "link_stale": true,
+    "mode": "standard",
+    "monitoring_active": null,
+    "monitoring_state": "unknown",
+    "nodes_rejection": null,
+    "perception": null,
+    "policies": null,
+    "preset_rejection": null,
+    "protection": "unknown",
+    "protection_command": {
+     "action": "resume",
+     "age_s": 51.0,
+     "applied_at": 1794577209.175632,
+     "delivering": false,
+     "id": "8deb53b87e3c",
+     "outcome": "confirmed",
+     "reason": null,
+     "reported_state": "protecting",
+     "requested_at": 1794577207.125632,
+     "timeout_s": 45.0
+    },
+    "protection_reasons": [],
+    "reasons": [
+     "no report from the device in the last 30 s"
+    ],
+    "reported_at": 1794577225.175632,
+    "role": "driver_safety",
+    "role_title": "Driver safety",
+    "rules": {
+     "active": null,
+     "additive": true,
+     "rejected": null
+    },
+    "stale": true
+   }
+  }
+ ]
+}

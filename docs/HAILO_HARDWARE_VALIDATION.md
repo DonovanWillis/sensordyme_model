@@ -14,6 +14,34 @@ buzzer on BCM 17 (`alerts.gpio_buzzer_pin`). Model:
 `e69136d3ebf3cc8ebaf3da5417a59962b139f3d3d67d715e9a9b1ae10963960e`
 (`accelerator.yolo_hef_sha256`).
 
+## M8.3 additions (2026-11-13): one command per stage, known-good inputs, the device path checked on the fleet
+
+Still **not executed on hardware**. What M8.3 added on top of the steps below:
+
+* **`hwv_stage.py`**: one command per stage, each ending in `STAGE <name>: PASS | FAIL | BLOCKED`.
+  - Stages: `pins`, `model`, `parse-hef`, `capture`, `parity`, `latency`, `thermal`, `buzzer`, plus `list` and `all`.
+  - Exit codes: 0 PASS, 1 FAIL, 2 BLOCKED, 3 SIMULATED.
+  - `--fake` runs a stage against stand-ins (`fake_hailo.py`, a fake GPIO, a synthetic soak CSV) and can never exit 0.
+  - The stage table, commands and provisional criteria are in `docs/MONDAY_HARDWARE_SESSION.md` §6.2.
+  - The stages wrap the scripts below. They do not replace steps 1 to 12.
+* **`sunday_preflight.py`** (M8.4): the one read-only preflight that runs the read-only checks and stages in order and writes one evidence summary; **`check_live_status.py`** checks live status and stream headers against the state model. The first hardware session moved to **Sunday 2026-11-15**: start from `docs/SUNDAY_DEVICE_ACTIVATION.md`.
+* **Known-good inputs** (`known_good/`). Six 640×480 frames with no people:
+  - Four photos: a cat, a cup, a clock and a rocket. All are scikit-image v0.24.0 sample data, CC0 or public domain, verified against scikit-image's own sha256 registry and pasted unscaled.
+  - Two generated frames: flat grey 114 and a test card.
+  - Licensing and hashes are in `SOURCES.json`. `make_known_good.py` rebuilds the set.
+  - Because the frames are camera-sized, `predict()` letterboxes them at scale 1.0 with no resampling, so the Pi's uint8 input tensor is bit-identical to the float run's. The `capture` stage checks this by sha256.
+* **Float expectations** (`known_good/expected_float.json`), made through the device's own `predict()` with the float ONNX standing in for the chip (fleet job `20261113-043857-f182d1`). For each image they hold:
+  - the input-tensor sha256;
+  - per-head statistics;
+  - the legacy detections at 0.05.
+
+  The `parity` stage compares the INT8 capture against them without needing ONNX on the Pi.
+* **Clean refusals.** Every script here now refuses a missing input or missing hardware with one line and exit 2, never a traceback (`hwv_common.run_cli`). `stage_timing.py health` refuses when nothing is listening, instead of polling a dead port for the whole run.
+* **Confirmed on the fleet** (`docs/research/M83_INFERENCE_PATH.md`):
+  - The float ONNX heads are NCHW `(1, 68|81, G, G)`. So the 81st class channel comes from the model, not from compiler padding (max 0.0079 over val), and the `to_nhwc` assumption in `compare_float_vs_int8.py` holds.
+  - The device path reproduces the Mission 5 AP.
+  - **Decoder fixes** (`core/accel.py`): malformed device results now raise errors. Before, they decoded silently to wrong boxes or to no boxes.
+
 ## 0. Questions this answers
 
 | # | Question | Step | Script |

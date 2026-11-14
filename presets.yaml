@@ -54,7 +54,7 @@ presets:
   # comma.ai's model. It is simply no longer a product decision.
   driver_safety:
     title: Driver Safety
-    description: Eyes, gaze, head pose, hands, phone use, drowsiness and risk fusion.
+    description: Drowsiness, eyes off the road, and phone use while looking away. Hand tracking and the combined risk score are experimental observations, never alerts.
     module: driver_attention
     variants:
       standard: { title: Standard }
@@ -67,7 +67,16 @@ presets:
       long_haul:
         title: Long Haul
         overrides: { perclos_threshold: 0.12, perclos_window_s: 45.0 }
-    version: 2
+    # 3 (M8): phone_use judges only the driver's phone and never one hand
+    # tracking shows set down; a downward look that lowers the lids is
+    # eyes_down, not closure; a camera stall credits one frame of evidence.
+    # 4 (M8.4): high_risk / elevated_risk / erratic_hand_movement are experimental
+    # observations, no longer alerts; a visible phone no longer raises the risk score.
+    # 5 (M8.5): phone_use needs the driver's phone HANDLED (a hand on it, or, with
+    # holding unobserved, the phone moving / at the face / in the lap zone under a
+    # downward gaze); a look at a mounted or unheld phone is eyes_down / distraction,
+    # never phone_use; a larger passenger's phone is not the driver's.
+    version: 5
     product_mode: driver_safety
     # Face landmarks carry drowsiness, distraction and attention-lost, and a
     # driver alert nobody in the cabin hears protects no one. Objects (phone,
@@ -79,17 +88,21 @@ presets:
       accelerator: Hailo-8L for object detection (phone, food, drink); face/hands run on the Pi CPU
       audible_output: required (gpio_buzzer or sound)
     temporal_policies:
-      - { event: drowsiness, description: eyes closed continuously, sustain_s: 2.0, setting: drowsy_seconds }
+      - { event: drowsiness, description: "eyes closed continuously (lids lowered by a downward look are not closure)", sustain_s: 2.0, setting: drowsy_seconds }
       - { event: distraction, description: head turned away from the road, sustain_s: 3.0, setting: distraction_seconds }
-      - { event: eyes_down, description: looking down (phone in lap), sustain_s: 2.5, setting: eyes_down_seconds }
-      - { event: phone_use, description: phone visible while the gaze is off the road, sustain_s: 2.0, setting: phone_use_seconds }
+      - { event: eyes_down, description: "looking down, away from the road (for example at a phone in the lap)", sustain_s: 2.5, setting: eyes_down_seconds }
+      - { event: phone_use, description: "the gaze off the road while the driver's phone is handled: a hand on it, or, when no hand is seen, the phone moving, at the face, or in the lap below the face with the gaze down (hand tracking is experimental; the phone-handling evidence is unvalidated). A mounted or unheld phone is never phone use: a long look at it is eyes_down or distraction", sustain_s: 2.0, setting: phone_use_seconds }
       - { event: attention_lost, description: face lost and no person detected, sustain_s: 2.5 }
       - { event: fatigue_warning, description: eyes closed for more than the PERCLOS share of a rolling window, window_s: 60.0 }
       - { event: frequent_glancing, description: repeated off-road glances within a rolling window, window_s: 45.0 }
     alert_patterns:
       - { tone: critical, events: [drowsiness, attention_lost], description: "continuous alarm; repeats while the condition lasts (bounded)" }
-      - { tone: loud, events: [distraction, eyes_down, eyes_up, phone_use, high_risk], description: "loud tone; repeats while the condition lasts (bounded)" }
-      - { tone: soft, events: [fatigue_warning, frequent_glancing, elevated_risk, erratic_hand_movement], description: "soft chime, once per episode" }
+      - { tone: loud, events: [distraction, eyes_down, eyes_up, phone_use], description: "loud tone; repeats while the condition lasts (bounded)" }
+      - { tone: soft, events: [fatigue_warning, frequent_glancing], description: "soft chime, once per episode" }
+    # M8.4 owner decision A: high_risk, elevated_risk and erratic_hand_movement are
+    # EXPERIMENTAL OBSERVATIONS -- logged (severity "log", `experimental: true` in the
+    # app), in no tone above, never pushed. Only alerts.experimental_alerts_audible:
+    # true (an explicit owner opt-in in config.yaml) makes them audible again.
     settings:
       - { key: drowsy_seconds, title: Eyes-closed time before alert, type: number, default: 2.0, min: 1.0, max: 3.0, step: 0.1, unit: s }
       - { key: distraction_seconds, title: Looking-away time before alert, type: number, default: 3.0, min: 1.0, max: 5.0, step: 0.1, unit: s }
@@ -97,7 +110,7 @@ presets:
       - { key: phone_use_seconds, title: Phone-use time before alert, type: number, default: 2.0, min: 0.5, max: 4.0, step: 0.1, unit: s }
       - { key: glance_min_count, title: Glances that count as frequent, type: number, default: 5, min: 2, max: 10, step: 1, unit: glances }
       - { key: perclos_threshold, title: Eyes-closed share for a fatigue warning, type: number, default: 0.15, min: 0.08, max: 0.3, step: 0.01, unit: fraction }
-      - { key: enable_hands, title: Use hand tracking for phone use, type: bool, default: true }
+      - { key: enable_hands, title: "Experimental: hand tracking (skips a phone that looks set down)", type: bool, default: true }
     compatibility:
       # On a driver_safety-role device custom rules run BESIDE this preset
       # (additive, core/roles.py); on any other role they replace it.
@@ -106,6 +119,11 @@ presets:
       - Face landmarks (MediaPipe Face Mesh) are unevaluated on in-cabin NoIR footage; the model card excludes life-critical use
       - The object detector gives a false phone box on about 60% of phone-free public validation images at the shipped threshold
       - Cannot tell texting from reading, or see the road; sunglasses and night driving are untested
+      - Hand-on-phone and looking-down rules are tested on synthetic scenes only; the hand model often misses a gripping hand
+      - "Unvalidated phone-handling evidence (M8.5): with no hand seen, a phone counts as handled only if it moved in the last 2 s, is at the face, or sits in the lap below the face while the driver looks down. A phone held perfectly still elsewhere (for example beside the wheel) with no hand seen reads as mounted: the look still alerts as eyes_down or distraction, 0.5-1 s later than phone_use would have. The thresholds are image geometry and timing tested on synthetic scenes only"
+      - A visible or mounted phone is not phone use; phone_detected is logged, never alerted
+      - "Experimental and unvalidated, logged as observations and never sounded or pushed: the combined risk score (high_risk, elevated_risk) and erratic_hand_movement (hand tracking). A merely visible or mounted phone no longer adds to the risk score; only a phone hand tracking sees held, with the eyes off the road, does"
+      - "Which person is the driver is assumed (the person whose face is measured, else the largest person box) for phone use as well; driver-vs-passenger association is unevaluated"
     evidence:
       - docs/MODEL_REGISTRY.md
       - docs/DETECTION_THRESHOLDS.md
@@ -221,7 +239,7 @@ presets:
       play_area:
         title: Play Area
         overrides: { still_warning_s: 60, zone_confirm_s: 1.5 }
-    version: 2
+    version: 3
     product_mode: child_monitoring
     required_capabilities: [camera, inference, objects, alert_output]
     # Pose carries flailing and choking-hazard scoring; presence, zones and
@@ -236,8 +254,11 @@ presets:
       - { event: person_absent, description: nobody visible (when presence is expected), sustain_s: 30.0, setting: absence_warning_s }
       - { event: safe_zone_exit, description: leaving the user-drawn safe area, sustain_s: 2.0, setting: zone_confirm_s }
       - { event: zone_violation, description: entering a user-drawn danger area, sustain_s: 2.0, setting: zone_confirm_s }
-      - { event: flailing, description: frantic arm movement over about 1.2 s }
-      - { event: choking_hazard, description: a hand-held small object closing on the mouth region }
+      # Experimental (M8): pose-based, unevaluated on any footage of children. Reported as
+      # experimental features of the node (perception.nodes[].experimental_features), with
+      # whether this device runs them (config_key). Neither detects choking or distress.
+      - { event: flailing, description: "EXPERIMENTAL: fast, repeated arm movement over about 1.2 s (pose; unevaluated)", experimental: true, config_key: enable_pose }
+      - { event: choking_hazard, description: "EXPERIMENTAL: a hand-held small object closing on the mouth region (pose + boxes; not choking detection, unevaluated)", experimental: true, config_key: enable_pose }
     alert_patterns:
       - { tone: loud, events: [zone_violation, safe_zone_exit, unusual_stillness, person_absent, flailing, choking_hazard, infant_unidentified], description: loud tone and push }
     settings:
@@ -245,6 +266,10 @@ presets:
       - { key: absence_warning_s, title: Out-of-view time before alert, type: number, default: 30, min: 5, max: 300, step: 5, unit: s }
       - { key: expect_presence, title: Alert when nobody is visible, type: bool, default: true }
       - { key: zone_confirm_s, title: Time outside/inside an area before alert, type: number, default: 2.0, min: 0.5, max: 10.0, step: 0.5, unit: s }
+      # M8: off by default. Both pose features are experimental and unevaluated on any
+      # footage of children, so an owner must opt in; presence, zones and stillness
+      # do not need pose.
+      - { key: enable_pose, title: "Experimental: arm-movement and object-near-mouth alerts", type: bool, default: false }
     compatibility:
       custom_rules: replace
     limitations:
@@ -280,16 +305,19 @@ presets:
       accelerator: Hailo-8L for the shared object detector
       audible_output: not required (alerts go to the app)
     temporal_policies:
-      - { event: person_entered, description: the settled person count rose (a count must hold for 2 s), sustain_s: 2.0 }
-      - { event: person_exited, description: the settled person count fell, sustain_s: 2.0 }
-      - { event: zone_dwell, description: someone stayed inside a drawn area, sustain_s: 30.0 }
+      - { event: person_entered, description: a new tracked person has been seen for 2 s (people already present when counting starts are not entries), sustain_s: 2.0 }
+      - { event: person_exited, description: a counted person's track was lost for the tracker's 2 s grace, sustain_s: 2.0 }
+      - { event: zone_entered, description: a tracked person's feet were inside a drawn area for 2 s (logged), sustain_s: 2.0 }
+      - { event: zone_exited, description: "a tracked person left a drawn area, with how long they stayed (logged)", sustain_s: 2.0 }
+      - { event: zone_dwell, description: one tracked person stayed inside a drawn area (once per visit), sustain_s: 30.0 }
       - { event: capacity_exceeded, description: more people than the set capacity (off unless set) }
     alert_patterns:
       - { tone: soft, events: [capacity_exceeded, zone_dwell], description: "push to the app; no local tone" }
     compatibility:
       custom_rules: replace
     limitations:
-      - Counts per-frame person boxes; people hidden behind others are not counted and identities are not tracked
+      - Counts tracked person boxes (core/tracking.py); people hidden behind others are not counted
+      - Identity is box tracking, not recognition; two people crossing can swap ids, and someone out of view for over 2 s returns as a new person
       - Exercised only on the virtual device (synthetic scenes); no in-domain occupancy evidence exists
     evidence:
       - docs/M7_IMPLEMENTATION_MAP.md

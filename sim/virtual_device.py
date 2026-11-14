@@ -145,6 +145,38 @@ def _advertise(identity, port: int, host: str):
     return zc, info
 
 
+def _health_freeze_signals(device) -> None:
+    """A fault for the iOS UI tests (scripts/sim/uitest_control.py POST /health):
+    SIGUSR1 freezes the health this device reports while it keeps polling (the
+    sampling thread stops handing samples to the uplink, which re-sends the last
+    one), SIGUSR2 lets samples through again. The same fault as
+    tests/test_m81_health_freshness_sim.py `_freeze`; a restart clears it.
+    The acknowledgement is written with os.write: print() from a signal handler
+    can re-enter the buffered stdout the device is printing to."""
+    import signal
+
+    if not hasattr(signal, "SIGUSR1"):
+        return
+
+    def say(text: str) -> None:
+        os.write(sys.stdout.fileno(), f"SensorDyme SIM: {text}\n".encode())
+
+    def freeze(*_) -> None:
+        uplink = getattr(device.runtime, "uplink", None)
+        if uplink is not None:
+            uplink.set_health = lambda report: None
+            say("FAULT health frozen (SIGUSR1): polling continues with the last health sample")
+
+    def thaw(*_) -> None:
+        uplink = getattr(device.runtime, "uplink", None)
+        if uplink is not None:
+            vars(uplink).pop("set_health", None)
+            say("FAULT health cleared (SIGUSR2): health samples flow again")
+
+    signal.signal(signal.SIGUSR1, freeze)
+    signal.signal(signal.SIGUSR2, thaw)
+
+
 def main(argv: Optional[list[str]] = None) -> int:
     args = _parse(argv)
     sys.path.insert(0, str(REPO))
@@ -202,6 +234,7 @@ def main(argv: Optional[list[str]] = None) -> int:
 
         advert = (_advertise(identity, args.dashboard_port, args.dashboard_host)
                   if args.mdns and not args.no_dashboard else None)
+        _health_freeze_signals(device)
         try:
             device.run()
         finally:

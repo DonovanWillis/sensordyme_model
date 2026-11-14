@@ -178,7 +178,12 @@ def test_driver_attention_declarations_match_the_registry():
     from modules.driver_attention import DriverAttentionModule
 
     declared = {k for needs in DriverAttentionModule._EVENT_REQUIREMENTS.values() for k in needs}
-    assert declared == set(mr.load_registry().module_map["driver_attention"].uses)
+    derived = DriverAttentionModule.DERIVED_CAPABILITIES
+    uses = set(mr.load_registry().module_map["driver_attention"].uses)
+    # A derived capability (e.g. the calibrated forward gaze) is computed from a
+    # model capability the registry does list; it is never a model of its own.
+    assert set(derived.values()) <= uses
+    assert declared - set(derived) == uses
 
 
 # ---------------------------------------------------------------------- the ladder

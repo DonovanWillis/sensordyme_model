@@ -1,10 +1,21 @@
-# Monday hardware runbook — Raspberry Pi 5 + Hailo-8L + Camera Module 3 Wide NoIR
+# Hardware runbook ("Monday runbook") — Raspberry Pi 5 + Hailo-8L + Camera Module 3 Wide NoIR
+
+> **M8.4 date change (2026-11-13):** the device arrives **Sunday 2026-11-15**, not Monday.
+> "Monday" below means *the first hardware session*, now Sunday. Start from
+> **`docs/SUNDAY_DEVICE_ACTIVATION.md`** (25 steps, the read-only `sunday_preflight.py`,
+> the compatibility checklist); it cites this runbook as RB-x. The file name is kept so
+> existing links work. The release candidate is now `feat/m8.4-leapfrog` (§0).
 
 > **STATUS: NOT EXECUTED — requires the physical device.** Every command, expected
 > output and pass criterion below was written on a Mac on 2026-11-11 from the code
 > and the M5 package. None has been run against the Pi. Where an expected output
 > is a best expectation rather than measured, it says so. Record what you
 > actually see in the evidence log (§N) even when it matches.
+>
+> **M8 update (2026-11-12):** brought up to the M8 release candidate. What changed for
+> Monday is collected in **§R** (new checks, the rewritten K4, the optional
+> proof-of-possession onboarding session, and a map of every Monday task A–Q to its step).
+> Still NOT EXECUTED: nothing in M8 ran on the Pi, the Hailo, the camera or a radio.
 
 Who runs this: the **owner/operator**, at the device. Agents prepared it and are
 not authorized to SSH to the Pi, change its networking, install Tailscale,
@@ -23,8 +34,9 @@ Reuses, does not duplicate:
 ```bash
 # On the Mac (repo checkout at the release candidate):
 export PI=<user>@<pi-host-or-ip>      # e.g. pi@sensordyme.local. The user may NOT be `pi` (Bookworm)
-export RC=m6/autonomy-security-runbook # the approved release ref (or its merged successor)
+export RC=feat/m8.4-leapfrog  # M8.4 candidate (pending owner approval; was feat/m8.3-hardware-truth); the integrator records `git rev-parse $RC`
 export REL=~/sensordyme-release        # manifest + tarball + evidence on the Mac
+export VENV=$HOME/.venvs/sensordyme-m01/bin  # M8.1: the Makefile defaults to .venv/bin, which this checkout does not have
 
 # On the Pi, discover the real service user and install directory first (§C1), then:
 export U=<service user>  D=/home/$U/sensordyme
@@ -42,7 +54,7 @@ Rules:
 
 ---
 
-## A. Before Monday (Mac; no device needed)
+## A. Before the hardware session (Mac; no device needed)
 
 **A0. One-command offline release verification** (read-only; M6.5; ~15 s on the Mac):
 ```bash
@@ -61,13 +73,15 @@ release tests. **FAIL:** do not take this ref to the device. The status-tier tab
 ```bash
 git switch --detach $RC && git status --short            # expect: nothing
 PYTHONDONTWRITEBYTECODE=1 ~/.venvs/sensordyme-m01/bin/python -m pytest -p no:cacheprovider -q \
-  tests/test_m6_*.py tests/test_m02_*.py tests/test_m01_*.py tests/test_m5_hw_validation.py
+  tests/test_m6_*.py tests/test_m02_*.py tests/test_m01_*.py tests/test_m5_hw_validation.py \
+  tests/test_m7_*.py tests/test_m8_*.py
 ```
-Expect: `… passed` with 0 failed. Record the line; it goes into the manifest.
+Expect: `… passed` with 0 failed. Record the line; it goes into the manifest. (The full suite,
+`make test`, is ~3,200 tests and ~7 minutes on the Mac; run it once on the exact RC commit.)
 
 **A2. Build the manifest** (read-only on the repo; writes `$REL`):
 ```bash
-make release-manifest REF=$RC RELEASE_DIR=$REL TESTS="<the A1 summary line>, <date>, <machine>"
+make release-manifest VENV=$VENV REF=$RC RELEASE_DIR=$REL TESTS="<the A1 summary line>, <date>, <machine>"
 ```
 Expect: `<commit>  <N> files  aggregate <hash>…  model pins consistent: True`, exit 0.
 **FAIL** if the pins are not consistent: do not take this ref to the device.
@@ -146,7 +160,7 @@ dpkg -l | grep -E 'hailo|hailort|rpicam|libcamera0|python3-picamera2|bluez|netwo
 hailortcli --version
 $PY -m pip freeze > $EV/pip_freeze_before.txt
 sha256sum $D/models/*.hef
-cd $D && git rev-parse HEAD 2>/dev/null || echo "not a git checkout (expected: make deploy rsyncs files)"
+cd $D && git rev-parse HEAD 2>/dev/null || echo "not a git checkout (expected: deployed from a release tarball)"; readlink $D || true   # M8.5: a symlink to sensordyme.releases/<id> once adopted (§R6)
 ```
 Expect: hailo-all / HailoRT 4.x installed; the `.hef` sha256 is `e69136d3…960e` (pinned) or `4c71eab8…add2` ("evaluated": unverified provenance, which the runtime refuses).
 
@@ -246,7 +260,7 @@ Clean install (fresh Raspberry Pi OS Bookworm 64-bit + `setup_pi.sh`) **only if 
 - OS is not Bookworm 64-bit, or `hailo-all` cannot be installed or upgraded on it;
 - the install tree cannot be identified (C4 matches no revision, with large unexplained drift) **and** the backup (E1) is complete;
 - unknown users, keys, services or cron jobs that cannot be explained (possible compromise);
-- the service user is root, or the venv is broken beyond `pip install -r requirements-device.txt`.
+- the service user is root, or the venv is broken beyond a hashed reinstall (`.venv/bin/python -m pip install --require-hashes --only-binary=:all: -r requirements-device.lock`).
 
 Otherwise **upgrade in place** (§F). It keeps NetworkManager, BlueZ, avahi and the identity untouched. A clean install loses NetworkManager profiles unless restored, and needs the backend device key and the dashboard token re-entered from the E1 backup.
 
@@ -256,8 +270,16 @@ Otherwise **upgrade in place** (§F). It keeps NetworkManager, BlueZ, avahi and 
 
 **F0. Precheck the device config against the release** (Mac, read-only on the device):
 ```bash
-make deploy-preflight ROLE=driver_safety     # copies only config.yaml to a temp dir; prints REFUSED/OK
+make deploy-preflight VENV=$VENV ROLE=driver_safety     # copies only config.yaml to a temp dir; prints REFUSED/OK
 ```
+`make deploy-preflight` is hard-wired to `pi@sensordyme.local:~/sensordyme`. If §C1 found a different user, host or directory, run the same check by hand (M8.1):
+```bash
+DPI=<install dir from §C1, e.g. /home/<user>/sensordyme>     # on the Mac; $D exists only on the Pi
+T=$(mktemp -d) && scp -q $PI:$DPI/config.yaml $T/config.yaml && \
+$VENV/python scripts/deploy_preflight.py --config $T/config.yaml --expect-role driver_safety \
+  --hef-sha256 "$(ssh $PI "sha256sum $DPI/models/damoyolo_tinynasL20_T.hef | cut -d' ' -f1")"; rm -rf $T
+```
+**Expected first REFUSED on a pre-M0.1 install:** a config with no `role:` runs as `general` and is refused for a `driver_safety` deploy (M8.1 dry run on the `50e9441` config). Add `role: driver_safety` to the device's config by hand (a deliberate, recorded change: deploys never change a role), then re-run.
 **FAIL:** any REFUSED. Fix the device config deliberately first (for example `profile: pi`, the model pin). Read every warning (token length, `http://`, frame capture) and record them.
 
 **F1. Stop, then stage the new tree beside the old one:**
@@ -279,7 +301,7 @@ cp -a $D/.venv $STAGE/.venv              # same final path, so the venv's absolu
 ```bash
 PREV=$(dirname $D)/sensordyme.prev-$(date +%Y%m%dT%H%M%S)
 mv $D $PREV && mv $STAGE $D && echo "$PREV" > ~/m6-previous-release-path
-cd $D && .venv/bin/pip install -q -r requirements-device.txt && .venv/bin/pip install -q gpiozero==2.0.1 lgpio==0.2.2.0
+cd $D && .venv/bin/python -m pip install --require-hashes --only-binary=:all: --disable-pip-version-check --no-input -r requirements-device.lock   # M8.5: the hashed lock (gpiozero/lgpio are in it; simpleaudio is not on Linux: sound uses aplay)
 python3 scripts/migrate_config.py config.yaml             # prints added keys; never removes any
 sudo bash scripts/release/install_units.sh --user $U      # installs sensordyme.service + the recovery unit + guard
 systemctl cat sensordyme.service | grep -E 'StartLimitAction|OnFailure'   # expect: none / sensordyme-recover.service
@@ -289,9 +311,10 @@ sha256sum $D/models/*.hef                                 # expect: e69136d3…9
 
 > M6.5 notes for F2. `requirements-device.txt` no longer contains `pytest` or `anthropic`; pip
 > does not uninstall them, so an existing venv keeps them (harmless; `release-verify` compares
-> only the pins). Do not switch to `requirements-device.lock` (`--require-hashes`) or to the
-> least-privilege unit (`deploy/systemd/sensordyme.service.hardened`) on Monday: both are
-> hardware-pending and are a separate, later session (`docs/LEAST_PRIVILEGE.md`). F2 installs
+> only the pins). M8.5: F2 now installs the hashed `requirements-device.lock` (wheels only;
+> `docs/DEPLOYMENT.md`). Do not switch to the least-privilege unit
+> (`deploy/systemd/sensordyme.service.hardened`) in the first session: it is hardware-pending and a
+> separate, later session (`docs/LEAST_PRIVILEGE.md`). F2 installs
 > the **stock** unit, as before. No identity changes: device id, device key and claim code are
 > carried over by F1 unchanged, and no key is rotated.
 
@@ -299,7 +322,7 @@ sha256sum $D/models/*.hef                                 # expect: e69136d3…9
 ```bash
 $PY $V/integrity_manifest.py snapshot --root $D --expect-role driver_safety --out $EV/integrity_rc.json
 # Mac:
-scp $PI:m6-evidence/integrity_rc.json $REL/ && make release-verify RELEASE_DIR=$REL SNAPSHOT=$REL/integrity_rc.json
+scp $PI:m6-evidence/integrity_rc.json $REL/ && make release-verify VENV=$VENV RELEASE_DIR=$REL SNAPSHOT=$REL/integrity_rc.json
 ```
 Expect: `VERDICT: PASS against <commit>`: deployed files exact, model hash = pin, device config pins it, requirements installed, unit matches, preflight ok. **FAIL:** do not start. Explain each failing check, or roll back (§O).
 
@@ -397,6 +420,8 @@ Pass: `get_throttled` stays `0x0` throughout (no sticky bits 16/18); ARM clock n
 
 ## K. Autonomy: boot, Wi-Fi loss, reconnection, reboot, restart policy
 
+> **Journal timing (M8.3 check against the code).** Four quoted lines in K and L are written with `print()` to stdout, not the logger: `restored the last selected mode` (main.py), `switched to preset` and `rules: enforcing` (services/runtime.py), and `cloud_uplink: connection lost` / `connected to` (core/uplink.py). The unit runs Python without `-u`, so under systemd these can reach `journalctl` late or out of order with the `[PROTECTION]`/`[MONITORING]` logger lines. If a `grep` for one of them finds nothing, wait 30 s and re-run it before recording a FAIL.
+
 **K1. Reboot and reconnection** (CHANGE: reboot):
 ```bash
 sudo reboot
@@ -426,14 +451,37 @@ The app should report success, then `nmcli -t -f ACTIVE,SSID dev wifi | grep ^ye
 
 `journalctl -u sensordyme --since "-10 min" | grep cloud_uplink > $EV/uplink_outage.txt`.
 
-**K4. Bad config is refused, not looped** (CHANGE; restore after):
+**K4. Damaged config: boots on the last-known-good, never loops** (CHANGE; restore after). M8 changed this step: a damaged `config.yaml` no longer leaves the device dark when a known-good copy exists.
+
+The runtime records `data/config.last_good.yaml` (0600) once it has started successfully on a config, so after F4 the copy should exist.
+
+*K4a, with a saved copy:*
 ```bash
 sudo systemctl stop sensordyme && cp -p $D/config.yaml ~/config.good
+ls -l $D/data/config.last_good.yaml          # expect: -rw------- $U ... (recorded after F4). Absent? -> K4b only, record why
 echo "module: [unclosed" | sudo -u $U tee -a $D/config.yaml >/dev/null
+sudo systemctl start sensordyme; sleep 60
+systemctl show sensordyme -p ActiveState -p NRestarts -p ExecMainStatus
+curl -s -H "X-Device-Token: $TOKEN" localhost:8899/api/health | $PY -c '
+import json,sys;d=json.load(sys.stdin)["device"];print(d["config"]);print(d["monitoring"]["state"])'
+grep config_fault $D/data/events.csv | tail -1
+```
+Expect:
+- `ActiveState=active`, `NRestarts=0`, no reboot;
+- `config` = `{"source": "last_known_good", "fault": "<parse error …>", "running_from": "…/data/config.last_good.yaml", …}`;
+- monitoring `ready` (or the same state as before the damage);
+- one `config_fault` row;
+- `config.yaml` itself is still the damaged file, because the device never rewrites it.
+
+*K4b, with no saved copy* (the pre-M8 behaviour, still the fallback):
+```bash
+sudo systemctl stop sensordyme && sudo -u $U mv $D/data/config.last_good.yaml ~/last_good.bak
 sudo systemctl start sensordyme; sleep 15
 systemctl show sensordyme -p Result -p ExecMainStatus -p NRestarts -p ActiveState
 ```
-Expect: `ExecMainStatus=78`, `ActiveState=failed`, `NRestarts=0`, no reboot, and `journalctl -u sensordyme-recover` reporting "unit result is 'exit-code' … no reboot". Restore: `sudo -u $U cp -p ~/config.good $D/config.yaml && sudo systemctl reset-failed sensordyme && sudo systemctl start sensordyme`.
+Expect: `ExecMainStatus=78`, `ActiveState=failed`, `NRestarts=0`, no reboot, and `journalctl -u sensordyme-recover` reporting "unit result is 'exit-code' … no reboot".
+
+Restore both: `sudo -u $U cp -p ~/config.good $D/config.yaml && sudo -u $U mv ~/last_good.bak $D/data/config.last_good.yaml && sudo systemctl reset-failed sensordyme && sudo systemctl start sensordyme`.
 
 **K5. Crash loop is bounded across boots** (CHANGE; optional, owner-approved; leaves a reboot budget record):
 Simulate a startup crash, e.g. `sudo systemctl edit sensordyme` with `[Service]` / `ExecStart=` / `ExecStart=/bin/false`. Expect: 5 failures within ~20 s, then the unit enters `failed (start-limit-hit)`, `sensordyme-recover` logs "start limit hit: rebooting (1 of 3 …)" and the Pi reboots. After the third reboot inside 6 h it logs "leaving the service failed and the device up", and SSH stays available. Clean up with `sudo systemctl revert sensordyme && sudo systemctl reset-failed sensordyme && sudo rm /var/lib/sensordyme-recover/reboots.json && sudo systemctl start sensordyme`.
@@ -454,9 +502,14 @@ Simulate a startup crash, e.g. `sudo systemctl edit sensordyme` with `[Service]`
    ```
    The app shows the live feed, the device's real monitoring state, and the device id equal to the C2 id.
 
-**L2. Presets:** from the app, switch Driver Safety → Elderly Monitoring → Driver Safety. Expect each switch confirmed in the app within ~2 poll intervals, and the journal `switched to preset …`. On a `driver_safety`-role device, a role-violating preset is **refused** with a reason (409 locally / refusal in the app). That refusal is the M0.1 safety floor, not a failure.
+**L2. Presets:** this unit is `role: driver_safety` (config.yaml; `core/roles.py` allows only the `driver_safety` preset on that role). From the app, select Driver Safety (and a variant, e.g. Strict): expect it confirmed within ~2 poll intervals and the journal `switched to preset …`. Then select Elderly Monitoring: on this unit it must be **refused** with the reason `this device's role is 'driver_safety': preset 'elderly_monitoring' would stop driver_attention; allowed: driver_safety` (409 `role_forbids_preset` from the backend / 409 locally / the refusal shown in the app), and Driver Safety keeps running. That refusal is the M0.1 safety floor, not a failure. (Corrected in M8.3: this step used to expect Elderly Monitoring to switch, which the code refuses on this role.)
 
-**L3. Custom rules:** in the app, Configure with AI, e.g. "alert me if a phone is visible for 5 seconds"; review, then activate. Expect: the journal shows the rule set applied (rules version reported upstream); `/api/state` → `policy` shows the custom configuration; holding a phone in view for 5 s produces an alert in the app. Then switch back to Driver Safety and confirm the rules stop. Stop/resume: from the app, stop protection (with confirmation), then resume. Expect `[PROTECTION] STOPPED` / `resumed`, each applied exactly once.
+**L3. Custom rules:** in the app, open **Ask Jupiter** (formerly "Configure with AI"), e.g. "alert me if a phone is visible for 5 seconds"; review, then **Activate**. Expect:
+- journal `rules: enforcing 1 AI-configured rule(s)` and `[MONITORING] mode=standard_plus_custom module=driver_attention base_monitoring=enabled …` (the rules version goes upstream as `rules_version`; it is not logged);
+- `/api/state` → `policy.mode` is `standard_plus_custom` (custom rules run beside Driver Safety on this role; `policy` holds `role`, `protection`, `mode`, `last_rejection`, `features`, not the rules), and `/api/health` → `device.monitoring.custom_rules` lists the rule;
+- holding a phone in view for 5 s produces an alert in the app. This is a custom "phone visible" rule, not the product's `phone_use` alert: a visible phone alone is not phone use.
+
+Then select Driver Safety again and confirm the rules stop (journal `[MONITORING] custom monitoring exited: explicit mode switch`). Stop/resume: from the app, **Stop monitoring** (confirm "Stop monitoring?"), then **Resume monitoring**. Expect `[PROTECTION] STOPPED by …` / `[PROTECTION] resumed by …`, each logged exactly once.
 
 > **M6.5 notes for K and L.**
 >
@@ -465,7 +518,7 @@ Simulate a startup crash, e.g. `sudo systemctl edit sensordyme` with `[Service]`
 >   - Do not run `scripts/migrate_device_key.py` (dry-run by default) and do not rotate keys on Monday.
 > - **BLE provisioning.** It stays `network.provisioning.auth: legacy`, so K2 uses the existing app flow. The proof-of-possession flow (`docs/BLE_PROOF_OF_POSSESSION.md`) needs a setup-code label, an app build with its setup screen, and its own hardware session. Do not set `deployment: production` on Monday: with `legacy` that is a schema error by design.
 > - **Person rules.** Custom rules on `person` now receive the driver's person box (fixed in M6.5; before, "nobody in the seat" fired with the driver seated). If L3 includes a person rule, record whether it fires correctly.
-> - **Ask Jupiter.** In the app use the full Ask Jupiter screen (the "Examples" link or the custom-rules card). The inline Ask Jupiter bar on the device screen failed UI automation: its field did not take keyboard focus. If it works by hand on the phone, record that in `$EV/LOG.md`.
+> - **Ask Jupiter.** In the app use the full Ask Jupiter screen (the "All examples" link or the custom-rules card). The inline Ask Jupiter bar on the device screen failed UI automation: its field did not take keyboard focus. If it works by hand on the phone, record that in `$EV/LOG.md`.
 > - **`calibration.json`.** A `calibration.json` that is not a JSON object is now ignored and the driver recalibrates. Before, the device booted FAILED every time.
 
 
@@ -518,7 +571,7 @@ systemctl is-active sensordyme.service && sha256sum /etc/systemd/system/sensordy
 ```
 The previous unit has no `OnFailure=`, so the recovery unit stays installed and inert. `config.yaml` and `data/` changed after the swap (for example a token set in §L1) live in the failed tree: copy them back deliberately if wanted.
 
-**O2. To the exact pre-Monday state:** restore E1. Stop the service, then `tar -xzf sensordyme_tree.tgz -C $(dirname $D)` (the venv is not in the archive, so keep the existing `.venv` or recreate it with setup_pi.sh), then `sudo tar -xzf system_glue.tgz -C /`, `sudo systemctl daemon-reload`, and start the service.
+**O2. To the exact pre-session state:** restore E1. Stop the service, then `tar -xzf sensordyme_tree.tgz -C $(dirname $D)` (the venv is not in the archive, so keep the existing `.venv` or recreate it with setup_pi.sh), then `sudo tar -xzf system_glue.tgz -C /`, `sudo systemctl daemon-reload`, and start the service.
 
 **O3. Total:** write the E5 image back to the card. On the Mac: `diskutil unmountDisk /dev/diskN && sudo dd if=$REL/pi-sd-<date>.img of=/dev/rdiskN bs=4m status=progress`. Check the disk number twice.
 
@@ -554,10 +607,166 @@ All items are **NOT EXECUTED — requires the physical device**. Tick only with 
 - [ ] K1 reboot: same device id, `ready`, app online, preset and rules restored
 - [ ] K2 offline monitoring still alerts; BLE provisioning joins Wi-Fi from the app; a refused credential reaches the app
 - [ ] K3 outage: backoff observed; reconnect ≤ ~45 s; queued alert delivered exactly once
-- [ ] K4 bad config → exit 78, unit stopped, no reboot
+- [ ] K4a damaged config → boots on the last-known-good, `config.source=last_known_good`, `config_fault` row, no reboot; K4b with no saved copy → exit 78, unit stopped, no reboot
 - [ ] K5 (optional) crash loop → at most 3 reboots in 6 h, then the device stays up
 - [ ] L1 pairing: header token 200, missing or query token 401; app shows the live feed and the real state
 - [ ] L2 preset switches confirmed; a role-violating preset refused with a reason
 - [ ] L3 custom rule fires in the app; stop/resume each applied once
 - [ ] N evidence copied off the Pi; frame-bearing data handled per M5
 - [ ] O1 rollback path confirmed available (`~/m6-previous-release-path` exists, E1 backup verified)
+- [ ] R1 M8 health fields as expected (`config.source=config`, no `saved_state` faults, `uplink_backlog.persistent`, accelerator `detector_available`)
+- [ ] R2 `attention` capability STARTING during calibration, then READY; drowsiness alerts throughout
+- [ ] R3 G3 with tracking: `tracking.updates` = detector runs; occupancy-style counts stable with one seated person
+- [ ] R4 outage + power cut: queued alert delivered exactly once after power returns
+- [ ] R5 (optional, separate session) proof-of-possession onboarding, BLE doc steps 1–10, all recorded
+- [ ] R6 (optional) rollback guard: one deliberately broken `make deploy` rolls back by itself
+
+---
+
+## R. M8 additions (2026-11-12): what changed for Monday, and the extra checks
+
+M8 (`feat/m8-product-intelligence`) changes device behaviour in ways the steps above must expect. Every M8 claim is **simulator- or test-verified only**. The steps below are where the Pi proves or disproves them.
+
+### R0. Monday task map (task → step). Hardware-only gates are marked **HW**; everything else was already proven in software on the Mac.
+
+| Task | Where | Notes |
+|---|---|---|
+| A. Initial physical inspection | B1–B3 | **HW** |
+| B. Safe backup of the installed system | E1–E5 | **HW**; nothing is flashed before E5 |
+| C. Clean install vs upgrade | E6 | default: upgrade in place; never factory-reset by default |
+| D. Version-pinned deployment | A0–A3, F0–F4 | `make verify-release REF=$RC` must PASS; tarball from git objects |
+| E. Camera and Hailo verification | D1, D2, G1 | **HW** |
+| F. Legacy vs corrected decoder | H1 | **HW**; stays `legacy` unless the INT8 report justifies a switch and the owner approves |
+| G. Model artifact validation | C3, F2 (`sha256sum`), F3, G1 | pin `e69136d3…960e`; the EXP-08 3-class model stays experiment-only |
+| H. Camera geometry calibration | I | **HW**; the wide-lens `camera_hfov_deg` decision waits for this (R2) |
+| I. Processed FPS and latency | G3, H2 (+ R3 tracking cost) | **HW** |
+| J. Buzzer and alert output | G2 | **HW**; a person must hear it |
+| K. Wi-Fi provisioning | K2 (legacy BLE) | **HW** |
+| L. Authenticated BLE pairing | R5 (optional, separate session) | **HW** + an M8 app build on a physical iPhone |
+| M. iPhone association and reconnection | L1, K1, R5 steps 8–9 | **HW** |
+| N. Preset activation | L2 (+ R2) | |
+| O. Custom policy activation | L3 (+ R3) | |
+| P. Restart and recovery | K1, K3, K4, K5, R4 | **HW** |
+| Q. Rollback | O1–O3 (+ R6) | |
+
+### R1. New health fields (read-only, after F4)
+
+```bash
+curl -s -H "X-Device-Token: $TOKEN" localhost:8899/api/health | $PY -c '
+import json,sys;d=json.load(sys.stdin)["device"]
+print("config", d.get("config")); print("saved_state", d.get("saved_state")); print("uplink_backlog", d.get("uplink_backlog"))
+print("accelerator", json.dumps(d.get("accelerator"))[:400])'
+```
+
+Expect:
+- `config.source: "config"` with `fault: null`;
+- `saved_state.faults: []`;
+- `uplink_backlog.persistent: true` when the cloud is enabled;
+- an accelerator component that does not say "detector unavailable".
+
+**FAIL:**
+- `config.source: last_known_good` on a config nobody touched;
+- any `saved_state` fault: a damaged `data/device_state.json` or `monitoring.json` was kept aside as `<name>.corrupt`, so record it;
+- an accelerator with `detector_available: false` while D1 enumerated the Hailo.
+
+Field names were read from the M8 code; the exact `components` layout of `/api/health` was not checked on hardware, so record what you see.
+
+### R2. Driver Safety changes (with G2/G3, L2)
+
+- **Calibration.** A new capability, `attention` (the driver's calibrated forward gaze), is STARTING until calibration completes, at most ~30 s, then READY.
+  - During it: drowsiness and attention-lost still alert; distraction, eyes-down, glancing and phone use do not yet.
+  - The device no longer reports READY while it cannot judge gaze.
+  - Check this after `--recalibrate` (§I) and record how long it took.
+- **Phone use.** A phone counts only inside the driver's person box.
+  - A phone that is held (a hand overlapping it) alerts after `phone_use_seconds`.
+  - A still phone in a mount with both hands on the wheel does not alert.
+  - With no hand evidence, it alerts as before and says "hold unknown".
+  - **HW check:** a phone in a dash mount, with the driver glancing at it while both hands are visible on the wheel, must not raise phone use. Record it.
+- **Looking down vs closing the eyes.** A look down (lowered lids) is no longer drowsiness; a real closure still is.
+  - **HW check:** read something on the lap for 5 s and expect eyes_down, not drowsiness. Closing the eyes for 3 s with the head down must still give drowsiness.
+- **Camera stalls** no longer count as evidence. Record `stalls_1s_total` in H2; a stall-heavy camera now delays alerts slightly instead of firing them early.
+- **Wide lens.** `camera_hfov_deg` stays `null` (fx = frame width, about 53°). Set it only after §I measures the intrinsics and the owner approves; changing it invalidates the stored calibration.
+
+### R3. Shared tracking and nodes (with G3, L3)
+
+Add to the G3 printout:
+```bash
+curl -s -H "X-Device-Token: $TOKEN" localhost:8899/api/health | $PY -c '
+import json,sys;p=json.load(sys.stdin)["device"]["monitoring"].get("perception") or {}
+print(p.get("tracking")); [print(n["id"], n.get("state"), n.get("metrics"), n.get("experimental_features")) for n in p.get("nodes") or []]'
+```
+
+Expect:
+- `tracking.updates` equals the detector's `runs`. One shared tracker, never one per node.
+- Record `tracking.update_ms`, the first Pi measurement of tracker cost; the Mac measured 0.03–0.07 ms for a 5-person room.
+- With one seated person, `people_counter` (if enabled) holds count 1 for 60 s with no entry/exit flapping.
+
+Two people crossing can swap IDs; that is a known limit, not re-identification.
+
+**Child Monitoring default changed.** Its experimental pose alerts (flailing, choking-hazard) are now **off by default** for new configs. Existing devices keep their own `enable_pose` value, because `migrate_config.py` only adds keys. The app shows them as experimental, with an opt-in setting. Child Monitoring is refused on a `driver_safety`-role device anyway; do not change the role on Monday.
+
+### R4. Outage plus power cut: the queued alert survives (CHANGE: power pull, owner-approved; after K3)
+
+1. With the cloud configured, take the AP down (as in K3).
+2. Trigger one drowsiness alert. Confirm `uplink_backlog.queued` ≥ 1, and that `$D/data/uplink_spool.jsonl` exists, owned by `$U`.
+3. Pull the power. Restore it with the AP still down. After boot, `uplink_backlog.restored` ≥ 1.
+4. Bring the AP back. Expect the alert in the app **exactly once**; the backend dedupes by `event_key`.
+5. Record the time from AP up to the event appearing.
+
+**FAIL:** the alert is missing (spool lost: check fsync on the card), or it appears twice.
+
+### R5. Proof-of-possession onboarding (OPTIONAL, separate owner-approved session; never before E5 and L1 pass)
+
+This is the authenticated BLE pairing. It needs:
+- a printed or noted setup code, generated **on the Pi**;
+- `network.provisioning.auth: pop` on the device;
+- an M8 build of the app on a **physical** iPhone. Build it from `$RC` with the owner's Apple signing team, launched **without** `-orynSimulatedBLE`.
+
+Follow `docs/BLE_PROOF_OF_POSSESSION.md` → "On the hardware (Monday)", steps 1–10. They cover: the wrong code, the lockout countdown, another device's QR refused, a wrong Wi-Fi password, the plain-write refusal on 5d1e0003, the claim, re-provisioning without a second claim, and the MTU and timing measurements.
+
+Rollback: set `auth: legacy` and restart. No data migration. **Do not** set `deployment: production`.
+
+Known limits (documented, not defects):
+- the lockout counter resets on a power cycle;
+- offline guessing from a recorded session is possible; the 60-bit code and PBKDF2 are the defence.
+
+### R6. Staged releases and rollback (OPTIONAL; last; owner-approved; M8.5)
+
+The first session installs by the manual tree swap (F1/F2, rollback O1). The M8.5 staged-release path
+(`docs/DEPLOYMENT.md`) is checked here only after everything else passes, because it changes the
+install layout (`$D` becomes a symlink to `sensordyme.releases/<id>`, device state moves to `sensordyme.state/`).
+
+1. Adopt once: `make deploy-adopt DEVICE=$PI DIR=<dir from §C1>`; service active again; `readlink $D` names a release.
+2. Deploy `$RC` staged: `make verify-release REF=$RC && make deploy DEVICE=$PI DIR=<dir> REF=$RC ROLE=driver_safety` → exit 0
+   (confirmed); `release_guard.py status` shows it live; `ARTIFACTS.json` in the live release has `"ok": true`.
+3. Rollback test: deploy a throwaway commit whose `main.py` exits 1 at import → exit 1; journal shows the switch back;
+   service `active` on the previous release; no pip or network was needed (the rollback is a symlink switch).
+4. Manual rollback: `make deploy-rollback DEVICE=$PI DIR=<dir>` (or on the Pi
+   `python3 $D/scripts/release/release_guard.py switch --root $D --to previous --user $U`).
+
+Things only the Pi can show (record each): systemd 252 following the symlink for `WorkingDirectory`/`ExecStart`;
+`Type=notify`/`NRestarts` as the guard assumes; the detached activation surviving an SSH drop; non-interactive sudo
+for the deploying user; disk/time cost of one venv per release. To leave the staged layout: `docs/DEPLOYMENT.md` §2.
+
+### R7. Security notes (M8)
+
+Leave every default. Do not run the new `cloud/manage.py` commands (`revoke-device`, `require-signed`, `allow-bearer`) on Monday, and rotate nothing.
+
+**Backend before device.** The M8 backend adds tables on start (`auth_nonces`, `revoked_device_keys`, `devices.auth_mode`) and signs clock answers. Update the backend before the device:
+- an M8 device set to `command_auth: required` cannot recover from a clock more than 300 s off behind a pre-M8 backend;
+- at the default `permissive`, every old/new combination works.
+
+The backend's request-nonce memory now survives restarts, so a captured request cannot be replayed after a backend restart.
+
+### R8. Model research for the hardware session (no model change on Monday)
+
+`docs/research/M8_CV_RESEARCH.md` recommends a single 3-class (person/phone/hand) detector as the next architecture. It is **not** for Monday.
+
+What Monday can collect, without changing the model:
+- the H1 INT8 capture;
+- the per-frame Hailo cost (G3 `run_ms`; desk baseline 22.07 ms);
+- Pi CPU cost for Face Mesh and Hands. Record the per-stage times from M5 step 7 if run.
+
+A future compile of the 3-class model needs at least 1,024 NoIR calibration frames, collected only with consent under the M5 workflow.
+
+All image-level accuracy figures in the research doc are from Open Images, not driving events.

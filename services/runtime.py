@@ -21,6 +21,7 @@ from __future__ import annotations
 
 import json
 import os
+import shutil
 import signal
 import subprocess
 import threading
@@ -30,15 +31,17 @@ from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
 from types import MappingProxyType
-from typing import Any, Optional
+from typing import Any, Optional, cast
 
 import cv2
 
-from core import accel, device_health, device_state, monitoring_mode, roles, sdnotify
+from core import accel, device_health, device_state, health_stamp, monitoring_mode, roles, sdnotify
+from core import camera_privacy as cprivacy
 from core import monitoring_state as ms
 from core import nodes as monitoring_nodes
 from core import perception as pc
 from core.alerts import AlertLevel, AlertManager
+from core.behavior.experimental import is_experimental
 from core.camera import Camera, CameraError
 from core.dataset import CaptureStore
 from core.events import Event
@@ -93,6 +96,14 @@ _ANNOTATE_FAILURE_LOG_EVERY = 300
 _FLASH_DURATION_S = 1.5
 #: Longest a module swap may run before the inference check treats it as hung.
 #: Model loading on a Pi CPU fallback has been measured in tens of seconds.
+#: Capabilities that are hardware, not analysis: they keep their real state while
+#: monitoring is stopped (the camera still captures; the outputs still work).
+_NOT_PAUSED_WHEN_STOPPED = frozenset({"camera", "audible_alert", "alert_output"})
+#: Capabilities that are analysis results (M8.3): never "available" while the
+#: camera or the inference loop that feeds them is impaired.
+_ANALYSIS_CAPABILITIES = frozenset({"face", "objects", "hands", "pose", "attention"})
+#: The stop reason in words for the app ("by uplink" was internal jargon).
+_STOP_SOURCE_WORDS = {"uplink": "from the app", "dashboard": "from the device's dashboard"}
 _MAX_SWAP_S = 120.0
 #: Quiet time after which a run of last-resort reboots counts as over.
 _REBOOT_CAMPAIGN_RESET_S = 24 * 3600.0
@@ -107,6 +118,10 @@ _PROCESS_RESTART_WINDOW_S = 900.0
 _INFERENCE_STARTING_GRACE_S = 30.0
 #: While DEGRADED (no detector), how often to try loading it again.
 _DETECTOR_RETRY_S = 60.0
+#: A module that could not be built at boot (main.py's UnavailableModule) is
+#: rebuilt after this long, then at doubling intervals up to the cap (M8).
+_MODULE_REBUILD_FIRST_S = 30.0
+_MODULE_REBUILD_MAX_S = 600.0
 
 
 @dataclass
@@ -225,9 +240,14 @@ class DeviceRuntime:
     _last_observation = None
     _detector_unavailable = None
     _node_zone_signature = None
-    _companions = MappingProxyType({})
-    _preset_nodes = MappingProxyType({})
-    _node_errors = MappingProxyType({})
+    _preset_nodes_suspended = False
+    # Read-only on purpose: a write raises TypeError instead of mutating one dict
+    # shared by every such runtime. __init__ binds real dicts, the declared type;
+    # the casts say "read-only on the class, a dict on the instance", which an
+    # annotation cannot express.
+    _companions = cast("dict[str, monitoring_nodes.MonitoringNode]", MappingProxyType({}))
+    _preset_nodes = cast("dict[str, monitoring_nodes.MonitoringNode]", MappingProxyType({}))
+    _node_errors = cast("dict[str, str]", MappingProxyType({}))
     _consecutive_process_failures = 0
     _last_process_error: Optional[str] = None
     _detection_degraded: Optional[str] = None
@@ -242,6 +262,14 @@ class DeviceRuntime:
     #: (SENSORDYME_MONITORING_PATH or data/monitoring.json). A seam for sim/,
     #: which keeps each virtual device's state in its own directory.
     monitoring_path: Optional[str] = None
+    #: The config file this runtime was built from (main.build_runtime sets it)
+    #: and, when that file could not be used, the fault: the runtime is then
+    #: running on core.config_lkg's last-known-good copy (M8).
+    config_path: Optional[str] = None
+    config_fault = None
+    #: When to try building an UnavailableModule again (inf: nothing to rebuild).
+    _module_rebuild_at = float("inf")
+    _module_rebuild_attempts = 0
 
     def __init__(
         self,
@@ -269,6 +297,12 @@ class DeviceRuntime:
         # labelled the pi detector while the module ran a different one on MPS.
         self._boot_module = module
         self._boot_module_config = module_config
+        # The config a module built by a PRESET SWITCH was built from: the
+        # module's config.yaml block plus the variant overrides and owner
+        # settings (M8). Without it, _active_module_config() re-read the bare
+        # config.yaml block, so reports ignored the owner's settings.
+        self._switched_module: Any = None
+        self._switched_module_config: Optional[dict] = None
         # Which exact model events from this module come from; see
         # _verify_detection_backend and core.detectors.model_identity.
         self._model_identity: Optional[dict] = None
@@ -299,6 +333,9 @@ class DeviceRuntime:
         # and to the rule engine, and remembered across restarts so an offline
         # device does not come back without them. See _effective_zones.
         self._app_zones: Optional[list] = None
+        # Saved state that exists but cannot be read is restored as empty (every
+        # loader falls back safely) -- and reported, not silently forgotten (M8).
+        self._state_faults = self._check_saved_state()
         saved_zones = device_state.saved_zones()
         if saved_zones is not None:
             self._app_zones = _zones_from_app(saved_zones)
@@ -313,6 +350,15 @@ class DeviceRuntime:
             max_age_s=float(perception_cfg.get("max_age_s", pc.DEFAULT_MAX_AGE_S)))
         self.perception.set_detector_loader(self._load_shared_detector)
         self.perception.adopt(module)
+        # M8.5 (M84-5): a model file main.py refused at boot (sha256 not its registry
+        # pin) is reported for the life of the process: the component UNAVAILABLE
+        # with the reason, so the capability is IMPAIRED in health, whatever runs.
+        from core import model_registry as _registry
+
+        self._artifact_faults = _registry.boot_artifact_faults()
+        for capability, reason in self._artifact_faults.items():
+            if capability in pc.COMPONENT_OF:
+                self.perception.block(pc.COMPONENT_OF[capability], reason)
         #: Where analysed frames come from (the simulator says "sim").
         self._perception_source = "camera"
         self._perception_simulated = False
@@ -371,6 +417,9 @@ class DeviceRuntime:
         self.shutdown = threading.Event()
         self._module_lock = threading.Lock()  # guards module swaps vs. the inference loop
         self._heartbeat = 0.0  # monotonic time of the last completed inference iteration
+        #: Stamps every health snapshot where it is generated (M8.1, core/health_stamp.py):
+        #: a new boot id per process start, and a generation per sample.
+        self._health_stamper = health_stamp.HealthStamper()
         # When the heartbeat was last reset to "starting"; bounds that grace.
         self._heartbeat_reset_at = time.monotonic()
         self._inference_service: Optional[_InferenceService] = None
@@ -391,6 +440,9 @@ class DeviceRuntime:
         # up is IMPAIRED. Camera grace mirrors camera_check's.
         self._ready_grace_from = time.monotonic()
         self._camera_grace_until = time.monotonic() + 10.0
+        self._module_rebuild_attempts = 0
+        self._module_rebuild_at = (time.monotonic() + _MODULE_REBUILD_FIRST_S
+                                   if self._module_unavailable() else float("inf"))
 
         self.camera: Optional[Camera] = None
         self.capture: Optional[CaptureService] = None
@@ -535,6 +587,9 @@ class DeviceRuntime:
         )
 
         dash_cfg = self.config.get("dashboard", {})
+        # M8.4 Decision C: the owner's camera-only setting, OFF unless saved ON
+        # (core/camera_privacy.py). Loaded even without a dashboard: it is reported.
+        self.camera_privacy = cprivacy.CameraPrivacy.load()
         if bool(dash_cfg.get("enabled", False)):
             from core.dashboard import DashboardServer
 
@@ -562,6 +617,8 @@ class DeviceRuntime:
                 # made each consume the other's window and report ~0 fps.
                 health_provider=lambda: {**self.health.snapshot(),
                                          "device": self._collect_health("dashboard")},
+                camera_privacy=self.camera_privacy,
+                local_camera_while_stopped=dash_cfg.get("local_camera_while_stopped", True) is not False,
             )
             # Refuse a role-violating preset at the request, with the reason, rather
             # than accept it and silently drop it in the inference loop.
@@ -570,6 +627,9 @@ class DeviceRuntime:
             self.dashboard.preset_guard = lambda name: roles.preset_violation(
                 self.role, resolve_preset(name, self.presets), self.presets)
             self.dashboard.set_policy_state(self._policy_state())
+            # M8.3: the camera itself, for stream heartbeats and the unannotated
+            # fallback while monitoring is stopped (core/dashboard.py).
+            self.dashboard.attach_frame_source(self.bus)
             try:
                 dashboard_url = self.dashboard.start()
             except OSError as exc:
@@ -605,7 +665,16 @@ class DeviceRuntime:
                 print(f"SensorDyme: cloud uplink OFF -- the device key file cannot be used: {exc}")
                 cloud_cfg = {**cloud_cfg, "device_key": ""}
         if bool(cloud_cfg.get("enabled", False)) and cloud_cfg.get("device_key"):
+            # M8: the undelivered-event backlog lives on disk beside the event log,
+            # so alerts raised during an outage survive a restart or a power cut.
+            if not cloud_cfg.get("spool_path"):
+                events_csv = str(logging_config.get("csv_path", "data/events.csv"))
+                cloud_cfg = {**cloud_cfg,
+                             "spool_path": str(Path(events_csv).parent / "uplink_spool.jsonl")}
             self.uplink = self._make_uplink(cloud_cfg)
+            # M8.3: every event pushed carries what the alert policy did with it
+            # and what the in-cabin outputs reported (docs/EVENT_PIPELINE.md).
+            self.uplink.delivery_lookup = getattr(self.alert_manager, "delivery", None)
             self.uplink.set_active_preset(self.active_preset)
             # Report the restored configuration at startup too, not only when a
             # new one arrives — otherwise a device that rebooted into a custom
@@ -735,6 +804,18 @@ class DeviceRuntime:
         )
         for name, component in self.hardware.health_checks().items():
             self.health.register(name, check=component, check_interval_s=60.0)
+
+        if self.config_fault is not None:
+            # Reported, not hidden: in the event log here, in every health report
+            # (_config_report), and on the journal by main.load_device_config.
+            log.error("[CONFIG] %s", self.config_fault.reason)
+            self._log_system_event("config_fault", "running on the last known good config "
+                                   f"({self.config_fault.fallback_path}): {self.config_fault.reason}")
+        for fault in getattr(self, "_state_faults", []) or []:
+            self._log_system_event("saved_state_fault", fault)
+        for capability, reason in (getattr(self, "_artifact_faults", None) or {}).items():
+            log.error("[MODEL INTEGRITY] %s: %s", capability, reason)
+            self._log_system_event("model_integrity_fault", f"{capability}: {reason}")
 
         # ---- supervisor -----------------------------------------------------------
         self.supervisor = Supervisor(self.health)
@@ -903,10 +984,69 @@ class DeviceRuntime:
             log.info("object detection recovered for %s; monitoring is active again",
                      self.module_name)
 
+    def _module_unavailable(self) -> bool:
+        from modules.base import UnavailableModule
+
+        return isinstance(getattr(self, "module", None), UnavailableModule)
+
+    def _retry_unavailable_module(self) -> bool:
+        """Rebuild a module that could not be built at boot (M8). True once it runs.
+
+        main.py boots FAILED-but-reachable with an UnavailableModule when the
+        module raised (a model file not mounted yet, a transient load error).
+        Nothing ever tried again, so a fault that cleared a second later kept
+        the device FAILED -- impaired buzzer and all -- until a person restarted
+        it. Retried here, on the inference thread like every module swap, after
+        _MODULE_REBUILD_FIRST_S and then at doubling intervals up to
+        _MODULE_REBUILD_MAX_S. Each failure keeps the reason current.
+        """
+        current = self.module
+        if not self._module_unavailable() or self.profile == "mac_max":
+            self._module_rebuild_at = float("inf")
+            return not self._module_unavailable()
+        self._module_rebuild_attempts += 1
+        delay = min(_MODULE_REBUILD_MAX_S, _MODULE_REBUILD_FIRST_S * 2 ** (self._module_rebuild_attempts - 1))
+        if current is self._boot_module and self._boot_module_config is not None:
+            module_cfg = self._boot_module_config
+        else:
+            module_cfg = (self.config.get("modules", {}) or {}).get(self.module_name, {}) or {}
+        try:
+            with self._module_swap():
+                new_module = self.perception.adopt(self._build_module(self.module_name, dict(module_cfg)))
+        except Exception as exc:  # noqa: BLE001 - still FAILED, with the current reason
+            self._module_rebuild_at = time.monotonic() + delay
+            current.reason = str(exc)
+            log.warning("module '%s' still cannot be built (attempt %d, next in %.0f s): %s",
+                        self.module_name, self._module_rebuild_attempts, delay, exc)
+            return False
+        self._push_zones_to(new_module)
+        with self._module_lock:
+            self.module = new_module
+            if current is self._boot_module:
+                self._boot_module = new_module
+            self._model_identity = None
+            self._consecutive_process_failures = 0
+            self._ready_grace_from = time.monotonic()
+        self._module_rebuild_at = float("inf")
+        self._verify_detection_backend()
+        if self._custom_active():
+            self._apply_requested_labels()
+        with suppress(Exception):
+            current.close()
+        log.info("module '%s' built on attempt %d; monitoring resumes", self.module_name,
+                 self._module_rebuild_attempts)
+        self._log_system_event("module_recovered", f"module '{self.module_name}' built after "
+                               f"{self._module_rebuild_attempts} retr{'y' if self._module_rebuild_attempts == 1 else 'ies'}")
+        self._publish_monitoring()
+        return True
+
     def _active_module_config(self) -> dict:
         """The config the RUNNING module was built from (see __init__)."""
         if self._boot_module_config is not None and self.module is self._boot_module:
             return self._boot_module_config
+        switched_config = getattr(self, "_switched_module_config", None)
+        if switched_config is not None and self.module is getattr(self, "_switched_module", None):
+            return switched_config
         return (self.config.get("modules", {}) or {}).get(self.module_name, {}) or {}
 
     def _module_identity_name(self) -> str:
@@ -972,11 +1112,126 @@ class DeviceRuntime:
         # monitoring state decides monitoring_active (READY or DEGRADED), not
         # the components alone -- a stopped, failed or still-starting device is
         # not monitoring however healthy its parts look.
-        monitoring = self.monitoring_report()
+        # One evaluation for both blocks (M8.3): see monitoring_report().
+        evaluation = self._evaluate_monitoring()
+        monitoring = self.monitoring_report(evaluation)
         report["monitoring"] = monitoring.to_dict()
         report["monitoring_active"] = monitoring.monitoring
-        report["protection"] = self.protection_state()
-        return report
+        report["protection"] = self.protection_state(evaluation)
+        report["config"] = self._config_report()
+        report["saved_state"] = {"faults": list(getattr(self, "_state_faults", []) or [])}
+        backlog = getattr(self.uplink, "backlog", None)
+        if callable(backlog):
+            report["uplink_backlog"] = backlog()
+        report["storage"] = self._storage_report(report.get("uplink_backlog"))
+        # Stamped HERE, where the sample is taken, not where it is sent (M8.1): a
+        # snapshot re-sent unchanged keeps its generation, so the backend can tell
+        # a frozen report from a new one whatever the device's wall clock says.
+        return self._stamper().stamp(report)
+
+    #: Free space below which the data card is reported failed / nearly full (M8.4).
+    _STORAGE_FAILED_BYTES = 1 << 20
+    _STORAGE_LOW_BYTES = 50 << 20
+
+    def _storage_report(self, backlog: Optional[dict] = None) -> dict:
+        """Can the device still write its data directory (M8.4)?
+
+        events.csv, the undelivered-event spool and the saved state all live
+        there, and every one of them fails quietly by design (losing a log row
+        must not cost an alert). Quietly is not the same as invisibly: a full or
+        read-only card used to leave every health component "ok" while the
+        device's only permanent record stopped growing. Two syscalls, no write.
+        """
+        config = getattr(self, "config", None) or {}
+        csv_path = Path(str((config.get("logging", {}) or {}).get("csv_path", "data/events.csv")))
+        directory = csv_path.parent
+        metrics: dict[str, Any] = {"path": str(directory)}
+        problems: list[str] = []
+        free: Optional[int] = None
+        try:
+            free = int(shutil.disk_usage(directory).free)
+            metrics["free_mb"] = round(free / 2**20, 1)
+        except OSError as exc:
+            problems.append(f"data directory unavailable ({exc.strerror or exc})")
+        writable = os.access(directory, os.W_OK) and (not csv_path.exists() or os.access(csv_path, os.W_OK))
+        metrics["writable"] = writable
+        if not writable:
+            problems.append("data directory is not writable: the spool, saved state and new log files cannot be written")
+        if free is not None and free < self._STORAGE_FAILED_BYTES:
+            problems.append(f"data card full ({metrics['free_mb']} MB free): local records are being lost")
+        fault = backlog.get("spool_fault") if isinstance(backlog, dict) else None
+        if fault:
+            problems.append(f"undelivered-event spool not on disk ({fault}); kept in memory only")
+        if problems:
+            return {"state": "failed", "detail": "; ".join(problems), "metrics": metrics}
+        if free is not None and free < self._STORAGE_LOW_BYTES:
+            return {"state": "warning", "detail": f"data card nearly full ({metrics['free_mb']} MB free)",
+                    "metrics": metrics}
+        return {"state": "ok", "detail": "data directory writable", "metrics": metrics}
+
+    def _stamper(self) -> health_stamp.HealthStamper:
+        stamper = getattr(self, "_health_stamper", None)
+        if stamper is None:  # a runtime built without __init__ (unit-test doubles)
+            stamper = self._health_stamper = health_stamp.HealthStamper()
+        return stamper
+
+    def _check_saved_state(self) -> list[str]:
+        """Faults in the files that carry the owner's choices across a restart.
+
+        device_state.json (mode, zones, companion nodes) and monitoring.json
+        (custom rules) are read as empty when damaged -- the device boots on its
+        configured mode, which is the safe direction -- but the owner's choices
+        are gone, and the next save overwrites the evidence. So each damaged file
+        is copied aside (<name>.corrupt) and named in every health report.
+        """
+        from core.monitoring_config import DEFAULT_PATH as MONITORING_DEFAULT
+
+        paths = {
+            "device_state": Path(os.environ.get("SENSORDYME_DEVICE_STATE_PATH") or device_state.DEFAULT_PATH),
+            "custom_rules": Path(self.monitoring_path or MONITORING_DEFAULT),
+        }
+        faults: list[str] = []
+        for what, path in paths.items():
+            try:
+                raw = path.read_bytes()
+            except FileNotFoundError:
+                continue
+            except OSError as exc:
+                faults.append(f"{what} ({path.name}) unreadable: {exc}")
+                continue
+            try:
+                ok = isinstance(json.loads(raw), dict)
+            except (ValueError, UnicodeDecodeError):
+                ok = False
+            if ok:
+                continue
+            faults.append(f"{what} ({path.name}) was damaged and could not be restored; "
+                          f"kept as {path.name}.corrupt")
+            with suppress(OSError):
+                path.with_name(path.name + ".corrupt").write_bytes(raw)
+        for fault in faults:
+            log.error("[STATE] %s", fault)
+        return faults
+
+    def _config_report(self) -> dict:
+        """Which configuration is in force, and the fault when it is not config.yaml (M8)."""
+        if self.config_fault is not None:
+            return self.config_fault.describe()
+        return {"source": "config", "path": self.config_path, "fault": None}
+
+    def _record_known_good_config(self) -> None:
+        """Once READY: this config.yaml is the one to fall back to (core/config_lkg.py).
+
+        Never while running FROM the fallback -- the broken config.yaml must not
+        become the "good" copy -- and never for a runtime built without a file.
+        """
+        if not self.config_path or self.config_fault is not None:
+            return
+        from core import config_lkg
+
+        if not config_lkg.save_last_good(self.config_path):
+            log.warning("could not record %s as the last known good config (%s)",
+                        self.config_path, config_lkg.last_good_path(self.config_path))
 
     def _collect_component_health(self, caller: str) -> dict:
         heartbeat_age = None if self._heartbeat == 0.0 else time.monotonic() - self._heartbeat
@@ -997,12 +1252,17 @@ class DeviceRuntime:
             # per call because the active module changes at runtime when the
             # operator switches preset mid-demo.
             detector_required=self._module_uses_a_detector(),
+            # Whatever the accelerator probe says, no detector is no detector:
+            # never "OK, running on CPU" on a device with no CPU backend (M8).
+            detector_unavailable=self._detection_degraded,
         )
 
     def _accelerator_health(self) -> tuple[bool, str]:
         """Accelerator health, scoped to whether this mode actually uses it."""
         if not self._module_uses_a_detector():
             return True, f"not used by this mode ({self.module_name}) — {accel.status()[1]}"
+        if self._detection_degraded is not None:
+            return False, f"object detection unavailable — {self._detection_degraded}"
         return accel.live_status()
 
     def _module_uses_a_detector(self) -> bool:
@@ -1570,18 +1830,43 @@ class DeviceRuntime:
             return None
         if self.module_name not in observation.detection_consumers:
             return None  # nothing new for this module since its last detector run
-        return module.get_detections()
+        # The module's boxes ARE this run's boxes: give them the shared tracker's
+        # ids, so per-subject rules (dwell) follow the device's one tracker (M8).
+        return observation.attach_tracks(module.get_detections())
 
     # ------------------------------------------------------------------ monitoring nodes (M7)
     def _node_zones(self) -> list:
         return list(self._effective_zones(self.module_name))
 
     def _active_companions(self) -> list:
-        """Companion nodes running now: the preset's own, then the owner's (deduplicated)."""
-        nodes = dict(self._preset_nodes)
+        """Companion nodes running now: the preset's own, then the owner's (deduplicated).
+
+        When custom rules REPLACE the preset (AI_CUSTOM, M8), the preset's own
+        nodes are part of what was replaced and stop with it; the owner's
+        companions are additive and keep running."""
+        nodes = {} if self._preset_replaced() else dict(self._preset_nodes)
         for node_id, node in self._companions.items():
             nodes.setdefault(node_id, node)
         return list(nodes.values())
+
+    def _preset_replaced(self) -> bool:
+        return getattr(self, "mode", None) is monitoring_mode.MonitoringMode.AI_CUSTOM
+
+    def _sync_preset_node_demands(self) -> None:
+        """Withdraw the preset's own nodes' detector demands while custom rules
+        replace the preset, and restore them when it is back."""
+        replaced = self._preset_replaced()
+        if replaced == self._preset_nodes_suspended:
+            return
+        self._preset_nodes_suspended = replaced
+        for node in self._preset_nodes.values():
+            if node.id in self._companions:
+                continue  # the owner's own copy keeps the (shared-key) demand
+            if replaced:
+                self.perception.withdraw(node.id)
+            else:
+                for demand in node.demands():
+                    self.perception.demand(demand)
 
     def _register_node(self, node) -> None:
         node.set_zones(self._node_zones())
@@ -1621,6 +1906,11 @@ class DeviceRuntime:
                 continue
             self._preset_nodes[node_id] = node
             self._register_node(node)
+        if self._preset_nodes_suspended:  # kept nodes had their demands withdrawn: restore them
+            for node in self._preset_nodes.values():
+                for demand in node.demands():
+                    self.perception.demand(demand)
+        self._preset_nodes_suspended = False  # every demand registered: the next frame re-checks the mode
 
     @staticmethod
     def _node_items(raw) -> Optional[list[tuple[Any, Any]]]:
@@ -1738,6 +2028,7 @@ class DeviceRuntime:
             self._apply_nodes(saved, source="restore")
 
     def _run_nodes(self, observation: pc.Observation, now: float) -> None:
+        self._sync_preset_node_demands()
         nodes = self._active_companions()
         if not nodes:
             return
@@ -1788,11 +2079,7 @@ class DeviceRuntime:
             state, missing, reason = monitoring_nodes.node_state(spec, capabilities, stopped=stopped)
             if self.mode is monitoring_mode.MonitoringMode.AI_CUSTOM and not stopped:
                 state, missing, reason = monitoring_nodes.INACTIVE, [], "custom rules replace this mode"
-            features = []
-            if base == "driver_safety":
-                module_cfg = self._active_module_config()
-                features = [{**f, "enabled": bool(module_cfg.get(f["config_key"], False))}
-                            for f in monitoring_nodes.EXPERIMENTAL_DRIVER_FEATURES]
+            features = monitoring_nodes.preset_experimental_features(base, preset, self._active_module_config())
             entries.append(monitoring_nodes.wire_entry(
                 spec, state=state, missing=missing, reason=reason,
                 validation=monitoring_nodes.validation_tier(base), experimental_features=features))
@@ -1814,14 +2101,33 @@ class DeviceRuntime:
                 settings=node.settings)
             entry["enabled_by"] = "preset" if node.id in self._preset_nodes else "owner"
             entries.append(entry)
+        if self._preset_replaced():
+            running = {e["id"] for e in entries}
+            for node in self._preset_nodes.values():
+                if node.id in running:
+                    continue
+                entry = monitoring_nodes.wire_entry(
+                    node.spec, state=monitoring_nodes.INACTIVE, missing=[],
+                    reason="custom rules replace this mode", validation=monitoring_nodes.validation_tier(node.id),
+                    settings=node.settings)
+                entry["enabled_by"] = "preset"
+                entries.append(entry)
         return entries
 
     def perception_report(self, capabilities=None) -> dict:
         """`monitoring.perception` exactly as the wire contract describes it."""
         if capabilities is None:
             capabilities = self._evaluate_monitoring().capabilities
-        return self.perception.to_wire(simulated=self._perception_simulated,
+        wire = self.perception.to_wire(simulated=self._perception_simulated,
                                        nodes=self._node_entries(capabilities))
+        if getattr(self, "_stopped", None) is not None:
+            # Stopped on purpose (M8.2): a component that is only stale or idle
+            # because nothing runs is reported "paused" with the reason; failed
+            # and unavailable components keep their own state (real faults).
+            for status in (wire.get("components") or {}).values():
+                if isinstance(status, dict) and status.get("state") in (pc.OK, pc.STALE, pc.IDLE):
+                    status["state"], status["reason"] = "paused", "monitoring is stopped"
+        return wire
 
     # ------------------------------------------------------------------ monitoring state (M0.2)
     def _module_runs_without_detector(self, module=None) -> bool:
@@ -1866,6 +2172,9 @@ class DeviceRuntime:
             return ms.Capability(
                 ms.IMPAIRED, f"analysis failing ({self._consecutive_process_failures} frame(s) in a row): "
                              f"{self._last_process_error}")
+        if getattr(self, "_stopped", None) is not None:
+            # The loop is alive (checked above) but analyses nothing by design.
+            return ms.Capability(ms.PAUSED, "paused while monitoring is stopped")
         analysing = self._detection_degraded is None or self._module_runs_without_detector()
         bus: Optional[FrameBus] = getattr(self, "bus", None)
         if camera_ok and analysing and bus is not None:
@@ -1922,6 +2231,10 @@ class DeviceRuntime:
             return declared  # the module knows more (its own backoff, a refused load)
         if status.state in (pc.FAILED, pc.UNAVAILABLE):
             return ms.Capability(ms.IMPAIRED, f"{label} {status.state}: {status.reason}")
+        if getattr(self, "_stopped", None) is not None:
+            # Stopped on purpose: no result is expected, so a stale or missing
+            # one is not a fault (M8.2). Real faults are reported above.
+            return ms.Capability(ms.PAUSED, f"{label}: paused while monitoring is stopped")
         restarted_at = self._ready_grace_from
         if (status.last_run_age_s is not None and now - status.last_run_age_s < restarted_at
                 and now - restarted_at <= self.perception.max_age_s):
@@ -1948,6 +2261,15 @@ class DeviceRuntime:
         caps = {"camera": self._camera_capability(now)}
         caps["inference"] = self._inference_capability(now, caps["camera"].available)
         caps.update(self._module_capabilities(module))
+        if getattr(self, "_stopped", None) is not None:
+            # Nothing starts or analyses while stopped (e.g. the driver calibration
+            # waits for frames): paused, not "not ready after 30 s", and an
+            # analysis capability is not "producing results" (M8.2). Real faults
+            # (impaired) and the hardware outputs (camera, alerts) keep their state.
+            return {name: ms.Capability(ms.PAUSED, f"{name}: paused while monitoring is stopped")
+                    if cap.state == ms.STARTING
+                    or (cap.state == ms.AVAILABLE and name not in _NOT_PAUSED_WHEN_STOPPED)
+                    else cap for name, cap in caps.items()}
         if now - self._ready_grace_from >= _INFERENCE_STARTING_GRACE_S:
             # Bounded: a capability "starting" past the grace never came up.
             caps = {
@@ -1956,6 +2278,15 @@ class DeviceRuntime:
                 if cap.state == ms.STARTING and name != "inference" else cap
                 for name, cap in caps.items()
             }
+        # M8.3: nothing produces results without frames or a running inference
+        # loop. A model's last result stays "fresh" for its max age after the
+        # camera froze or the loop died; it is not "available" in that window.
+        lost = next((p for p in ("camera", "inference") if caps[p].impaired), None)
+        if lost is not None:
+            why = f"no analysis: {lost} unavailable ({caps[lost].reason or 'impaired'})"
+            caps = {name: ms.Capability(ms.IMPAIRED, why)
+                    if name in _ANALYSIS_CAPABILITIES and cap.available else cap
+                    for name, cap in caps.items()}
         return caps
 
     _LABEL_KINDS = frozenset({"objects", "pose", "face", "hands"})
@@ -1974,6 +2305,14 @@ class DeviceRuntime:
         if self.mode is not monitoring_mode.MonitoringMode.AI_CUSTOM:
             hook: Any = getattr(module, "event_requirements", dict)
             reqs: dict[str, frozenset[str]] = dict(hook())
+            if not getattr(getattr(self, "alert_manager", None), "experimental_audible", False):
+                # M8.4 Decision A: an experimental family is an observation, not a
+                # protection, so a capability only it needs (e.g. hands for
+                # erratic_hand_movement) never degrades monitoring. With the
+                # owner's explicit opt-in it alerts, and then it counts again.
+                from core.behavior.experimental import EXPERIMENTAL_ALERT_TYPES
+                kept = {event: needs for event, needs in reqs.items() if event not in EXPERIMENTAL_ALERT_TYPES}
+                reqs = kept or reqs
             if not reqs:
                 reqs = {self.module_name: frozenset({"objects"}) if self._module_uses_a_detector() else frozenset()}
             name = self.active_preset or self.module_name
@@ -2006,18 +2345,49 @@ class DeviceRuntime:
         """The device's monitoring state from what is observed right now."""
         now = time.monotonic()
         module = getattr(self, "module", None)
-        stopped = None if self._stopped is None else f"monitoring stopped by {self._stopped['by']}"
+        stopped = None if self._stopped is None else (
+            f"monitoring stopped {_STOP_SOURCE_WORDS.get(self._stopped['by'], 'by ' + str(self._stopped['by']))}")
+        thermal = getattr(self, "_thermal_reason", None)
         return ms.evaluate(
             stopped=stopped,
             capabilities=self._capabilities(now, module),
             policies=self._active_policies(module),
             role_required=self.role.required_capabilities,
             actuators=self.alert_manager.actuators() if hasattr(self.alert_manager, "actuators") else (),
+            conditions=(thermal,) if thermal else (),
         )
 
-    def monitoring_report(self) -> ms.MonitoringReport:
-        """The public, typed monitoring state (dashboard /api/health, uplink, app)."""
-        evaluation = self._evaluate_monitoring()
+    #: How often the health thread re-reads temperature and throttling (vcgencmd).
+    _THERMAL_READ_EVERY_S = 20.0
+
+    def _thermal_reading(self) -> tuple[Optional[float], list[str]]:
+        """(SoC °C, live throttle flags). The virtual device overrides this."""
+        return device_health.thermal_reading()
+
+    def _refresh_thermal(self) -> None:
+        """Re-read heat and throttling at most every _THERMAL_READ_EVERY_S, on the
+        health thread (M8.3). Evaluations read only the cached reason, so the
+        inference loop never waits on vcgencmd."""
+        now = time.monotonic()
+        last = getattr(self, "_thermal_read_at", None)
+        if last is not None and now - last < self._THERMAL_READ_EVERY_S:
+            return
+        self._thermal_read_at = now
+        try:
+            temperature, flags = self._thermal_reading()
+        except Exception as exc:  # noqa: BLE001 - an unreadable sensor is not a fault of monitoring
+            log.debug("thermal reading failed: %s", exc)
+            temperature, flags = None, []
+        was = getattr(self, "_thermal_reason", None) is not None
+        self._thermal_reason = device_health.thermal_condition(temperature, list(flags), was)
+
+    def monitoring_report(self, evaluation: Optional[ms.Evaluation] = None) -> ms.MonitoringReport:
+        """The public, typed monitoring state (dashboard /api/health, uplink, app).
+
+        `evaluation` lets a caller report this and protection_state() from ONE
+        evaluation (M8.3): two evaluations a moment apart can straddle a
+        threshold and send "failed" beside "protecting" in the same sample."""
+        evaluation = evaluation if evaluation is not None else self._evaluate_monitoring()
         bus: Optional[FrameBus] = getattr(self, "bus", None)
         frame_age = None if bus is None or bus.age_s() == float("inf") else round(bus.age_s(), 2)
         processed = None if bus is None else bus.processed_age_s()
@@ -2042,6 +2412,7 @@ class DeviceRuntime:
 
     def _monitoring_check(self) -> tuple[bool, str]:
         """Health-monitor tick: evaluate, act on transitions, drive the impaired alert."""
+        self._refresh_thermal()
         report = self.monitoring_report()
         state = report.state
         now = time.monotonic()
@@ -2078,19 +2449,22 @@ class DeviceRuntime:
         self.alert_manager.observe(now, source="health", active={self._IMPAIRED_KEY} if impaired else (),
                                    tracked={self._IMPAIRED_KEY})
 
-    def protection_state(self) -> dict:
+    def protection_state(self, evaluation: Optional[ms.Evaluation] = None) -> dict:
         """The truthful answer to "is this device protecting right now?".
 
         stopped        an explicit, confirmed stop is in force
         protecting     every safeguard the role requires is running
         not_protecting something required is not running; `reasons` says what
+
+        Pass the `evaluation` the accompanying monitoring report was built from,
+        so the two can never disagree (M8.3).
         """
         if self._stopped is not None:
             return {"state": "stopped", "role": self.role.name, "since": self._stopped["since"],
                     "by": self._stopped["by"], "reasons": ["monitoring was stopped explicitly"],
                     "monitoring_state": ms.MonitoringState.STOPPED.value,
                     "last_command_id": self._last_protection_command}
-        evaluation = self._evaluate_monitoring()
+        evaluation = evaluation if evaluation is not None else self._evaluate_monitoring()
         reasons: list[str] = []
         if evaluation.state in (ms.MonitoringState.FAILED, ms.MonitoringState.STARTING):
             reasons += list(evaluation.reasons)
@@ -2114,7 +2488,25 @@ class DeviceRuntime:
             # settings, dwell rules): the backend sends those only to a device
             # that reports them (core/presets.py DEVICE_POLICY_FEATURES).
             "features": list(DEVICE_POLICY_FEATURES),
+            # M8.4 Decision C: who may see the camera while stopped. Its presence
+            # is what tells the backend this firmware understands set_camera_mode.
+            "camera": self._camera_report(),
         }
+
+    def _camera_report(self) -> dict:
+        privacy = getattr(self, "camera_privacy", None) or cprivacy.CameraPrivacy(persist=False)
+        dashboard = getattr(self, "dashboard", None)
+        local = getattr(dashboard, "_local_camera_while_stopped", True) if dashboard is not None else False
+        return privacy.report(stopped=self._stopped is not None, dashboard=dashboard is not None,
+                              local_while_stopped=bool(local))
+
+    def _apply_camera_mode(self, request: dict, source: str) -> None:
+        """The owner's camera-only setting (M8.4). Validated and authenticated by the uplink."""
+        privacy = getattr(self, "camera_privacy", None)
+        if privacy is None:
+            return
+        privacy.apply(request["camera_only"] is True, command_id=request.get("id"), by=source)
+        self._publish_monitoring()
 
     def _publish_monitoring(self) -> None:
         """Tell the backend what runs, the role, the protection state and the last refusal."""
@@ -2128,8 +2520,9 @@ class DeviceRuntime:
             if callable(refresh):
                 # Same moment, same facts: without this the 5 s health sample still
                 # carried the previous state and the app saw a stop or a failure late.
-                report = self.monitoring_report()
-                refresh(report.to_dict(), report.monitoring, self.protection_state())
+                evaluation = self._evaluate_monitoring()
+                report = self.monitoring_report(evaluation)
+                refresh(report.to_dict(), report.monitoring, self.protection_state(evaluation))
         if self.dashboard is not None:
             setter = getattr(self.dashboard, "set_policy_state", None)
             if callable(setter):
@@ -2242,7 +2635,7 @@ class DeviceRuntime:
             return
         violation = roles.preset_violation(self.role, name, self.presets)
         if violation:
-            self._record_rejection("preset", name, [violation])
+            self._record_rejection("preset", name, [violation], code="role_forbids_preset")
             log.warning("[POLICY] preset '%s' refused: %s", name, violation)
             return
         base_name, _, variant_name = name.partition("@")[0].partition(":")
@@ -2253,7 +2646,8 @@ class DeviceRuntime:
                 self._record_rejection("preset", name, [f"unknown preset '{name}' on this device"],
                                        code="unknown_preset")
             else:
-                self._record_rejection("preset", name, ["the mac_max profile cannot switch presets"])
+                self._record_rejection("preset", name, ["the mac_max profile cannot switch presets"],
+                                       code="profile_fixed")
             return
         # Variant overrides plus any owner settings ("preset:variant@key=value",
         # core/presets.py), validated against the preset's schema. A setting this
@@ -2263,14 +2657,13 @@ class DeviceRuntime:
         try:
             name, _preset, overrides = preset_overrides(name, self.presets)
         except PresetError as exc:
-            self._record_rejection("preset", name, [exc.reason])
+            self._record_rejection("preset", name, [exc.reason], code="invalid_setting")
             print(f"SensorDyme: preset '{name}' refused: {exc.reason}")
             return
         new_module_name = preset["module"]
+        new_module_config = {**self.config["modules"][new_module_name], **overrides, "recalibrate": False}
         try:
-            new_module = self.perception.adopt(self._build_module(
-                new_module_name, {**self.config["modules"][new_module_name], **overrides, "recalibrate": False}
-            ))
+            new_module = self.perception.adopt(self._build_module(new_module_name, dict(new_module_config)))
         except Exception as exc:  # noqa: BLE001 - a bad preset must not kill the device
             print(f"SensorDyme: preset switch to '{name}' failed: {exc}")
             # Refused with the reason, so the backend stops re-sending a switch
@@ -2294,6 +2687,7 @@ class DeviceRuntime:
         with self._module_lock:
             old_module = self.module
             self.module, self.module_name, self.active_preset = new_module, new_module_name, name
+            self._switched_module, self._switched_module_config = new_module, new_module_config
             self._model_identity = None  # unknown, not the old module's, until verified below
             self.alert_event_types = self.alert_types_for(new_module_name, preset)
             self._consecutive_process_failures = 0  # the new module starts with a clean slate
@@ -2404,6 +2798,11 @@ class DeviceRuntime:
                 self._push_zones_to(module)
                 print(f"zones: {len(zones)} area(s) active ({', '.join(z.name for z in zones) or 'none'})")
 
+            pop_camera = getattr(self.uplink, "pop_pending_camera_mode", None)
+            camera_request = pop_camera() if callable(pop_camera) else None
+            if isinstance(camera_request, dict):
+                self._apply_camera_mode(camera_request, source="owner")
+
             pop_nodes = getattr(self.uplink, "pop_pending_nodes", None)
             new_nodes = pop_nodes() if callable(pop_nodes) else None
             if new_nodes is not None:
@@ -2465,7 +2864,11 @@ class DeviceRuntime:
                 self.alert_manager.notify(event, now=now)
             self.logger.log(event)
             severity = (
-                "loud" if event.type in self.loud_types
+                # M8.4 owner decision A: an experimental family the policy will not
+                # actuate is an observation, "log", whatever loud/soft_types say
+                # (deployed configs still list them; core/behavior/experimental.py).
+                "log" if is_experimental(event.type) and not getattr(self.alert_manager, "experimental_audible", False)
+                else "loud" if event.type in self.loud_types
                 else "soft" if event.type in self.soft_types or event.type in self.alert_event_types
                 else "log"
             )
@@ -2499,6 +2902,11 @@ class DeviceRuntime:
         nothing.
         """
         missing = (set(active) & set(tracked) & set(self.alert_event_types)) - self.alert_manager.open_keys("module")
+        # An episode the policy refuses (an experimental observation) would be
+        # "missing" on every frame: there is nothing to re-open.
+        permits = getattr(self.alert_manager, "permits", None)
+        if callable(permits):
+            missing = {t for t in missing if permits(t)}
         for event_type in sorted(missing):
             event = Event.now(event_type, 0.0, None, getattr(module, "name", self.module_name),
                               "condition still active")
@@ -2570,6 +2978,11 @@ class DeviceRuntime:
             self._heartbeat = time.monotonic()
             stop.wait(0.5)
             return True
+        if time.monotonic() >= self._module_rebuild_at and self._module_unavailable():
+            try:
+                self._retry_unavailable_module()
+            except Exception:  # a failed retry must not crash the loop
+                log.exception("module rebuild failed; still FAILED")
         if self._detection_degraded is not None:
             self._heartbeat = time.monotonic()
             if time.monotonic() - loop.last_detector_retry >= _DETECTOR_RETRY_S:
@@ -2746,7 +3159,7 @@ class DeviceRuntime:
                 if now < self._flash_until:
                     view = _apply_alert_overlay(view)
                 if want_stream:
-                    self.dashboard.push_frame(view)
+                    self.dashboard.push_frame(view, captured_at=captured_at)  # M8.3: X-Frame-Age-Ms
                     self._last_stream_push = now
         if self.display and view is not None:
             cv2.imshow(self.window_name, view)
@@ -2845,6 +3258,7 @@ class DeviceRuntime:
         self.supervisor.start_all()
         self.health.start()
         sdnotify.notify_ready()
+        self._record_known_good_config()
         log.info(
             "runtime up: profile=%s module=%s display=%s accelerator=%s%s",
             self.profile, self.module_name, self.display, accel.status()[1],

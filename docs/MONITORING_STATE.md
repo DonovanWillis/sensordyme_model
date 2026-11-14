@@ -44,7 +44,9 @@ Vocabulary shared with `core/capabilities.py`:
 | `alert_output`, `audible_alert` | `AlertManager.actuators()` | no configured output ready; no *audible* output ready |
 
 A module declares what each event needs (`event_requirements()`); see
-driver_attention: drowsiness → face; phone_use → face + objects. A module that
+driver_attention: drowsiness → face; distraction / eyes down / eyes up /
+glancing → face + `attention` (the driver's calibrated forward gaze, `starting`
+until calibration settles); phone_use → face + attention + objects. A module that
 declares nothing is judged only by whether it processes frames. Custom rules
 need the capability that provides their target label. A rule naming an area
 that has not been drawn yet is *waiting*, and reported as such.
@@ -62,6 +64,19 @@ Example: object detection fails on a driver unit. Phone use is unavailable and
 the state is `degraded`. Drowsiness, distraction and attention-lost keep working
 and keep alerting. Object detection retries on its own (1 s, doubling to 60 s)
 and the state returns to `ready`.
+
+## Heat (M8.3)
+
+A device the firmware is throttling still monitors, more slowly, so it is
+`degraded` with the reason (`device: SoC at 84.0°C, at or above the 80°C
+throttle point: analysis may be slower`), never `ready` and never `failed`.
+`core/device_health.py` `thermal_condition` uses the Pi 5's published limits
+unchanged (`core/thermal.py`): it enters at 80 °C or on any live
+`get_throttled` bit (under-voltage, frequency capped, throttled, soft limit)
+and clears below 75 °C with no live bit, so a device hovering at the limit
+does not flap. The health thread reads temperature and throttling every 20 s;
+an evaluation only reads the cached reason, so the inference loop never waits
+on `vcgencmd`. Tests: `tests/test_m83_truth_failure_matrix.py` (F20).
 
 ## Alert outputs
 
@@ -81,7 +96,10 @@ lost phone detector does not teach a driver to ignore the buzzer.
 Every frame carries its capture (publish) time (`FrameBus.wait_for_fresh_stamped`).
 The runtime hands it to the module (`set_frame_time`). Trackers run on
 *evidence time* (`modules/base.py:EvidenceClock`): a gap between frames longer
-than `max_evidence_gap_s` (0.5 s) counts as only 0.5 s. A camera freeze or a
+than `max_evidence_gap_s` (0.5 s) counts as only 0.5 s. `driver_attention`
+uses a stricter clock (`StallAwareEvidenceClock`, M8): a stall counts as one
+ordinary frame interval of the stream, and only a stream that is slow
+throughout keeps the 0.5 s cap. A camera freeze or a
 blocked loop can no longer become evidence of eye closure or looking down.
 This is also the seam a deterministic replay would feed recorded timestamps
 through.

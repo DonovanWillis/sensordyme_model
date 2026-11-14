@@ -18,6 +18,10 @@ struct APIError: LocalizedError {
     /// server sent none. Branch on this, never on the status alone: several
     /// different refusals share 409.
     var code: String? = nil
+    /// The headline for a banner (ServerReply.Title), when the server answered
+    /// with something other than the answer. nil for a transport failure, which
+    /// the banner heads "Can't reach the server".
+    var title: String? = nil
     var errorDescription: String? { message }
 }
 
@@ -25,6 +29,10 @@ struct APIError: LocalizedError {
 struct APIClient {
     let baseURL: URL?
     let token: String?
+    /// The app believes it is signed in. A 401 then ends the session even when
+    /// no token could be sent (ServerReply.sessionEnded), instead of showing
+    /// "missing bearer token" on every refresh for ever.
+    var signedIn: Bool = false
     /// Finds the backend when the saved address is missing or has stopped
     /// answering. Supplied by AppState; see BackendLocator.
     var relocate: (@Sendable () async -> URL?)?
@@ -88,7 +96,9 @@ struct APIClient {
         let data: Data
         let response: URLResponse
         do {
-            (data, response) = try await URLSession.shared.data(for: req)
+            // A redirect is followed only on the same host and never out of
+            // https (RedirectPolicy): the check above covers the first URL only.
+            (data, response) = try await URLSession.shared.data(for: req, delegate: RedirectGuard.shared)
         } catch let error as URLError {
             throw APIError(
                 message: Self.explain(error, host: base.host ?? "the server"),
@@ -96,7 +106,7 @@ struct APIClient {
             )
         }
         let status = (response as? HTTPURLResponse)?.statusCode ?? 0
-        if let error = Self.httpError(status: status, data: data, sentToken: token != nil) {
+        if let error = Self.httpError(status: status, data: data, sentToken: token != nil, signedIn: signedIn) {
             throw error
         }
         return data
@@ -107,18 +117,17 @@ struct APIClient {
     /// A 401 means "your session expired" only when a session was sent. Sign-in
     /// sends none, and its 401 is "wrong email or password" -- which every caller
     /// used to report as an expired session, on the sign-in screen itself.
-    static func httpError(status: Int, data: Data, sentToken: Bool) -> APIError? {
+    static func httpError(status: Int, data: Data, sentToken: Bool, signedIn: Bool = false) -> APIError? {
         if (200..<300).contains(status) { return nil }
         // FastAPI errors arrive as {"detail": "..."}, and refusals the app must
-        // tell apart also carry {"code": "..."} beside it.
-        let body = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any]
-        let detail = body?["detail"] as? String
-        let code = body?["code"] as? String
-        if status == 401 && sentToken {
-            return APIError(message: "Your session has expired. Please sign in again.",
-                            isAuthFailure: true, status: status, code: code)
+        // tell apart also carry {"code": "..."} beside it. Anything else (an
+        // HTML error page, a validation list, an empty body) is put into words
+        // by ServerReply rather than shown raw or as "request failed (502)".
+        let failure = ServerReply.httpFailure(status: status, data: data)
+        if let expired = ServerReply.sessionEnded(status: status, sentToken: sentToken, signedIn: signedIn) {
+            return APIError(message: expired, isAuthFailure: true, status: status, code: failure.code)
         }
-        return APIError(message: detail ?? "request failed (\(status))", status: status, code: code)
+        return APIError(message: failure.message, status: status, code: failure.code, title: failure.title)
     }
 
     /// Did this fail to reach a server at all, rather than reach one that refused?
@@ -166,12 +175,27 @@ struct APIClient {
     }
 
     /// Decode a reply, turning a malformed one into a message a person can act on
-    /// (ReplyError) instead of Foundation's "isn't in the correct format".
+    /// (ServerReply: empty, a web page, or unreadable data) instead of
+    /// Foundation's "isn't in the correct format".
     static func decodeReply<T: Decodable>(_ type: T.Type, from data: Data) throws -> T {
         do {
             return try JSONDecoder().decode(type, from: data)
-        } catch let error as DecodingError {
-            throw APIError(message: ReplyError.message(for: error) ?? ReplyError.unreadable)
+        } catch is DecodingError {
+            let failure = ServerReply.undecodable(data)
+            throw APIError(message: failure.message, status: 200, title: failure.title)
+        }
+    }
+
+    /// One URLSession call with the transport failure in words (APIClient.explain),
+    /// for the helpers that do not go through `request` (getJSON, postJSON). They
+    /// used to let a raw URLError through: "Could not connect to the server."
+    static func perform(_ request: URLRequest, host: String) async throws -> (Data, Int) {
+        do {
+            // Redirects as in `send`: same host, never out of https (RedirectPolicy).
+            let (data, response) = try await URLSession.shared.data(for: request, delegate: RedirectGuard.shared)
+            return (data, (response as? HTTPURLResponse)?.statusCode ?? 0)
+        } catch let error as URLError {
+            throw APIError(message: explain(error, host: host), isUnreachable: isUnreachable(error))
         }
     }
 
@@ -184,9 +208,18 @@ struct APIClient {
         try decode(AuthResponse.self, from: try await request("POST", "v1/login", body: ["email": email, "password": password]))
     }
 
+    /// Trade the current session for one with a fresh 30-day expiry
+    /// (`POST /v1/session/refresh`). The old token keeps its own expiry; the
+    /// backend refuses this exactly where it refuses any authenticated route.
+    func refreshSession() async throws -> AuthResponse {
+        try decode(AuthResponse.self, from: try await request("POST", "v1/session/refresh"))
+    }
+
     // MARK: devices
     func devices() async throws -> [Device] {
-        try decode(DevicesResponse.self, from: try await request("GET", "v1/devices")).devices
+        let devices = try decode(DevicesResponse.self, from: try await request("GET", "v1/devices")).devices
+        let received = Date()
+        return devices.map { var device = $0; device.receivedAt = received; return device }
     }
 
     func claim(code: String) async throws {
@@ -248,6 +281,16 @@ struct APIClient {
 
     func capabilityTiers() async throws -> CapabilityTiersResponse {
         try decode(CapabilityTiersResponse.self, from: try await request("GET", "v1/capability-tiers"))
+    }
+
+    func setCameraMode(deviceID: Int, cameraOnly: Bool, confirm: Bool) async throws {
+        _ = try await request("POST", "v1/devices/\(deviceID)/camera-mode",
+                              body: ["camera_only": cameraOnly, "confirm": confirm])
+    }
+
+    func deleteAccount(password: String) async throws -> AccountDeletionResult {
+        let data = try await request("POST", "v1/account/delete", body: ["password": password, "confirm": true])
+        return (try? decode(AccountDeletionResult.self, from: data)) ?? AccountDeletionResult()
     }
 }
 
@@ -416,9 +459,24 @@ final class AppState: ObservableObject {
     /// Auth token, kept in the Keychain (not UserDefaults). Migrates any token
     /// stored by earlier builds on first launch.
     private var storedToken: String {
-        get { Keychain.get("authToken") ?? "" }
-        set { Keychain.set("authToken", newValue) }
+        get {
+            if let tokenMemory { return tokenMemory }
+            let read = Keychain.get("authToken") ?? ""
+            tokenMemory = read
+            return read
+        }
+        set {
+            tokenMemory = newValue
+            if !Keychain.set("authToken", newValue) {
+                Self.log.error("the session token could not be stored in the Keychain; it is kept for this run only")
+            }
+        }
     }
+    /// The token in memory, read from the Keychain once. Every request used to
+    /// re-read the Keychain (`api` is rebuilt per access); one failed read sent
+    /// a request with no token, and the signed-in app then showed "missing
+    /// bearer token" on every refresh (M8 full journey run, journey 05).
+    private var tokenMemory: String?
 
     /// The device's own dashboard token (`dashboard.token` in its config.yaml),
     /// sent as `X-Device-Token` on `/stream` and `/api`.
@@ -579,6 +637,7 @@ final class AppState: ObservableObject {
         return APIClient(
             baseURL: base.isEmpty ? nil : URL(string: base),
             token: storedToken.isEmpty ? nil : storedToken,
+            signedIn: isSignedIn && !isDemo,
             relocate: { [weak self] in await self?.relocateBackend() ?? nil },
             // Rebuilt on every access (this is a computed property), so the
             // wording tracks how many attempts have actually failed.
@@ -733,6 +792,33 @@ final class AppState: ObservableObject {
         retryTask = nil
         Self.log.info("backend connected at \(url, privacy: .public)")
         startHeartbeat()
+        renewSessionSoon()
+    }
+
+    /// Whether this launch already traded its session token for a fresh one.
+    private var sessionRenewed = false
+
+    /// One renewal per launch, the first time a backend is confirmed: the
+    /// token's 30-day expiry is fixed at issue, so without this a healthy,
+    /// regularly-used app still landed on the sign-in screen on day 31 (M8.5
+    /// reconnect audit). Trading the session here means one used at least once
+    /// a month never ages out. Fire and forget: an older backend without the
+    /// route, an offline moment or an already-expired token change nothing —
+    /// the normal request paths already turn a 401 into the explained
+    /// sign-out — and the fresh token is adopted only while still signed in,
+    /// so a sign-out that races the reply is not undone.
+    private func renewSessionSoon() {
+        guard !sessionRenewed, isSignedIn, !isDemo, !storedToken.isEmpty else { return }
+        sessionRenewed = true
+        let client = api
+        Task { [weak self] in
+            guard let auth = try? await client.refreshSession(), !auth.token.isEmpty else { return }
+            await MainActor.run {
+                guard let self, self.isSignedIn, !self.storedToken.isEmpty else { return }
+                self.storedToken = auth.token
+                Self.log.info("session renewed for another 30 days")
+            }
+        }
     }
 
     /// How often to re-check a backend we believe we are connected to.
@@ -1051,6 +1137,24 @@ final class AppState: ObservableObject {
         localStateOwner = owner
     }
 
+    /// The account was deleted on the server (M8.4): forget everything this
+    /// phone kept for it -- the paired camera and its token, the saved alert
+    /// channel and phone number, announced alert ids -- then sign out. The
+    /// session itself was already ended by the server.
+    func forgetDeletedAccount(notice: String) {
+        deviceLocalURL = ""
+        linkedDeviceID = ""
+        deviceToken = ""
+        accountHardwareIDsRaw = ""
+        UserDefaults.standard.removeObject(forKey: "alertPhone")
+        UserDefaults.standard.removeObject(forKey: "smsOnLoud")
+        Keychain.delete(BackgroundAlertsSection.savedTopicKey)
+        AlertNotifier.shared.forgetAnnounced()
+        localStateOwner = ""
+        signOut(explicit: true)
+        signOutNotice = notice
+    }
+
     func enterDemo() {
         // The demo's simulated event ids would collide with a real backend's;
         // it does not take over the real account's paired camera, though.
@@ -1062,7 +1166,11 @@ final class AppState: ObservableObject {
         signOutNotice = nil
     }
 
-    func signOut() {
+    /// - Parameter explicit: the person chose to sign out (Settings → Log out).
+    ///   The device token, a credential for the camera, is then forgotten too.
+    ///   An expired session (`expireSession`) keeps it: the same person signs
+    ///   back in and their camera must not need pairing again.
+    func signOut(explicit: Bool = true) {
         // Revoke the token server-side too, not just forget it locally --
         // without this, "sign out" on this device left the same token still
         // valid anywhere else it existed (another device, a log, an
@@ -1078,6 +1186,8 @@ final class AppState: ObservableObject {
             AlertNotifier.shared.forgetAnnounced()  // leaving the demo: drop its ids
         }
         let wasDemo = isDemo
+        // Not when leaving the demo: the demo never had the real account's token.
+        if explicit && !wasDemo { deviceToken = "" }
         storedToken = ""
         accountEmail = ""
         storedDemo = false
@@ -1095,7 +1205,7 @@ final class AppState: ObservableObject {
     /// every few seconds forever, showing nothing to explain why data went stale.
     func expireSession(_ reason: String) {
         guard isSignedIn, !isDemo else { return }
-        signOut()
+        signOut(explicit: false)
         signOutNotice = reason
     }
 }

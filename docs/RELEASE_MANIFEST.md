@@ -6,10 +6,15 @@ not memory:
 1. **What exactly does release candidate X put on a device?** (`build`)
 2. **Does this device hold exactly that?** (`verify`)
 
-Before M6, a deploy was `make deploy`. It rsyncs a developer's working tree,
-which may include uncommitted edits. It runs without `--delete`, so a file
-removed from the repo stays on the device. And nothing on the device checks
+Before M6, a deploy was `make deploy`. It rsynced a developer's working tree,
+which could include uncommitted edits. It ran without `--delete`, so a file
+removed from the repo stayed on the device. And nothing on the device checked
 what arrived.
+
+**M8.5:** `make deploy` no longer rsyncs anything. It ships a **bundle** built
+by this tool from git objects (`bundle`, below) and the device stages it,
+verifying every file against the manifest before it is written. The procedure
+is `docs/DEPLOYMENT.md`.
 
 ## build (Mac / worker)
 
@@ -30,7 +35,7 @@ uncommitted edit can never enter a manifest. It records:
 | `config` | sha256 of the repo's default `config.yaml`. A deploy **never** overwrites a device's own config, so this is a reference, not something to install |
 | `model_pins` | `accelerator.yolo_hef(_sha256)`; `setup_pi.sh` `MODEL_SHA256` and `MODEL_SHA256_EVALUATED`; the model-registry artifacts; and `consistent` (config = setup = registry for the `.hef`). `build` exits 1 when the pins disagree |
 | `decoder` | `accelerator.yolo_decoder` (`legacy` is the default. `reference` is opt-in and not INT8-validated; see `docs/DECODER_CANDIDATE.md`) |
-| `requirements` | `requirements-device.txt` sha256 and its pins, plus the extra pins `setup_pi.sh` installs (gpiozero, lgpio) |
+| `requirements` | `requirements-device.txt` sha256 and the pins that apply **on the device** (M8.5: markers evaluated for Linux/aarch64/CPython 3.11; e.g. `simpleaudio` is listed under `not_on_device`). gpiozero and lgpio are device pins since M8.5 (they used to be a separate `setup_pi.sh` install) |
 | `systemd_units` | sha256 of the `sensordyme.service` template and `deploy/systemd/sensordyme-recover.service` |
 | `test_runs` | Free-text references to the test runs that back this release (`--test-ref`, repeatable) |
 
@@ -57,6 +62,28 @@ not exist at an older ref is INFO, never a silent PASS.
 (`scripts/release/verify.sh`): device dependencies → manifest build → gates → systemd units
 (`systemd-analyze verify` + offline exposure score; SKIP on macOS) → focused release tests.
 About 15 s on the Mac, no downloads, changes nothing. `KEEP_MANIFEST=<dir>` keeps the manifest.
+
+## M8.5 additions: the bundle, hashed install paths, the lock on the device
+
+`bundle --ref <ref> --out-dir <dir>` writes the release a device stages:
+
+| File | Meaning |
+|---|---|
+| `sensordyme-<id>.tar.gz` | EXACTLY the manifest's deploy set, from git objects. Regular files only, mode 0644/0755, owner 0, mtime = commit time, so the same commit always gives the same bytes |
+| `sensordyme-<id>.manifest.json` / `.md` | The manifest the device verifies every file against. Its sha256 travels on the stage command line, not in a file |
+| `SHA256SUMS`, `RELEASE_ID`, `COMMIT` | The tarball's and manifest's sha256; `<id>` = commit[:12]; the full commit |
+
+`bundle` exits 1 when a release gate FAILs (`--allow-failed-gates` writes it anyway; never for a device).
+
+New in the manifest and the gates:
+
+| Field / gate | Meaning |
+|---|---|
+| `install_paths` | Every pip install in `setup_pi.sh`, `Makefile`, `scripts/release/release_guard.py` and `scripts/release/install_units.sh`. Gate **"every device install path uses pip --require-hashes with the lock (M84-4)"**: FAIL on a non-comment unhashed install of `requirements-device.txt`, a bare `pkg==ver`, or `--upgrade pip` (a line marked `unhashed-fallback` is the documented dev-box exception), or a file that installs without the lock. INFO for a manifest older than M8.5 |
+| `dependency_lock.locked` | Every locked package and version. `verify` adds the check **"installed packages = the hashed lock"**: the device venv's `pip freeze` must show every locked version (pip/setuptools/wheel excepted, freeze hides them). A venv that did not come from the lock FAILs |
+
+`scripts/release/check_device_deps.py` (verify-release step 1) now also checks the lock against
+the device pins and imports (`docs/DEPLOYMENT.md` §5).
 
 ## verify (device snapshot → Mac)
 
@@ -93,6 +120,18 @@ Exit code: `0` = PASS, `1` = FAIL. Tests: `tests/test_m6_security_release_manife
 
 ## Limits
 
-* The manifest is not signed. It proves what the device holds only relative to a manifest you trust. Store it with the release record.
+* The manifest is not signed. It proves what the device holds only relative to a manifest you trust. Store it with the release record. For a staged deploy, the device checks that the manifest's sha256 equals the value the operator passed over SSH. `docs/DEPLOYMENT.md` §7 explains why that, and not a signature, is the trust anchor.
+* On a staged device the snapshot root is `~/sensordyme`, which is a symlink to the current release. Snapshot it as before: `integrity_manifest.py snapshot --root ~/sensordyme`. The `STAGED.json` and `ARTIFACTS.json` beside the code are release records, not code. `verify` reports them as INFO, as it does `config.yaml.bak-*`.
 * The unit check guesses the service user from `/home/<user>/…`. An install elsewhere reports INFO, not PASS.
 * `pip freeze` in a `--system-site-packages` venv also lists apt packages. Only the pinned names are compared.
+
+## M8.5 PACKAGE: the transfer package
+
+`make transfer-package REF=<rc>` (`scripts/release/build_transfer_package.py`) wraps `bundle`
+into the full carry-to-the-device directory `~/sensordyme-release/transfer-<id>/`: the bundle
+tarball + manifest, the hashed aarch64/cp311 wheel set for offline installs, the production
+`.hef` verified against its pin **before** inclusion, a config template (never a real
+`config.yaml`), install scripts and unit templates, generated `INSTALL.md`/`MODELS.md`, and a
+package-wide `SHA256SUMS` that the build re-verifies before printing its final line. The build
+refuses secrets and device state anywhere in the package. Procedure and contents:
+`docs/DEPLOYMENT.md` §10. Tests: `tests/test_m85_package_transfer.py`.

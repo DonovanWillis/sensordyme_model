@@ -13,8 +13,10 @@ States, in precedence order (the first that applies wins):
              any active policy watches for can be evaluated at all
   STARTING   boot (or a mode switch) is still bringing a needed capability up,
              and nothing has failed outright; bounded by the caller's grace
-  DEGRADED   some policy, event or alert output cannot work, but every
-             role-required capability is available and something is watched
+  DEGRADED   some policy, event or alert output cannot work, or a device-wide
+             condition (sustained heat throttling the SoC, M8.3) makes it work
+             worse, but every role-required capability is available and
+             something is watched
   READY      every active policy can evaluate every event it declares, and
              every configured alert output is ready
 
@@ -47,6 +49,10 @@ class MonitoringState(str, Enum):  # noqa: UP042 - str() of members is part of t
 AVAILABLE = "available"
 IMPAIRED = "impaired"
 STARTING = "starting"
+#: Not running because the owner stopped monitoring (M8.2). Neither a failure
+#: nor start-up: the device is not watching on purpose, and says so. Real faults
+#: found while stopped (a failed model, a camera fault) stay IMPAIRED.
+PAUSED = "paused"
 
 #: Every policy needs frames and a running inference loop, whatever it watches.
 BASE_REQUIREMENTS = frozenset({"camera", "inference"})
@@ -66,6 +72,10 @@ class Capability:
     @property
     def impaired(self) -> bool:
         return self.state == IMPAIRED
+
+    @property
+    def paused(self) -> bool:
+        return self.state == PAUSED
 
     def to_dict(self) -> dict:
         return {"state": self.state, "reason": self.reason}
@@ -186,10 +196,14 @@ def evaluate(
     policies: Iterable[Policy],
     role_required: Iterable[str] = (),
     actuators: Iterable[Actuator] = (),
+    conditions: Iterable[str] = (),
 ) -> Evaluation:
     """The device's monitoring state from observed facts. See the module docstring.
 
     `stopped` is the reason monitoring was explicitly stopped, or None.
+    `conditions` (M8.3) are device-wide facts that make monitoring work worse
+    without taking a capability away -- sustained heat throttling the SoC. Each
+    is a reason the state is DEGRADED and never READY; none can make it FAILED.
     """
     caps = dict(capabilities)
     actuators = list(actuators)
@@ -222,6 +236,7 @@ def evaluate(
 
     reasons = [f"{p.name}: {r}" for p in policy_health for r in p.reasons]
     reasons += [f"alert output {a.name} unavailable: {a.detail}" for a in actuators if not a.ready]
+    reasons += [f"device: {c}" for c in conditions if c]
     if reasons:
         return Evaluation(MonitoringState.DEGRADED, tuple(reasons), policy_health, caps)
     return Evaluation(MonitoringState.READY, (), policy_health, caps)
@@ -273,6 +288,7 @@ class MonitoringReport:
             "capabilities": {name: cap.to_dict() for name, cap in sorted(caps.items())},
             "available": sorted(n for n, c in caps.items() if c.available),
             "impaired": sorted(n for n, c in caps.items() if c.impaired),
+            "paused": sorted(n for n, c in caps.items() if c.paused),
             "policies": [p.to_dict() for p in self.policies],
             "actuators": [a.to_dict() for a in self.actuators],
             "last_frame_age_s": self.last_frame_age_s,

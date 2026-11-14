@@ -118,5 +118,18 @@ do {
     check(poll("quiet", [newest + 1, 1000]) == [newest + 1], "while its genuinely new event still is")
 }
 
+print("\na tapped notification opens its own device, or says why it can't:")
+check(NotificationRouting.route(pendingDeviceID: 7, deviceIDs: [3, 7]) == .open(7), "its device")
+check(NotificationRouting.route(pendingDeviceID: 9, deviceIDs: [3, 7]) == .deviceNotOnAccount,
+      "a device no longer on the account is said (was: opened the first device, which then ignored the alert)")
+check(NotificationRouting.route(pendingDeviceID: nil, deviceIDs: [3]) == .open(3),
+      "an old notification without a device id opens the only device")
+check(NotificationRouting.route(pendingDeviceID: nil, deviceIDs: [3, 7]) == .ambiguous,
+      "and with several devices does not guess")
+check(NotificationRouting.route(pendingDeviceID: 7, deviceIDs: []) == .deviceNotOnAccount, "no devices at all")
+check(NotificationRouting.message(.deviceNotOnAccount)?.contains("no longer on this account") == true,
+      "the reason is said in words")
+check(NotificationRouting.message(.open(3)) == nil, "nothing to say when it opens")
+
 print("\n\(failures == 0 ? "PASSED" : "\(failures) FAILED")")
 exit(failures == 0 ? 0 : 1)

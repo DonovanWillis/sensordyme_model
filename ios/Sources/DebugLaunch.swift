@@ -19,12 +19,27 @@ enum DebugLaunch {
     static var openJupiter: Bool { args.contains("-orynOpenJupiter") }
     /// Open the device's event history.
     static var openHistory: Bool { args.contains("-orynOpenHistory") }
+    /// Open one event's detail sheet: `latest`, or `experimental` (the newest
+    /// experimental observation), e.g. `-orynOpenEvent experimental`.
+    static var openEvent: String? { value(after: "-orynOpenEvent") }
     /// Scroll the device screen to its last section.
     static var scrollToBottom: Bool { args.contains("-orynScrollBottom") }
+    /// Open the full-screen camera from the device screen (to record its zoom).
+    static var openCamera: Bool { args.contains("-orynOpenCamera") }
+    /// Open one mode's detail from the device screen (`-orynOpenMode driver_safety`).
+    static var openMode: String? { value(after: "-orynOpenMode") }
     /// Select a tab: devices, shop or settings.
     static var tab: String? { value(after: "-orynTab") }
     /// Text to pre-fill (and send) in Ask Jupiter.
     static var jupiterPrompt: String? { value(after: "-orynPrompt") }
+    /// Open a Settings page: live, text, alerts, doctor or delete.
+    static var settingsPage: String? { value(after: "-orynSettingsPage") }
+    /// Scroll the device screen to a section (`-orynScrollTo modes`).
+    static var scrollTarget: String? { value(after: "-orynScrollTo") }
+    /// Open Add device (`wizard`) or Bluetooth setup (`bluetooth`) from the device list.
+    static var openSetup: String? { value(after: "-orynOpenSetup") }
+    /// Put the keyboard in the device screen's Ask Jupiter dock.
+    static var focusJupiter: Bool { args.contains("-orynFocusJupiter") }
     /// Don't ask for notification permission (the prompt would cover the screen).
     static var noPermissionPrompt: Bool { args.contains("-orynNoPrompt") }
     /// Start signed out, so a UI test can begin at the sign-in screen. It calls the
@@ -38,6 +53,15 @@ enum DebugLaunch {
         return (args[index + 1], args[index + 2])
     }
 
+    /// Point the live feed at a device (`-orynDeviceFeed <url> <token>`), e.g. the
+    /// virtual device's own feed (scripts/sim/uitest_control.py
+    /// --device-dashboard-port), for renders of the camera states. Applied after
+    /// sign-in (a new account clears the paired camera).
+    static var deviceFeed: (url: String, token: String)? {
+        guard let index = args.firstIndex(of: "-orynDeviceFeed"), args.indices.contains(index + 2) else { return nil }
+        return (args[index + 1], args[index + 2])
+    }
+
     private static func value(after flag: String) -> String? {
         guard let index = args.firstIndex(of: flag), args.indices.contains(index + 1) else { return nil }
         return args[index + 1]
@@ -47,10 +71,18 @@ enum DebugLaunch {
     static let openDevice = false
     static let openJupiter = false
     static let openHistory = false
+    static let openEvent: String? = nil
     static let scrollToBottom = false
+    static let openCamera = false
+    static let openMode: String? = nil
     static let tab: String? = nil
     static let jupiterPrompt: String? = nil
+    static let openSetup: String? = nil
+    static let scrollTarget: String? = nil
+    static let settingsPage: String? = nil
+    static let focusJupiter = false
     static let session: (token: String, email: String)? = nil
+    static let deviceFeed: (url: String, token: String)? = nil
     static let noPermissionPrompt = false
     static let signOut = false
     #endif

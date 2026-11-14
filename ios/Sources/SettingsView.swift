@@ -1,284 +1,207 @@
 import SwiftUI
 
+/// Settings, in the order people come here for: who is signed in, their
+/// devices, their alerts, then the connection to the server and the tools to
+/// fix it. Each row says what it is; anything with more than a line of detail
+/// is one level down, so this screen reads as a list, not a manual.
+///
+/// Every control does what it says, at once or with an explicit Save that
+/// says whether it is saved. Device information is shown only as the device
+/// itself reported it (Live feed → Device health); nothing here is a
+/// placeholder.
 struct SettingsView: View {
     @State private var showSetup = false
     @EnvironmentObject private var state: AppState
-    @StateObject private var discovery = DeviceDiscovery()
-    @State private var ntfyTopic = ""
-    @State private var savedMessage: String?
-    @State private var errorMessage: String?
-    @AppStorage("alertPhone") private var alertPhone = ""
-    @AppStorage("smsOnLoud") private var smsOnLoud = true
-    @State private var phoneSaved = false
-    @State private var health: DeviceHealth?
-    @State private var healthError: String?
     @State private var findMessage: String?
-    /// Local draft so the field is editable without writing the Keychain on every keystroke.
-    @State private var tokenDraft = ""
+    @Environment(\.dynamicTypeSize) private var typeSize
 
     var body: some View {
         NavigationStack {
+            ScrollViewReader { proxy in
             Form {
             Group {
                 if state.isDemo {
                     Section {
                         HStack(spacing: 12) {
                             OrynMark(height: 22)
+                                .accessibilityHidden(true)
                             Text("Demo mode — everything you see is a simulated device.")
-                                .font(.subheadline)
+                                .font(SD.Typography.callout)
+                                .fixedSize(horizontal: false, vertical: true)
                         }
                         Button("Exit demo", role: .destructive) { state.signOut() }
+                            .accessibilityIdentifier("settings.exitDemo")
+                    }
+                } else if state.isSignedIn {
+                    Section("Account") {
+                        LabeledContent("Signed in as") {
+                            Text(state.accountEmail)
+                                .foregroundStyle(SD.Colors.textSecondary)
+                                .fixedSize(horizontal: false, vertical: true)
+                        }
+                        .accessibilityElement(children: .combine)
+                        // M8.4: deleting the account, one level down, where what
+                        // is and is not deleted is said before anything happens.
+                        NavigationLink {
+                            AccountDeletionView()
+                        } label: {
+                            Label("Delete account", systemImage: "person.crop.circle.badge.xmark")
+                                .foregroundStyle(SD.Colors.danger)
+                        }
+                        .accessibilityIdentifier("settings.deleteAccount")
                     }
                 }
 
-                // Every "can't reach the backend" message in the app tells the
-                // user to come here, and for a while there was nothing here to
-                // come to: this section had been removed while the messages that
-                // point at it stayed, so the app named a fix that did not exist.
-                Section("Server") {
-                    // A plain row, not LabeledContent: on iOS 26 a LabeledContent
-                    // whose value is a Label grew to several hundred points tall,
-                    // leaving a blank card. (Same fix as rebuild/oryn-edge-app c3a9c87.)
-                    HStack {
-                        Text("Status")
-                        Spacer(minLength: SD.Space.sm)
-                        backendStatusLabel
+                Section {
+                    // Same flow as the device list's Bluetooth button, not a
+                    // second one. Two provisioning screens means two state
+                    // machines to keep honest, and they drift.
+                    Button { showSetup = true } label: {
+                        Label("Set up device Wi-Fi over Bluetooth", systemImage: "dot.radiowaves.left.and.right")
                     }
-                    .accessibilityElement(children: .combine)
+                    .accessibilityIdentifier("settings.bluetoothSetup")
+                    NavigationLink {
+                        LiveFeedSettingsView()
+                    } label: {
+                        Label("Live feed", systemImage: "video")
+                    }
+                    .accessibilityIdentifier("settings.liveFeed")
+                } header: {
+                    Text("Devices")
+                } footer: {
+                    Text("Bluetooth setup is for a new device, or one moved somewhere new. Live feed is the picture on this Wi-Fi: finding the device, its token and its health.")
+                }
+
+                Section("Alerts") {
+                    NavigationLink {
+                        BackgroundAlertsSettingsView()
+                    } label: {
+                        Label("When the app is closed", systemImage: "bell.badge")
+                    }
+                    .accessibilityIdentifier("settings.backgroundAlerts")
+                    NavigationLink {
+                        TextAlertsSettingsView()
+                    } label: {
+                        Label("Text messages", systemImage: "message")
+                    }
+                    .accessibilityIdentifier("settings.textAlerts")
+                }
+
+                // Every "can't reach the backend" message in the app tells the
+                // user to come here, so it must always be here.
+                Section {
+                    statusRow
                     if let address = backendAddress {
-                        LabeledContent("Address", value: address)
-                            .font(.footnote)
-                            .foregroundStyle(SD.Colors.textSecondary)
-                        Text("Found \(backendSource).")
-                            .font(.footnote)
-                            .foregroundStyle(SD.Colors.textSecondary)
+                        LabeledContent("Address") {
+                            Text(address)
+                                .font(SD.Typography.callout.monospaced())
+                                .foregroundStyle(SD.Colors.textSecondary)
+                                .fixedSize(horizontal: false, vertical: true)
+                        }
+                        .accessibilityElement(children: .combine)
                     }
                     Button {
                         Task { await findBackend() }
                     } label: {
-                        Label("Find my server", systemImage: "antenna.radiowaves.left.and.right")
+                        Label(state.isLocatingBackend ? "Looking for your server…" : "Find my server",
+                              systemImage: "antenna.radiowaves.left.and.right")
                     }
                     .disabled(state.isLocatingBackend)
+                    .accessibilityIdentifier("settings.findServer")
                     if let findMessage {
                         Text(findMessage)
-                            .font(.footnote)
+                            .font(SD.Typography.caption)
                             .foregroundStyle(SD.Colors.textSecondary)
+                            .fixedSize(horizontal: false, vertical: true)
                     }
-                    Text("ORYN EDGE finds your server on the Wi-Fi by itself and reconnects when it moves, restarts, or the phone rejoins the network. You should not need to type an address.")
-                        .font(.footnote)
-                        .foregroundStyle(SD.Colors.textSecondary)
-                }
-
-                // Deliberately its own collapsed-by-default screen rather than a
-                // field in the section above. A typed address outranks discovery,
-                // so it is the one setting here that can take the app off the air
-                // — it should take a deliberate trip to reach, not sit under the
-                // cursor next to the automatic behaviour that normally works.
-                Section {
+                    // Deliberately one level down: a typed address outranks
+                    // discovery, so it is the one setting here that can take the
+                    // app off the air.
                     NavigationLink {
                         ManualBackendView()
                     } label: {
                         Label("Manual server address", systemImage: "slider.horizontal.3")
                     }
-                } footer: {
-                    Text("Only needed for a server that Bonjour can't reach — a different subnet, or a deployed URL.")
-                }
-
-                Section("Troubleshooting") {
                     NavigationLink {
                         DiagnosticsView()
                     } label: {
                         Label("Connection doctor", systemImage: "stethoscope")
                     }
-                    Text("Tests every stage — account, cloud, device, live feed — and points at the first one that fails.")
-                        .font(.footnote)
-                        .foregroundStyle(SD.Colors.textSecondary)
+                } header: {
+                    Text("Server")
+                } footer: {
+                    Text(backendAddress == nil
+                         ? "ORYN EDGE finds your server on the Wi-Fi by itself. The connection doctor tests every stage and points at the first one that fails."
+                         : "Address \(backendSource). ORYN EDGE finds your server on the Wi-Fi by itself and reconnects when it moves. The connection doctor tests every stage and points at the first one that fails.")
                 }
 
-
-
-                Section("Device Wi-Fi setup") {
-                    // Same flow as the home screen's Bluetooth button, not a
-                    // second one. Two provisioning screens means two state
-                    // machines to keep honest, and they drift.
-                    Button { showSetup = true } label: {
-                        Label("Set up device Wi-Fi over Bluetooth", systemImage: "wave.3.right")
-                    }
-                    Text("For a brand-new device, or one moved somewhere new. Works whether or not the device currently has Wi-Fi.")
-                        .font(.footnote)
-                        .foregroundStyle(SD.Colors.textSecondary)
-                }
-
-                // `discovery` was already declared here and never used, while
-                // DiagnosticsView told people to come to "Find my device" to fix
-                // an empty device address. Both halves existed; nothing joined
-                // them, so the live feed could not be pointed at a device at all.
-                Section("Live feed") {
-                    if !state.deviceLocalURL.isEmpty {
-                        LabeledContent("Device", value: state.deviceLocalURL)
-                            .font(.footnote)
-                            .foregroundStyle(SD.Colors.textSecondary)
-                    }
-                    Button {
-                        discovery.start()
-                    } label: {
-                        Label(
-                            discovery.isSearching ? "Looking for your device…" : "Find my device",
-                            systemImage: "video.badge.waveform"
-                        )
-                    }
-                    .disabled(discovery.isSearching)
-                    ForEach(discovery.found) { device in
-                        Button {
-                            state.deviceLocalURL = device.url
-                            // The id too: the address alone left the stored id
-                            // naming a different camera than the one streaming.
-                            state.linkedDeviceID = device.id
-                            discovery.stop()
-                        } label: {
-                            HStack {
-                                VStack(alignment: .leading, spacing: 2) {
-                                    Text(device.name)
-                                    Text(device.url)
-                                        .font(.caption)
-                                        .foregroundStyle(SD.Colors.textSecondary)
-                                }
-                                Spacer()
-                                if state.deviceLocalURL == device.url {
-                                    Image(systemName: "checkmark")
-                                        .foregroundStyle(SD.Colors.success)
-                                }
-                            }
-                        }
-                    }
-                    if let problem = discovery.problem {
-                        Text(problem)
-                            .font(.footnote)
-                            .foregroundStyle(SD.Colors.warning)
-                    } else if discovery.found.isEmpty && !discovery.isSearching && state.deviceLocalURL.isEmpty {
-                        Text("The device publishes itself on the Wi-Fi it is joined to, so the phone has to be on that same network.")
-                            .font(.footnote)
-                            .foregroundStyle(SD.Colors.textSecondary)
-                    }
-
-                    // The feed and /api on the device both require this token, and
-                    // AppState.deviceToken had no writer anywhere in the app -- so
-                    // the stream's own "add it in Settings -> Device token" message
-                    // named a field that did not exist. It does now.
-                    SecureField("Device token", text: $tokenDraft)
-                        .textInputAutocapitalization(.never)
-                        .autocorrectionDisabled()
-                        .onSubmit { state.deviceToken = tokenDraft }
-                    if tokenDraft != state.deviceToken {
-                        Button("Save token") { state.deviceToken = tokenDraft }
-                    }
-                    Text(state.deviceToken.isEmpty
-                         ? "Set dashboard.token in the device's config.yaml, then paste the same value here. Without it the device refuses the live feed rather than showing its camera to everyone on the Wi-Fi."
-                         : "Saved to the keychain. It must match dashboard.token in the device's config.yaml.")
-                        .font(.footnote)
-                        .foregroundStyle(SD.Colors.textSecondary)
-                }
-
-                Section("Device health") {
-                    if let health {
-                        LabeledContent("Overall") {
-                            Label(health.state, systemImage: health.state == "ok" ? "checkmark.circle.fill" : "exclamationmark.triangle.fill")
-                                .foregroundStyle(health.state == "ok" ? SD.Colors.success : SD.Colors.warning)
-                        }
-                        LabeledContent("Uptime", value: Self.uptimeLabel(health.uptime_s))
-                        ForEach(health.components.sorted(by: { $0.key < $1.key }), id: \.key) { name, component in
-                            if component.state != "ok" || component.critical {
-                                LabeledContent(name) {
-                                    Text(component.state == "ok" ? "ok" : component.detail)
-                                        .font(.caption)
-                                        .foregroundStyle(component.state == "ok" ? SD.Colors.success : SD.Colors.warning)
-                                        .lineLimit(2)
-                                }
-                            }
-                        }
-                    } else if let healthError {
-                        Text(healthError).font(.footnote).foregroundStyle(SD.Colors.textSecondary)
-                    }
-                    Button("Check device health") {
-                        Task {
-                            do {
-                                health = try await DeviceHealth.fetch(
-                                    baseURL: state.deviceLocalURL, token: state.deviceToken
-                                )
-                                healthError = nil
-                            } catch {
-                                health = nil
-                                healthError = error.localizedDescription
-                            }
-                        }
-                    }
-                    .disabled(state.deviceLocalURL.isEmpty)
-                }
-
-                Section("Text-message alerts") {
-                    TextField("+1 555 123 4567", text: $alertPhone)
-                        .keyboardType(.phonePad)
-                    Toggle("Text me on serious alerts", isOn: $smsOnLoud)
-                    Button("Save phone number") {
-                        Task {
-                            do {
-                                try await state.backend.setPhone(
-                                    alertPhone.replacingOccurrences(of: " ", with: ""), smsOnLoud: smsOnLoud
-                                )
-                                phoneSaved = true
-                                errorMessage = nil
-                            } catch {
-                                errorMessage = error.localizedDescription
-                                phoneSaved = false
-                            }
-                        }
-                    }
-                    .disabled(alertPhone.isEmpty)
-                    if phoneSaved {
-                        Label("Saved to your account", systemImage: "checkmark.circle.fill")
-                            .font(.footnote).foregroundStyle(SD.Colors.success)
-                    }
-                    if let errorMessage {
-                        Label(errorMessage, systemImage: "exclamationmark.circle")
-                            .font(.footnote).foregroundStyle(SD.Colors.danger)
-                    }
-                    // Honest about both limits: texts need SMS set up on the
-                    // server, and the server can't report saved values back
-                    // (no GET /v1/account), so the field shows what this phone
-                    // last entered, not what the account holds.
-                    Text("On a serious alert (distracted driving, a fall, a covered face, an intruder) the server texts this number — only if SMS is set up on the server. The server can't show saved settings back, so this field shows what this phone last entered.")
-                        .font(.footnote)
-                        .foregroundStyle(SD.Colors.textSecondary)
-                }
-
-                BackgroundAlertsSection(topic: $ntfyTopic)
-
-                if state.isSignedIn {
-                    Section("Account") {
-                        LabeledContent("Signed in as", value: state.accountEmail)
+                if state.isSignedIn && !state.isDemo {
+                    Section {
                         Button("Log out", role: .destructive) {
                             state.signOut()
                         }
+                        .accessibilityIdentifier("settings.logout")
+                    } footer: {
+                        Text("Signing out also forgets this phone's device token.")
                     }
+                    .id("settings.end")
                 }
             }
             .orynRows()
         }
+        .task {
+            guard DebugLaunch.scrollToBottom else { return }
+            try? await Task.sleep(for: .seconds(1))
+            proxy.scrollTo("settings.end", anchor: .bottom)
+        }
+            }
         .orynFormStyle()
             .navigationTitle("Settings")
             .navigationBarTitleDisplayMode(.large)
             .toolbarBackground(SD.Colors.background, for: .navigationBar)
             .sheet(isPresented: $showSetup) { SetupFlowView() }
-            .onAppear {
-                tokenDraft = state.deviceToken
-                // The channel this phone saved last time, not a new one: an
-                // empty field used to mean a fresh random channel on every
-                // visit, silently replacing the one the person subscribed to.
-                if ntfyTopic.isEmpty {
-                    ntfyTopic = Keychain.get(BackgroundAlertsSection.savedTopicKey) ?? ""
+            // DEBUG renders only (DebugLaunch.settingsPage); nil in Release.
+            .navigationDestination(isPresented: Binding(get: { debugPage != nil }, set: { if !$0 { debugPage = nil } })) {
+                switch debugPage {
+                case "live": LiveFeedSettingsView()
+                case "text": TextAlertsSettingsView()
+                case "alerts": BackgroundAlertsSettingsView()
+                case "doctor": DiagnosticsView()
+                case "delete": AccountDeletionView()
+                default: EmptyView()
+                }
+            }
+            .task {
+                guard let page = DebugLaunch.settingsPage else { return }
+                try? await Task.sleep(for: .seconds(1))
+                debugPage = page
+            }
+        }
+    }
+
+    @State private var debugPage: String?
+
+    /// The connection state beside its name, or under it when the reader's
+    /// text size will not fit both on one line ("Con / nected" at AX sizes).
+    private var statusRow: some View {
+        Group {
+            if typeSize.isAccessibilitySize {
+                VStack(alignment: .leading, spacing: SD.Space.xxs) {
+                    Text("Status")
+                    backendStatusLabel
+                }
+            } else {
+                HStack {
+                    Text("Status")
+                    Spacer(minLength: SD.Space.sm)
+                    backendStatusLabel
                 }
             }
         }
+        // A plain row, not LabeledContent: on iOS 26 a LabeledContent whose
+        // value is a Label grew to several hundred points tall.
+        .accessibilityElement(children: .combine)
+        .accessibilityIdentifier("settings.serverStatus")
     }
 
     /// The connection state, said in terms of what the app actually verified.
@@ -324,30 +247,20 @@ struct SettingsView: View {
             return "from the address you entered"
         }
         if !AppState.productionBaseURL.isEmpty { return "built into this app" }
-        return "on this network"
+        return "found on this network"
     }
 
     /// Search the network on demand, and say what happened either way.
     ///
-    /// Ignores whatever is currently saved: the reason to press this button is
-    /// that the saved address is wrong, so confirming it is not an answer.
-    ///
-    /// The result goes to the discovery cache, not to the field above. Pressing
-    /// "find my server" is a request to locate one now, not a decision to pin
-    /// the app to the address it happens to have today — and writing a found
-    /// LAN address into configuration is precisely the conflation that stranded
-    /// the app on an IP from a network it had left.
+    /// Goes through AppState's resolver rather than browsing directly, so this
+    /// button and the automatic reconnection cannot disagree about what is
+    /// connected. It also clears the confirmed address first, which is the
+    /// point of pressing it: the reason to look again is that what the app is
+    /// using is wrong. The result goes to the discovery cache, never into the
+    /// typed address (that conflation once stranded the app on an old IP).
     private func findBackend() async {
         findMessage = nil
-        // Goes through AppState's resolver rather than browsing directly, so this
-        // button and the automatic reconnection cannot disagree about what is
-        // connected — two code paths writing the same state is what made the
-        // status unreliable in the first place. It also clears the confirmed
-        // address first, which is the point of pressing it: the reason to look
-        // again is that what the app is using is wrong, so re-confirming it is
-        // not an answer.
         state.reconnect()
-        // Wait for the resolve the line above kicked off, rather than racing it.
         let found = await state.resolveBackend()
         if let found {
             findMessage = "Found your server at \(found)."
@@ -358,13 +271,6 @@ struct SettingsView: View {
         } else {
             findMessage = "No SensorDyme server answered on this Wi-Fi. Check that it is running and that this phone is on the same network."
         }
-    }
-
-    private static func uptimeLabel(_ seconds: Double) -> String {
-        let total = Int(seconds)
-        if total < 3600 { return "\(total / 60)m" }
-        if total < 86400 { return "\(total / 3600)h \(total % 3600 / 60)m" }
-        return "\(total / 86400)d \(total % 86400 / 3600)h"
     }
 }
 
@@ -423,7 +329,7 @@ struct ManualBackendView: View {
                 if let message {
                     Text(message)
                 } else {
-                    Text("While this is set, ORYN EDGE uses it in preference to whatever it finds on the network. Clear it to go back to finding your Mac automatically.")
+                    Text("While this is set, ORYN EDGE uses it in preference to whatever it finds on the network. Clear it to go back to finding the server on your network automatically.")
                 }
             }
         }

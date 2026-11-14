@@ -594,6 +594,71 @@ class BLEProvisioningServer:
                 log.warning("BLE auth notify failed: %s", exc)
         return reply
 
+    # ------------------------------------------------------------------ the GATT table
+    def gatt_characteristics(self) -> list[tuple[str, tuple[str, ...]]]:
+        """(uuid, flags) of every characteristic served, in registration order.
+
+        The auth characteristic exists only under proof of possession.
+        """
+        table = [
+            (CHAR_DEVICE_INFO_UUID, ("read",)),
+            (CHAR_WIFI_CREDS_UUID, ("write",)),
+            (CHAR_STATUS_UUID, ("read", "notify")),
+            (CHAR_COMMAND_UUID, ("write",)),
+            (CHAR_NETWORKS_UUID, ("read",)),
+        ]
+        if self._on_auth is not None:
+            table.append((CHAR_AUTH_UUID, ("read", "write", "notify")))
+        return table
+
+    def gatt_read(self, uuid: str, offset: int = 0) -> bytes:
+        """The value a read of `uuid` returns (offset 0 = a read from the start)."""
+        if uuid == CHAR_DEVICE_INFO_UUID:
+            return json.dumps(self._device_info).encode()
+        if uuid == CHAR_STATUS_UUID:
+            payload = dict(self._status)
+            payload["scanning"] = self._scanning
+            return _encode_status(payload)
+        if uuid == CHAR_NETWORKS_UUID:
+            return self.read_networks(offset)
+        if uuid == CHAR_AUTH_UUID and self._on_auth is not None:
+            return self._auth_reply
+        return b"{}"
+
+    def gatt_write(self, uuid: str, data: bytes) -> None:
+        """One whole (reassembled) value written to `uuid`."""
+        if uuid == CHAR_WIFI_CREDS_UUID:
+            self.handle_credentials_write(data)
+        elif uuid == CHAR_AUTH_UUID:
+            self.handle_auth_write(data)
+        elif uuid == CHAR_COMMAND_UUID:
+            self.handle_command_write(data)
+
+    def read_networks(self, offset: int = 0) -> bytes:
+        """Wi-Fi networks the DEVICE can see, so the app can offer a list.
+
+        Served from a cache refreshed on a worker thread. The read itself must
+        return instantly -- it runs on the BLE event loop, so any wait here is a
+        wait for every other BLE operation too. Never scan here.
+        """
+        with self._scan_lock:
+            networks = list(self._networks)
+        if offset == 0:
+            # A read from the start is the app arriving on the network screen,
+            # which is when a fresh list is worth starting -- if the cached one
+            # is not already fresh (rate-limited inside).
+            self.refresh_networks()
+        return _fit_networks(networks)
+
+    def handle_command_write(self, data: bytes) -> None:
+        if self._on_command is None:
+            return
+        command = parse_command(data)
+        if command is None:
+            log.warning("BLE: malformed command write ignored")
+            return
+        self._on_command(command)
+
     # ------------------------------------------------------------------ GLib main loop thread
     def _run(self) -> None:
         try:
@@ -754,56 +819,37 @@ class BLEProvisioningServer:
             def GetAll(self, interface):  # noqa: N802 - D-Bus/BlueZ method name
                 return self.properties().get(interface, {})
 
+        # Each characteristic serves what the server's gatt_read/gatt_write
+        # say, so the virtual peripheral (sim/ble_peripheral.py) serves the
+        # very same bytes without D-Bus.
         class DeviceInfoChrc(Characteristic):
             def read_value(self, offset=0):
-                return json.dumps(server._device_info).encode()
+                return server.gatt_read(CHAR_DEVICE_INFO_UUID, offset)
 
         class WifiCredsChrc(Characteristic):
             def write_value(self, data):
-                server.handle_credentials_write(data)
+                server.gatt_write(CHAR_WIFI_CREDS_UUID, data)
 
         class AuthChrc(Characteristic):
             def read_value(self, offset=0):
-                return server._auth_reply
+                return server.gatt_read(CHAR_AUTH_UUID, offset)
 
             def write_value(self, data):
-                server.handle_auth_write(data)
+                server.gatt_write(CHAR_AUTH_UUID, data)
 
         class NetworksChrc(Characteristic):
-            """Wi-Fi networks the DEVICE can see, so the app can offer a list.
-
-            Served from a cache refreshed on a worker thread. The read itself
-            must return instantly — it runs on the BLE event loop, so any wait
-            here is a wait for every other BLE operation too.
-            """
+            """Wi-Fi networks the DEVICE can see (see BLEProvisioningServer.read_networks)."""
 
             def read_value(self, offset=0):
-                # Answers from cache, always. Never scan here: this runs on the
-                # GLib main loop and blocking it stalls the whole connection.
-                with server._scan_lock:
-                    networks = list(server._networks)
-                if offset == 0:
-                    # A read from the start is the app arriving on the network
-                    # screen, which is when a fresh list is worth starting -- if
-                    # the cached one is not already fresh (rate-limited inside).
-                    server.refresh_networks()
-                return _fit_networks(networks)
+                return server.gatt_read(CHAR_NETWORKS_UUID, offset)
 
         class StatusChrc(Characteristic):
             def read_value(self, offset=0):
-                payload = dict(server._status)
-                payload["scanning"] = server._scanning
-                return _encode_status(payload)
+                return server.gatt_read(CHAR_STATUS_UUID, offset)
 
         class CommandChrc(Characteristic):
             def write_value(self, data):
-                if server._on_command is None:
-                    return
-                command = parse_command(data)
-                if command is None:
-                    log.warning("BLE: malformed command write ignored")
-                    return
-                server._on_command(command)
+                server.gatt_write(CHAR_COMMAND_UUID, data)
 
         class Advertisement(dbus.service.Object):
             PATH = "/com/sensordyme/advertisement0"
@@ -834,15 +880,13 @@ class BLEProvisioningServer:
         exported.append(service)
         app.add(service)
         status_chrc = None
-        characteristics = [
-            (0, DeviceInfoChrc, CHAR_DEVICE_INFO_UUID, ["read"]),
-            (1, WifiCredsChrc, CHAR_WIFI_CREDS_UUID, ["write"]),
-            (2, StatusChrc, CHAR_STATUS_UUID, ["read", "notify"]),
-            (3, CommandChrc, CHAR_COMMAND_UUID, ["write"]),
-            (4, NetworksChrc, CHAR_NETWORKS_UUID, ["read"]),
-        ]
-        if self._on_auth is not None:
-            characteristics.append((5, AuthChrc, CHAR_AUTH_UUID, ["read", "write", "notify"]))
+        classes = {
+            CHAR_DEVICE_INFO_UUID: DeviceInfoChrc, CHAR_WIFI_CREDS_UUID: WifiCredsChrc,
+            CHAR_STATUS_UUID: StatusChrc, CHAR_COMMAND_UUID: CommandChrc,
+            CHAR_NETWORKS_UUID: NetworksChrc, CHAR_AUTH_UUID: AuthChrc,
+        }
+        characteristics = [(index, classes[uuid], uuid, list(flags))
+                           for index, (uuid, flags) in enumerate(self.gatt_characteristics())]
         for index, cls, uuid, flags in characteristics:
             chrc = cls(bus, index, uuid, flags, service.PATH)
             exported.append(chrc)

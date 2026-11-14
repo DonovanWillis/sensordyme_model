@@ -43,6 +43,23 @@ REPO = Path(__file__).resolve().parent.parent
 #: Health-monitor and uplink cadence in the deterministic path (production: 2 s each).
 MONITORING_CHECK_S = 2.0
 
+#: Ways a config.yaml is found damaged at boot (M8): a power cut mid-write, a bad
+#: hand edit, a migration that broke the schema, an emptied file.
+CONFIG_DAMAGE = {
+    # A write cut off by a power loss: a third of the file, stopping mid-line. The final
+    # rstrip matters: when len//3 lands one character into a line, [:-1] alone would hand
+    # back whole lines ending in a newline, which the boot path reads as a deliberate
+    # trailing deletion (core/config_lkg.torn_write), not a torn write.
+    "truncated": lambda text: text[: len(text) // 3].rstrip("\n")[:-1].rstrip("\n"),
+    # The same, cut where the result is no longer a mapping with `modules:`.
+    "truncated_early": lambda text: text[: len(text) // 10].rstrip("\n")[:-1].rstrip("\n"),
+    "invalid_yaml": lambda text: text + "\nmodule: [unclosed\n",
+    "not_mapping": lambda _text: "- just\n- a list\n",
+    "schema": lambda text: text + "\nmodules: 7\n",
+    "empty": lambda _text: "",
+    "binary": lambda _text: "\x00\xff\xfe garbage",
+}
+
 
 class _SteppedCapture:
     """Stands in for CaptureService when advance() is the camera pump.
@@ -100,6 +117,8 @@ class VirtualDevice:
         log_level: str = "info",
         honour_backoff: bool = False,
         config_overrides: Optional[dict] = None,
+        config_damage: Optional[str] = None,
+        supervise_inference: bool = False,
     ) -> None:
         self.state_dir = Path(state_dir).resolve()
         self.state_dir.mkdir(parents=True, exist_ok=True)
@@ -120,6 +139,18 @@ class VirtualDevice:
         #: {"role": "general", "module": "shared_perception"}): another kind of
         #: device, same code.
         self.config_overrides = dict(config_overrides or {})
+        #: How this boot's config.yaml is damaged on disk (M8 fault injection),
+        #: one of CONFIG_DAMAGE; None writes it intact.
+        if config_damage is not None and config_damage not in CONFIG_DAMAGE:
+            raise ValueError(f"unknown config damage {config_damage!r}; one of {sorted(CONFIG_DAMAGE)}")
+        self.config_damage = config_damage
+        #: M8.4: an inference pass that raises (a module failing past its
+        #: consecutive-failure budget re-raises on purpose) is handled the way
+        #: services/supervisor.Service handles the thread: a new loop generation
+        #: (restart backoff and the reboot ladder are not modelled). Off by
+        #: default, so an unexpected exception still fails every other test.
+        self.supervise_inference = bool(supervise_inference)
+        self.inference_restarts = 0
         self.log_level = log_level
         self.buzzer = SimBuzzerSink(echo=echo_alerts)
         monotonic = clock.monotonic if clock is not None else time.monotonic
@@ -195,7 +226,15 @@ class VirtualDevice:
 
     def write_config(self) -> Path:
         path = self.state_dir / "config.yaml"
-        path.write_text(yaml.safe_dump(self.config(), sort_keys=False))
+        text = yaml.safe_dump(self.config(), sort_keys=False)
+        if self.config_damage is not None:
+            text = CONFIG_DAMAGE[self.config_damage](text)
+        try:
+            unchanged = path.read_text() == text
+        except (OSError, UnicodeDecodeError):
+            unchanged = False
+        if not unchanged:  # a reboot onto a read-only card still boots (M8.4)
+            path.write_text(text)
         return path
 
     # ------------------------------------------------------------------ build
@@ -232,6 +271,8 @@ class VirtualDevice:
         self._loop = runtime._new_inference_loop_state()
         self._loop.frame_timeout_s = 0.0
         self._next_check = self._next_sync = time.monotonic()
+        # What run() does right after READY=1.
+        runtime._record_known_good_config()
         return runtime
 
     def advance(self, seconds: float, step: float = 0.05) -> None:
@@ -244,7 +285,15 @@ class VirtualDevice:
             frame = self.camera.grab()
             if frame is not None:
                 self.runtime.bus.publish(frame)
-            self.runtime._inference_pass(self._loop, _NoWait())
+            try:
+                self.runtime._inference_pass(self._loop, _NoWait())
+            except Exception:
+                if not self.supervise_inference:
+                    raise
+                self.inference_restarts += 1
+                self.runtime._consecutive_process_failures = 0  # what _inference_loop does on start
+                self._loop = self.runtime._new_inference_loop_state()
+                self._loop.frame_timeout_s = 0.0
             now = self.clock.monotonic()
             if now >= self._next_check:
                 self.runtime._monitoring_check()

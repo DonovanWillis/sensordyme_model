@@ -141,6 +141,13 @@ def facts_from_event(event: dict, rule: Optional[dict] = None) -> list[Fact]:
     model = _model_fact(event.get("model"))
     if model:
         facts.append(Fact("Model", model))
+    # M8.4: an experimental observation (the driver module's risk score, hand
+    # motion) is recorded, never alerted; the explanation says so rather than
+    # reading like an alert. Stored as true or 1; absent on older rows.
+    experimental = event.get("experimental")
+    if experimental is True or (isinstance(experimental, int) and not isinstance(experimental, bool)
+                                and experimental == 1):
+        facts.append(Fact("Experimental observation", "not an alert"))
     return facts
 
 

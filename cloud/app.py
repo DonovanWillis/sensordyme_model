@@ -34,12 +34,14 @@ import sqlite3
 import threading
 import time
 from contextlib import asynccontextmanager, contextmanager, suppress
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any, Optional
 
 import jwt
 import yaml
 from fastapi import BackgroundTasks, Depends, FastAPI, Header, HTTPException, Request
+from fastapi.concurrency import run_in_threadpool
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field
@@ -52,12 +54,16 @@ from cloud.ratelimit import (
     AI_GLOBAL_CONCURRENCY,
     AI_GLOBAL_KEY,
     AI_RATE_LIMITER,
+    CLAIM_FAILURE_LIMITER,
     CLAIM_LIMITER,
     LOGIN_FAILURE_LIMITER,
     LOGIN_LIMITER,
     SIGNUP_LIMITER,
 )
 from core import command_auth as sd_auth
+from core import health_stamp
+from core.behavior.experimental import is_experimental as _is_experimental_type
+from core.logging_setup import describe_failure, mask_phone
 from core.presets import (
     SETTINGS_SEPARATOR,
     PresetError,
@@ -130,6 +136,14 @@ def _load_jwt_secret() -> str:
     try:
         existing = path.read_text().strip()
         if existing:
+            # Created 0600 below, but a restored backup or a copied data
+            # directory keeps whatever mode it arrived with, and anyone who can
+            # read this file can mint a session for any account (M8).
+            with suppress(OSError):
+                if path.stat().st_mode & 0o077:
+                    os.chmod(path, 0o600)
+                    logging.getLogger("uvicorn.error").warning(
+                        "%s was readable by other users; its mode is now 0600", path)
             return existing
     except FileNotFoundError:
         pass
@@ -283,6 +297,37 @@ class _BodySizeLimit:
 app.add_middleware(_BodySizeLimit, limit=MAX_BODY_BYTES)
 
 
+class _NoStore:
+    """`Cache-Control: no-store` on every /v1 answer (M8.3, SECURITY_REVIEW_M6 §6).
+
+    The answers are one account's cameras, alert history and explanations, and
+    the commands a device is to obey. Without a cache header the app's
+    URLSession.shared kept each GET answer in its on-disk URLCache (reproduced:
+    cached with no header, not cached with no-store), where it outlived sign-out
+    and an account change on a shared phone; any HTTP cache in front of the
+    backend could equally serve one account's answer to another request.
+    """
+
+    def __init__(self, app) -> None:
+        self.app = app
+
+    async def __call__(self, scope, receive, send) -> None:
+        if scope["type"] != "http" or not scope.get("path", "").startswith("/v1/"):
+            await self.app(scope, receive, send)
+            return
+
+        async def send_no_store(message) -> None:
+            if message["type"] == "http.response.start":
+                headers = [(k, v) for k, v in message.get("headers", []) if k.lower() != b"cache-control"]
+                message = {**message, "headers": [*headers, (b"cache-control", b"no-store")]}
+            await send(message)
+
+        await self.app(scope, receive, send_no_store)
+
+
+app.add_middleware(_NoStore)
+
+
 @app.exception_handler(RequestValidationError)
 async def _validation_error(_request: Request, exc: RequestValidationError) -> JSONResponse:
     """FastAPI's default 422, minus the echo of what was sent.
@@ -313,6 +358,8 @@ class CodedError(HTTPException):
     def __init__(self, status_code: int, code: str, detail: str) -> None:
         super().__init__(status_code, detail)
         self.code = code
+        #: More fields for the answer body (a device clock_skew's signed time).
+        self.extra: dict = {}
 
 
 @app.exception_handler(CodedError)
@@ -320,6 +367,7 @@ async def _coded_error(_request: Request, exc: CodedError) -> JSONResponse:
     content = {"detail": exc.detail, "code": exc.code}
     if exc.code == "clock_skew":
         content["server_time"] = int(time.time())
+    content.update(getattr(exc, "extra", None) or {})
     return JSONResponse(status_code=exc.status_code, content=content)
 
 
@@ -562,6 +610,53 @@ def init_db() -> None:
             # an earlier request for the same name must not cancel a new one.
             # Compared by content, not by clock -- the device's clock is its own.
             "ALTER TABLE devices ADD COLUMN rejection_baseline TEXT",
+            # Health freshness (M8.1, core/health_stamp.py): which sample the stored
+            # `health` is (boot id, generation, revision), when the BACKEND first
+            # received that generation, when the device observed it (on the
+            # backend's clock: received_at - the device's own monotonic age), how
+            # many times the same sample was re-sent, the boot ids already
+            # superseded by a reboot (JSON list), and the last report refused as
+            # older than the stored one (JSON {reason, at, boot_id, generation}).
+            "ALTER TABLE devices ADD COLUMN health_boot TEXT",
+            "ALTER TABLE devices ADD COLUMN health_generation INTEGER",
+            "ALTER TABLE devices ADD COLUMN health_revision INTEGER",
+            "ALTER TABLE devices ADD COLUMN health_received_at REAL",
+            "ALTER TABLE devices ADD COLUMN health_observed_at REAL",
+            "ALTER TABLE devices ADD COLUMN health_repeats INTEGER DEFAULT 0",
+            "ALTER TABLE devices ADD COLUMN health_boots TEXT",
+            "ALTER TABLE devices ADD COLUMN health_ignored TEXT",
+            # M8.3: the last stop/resume the app asked for and what became of it
+            # (JSON {id, action, requested_at, applied_at, applied_state, ...}).
+            # Unlike desired_protection it is never cleared, so the status can
+            # say confirmed / mismatch / timed_out after delivery ends.
+            "ALTER TABLE devices ADD COLUMN protection_request TEXT",
+            # M8.4 Decision C: the OWNER's camera-only choice (JSON {camera_only,
+            # id, requested_at}). NULL -- every existing row after this
+            # migration -- means OFF: no live camera while monitoring is stopped.
+            "ALTER TABLE devices ADD COLUMN camera_mode TEXT",
+            # M8.3 event integrity (docs/EVENT_PIPELINE.md). NULL for history and
+            # for firmware that predates each field -- never back-filled.
+            # What the device's alert policy did and what its in-cabin outputs
+            # reported (JSON, see _alert_report); `alert_output` is its summary
+            # ("sounded" only when a real output said so) and `alert_rev` the
+            # report's revision, so a late, older report never overwrites a newer.
+            "ALTER TABLE events ADD COLUMN alert TEXT",
+            "ALTER TABLE events ADD COLUMN alert_output TEXT",
+            "ALTER TABLE events ADD COLUMN alert_rev INTEGER",
+            # The alert episode the event opened (`<boot>-<n>`): one stored row per episode.
+            "ALTER TABLE events ADD COLUMN episode TEXT",
+            # 1 when the event came from a simulated device or detector (sim/).
+            "ALTER TABLE events ADD COLUMN simulated INTEGER",
+            # When it happened on the BACKEND's clock, and how that was found:
+            # "device_monotonic" (received_at - the device's own age_s),
+            # "device_clock" (the device timestamp, judged plausible) or
+            # "received" (the device clock was implausible; arrival time).
+            "ALTER TABLE events ADD COLUMN occurred_at REAL",
+            "ALTER TABLE events ADD COLUMN time_basis TEXT",
+            # M8.4 owner decision A: 1 for an experimental observation (high_risk,
+            # elevated_risk, erratic_hand_movement), 0 for any other event this
+            # backend stored since; NULL for history (never back-filled).
+            "ALTER TABLE events ADD COLUMN experimental INTEGER",
         ):
             try:
                 conn.execute(statement)
@@ -586,9 +681,17 @@ def init_db() -> None:
             "CREATE UNIQUE INDEX IF NOT EXISTS idx_events_dedup "
             "ON events(device_id, event_key) WHERE event_key IS NOT NULL"
         )
+        # One stored alert per alert episode (M8.3): a second event for an
+        # episode already stored -- re-reported after a reconnect, under a new
+        # key -- is not a new alert, so it is neither stored nor notified.
+        conn.execute(
+            "CREATE UNIQUE INDEX IF NOT EXISTS idx_events_episode "
+            "ON events(device_id, episode) WHERE episode IS NOT NULL"
+        )
         # For retention (see _prune_events): an age cut-off without this is a
         # full scan of the largest table, on a write transaction.
         conn.execute("CREATE INDEX IF NOT EXISTS idx_events_received ON events(received_at)")
+        _init_device_auth_tables(conn)
         _backfill_auth_kids(conn)
 
 
@@ -608,6 +711,35 @@ def _backfill_auth_kids(conn) -> None:
             except ValueError:
                 kids.append(None)
         conn.execute("UPDATE devices SET auth_kid = ?, previous_auth_kid = ? WHERE id = ?", (*kids, row[0]))
+
+
+def _init_device_auth_tables(conn) -> None:
+    """Device-auth state (docs/DEVICE_AUTH_CONTRACT.md §3, §6): request nonces,
+    revoked keys, per-device enforcement and the last refusal."""
+    conn.execute("CREATE TABLE IF NOT EXISTS auth_nonces (nonce TEXT PRIMARY KEY, seen_at REAL NOT NULL)"
+                 " WITHOUT ROWID")
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_auth_nonces_seen ON auth_nonces(seen_at)")
+    # A revoked key is kept, so a request from its holder is recognised and
+    # reported as revoked rather than as an unknown key. It authenticates
+    # nothing: no lookup that grants access reads this table.
+    conn.execute("CREATE TABLE IF NOT EXISTS revoked_device_keys (kid TEXT PRIMARY KEY,"
+                 " device_id INTEGER NOT NULL, device_key TEXT NOT NULL, revoked_at REAL NOT NULL)")
+    for statement in (
+        # 'required': this device must sign, whatever SENSORDYME_DEVICE_AUTH says
+        # (it can only tighten). NULL follows the backend mode.
+        "ALTER TABLE devices ADD COLUMN auth_mode TEXT",
+        # Set by `manage.py revoke-device`: every request from it is refused.
+        "ALTER TABLE devices ADD COLUMN auth_revoked_at REAL",
+        # 'signed' or 'bearer': how the device last authenticated.
+        "ALTER TABLE devices ADD COLUMN last_auth TEXT",
+        # JSON {reason, at}: the last refusal attributable to this device.
+        "ALTER TABLE devices ADD COLUMN auth_refusal TEXT",
+    ):
+        try:
+            conn.execute(statement)
+        except sqlite3.OperationalError as exc:
+            if "duplicate column name" not in str(exc).lower():
+                raise
 
 
 init_db()
@@ -751,11 +883,147 @@ def _health_payload(row: sqlite3.Row, now: float) -> Optional[dict]:
     last_seen = row["last_seen"]
     if not last_seen or now - last_seen >= _HEALTH_STALE_S:
         return None
+    # A device still polling is not proof the report is current (M8.1): a
+    # sample that stopped being refreshed is withheld like a silent device's.
+    if _health_freshness(row, now)["state"] == "stale":
+        return None
     try:
         report = json.loads(row["health"] or "null")
     except (ValueError, TypeError):
         return None
     return report if isinstance(report, dict) else None
+
+
+#: Boot ids remembered as superseded, so a delayed report from before a reboot
+#: is not taken for yet another reboot.
+_HEALTH_BOOTS_KEPT = 8
+
+_HEALTH_COLUMNS = ("health_boot", "health_generation", "health_revision", "health_received_at",
+                   "health_observed_at", "health_repeats", "health_boots")
+
+
+def _health_decision(stored: dict, health: dict, now: float) -> tuple[str, dict]:
+    """What a reported health sample does to the stored one (M8.1).
+
+    `stored` holds the _HEALTH_COLUMNS of the device row. Returns the outcome and
+    the columns to write (`health` itself only when the content is stored):
+
+      new          a newer generation of the current boot (or the first sample)
+      reboot       a boot id never seen before: the generation restart is accepted
+      revised      the same sample with newer monitoring keys: content stored, age kept
+      repeat       the same sample again: nothing new, it keeps ageing
+      out_of_order an older generation or revision of the current boot: ignored
+      retired_boot a report from a boot a reboot already superseded: ignored
+      invalid      a stamp that cannot be trusted: ignored, so it never refreshes
+      unverified   no stamp (firmware before M8.1): stored, freshness unknown
+
+    Ages are on the backend's clock only: receipt time minus the age the device
+    measured on its monotonic clock. The device's wall clock is never used.
+    """
+    try:
+        stamp = health_stamp.parse(health)
+    except health_stamp.StampError as exc:
+        return "invalid", {"health_ignored": json.dumps({"reason": "invalid", "detail": str(exc)[:120],
+                                                         "at": now, "boot_id": None, "generation": None})}
+    content = json.dumps(_finite(health))
+    if stamp is None:
+        return "unverified", {"health": content, "health_boot": None, "health_generation": None,
+                              "health_revision": None, "health_received_at": now,
+                              "health_observed_at": None, "health_repeats": 0}
+
+    def ignored(reason: str) -> tuple[str, dict]:
+        return reason, {"health_ignored": json.dumps({"reason": reason, "at": now, "boot_id": stamp.boot_id,
+                                                      "generation": stamp.generation})}
+
+    observed = now - (stamp.age_s or 0.0)
+    try:
+        retired = json.loads(stored.get("health_boots") or "[]")
+    except (TypeError, ValueError):
+        retired = []
+    retired = [b for b in retired if isinstance(b, str)] if isinstance(retired, list) else []
+    current = stored.get("health_boot")
+    new_sample = {"health": content, "health_boot": stamp.boot_id, "health_generation": stamp.generation,
+                  "health_revision": stamp.revision, "health_received_at": now,
+                  "health_observed_at": observed, "health_repeats": 0}
+    if stamp.boot_id in retired:
+        return ignored("retired_boot")
+    if current is None:
+        return "new", new_sample
+    if stamp.boot_id != current:
+        retired = [*retired, current][-_HEALTH_BOOTS_KEPT:]
+        return "reboot", {**new_sample, "health_boots": json.dumps(retired)}
+    generation, revision = stored.get("health_generation") or 0, stored.get("health_revision") or 0
+    if stamp.generation > generation:
+        return "new", new_sample
+    if stamp.generation < generation or stamp.revision < revision:
+        return ignored("out_of_order")
+    # The earliest estimate wins: another copy can only make the sample older.
+    stored_observed = stored.get("health_observed_at")
+    kept = min(observed, stored_observed) if isinstance(stored_observed, (int, float)) else observed
+    if stamp.revision > revision:
+        return "revised", {"health": content, "health_revision": stamp.revision, "health_observed_at": kept}
+    return "repeat", {"health_observed_at": kept, "health_repeats": (stored.get("health_repeats") or 0) + 1}
+
+
+def _store_health(conn: sqlite3.Connection, device_id: int, health: Optional[dict], now: float) -> str:
+    """Apply a reported health sample to the device row; returns the outcome (M8.1).
+
+    Called after ingest's first write, so this connection already holds the
+    database's write lock: two overlapping polls from one device (a timed-out
+    request still being served when the retry arrives) cannot both read the
+    same stored generation.
+    """
+    if health is None:
+        return "none"
+    stored = conn.execute(f"SELECT {', '.join(_HEALTH_COLUMNS)} FROM devices WHERE id = ?",  # noqa: S608 - fixed names
+                          (device_id,)).fetchone()
+    outcome, updates = _health_decision(dict(stored) if stored is not None else {}, health, now)
+    if updates:
+        assignments = ", ".join(f"{name} = ?" for name in updates)
+        conn.execute(f"UPDATE devices SET {assignments} WHERE id = ?",  # noqa: S608 - fixed names
+                     (*updates.values(), device_id))
+    if outcome in ("out_of_order", "retired_boot", "invalid"):
+        log.info("ingest: health report from device %s not applied (%s)", device_id, outcome)
+    return outcome
+
+
+def _health_freshness(row: sqlite3.Row, now: float) -> dict:
+    """How current the stored health is as evidence (M8.1, status `health_freshness`).
+
+    Separate from link liveness (`last_seen`): a device can poll every 2 s while
+    re-sending a sample minutes old. `fresh`/`stale` only for a stamped sample;
+    `unverified` for firmware that does not stamp (judged by the link alone, as
+    before M8.1); `absent` when no health was ever stored.
+    """
+    keys = row.keys()
+
+    def col(name: str):
+        return row[name] if name in keys else None
+
+    try:
+        stored = json.loads(row["health"] or "null")
+    except (ValueError, TypeError):
+        stored = None
+    out: dict = {"state": "absent", "verified": False, "age_s": None, "threshold_s": _HEALTH_STALE_S,
+                 "observed_at": None, "received_at": _reported_at(col("health_received_at")),
+                 "device_generated_at": None, "boot_id": None, "generation": None,
+                 "repeats": int(col("health_repeats") or 0),
+                 "last_ignored": _loads_dict(col("health_ignored")) or None}
+    if not isinstance(stored, dict):
+        return out
+    try:
+        stamp = health_stamp.parse(stored)
+    except health_stamp.StampError:
+        stamp = None
+    observed = _reported_at(col("health_observed_at"))
+    if stamp is None or col("health_boot") != stamp.boot_id or observed is None:
+        out["state"] = "unverified"
+        return out
+    age = max(0.0, now - observed)
+    out.update(state="fresh" if age < _HEALTH_STALE_S else "stale", verified=True, age_s=round(age, 1),
+               observed_at=observed, device_generated_at=stamp.generated_wall, boot_id=stamp.boot_id,
+               generation=stamp.generation)
+    return out
 
 
 def _rules_version(ai_rules_json: Optional[str], activation: int = 0) -> str:
@@ -934,10 +1202,13 @@ def _role_facts(monitoring: dict, health_monitoring: dict, protection: dict):
 
 
 def _capabilities_summary(raw) -> Optional[dict]:
-    """{available, impaired: [{name, reason}], starting} from the device's map."""
+    """{available, impaired: [{name, reason}], starting, paused} from the device's map.
+
+    `paused` (M8.2, additive): not running because monitoring was stopped on
+    purpose; never a fault. Older apps ignore the key."""
     if not isinstance(raw, dict):
         return None
-    available, impaired, starting = [], [], []
+    available, impaired, starting, paused = [], [], [], []
     for name, cap in sorted(raw.items()):
         if not isinstance(name, str) or not isinstance(cap, dict):
             continue
@@ -949,7 +1220,9 @@ def _capabilities_summary(raw) -> Optional[dict]:
             impaired.append({"name": name, "reason": str(reason)[:500] if reason else None})
         elif state == "starting":
             starting.append(name)
-    return {"available": available, "impaired": impaired, "starting": starting}
+        elif state == "paused":
+            paused.append(name)
+    return {"available": available, "impaired": impaired, "starting": starting, "paused": paused}
 
 
 def _rejection(raw) -> Optional[dict]:
@@ -1009,7 +1282,7 @@ def _new_refusal(raw, kind: str, baseline_json: Optional[str]) -> Optional[dict]
 
 # ---------------------------------------------------------------- M7 perception (device truth)
 #: docs/M7_IMPLEMENTATION_MAP.md wire contract, `monitoring.perception`.
-_COMPONENT_STATES = ("ok", "stale", "failed", "unavailable", "idle")
+_COMPONENT_STATES = ("ok", "stale", "failed", "unavailable", "idle", "paused")  # paused: M8.2
 _NODE_STATES = ("active", "degraded", "inactive", "failed")
 #: Which product capability kind each shared perception component provides.
 COMPONENT_CAPABILITY = {
@@ -1034,6 +1307,36 @@ def _count(value) -> Optional[int]:
 
 def _short(value, limit: int = 200) -> Optional[str]:
     return value[:limit] if isinstance(value, str) and value else None
+
+
+def _node_metrics(raw) -> Optional[dict]:
+    """A node's current values (M8: counts, per-area occupancy and dwell), bounded:
+    numbers, booleans and short id lists only -- never free text, never accuracy."""
+    if not isinstance(raw, dict):
+        return None
+
+    def scalar(value):
+        if isinstance(value, bool) or value is None:
+            return value
+        return _finite_or_none(value)
+
+    out: dict = {}
+    for key, value in list(raw.items())[:16]:
+        if not isinstance(key, str):
+            continue
+        if isinstance(value, dict):
+            nested = {}
+            for name, inner in list(value.items())[:16]:
+                if isinstance(name, str) and isinstance(inner, dict):
+                    nested[name[:64]] = {str(k)[:32]: scalar(v) for k, v in list(inner.items())[:8]}
+                elif isinstance(name, str):
+                    nested[name[:64]] = scalar(inner)
+            out[key[:32]] = nested
+        elif isinstance(value, list):
+            out[key[:32]] = [v for v in value[:64] if isinstance(v, int) and not isinstance(v, bool)]
+        else:
+            out[key[:32]] = scalar(value)
+    return out
 
 
 def _perception(raw) -> Optional[dict]:
@@ -1079,19 +1382,33 @@ def _perception(raw) -> Optional[dict]:
             "validation": _short(node.get("validation"), 64),
             "experimental": node.get("experimental") if isinstance(node.get("experimental"), bool) else None,
             "reason": _short(node.get("reason"), 500),
+            # M8: what it measures now (people_counter: count, areas) and its
+            # experimental parts (baby monitoring's pose features), as reported.
+            "enabled_by": _short(node.get("enabled_by"), 16),
+            "metrics": _node_metrics(node.get("metrics")),
+            "experimental_features": [
+                {"id": _short(f.get("id"), 64), "status": _short(f.get("status"), 200),
+                 "enabled": f.get("enabled") if isinstance(f.get("enabled"), bool) else None}
+                for f in (node.get("experimental_features") or [])[:8] if isinstance(f, dict)
+            ] if isinstance(node.get("experimental_features"), list) else [],
         })
+    tracking = raw.get("tracking")
     return {
         "schema": _short(raw.get("schema"), 64),
         "simulated": raw.get("simulated") if isinstance(raw.get("simulated"), bool) else None,
         "components": components,
         "nodes": nodes,
+        # M8: the shared tracker's counters and cost (numbers only).
+        "tracking": ({k: _finite_or_none(v) for k, v in list(tracking.items())[:16]
+                      if isinstance(k, str) and not isinstance(v, bool) and isinstance(v, (int, float))}
+                     if isinstance(tracking, dict) else None),
     }
 
 
 def _reported_perception(live_health: dict, monitoring: dict) -> Optional[dict]:
     """Perception from a LIVE report: the health report's monitoring block, the
     health report itself, or the pushed monitoring block (firmware generations)."""
-    live_monitoring = live_health.get("monitoring") if isinstance(live_health.get("monitoring"), dict) else {}
+    live_monitoring = _dict_field(live_health, "monitoring")
     for source in (live_monitoring, live_health, monitoring):
         if isinstance(source.get("perception"), dict):
             return _perception(source["perception"])
@@ -1126,6 +1443,219 @@ _ACTUATOR_KEYS = ("name", "kind", "audible", "ready", "detail", "commands_ok", "
                   "physically_verified")
 
 
+# ---------------------------------------------------------------- M8.3 truth (docs/STATE_MODEL.md)
+#: Capabilities that are analysis results, as opposed to the pipeline that feeds
+#: them (camera, inference) and the hardware outputs (alert_output, audible_alert).
+_ANALYSIS_CAPABILITIES = frozenset({"face", "objects", "hands", "pose", "attention"})
+#: How long a stop/resume may go unacknowledged before its outcome is `timed_out`
+#: (the app's ProtectionControl.timeout: stopping drains the pipeline).
+PROTECTION_ACK_TIMEOUT_S = 45.0
+#: A stop not delivered within this long is never delivered: a stop arriving
+#: minutes after the person gave up on it would end protection behind their back.
+#: A resume keeps being delivered until applied (the protective direction).
+PROTECTION_STOP_DELIVERY_S = 30.0
+
+
+def _make_coherent(status: dict) -> list[str]:
+    """Apply the device's own rules to its own report, in the safe direction only.
+
+    A report is normally coherent: services/runtime.py derives every field from
+    one evaluation. One that is not (older firmware, a sample torn between two
+    evaluations, a capability list from before M8.2) must never reach the app
+    as a claim the device's own rules forbid. Each correction only withdraws a
+    claim -- protecting, monitoring, a capability producing results -- never
+    adds one, and is listed in `status.corrections`. A stale status is not
+    touched: it already claims nothing.
+    """
+    if status["stale"]:
+        return []
+    fixes: list[str] = []
+    state, protection = status["monitoring_state"], status["protection"]
+    # An explicit stop is authoritative in whichever block reports it.
+    if (state == "stopped") != (protection == "stopped") and "stopped" in (state, protection):
+        fixes.append(f"stopped in one block but {state if protection == 'stopped' else protection} "
+                     "in the other: reported as stopped")
+        state = protection = "stopped"
+    caps = status.get("capabilities")
+    if isinstance(caps, dict):
+        available = list(caps.get("available") or [])
+        impaired = list(caps.get("impaired") or [])
+        paused = list(caps.get("paused") or [])
+        impaired_names = {i["name"]: i.get("reason") for i in impaired if isinstance(i, dict)}
+
+        def withdraw(name: str, *, pause: bool, reason: str, into_impaired: bool = True) -> None:
+            if name not in available:
+                return
+            available.remove(name)
+            if pause:
+                paused.append(name)
+            elif into_impaired:
+                impaired.append({"name": name, "reason": reason})
+                impaired_names[name] = reason
+            fixes.append(f"{name} withdrawn from available: {reason}")
+
+        if state == "stopped":
+            # M8.2: nothing analyses while stopped (a device before M8.2 said otherwise).
+            for name in sorted(_ANALYSIS_CAPABILITIES | {"inference"}):
+                withdraw(name, pause=True, reason="monitoring is stopped")
+        # Nothing produces results without frames or a running inference loop.
+        for pipe in ("camera", "inference"):
+            if pipe in impaired_names:
+                why = f"no analysis: {pipe} unavailable ({impaired_names[pipe] or 'impaired'})"
+                for name in sorted(_ANALYSIS_CAPABILITIES):
+                    withdraw(name, pause=False, reason=why)
+        # A model that failed or is missing produces nothing (perception truth).
+        # A missing one is left to the perception report, which says
+        # `unsupported` (capability_states): switching cannot repair it.
+        for component, comp in ((status.get("perception") or {}).get("components") or {}).items():
+            kind = COMPONENT_CAPABILITY.get(component)
+            if kind and isinstance(comp, dict) and comp.get("state") in ("failed", "unavailable"):
+                withdraw(kind, pause=False, into_impaired=comp["state"] == "failed",
+                         reason=f"{component.replace('_', ' ')} {comp['state']}: "
+                                f"{comp.get('reason') or 'no reason given'}")
+        # Every policy needs frames and inference (core/monitoring_state.py
+        # BASE_REQUIREMENTS): without either nothing can be evaluated -- FAILED.
+        lost = [p for p in ("camera", "inference") if p in impaired_names]
+        if lost and state in ("ready", "degraded"):
+            fixes.append(f"{state} while {', '.join(lost)} impaired: reported as failed")
+            status["reasons"] = [*status["reasons"],
+                                 *(f"required capability unavailable — {p}: {impaired_names[p]}" for p in lost)]
+            state = "failed"
+        status["capabilities"] = {**caps, "available": available, "impaired": impaired, "paused": paused}
+    if state == "stopped" and isinstance(status.get("perception"), dict):
+        for comp in (status["perception"].get("components") or {}).values():
+            if isinstance(comp, dict) and comp.get("state") in ("ok", "stale", "idle"):
+                comp["state"], comp["reason"] = "paused", "monitoring is stopped"
+                fixes.append("a perception component withdrawn while stopped")
+    if protection == "protecting" and state not in ("ready", "degraded"):
+        fixes.append(f"protecting while {state}: reported as not protecting")
+        protection = "not_protecting"
+        status["protection_reasons"] = [*status["protection_reasons"], f"monitoring state is {state}"]
+    status["monitoring_state"], status["protection"] = state, protection
+    if state != "unknown":
+        status["monitoring_active"] = state in ("ready", "degraded")
+    return fixes
+
+
+def _desired_camera_mode(row) -> dict:
+    """The owner's camera-only choice for a device row; OFF when never set (M8.4)."""
+    columns = row.keys() if hasattr(row, "keys") else ()
+    record = _loads_dict(row["camera_mode"] if "camera_mode" in columns else None)
+    return {"camera_only": record.get("camera_only") is True,
+            "id": record.get("id") if isinstance(record.get("id"), str) else None,
+            "requested_at": _reported_at(record.get("requested_at"))}
+
+
+def _reported_camera(monitoring: Optional[dict]) -> Optional[dict]:
+    """The device's own camera block (core/camera_privacy.py report), or None for
+    firmware that predates M8.4 (it cannot honour camera-only at all)."""
+    block = (monitoring or {}).get("camera")
+    if not isinstance(block, dict) or block.get("schema") != 1:
+        return None
+    return block
+
+
+_REMOTE_STREAM_STATES = ("monitoring", "camera_only", "off_while_stopped", "unavailable")
+
+
+def _camera_mode_status(row: sqlite3.Row, monitoring: dict, stale: bool) -> dict:
+    """What the app shows about camera access (docs/PRIVACY.md, APP_STATUS_CONTRACT).
+
+    The device's report is the truth; the owner's choice is shown beside it so
+    "pending" is visible. `supported: false` = firmware before M8.4: such a
+    device (M8.3) streams the raw camera while stopped and cannot be told not
+    to -- the app must say so rather than claim the camera is off.
+    """
+    desired = _desired_camera_mode(row)
+    reported = _reported_camera(monitoring)
+    if reported is None:
+        return {"supported": False, "camera_only": None, "remote_stream": None,
+                "desired_camera_only": desired["camera_only"], "pending": False,
+                "command_id": desired["id"], "stale": bool(stale)}
+    camera_only = reported.get("camera_only") is True
+    remote = reported.get("remote_stream")
+    return {
+        "supported": True,
+        "camera_only": camera_only,
+        # Only while live: a stale report says nothing about the stream NOW.
+        "remote_stream": remote if (remote in _REMOTE_STREAM_STATES and not stale) else None,
+        "desired_camera_only": desired["camera_only"],
+        "pending": camera_only != desired["camera_only"],
+        "command_id": desired["id"],
+        "stale": bool(stale),
+    }
+
+
+def _protection_command(row: sqlite3.Row, now: float) -> Optional[dict]:
+    """The last stop/resume the app asked for, and its outcome (M8.3).
+
+    outcome   pending    not applied yet, within PROTECTION_ACK_TIMEOUT_S
+              confirmed  the device echoed THIS id with the requested state
+              mismatch   the device echoed this id but reports another state
+                         (it refused, or something else changed it first)
+              timed_out  not applied within the timeout
+    The outcome is latched from the report that first carried the echo, so a
+    later local change cannot rewrite what this request did. `delivering` says
+    whether the backend still sends it: a resume until applied, a stop only for
+    PROTECTION_STOP_DELIVERY_S.
+    """
+    columns = row.keys()  # sqlite3.Row: `in row` would test the values
+    record = _loads_dict(row["protection_request"] if "protection_request" in columns else None)
+    action, command_id = record.get("action"), record.get("id")
+    if action not in ("stop", "resume") or not isinstance(command_id, str):
+        return None
+    requested = _reported_at(record.get("requested_at"))
+    age = max(0.0, now - requested) if requested is not None else None
+    applied_at = _reported_at(record.get("applied_at"))
+    applied_state = record.get("applied_state") if isinstance(record.get("applied_state"), str) else None
+    reason = None
+    if applied_at is not None:
+        wanted = applied_state == "stopped" if action == "stop" else applied_state not in (None, "stopped")
+        outcome = "confirmed" if wanted else "mismatch"
+        if not wanted:
+            reason = record.get("refusal") or f"the device reports {applied_state or 'no protection state'}"
+    elif age is not None and age >= PROTECTION_ACK_TIMEOUT_S:
+        outcome = "timed_out"
+    else:
+        outcome = "pending"
+    delivering = applied_at is None and (
+        action == "resume" or (age is not None and age < PROTECTION_STOP_DELIVERY_S))
+    return {"id": command_id[:64], "action": action, "requested_at": requested,
+            "age_s": None if age is None else round(age, 1), "timeout_s": PROTECTION_ACK_TIMEOUT_S,
+            "outcome": outcome, "delivering": delivering, "applied_at": applied_at,
+            "applied_boot": record.get("applied_boot") if isinstance(record.get("applied_boot"), str) else None,
+            "reported_state": applied_state, "reason": str(reason)[:500] if reason else None}
+
+
+def _record_protection_ack(conn: sqlite3.Connection, device_id: int, reported_block: Optional[dict],
+                           monitoring: Optional[dict]) -> None:
+    """Latch the outcome of the last stop/resume from the first report echoing its id (M8.3).
+
+    The state that report carries is what the request did: `stopped` for a stop
+    that took effect, anything else for one the device refused. Later reports
+    (a local resume, a restart) change the status, never this record.
+    """
+    if not reported_block or not isinstance(reported_block.get("last_command_id"), str):
+        return
+    stored = conn.execute("SELECT protection_request, health_boot FROM devices WHERE id = ?",
+                          (device_id,)).fetchone()
+    record = _loads_dict(stored["protection_request"] if stored is not None else None)
+    if record.get("id") != reported_block["last_command_id"] or record.get("applied_at") is not None:
+        return
+    state = reported_block.get("state")
+    record["applied_at"] = time.time()
+    # The boot the request took effect on (M8.4): a device that restarts soon after a
+    # resume is starting its NEW boot, not still settling from the resume.
+    boot = stored["health_boot"] if stored is not None else None
+    record["applied_boot"] = boot if isinstance(boot, str) else None
+    record["applied_state"] = state if state in _PROTECTION_STATES else None
+    refusal = _new_refusal((monitoring or {}).get("last_rejection"), "protection",
+                           json.dumps({"protection": record.get("refusal_baseline")}))
+    if refusal is not None:
+        record["refusal"] = "; ".join(refusal["reasons"]) or "the device refused it"
+    conn.execute("UPDATE devices SET protection_request = ? WHERE id = ?", (json.dumps(record), device_id))
+
+
 def _device_status(row: sqlite3.Row, now: float) -> dict:
     """The typed status the app renders (docs/APP_STATUS_CONTRACT.md).
 
@@ -1135,7 +1665,14 @@ def _device_status(row: sqlite3.Row, now: float) -> dict:
     is a photograph of a moment that has passed.
     """
     last_seen = row["last_seen"]
-    stale = not last_seen or now - last_seen >= _HEALTH_STALE_S
+    link_stale = not last_seen or now - last_seen >= _HEALTH_STALE_S
+    # M8.1: a successful poll is not proof the device is monitoring. A device
+    # that keeps polling while its health sample stops being refreshed is
+    # reachable (link_stale false) on stale evidence (health_stale true), and
+    # `stale` -- what every claim below is gated on -- covers both.
+    freshness = _health_freshness(row, now)
+    health_stale = freshness["state"] == "stale"
+    stale = link_stale or health_stale
     # A live device that sends no health at all (older software) is not stale:
     # it is "unknown" below for its own reason.
     health = None if stale else _health_payload(row, now)
@@ -1154,20 +1691,31 @@ def _device_status(row: sqlite3.Row, now: float) -> dict:
     role, role_title, allowed_presets, additive = _role_facts(monitoring, stored_monitoring, stored_protection)
 
     live = health or {}
-    live_monitoring = live.get("monitoring") if isinstance(live.get("monitoring"), dict) else {}
+    live_monitoring = _dict_field(live, "monitoring")
     reported_protection = live.get("protection")
     if not isinstance(reported_protection, dict):
         # Firmware that sends protection only in the monitoring block.
-        reported_protection = monitoring.get("protection") if isinstance(monitoring.get("protection"), dict) else {}
+        reported_protection = _dict_field(monitoring, "protection")
 
     reasons: list[str] = []
     protection_reasons: list[str] = []
     if stale:
         state, protection, active = "unknown", "unknown", None
-        reasons = [
-            "the device has not reported yet" if not last_seen
-            else f"no report from the device in the last {_HEALTH_STALE_S} s"
-        ]
+        if link_stale:
+            reasons = [
+                "the device has not reported yet" if not last_seen
+                else f"no report from the device in the last {_HEALTH_STALE_S} s"
+            ]
+        else:
+            reasons = [("the device is connected, but its monitoring status has not been updated for "
+                        f"{int(freshness['age_s'] or 0)} s")]
+        refused = _credential_refusal(row)
+        if refused is not None:
+            # The refusal is WHY there is no report, so it leads: the app
+            # presents only the first reason, and "no report from the device
+            # in the last 30 s" hid the actionable cause behind it for as
+            # long as the revocation lasted (M8.5 reconnect audit).
+            reasons.insert(0, refused["detail"])
     else:
         state = live_monitoring.get("state")
         if state not in _MONITORING_STATES:
@@ -1215,7 +1763,7 @@ def _device_status(row: sqlite3.Row, now: float) -> dict:
     # reported" (stale, or firmware without it) -- never filled in.
     perception = None if stale else _reported_perception(live, monitoring)
     last_command_id = reported_protection.get("last_command_id") if not stale else None
-    return {
+    status = {
         "monitoring_state": state,
         "monitoring_active": active,
         "protection": protection,
@@ -1238,13 +1786,67 @@ def _device_status(row: sqlite3.Row, now: float) -> dict:
         "actuators": None if stale else _bounded_dicts(live_monitoring.get("actuators"), _ACTUATOR_KEYS),
         "stale": stale,
         "reported_at": _reported_at(row["last_seen"]),
+        # M8.1: the two halves of `stale`, and how old the evidence itself is.
+        "link_stale": bool(link_stale),
+        "health_stale": health_stale,
+        "health_freshness": freshness,
+        # M8.3: the last stop/resume and its acknowledged outcome.
+        "protection_command": _protection_command(row, now),
+        # M8.4 Decision C: camera access while stopped, as the DEVICE reports it.
+        "camera_mode": _camera_mode_status(row, monitoring, stale),
     }
+    # M8.3: never a claim the device's own rules forbid (see _make_coherent).
+    status["corrections"] = _make_coherent(status)
+    return status
 
 
-#: Request nonces seen in the last 2 x CLOCK_SKEW_S (sd-auth-v1 replay refusal).
-#: Per process: the backend is a single SQLite-backed process.
-_REQUEST_NONCES = sd_auth.NonceCache()
-_REQUEST_NONCES_LOCK = threading.Lock()
+#: Request nonces the backend remembers, in the database (sd-auth-v1 replay
+#: refusal). They used to live in this process's memory, so a backend restart
+#: forgot them and a request captured up to CLOCK_SKEW_S earlier was accepted
+#: again (M8). The table is pruned of nonces older than 2 x CLOCK_SKEW_S --
+#: those requests fail the clock check anyway -- and bounded.
+REQUEST_NONCES_MAX = 1_000_000
+_NONCE_PRUNE_EVERY_S = 30.0
+
+
+class _StoredNonces:
+    """sd_auth.NonceStore over the `auth_nonces` table: survives a restart, and
+    is shared by every process on this database. INSERT OR IGNORE on the primary
+    key is the atomic test-and-set, so no lock is needed."""
+
+    def __init__(self, max_entries: int = REQUEST_NONCES_MAX, ttl_s: float = 2 * sd_auth.CLOCK_SKEW_S) -> None:
+        self._max, self._ttl = max_entries, ttl_s
+        self._next_prune = 0.0
+
+    def add(self, nonce: str, now: float) -> bool:
+        with db() as conn:
+            if now >= self._next_prune:
+                self._next_prune = now + _NONCE_PRUNE_EVERY_S
+                conn.execute("DELETE FROM auth_nonces WHERE seen_at < ?", (now - self._ttl,))
+                excess = conn.execute("SELECT COUNT(*) FROM auth_nonces").fetchone()[0] - self._max
+                if excess > 0:
+                    # Not reachable at a single backend's request rate (it would take
+                    # over 1,600 signed requests a second); said loudly if it is.
+                    log.warning("device auth: %d unexpired request nonces evicted (table full)", excess)
+                    conn.execute("DELETE FROM auth_nonces WHERE nonce IN (SELECT nonce FROM auth_nonces"
+                                 " ORDER BY seen_at LIMIT ?)", (excess,))
+            inserted = conn.execute("INSERT OR IGNORE INTO auth_nonces (nonce, seen_at) VALUES (?, ?)",
+                                    (nonce, now))
+            return inserted.rowcount == 1
+
+
+_REQUEST_NONCES = _StoredNonces()
+
+#: What the app is told when the backend refused a device it could identify
+#: (GET /v1/devices `credentials` and the stale status reason). Only refusals
+#: that prove they came from the key's holder are recorded: anyone can send a
+#: bad tag under a public key id, and that must not paint a healthy device red.
+_CREDENTIAL_REFUSALS = {
+    "revoked_key": "the backend refused this device's key: it has been revoked",
+    "revoked_device": "this device's credentials have been revoked by the operator",
+    "clock_skew": "the device's clock is too far from the backend's for a signed request",
+    "signature_required": "the device sends unsigned requests, and the backend requires signed ones for it",
+}
 
 
 def _device_for_kid(kid: str) -> tuple[Optional[sqlite3.Row], Optional[sd_auth.Keyring]]:
@@ -1266,15 +1868,95 @@ def _device_for_kid(kid: str) -> tuple[Optional[sqlite3.Row], Optional[sd_auth.K
     return row, keyring
 
 
-def _refuse_device(reason: str, kid: str = "") -> HTTPException:
+def _revoked_key(kid: str) -> Optional[tuple[int, str]]:
+    """(device id, key) of a revoked key, by its public id."""
+    with db() as conn:
+        row = conn.execute("SELECT device_id, device_key FROM revoked_device_keys WHERE kid = ?", (kid,)).fetchone()
+    return (row[0], row[1]) if row is not None else None
+
+
+def _record_refusal(device_id: int, reason: str) -> None:
+    """Remember an authenticated refusal for the app. At most one write a minute
+    per device and reason, so a device retrying every poll is not a write storm."""
+    now = time.time()
+    with db() as conn:
+        conn.execute(
+            "UPDATE devices SET auth_refusal = ? WHERE id = ? AND (auth_refusal IS NULL"
+            " OR json_extract(auth_refusal, '$.reason') IS NOT ? OR json_extract(auth_refusal, '$.at') < ?)",
+            (json.dumps({"reason": reason, "at": now}), device_id, reason, now - 60),
+        )
+
+
+def _note_auth(row: sqlite3.Row, kind: str) -> None:
+    """Record how the device authenticated ('signed' / 'bearer'), on change only:
+    an operator moves a device to `required` once it is seen signing."""
+    if row["last_auth"] != kind:
+        with db() as conn:
+            conn.execute("UPDATE devices SET last_auth = ? WHERE id = ?", (kind, row["id"]))
+
+
+def _credential_refusal(row: sqlite3.Row) -> Optional[dict]:
+    """The device's last recorded refusal, unless a report was accepted after it."""
+    refusal = _loads_dict(row["auth_refusal"])
+    at = refusal.get("at")
+    if not isinstance(at, (int, float)) or refusal.get("reason") not in _CREDENTIAL_REFUSALS:
+        return None
+    if row["last_seen"] and row["last_seen"] >= at:
+        return None
+    return {"reason": refusal["reason"], "detail": _CREDENTIAL_REFUSALS[refusal["reason"]], "at": at}
+
+
+def _credentials_status(row: sqlite3.Row) -> dict:
+    """GET /v1/devices `credentials`: whether the backend accepts this device."""
+    refusal = _credential_refusal(row)
+    if row["auth_revoked_at"]:
+        state = "revoked"
+    elif refusal is not None:
+        state = "refused"
+    else:
+        state = "accepted" if row["last_seen"] else "unknown"
+    return {
+        "state": state,
+        "auth": row["last_auth"] if row["last_auth"] in ("signed", "bearer") else None,
+        "signature_required": DEVICE_AUTH_MODE == "required" or row["auth_mode"] == "required",
+        "refusal": refusal,
+    }
+
+
+def _refuse_device(reason: str, kid: str = "", *, extra: Optional[dict] = None) -> CodedError:
     # Reason code and public key id only: never the key, the tag or the body.
     log.warning("device auth refused: %s%s", reason, f" (kid {kid})" if kid else "")
     if reason == "clock_skew":
         # Answered with server_time (see _coded_error): a Pi has no RTC. The
         # device uses it only to timestamp its next request; freshness is still
         # judged here, against this clock.
-        return CodedError(401, "clock_skew", "device clock is too far from the backend's")
-    return CodedError(401, f"device_auth_{reason}", "device authentication failed")
+        error = CodedError(401, "clock_skew", "device clock is too far from the backend's")
+    else:
+        error = CodedError(401, f"device_auth_{reason}", "device authentication failed")
+    error.extra = extra or {}
+    return error
+
+
+def _signed_by(secret: str, parsed: sd_auth.RequestAuth, method: str, path: str, body: bytes) -> bool:
+    """Whether `secret` made this request's tag (no clock or nonce check)."""
+    try:
+        sd_auth.verify_request(sd_auth.Keyring(sd_auth.DeviceKey(secret)), parsed, method, path, body,
+                               nonces=sd_auth.NonceCache(), skew_s=float("inf"))
+    except (sd_auth.AuthError, ValueError):
+        return False
+    return True
+
+
+def _bearer_revoked(presented: str) -> Optional[int]:
+    """The device a revoked bearer key belonged to, if `presented` is exactly that key."""
+    try:
+        kid = sd_auth.key_id(presented)
+    except ValueError:
+        return None
+    revoked = _revoked_key(kid)
+    if revoked is not None and hmac.compare_digest(revoked[1].encode(), presented.encode()):
+        return revoked[0]
+    return None
 
 
 async def current_device(request: Request, x_device_key: str = Header(default=""),
@@ -1282,10 +1964,11 @@ async def current_device(request: Request, x_device_key: str = Header(default=""
     """FastAPI dependency: authenticate a device request (sd-auth-v1 or legacy key).
 
     A signed request (X-SD-Auth) is checked against the key its id names, the
-    exact body bytes, the backend clock (+-CLOCK_SKEW_S) and the nonce cache.
+    exact body bytes, the backend clock (+-CLOCK_SKEW_S) and the stored nonces.
     Otherwise X-Device-Key is the bearer secret, as before -- unless
-    SENSORDYME_DEVICE_AUTH=required. Either way, `request.state.sd_auth` says
-    which key to sign the reply's command with and which request nonce it answers.
+    SENSORDYME_DEVICE_AUTH=required or the device's own auth_mode is. A revoked
+    key or device is refused either way. `request.state.sd_auth` says which key
+    to sign the reply's command with and which request nonce it answers.
     """
     request.state.sd_auth = None
     if x_sd_auth:
@@ -1295,25 +1978,54 @@ async def current_device(request: Request, x_device_key: str = Header(default=""
             parsed = sd_auth.parse_request_header(x_sd_auth)
         except sd_auth.AuthError as exc:
             raise _refuse_device(exc.reason) from None
-        row, keyring = _device_for_kid(parsed.kid)
-        if row is None or keyring is None:
-            raise _refuse_device("unknown_key", parsed.kid)
         body = await request.body()
         root = request.scope.get("root_path") or ""
         path = request.url.path[len(root):] if root and request.url.path.startswith(root) else request.url.path
+        row, keyring = _device_for_kid(parsed.kid)
+        if row is None or keyring is None:
+            revoked = _revoked_key(parsed.kid)
+            if revoked is not None and _signed_by(revoked[1], parsed, request.method, path, body):
+                _record_refusal(revoked[0], "revoked_key")
+                raise _refuse_device("revoked_key", parsed.kid)
+            raise _refuse_device("unknown_key", parsed.kid)
         try:
-            with _REQUEST_NONCES_LOCK:
-                key = sd_auth.verify_request(keyring, parsed, request.method, path, body, nonces=_REQUEST_NONCES)
+            # In the threadpool: recording the nonce is a database write, and a
+            # write-lock wait here must not stall the event loop for every request.
+            key = await run_in_threadpool(sd_auth.verify_request, keyring, parsed, request.method, path, body,
+                                          nonces=_REQUEST_NONCES)
         except sd_auth.AuthError as exc:
-            raise _refuse_device(exc.reason, parsed.kid) from None
+            if exc.reason != "clock_skew":
+                raise _refuse_device(exc.reason, parsed.kid) from None
+            # The tag was checked before the clock, so this answer goes to the
+            # key's holder: sign the time, bound to the request it answers.
+            _record_refusal(row["id"], "clock_skew")
+            now = int(time.time())
+            clock = sd_auth.sign_clock(keyring.for_kid(parsed.kid), request_nonce=parsed.nonce, server_time=now)
+            raise _refuse_device("clock_skew", parsed.kid,
+                                 extra={"server_time": now, "clock_auth": clock}) from None
+        if row["auth_revoked_at"]:
+            _record_refusal(row["id"], "revoked_device")
+            raise _refuse_device("revoked_device", parsed.kid)
+        _note_auth(row, "signed")
         request.state.sd_auth = (key, parsed.nonce)
         return row
-    if DEVICE_AUTH_MODE == "required":
-        raise _refuse_device("signature_required")
     with db() as conn:
         row = conn.execute("SELECT * FROM devices WHERE device_key = ?", (x_device_key,)).fetchone()
     if row is None:
+        revoked_device = _bearer_revoked(x_device_key) if x_device_key else None
+        if revoked_device is not None:
+            _record_refusal(revoked_device, "revoked_key")
+            raise _refuse_device("revoked_key")
+        if DEVICE_AUTH_MODE == "required":
+            raise _refuse_device("signature_required")
         raise HTTPException(401, "invalid device key")
+    if DEVICE_AUTH_MODE == "required" or row["auth_mode"] == "required":
+        _record_refusal(row["id"], "signature_required")
+        raise _refuse_device("signature_required")
+    if row["auth_revoked_at"]:
+        _record_refusal(row["id"], "revoked_device")
+        raise _refuse_device("revoked_device")
+    _note_auth(row, "bearer")
     if DEVICE_AUTH_MODE != "off" and x_sd_nonce and re.fullmatch(r"[0-9a-f]{32}", x_sd_nonce):
         with suppress(ValueError):  # a key under 16 bytes: legacy only, nothing to sign with
             request.state.sd_auth = (sd_auth.DeviceKey(row["device_key"]), x_sd_nonce)
@@ -1447,7 +2159,9 @@ def send_sms(user_row: sqlite3.Row, body: str) -> None:
     token = os.environ.get("TWILIO_AUTH_TOKEN")
     sender = os.environ.get("TWILIO_FROM")
     if not (sid and token and sender):
-        print(f"sms (log-only, set TWILIO_* env to send for real) -> {phone}: {body}")
+        # The number masked (M8.3): a backend without Twilio configured logged
+        # every account's phone number on every serious alert.
+        print(f"sms (log-only, set TWILIO_* env to send for real) -> {mask_phone(phone)}: {body}")
         return
     import requests
 
@@ -1478,12 +2192,14 @@ def _notify(
         try:
             send_push(owner, title, detail)
         except Exception as exc:  # noqa: BLE001 - see send_push's own docstring
-            log.warning("notify: push delivery failed after retries: %r", exc)
+            # Type and status only: the exception's text carries the ntfy URL,
+            # and the topic in it is the account's alert credential (M8.3).
+            log.warning("notify: push delivery failed after retries: %s", describe_failure(exc))
     if sms:
         try:
             send_sms(owner, f"{title} — {detail} ({device_name})")
         except Exception as exc:  # noqa: BLE001 - see send_sms's own docstring
-            log.warning("notify: sms delivery failed after retries: %r", exc)
+            log.warning("notify: sms delivery failed after retries: %s", describe_failure(exc))
 
 
 def _notify_channels(event: dict) -> tuple[bool, bool]:
@@ -1532,7 +2248,7 @@ _EVENT_TITLES = {
     "frequent_glancing": "⚠️ Frequent Glancing Away",
     "phone_use": "📱 Phone Use Detected",
     "phone_detected": "📱 Phone Detected",
-    "phone_in_hand": "📱 Phone In Hand",
+    "phone_in_hand": "📱 Phone Near Hand (experimental)",
     "eating_drinking": "🍔 Eating/Drinking Detected",
     "occupancy_change": "🚶 Occupancy Changed",
     "person_lingering": "🚨 Person Lingering",
@@ -1658,6 +2374,13 @@ class ProtectionBody(BaseModel):
     """Explicit stop/resume of monitoring. Stopping must be confirmed."""
 
     action: str = Field(pattern="^(stop|resume)$")
+    confirm: bool = False
+
+
+class CameraModeBody(BaseModel):
+    """M8.4 Decision C: the owner's camera-only mode. Turning it ON must be confirmed."""
+
+    camera_only: bool
     confirm: bool = False
 
 
@@ -1896,6 +2619,87 @@ def logout(payload: dict = Depends(current_token)) -> dict:
     return {"ok": True}
 
 
+@app.post("/v1/session/refresh")
+def refresh_session(payload: dict = Depends(current_token)) -> dict:
+    """A fresh 30-day token for the session that called.
+
+    `exp` is fixed at issue and nothing renewed it, so an app opened on day 31
+    landed on the sign-in screen however healthy the setup (M8.5 reconnect
+    audit). The app calls this once per launch; a session used at least once a
+    month therefore never ages out. The old token is NOT revoked here --
+    signing out stays /v1/logout's job, and another signed-in device keeps its
+    own session -- it simply ages out on the expiry it already had.
+    `current_token` has already refused everything this must refuse: a bad or
+    expired token, a signed-out jti, and an account this database does not
+    have."""
+    return {"token": _issue_token(payload["uid"], payload["email"]), "email": payload["email"]}
+
+
+class DeleteAccountBody(BaseModel):
+    """M8.4: deleting an account needs the password again and an explicit confirm."""
+
+    password: str = Field(max_length=MAX_PASSWORD_LEN)
+    confirm: bool = False
+
+
+#: Device columns that hold what the OWNER configured or said (names, areas,
+#: typed instructions, AI rules, pending commands). Cleared when the account is
+#: deleted; the device's own identity, key and health stay with the device.
+_OWNER_DEVICE_COLUMNS = (
+    "zones", "ai_rules", "ai_rules_draft", "ai_rules_promoted_from", "desired_preset", "desired_protection",
+    "protection_request", "desired_nodes", "preset_rejection", "nodes_rejection", "rejection_baseline",
+    "monitoring",
+)
+
+
+@app.post("/v1/account/delete")
+def delete_account(body: DeleteAccountBody, request: Request, payload: dict = Depends(current_token)) -> dict:
+    """Delete the caller's account and the data it owns (M8.4, docs/PRIVACY.md §5).
+
+    One transaction: every event of every device the account owns, its orders
+    and the user row are deleted; each device is released (owner cleared, the
+    owner's configuration cleared, its name reset, camera-only explicitly OFF)
+    so it can be claimed again and never carries the old owner's settings.
+    Every session ends: `current_token` refuses a token whose user row is gone.
+
+    NOT done (stated, not hidden): the device's own copies -- data/events.csv,
+    saved rules, zones and the camera-only setting on the device itself -- stay
+    until the device is reset by hand (docs/PRIVACY.md); the database file may
+    keep deleted rows in free pages until SQLite reuses them (no VACUUM here).
+    """
+    if not body.confirm:
+        raise CodedError(400, "confirmation_required", "deleting the account requires confirm: true")
+    if not LOGIN_LIMITER.allow(_client_ip(request)):
+        raise HTTPException(429, "too many attempts — try again in a few minutes")
+    uid = payload["uid"]
+    with db() as conn:
+        user = conn.execute("SELECT * FROM users WHERE id = ?", (uid,)).fetchone()
+        if user is None or not hmac.compare_digest(_hash_pw(body.password, user["salt"]), user["pw_hash"]):
+            LOGIN_FAILURE_LIMITER.record(str(payload.get("email") or uid))
+            raise CodedError(403, "wrong_password", "the password is not correct")
+        devices = [r["id"] for r in conn.execute("SELECT id FROM devices WHERE owner_id = ?", (uid,))]
+        events = 0
+        columns = {r["name"] for r in conn.execute("PRAGMA table_info(devices)")}
+        cleared = ", ".join(f"{c} = NULL" for c in _OWNER_DEVICE_COLUMNS if c in columns)
+        for device_id in devices:
+            events += conn.execute("DELETE FROM events WHERE device_id = ?", (device_id,)).rowcount
+            conn.execute(
+                f"UPDATE devices SET owner_id = NULL, name = 'SensorDyme', {cleared}, "  # noqa: S608 - fixed column names
+                "custom_monitoring_wanted = 0, ai_rules_activation = 0, camera_mode = ? WHERE id = ?",
+                (json.dumps({"camera_only": False, "id": secrets.token_hex(6), "requested_at": time.time()}),
+                 device_id),
+            )
+        orders = conn.execute("DELETE FROM orders WHERE user_id = ?", (uid,)).rowcount
+        conn.execute("DELETE FROM users WHERE id = ?", (uid,))
+        jti = payload.get("jti")
+        if jti is not None:
+            conn.execute("INSERT OR REPLACE INTO revoked_tokens (jti, exp) VALUES (?, ?)",
+                         (jti, float(payload.get("exp", time.time() + JWT_TTL_S))))
+    log.info("account deleted: %d device(s) released, %d event(s) and %d order(s) deleted",
+             len(devices), events, orders)
+    return {"ok": True, "devices_released": len(devices), "events_deleted": events, "orders_deleted": orders}
+
+
 #: What ntfy itself accepts as a topic name, and nothing else.
 #
 # The topic IS the credential: ntfy has no accounts, so anyone who knows the
@@ -1972,11 +2776,16 @@ def rename_device(device_id: int, body: RenameBody, uid: int = Depends(current_u
 def claim_device(body: ClaimBody, request: Request, uid: int = Depends(current_user)):
     if not CLAIM_LIMITER.allow(_client_ip(request)):
         raise HTTPException(429, "too many attempts — try again in a few minutes")
+    account = f"uid:{uid}"
+    if CLAIM_FAILURE_LIMITER.blocked(account):
+        raise HTTPException(429, "too many attempts — try again in a few minutes")
     with db() as conn:
         row = conn.execute("SELECT * FROM devices WHERE claim_code = ?", (body.claim_code.strip(),)).fetchone()
         if row is None:
+            CLAIM_FAILURE_LIMITER.record(account)
             raise HTTPException(404, "unknown claim code")
         if row["owner_id"] is not None and row["owner_id"] != uid:
+            CLAIM_FAILURE_LIMITER.record(account)
             raise CodedError(409, "device_already_claimed", "device already claimed by another account")
         # Conditional, not a blind overwrite: two accounts holding the same code
         # could both pass the check above before either wrote, and both got a
@@ -1987,6 +2796,12 @@ def claim_device(body: ClaimBody, request: Request, uid: int = Depends(current_u
         )
         if claimed.rowcount == 0:
             raise CodedError(409, "device_already_claimed", "device already claimed by another account")
+        if row["owner_id"] is None:
+            # M8.4: a new owner never inherits camera access someone else turned
+            # on. Explicitly OFF (delivered only if the device reports otherwise).
+            conn.execute("UPDATE devices SET camera_mode = ? WHERE id = ?",
+                         (json.dumps({"camera_only": False, "id": secrets.token_hex(6),
+                                      "requested_at": time.time()}), row["id"]))
     return {"ok": True, "device_id": row["id"], "name": row["name"]}
 
 
@@ -2022,6 +2837,9 @@ def list_devices(uid: int = Depends(current_user)):
                 # What the app renders as "is it watching": the typed contract in
                 # docs/APP_STATUS_CONTRACT.md, "unknown" once the device goes quiet.
                 "status": _device_status(r, now),
+                # Whether the backend accepts this device's credentials, and why not
+                # (revoked, clock, unsigned): "offline" alone hid a lockout.
+                "credentials": _credentials_status(r),
             }
             for r in rows
         ]
@@ -2029,18 +2847,37 @@ def list_devices(uid: int = Depends(current_user)):
 
 
 @app.get("/v1/devices/{device_id}/events")
-def device_events(device_id: int, limit: int = 100, uid: int = Depends(current_user)):
+def device_events(device_id: int, limit: int = 100, before_id: Optional[int] = None,
+                  uid: int = Depends(current_user)):
+    """A device's events, newest stored first (by row id, which only grows).
+
+    `before_id` pages back from a row id the app already has: the id cursor is
+    stable while new events arrive, where an offset would shift under them.
+
+    Each event carries (M8.3, docs/EVENT_PIPELINE.md) its `event_key`, the
+    device's own `timestamp` exactly as reported, `received_at` (this backend's
+    clock), `occurred_at` + `time_basis` (when it happened on this backend's
+    clock, and how that was found), `alert` (what the device reported its alert
+    outputs did -- None when it reported nothing) and `simulated`.
+    """
     limit = max(1, min(limit, 1000))
     with db() as conn:
         _owned_device(conn, device_id, uid)
         # `id` is included so the app can ask why a specific alert fired.
         # Without it an event is unaddressable and /explain is unreachable.
-        rows = conn.execute(
-            "SELECT id, timestamp, type, confidence, signals, severity, source, duration, model FROM events "
-            "WHERE device_id = ? ORDER BY id DESC LIMIT ?",
-            (device_id, limit),
-        ).fetchall()
-    return {"events": [{**dict(r), "model": _stored_model(r["model"])} for r in rows]}
+        columns = ("SELECT id, timestamp, type, confidence, signals, severity, source, duration, model,"
+                   " event_key, received_at, occurred_at, time_basis, alert, simulated, experimental FROM events ")
+        if before_id is not None:
+            rows = conn.execute(
+                columns + "WHERE device_id = ? AND id < ? ORDER BY id DESC LIMIT ?",
+                (device_id, before_id, limit),
+            ).fetchall()
+        else:
+            rows = conn.execute(
+                columns + "WHERE device_id = ? ORDER BY id DESC LIMIT ?",
+                (device_id, limit),
+            ).fetchall()
+    return {"events": [_event_row(r) for r in rows]}
 
 
 def _stored_model(raw: Optional[str]) -> Optional[dict]:
@@ -2108,6 +2945,7 @@ def _beside_a_mode_unsupported(rules: list, additive: bool = False) -> list[dict
                         "or device support for rules beside a mode",
             "support": "unsupported",
             "alternatives": [],
+            "code": "not_beside_mode",
         })
     return entries
 
@@ -2166,6 +3004,16 @@ def _loads_dict(raw: Optional[str]) -> dict:
     return value if isinstance(value, dict) else {}
 
 
+def _dict_field(source: dict, key: str) -> dict:
+    """source[key] when it is a dict (the same object, not a copy), else {}.
+
+    Reads the field once, so the isinstance check narrows the value that is
+    returned (`d.get(k) if isinstance(d.get(k), dict) else {}` checks one call
+    and returns another, which a type checker cannot see is the same dict)."""
+    value = source.get(key)
+    return value if isinstance(value, dict) else {}
+
+
 def _reported_role(device: sqlite3.Row):
     """The role the device last reported (core/roles.py), or None.
 
@@ -2180,8 +3028,8 @@ def _reported_role(device: sqlite3.Row):
     except (ValueError, TypeError):
         health = None
     health = health if isinstance(health, dict) else {}
-    health_monitoring = health.get("monitoring") if isinstance(health.get("monitoring"), dict) else {}
-    protection = reported.get("protection") if isinstance(reported.get("protection"), dict) else {}
+    health_monitoring = _dict_field(health, "monitoring")
+    protection = _dict_field(reported, "protection")
     name = _role_name(reported.get("role"), health_monitoring.get("role"), protection.get("role"))
     return ROLES.get(name) if name is not None else None
 
@@ -2234,12 +3082,48 @@ def set_protection(device_id: int, body: ProtectionBody, uid: int = Depends(curr
         # stop still in flight cannot be mistaken for a later resume (or the
         # reverse) by comparing states alone.
         command_id = secrets.token_hex(6)
+        requested_at = time.time()
+        # M8.3: the request's record, kept after delivery ends so its outcome
+        # (confirmed / mismatch / timed_out) can be reported, with the device's
+        # current protection refusal as the baseline a new refusal must differ from.
+        record = {"id": command_id, "action": body.action, "requested_at": requested_at,
+                  "applied_at": None, "applied_state": None,
+                  "refusal_baseline": _rejection_fingerprint(_stored_last_rejection(device))}
         conn.execute(
-            "UPDATE devices SET desired_protection = ? WHERE id = ?",
+            "UPDATE devices SET desired_protection = ?, protection_request = ? WHERE id = ?",
             (json.dumps({"action": body.action, "confirm": body.confirm, "id": command_id,
-                         "requested_at": time.time()}), device_id),
+                         "requested_at": requested_at}), json.dumps(record), device_id),
         )
-    return {"ok": True, "desired_protection": body.action, "command_id": command_id}
+    return {"ok": True, "desired_protection": body.action, "command_id": command_id,
+            "timeout_s": PROTECTION_ACK_TIMEOUT_S}
+
+
+@app.post("/v1/devices/{device_id}/camera-mode")
+def set_camera_mode(device_id: int, body: CameraModeBody, uid: int = Depends(current_user)):
+    """Turn the device's camera-only mode on or off (M8.4, owner Decision C).
+
+    Off (the default): while monitoring is stopped the device sends NO camera
+    frames to the app. On: the owner can watch the camera while monitoring is
+    stopped, labelled "Camera only -- not monitoring". Separate from stop/resume
+    on purpose; turning it on must carry `confirm: true`. Owner-scoped
+    (_owned_device); delivered to the device as a signed `set_camera_mode`
+    command, which the device refuses to turn ON unless the signature verifies.
+    The app shows what the device REPORTS (status.camera_mode), not this request.
+    """
+    if body.camera_only and not body.confirm:
+        raise CodedError(400, "confirmation_required", "turning on camera-only mode requires confirm: true")
+    with db() as conn:
+        device = _owned_device(conn, device_id, uid)
+        reported = _monitoring_payload(device["monitoring"])
+        if reported and _reported_camera(reported) is None:
+            raise CodedError(409, "firmware_unsupported",
+                             "this device's software cannot turn the camera off while monitoring is "
+                             "stopped; update it first")
+        command_id = secrets.token_hex(6)
+        conn.execute("UPDATE devices SET camera_mode = ? WHERE id = ?",
+                     (json.dumps({"camera_only": body.camera_only, "id": command_id,
+                                  "requested_at": time.time()}), device_id))
+    return {"ok": True, "camera_only": body.camera_only, "command_id": command_id}
 
 
 @app.post("/v1/devices/{device_id}/preset")
@@ -2633,6 +3517,7 @@ def _reported_preset(row: sqlite3.Row) -> tuple[Optional[str], Optional[str], di
 _COMPONENT_TO_CAPABILITY_STATE = {
     "ok": "available", "idle": "idle", "stale": "impaired", "failed": "impaired",
     "unavailable": "unsupported", "unknown": "unknown",
+    "paused": "paused",  # M8.2: monitoring stopped on purpose; not a fault
 }
 
 
@@ -2640,7 +3525,7 @@ def capability_states(status: dict) -> dict[str, dict]:
     """{capability kind: {state, reason, source}} from what the device REPORTS.
 
     States: available | idle (the device has it, nothing uses it now) | starting
-    | impaired | unsupported | unknown. A kind the device does not report is
+    | paused (monitoring stopped on purpose, M8.2) | impaired | unsupported | unknown. A kind the device does not report is
     `unknown` -- a device reports only what its current mode uses, so silence
     is not evidence that a preset it is not running would work."""
     out: dict[str, dict] = {}
@@ -2649,6 +3534,8 @@ def capability_states(status: dict) -> dict[str, dict]:
         out[name] = {"state": "available", "reason": None, "source": "monitoring"}
     for name in caps.get("starting") or []:
         out[name] = {"state": "starting", "reason": None, "source": "monitoring"}
+    for name in caps.get("paused") or []:
+        out[name] = {"state": "paused", "reason": "monitoring is stopped", "source": "monitoring"}
     for item in caps.get("impaired") or []:
         if isinstance(item, dict) and item.get("name"):
             reason = item.get("reason")
@@ -2666,6 +3553,10 @@ def capability_states(status: dict) -> dict[str, dict]:
         # The module's own impairment verdict wins over a healthy component: the
         # component may be fine while the module cannot use it.
         if known and known["state"] in ("impaired", "unsupported") and state in ("available", "idle"):
+            continue
+        # Stopped on purpose (M8.2): a component that is merely stale or idle
+        # because nothing runs stays "paused"; a failed one is still a fault.
+        if known and known["state"] == "paused" and comp.get("state") in ("stale", "idle", "ok"):
             continue
         out[kind] = {"state": state, "reason": comp.get("reason"), "source": "perception"}
     return out
@@ -3338,7 +4229,9 @@ _AI_FALLBACKS = [
     (("security", "intruder", "door", "burglar", "lurk", "linger", "trespass"), "security_monitoring",
      ("Security: person-count changes, plus restricted-zone and lingering alerts once you draw "
       "zones in the app.")),
-    (("drive", "driving", "car", "phone", "drowsy", "road"), "driver_safety",
+    # Not "car" or "phone": "a car pulls into the driveway" and "someone picks
+    # up my phone" are not requests to watch a driver.
+    (("drive", "driving", "driver", "drowsy", "road"), "driver_safety",
      "Driver Safety: loud alerts for phone use while looking away and sustained eye closure."),
 ]
 
@@ -3347,11 +4240,18 @@ def _ai_fallback(prompt: str) -> dict:
     """Deterministic keyword configuration when the model is unavailable. Returns
     the same structured shape, honestly labeled with source=fallback: a mode,
     and no rules (see _AI_FALLBACKS for why)."""
+    # Whole words and their plain inflections (M8.4): substring matching read
+    # "careful" as a car, "outdoor" as a door and "waterfall" as a fall, and
+    # proposed a mode for each.
     lowered = prompt.lower()
     for keywords, preset, explanation in _AI_FALLBACKS:
-        if any(k in lowered for k in keywords):
+        if any(re.search(rf"\b{k}(?:s|es|ed|ing|en|ly)?\b", lowered) for k in keywords):
             return {
-                "preset": preset, "variant": "", "explanation": explanation,
+                "preset": preset, "variant": "",
+                # Said up front: this is the closest MODE, not the request read.
+                "explanation": ("No custom rule was set up: the language service that reads requests "
+                                "isn't configured on your backend, so this is the closest built-in mode. "
+                                + explanation),
                 "rules": [], "settings": {}, "unsupported": [], "source": "fallback",
             }
     # No keyword matched. Historically this returned security_monitoring as a
@@ -3372,6 +4272,7 @@ def _ai_fallback(prompt: str) -> dict:
             "requires": "set ANTHROPIC_API_KEY on the backend and restart it",
             "support": "unsupported",
             "alternatives": [],
+            "code": "interpreter_unavailable",
         }],
         "source": "unavailable",
     }
@@ -3426,6 +4327,7 @@ def _validate_proposal(data: dict, role=None, device: Optional[sqlite3.Row] = No
                 "requires": "an object, posture or activity from the capability sheet",
                 "support": caps.Support.UNSUPPORTED.value,
                 "alternatives": [],
+                "code": "no_target",
             })
             continue
 
@@ -3459,6 +4361,7 @@ def _validate_proposal(data: dict, role=None, device: Optional[sqlite3.Row] = No
                 "requires": "a zone the user draws in the app",
                 "support": "unsupported",
                 "alternatives": [],
+                "code": "needs_area",
             })
             continue
         if predicate in ("near", "holding", "near_mouth") and not secondary:
@@ -3468,6 +4371,7 @@ def _validate_proposal(data: dict, role=None, device: Optional[sqlite3.Row] = No
                 "requires": "a second object for the relation",
                 "support": "unsupported",
                 "alternatives": [],
+                "code": "needs_second_object",
             })
             continue
 
@@ -3517,7 +4421,7 @@ def _validate_proposal(data: dict, role=None, device: Optional[sqlite3.Row] = No
         if problem:
             unsupported.append({
                 "request": described, "reason": problem, "requires": "a rule the device can evaluate as written",
-                "support": "unsupported", "alternatives": [],
+                "support": "unsupported", "alternatives": [], "code": "invalid_rule",
             })
             continue
         valid_rules.append(rule)
@@ -3548,6 +4452,15 @@ def _policy_problem(rule: dict, reg=None) -> Optional[str]:
     except PolicyError as exc:
         return str(exc)
     return None
+
+
+def _typed_unsupported(entries: list) -> list[dict]:
+    """`entries` with a typed `code` each (jupiter/policy.py), or as they are."""
+    try:
+        from jupiter.policy import typed_unsupported
+    except ImportError:
+        return entries
+    return typed_unsupported(entries)
 
 
 def _policies_for(rules: list, zone_names: list[str]) -> list[dict]:
@@ -3710,6 +4623,9 @@ def ai_configure(body: AIConfigureBody, uid: int = Depends(current_user)):
     # later toggle (Activate keeps ids it is given).
     result["rules"] = _with_rule_ids(result.get("rules") or [])
     result["policies"] = _policies_for(result["rules"], zone_names)
+    # Every refusal carries a typed `code` (jupiter/policy.py UNSUPPORTED_CODES)
+    # the app renders as one consistent headline (M8.4).
+    result["unsupported"] = _typed_unsupported(result.get("unsupported") or [])
     # Persist the validated proposal as a DRAFT, so the app's Activate
     # (set_preset) has it to promote.
     #
@@ -3772,6 +4688,11 @@ def explain_event(device_id: int, event_id: int, uid: int = Depends(current_user
         raise HTTPException(503, "explanations are unavailable on this backend") from None
 
     event = dict(row)
+    # "When" on the backend's clock wherever the device's own clock was not the
+    # evidence (M8.3): a device on a 1970 clock must not explain an alert as
+    # having happened in 1970.
+    if event.get("occurred_at") is not None and event.get("time_basis") in ("device_monotonic", "received"):
+        event["timestamp"] = datetime.fromtimestamp(float(event["occurred_at"]), UTC).isoformat()
     # `signals` disambiguates when several rules watch the same target: the
     # device records the firing rule's own message there.
     rule = parse_rule_for_event(device["ai_rules"], event.get("type", ""), event.get("signals"))
@@ -3837,6 +4758,144 @@ def _model_identity(raw) -> Optional[dict]:
     else:
         out["detector"] = None
     return out if out["module"] or out["detector"] else None
+
+
+# ------------------------------------------------------------------ M8.3 event integrity
+#: core/alerts.py AlertDelivery: summaries and decisions a device may report.
+_ALERT_OUTPUTS = frozenset({"sounded", "simulated", "pending", "unconfirmed", "failed", "none"})
+_ALERT_DECISIONS = frozenset({"alerted", "merged", "suppressed"})
+_EPISODE_RE = re.compile(r"^[0-9a-f]{6,32}-[0-9]{1,12}$")
+#: An event's age (seconds since the device queued it) is believed up to this:
+#: the device's backlog survives restarts, not months.
+_MAX_EVENT_AGE_S = 30 * 86400.0
+#: A device timestamp later than its arrival by more than this is a wrong clock.
+_DEVICE_CLOCK_AHEAD_S = 120.0
+
+
+def _alert_report(raw) -> Optional[dict]:
+    """A device-reported alert delivery (core/alerts.py AlertDelivery.summary),
+    validated at the boundary: known keys and values only, bounded, or None.
+
+    "sounded" is accepted only as the device's own summary of its own outputs;
+    nothing here, or anywhere in the backend, ever derives it."""
+    if not isinstance(raw, dict):
+        return None
+    output = raw.get("output")
+    decision = raw.get("decision")
+    if output not in _ALERT_OUTPUTS or decision not in _ALERT_DECISIONS:
+        return None
+    rev = raw.get("rev")
+    episode = raw.get("episode")
+    category = raw.get("category")
+    outputs = []
+    for item in (raw.get("outputs") or [])[:8] if isinstance(raw.get("outputs"), list) else []:
+        if not isinstance(item, dict):
+            continue
+        entry: dict = {
+            "name": _short(item.get("name"), 32), "kind": _short(item.get("kind"), 16),
+            "audible": item.get("audible") is True,
+        }
+        for count in ("played", "failed", "skipped", "pending", "unconfirmed"):
+            value = item.get(count)
+            entry[count] = int(value) if isinstance(value, int) and not isinstance(value, bool) \
+                and 0 <= value <= 10_000 else 0
+        if item.get("visual") is True:
+            entry["visual"] = True
+        if item.get("simulated") is True:
+            entry["simulated"] = True
+        error = _short(item.get("error"), 160)
+        if error:
+            entry["error"] = error
+        outputs.append(entry)
+    return {
+        "decision": decision, "output": output,
+        "rev": rev if isinstance(rev, int) and not isinstance(rev, bool) and 0 <= rev < 1_000_000 else 0,
+        "episode": episode if isinstance(episode, str) and _EPISODE_RE.match(episode) else None,
+        "category": _short(category, 16) or None,
+        "outputs": outputs,
+    }
+
+
+def _event_time(e: dict, received_at: float) -> tuple[float, str]:
+    """When an event happened, on THIS backend's clock, and how that was found.
+
+    The device's wall clock is its own: a Pi has no RTC and can run for minutes
+    on a 1970 or last-shutdown clock before NTP, and a backlog can arrive an
+    hour late. Neither may put an alert at the wrong time in the app.
+
+    device_monotonic  received_at - age_s: the device's own monotonic age of the
+                      event, sent by firmware that queued it in this boot (M8.3)
+    device_clock      the device timestamp, when it is not in the future of its
+                      arrival and not older than the backlog can be
+    received          neither: the arrival time, and the app says so
+    """
+    age = e.get("age_s")
+    if isinstance(age, (int, float)) and not isinstance(age, bool) and math.isfinite(age) \
+            and 0 <= age <= _MAX_EVENT_AGE_S:
+        return received_at - float(age), "device_monotonic"
+    stamp = e.get("timestamp")
+    if isinstance(stamp, str) and stamp:
+        try:
+            parsed = datetime.fromisoformat(stamp.replace("Z", "+00:00"))
+            if parsed.tzinfo is None:
+                parsed = parsed.replace(tzinfo=UTC)
+            device_time = parsed.timestamp()
+        except (ValueError, OverflowError, OSError):
+            device_time = None
+        if device_time is not None and \
+                received_at - _MAX_EVENT_AGE_S <= device_time <= received_at + _DEVICE_CLOCK_AHEAD_S:
+            return device_time, "device_clock"
+    return received_at, "received"
+
+
+def _event_simulated(e: dict, model: Optional[dict], health, monitoring) -> bool:
+    """Whether an event came from a simulated device or detector (sim/).
+
+    Said by the event itself (the virtual device's uplink), by the report it
+    arrived with (the virtual device's health/monitoring), or by the model that
+    produced it (a scripted detector's backend is "simulated")."""
+    if e.get("simulated") is True:
+        return True
+    for block in (health, monitoring):
+        if isinstance(block, dict) and block.get("simulated") is True:
+            return True
+    detector = (model or {}).get("detector")
+    return isinstance(detector, dict) and detector.get("backend") == "simulated"
+
+
+def _stored_alert(raw: Optional[str]) -> Optional[dict]:
+    if not raw:
+        return None
+    try:
+        value = json.loads(raw)
+    except ValueError:
+        return None
+    return value if isinstance(value, dict) else None
+
+
+def _event_row(r) -> dict:
+    """One stored event as GET /v1/devices/{id}/events returns it."""
+    out = {k: r[k] for k in ("id", "timestamp", "type", "confidence", "signals", "severity", "source",
+                              "duration", "event_key", "received_at", "occurred_at", "time_basis")}
+    out["model"] = _stored_model(r["model"])
+    # Exactly what the device reported about its alert outputs, or None (older
+    # firmware, a log-only event). The app says "sounded" only from this.
+    out["alert"] = _stored_alert(r["alert"])
+    out["simulated"] = bool(r["simulated"]) if r["simulated"] is not None else None
+    # M8.4 owner decision A: an experimental observation, which the app labels
+    # "Experimental observation" (never an alert); its severity is always "log".
+    out["experimental"] = _row_experimental(r)
+    return out
+
+
+def _row_experimental(r) -> bool:
+    """From the stored column only. History (NULL) is not relabelled: an old
+    high_risk row did sound and notify then, and its row says what happened."""
+    try:
+        stored = r["experimental"]
+    except (IndexError, KeyError):  # a query that did not select it
+        stored = None
+    return stored == 1
 
 
 #: A device's hardware id. `SD-SIM-` marks the virtual device (sim/); it is kept so
@@ -4015,17 +5074,20 @@ def ingest(body: IngestBody, background_tasks: BackgroundTasks, request: Request
             )
         conn.execute(
             "UPDATE devices SET last_seen = ?, active_preset = COALESCE(?, active_preset),"
-            " health = COALESCE(?, health), monitoring = COALESCE(?, monitoring),"
+            " monitoring = COALESCE(?, monitoring),"
             " hardware_id = COALESCE(?, hardware_id) WHERE id = ?",
             (
                 now,
                 reported_preset,
-                json.dumps(_finite(body.health)) if body.health is not None else None,
                 json.dumps(_finite(body.monitoring)) if body.monitoring is not None else None,
                 hardware_id,
                 device["id"],
             ),
         )
+        # `last_seen` is link liveness only. The health sample is judged by its
+        # own stamp (M8.1): a re-sent or older sample never passes for a new one.
+        # Never a reason to refuse the poll -- its events are stored below.
+        _store_health(conn, device["id"], body.health, now)
         owner = (
             conn.execute("SELECT * FROM users WHERE id = ?", (device["owner_id"],)).fetchone()
             if device["owner_id"]
@@ -4086,10 +5148,26 @@ def ingest(body: IngestBody, background_tasks: BackgroundTasks, request: Request
                 model = _model_identity(e.get("model"))
                 if duration is not None and not math.isfinite(duration):
                     duration = None
+                # M8.3 (docs/EVENT_PIPELINE.md): the device's alert-delivery
+                # report, the episode it opened, real vs simulated, and when it
+                # happened on this backend's clock. All additive: NULL when an
+                # older device does not send them.
+                alert = _alert_report(e.get("alert"))
+                occurred_at, time_basis = _event_time(e, now)
+                simulated = _event_simulated(e, model, body.health, body.monitoring)
+                # M8.4 owner decision A: an experimental observation is stored as
+                # severity "log" whatever the device said (older firmware tags
+                # high_risk "loud"), and the notification loop skips it.
+                experimental = e.get("experimental") is True or _is_experimental_type(e.get("type"))
+                if experimental:
+                    e["severity"] = "log"
+                stored_key = str(event_key) if event_key not in (None, "") else None
                 cursor = conn.execute(
                     "INSERT OR IGNORE INTO events (device_id, timestamp, type, confidence, signals,"
-                    " severity, source, received_at, event_key, duration, model)"
-                    " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                    " severity, source, received_at, event_key, duration, model,"
+                    " alert, alert_output, alert_rev, episode, simulated, occurred_at, time_basis,"
+                    " experimental)"
+                    " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
                     (
                         device["id"],
                         str(e.get("timestamp", "")),
@@ -4099,11 +5177,31 @@ def ingest(body: IngestBody, background_tasks: BackgroundTasks, request: Request
                         str(e.get("severity", "log")),
                         str(e.get("source") or "module"),
                         now,
-                        str(event_key) if event_key not in (None, "") else None,
+                        stored_key,
                         duration,
                         json.dumps(model, sort_keys=True) if model is not None else None,
+                        json.dumps(alert, sort_keys=True) if alert is not None else None,
+                        alert["output"] if alert is not None else None,
+                        alert["rev"] if alert is not None else None,
+                        alert["episode"] if alert is not None else None,
+                        1 if simulated else 0,
+                        occurred_at,
+                        time_basis,
+                        1 if experimental else 0,
                     ),
                 )
+                if cursor.rowcount == 0 and stored_key is not None and alert is not None:
+                    # Already stored: this is the same event re-sent -- a retry
+                    # after a lost response, a spool replay, or the device's
+                    # later report of what its alert outputs did. Only a NEWER
+                    # report (by its revision) replaces the stored one; nothing
+                    # else about the row changes, and it is never re-notified.
+                    conn.execute(
+                        "UPDATE events SET alert = ?, alert_output = ?, alert_rev = ?"
+                        " WHERE device_id = ? AND event_key = ? AND COALESCE(alert_rev, -1) < ?",
+                        (json.dumps(alert, sort_keys=True), alert["output"], alert["rev"],
+                         device["id"], stored_key, alert["rev"]),
+                    )
                 # rowcount is 0 when OR IGNORE silently dropped a retry of an
                 # event_key already stored — that upload is not new information,
                 # so it must not reach the notification loop below. Without this
@@ -4115,7 +5213,7 @@ def ingest(body: IngestBody, background_tasks: BackgroundTasks, request: Request
                 # gate exists to prevent, just moved from "database row" to
                 # "notification".
                 if cursor.rowcount > 0:
-                    newly_inserted_events.append(e)
+                    newly_inserted_events.append({**e, "_simulated": simulated, "_experimental": experimental})
             except (TypeError, ValueError, OverflowError) as exc:
                 # Only what is wrong with THIS EVENT. A storage failure (a full
                 # disk, an I/O error) is not: it used to be caught here too, so
@@ -4134,10 +5232,12 @@ def ingest(body: IngestBody, background_tasks: BackgroundTasks, request: Request
                 continue
         row = conn.execute(
             "SELECT desired_preset, ai_rules, zones, custom_monitoring_wanted, ai_rules_activation,"
-            " desired_protection, desired_nodes, rejection_baseline, monitoring FROM devices WHERE id = ?",
+            " desired_protection, desired_nodes, rejection_baseline, monitoring, camera_mode"
+            " FROM devices WHERE id = ?",
             (device["id"],),
         ).fetchone()
         desired, ai_rules_json, zones_json = row["desired_preset"], row["ai_rules"], row["zones"]
+        camera_mode = _desired_camera_mode(row)
         desired_protection = _loads_dict(row["desired_protection"]) if row["desired_protection"] else {}
         reported_block = (body.monitoring or {}).get("protection")
         reported_block = reported_block if isinstance(reported_block, dict) else None
@@ -4154,12 +5254,19 @@ def ingest(body: IngestBody, background_tasks: BackgroundTasks, request: Request
                 # firmware that cannot do this: stop asking it every poll.
                 or (body.monitoring is not None and reported_block is None)
             )
-        if protection_action and protection_done:
+        # M8.3: a stop not delivered in PROTECTION_STOP_DELIVERY_S is withdrawn,
+        # never delivered late; its outcome becomes `timed_out` (a resume is
+        # delivered until applied: late protection is the safe direction).
+        requested_at = _reported_at(desired_protection.get("requested_at"))
+        stop_expired = (protection_action == "stop" and not protection_done and requested_at is not None
+                        and time.time() - requested_at >= PROTECTION_STOP_DELIVERY_S)
+        if protection_action and (protection_done or stop_expired):
             conn.execute(
                 "UPDATE devices SET desired_protection = NULL WHERE id = ? AND desired_protection = ?",
                 (device["id"], row["desired_protection"]),
             )
             protection_action = None
+        _record_protection_ack(conn, device["id"], reported_block, body.monitoring)
         rules_activation = row["ai_rules_activation"] or 0
         custom_monitoring_wanted = bool(row["custom_monitoring_wanted"])
         # A device can report the same active_preset string while AI Custom
@@ -4313,6 +5420,10 @@ def ingest(body: IngestBody, background_tasks: BackgroundTasks, request: Request
     # about); the cooldown then rate-limits distinct, genuinely-new alerts
     # against each other. Both are always active together.
     for e in newly_inserted_events:
+        if e.get("_experimental"):
+            # An experimental observation (owner decision A) never interrupts
+            # anyone, and never uses up the account's cooldown.
+            continue
         owner_id = owner["id"] if owner is not None else None
         push, sms = _notify_channels(e)
         if not (push or sms):
@@ -4325,6 +5436,9 @@ def ingest(body: IngestBody, background_tasks: BackgroundTasks, request: Request
         if not send:
             continue
         title = _readable_title(str(e.get("type", "alert")))
+        if e.get("_simulated"):
+            # A rehearsal must never reach a lock screen as a real detection (M8.3).
+            title += " (simulated)"
         detail = _notification_detail(e)
         if held:
             detail += f" (and {held} more in the last {int(NOTIFY_COOLDOWN_S)}s)"
@@ -4405,6 +5519,13 @@ def ingest(body: IngestBody, background_tasks: BackgroundTasks, request: Request
             node_id: {"enabled": bool(want.get("enabled")), "settings": want.get("settings") or {}}
             for node_id, want in sorted(desired_nodes.items()) if isinstance(want, dict)
         }
+
+    # M8.4: the owner's camera-only choice, until the device reports the same
+    # value. Only to firmware that reports a camera block (it understands it).
+    reported_camera = _reported_camera(body.monitoring)
+    if reported_camera is not None and (reported_camera.get("camera_only") is True) != camera_mode["camera_only"]:
+        command = dict(command or {})
+        command["set_camera_mode"] = {"camera_only": camera_mode["camera_only"], "id": camera_mode["id"]}
 
     # An explicit, confirmed stop/resume, until the device reports it (one-shot).
     if protection_action in ("stop", "resume"):

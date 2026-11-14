@@ -7,6 +7,9 @@ struct DiagnosticsView: View {
     @EnvironmentObject private var state: AppState
     @State private var results: [StageResult] = []
     @State private var running = false
+    /// The app's own shared live-feed connection, as measured (StreamMetrics):
+    /// nil until a feed has been opened in this app session.
+    @State private var feedMetrics: String?
 
     struct StageResult: Identifiable {
         let id = UUID()
@@ -30,28 +33,76 @@ struct DiagnosticsView: View {
                 }
                 .disabled(running)
             } footer: {
-                Text("Checks run top to bottom: account → cloud → device → live feed. The first ✗ is where your problem is.")
+                Text("Checks run top to bottom: server, account, device, live feed. The first one that fails is where to start.")
             }
 
             if !results.isEmpty {
-                Section("Results") {
+                Section {
                     ForEach(results) { result in
-                        HStack(alignment: .top, spacing: 10) {
+                        HStack(alignment: .firstTextBaseline, spacing: SD.Space.sm) {
                             Image(systemName: icon(for: result.passed))
                                 .foregroundStyle(color(for: result.passed))
+                                .accessibilityHidden(true)
                             VStack(alignment: .leading, spacing: 2) {
-                                Text(result.name).font(.subheadline.weight(.semibold))
-                                Text(result.detail).font(.caption).foregroundStyle(SD.Colors.textSecondary)
+                                Text(result.name)
+                                    .font(SD.Typography.label.weight(.semibold))
+                                    .foregroundStyle(SD.Colors.textPrimary)
+                                    .fixedSize(horizontal: false, vertical: true)
+                                Text(result.detail)
+                                    .font(SD.Typography.caption)
+                                    .foregroundStyle(SD.Colors.textSecondary)
+                                    .fixedSize(horizontal: false, vertical: true)
                             }
                         }
+                        // The result as a word too: the glyph's colour is not the only carrier.
+                        .accessibilityElement(children: .combine)
+                        .accessibilityValue(word(for: result.passed))
+                    }
+                } header: {
+                    Text("Results")
+                } footer: {
+                    if let first = results.first(where: { $0.passed == false }) {
+                        Text("Start with \u{201C}\(first.name)\u{201D}.")
+                    } else if results.allSatisfy({ $0.passed != false }) {
+                        Text("Nothing failed. A skipped check (—) depends on one before it.")
                     }
                 }
+            }
+            // M8.4: what the app's own feed connection measured -- delivered
+            // fps, frame age, duplicates, reconnects -- read from the shared
+            // reader (no new connection is opened to show it).
+            Section {
+                Text(feedMetrics ?? "No live feed has been opened since the app started.")
+                    .font(feedMetrics == nil ? SD.Typography.caption : SD.Typography.caption.monospaced())
+                    .foregroundStyle(SD.Colors.textSecondary)
+                    .fixedSize(horizontal: false, vertical: true)
+                    .textSelection(.enabled)
+                    .accessibilityIdentifier("doctor.feedMetrics")
+            } header: {
+                Text("Live feed in this app")
+            } footer: {
+                Text("Counted by this phone for the camera feed it has open or had open: frames per second delivered, how old frames were when they arrived, and how often the connection dropped.")
             }
         }
             .orynRows()
         }
         .orynFormStyle()
+        .onAppear { refreshFeedMetrics() }
         .navigationTitle("Connection doctor")
+        .navigationBarTitleDisplayMode(.inline)
+    }
+
+    private func refreshFeedMetrics() {
+        let reader = LiveFeedSession.shared.reader
+        feedMetrics = reader.metrics.connectionOpens > 0 ? reader.metricsSummary() : nil
+    }
+
+    private func word(for passed: Bool?) -> String {
+        switch passed {
+        case .some(true): "Passed"
+        case .some(false): "Failed"
+        case .none: "Skipped"
+        }
     }
 
     private func icon(for passed: Bool?) -> String {
@@ -77,7 +128,7 @@ struct DiagnosticsView: View {
             return .init(name: name, passed: nil,
                          detail: "this server doesn't report whether the device is monitoring (older backend)")
         }
-        let capabilities = CapabilityHealth.rows(status: device.status, online: device.online)
+        let capabilities = CapabilityHealth.rows(status: device.status, online: device.isLive())
         let impaired = capabilities.rows.filter { $0.state == .impaired }
         var detail = presentation.detail
         if !impaired.isEmpty {
@@ -100,7 +151,7 @@ struct DiagnosticsView: View {
     // ------------------------------------------------------------------ checks
     private func runAll() async {
         running = true
-        defer { running = false }
+        defer { running = false; refreshFeedMetrics() }
         results = []
 
         if state.isDemo {
@@ -252,7 +303,7 @@ struct DiagnosticsView: View {
                 let status = (resp as? HTTPURLResponse)?.statusCode ?? 0
                 if status == 401 || status == 403 {
                     results.append(.init(name: "Live stream", passed: false,
-                                         detail: "device rejected the token (\(status)) — the device's dashboard.token and Settings → Device token must match"))
+                                         detail: "device rejected the token (\(status)) — the device's dashboard.token and Settings → Live feed → Device token must match"))
                 } else if status == 200 {
                     connected = true
                     var parser = MJPEGFrameParser()

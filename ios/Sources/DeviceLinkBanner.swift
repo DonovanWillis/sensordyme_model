@@ -24,8 +24,16 @@ struct DeviceLinkBanner: View {
         case .idle, .connected:
             EmptyView()   // working, or nothing to report yet
         case .searching:
-            row(icon: "antenna.radiowaves.left.and.right", tint: SD.Colors.textSecondary,
-                title: "Looking for your device…", detail: nil, action: nil)
+            // A process, not a problem: one quiet line, not a box.
+            HStack(spacing: SD.Space.xs) {
+                ProgressView().controlSize(.mini).tint(SD.Colors.textTertiary)
+                Text("Looking for your device on this Wi-Fi…")
+                    .font(SD.Typography.caption)
+                    .foregroundStyle(SD.Colors.textSecondary)
+                    .fixedSize(horizontal: false, vertical: true)
+                Spacer(minLength: 0)
+            }
+            .accessibilityElement(children: .combine)
         case .notFound:
             // Bonjour found nothing, which on its own says only "not reachable
             // from this phone". It used to be reported as "Can't find your
@@ -72,11 +80,11 @@ struct DeviceLinkBanner: View {
     @ViewBuilder
     private func row(icon: String, tint: Color, title: String,
                      detail: String?, action: String?) -> some View {
-        SDCard {
-            HStack(alignment: .top, spacing: SD.Space.sm) {
+        HStack(alignment: .top, spacing: SD.Space.sm) {
                 Image(systemName: icon)
-                    .font(SD.Typography.headline)
+                    .font(SD.Typography.callout)
                     .foregroundStyle(tint)
+                    .accessibilityHidden(true)
                 VStack(alignment: .leading, spacing: SD.Space.xxs) {
                     // The words as one element; the action stays its own button
                     // (combining the whole card made the button unpressable).
@@ -96,12 +104,19 @@ struct DeviceLinkBanner: View {
                         Button(action) { Task { await link.resolve(force: true) } }
                             .font(SD.Typography.caption.weight(.semibold))
                             .foregroundStyle(SD.Colors.accent)
-                            .padding(.top, 2)
+                            // 44 pt hit area (M8 audit 21); the drawn text is unchanged.
+                            .frame(minHeight: 44, alignment: .leading)
+                            .contentShape(Rectangle())
                     }
                 }
                 Spacer(minLength: 0)
             }
-        }
+        .padding(.vertical, SD.Space.sm)
+        .padding(.horizontal, SD.Space.sm + 2)
+        .background(
+            RoundedRectangle(cornerRadius: SD.Radius.lg, style: .continuous)
+                .fill(SD.Colors.surface)
+        )
         .accessibilityElement(children: .contain)
     }
 }

@@ -132,18 +132,18 @@ struct AIUnsupported: Codable, Equatable, Identifiable, Sendable {
     /// supported | partial | needs_model | needs_training_data | needs_hardware | unsupported
     var support: String?
     var alternatives: [String]?
+    /// The typed reason (jupiter/policy.py UNSUPPORTED_CODES, M8.4). Nil from
+    /// an older backend: the headline then comes from `support` as before.
+    var code: String? = nil
 
     var id: String { request + reason }
 
-    /// The takeaway, phrased as a next step rather than a refusal.
-    var route: String {
-        switch support {
-        case "needs_training_data": "Add examples to teach it"
-        case "needs_model": "Needs an extra model"
-        case "needs_hardware": "Needs extra hardware"
-        default: "Not possible from camera alone"
-        }
-    }
+    /// The reason as one headline (JupiterRefusal), the same wherever the
+    /// refusal came from.
+    var route: String { JupiterRefusal.headline(code: code, support: support) }
+
+    /// "Why: ..." for a policy refusal nothing can enable, else "To enable: ...".
+    var requiresLine: String { "\(JupiterRefusal.requiresPrefix(code: code)): \(requires)" }
 }
 
 /// How confident Jupiter is that it correctly understood the REQUEST — not to
@@ -203,6 +203,17 @@ struct AIProposal: Codable, Equatable, Sendable {
     /// on activation so the backend can refuse — 409 — a draft that has been
     /// replaced since this one was reviewed. Nil from an older backend.
     var draft_version: String? = nil
+    /// The typed policy for each rule (jupiter/policy.py), in rule order: is
+    /// its area drawn, and what it will and won't watch. Nil from an older backend.
+    var policies: [AIPolicyPreview]? = nil
+
+    /// The typed policy for the rule at `index`, when the backend sent one.
+    func policy(at index: Int) -> AIPolicyPreview? {
+        guard rules.indices.contains(index) else { return nil }
+        var ruleID: String?
+        if case .string(let id)? = rules[index].extra["id"] { ruleID = id }
+        return AIPolicyPreview.matching(policies, ruleID: ruleID, index: index, ruleCount: rules.count)
+    }
 
     /// A custom configuration is the normal outcome, not a failure to match.
     var isCustom: Bool { preset.isEmpty }
@@ -298,6 +309,27 @@ protocol BackendAPI {
     /// GET /v1/capability-tiers: how far each product capability has been
     /// validated, from the model registry (CapabilityTier.swift).
     func capabilityTiers() async throws -> CapabilityTiersResponse
+    /// POST /v1/devices/{id}/camera-mode (M8.4, owner Decision C). Turning it
+    /// ON needs `confirm: true`; refusals: 400 confirmation_required, 409
+    /// firmware_unsupported. Accepted means queued: the device's own report
+    /// (`status.camera_mode`) is the only proof it applied.
+    func setCameraMode(deviceID: Int, cameraOnly: Bool, confirm: Bool) async throws
+    /// POST /v1/account/delete (M8.4, docs/PRIVACY.md §5). Refusals: 403
+    /// wrong_password, 400 confirmation_required.
+    func deleteAccount(password: String) async throws -> AccountDeletionResult
+}
+
+/// What `POST /v1/account/delete` reported doing. Every count optional.
+struct AccountDeletionResult: Codable, Equatable {
+    var devicesReleased: Int?
+    var eventsDeleted: Int?
+    var ordersDeleted: Int?
+
+    enum CodingKeys: String, CodingKey {
+        case devicesReleased = "devices_released"
+        case eventsDeleted = "events_deleted"
+        case ordersDeleted = "orders_deleted"
+    }
 }
 
 /// A rehearsable demo event. Waiting ~20s for a synthesised alert is not a
@@ -317,16 +349,17 @@ struct DemoScenario: Identifiable, Hashable, CaseIterable {
 
     static let distractedDriving = DemoScenario(
         id: "distraction", title: "Distracted driving",
-        detail: "Phone in hand with eyes off the road", icon: "car.fill",
-        type: "phone_use", signals: "phone + hand_overlap + gaze_off", severity: "loud")
+        detail: "Phone visible while eyes are off the road", icon: "car.fill",
+        type: "phone_use", signals: "phone_visible + gaze_off_road (sustained)", severity: "loud")
 
     static let drowsyDriving = DemoScenario(
         id: "drowsy", title: "Drowsy driver",
-        detail: "Sustained eye closure at speed", icon: "eye.slash.fill",
-        type: "drowsiness", signals: "sustained_closure + head_nod", severity: "loud")
+        detail: "Eyes closed for longer than a blink", icon: "eye.slash.fill",
+        type: "drowsiness", signals: "sustained_eye_closure", severity: "loud")
 
+    // "Someone", not "a child": the camera cannot tell children from adults.
     static let poolSafety = DemoScenario(
-        id: "pool", title: "Child near pool",
+        id: "pool", title: "Someone in the pool area",
         detail: "Person in the pool zone", icon: "figure.pool.swim",
         type: "zone_violation:pool", signals: "person + zone_entry", severity: "loud")
 
@@ -459,28 +492,38 @@ final class MockAPI: BackendAPI {
         seedHistory()
     }
 
-    // Demo scenarios per mode: (type, signals, severity, avg interval seconds)
+    // Demo scenarios per mode: (type, signals, severity, avg interval seconds).
+    // Only event types the real modules emit (presets.yaml alert_types), in
+    // words the device could have measured (M8.4): the demo is reachable in a
+    // release build, so it must not show crying (there is no microphone), a
+    // "face covered" or an "unknown person" (no identity), which no SensorDyme
+    // can detect.
     private var scenario: [(String, String, String, Double)] {
         switch Preset.split(activePreset).base {
         case "baby_monitoring":
-            [("stir_detected", "movement in crib", "log", 30),
-             ("face_covered", "blanket near face 4s", "loud", 150),
-             ("crying_detected", "audio pattern match 0.91", "soft", 90)]
+            [("movement", "movement in the crib zone", "log", 30),
+             ("unusual_stillness", "no movement in the crib zone for 4 min", "soft", 150),
+             ("flailing", "rapid limb movement for 3 s (pose)", "soft", 90)]
         case "elderly_monitoring":
             [("movement", "kitchen zone", "log", 40),
              ("fall", "rapid drop + 2.1s stillness", "loud", 240),
-             ("inactivity_warning", "no movement 25 min", "soft", 180)]
+             ("unusual_stillness", "no movement for 25 min", "soft", 180)]
         case "security_monitoring":
             [("occupancy_change", "1 -> 2 people", "soft", 60),
              ("person_detected", "entry zone", "log", 45),
-             ("unknown_person_lingering", "entry zone 40s", "loud", 200)]
+             ("person_lingering", "a person in the entry zone for 40s", "loud", 200)]
         default:
-            [("eyes_off_road", "gaze yaw 31deg for 2.4s", "soft", 45),
-             ("phone_use_while_distracted", "phone + hand_overlap + gaze_off", "loud", 120),
-             ("drowsiness", "sustained_eye_closure 1.8s", "loud", 160),
-             ("vlm_judgment", "vlm:attentive — eyes forward, hands on wheel", "log", 25)]
+            [("distraction", "head turned away from the road for 3.4s", "loud", 45),
+             ("phone_use", "phone visible while eyes off the road for 3.1s", "loud", 120),
+             ("drowsiness", "sustained_eye_closure 2.3s", "loud", 160),
+             ("eyes_down", "looking down for 2.6s", "loud", 25),
+             // Experimental (M8.4): recorded, never an alert.
+             ("elevated_risk", "risk_score 0.46 + phone_visible + gaze_off_road", "log", 70)]
         }
     }
+
+    /// The driver module's experimental families (M8.4): observations, never alerts.
+    private static let experimentalTypes: Set<String> = ["high_risk", "elevated_risk", "erratic_hand_movement"]
 
     private func seedHistory() {
         var seeded: [EventItem] = []
@@ -509,7 +552,15 @@ final class MockAPI: BackendAPI {
             // Demo events come from a preset, not a configured rule. Marking
             // them as configured would make them all notify, which is exactly
             // the spam this distinction exists to prevent.
-            source: "module"
+            source: "module",
+            // A demo alert went to a simulated output, as a simulated device
+            // reports it: "Simulated alert (no sound)", never "sounded".
+            alert: severity == "log" || Self.experimentalTypes.contains(type)
+                ? nil : EventAlertReport(decision: "alerted", output: "simulated"),
+            // Every demo event says it is one (M8.3), so the timeline and the
+            // detail sheet label it, wherever it is shown.
+            simulated: true,
+            experimental: Self.experimentalTypes.contains(type) ? true : nil
         )
     }
 
@@ -568,7 +619,8 @@ final class MockAPI: BackendAPI {
                    monitoring: customActive
                        ? CustomMonitoring(instruction: customInstruction, ruleCount: customRules.count, active: true)
                        : nil,
-                   status: demoStatus(customActive: customActive, running: running.map(\.id)))
+                   status: demoStatus(customActive: customActive, running: running.map(\.id)),
+                   receivedAt: Date())
         ]
     }
 
@@ -607,6 +659,7 @@ final class MockAPI: BackendAPI {
         return PerceptionReport(simulated: true, components: [
             "object_detector": PerceptionComponent(state: "ok", lastRunAgeS: 0.2, reason: "simulated"),
             "face_landmarks": PerceptionComponent(state: "ok", lastRunAgeS: 0.1, reason: "simulated"),
+            "pose": PerceptionComponent(state: "ok", lastRunAgeS: 0.2, reason: "simulated"),
         ], nodes: nodes)
     }
 
@@ -698,11 +751,14 @@ final class MockAPI: BackendAPI {
         for index in presets.indices {
             switch presets[index].id {
             case "driver_safety":
-                presets[index].requiredCapabilities = ["face", "gaze"]
-                presets[index].optionalCapabilities = ["phone_use"]
+                // Capability names the device reports (presets.yaml), so the
+                // mode sheet can check them; "gaze" and "phone_use" are not
+                // capabilities, and read as "Unknown" on a running mode (M8.4).
+                presets[index].requiredCapabilities = ["face"]
+                presets[index].optionalCapabilities = ["objects", "hands"]
                 presets[index].hardware = ["IR camera facing the driver"]
                 presets[index].temporalPolicies = [
-                    TemporalPolicy(event: "eyes_off_road", description: "Eyes off the road", sustainS: 2),
+                    TemporalPolicy(event: "distraction", description: "Head turned away from the road", sustainS: 3),
                     TemporalPolicy(event: "drowsiness", description: "Eyes closed", sustainS: 1.5),
                 ]
                 presets[index].settings = [
@@ -711,21 +767,24 @@ final class MockAPI: BackendAPI {
                     setting("chime", "Chime on the device", .bool, .bool(true)),
                 ]
                 presets[index].validation = PresetValidation(
-                    status: .benchmarkedOffline,
-                    evidence: ["Benchmarked offline on a public driver dataset (demo figure)."])
+                    status: .unevaluated,
+                    evidence: ["Not yet validated: checked only in synthetic tests (the demo device is simulated)."])
                 presets[index].limitations = ["Sunglasses can hide the eyes.", "Needs the face in view."]
             case "baby_monitoring":
-                presets[index].requiredCapabilities = ["pose", "audio"]
+                // No "audio" and no crying alert: SensorDyme has no microphone.
+                presets[index].requiredCapabilities = ["objects"]
+                presets[index].optionalCapabilities = ["pose"]
                 presets[index].settings = [
                     sensitivity,
-                    setting("cry_alert", "Alert on crying", .bool, .bool(true)),
+                    setting("still_warning_s", "Alert after stillness for", .number, .number(120),
+                            min: 30, max: 600, step: 30, unit: "s"),
                 ]
                 presets[index].limitations = ["Can't see through a fully covered crib."]
             case "elderly_monitoring":
                 presets[index].requiredCapabilities = ["pose"]
                 presets[index].temporalPolicies = [
                     TemporalPolicy(event: "fall", description: "On the floor after a fall", sustainS: 5),
-                    TemporalPolicy(event: "inactivity_warning", description: "No movement", sustainS: 1500),
+                    TemporalPolicy(event: "unusual_stillness", description: "No movement", sustainS: 1500),
                 ]
                 presets[index].settings = [
                     setting("inactivity_min", "Alert after no movement for", .number, .number(25),
@@ -733,7 +792,7 @@ final class MockAPI: BackendAPI {
                 ]
                 presets[index].limitations = ["Falls out of the camera's view are missed."]
             case "security_monitoring":
-                presets[index].requiredCapabilities = ["person"]
+                presets[index].requiredCapabilities = ["objects"]
                 presets[index].settings = [
                     setting("linger_s", "Lingering after", .number, .number(40), min: 10, max: 300, step: 10, unit: "s"),
                     setting("arm", "Armed", .choice, .string("home"),
@@ -745,7 +804,7 @@ final class MockAPI: BackendAPI {
         presets.append(CatalogPreset(
             id: "pool_safety", version: "demo", title: "Pool Safety",
             description: "Someone entering the pool area",
-            requiredCapabilities: ["person", "zones"],
+            requiredCapabilities: ["objects"],
             validation: PresetValidation(status: .unevaluated),
             limitations: ["Planned. Not available on any device yet."]))
         return PresetCatalog(catalogVersion: "demo-1", presets: presets, source: .server)
@@ -889,21 +948,39 @@ final class MockAPI: BackendAPI {
 
     func explain(deviceID: Int, eventID: Int) async throws -> AlertExplanation {
         try await Task.sleep(for: .milliseconds(400))
-        // Mirrors the real deterministic path, including the rule sentence —
-        // a demo that explains alerts differently from the product teaches the
-        // wrong thing to whoever is watching.
+        // Mirrors the real deterministic path (jupiter/explain.py
+        // facts_from_event) for THIS event. It used to answer "Fall, 94%, living
+        // room" whichever event was tapped -- a phone-use alert explained as a
+        // fall, in a demo anyone can open from the sign-in screen (M8.4).
+        guard let event = history.first(where: { $0.eventID == eventID }) else {
+            throw APIError(message: "That demo event is no longer in the demo history.")
+        }
+        var facts = (event.signals ?? "").replacingOccurrences(of: "+", with: ",")
+            .split(separator: ",").map { $0.trimmingCharacters(in: .whitespaces) }.filter { !$0.isEmpty }
+            .map { ExplanationFact(label: $0.prefix(1).uppercased() + $0.dropFirst()
+                                       .replacingOccurrences(of: "_", with: " "), detail: "") }
+        if let confidence = event.confidence, confidence > 0 {
+            facts.append(ExplanationFact(label: "Confidence", detail: "\(Int((confidence * 100).rounded()))%"))
+        }
+        if event.isExperimental {
+            facts.append(ExplanationFact(label: "Experimental observation", detail: "not an alert"))
+        }
+        let severity = event.isCritical ? "critical" : (event.severity == "soft" ? "warning" : "info")
+        let when = event.date.map { $0.formatted(date: .omitted, time: .shortened) } ?? ""
+        let saw = facts.isEmpty ? "" : " SensorDyme saw: " + facts.map(\.text).joined(separator: "; ") + "."
         return AlertExplanation(
-            headline: "Fall", severity: "critical", when: "2:41 PM",
-            facts: [
-                ExplanationFact(label: "Rapid drop", detail: ""),
-                ExplanationFact(label: "Stillness", detail: ""),
-                ExplanationFact(label: "Confidence", detail: "94%"),
-                ExplanationFact(label: "Held for", detail: "8 seconds"),
-                ExplanationFact(label: "Area", detail: "living room"),
-            ],
-            rule: "You were alerted because your rule alerts after 5 seconds.",
-            confidence: 0.94, source: "facts",
-            narrative: "Fall SensorDyme saw: Rapid drop; Stillness; Confidence — 94%; Held for — 8 seconds; Area — living room. You were alerted because your rule alerts after 5 seconds.")
+            headline: event.title, severity: severity, when: when, facts: facts, rule: "",
+            confidence: event.confidence, source: "facts", narrative: event.title + "." + saw)
+    }
+
+    /// The demo device reports no camera_mode (CameraModePresentation: unknown,
+    /// no switch), so this is never offered; refused plainly if reached.
+    func setCameraMode(deviceID: Int, cameraOnly: Bool, confirm: Bool) async throws {
+        throw APIError(message: "The demo device has no camera to allow.", status: 409, code: "firmware_unsupported")
+    }
+
+    func deleteAccount(password: String) async throws -> AccountDeletionResult {
+        throw APIError(message: "The demo has no account to delete. Exit the demo instead.", status: 400)
     }
 
     func aiConfigure(deviceID: Int, prompt: String) async throws -> AIProposal {
@@ -913,16 +990,87 @@ final class MockAPI: BackendAPI {
         func has(_ words: String...) -> Bool { words.contains { p.contains($0) } }
         func rule(_ target: String, _ predicate: String, _ desc: String, secondary: String = "",
                   zone: String = "", persist: Double = 3, severity: String = "warning",
-                  cooldown: Double = 120, caveat: String? = nil) -> AIRule {
+                  cooldown: Double = 120, caveat: String? = nil, minCount: Int = 1) -> AIRule {
             AIRule(target: target, predicate: predicate, secondary: secondary, description: desc,
-                   zone: zone, persist_s: persist, min_count: 1, confidence: 0.6,
+                   zone: zone, persist_s: persist, min_count: minCount, confidence: 0.6,
                    severity: severity, cooldown_s: cooldown, schedule: "", notify: "push",
                    caveat: caveat)
         }
+        func refused(_ code: String, _ reason: String, _ requires: String) -> AIProposal {
+            AIProposal(
+                preset: "", variant: "", explanation: "Nothing was set up. " + reason, rules: [], settings: [:],
+                unsupported: [AIUnsupported(request: prompt, reason: reason, requires: requires,
+                                            support: "unsupported", alternatives: [], code: code)],
+                source: "demo", mode: "custom")
+        }
 
-        // The demo mirrors the real capability layer, refusals included. A
-        // walkthrough that only ever succeeds teaches the wrong expectation and
-        // falls apart the first time someone asks for something unsupported.
+        // The demo mirrors the real backend (M8.4): the policy guard first
+        // (jupiter/policy.py refusal_for, with its typed codes), then the
+        // grammar's area requests, then what a mode or the capability layer
+        // would answer. A walkthrough that only ever succeeds -- or succeeds
+        // where the product refuses -- teaches the wrong expectation.
+        if has("recogni", "stranger", "unknown person", "identify", "who is") {
+            return refused("identity", "Recognising who someone is is not something SensorDyme can monitor.",
+                           "face recognition — deliberately not shipped (privacy). SensorDyme can tell that a "
+                           + "person is present, never who it is")
+        }
+        if has("high risk", "elevated risk", "risk score", "erratic", "hand movement", "fidget") {
+            return refused("experimental_signal",
+                           "An experimental driver observation (the combined risk score or erratic hand movement) "
+                           + "is not something SensorDyme can alert on.",
+                           "they haven't been validated on real in-cabin footage, so they are recorded in "
+                           + "Activity as experimental observations and never sound or notify. Ask for something "
+                           + "observable instead (someone in an area you draw, nobody in view)")
+        }
+        if has("cry", "bark", "sound", "noise", "hear", "scream", "shout") {
+            return refused("audio", "Sounds are not something SensorDyme can monitor.",
+                           "a microphone and an audio classifier; this device has no microphone")
+        }
+        if has("breathing", "choking", "seizure", "heart attack") {
+            return refused("medical", "Medical conditions are not something SensorDyme can monitor.",
+                           "out of scope by policy — the system reports observable safety conditions only")
+        }
+
+        // The grammar's area requests (the suggestions Ask Jupiter offers).
+        if has("marked area", "the area", "the zone") {
+            let zone = demoZones.count == 1 ? demoZones[0].name : "marked area"
+            let drawn = demoZones.contains { $0.name == zone }
+            let description = prompt.trimmingCharacters(in: .whitespacesAndNewlines)
+            let proposed: AIRule
+            let summary: String  // jupiter/policy.py explain()'s summary, for the same rule
+            if has("nobody", "no one", "empty") {
+                proposed = rule("person", "absent", description, zone: zone, persist: 300)
+                summary = "Alert when no person is inside the area '\(zone)' for 5 minutes."
+            } else if has("more than 3 people") {
+                proposed = rule("person", "count", description, zone: zone, persist: 2, minCount: 4)
+                summary = "Alert when at least 4 of 'person' are inside the area '\(zone)' (the count must hold for 2 seconds)."
+            } else if has("stays", "longer than") {
+                var dwell = rule("person", "lingering", description, zone: zone, persist: 10)
+                dwell.extra["dwell_s"] = .number(10)
+                proposed = dwell
+                summary = "Alert when a person stays inside the area '\(zone)' for 10 seconds or longer without leaving."
+            } else if has("dog") {
+                proposed = rule("dog", "in_zone", description, zone: zone, persist: 2)
+                summary = "Alert when a dog is inside the area '\(zone)' for 2 seconds."
+            } else {
+                proposed = rule("person", "in_zone", description, zone: zone, persist: 2)
+                summary = "Alert when a person is inside the area '\(zone)' for 2 seconds."
+            }
+            let policy = AIPolicyPreview(
+                rule_id: nil, status: drawn ? "ready" : "needs_zone", zone: .init(name: zone, drawn: drawn),
+                explanation: .init(
+                    summary: nil,
+                    monitors: ["the object detector's '\(proposed.target)' class",
+                               "whether a subject's feet are inside the area you drew named '\(zone)'"],
+                    does_not_monitor: ["who the person is (no face recognition)", "why anyone is there (intent is never inferred)",
+                                       "sound (no microphone)", "anything outside '\(zone)'"],
+                    status: drawn ? nil : "Waiting: draw an area named '\(zone)' in the app."))
+            return AIProposal(
+                preset: "", variant: "",
+                explanation: summary + " Severity: warning; notification: push.",
+                rules: [proposed], settings: [:], unsupported: [], source: "demo", mode: "custom",
+                policies: [policy])
+        }
         if has("dog", "cat", "pet", "couch") {
             return AIProposal(
                 preset: "", variant: "",
@@ -931,7 +1079,7 @@ final class MockAPI: BackendAPI {
                              caveat: "Overlap shows the dog is with the couch, not certainly on it.")],
                 settings: [:], unsupported: [], source: "demo", mode: "custom")
         }
-        if has("can", "package", "parcel", "delivery") {
+        if has("a can", "soda can", "package", "parcel", "delivery") {
             return AIProposal(
                 preset: "", variant: "",
                 explanation: "I can't set that up. The detector doesn't recognise that object, and I'd rather say so than quietly watch for something else.",
@@ -941,16 +1089,16 @@ final class MockAPI: BackendAPI {
                     reason: "the current vision model doesn't recognise that object",
                     requires: "labelled examples to fine-tune a detector for it",
                     support: "needs_training_data",
-                    alternatives: ["bottle", "cup", "backpack", "suitcase"])],
+                    alternatives: ["bottle", "cup", "backpack", "suitcase"], code: "not_detectable")],
                 source: "demo", mode: "custom")
         }
-        if has("floor", "ground", "fall", "elder", "grandma", "grandpa") {
+        // A mode, and only the mode: the real backend never sends rules with a
+        // mode switch (they would replace the mode's own detection).
+        if has("floor", "fall", "elder", "grandma", "grandpa") {
             return AIProposal(
                 preset: "elderly_monitoring", variant: "standard",
-                explanation: "Switching to Elderly Monitoring and adding a rule for someone remaining on the floor. Posture comes from body-pose landmarks, and lying in bed does not count: the rule needs them low in the frame too.",
-                rules: [rule("on_floor", "present", "Alert if someone stays on the floor",
-                             persist: 30, severity: "critical", cooldown: 60)],
-                settings: [:], unsupported: [], source: "demo", mode: "preset")
+                explanation: "Elderly Monitoring: immediate fall alerts (rapid drop then stillness — sitting down won't trigger it), staying active until movement resumes.",
+                rules: [], settings: [:], unsupported: [], source: "demo", mode: "preset")
         }
         if has("empty", "nobody", "leaves") {
             return AIProposal(
@@ -959,13 +1107,11 @@ final class MockAPI: BackendAPI {
                 rules: [rule("person", "absent", "Alert when nobody is in view", persist: 10)],
                 settings: [:], unsupported: [], source: "demo", mode: "custom")
         }
-        if has("drive", "driving", "car", "phone", "drowsy", "road") {
+        if has("drive", "driving", "drowsy", "road") {
             return AIProposal(
-                preset: "driver_safety", variant: "strict",
-                explanation: "Switching to Driver Distraction (Strict). Phone use while looking away alerts within a second; quick mirror checks never alarm.",
-                rules: [rule("cell phone", "present", "Alert on phone use while driving",
-                             persist: 1, severity: "critical", cooldown: 30)],
-                settings: [:], unsupported: [], source: "demo", mode: "preset")
+                preset: "driver_safety", variant: "standard",
+                explanation: "Driver Safety: loud alerts for phone use while looking away and sustained eye closure. A phone that is only visible is logged, never alerted.",
+                rules: [], settings: [:], unsupported: [], source: "demo", mode: "preset")
         }
         return AIProposal(
             preset: "", variant: "",
@@ -975,7 +1121,7 @@ final class MockAPI: BackendAPI {
                 request: prompt,
                 reason: "no detectable object or condition matched the request",
                 requires: "rephrase using an object the camera knows, or add a model for it",
-                support: "unsupported", alternatives: [])],
+                support: "unsupported", alternatives: [], code: "not_supported")],
             source: "demo", mode: "custom")
     }
 }
@@ -1004,9 +1150,8 @@ extension APIClient {
         req.httpMethod = "GET"
         req.timeoutInterval = 30
         if let token { req.setValue("Bearer \(token)", forHTTPHeaderField: "Authorization") }
-        let (data, response) = try await URLSession.shared.data(for: req)
-        let status = (response as? HTTPURLResponse)?.statusCode ?? 0
-        if let error = Self.httpError(status: status, data: data, sentToken: token != nil) {
+        let (data, status) = try await Self.perform(req, host: baseURL.host ?? "the server")
+        if let error = Self.httpError(status: status, data: data, sentToken: token != nil, signedIn: signedIn) {
             throw error
         }
         return try Self.decodeReply(T.self, from: data)
@@ -1029,9 +1174,8 @@ extension APIClient {
         if let token { req.setValue("Bearer \(token)", forHTTPHeaderField: "Authorization") }
         req.setValue("application/json", forHTTPHeaderField: "Content-Type")
         req.httpBody = try JSONSerialization.data(withJSONObject: body)
-        let (data, response) = try await URLSession.shared.data(for: req)
-        let status = (response as? HTTPURLResponse)?.statusCode ?? 0
-        if let error = Self.httpError(status: status, data: data, sentToken: token != nil) {
+        let (data, status) = try await Self.perform(req, host: baseURL.host ?? "the server")
+        if let error = Self.httpError(status: status, data: data, sentToken: token != nil, signedIn: signedIn) {
             throw error
         }
         return try Self.decodeReply(T.self, from: data)

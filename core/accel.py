@@ -576,9 +576,27 @@ class HailoYOLO:
             h, w, c = info.shape
             if h != w:
                 raise RuntimeError(f"non-square detection grid {info.shape} on {info.name}")
+            # M8.3: each of these used to load and then decode wrongly in silence
+            # (tests/test_m83_inference_path.py): a grid that does not divide the
+            # input gave a truncated stride (640 // 21 = 30), a second head of one
+            # role at a grid overwrote the first, and a class head narrower than
+            # COCO shifted every class id it did have.
+            if h <= 0 or self._input_h % h:
+                raise RuntimeError(f"grid {h} on {info.name} does not divide the {self._input_h}-px input")
             entry = by_grid.setdefault(h, {"grid": h, "stride": self._input_h // h})
-            entry["box" if c == box_channels else "cls"] = info.name
-            if c != box_channels:
+            role = "box" if c == box_channels else "cls"
+            if role in entry:
+                raise RuntimeError(
+                    f"grid {h} has two {role} heads ({entry[role]} and {info.name}); this decoder "
+                    "pairs exactly one box head with one class head per grid"
+                )
+            entry[role] = info.name
+            if role == "cls":
+                if c < len(COCO_NAMES):
+                    raise RuntimeError(
+                        f"class head {info.name} has {c} channels, fewer than the "
+                        f"{len(COCO_NAMES)} COCO classes the class map assumes"
+                    )
                 entry["num_classes"] = c
         scales = [by_grid[g] for g in sorted(by_grid, reverse=True)]
         for s in scales:
@@ -590,6 +608,51 @@ class HailoYOLO:
                 )
         return scales
 
+    def _scale_heads(self, raw, spec) -> tuple[np.ndarray, np.ndarray]:
+        """One scale's (box, cls) tensors from an inference result, as (G, G, C).
+
+        Refuses, with the tensor named, anything that is not the NHWC
+        (1, G, G, C) layout the .hef declared. Before M8.3 a missing head was a
+        bare KeyError, a result without the batch axis or from the wrong grid
+        decoded to NO detections, and an NCHW tensor decoded to boxes of the
+        wrong size (all measured in tests/test_m83_inference_path.py). An empty
+        result is a legitimate answer ("nothing there"), so a fault must never
+        be able to produce one.
+        """
+        grid = spec["grid"]
+        heads = []
+        for role, want in (("box", 4 * self._DFL_BINS), ("cls", spec.get("num_classes"))):
+            name = spec[role]
+            if name not in raw:
+                raise RuntimeError(
+                    f"Hailo output {name!r} (grid-{grid} {role} head) is missing from the inference "
+                    f"result, which has {sorted(raw)}"
+                )
+            tensor = np.asarray(raw[name])
+            ok = (tensor.ndim == 4 and tensor.shape[:3] == (1, grid, grid)
+                  and (tensor.shape[3] == want if want else
+                       tensor.shape[3] >= (len(COCO_NAMES) if role == "cls" else 1)))
+            if not ok:
+                raise RuntimeError(
+                    f"Hailo output {name!r} has shape {tensor.shape}; the grid-{grid} {role} head "
+                    f"must be NHWC (1, {grid}, {grid}, {want or 'C'}). Decoding another layout "
+                    "would silently produce wrong boxes or none."
+                )
+            heads.append(tensor[0])
+        return heads[0], heads[1]
+
+    @staticmethod
+    def _finite_or_raise(values: np.ndarray, what: str) -> None:
+        """A NaN/inf from the device is a fault, not a low score (M8.3).
+
+        NaN fails every `>= conf` test, so a corrupted class head read as "no
+        detection"; a non-finite box logit leaked NaN coordinates to callers.
+        Checked on values the decoder already reduced (per-anchor maxima, the
+        kept anchors' distances), so it adds no full pass over the tensors.
+        """
+        if not np.isfinite(values).all():
+            raise RuntimeError(f"Hailo output contains non-finite {what}; refusing to decode it")
+
     def predict(self, frame: np.ndarray, verbose: bool = False, classes=None, conf: float = 0.25, **_ignored):
         """Ultralytics-shaped predict: BGR frame in, [Result] out, boxes in pixel xyxy.
 
@@ -600,6 +663,10 @@ class HailoYOLO:
         """
         import cv2
 
+        if getattr(frame, "dtype", None) != np.uint8:
+            # The input vstream is UINT8. A float frame would otherwise reach the
+            # chip as whatever bytes the cast or the runtime makes of it (M8.3).
+            raise TypeError(f"HailoYOLO.predict needs a uint8 BGR frame, got {getattr(frame, 'dtype', type(frame))}")
         h, w = frame.shape[:2]
         scale, left, top = letterbox_transform(w, h, self._input_w, self._input_h)
         new_w, new_h = round(w * scale), round(h * scale)
@@ -678,8 +745,7 @@ class HailoYOLO:
         all_classes: list[np.ndarray] = []
 
         for spec in self._scales:
-            box_raw = np.asarray(raw[spec["box"]])[0]   # (G, G, 4*bins)
-            cls_raw = np.asarray(raw[spec["cls"]])[0]   # (G, G, C)
+            box_raw, cls_raw = self._scale_heads(raw, spec)  # (G, G, 4*bins), (G, G, C)
             grid, stride = spec["grid"], spec["stride"]
 
             # Only the real COCO classes; anything past 80 is padding, and letting
@@ -687,7 +753,8 @@ class HailoYOLO:
             scores = cls_raw.reshape(-1, cls_raw.shape[-1])[:, : len(COCO_NAMES)]
 
             best_cls = scores.argmax(axis=1)
-            best_score = scores.max(axis=1)
+            best_score = scores.max(axis=1)  # max propagates NaN: one check covers every anchor
+            self._finite_or_raise(best_score, f"class scores at grid {grid}")
             keep = best_score >= conf
             if wanted is not None:
                 keep &= np.isin(best_cls, list(wanted))
@@ -700,6 +767,7 @@ class HailoYOLO:
             prob = np.exp(dfl)
             prob /= prob.sum(axis=2, keepdims=True)
             dist = (prob * np.arange(self._DFL_BINS, dtype=np.float32)).sum(axis=2)  # (N,4) l,t,r,b
+            self._finite_or_raise(dist, f"box logits at grid {grid}")
 
             # Anchor points at cell centres, in letterboxed-input pixels.
             #
@@ -790,12 +858,13 @@ class HailoYOLO:
         all_scores: list[np.ndarray] = []
         all_classes: list[np.ndarray] = []
         for spec in self._scales:
-            box_raw = np.asarray(raw[spec["box"]])[0]   # (G, G, 4*bins) logits
-            cls_raw = np.asarray(raw[spec["cls"]])[0]   # (G, G, C) probabilities
+            box_raw, cls_raw = self._scale_heads(raw, spec)  # (G, G, 4*bins) logits, (G, G, C) probabilities
             if cls_raw.shape[-1] < num_classes:
                 raise RuntimeError(f"class head has {cls_raw.shape[-1]} channels, expected >= {num_classes}")
             grid, stride = spec["grid"], spec["stride"]
             scores = cls_raw.reshape(-1, cls_raw.shape[-1])[:, :num_classes]
+            # One reduction (NaN/inf propagate through a sum) instead of a full isfinite pass.
+            self._finite_or_raise(scores.sum(), f"class scores at grid {grid}")
             anchor_idx, class_idx = np.nonzero(scores >= conf)
             if wanted is not None:
                 keep = np.isin(class_idx, list(wanted))
@@ -807,6 +876,7 @@ class HailoYOLO:
             prob = np.exp(dfl)
             prob /= prob.sum(axis=2, keepdims=True)
             dist = (prob * np.arange(self._DFL_BINS, dtype=np.float32)).sum(axis=2)
+            self._finite_or_raise(dist, f"box logits at grid {grid}")
             ys, xs = np.divmod(anchor_idx, grid)
             px, py = xs * stride, ys * stride  # reference priors: no half-cell offset
             all_boxes.append(np.stack([

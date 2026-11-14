@@ -84,7 +84,9 @@ def test_a_planted_violation_is_caught(tmp_path):
 def test_the_lock_matches_the_pins_and_hashes_everything():
     lock = (REPO / "requirements-device.lock").read_text()
     locked = dict(re.findall(r"^([a-z0-9][a-z0-9._-]*)==([^\s\\]+)", lock, re.M))
-    for name, version in deps.requirement_pins(REPO / "requirements-device.txt").items():
+    # M8.5: the pins that apply ON THE DEVICE (markers evaluated for Linux/aarch64/3.11);
+    # simpleaudio is a non-Linux pin and is deliberately not in the device lock.
+    for name, version in deps.device_pins(REPO / "requirements-device.txt").items():
         assert locked.get(name) == version, f"{name}: lock {locked.get(name)} != pin {version}"
     blocks = re.split(r"\n(?=[a-z0-9])", lock.split("\n\n", 1)[-1] if lock.startswith("#") else lock)
     for block in blocks:

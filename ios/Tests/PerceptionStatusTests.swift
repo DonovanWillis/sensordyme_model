@@ -1,7 +1,7 @@
 import Foundation
 
 // Run with ios/Tests/run.sh
-// run.sh deps: DeviceStatus CapabilityTier
+// run.sh deps: DeviceStatus CapabilityTier PresetLibrary StreamLiveness MJPEGStream
 
 var failures = 0
 func check(_ condition: Bool, _ what: String) {
@@ -157,6 +157,73 @@ check(CompanionNodeToggle.isOn("people_counter", report: report, live: false) ==
 check(CompanionNodeToggle.isOn("people_counter", report: nil, live: true) == nil, "no report: unknown")
 check(CompanionNodeToggle.confirmed("people_counter", wanted: true, report: report, live: true), "on confirmed")
 check(!CompanionNodeToggle.confirmed("people_counter", wanted: false, report: report, live: true), "off not yet")
+
+print("\nM8: starting capabilities, experimental features, coded refusals:")
+do {
+    let calibrating = DeviceStatus(monitoringState: "starting", capabilities: .init(available: ["face"], starting: ["attention"]),
+                                   stale: false)
+    let checks = CapabilityChecks.make(required: ["face", "attention"], optional: [], status: calibrating, online: true)
+    if case .starting(let what)? = checks.first(where: { $0.name == "attention" })?.verdict {
+        check(what.hasPrefix("Calibrating to the driver"), "attention is calibrating: \(what)")
+    } else {
+        check(false, "attention is a starting verdict, not unknown or unavailable")
+    }
+    check(CapabilityChecks.blockingSummary(checks) == nil, "a calibrating capability does not block or read as failed")
+
+    let json = """
+    {"id": "baby_monitoring", "kind": "preset", "state": "active",
+     "experimental_features": [{"id": "flailing", "status": "experimental", "enabled": false},
+                               {"id": "choking_hazard", "enabled": true}, {"status": "no id"}]}
+    """
+    let node = try? JSONDecoder().decode(MonitoringNode.self, from: Data(json.utf8))
+    check(node?.experimentalFeatures.count == 2, "features decode; one without an id drops itself")
+    check(node.flatMap(NodePresentation.experimentalNote) == "Experimental: Flailing (off), Choking hazard (on)",
+          "experimental features are said as experimental, with on/off")
+    check(NodePresentation.experimentalNote(MonitoringNode(id: "x")) == nil, "none, nothing said")
+
+    check(RefusalText.message(code: "unknown_node", reason: "no companion node 'pets'; known: occupancy",
+                              fallback: "x") == "This device doesn't have that monitoring add-on.",
+          "a developer-worded refusal becomes a sentence")
+    check(RefusalText.message(code: "profile_fixed", reason: nil, fallback: "x").contains("profile is fixed"), "profile_fixed")
+    check(RefusalText.message(code: "invalid_setting", reason: "dwell must be 1–600 s", fallback: "x")
+          == "A setting was refused: dwell must be 1–600 s", "a readable reason is kept")
+    check(RefusalText.message(code: nil, reason: "camera busy", fallback: "x") == "camera busy", "uncoded keeps its reason")
+    let refused = DeviceStatus(lastRejection: .init(kind: "nodes", subject: "people_counter",
+                                                    reasons: ["role 'driver_safety' forbids it"], code: "role_forbids_preset", at: nil))
+    check(DeviceRefusal.forNode("people_counter", status: refused) == "This device's role doesn't allow that mode.",
+          "last_rejection's code is used")
+}
+
+print("\na stopped device is paused, never 'Not working' (M8.2):")
+let stoppedWire = """
+{"monitoring_state": "stopped", "protection": "stopped", "stale": false,
+ "capabilities": {"available": ["camera"], "impaired": [{"name": "audible_alert", "reason": "buzzer missing"}],
+                  "starting": [], "paused": ["face", "objects", "inference"]},
+ "perception": {"schema": "sd-perception/1", "simulated": true,
+  "components": {"face_landmarks": {"state": "paused", "reason": "monitoring is stopped"},
+                 "object_detector": {"state": "paused", "reason": "monitoring is stopped"},
+                 "hand_landmarks": {"state": "failed", "reason": "model crashed"}}, "nodes": []}}
+"""
+let stopped = decodeStatus(stoppedWire)
+check(stopped?.capabilities?.paused == ["face", "objects", "inference"], "paused decodes")
+let stoppedRows = CapabilityHealth.rows(status: stopped, online: true).rows
+check(stoppedRows.first { $0.name == "face" }?.state == .paused, "face row is paused")
+check(stoppedRows.first { $0.name == "face" }?.detail == "Paused — monitoring is stopped", "said plainly")
+check(stoppedRows.first { $0.name == "face" }?.tone == .neutral, "neutral, not caution or critical")
+check(stoppedRows.first { $0.name == "audible_alert" }?.state == .impaired, "a real fault while stopped is still a fault")
+check(PerceptionPresentation.describe(PerceptionComponent(state: "paused")).0 == "Paused — monitoring is stopped",
+      "a paused component is described as paused")
+check(PerceptionPresentation.describe(PerceptionComponent(state: "paused")).1 == .neutral, "neutral tone")
+check(PerceptionPresentation.degradedSummary(stopped?.perception, live: true)?.contains("Face") != true,
+      "paused components are not in the 'detection is impaired' banner")
+check(PerceptionPresentation.degradedSummary(stopped?.perception, live: true)?.contains("Hand tracking") == true,
+      "a failed component still is")
+let stoppedChecks = CapabilityChecks.make(required: ["face", "objects"], optional: ["hands"], status: stopped, online: true)
+check(stoppedChecks.first { $0.name == "face" }?.verdict == .paused("Paused — monitoring is stopped"),
+      "mode details say paused for face")
+check(stoppedChecks.first { $0.name == "hands" }?.verdict != .available, "a failed component is never available")
+let oldBackend = decodeStatus(#"{"monitoring_state": "stopped", "capabilities": {"available": [], "impaired": [], "starting": []}}"#)
+check(oldBackend?.capabilities?.paused == nil, "an older backend without `paused` still decodes")
 
 print(failures == 0 ? "\nall passed" : "\n\(failures) FAILED")
 exit(failures == 0 ? 0 : 1)

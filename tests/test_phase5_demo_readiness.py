@@ -184,23 +184,21 @@ def test_no_module_loads_a_detector_in_its_constructor():
 def test_deploy_ships_no_model_weights_of_either_format():
     """`.pt` was excluded in Phase 4; `.hef` is the format the device can RUN.
 
-    Excluding only .pt is a licence control aimed at the one format the Pi cannot
-    execute. docs/ACCELERATOR.md used to direct readers to download
-    Ultralytics-derived .hef files into models/, which is gitignored — and rsync
-    copies the working tree, not the index.
-
     It is also a determinism control: the device's model must come only from
     setup_pi.sh, which pins a URL and verifies sha256, never from whatever
-    happened to be in a developer's tree.
+    happened to be in a developer's tree. M8.5: releases are git objects filtered
+    by the manifest excludes, and the device refuses such a member outright.
     """
-    makefile = (REPO / "Makefile").read_text()
-    deploy = makefile[makefile.index("deploy:") :]
-    deploy = deploy[: deploy.index("\n\n")] if "\n\n" in deploy else deploy
-    for pattern in ("'*.pt'", "'*.hef'"):
-        assert f"--exclude={pattern}" in deploy, (
-            f"make deploy does not exclude {pattern} — a model can reach the "
-            "device from a working tree instead of from checksum-pinned provisioning"
-        )
+    import sys
+
+    sys.path.insert(0, str(REPO / "scripts" / "hw_validation"))
+    import integrity_manifest as im
+
+    from scripts.release import release_guard as rg
+
+    for path in ("yolo11n.pt", "models/yolov11n.hef", "damoyolo_tinynasL20_T.hef"):
+        assert im.should_exclude(path), f"a release would carry {path}"
+        assert rg._excluded(Path(path)), f"the device would accept {path} in a bundle"
 
 
 def test_model_version_reads_every_weights_key_a_module_can_use():

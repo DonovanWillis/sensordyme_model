@@ -24,19 +24,15 @@ struct CustomRulesCard: View {
     let onAskJupiter: () -> Void
 
     var body: some View {
-        VStack(alignment: .leading, spacing: SD.Space.xs) {
+        // Open layout: the section is its heading and its rows, no box.
+        VStack(alignment: .leading, spacing: SD.Space.sm) {
             SDSectionHeader(title: "Custom rules", action: ("Ask Jupiter", onAskJupiter))
-                .padding(.horizontal, SD.Space.xxs)
-            SDCard {
-                VStack(alignment: .leading, spacing: SD.Space.sm) {
-                    content
-                    if let toggleError {
-                        Label(toggleError, systemImage: "exclamationmark.circle.fill")
-                            .font(SD.Typography.caption)
-                            .foregroundStyle(SD.Colors.danger)
-                            .fixedSize(horizontal: false, vertical: true)
-                    }
-                }
+            content
+            if let toggleError {
+                Label(toggleError, systemImage: "exclamationmark.circle.fill")
+                    .font(SD.Typography.caption)
+                    .foregroundStyle(SD.Colors.danger)
+                    .fixedSize(horizontal: false, vertical: true)
             }
         }
     }
@@ -62,7 +58,7 @@ struct CustomRulesCard: View {
             ForEach(Array(rules.rules.enumerated()), id: \.element.id) { index, rule in
                 row(rule)
                 if index < rules.rules.count - 1 {
-                    Rectangle().fill(SD.Colors.border).frame(height: 1)
+                    OrynRowDivider(inset: 0)
                 }
             }
         }

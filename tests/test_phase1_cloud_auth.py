@@ -152,3 +152,47 @@ def test_a_real_token_still_works_and_logout_still_revokes_it(backend):
     assert client.get("/v1/devices", headers=auth).status_code == 200
     assert client.post("/v1/logout", headers=auth).status_code == 200
     assert client.get("/v1/devices", headers=auth).status_code == 401
+
+
+# ------------------------------------------------------------- session refresh
+def test_refresh_issues_a_new_token_without_costing_the_old_one(backend):
+    """The 30-day expiry is fixed at issue and nothing renewed it, so an app
+    opened on day 31 landed on the sign-in screen however healthy the setup
+    (M8.5 reconnect audit). A valid session may trade itself for a fresh one;
+    signing out stays /v1/logout's job, so the old token keeps its own expiry."""
+    _, client, auth = backend
+    reply = client.post("/v1/session/refresh", headers=auth)
+    assert reply.status_code == 200
+    fresh = reply.json()["token"]
+    old = dict(auth)["Authorization"].split(" ", 1)[1]
+    assert fresh != old
+    old_claims = jwt.decode(old, options={"verify_signature": False})
+    new_claims = jwt.decode(fresh, options={"verify_signature": False})
+    assert new_claims["exp"] >= old_claims["exp"]  # same-second issue gives equality
+    assert new_claims["jti"] != old_claims["jti"]
+    assert new_claims["uid"] == old_claims["uid"]
+    assert new_claims["email"] == old_claims["email"]
+    # both sessions work: renewal is additive, not a rotation
+    assert client.get("/v1/devices", headers=auth).status_code == 200
+    assert client.get("/v1/devices", headers={"Authorization": f"Bearer {fresh}"}).status_code == 200
+
+
+def test_refresh_refuses_what_every_authenticated_route_refuses(backend):
+    """Refresh must never resurrect a session: no token, a signed-out token
+    and a deleted account's token are all 401, exactly like /v1/devices."""
+    _, client, auth = backend
+    assert client.post("/v1/session/refresh").status_code == 401
+    assert client.post(
+        "/v1/session/refresh", headers={"Authorization": "Bearer not-a-token"}
+    ).status_code == 401
+    deleted = client.post(
+        "/v1/account/delete", json={"password": "password1", "confirm": True}, headers=auth
+    )
+    assert deleted.status_code == 200, deleted.text
+    assert client.post("/v1/session/refresh", headers=auth).status_code == 401
+
+
+def test_a_signed_out_token_cannot_refresh_itself(backend):
+    _, client, auth = backend
+    assert client.post("/v1/logout", headers=auth).status_code == 200
+    assert client.post("/v1/session/refresh", headers=auth).status_code == 401

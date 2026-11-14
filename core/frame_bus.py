@@ -136,6 +136,16 @@ class FrameBus:
         with self._cond:
             return self._frame, self._seq
 
+    def latest_stamped(self) -> tuple[Optional[np.ndarray], int, float]:
+        """latest(), plus the frame's publish (capture) time, read under one lock.
+
+        Never waits. (None, 0, 0.0) before the first publish. The live stream
+        uses it to stamp a camera frame with its true age (core/dashboard.py
+        `X-Frame-Age-Ms`) when it has to show the camera without annotation.
+        """
+        with self._cond:
+            return self._frame, self._seq, self._published_at
+
     @property
     def sequence(self) -> int:
         """Total frames published. Lets health measure real throughput between

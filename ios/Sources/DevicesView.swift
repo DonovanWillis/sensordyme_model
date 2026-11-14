@@ -11,8 +11,17 @@ import SwiftUI
 /// database" is the kind of thing that falls apart in a live demo.
 struct DevicesView: View {
     @EnvironmentObject private var state: AppState
+    /// A card zooms into its device's home (Continuity.swift).
+    @Namespace private var zoomNS
+    @Environment(\.accessibilityReduceMotion) private var reduceMotion
     @State private var devices: [Device] = []
     @State private var errorMessage: String?
+    /// The banner's headline for `errorMessage` when the server answered with
+    /// something unusable (ServerReply); nil = it couldn't be reached.
+    @State private var errorTitle: String?
+    /// Advanced by the refresh timer whether or not a reload runs, so a reply
+    /// that stops being refreshed stops claiming ONLINE (ConnectionTruth).
+    @State private var now = Date()
     @Environment(\.dynamicTypeSize) private var typeSize
     @State private var showClaim = false
     @State private var showSetup = false
@@ -22,6 +31,8 @@ struct DevicesView: View {
     /// The device a tapped notification belongs to, so the alert can be opened
     /// from anywhere in the app rather than only from the device screen.
     @State private var notificationTarget: Device?
+    /// Why a tapped notification could not be opened, said rather than silent.
+    @State private var alertOpenProblem: String?
     @StateObject private var refreshing = ProgressTracker()
     /// Same problem as DeviceDetailView's own copy of this: three independent
     /// triggers (appear, a 10s timer, pull-to-refresh) can all have a
@@ -37,55 +48,70 @@ struct DevicesView: View {
     /// Debug-only: the device a launch argument asked to open (see DebugLaunch).
     @State private var launchTarget: Device?
 
-    private var onlineCount: Int { devices.filter(\.online).count }
+    /// Counted with the same rule as each card's pill (ConnectionTruth), so the
+    /// summary can't say "1 online" above a card that says Stale or Unknown.
+    private var onlineCount: Int {
+        devices.filter { $0.isLive(now: now, lastRefreshFailed: errorMessage != nil) }.count
+    }
 
     var body: some View {
         NavigationStack {
-            ScrollView {
-                LazyVStack(spacing: SD.Space.sm) {
-                    header
-                        .padding(.bottom, SD.Space.xs)
-
-                    // Shown whether or not devices are loaded: a failed refresh
-                    // leaves stale cards on screen that look perfectly current.
-                    if let errorMessage {
-                        ConnectionBanner(message: errorMessage) { await reload() }
-                            .padding(.bottom, SD.Space.xxs)
-                    }
-
-                    if !devices.isEmpty {
-                        fleetSummary
-                            .padding(.top, SD.Space.xxs)
-                            .padding(.bottom, SD.Space.xxs)
-                    }
-                    // The backend's view of the same device, so the banner can
-                    // tell "switched off" from "not on this Wi-Fi" instead of
-                    // blaming the network for both.
-                    DeviceLinkBanner(
-                        link: link,
-                        backendDevice: linkedBackendDevice,
-                        backendReachable: errorMessage == nil,
-                        accountHasDevices: !devices.isEmpty
-                    )
-
-                    ForEach(devices) { device in
-                        NavigationLink(value: device) {
-                            DeviceCard(device: device, lastRefreshFailed: errorMessage != nil)
-                        }
-                        .buttonStyle(.plain)
-                        .accessibilityIdentifier("device.card")
-                        .accessibilityHint("Opens the live view and controls")
-                    }
-
-                    if devices.isEmpty {
-                        emptyOrLoading
-                    }
-                }
-                .padding(.horizontal, SD.Space.md)
-                .padding(.bottom, SD.Space.lg)
+            routed
+            // The home screen draws its own header (brand, actions, title) so
+            // the ORYN lockup is never squeezed into a toolbar slot. Pushed
+            // screens keep the standard navigation bar.
+            .navigationTitle("Your Devices")
+            .toolbar(.hidden, for: .navigationBar)
+            .sheet(isPresented: $showClaim) { SetupWizardView { await reload() } }
+            .sheet(isPresented: $showSetup) {
+                SetupFlowView()
+                    .onDisappear { Task { await link.ensureConnection() } }
             }
+            .refreshable { await reload() }
+            .task {
+                await reload()
+                if DebugLaunch.openDevice, launchTarget == nil { launchTarget = devices.first }
+                switch DebugLaunch.openSetup {
+                case "wizard"?: showClaim = true
+                case "bluetooth"?: showSetup = true
+                default: break
+                }
+                // Re-resolve the device's address on launch and whenever the
+                // network changes, so a move never requires typing an IP.
+                link.start()
+                await link.ensureConnection()
+            }
+            .onReceive(refreshTimer) { tick in
+                now = tick
+                // Same rule as DeviceDetailView: one timed reload at a time, and
+                // none into a backend AppState is already retrying on its own.
+                guard !timedReloadInFlight, state.periodicRefreshMayRun else { return }
+                timedReloadInFlight = true
+                Task {
+                    await reload()
+                    timedReloadInFlight = false
+                }
+            }
+        }
+        .tint(SD.Colors.accent)
+    }
+
+    /// The list with its destinations and notification routing.
+    private var routed: some View {
+            list
             .orynScreen()
-            .navigationDestination(for: Device.self) { DeviceDetailView(device: $0) }
+            // Said once; gone after the person moves on, not pinned to the home screen.
+            .onDisappear { alertOpenProblem = nil }
+            // Pushed by id, not by the Device value: the value changes on every
+            // 10 s refresh (receivedAt, telemetry), and a pushed screen keyed by
+            // a value the list no longer holds was popped back to the list
+            // (journey 26, after stale telemetry turned fresh).
+            .navigationDestination(for: DeviceRoute.self) { route in
+                if let device = devices.first(where: { $0.id == route.id }) ?? route.opened {
+                    DeviceDetailView(device: device)
+                        .sdZoomDestination(.device(device.id), in: zoomNS, enabled: !reduceMotion)
+                }
+            }
             .navigationDestination(item: $launchTarget) { DeviceDetailView(device: $0) }
             // A tapped notification opens its device, which then consumes
             // pendingEventID and shows the alert. Without this the id was set
@@ -109,51 +135,70 @@ struct DevicesView: View {
             // launched the app was silently ignored. Same root cause as
             // DeviceDetailView's own onChange just below in the navigation
             // stack; see its comment for the in-app (not cold-launch) case.
+            // Never another device as a fallback (NotificationRouting): that
+            // screen ignored the alert, so the tap opened the wrong camera and
+            // showed nothing.
             .onChange(of: notifier.pendingEventID, initial: true) { _, id in
                 guard id != nil, notificationTarget == nil else { return }
-                if let match = devices.first(where: { $0.id == notifier.pendingDeviceID }) {
-                    notificationTarget = match
-                } else if devices.isEmpty {
+                if devices.isEmpty {
                     Task {
                         await reload()
-                        notificationTarget = devices.first(where: { $0.id == notifier.pendingDeviceID })
-                            ?? devices.first
+                        routeNotification()
                     }
                 } else {
-                    notificationTarget = devices.first
+                    routeNotification()
                 }
             }
-            // The home screen draws its own header (brand, actions, title) so
-            // the ORYN lockup is never squeezed into a toolbar slot. Pushed
-            // screens keep the standard navigation bar.
-            .navigationTitle("Your Devices")
-            .toolbar(.hidden, for: .navigationBar)
-            .sheet(isPresented: $showClaim) { SetupWizardView { await reload() } }
-            .sheet(isPresented: $showSetup) {
-                SetupFlowView()
-                    .onDisappear { Task { await link.ensureConnection() } }
-            }
-            .refreshable { await reload() }
-            .task {
-                await reload()
-                if DebugLaunch.openDevice, launchTarget == nil { launchTarget = devices.first }
-                // Re-resolve the device's address on launch and whenever the
-                // network changes, so a move never requires typing an IP.
-                link.start()
-                await link.ensureConnection()
-            }
-            .onReceive(refreshTimer) { _ in
-                // Same rule as DeviceDetailView: one timed reload at a time, and
-                // none into a backend AppState is already retrying on its own.
-                guard !timedReloadInFlight, state.periodicRefreshMayRun else { return }
-                timedReloadInFlight = true
-                Task {
-                    await reload()
-                    timedReloadInFlight = false
+    }
+
+    private var list: some View {
+            ScrollView {
+                LazyVStack(alignment: .leading, spacing: SD.Space.md) {
+                    header
+                        .padding(.bottom, SD.Space.xxs)
+
+                    // Shown whether or not devices are loaded: a failed refresh
+                    // leaves stale cards on screen that look perfectly current.
+                    if let errorMessage {
+                        ConnectionBanner(message: errorMessage, title: errorTitle) { await reload() }
+                            .padding(.bottom, SD.Space.xxs)
+                    }
+                    if let alertOpenProblem {
+                        ConnectionBanner(message: alertOpenProblem, title: "Couldn't open that alert")
+                            .padding(.bottom, SD.Space.xxs)
+                    }
+
+                    if !devices.isEmpty {
+                        fleetSummary
+                    }
+                    // The backend's view of the same device, so the banner can
+                    // tell "switched off" from "not on this Wi-Fi" instead of
+                    // blaming the network for both.
+                    DeviceLinkBanner(
+                        link: link,
+                        backendDevice: linkedBackendDevice,
+                        backendReachable: errorMessage == nil,
+                        accountHasDevices: !devices.isEmpty
+                    )
+
+                    ForEach(devices) { device in
+                        NavigationLink(value: DeviceRoute(device)) {
+                            DeviceCard(device: device, zoomNS: zoomNS, zoomEnabled: !reduceMotion,
+                                       lastRefreshFailed: errorMessage != nil, now: now)
+                        }
+                        .buttonStyle(SDPressStyle(scale: 0.985))
+                        .accessibilityIdentifier("device.card")
+                        .accessibilityHint("Opens the live view and controls")
+                        .padding(.bottom, SD.Space.xs)
+                    }
+
+                    if devices.isEmpty {
+                        emptyOrLoading
+                    }
                 }
+                .padding(.horizontal, SD.Space.md)
+                .padding(.bottom, SD.Space.lg)
             }
-        }
-        .tint(SD.Colors.accent)
     }
 
     private var header: some View {
@@ -162,8 +207,10 @@ struct DevicesView: View {
                 OrynNavBrand()
                 Spacer()
                 // Beside the actions so a background refresh is visible
-                // without occupying a row of its own.
-                SDProgress(phase: refreshing.phase)
+                // without occupying a row of its own. Working and failed only:
+                // a green tick every 10 s said "the list refreshed" in the
+                // colour that means "your device is fine".
+                SDProgress(phase: refreshing.phase == .done ? .idle : refreshing.phase)
                 headerButton("dot.radiowaves.left.and.right", label: "Connect over Bluetooth", id: "devices.bluetooth") {
                     showSetup = true
                 }
@@ -187,11 +234,12 @@ struct DevicesView: View {
                 .font(.system(size: 14, weight: .medium))
                 .foregroundStyle(SD.Colors.textPrimary)
                 .frame(width: 38, height: 38)
-                .background(Circle().fill(SD.Colors.surface))
-                .overlay(Circle().strokeBorder(SD.Colors.borderStrong, lineWidth: 1))
-                .contentShape(Circle())
+                .background(Circle().fill(SD.Colors.surfaceRaised))
+                // The circle stays 38 pt as designed; the target is the 44 pt minimum.
+                .frame(width: 44, height: 44)
+                .contentShape(Rectangle())
         }
-        .buttonStyle(.plain)
+        .buttonStyle(SDPressStyle(scale: 0.92))
         .accessibilityLabel(label)
         .accessibilityIdentifier(id)
     }
@@ -203,20 +251,23 @@ struct DevicesView: View {
         // one-line row clipped both labels (audit).
         let layout = typeSize.isAccessibilitySize
             ? AnyLayout(VStackLayout(alignment: .leading, spacing: SD.Space.xxs))
-            : AnyLayout(HStackLayout(spacing: SD.Space.sm))
+            : AnyLayout(HStackLayout(spacing: SD.Space.xs))
         return layout {
-            SDEyebrow("\(devices.count) \(devices.count == 1 ? "device" : "devices")")
+            Text("\(devices.count) \(devices.count == 1 ? "device" : "devices")")
+                .foregroundStyle(SD.Colors.textSecondary)
             if !typeSize.isAccessibilitySize {
-                Rectangle().fill(SD.Colors.borderStrong).frame(width: 1, height: 10)
+                Circle().fill(SD.Colors.textTertiary).frame(width: 3, height: 3).accessibilityHidden(true)
             }
             HStack(spacing: 6) {
                 Circle()
                     .fill(onlineCount > 0 ? SD.Colors.success : SD.Colors.offline)
                     .frame(width: 6, height: 6)
-                SDEyebrow("\(onlineCount) online", color: onlineCount > 0 ? SD.Colors.textSecondary : SD.Colors.textTertiary)
+                Text("\(onlineCount) online")
+                    .foregroundStyle(onlineCount > 0 ? SD.Colors.textSecondary : SD.Colors.textTertiary)
             }
             if !typeSize.isAccessibilitySize { Spacer() }
         }
+        .font(SD.Typography.callout.monospacedDigit())
         .frame(maxWidth: .infinity, alignment: .leading)
         .accessibilityElement(children: .combine)
     }
@@ -250,6 +301,24 @@ struct DevicesView: View {
         }
     }
 
+    private func routeNotification() {
+        guard notifier.pendingEventID != nil else { return }
+        if devices.isEmpty, errorMessage != nil {
+            alertOpenProblem = "Your devices couldn't be loaded, so that alert can't be opened yet. "
+                + "Try again once the server is back."
+            notifier.pendingEventID = nil
+            return
+        }
+        let route = NotificationRouting.route(pendingDeviceID: notifier.pendingDeviceID, deviceIDs: devices.map(\.id))
+        if case .open(let id) = route, let match = devices.first(where: { $0.id == id }) {
+            alertOpenProblem = nil
+            notificationTarget = match
+        } else {
+            alertOpenProblem = NotificationRouting.message(route)
+            notifier.pendingEventID = nil
+        }
+    }
+
     private func reload() async {
         let token = reloadGuard.begin()
         refreshing.begin()
@@ -259,7 +328,13 @@ struct DevicesView: View {
             devices = fetched
             state.recordAccountDevices(fetched)
             errorMessage = nil
+            errorTitle = nil
+            now = Date()
             refreshing.succeed()
+            // A Pi that finished booting after the app opened: the backend
+            // sees it online while the local link gave up at "can't find it".
+            // One throttled re-look closes that without a relaunch.
+            await link.retryWhileBackendSeesDevice(anyDeviceOnline: fetched.contains { $0.online })
         } catch let error as APIError where error.isAuthFailure {
             guard reloadGuard.isLatest(token) else { return }
             refreshing.fail()
@@ -268,6 +343,7 @@ struct DevicesView: View {
             guard reloadGuard.isLatest(token) else { return }
             refreshing.fail()
             errorMessage = error.localizedDescription
+            errorTitle = (error as? APIError)?.title
         }
         if reloadGuard.isLatest(token) { hasLoaded = true }
     }
@@ -277,17 +353,21 @@ struct DevicesView: View {
 
 struct DeviceCard: View {
     let device: Device
+    @Environment(\.dynamicTypeSize) private var typeSize
+    var zoomNS: Namespace.ID? = nil
+    var zoomEnabled = true
     /// The latest refresh failed: `online` is from an older reply, so the card
     /// says Unknown instead of a stale ONLINE (ConnectionTruth).
     var lastRefreshFailed = false
+    /// The list's clock, so an old reply or old telemetry is judged against now.
+    var now = Date()
 
-    private var status: SDStatus {
-        switch ConnectionTruth.presence(online: device.online, lastRefreshFailed: lastRefreshFailed) {
-        case .online: .online
-        case .offline: .offline
-        case .unknown: .unknown
-        }
+    private var presence: ConnectionTruth.Presence {
+        device.presence(now: now, lastRefreshFailed: lastRefreshFailed)
     }
+
+    private var status: SDStatus { SDStatus(presence) }
+    private var live: Bool { presence.isOnline }
 
     /// "Offline" alone leaves people wondering whether it just happened or has
     /// been down all week, which is the first thing anyone wants to know.
@@ -306,26 +386,20 @@ struct DeviceCard: View {
     /// it is not simply watching ("Stopped · Driver Safety", "Not monitoring ·
     /// ..."), from the backend's status contract (DeviceStatus.swift). The card
     /// used to read like a healthy device whatever the device reported.
+    ///
+    /// Stale or offline, the line says how old the last report is instead
+    /// (ConnectionTruth.cardLine): a mode named under old telemetry reads as
+    /// what the device is doing now.
     private var subtitle: String {
-        if device.online {
-            // Rules running alongside the mode (an additive role) leave the
-            // mode in charge, so the mode is what is named.
-            let modeTitle = device.customRules == .replacing
-                ? (device.monitoring?.title ?? "AI Custom Monitoring")
-                : Preset.title(for: device.activePreset)
-            return MonitoringStatusPresentation.cardSubtitle(
-                modeTitle: modeTitle, presentation: device.monitoringPresentation)
-        }
-        guard let lastSeen = device.lastSeen else { return "Not seen yet" }
-        let elapsed = Date().timeIntervalSince(Date(timeIntervalSince1970: lastSeen))
-        return "Last seen \(Self.elapsed.localizedString(fromTimeInterval: -elapsed))"
+        if let line = ConnectionTruth.cardLine(presence) { return line }
+        // Rules running alongside the mode (an additive role) leave the
+        // mode in charge, so the mode is what is named.
+        let modeTitle = device.customRules == .replacing
+            ? (device.monitoring?.title ?? "AI Custom Monitoring")
+            : Preset.title(for: device.activePreset)
+        return MonitoringStatusPresentation.cardSubtitle(
+            modeTitle: modeTitle, presentation: device.monitoringPresentation(live: live))
     }
-
-    private static let elapsed: RelativeDateTimeFormatter = {
-        let formatter = RelativeDateTimeFormatter()
-        formatter.unitsStyle = .full
-        return formatter
-    }()
 
     /// The mode glyph shown in the preview tile — what the camera is doing,
     /// not a generic camera icon.
@@ -336,44 +410,41 @@ struct DeviceCard: View {
     }
 
     var body: some View {
-        VStack(spacing: 0) {
-            preview
-            HStack(alignment: .center, spacing: SD.Space.sm) {
+        VStack(alignment: .leading, spacing: SD.Space.sm) {
+            Group {
+                if let zoomNS {
+                    preview.sdZoomSource(.device(device.id), in: zoomNS, cornerRadius: SD.Radius.camera,
+                                         enabled: zoomEnabled)
+                } else {
+                    preview
+                }
+            }
+            HStack(alignment: .firstTextBaseline, spacing: SD.Space.sm) {
                 VStack(alignment: .leading, spacing: 3) {
                     // Wraps instead of truncating: at the largest text sizes a
                     // one- or two-line limit cut the name off (audit: clipped).
                     Text(device.name)
                         .font(SD.Typography.headline)
                         .foregroundStyle(SD.Colors.textPrimary)
+                        .multilineTextAlignment(.leading)
                         .fixedSize(horizontal: false, vertical: true)
                     Text(subtitle)
-                        .font(SD.Typography.caption)
+                        .font(SD.Typography.callout)
                         .foregroundStyle(SD.Colors.textSecondary)
+                        .multilineTextAlignment(.leading)
                         .fixedSize(horizontal: false, vertical: true)
                 }
                 Spacer(minLength: SD.Space.xs)
-                Image(systemName: "arrow.up.right")
+                Image(systemName: "chevron.right")
                     .font(.system(size: 13, weight: .semibold))
                     .foregroundStyle(SD.Colors.textSecondary)
-                    .frame(width: 32, height: 32)
-                    .background(Circle().fill(SD.Colors.surfaceRaised))
-                    .overlay(Circle().strokeBorder(SD.Colors.border, lineWidth: 1))
+                    .accessibilityHidden(true)
             }
-            .padding(.horizontal, SD.Space.md)
-            .padding(.vertical, SD.Space.sm + 2)
+            .padding(.horizontal, SD.Space.xxs)
         }
-        .background(
-            RoundedRectangle(cornerRadius: SD.Radius.lg, style: .continuous)
-                .fill(SD.Colors.surface)
-        )
-        .clipShape(RoundedRectangle(cornerRadius: SD.Radius.lg, style: .continuous))
-        .overlay(
-            RoundedRectangle(cornerRadius: SD.Radius.lg, style: .continuous)
-                .strokeBorder(SD.Colors.border, lineWidth: 1)
-        )
-        .contentShape(RoundedRectangle(cornerRadius: SD.Radius.lg, style: .continuous))
+        .contentShape(Rectangle())
         .accessibilityElement(children: .combine)
-        .accessibilityLabel("\(device.name), \(status.label), \(subtitle)")
+        .accessibilityLabel("\(device.name), \(ConnectionTruth.spoken(presence)), \(subtitle)")
     }
 
     /// A camera-shaped tile standing in for a thumbnail. The backend holds no
@@ -382,15 +453,20 @@ struct DeviceCard: View {
     private var preview: some View {
         ZStack {
             SD.Colors.canvas
-            CameraGrid()
-                .stroke(SD.Colors.border.opacity(device.online ? 0.9 : 0.5), lineWidth: 1)
+            RadialGradient(colors: [Color.white.opacity(live ? 0.05 : 0.02), .clear],
+                           center: .center, startRadius: 4, endRadius: 240)
             Image(systemName: modeIcon)
-                .font(.system(size: 30, weight: .light))
-                .foregroundStyle(device.online ? SD.Colors.textSecondary : SD.Colors.textDisabled)
+                .font(.system(size: 30, weight: .ultraLight))
+                .foregroundStyle(live ? SD.Colors.textSecondary : SD.Colors.textTertiary)
+                .accessibilityHidden(true)
             VStack {
-                HStack {
-                    SDStatusPill(status: status, pulses: status == .online)
-                    Spacer()
+                // Side by side normally; stacked at accessibility sizes, where the
+                // pill was cut to "ONLI…" beside the wrapping id.
+                (typeSize.isAccessibilitySize
+                    ? AnyLayout(VStackLayout(alignment: .leading, spacing: SD.Space.xs))
+                    : AnyLayout(HStackLayout())) {
+                    SDStatusPill(status: status, text: ConnectionTruth.label(presence))
+                    if !typeSize.isAccessibilitySize { Spacer() }
                     if let id = device.hardwareId {
                         // No shrink-to-fit: minimumScaleFactor stops the id following
                         // the reader's text size (audit: Dynamic Type partially
@@ -404,15 +480,32 @@ struct DeviceCard: View {
                 }
                 Spacer()
             }
-            .padding(SD.Space.sm)
+            .padding(SD.Space.md)
         }
         // A floor, not a fixed height: the pill and id grow with Dynamic Type.
-        .frame(minHeight: 132)
-        .overlay(alignment: .bottom) {
-            Rectangle().fill(SD.Colors.border).frame(height: 1)
-        }
-        .opacity(device.online ? 1 : 0.85)
+        .frame(minHeight: 168)
+        .clipShape(RoundedRectangle(cornerRadius: SD.Radius.camera, style: .continuous))
+        .overlay(
+            RoundedRectangle(cornerRadius: SD.Radius.camera, style: .continuous)
+                .strokeBorder(Color.white.opacity(0.08), lineWidth: 1)
+        )
     }
+}
+
+/// A device screen in the navigation path: equal by id only, so the path entry
+/// stays the same while the device's reported values change underneath it.
+/// Carries the device as it was when opened, for a moment the list is empty.
+struct DeviceRoute: Hashable {
+    let id: Int
+    let opened: Device?
+
+    init(_ device: Device) {
+        id = device.id
+        opened = device
+    }
+
+    static func == (lhs: DeviceRoute, rhs: DeviceRoute) -> Bool { lhs.id == rhs.id }
+    func hash(into hasher: inout Hasher) { hasher.combine(id) }
 }
 
 /// A faint rule-of-thirds grid — a viewfinder, so a

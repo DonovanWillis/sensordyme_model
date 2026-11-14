@@ -30,6 +30,17 @@ struct DeviceDetailView: View {
     /// taken over the UI.
     @State private var setModeGuard = LatestRequestGuard()
     @State private var errorMessage: String?
+    /// The banner's headline when the server answered with something unusable
+    /// (ServerReply); nil = it couldn't be reached.
+    @State private var errorTitle: String?
+    /// A tapped notification whose alert couldn't be found. Its own banner: it
+    /// used to go into `errorMessage`, which headed it "Can't reach the server"
+    /// and turned the presence pill to Unknown for a server that was fine.
+    @State private var alertOpenProblem: String?
+    /// Advanced by the refresh timer whether or not a reload runs, so a reply
+    /// that stops being refreshed stops claiming ONLINE (ConnectionTruth).
+    @State private var now = Date()
+    @Environment(\.dynamicTypeSize) private var typeSize
     @State private var showZones = false
     @State private var selectedEvent: EventItem?
     @State private var showDemoTrigger = false
@@ -37,14 +48,32 @@ struct DeviceDetailView: View {
     @State private var showRename = false
     @State private var newName = ""
     @State private var hasLoaded = false
-    /// What is being typed into the inline Ask Jupiter bar.
-    @State private var jupiterDraft = ""
+    /// Continuity: the camera, the modes and the Jupiter dock zoom into what
+    /// they open (Continuity.swift).
+    @Namespace private var zoomNS
+    /// The device's live stream, shared by the inline and full-screen camera.
+    /// `@State`, not `@StateObject`: held, never observed, so frames redraw the
+    /// camera alone and never this screen.
+    @State private var feedSession = LiveFeedSession()
+    @State private var showCamera = false
+    /// Device health opens itself when there is something to see (the device
+    /// isn't reporting, or a component isn't working) and stays folded to one
+    /// line while everything works. A tap overrides either way.
+    @State private var healthOverride: Bool?
+    @State private var expandedEventID: String?
+    /// Counts transitions INTO ready, for one quiet acknowledgement.
+    @State private var readyAck = 0
+    @State private var protectionTaps = 0
+    @Environment(\.accessibilityReduceMotion) private var reduceMotion
     /// The open Ask Jupiter screen and the request it starts with (sent straight
     /// away when non-empty). One value, so the sheet is built with the request it
     /// was opened for: a separate request string read only inside
     /// `.sheet(isPresented:)` could be captured stale, opening the screen with an
     /// empty prompt that never got an answer (XCUITest journey 10).
     @State private var jupiterSheet: JupiterSheet?
+    /// Where the page is, for the Ask Jupiter dock only. Held, never read
+    /// here, so scrolling does not re-evaluate this screen.
+    @State private var dockModel = JupiterDockModel()
     @State private var showHistory = false
     @State private var renameError: String?
 
@@ -77,7 +106,7 @@ struct DeviceDetailView: View {
     /// of offering a control that cannot work.
     @State private var protectionUnsupported: String?
     /// What the device confirmed, shown for a while after it converged.
-    @State private var protectionNotice: (text: String, at: Date)?
+    @State private var protectionNotice: (text: String, at: Date, confirmed: Bool)?
     @State private var confirmStop = false
 
     private let refreshTimer = Timer.publish(every: 4, on: .main, in: .common).autoconnect()
@@ -100,63 +129,75 @@ struct DeviceDetailView: View {
     var body: some View {
         ScrollViewReader { proxy in
         ScrollView {
-            VStack(spacing: SD.Space.md) {
-                // Above the feed, not below the fold: this view polls every 4s and
-                // keeps showing the last frame and event list when a refresh fails.
-                if let errorMessage {
-                    ConnectionBanner(message: errorMessage) { await reload() }
-                } else if hasLoaded && !deviceLive {
-                    // The server answers but the device doesn't: everything
-                    // below is the last thing it said, and changes wait for it.
-                    ConnectionBanner(
-                        message: staleDeviceMessage,
-                        title: "\(device.name) isn't reporting"
-                    ) { await reload() }
-                }
+            VStack(alignment: .leading, spacing: 0) {
+                banners
 
                 // The camera is the centrepiece and always comes first.
-                FeedCard(device: device, alertActive: alertActive)
+                CameraViewport(device: device, instrument: instrument, session: feedSession) { openCamera() }
+                    .sdZoomSource(.camera, in: zoomNS, cornerRadius: SD.Radius.camera, enabled: zoomEnabled)
+                    .padding(.top, SD.Space.xs)
 
-                statusRow
+                instrumentPanel
+                    .padding(.top, SD.Space.lg)
 
-                // A component the modes rely on isn't working: said up here,
-                // in the device's words, not only in the health card below.
-                if let impaired = PerceptionPresentation.degradedSummary(device.status?.perception, live: deviceLive) {
-                    Label(impaired, systemImage: "exclamationmark.triangle.fill")
-                        .font(SD.Typography.caption)
-                        .foregroundStyle(SD.Colors.warning)
-                        .fixedSize(horizontal: false, vertical: true)
-                        .frame(maxWidth: .infinity, alignment: .leading)
-                        .accessibilityIdentifier("perception.degraded")
-                }
+                actionKeys
+                    .padding(.top, SD.Space.lg)
 
-                askJupiterSection
-                modeCard
+                recentActivity
+                    .id("activity")
+                    .padding(.top, SD.Space.xl)
+
+                modeLibrary
+                    .id("modes")
+                    .padding(.top, SD.Space.xl)
+
                 CustomRulesCard(
                     load: rulesLoad, deviceLive: deviceLive, busy: rulesBusy, toggleError: ruleToggleError,
                     onToggle: { rule, enabled in toggleRule(rule, enabled: enabled) },
                     onAskJupiter: { jupiterSheet = JupiterSheet(prompt: "") })
-                manageCard
+                    .padding(.top, SD.Space.xl)
 
                 // Last on purpose: detail for someone who went looking for it,
                 // not something competing with the picture.
-                healthCard
+                healthSection
                     .id("health")
+                    .padding(.top, SD.Space.xl)
             }
             .padding(.horizontal, SD.Space.md)
-            .padding(.top, SD.Space.xs)
             .padding(.bottom, SD.Space.xl)
         }
+        // The page's position, to the dock alone (it steps aside while the
+        // page is read; JupiterDockBehavior).
+        .modifier(JupiterDockScrollTracking(model: dockModel))
         .task {
-            guard DebugLaunch.scrollToBottom else { return }
-            try? await Task.sleep(for: .seconds(1))
-            withAnimation { proxy.scrollTo("health", anchor: .bottom) }
+            if DebugLaunch.scrollToBottom {
+                try? await Task.sleep(for: .seconds(1))
+                withAnimation { proxy.scrollTo("health", anchor: .bottom) }
+            } else if let target = DebugLaunch.scrollTarget {
+                try? await Task.sleep(for: .seconds(1))
+                withAnimation { proxy.scrollTo(target, anchor: .top) }
+            }
         }
         }
         .scrollDismissesKeyboard(.interactively)
+        // Ask Jupiter floats above the tab bar and rises with the keyboard.
+        // As the bottom safe-area inset, so the page always ends above it.
+        .safeAreaInset(edge: .bottom, spacing: 0) {
+            JupiterDock(
+                deviceName: device.name,
+                model: dockModel,
+                zoomNamespace: zoomNS,
+                zoomEnabled: zoomEnabled,
+                onSubmit: { jupiterSheet = JupiterSheet(prompt: $0) },
+                onOpenFull: { jupiterSheet = JupiterSheet(prompt: "") })
+                .padding(.horizontal, SD.Space.md)
+                .padding(.top, SD.Space.xs)
+                .padding(.bottom, SD.Space.xs)
+        }
         .orynScreen()
         .navigationTitle(device.name)
         .navigationBarTitleDisplayMode(.inline)
+        .modifier(HidesNavigationTitle())
         .navigationDestination(isPresented: $showHistory) {
             EventHistoryView(device: device, initialEvents: events)
         }
@@ -185,7 +226,7 @@ struct DeviceDetailView: View {
                     Image(systemName: "ellipsis")
                         .font(.system(size: 15, weight: .semibold))
                         .foregroundStyle(SD.Colors.textPrimary)
-                        .frame(width: 32, height: 32)
+                        .frame(width: 44, height: 44)  // the minimum touch target
                         .contentShape(Rectangle())
                 }
                 .accessibilityLabel("Device options")
@@ -230,9 +271,16 @@ struct DeviceDetailView: View {
                     ? MonitoringStatusPresentation.presetUnavailableReason(preset.id, status: device.status)
                     : nil
             ) { await reload() }
+            .sdZoomDestination(.mode(preset.id), in: zoomNS, enabled: zoomEnabled)
         }
         .sheet(item: $jupiterSheet) { sheet in
             AIConfigureView(device: device, initialPrompt: sheet.prompt) { await reload() }
+                .sdZoomDestination(.jupiter, in: zoomNS, enabled: zoomEnabled)
+        }
+        .fullScreenCover(isPresented: $showCamera) {
+            LiveCameraView(device: device, instrument: instrument,
+                           presence: ConnectionTruth.label(presence), session: feedSession)
+                .sdZoomDestination(.camera, in: zoomNS, enabled: zoomEnabled)
         }
         .sheet(isPresented: $showZones) {
             ZoneEditorView(device: device)
@@ -242,6 +290,17 @@ struct DeviceDetailView: View {
         }
         .sheet(isPresented: $showDemoTrigger) {
             DemoTriggerView(device: device) { await reload() }
+        }
+        // Acknowledged only when the DEVICE confirms a stop or resume.
+        // Not for a stop/resume the device cancelled or answered differently
+        // (M8.3 failed / mismatch): those settle too, and are no success.
+        .sensoryFeedback(.success, trigger: protectionNotice?.at) { _, new in
+            new != nil && protectionNotice?.confirmed == true
+        }
+        .onChange(of: instrument.kind) { old, new in
+            // One quiet acknowledgement when monitoring becomes ready again —
+            // never on first load, never for anything short of ready.
+            if new == .ready, old != .ready, old != .connecting, !reduceMotion { readyAck += 1 }
         }
         // A tapped notification opens its alert, which is the last beat of the
         // demo: buzz, tap, "here is why".
@@ -273,6 +332,7 @@ struct DeviceDetailView: View {
             // failed, showed "Couldn't open that alert" and cleared the id —
             // racing the screen DevicesView was pushing for Y.
             if let target = notifier.pendingDeviceID, target != device.id { return }
+            alertOpenProblem = nil
             if let match = events.first(where: { $0.eventID == id }) {
                 selectedEvent = match
                 notifier.pendingEventID = nil
@@ -283,7 +343,7 @@ struct DeviceDetailView: View {
                 if let match = events.first(where: { $0.eventID == id }) {
                     selectedEvent = match
                 } else {
-                    errorMessage = "Couldn't open that alert. Open Event history below to find it."
+                    alertOpenProblem = "It may be older than the alerts this screen loads. Open Activity to find it."
                 }
                 notifier.pendingEventID = nil
             }
@@ -296,12 +356,28 @@ struct DeviceDetailView: View {
         .task {
             await reload()
             if DebugLaunch.openJupiter {
+                // After the push settles: a sheet presented mid-transition is dropped.
+                try? await Task.sleep(for: .seconds(1.5))
                 jupiterSheet = JupiterSheet(prompt: DebugLaunch.jupiterPrompt ?? "")
             } else if DebugLaunch.openHistory {
+                try? await Task.sleep(for: .seconds(1.5))  // after the push settles, as above
                 showHistory = true
+            } else if let which = DebugLaunch.openEvent {
+                try? await Task.sleep(for: .seconds(1.5))
+                selectedEvent = which == "experimental" ? events.first(where: \.isExperimental) : events.first
+            } else if DebugLaunch.openCamera || DebugLaunch.openMode != nil {
+                // A beat on the device screen first, so a recording shows the
+                // zoom out of its source.
+                try? await Task.sleep(for: .seconds(1.5))
+                if DebugLaunch.openCamera {
+                    openCamera()
+                } else if let id = DebugLaunch.openMode, let preset = libraryCatalog.preset(id) {
+                    presetSheet = preset
+                }
             }
         }
-        .onReceive(refreshTimer) { _ in
+        .onReceive(refreshTimer) { tick in
+            now = tick
             // One timed reload at a time. Each is two sequential requests; on a
             // link slower than the 4s tick every reload was superseded by the
             // next before it landed, so LatestRequestGuard discarded them all
@@ -315,45 +391,271 @@ struct DeviceDetailView: View {
         }
     }
 
-    // MARK: Status
+    // MARK: Banners
 
-    /// Online, alert state and what it is watching for, in one quiet line under
-    /// the picture. The second pill is the device's own monitoring state
-    /// (DeviceStatus): "All clear" only when the device reports `ready`, never
-    /// for a failed, stopped, starting or silent one.
-    private var statusRow: some View {
-        let pill = MonitoringStatusPresentation.pill(device.monitoringPresentation, alertActive: alertActive)
-        return HStack(spacing: SD.Space.xs) {
-            SDStatusPill(status: presenceStatus, pulses: presenceStatus == .online)
-            .accessibilityIdentifier("detail.online")
-            SDStatusPill(status: pill.tone.sdStatus, text: pill.text)
-                .accessibilityIdentifier("detail.monitoring")
-            Spacer(minLength: SD.Space.xs)
-            HStack(spacing: 5) {
-                if customMonitoringActive {
-                    Image(systemName: "sparkles")
-                        .font(.system(size: 10, weight: .semibold))
+    /// Above the camera, not below the fold: this view polls every 4s and keeps
+    /// showing the last frame and event list when a refresh fails.
+    @ViewBuilder private var banners: some View {
+        let notReporting = hasLoaded ? ConnectionTruth.notReportingMessage(presence) : nil
+        if errorMessage != nil || notReporting != nil || alertOpenProblem != nil {
+            VStack(spacing: SD.Space.sm) {
+                if let errorMessage {
+                    ConnectionBanner(message: errorMessage, title: errorTitle) { await reload() }
+                } else if let message = notReporting {
+                    // The server answers but the device's telemetry is not live:
+                    // everything below is the last thing it said, and changes
+                    // wait for it.
+                    ConnectionBanner(
+                        message: message,
+                        title: isNotRefreshed
+                            ? "This screen isn't up to date"
+                            : "\(device.name) isn't reporting"
+                    ) { await reload() }
                 }
-                // Rules running ALONGSIDE the mode leave the mode in charge, so
-                // the mode is what this line names.
-                Text(customReplacesModes
-                     ? (device.monitoring?.title ?? "AI Custom Monitoring")
-                     : presetTitle(device.activePreset))
-                    .font(SD.Typography.caption.weight(.medium))
-                    .lineLimit(2)
-                    .multilineTextAlignment(.trailing)
+                if let alertOpenProblem {
+                    ConnectionBanner(message: alertOpenProblem, title: "Couldn't open that alert")
+                }
             }
-            .foregroundStyle(customMonitoringActive ? SD.Colors.textPrimary : SD.Colors.textTertiary)
+            .padding(.top, SD.Space.xs)
+            .padding(.bottom, SD.Space.xs)
+            .transition(.opacity)
         }
     }
 
-    /// ONLINE only while the latest refresh succeeded (ConnectionTruth).
-    private var presenceStatus: SDStatus {
-        switch ConnectionTruth.presence(online: device.online, lastRefreshFailed: errorMessage != nil) {
-        case .online: .online
-        case .offline: .offline
-        case .unknown: .unknown
+    // MARK: Status
+
+    /// Presence, monitoring state and a recent alert, as one readout.
+    private var instrument: InstrumentState {
+        InstrumentState.make(presence: presence, monitoring: monitoringPresentation,
+                             alertActive: alertActive, loaded: hasLoaded)
+    }
+
+    /// iOS 18 zoom transitions, unless the reader asked for less motion.
+    private var zoomEnabled: Bool { !reduceMotion }
+
+    private func openCamera() {
+        // Under Reduce Motion the camera appears at once rather than sliding
+        // up: a spatial transition becomes an instant change.
+        var transaction = Transaction()
+        transaction.disablesAnimations = reduceMotion
+        withTransaction(transaction) { showCamera = true }
+    }
+
+    private func readoutTint(_ kind: InstrumentState.Kind) -> Color { kind.tint }
+
+    /// The sentence under the readout: the device's own words for its state.
+    private var readoutDetail: String? {
+        if alertActive, let latest = events.first(where: { $0.isCritical || $0.isConfigured }) {
+            return "\(latest.title) — in the last minute. Open Activity for why."
         }
+        if instrument.kind == .connecting { return "Connecting to \(device.name)…" }
+        return monitoringPresentation?.detail
+    }
+
+    /// The mode the device is running, as the line above the name says it.
+    private var modeLine: String {
+        // Rules running ALONGSIDE the mode leave the mode in charge, so the
+        // mode is what this line names.
+        customReplacesModes ? (device.monitoring?.title ?? "AI Custom Monitoring") : presetTitle(device.activePreset)
+    }
+
+    /// The status word and its symbol: one element whose label is the word
+    /// (what VoiceOver and the journeys read) and whose value is the device's
+    /// sentence.
+    private func readout(_ state: InstrumentState, wraps: Bool) -> some View {
+        HStack(spacing: SD.Space.xs) {
+            Image(systemName: state.symbol)
+                .font(.system(size: 19, weight: .medium))
+                .foregroundStyle(readoutTint(state.kind))
+                .contentTransition(.symbolEffect(.replace))
+                .symbolEffect(.bounce, value: readyAck)
+            Text(state.word)
+                .font(SD.Typography.readout)
+                .foregroundStyle(SD.Colors.textPrimary)
+                .contentTransition(.opacity)
+                .fixedSize(horizontal: !wraps, vertical: true)
+        }
+        .accessibilityElement(children: .ignore)
+        .accessibilityLabel(state.word)
+        .accessibilityValue(readoutDetail ?? "")
+        .accessibilityIdentifier("detail.monitoring")
+    }
+
+    /// The device's identity and its one status readout, with the action the
+    /// state calls for beside it (Stop while monitoring, Resume when stopped).
+    private var instrumentPanel: some View {
+        let state = instrument
+        let accessible = typeSize.isAccessibilitySize
+        return VStack(alignment: .leading, spacing: SD.Space.sm) {
+            // Presence and mode on one quiet line. Stacked at accessibility
+            // sizes, where one line truncated both.
+            (accessible
+                ? AnyLayout(VStackLayout(alignment: .leading, spacing: SD.Space.xs))
+                : AnyLayout(HStackLayout(spacing: SD.Space.xs))) {
+                SDStatusPill(status: presenceStatus, text: ConnectionTruth.label(presence))
+                    .accessibilityLabel(ConnectionTruth.spoken(presence))
+                    .accessibilityIdentifier("detail.online")
+                HStack(spacing: 5) {
+                    if customMonitoringActive {
+                        Image(systemName: "sparkles")
+                            .font(.system(size: 10, weight: .semibold))
+                            .accessibilityHidden(true)
+                    }
+                    Text(modeLine)
+                        .font(SD.Typography.caption.weight(.medium))
+                        .fixedSize(horizontal: false, vertical: true)
+                }
+                .foregroundStyle(customMonitoringActive ? SD.Colors.textPrimary : SD.Colors.textSecondary)
+                if !accessible { Spacer(minLength: 0) }
+            }
+
+            Text(device.name)
+                .font(SD.Typography.title)
+                .foregroundStyle(SD.Colors.textPrimary)
+                .fixedSize(horizontal: false, vertical: true)
+                .accessibilityAddTraits(.isHeader)
+
+            // Side by side when the word and the control fit on one line;
+            // stacked otherwise ("Status unknown" beside "Stop monitoring"
+            // wrapped the word) and always at accessibility sizes.
+            if accessible {
+                VStack(alignment: .leading, spacing: SD.Space.sm) {
+                    readout(state, wraps: true)
+                    protectionControl
+                }
+            } else {
+                ViewThatFits(in: .horizontal) {
+                    HStack(alignment: .center, spacing: SD.Space.sm) {
+                        readout(state, wraps: false)
+                        Spacer(minLength: SD.Space.xs)
+                        protectionControl.fixedSize()
+                    }
+                    VStack(alignment: .leading, spacing: SD.Space.sm) {
+                        readout(state, wraps: true)
+                        protectionControl
+                    }
+                }
+            }
+
+            if let sentence = readoutDetail {
+                Text(sentence)
+                    .font(SD.Typography.callout)
+                    .foregroundStyle(SD.Colors.textSecondary)
+                    .fixedSize(horizontal: false, vertical: true)
+                    .accessibilityHidden(true)  // the readout's value says it
+            }
+
+            // A component the modes rely on isn't working: said up here, in
+            // the device's words, not only in Device health below.
+            if let impaired = PerceptionPresentation.degradedSummary(device.status?.perception, live: deviceLive) {
+                Label(impaired, systemImage: "exclamationmark.triangle")
+                    .font(SD.Typography.caption)
+                    .foregroundStyle(SD.Colors.warning)
+                    .fixedSize(horizontal: false, vertical: true)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                    .accessibilityIdentifier("perception.degraded")
+            }
+
+            if let note = protectionNote {
+                Text(note.text)
+                    .font(SD.Typography.caption)
+                    .foregroundStyle(note.color)
+                    .fixedSize(horizontal: false, vertical: true)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+            }
+
+            if state.showsProgress {
+                ConnectingHairline()
+                    .transition(.opacity)
+            }
+        }
+        .animation(SD.Motion.resolved(SD.Motion.status, reduceMotion: reduceMotion), value: state.kind)
+    }
+
+    /// ONLINE only with fresh telemetry in a reply from a refresh that
+    /// succeeded and is current (ConnectionTruth). Everything on this screen
+    /// that says "live" reads this, so no two parts of it can disagree.
+    private var presence: ConnectionTruth.Presence {
+        device.presence(now: now, lastRefreshFailed: errorMessage != nil)
+    }
+
+    private var isNotRefreshed: Bool {
+        if case .unknown(.notRefreshed) = presence { return true }
+        return false
+    }
+
+    private var presenceStatus: SDStatus { SDStatus(presence) }
+
+    /// The monitoring state, from `status` — "Status unknown" whenever the
+    /// telemetry is not live, so "All clear" can't stand on an old reply.
+    private var monitoringPresentation: MonitoringStatusPresentation? {
+        device.monitoringPresentation(live: deviceLive)
+    }
+
+    /// Device health, folded to one line until someone opens it: the status
+    /// readout above already says whether it is monitoring, so the component
+    /// detail is for whoever goes looking.
+    private var healthSection: some View {
+        VStack(alignment: .leading, spacing: SD.Space.sm) {
+            Button {
+                withAnimation(SD.Motion.resolved(SD.Motion.spatial, reduceMotion: reduceMotion)) {
+                    healthOverride = !showHealth
+                }
+            } label: {
+                HStack(alignment: .center, spacing: SD.Space.sm) {
+                    VStack(alignment: .leading, spacing: 3) {
+                        SDEyebrow("Device health")
+                        Text(healthSummary)
+                            .font(SD.Typography.callout)
+                            .foregroundStyle(SD.Colors.textSecondary)
+                            .multilineTextAlignment(.leading)
+                            .fixedSize(horizontal: false, vertical: true)
+                    }
+                    Spacer(minLength: SD.Space.xs)
+                    Image(systemName: "chevron.down")
+                        .font(.system(size: 13, weight: .semibold))
+                        .foregroundStyle(SD.Colors.textTertiary)
+                        .rotationEffect(.degrees(showHealth ? 180 : 0))
+                }
+                .frame(minHeight: 44)
+                .contentShape(Rectangle())
+            }
+            .buttonStyle(SDUndimmedButtonStyle())
+            .accessibilityLabel("Device health")
+            .accessibilityValue(healthSummary)
+            .accessibilityHint(showHealth ? "Hides the details" : "Shows camera, AI, network and detection capabilities")
+            .accessibilityAddTraits(.isHeader)
+            .accessibilityIdentifier("detail.health")
+
+            if showHealth {
+                healthCard
+                    .transition(.opacity)
+            }
+        }
+    }
+
+    private var showHealth: Bool { healthOverride ?? healthNeedsAttention }
+
+    /// Anything short of "reporting, and every component working".
+    private var healthNeedsAttention: Bool {
+        guard deviceLive, let health = device.health else { return true }
+        let parts = [health.camera, health.accelerator, monitoringComponent(health), health.network].compactMap { $0 }
+        if parts.contains(where: { $0.state != "ok" }) { return true }
+        return PerceptionPresentation.degradedSummary(device.status?.perception, live: deviceLive) != nil
+    }
+
+    /// One line from what the device reported this cycle: how many of its
+    /// components say they are working. Counted, never estimated.
+    private var healthSummary: String {
+        guard deviceLive else { return "Appears while the device is reporting." }
+        guard let health = device.health else { return "This device isn't reporting its health yet." }
+        let parts = [health.camera, health.accelerator, monitoringComponent(health), health.network].compactMap { $0 }
+        guard !parts.isEmpty else { return "No components reported." }
+        let notOK = parts.filter { $0.state != "ok" }.count
+        let fps = health.camera?.metric("fps").map { " · camera \($0) fps" } ?? ""
+        return notOK == 0
+            ? "All \(parts.count) components working\(fps)"
+            : "\(notOK) of \(parts.count) components need attention\(fps)"
     }
 
     // MARK: Health
@@ -363,41 +665,73 @@ struct DeviceDetailView: View {
     // these disappear rather than freezing on their last happy values.
 
     @ViewBuilder private var healthCard: some View {
-        VStack(alignment: .leading, spacing: SD.Space.xs) {
-            SDSectionHeader(title: "Device health")
-                .padding(.horizontal, SD.Space.xxs)
-            if let health = device.health {
-                SDCard {
-                    VStack(alignment: .leading, spacing: SD.Space.sm) {
-                        healthRow("Camera", systemImage: "camera", health.camera, metric: "fps", suffix: " fps")
-                        OrynRowDivider(inset: 22 + SD.Space.sm)
-                        healthRow("AI", systemImage: "cpu", health.accelerator)
-                        OrynRowDivider(inset: 22 + SD.Space.sm)
-                        healthRow("Monitoring", systemImage: "eye", monitoringComponent(health))
-                        OrynRowDivider(inset: 22 + SD.Space.sm)
-                        healthRow("Network", systemImage: "wifi", health.network)
-                    }
-                }
+        VStack(alignment: .leading, spacing: SD.Space.sm) {
+            if let health = device.health, deviceLive {
+                healthRow("Camera", systemImage: "camera", health.camera, metric: "fps", suffix: " fps")
+                OrynRowDivider(inset: 22 + SD.Space.sm)
+                healthRow("AI", systemImage: "cpu", health.accelerator)
+                OrynRowDivider(inset: 22 + SD.Space.sm)
+                // Stopped on purpose: the pause glyph, not a caution dot.
+                healthRow("Monitoring", systemImage: "eye", monitoringComponent(health),
+                          paused: monitoringPresentation?.phase == .stopped)
+                OrynRowDivider(inset: 22 + SD.Space.sm)
+                healthRow("Network", systemImage: "wifi", health.network)
             } else {
                 // Online but silent about itself: an older device build that
                 // predates health reporting. Offline: the backend withholds a
                 // stale report. Either way, say so instead of leaving a gap.
-                SDCard {
-                    HStack(alignment: .top, spacing: SD.Space.sm) {
-                        Image(systemName: "info.circle")
-                            .foregroundStyle(SD.Colors.textTertiary)
-                        Text(device.online
-                             ? "This device isn't reporting its status yet. Update it to see camera and AI health here."
-                             : "Health appears here while the device is online.")
-                            .font(SD.Typography.caption)
-                            .foregroundStyle(SD.Colors.textTertiary)
-                            .fixedSize(horizontal: false, vertical: true)
-                    }
+                HStack(alignment: .top, spacing: SD.Space.sm) {
+                    Image(systemName: "info.circle")
+                        .foregroundStyle(SD.Colors.textTertiary)
+                    Text(deviceLive
+                         ? "This device isn't reporting its status yet. Update it to see camera and AI health here."
+                         : "Health appears here while the device is reporting.")
+                        .font(SD.Typography.caption)
+                        .foregroundStyle(SD.Colors.textTertiary)
+                        .fixedSize(horizontal: false, vertical: true)
                 }
             }
 
             capabilitiesCard
+
+            aboutDevice
         }
+    }
+
+    /// Which unit this is, as the server knows it (M8.4): the device screen
+    /// named the device but never said which physical unit, how it is set up
+    /// to be used, or when it last reported. Only stored fields; a field the
+    /// device has not sent says so.
+    private var aboutDevice: some View {
+        VStack(alignment: .leading, spacing: SD.Space.xs) {
+            SDEyebrow("About this device")
+                .accessibilityAddTraits(.isHeader)
+                .padding(.top, SD.Space.md)
+            aboutRow("Device ID", device.hardwareId ?? "Not reported yet")
+            aboutRow("Set up for", device.status?.roleTitle ?? "Not reported yet")
+            aboutRow("Last report", device.lastSeen.map {
+                Self.relative.localizedString(for: Date(timeIntervalSince1970: $0), relativeTo: now)
+            } ?? "Never")
+        }
+        .accessibilityIdentifier("detail.about")
+    }
+
+    private func aboutRow(_ label: String, _ value: String) -> some View {
+        ViewThatFits(in: .horizontal) {
+            HStack(alignment: .firstTextBaseline) {
+                Text(label).font(SD.Typography.caption).foregroundStyle(SD.Colors.textTertiary)
+                Spacer(minLength: SD.Space.xs)
+                Text(value).font(SD.Typography.caption.monospacedDigit()).foregroundStyle(SD.Colors.textSecondary)
+                    .textSelection(.enabled)
+            }
+            VStack(alignment: .leading, spacing: 1) {
+                Text(label).font(SD.Typography.caption).foregroundStyle(SD.Colors.textTertiary)
+                Text(value).font(SD.Typography.caption.monospacedDigit()).foregroundStyle(SD.Colors.textSecondary)
+                    .fixedSize(horizontal: false, vertical: true)
+                    .textSelection(.enabled)
+            }
+        }
+        .accessibilityElement(children: .combine)
     }
 
     /// What the device can detect right now, from `status.capabilities`:
@@ -405,44 +739,42 @@ struct DeviceDetailView: View {
     /// each has been evaluated when the backend says. Empty, with a sentence,
     /// whenever the device isn't reporting: an old list is never shown green.
     @ViewBuilder private var capabilitiesCard: some View {
-        let health = CapabilityHealth.rows(status: device.status, online: device.online)
-        SDSectionHeader(title: "Detection capabilities")
-            .padding(.horizontal, SD.Space.xxs)
-            .padding(.top, SD.Space.xs)
-        SDCard {
-            VStack(alignment: .leading, spacing: SD.Space.sm) {
-                if let notice = health.notice {
-                    HStack(alignment: .top, spacing: SD.Space.sm) {
-                        Image(systemName: "questionmark.circle")
-                            .foregroundStyle(SD.Colors.textTertiary)
-                        Text(notice)
-                            .font(SD.Typography.caption)
-                            .foregroundStyle(SD.Colors.textTertiary)
-                            .fixedSize(horizontal: false, vertical: true)
-                    }
-                }
-                // The shared perception engine's components, as the device
-                // reports them: one model run feeds every mode that needs it.
-                let components = PerceptionPresentation.componentRows(device.status?.perception, live: deviceLive)
-                ForEach(components) { row in
-                    healthRow(row.title, systemImage: "cpu",
-                              HealthComponent(state: row.tone.healthState, detail: row.detail, metrics: nil))
-                        .accessibilityIdentifier("perception.\(row.name)")
-                    OrynRowDivider(inset: 22 + SD.Space.sm)
-                }
-                ForEach(Array(health.rows.enumerated()), id: \.element.id) { index, row in
-                    healthRow(row.title, systemImage: capabilityIcon(row.state),
-                              HealthComponent(state: row.tone.healthState, detail: row.detail, metrics: nil))
-                    if index < health.rows.count - 1 {
-                        OrynRowDivider(inset: 22 + SD.Space.sm)
-                    }
-                }
-                if !health.rows.isEmpty {
-                    Text("“Producing results” means the capability is running, not that its results are accurate.")
+        let health = CapabilityHealth.rows(status: device.status, online: deviceLive)
+        SDEyebrow("Detection capabilities")
+            .accessibilityAddTraits(.isHeader)
+            .padding(.top, SD.Space.md)
+        VStack(alignment: .leading, spacing: SD.Space.sm) {
+            if let notice = health.notice {
+                HStack(alignment: .top, spacing: SD.Space.sm) {
+                    Image(systemName: "questionmark.circle")
+                        .foregroundStyle(SD.Colors.textTertiary)
+                    Text(notice)
                         .font(SD.Typography.caption)
                         .foregroundStyle(SD.Colors.textTertiary)
                         .fixedSize(horizontal: false, vertical: true)
                 }
+            }
+            // The shared perception engine's components, as the device
+            // reports them: one model run feeds every mode that needs it.
+            let components = PerceptionPresentation.componentRows(status: device.status, live: deviceLive)
+            ForEach(components) { row in
+                healthRow(row.title, systemImage: "cpu",
+                          HealthComponent(state: row.tone.healthState, detail: row.detail, metrics: nil))
+                    .accessibilityIdentifier("perception.\(row.name)")
+                OrynRowDivider(inset: 22 + SD.Space.sm)
+            }
+            ForEach(Array(health.rows.enumerated()), id: \.element.id) { index, row in
+                healthRow(row.title, systemImage: capabilityIcon(row.state),
+                          HealthComponent(state: row.tone.healthState, detail: row.detail, metrics: nil))
+                if index < health.rows.count - 1 {
+                    OrynRowDivider(inset: 22 + SD.Space.sm)
+                }
+            }
+            if !health.rows.isEmpty {
+                Text("“Producing results” means the capability is running, not that its results are accurate.")
+                    .font(SD.Typography.caption)
+                    .foregroundStyle(SD.Colors.textTertiary)
+                    .fixedSize(horizontal: false, vertical: true)
             }
         }
     }
@@ -451,6 +783,7 @@ struct DeviceDetailView: View {
         switch state {
         case .available: "waveform.path.ecg"
         case .starting: "hourglass"
+        case .paused: "pause.circle"
         case .impaired: "exclamationmark.triangle"
         }
     }
@@ -461,7 +794,7 @@ struct DeviceDetailView: View {
     /// the face model is gone. The inference component remains the fallback
     /// for a backend that predates the status contract.
     private func monitoringComponent(_ health: DeviceHealthReport) -> HealthComponent? {
-        guard let presentation = device.monitoringPresentation else { return health.inference }
+        guard let presentation = monitoringPresentation else { return health.inference }
         return HealthComponent(state: presentation.tone.healthState, detail: presentation.detail, metrics: nil)
     }
 
@@ -471,7 +804,8 @@ struct DeviceDetailView: View {
         systemImage: String,
         _ component: HealthComponent?,
         metric: String? = nil,
-        suffix: String = ""
+        suffix: String = "",
+        paused: Bool = false
     ) -> some View {
         if let component {
             HStack(spacing: SD.Space.sm) {
@@ -497,7 +831,12 @@ struct DeviceDetailView: View {
                         .font(SD.Typography.caption.monospacedDigit())
                         .foregroundStyle(SD.Colors.textSecondary)
                 }
-                if component.isKnown {
+                if paused || component.detail == CapabilityHealth.pausedDetail {
+                    // Stopped on purpose (M8.2): paused, not unknown and not a fault.
+                    Image(systemName: "pause.circle")
+                        .font(.caption)
+                        .foregroundStyle(SD.Colors.textTertiary)
+                } else if component.isKnown {
                     Circle().fill(component.status.tint).frame(width: 7, height: 7)
                 } else {
                     Image(systemName: "questionmark.circle")
@@ -511,103 +850,82 @@ struct DeviceDetailView: View {
         }
     }
 
-    // MARK: Ask Jupiter
+    // MARK: Actions
     //
-    // Was "Configure with AI". Same flow underneath: the request goes to
-    // `/v1/ai/configure`, comes back as a draft, and nothing changes on the
-    // device until the person reviews it and taps Activate in AIConfigureView.
+    // Ask Jupiter is the floating dock (JupiterDock): the same flow underneath.
+    // The request goes to `/v1/ai/configure`, comes back as a draft, and nothing
+    // changes on the device until the person reviews it and taps Activate in
+    // AIConfigureView.
 
-    private var askJupiterSection: some View {
-        VStack(alignment: .leading, spacing: SD.Space.xs) {
-            AskJupiterBar(text: $jupiterDraft) {
-                guard let request = JupiterPrompt.normalized(jupiterDraft) else { return }
-                jupiterDraft = ""
-                jupiterSheet = JupiterSheet(prompt: request)
+    /// The places you go FROM a device, as keys on one row: what it has seen,
+    /// where rules apply, and the report. A row of three, stacked at
+    /// accessibility sizes.
+    private var actionKeys: some View {
+        let layout = typeSize.isAccessibilitySize
+            ? AnyLayout(VStackLayout(spacing: SD.Space.xs))
+            : AnyLayout(HStackLayout(spacing: SD.Space.xs))
+        return layout {
+            Button { alertOpenProblem = nil; showHistory = true } label: {
+                InstrumentKey(icon: "clock.arrow.circlepath", title: "Activity",
+                              badge: alertActive ? "Alert" : nil, badgeColor: SD.Colors.danger)
             }
-            HStack(spacing: SD.Space.xxs) {
-                Text("Tell \(device.name) what to watch for. You review it before anything changes.")
-                    .font(SD.Typography.caption)
-                    .foregroundStyle(SD.Colors.textTertiary)
-                    .fixedSize(horizontal: false, vertical: true)
-                Spacer(minLength: SD.Space.xs)
-                Button {
-                    jupiterSheet = JupiterSheet(prompt: "")
-                } label: {
-                    Text("Examples")
-                        .font(SD.Typography.caption.weight(.semibold))
-                        .foregroundStyle(SD.Colors.textSecondary)
-                        .frame(minHeight: 44)  // the minimum touch target
-                        .contentShape(Rectangle())
+            .buttonStyle(SDPressStyle())
+            .accessibilityLabel(alertActive ? "Activity, alert in the last minute" : "Activity")
+            .accessibilityValue(historyDetail)
+            .accessibilityIdentifier("detail.history")
+
+            Button { showZones = true } label: {
+                InstrumentKey(icon: "square.dashed", title: "Areas")
+            }
+            .buttonStyle(SDPressStyle())
+            .accessibilityLabel("Detection areas")
+            .accessibilityHint("Draw where rules apply")
+            .accessibilityIdentifier("detail.zones")
+
+            NavigationLink {
+                ReportsView(device: device)
+            } label: {
+                InstrumentKey(icon: "chart.bar", title: "Report")
+            }
+            .buttonStyle(SDPressStyle())
+            .accessibilityLabel("Report")
+            .accessibilityHint("Estimates from recent events")
+
+            if state.isDemo {
+                Button { showDemoTrigger = true } label: {
+                    InstrumentKey(icon: "play.circle", title: "Demo alert")
                 }
-                .buttonStyle(.plain)
-                .accessibilityLabel("Jupiter examples")
-                .accessibilityIdentifier("detail.examples")
+                .buttonStyle(SDPressStyle())
+                .accessibilityLabel("Run a demo alert")
+                .accessibilityHint("Simulated: see an alert end to end")
             }
-            .padding(.horizontal, SD.Space.xxs)
         }
     }
 
-    // MARK: Manage
-
-    /// What used to be scattered between the toolbar menu and a long activity
-    /// card: the places you go *from* a device, as rows.
-    private var manageCard: some View {
-        VStack(alignment: .leading, spacing: SD.Space.xs) {
-            SDSectionHeader(title: "Manage")
-                .padding(.horizontal, SD.Space.xxs)
-            SDCard(padding: SD.Space.xxs) {
-                VStack(spacing: 0) {
-                    Button { showHistory = true } label: {
-                        OrynNavRow(
-                            icon: "clock.arrow.circlepath",
-                            title: "Event history",
-                            detail: historyDetail,
-                            trailing: alertActive ? "ALERT" : nil
-                        )
-                    }
-                    .buttonStyle(SDRowButtonStyle(minHeight: 60))
-                    .accessibilityIdentifier("detail.history")
-
-                    OrynRowDivider()
-
-                    Button { showZones = true } label: {
-                        OrynNavRow(
-                            icon: "square.dashed",
-                            title: "Detection areas",
-                            detail: "Draw where rules apply"
-                        )
-                    }
-                    .buttonStyle(SDRowButtonStyle(minHeight: 60))
-                    .accessibilityIdentifier("detail.zones")
-
-                    OrynRowDivider()
-
-                    NavigationLink {
-                        ReportsView(device: device)
-                    } label: {
-                        OrynNavRow(
-                            icon: "chart.bar",
-                            title: "Report",
-                            detail: "Estimates from recent events"
-                        )
-                    }
-                    .buttonStyle(SDRowButtonStyle(minHeight: 60))
-
-                    OrynRowDivider()
-                    protectionRow
-
-                    if state.isDemo {
-                        OrynRowDivider()
-                        Button { showDemoTrigger = true } label: {
-                            OrynNavRow(
-                                icon: "play.circle",
-                                title: "Run a demo alert",
-                                detail: "Simulated: see an alert end to end"
-                            )
-                        }
-                        .buttonStyle(SDRowButtonStyle(minHeight: 60))
+    /// The three latest events on the timeline spine; all of them one tap away.
+    private var recentActivity: some View {
+        let recent = Array(events.prefix(3))
+        return VStack(alignment: .leading, spacing: SD.Space.sm) {
+            SDSectionHeader(title: "Recent activity",
+                            action: events.isEmpty ? nil : ("See all", { alertOpenProblem = nil; showHistory = true }))
+            if recent.isEmpty {
+                Text(hasLoaded
+                     ? "Nothing to report yet. Events appear here as soon as \(device.name) sees something worth telling you about."
+                     : "Loading…")
+                    .font(SD.Typography.callout)
+                    .foregroundStyle(SD.Colors.textTertiary)
+                    .fixedSize(horizontal: false, vertical: true)
+            } else {
+                VStack(alignment: .leading, spacing: 0) {
+                    ForEach(Array(recent.enumerated()), id: \.element.id) { index, event in
+                        TimelineRow(event: event, isLast: index == recent.count - 1,
+                                    expanded: expandedEventID == event.id, relativeTime: true,
+                                    identifier: "detail.activity.row",
+                                    onToggle: { expandedEventID = expandedEventID == event.id ? nil : event.id },
+                                    onExplain: { selectedEvent = event })
                     }
                 }
+                .animation(SD.Motion.resolved(SD.Motion.standard, reduceMotion: reduceMotion), value: expandedEventID)
             }
         }
     }
@@ -644,101 +962,129 @@ struct DeviceDetailView: View {
     /// What the running mode's row says when the device is NOT monitoring
     /// (failed or stopped); nil when it is (or when there is no status).
     private var notMonitoringReason: String? {
-        guard let presentation = device.monitoringPresentation else { return nil }
+        guard let presentation = monitoringPresentation else { return nil }
         switch presentation.phase {
         case .failed: return presentation.detail
         case .stopped: return "Stopped — nothing is monitored until it's resumed"
         default: return nil
         }
     }
+    /// The status can't be confirmed (stale health, unknown): the row the
+    /// device runs must not read green (M8.1 frozen-health finding).
+    private var unconfirmedReason: String? {
+        guard let presentation = monitoringPresentation, presentation.phase == .unknown else { return nil }
+        return "Status unknown — \(presentation.detail)"
+    }
     private var activeVariant: String? { Preset.split(device.activePreset).variant }
 
-    private var modeCard: some View {
-        VStack(alignment: .leading, spacing: SD.Space.xs) {
-        SDSectionHeader(title: "Monitoring mode")
-            .padding(.horizontal, SD.Space.xxs)
-        SDCard {
-            VStack(alignment: .leading, spacing: SD.Space.sm) {
-                // What is ACTUALLY running, when it is not one of the presets
-                // below. The device reports this itself, so it cannot disagree
-                // with what the device is doing.
-                if customMonitoringActive, let custom = device.monitoring {
-                    VStack(alignment: .leading, spacing: SD.Space.xs) {
-                        HStack(spacing: SD.Space.sm) {
-                            OrynMark(height: 16, color: SD.Colors.signal)
-                                .frame(width: 26)
-                            VStack(alignment: .leading, spacing: 1) {
-                                Text(custom.title)
-                                    .font(SD.Typography.body)
-                                    .foregroundStyle(SD.Colors.textPrimary)
-                                Text(customReplacesModes
-                                     ? "Set by Jupiter · replaces the modes below"
-                                     : "Set by Jupiter · runs alongside the mode below")
-                                    .font(SD.Typography.caption)
-                                    .foregroundStyle(SD.Colors.textSecondary)
-                            }
-                            Spacer(minLength: 0)
-                            Image(systemName: "checkmark.circle.fill")
-                                .foregroundStyle(SD.Colors.success)
-                        }
+    /// The mode leading the library: the one the device runs, else the
+    /// flagship (Driver Safety, the Distracted Driving product), else the first.
+    private var featuredModeID: String? {
+        let presets = libraryCatalog.presets
+        if !customReplacesModes, presets.contains(where: { $0.id == activeBase }) { return activeBase }
+        if presets.contains(where: { $0.id == "driver_safety" }) { return "driver_safety" }
+        return presets.first?.id
+    }
 
-                        Text(custom.summary)
-                            .font(SD.Typography.callout)
-                            .foregroundStyle(SD.Colors.textSecondary)
-                            .fixedSize(horizontal: false, vertical: true)
-                            .padding(.leading, 26 + SD.Space.sm)
-                    }
-                    .padding(.vertical, SD.Space.xxs)
+    /// The library, edited rather than listed: the featured mode first and in
+    /// full, the modes this device can run next, and the ones its role rules
+    /// out last and quieter, each still openable to read why.
+    private var modeLibrary: some View {
+        let presets = libraryCatalog.presets
+        let featured = presets.first { $0.id == featuredModeID }
+        let rest = presets.filter { $0.id != featuredModeID }
+        let available = rest.filter { unavailableReason($0.id) == nil }
+        let unavailable = rest.filter { unavailableReason($0.id) != nil }
+        return VStack(alignment: .leading, spacing: SD.Space.md) {
+            SDSectionHeader(title: "Monitoring modes")
 
-                    // Alongside a mode, picking the mode again leaves the rules on
-                    // (measured against the backend: rules_active stays 1); their
-                    // own switches under Custom rules are what turn them off.
-                    Text(customReplacesModes
-                         ? "Pick a mode below to go back to standard monitoring."
-                         : "Turn these rules off with their switches under Custom rules.")
-                        .font(SD.Typography.caption)
-                        .foregroundStyle(SD.Colors.textTertiary)
-
-                    Rectangle().fill(SD.Colors.border).frame(height: 1)
-                }
-
-                // The device refused the latest rules (all or nothing) and kept
-                // what it was running. They are not shown as running anywhere.
-                if let notice = MonitoringStatusPresentation.rejectedRulesNotice(device.status) {
+            // What is ACTUALLY running, when it is not one of the presets
+            // below. The device reports this itself, so it cannot disagree
+            // with what the device is doing.
+            if customMonitoringActive, let custom = device.monitoring {
+                VStack(alignment: .leading, spacing: SD.Space.xs) {
                     HStack(alignment: .top, spacing: SD.Space.sm) {
-                        Image(systemName: "exclamationmark.triangle.fill")
-                            .font(.system(size: 13))
-                            .frame(width: 26)
-                            .foregroundStyle(SD.Colors.danger)
-                        Text(notice)
-                            .font(SD.Typography.caption)
-                            .foregroundStyle(SD.Colors.danger)
-                            .fixedSize(horizontal: false, vertical: true)
+                        OrynMark(height: 16, color: SD.Colors.signal)
+                            .frame(width: 28, height: 22)
+                        VStack(alignment: .leading, spacing: 2) {
+                            Text(custom.title)
+                                .font(SD.Typography.headline)
+                                .foregroundStyle(SD.Colors.textPrimary)
+                            Text(customReplacesModes
+                                 ? "Set by Jupiter · replaces the modes below"
+                                 : "Set by Jupiter · runs alongside the mode below")
+                                .font(SD.Typography.caption)
+                                .foregroundStyle(SD.Colors.textSecondary)
+                            Text(custom.summary)
+                                .font(SD.Typography.callout)
+                                .foregroundStyle(SD.Colors.textSecondary)
+                                .fixedSize(horizontal: false, vertical: true)
+                                .padding(.top, SD.Space.xxs)
+                            // Alongside a mode, picking the mode again leaves the
+                            // rules on (measured against the backend: rules_active
+                            // stays 1); their own switches under Custom rules are
+                            // what turn them off.
+                            Text(customReplacesModes
+                                 ? "Pick a mode below to go back to standard monitoring."
+                                 : "Turn these rules off with their switches under Custom rules.")
+                                .font(SD.Typography.caption)
+                                .foregroundStyle(SD.Colors.textTertiary)
+                                .fixedSize(horizontal: false, vertical: true)
+                                .padding(.top, SD.Space.xxs)
+                        }
+                        Spacer(minLength: 0)
                     }
-                    .padding(.vertical, SD.Space.xxs)
-
-                    Rectangle().fill(SD.Colors.border).frame(height: 1)
                 }
-
-                // The built-in list says so: it knows names, not what this
-                // device can run or how far anything has been validated.
-                if case .builtIn(let reason) = libraryCatalog.source {
-                    Label(reason, systemImage: "info.circle")
-                        .font(SD.Typography.caption)
-                        .foregroundStyle(SD.Colors.textTertiary)
-                        .fixedSize(horizontal: false, vertical: true)
-                }
-
-                ForEach(libraryCatalog.presets) { preset in
-                    modeRow(preset)
-                    if preset.id != libraryCatalog.presets.last?.id {
-                        Rectangle().fill(SD.Colors.border).frame(height: 1)
-                    }
-                }
-
-                nodesSection
+                .padding(SD.Space.md)
+                .background(
+                    RoundedRectangle(cornerRadius: SD.Radius.camera, style: .continuous)
+                        .fill(SD.Colors.surface)
+                )
             }
-        }
+
+            // The device refused the latest rules (all or nothing) and kept
+            // what it was running. They are not shown as running anywhere.
+            if let notice = MonitoringStatusPresentation.rejectedRulesNotice(device.status) {
+                Label(notice, systemImage: "exclamationmark.triangle")
+                    .font(SD.Typography.caption)
+                    .foregroundStyle(SD.Colors.danger)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+
+            // The built-in list says so: it knows names, not what this
+            // device can run or how far anything has been validated.
+            if case .builtIn(let reason) = libraryCatalog.source {
+                Label(reason, systemImage: "info.circle")
+                    .font(SD.Typography.caption)
+                    .foregroundStyle(SD.Colors.textTertiary)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+
+            if let featured {
+                modeRow(featured, featured: true)
+            }
+
+            if !available.isEmpty {
+                VStack(alignment: .leading, spacing: 0) {
+                    ForEach(available) { preset in
+                        modeRow(preset, featured: false)
+                        if preset.id != available.last?.id { OrynRowDivider(inset: 28 + SD.Space.sm) }
+                    }
+                }
+            }
+
+            if !unavailable.isEmpty {
+                VStack(alignment: .leading, spacing: SD.Space.xxs) {
+                    SDEyebrow("Not available on this device")
+                        .padding(.top, SD.Space.xs)
+                    ForEach(unavailable) { preset in
+                        modeRow(preset, featured: false)
+                        if preset.id != unavailable.last?.id { OrynRowDivider(inset: 28 + SD.Space.sm) }
+                    }
+                }
+            }
+
+            nodesSection
         }
     }
 
@@ -751,7 +1097,6 @@ struct DeviceDetailView: View {
     /// switch. Only shown when the device reports nodes at all.
     @ViewBuilder private var nodesSection: some View {
         if let report = perceptionReport {
-            Rectangle().fill(SD.Colors.border).frame(height: 1)
             VStack(alignment: .leading, spacing: SD.Space.xs) {
                 SDEyebrow(report.simulated == true ? "Running on this device · simulated" : "Running on this device")
                 ForEach(report.nodes.filter { $0.isRunning || $0.state == "failed" }) { node in
@@ -759,6 +1104,9 @@ struct DeviceDetailView: View {
                 }
                 occupancyToggle(report)
             }
+            // Its own element, so the id names the section without replacing the
+            // rows' and the switch's own ids (journey 24 found no switch).
+            .accessibilityElement(children: .contain)
             .accessibilityIdentifier("nodes.section")
         }
     }
@@ -775,13 +1123,25 @@ struct DeviceDetailView: View {
                     .font(SD.Typography.caption)
                     .foregroundStyle(SD.Colors.textSecondary)
                     .fixedSize(horizontal: false, vertical: true)
+                if let experimental = NodePresentation.experimentalNote(node) {
+                    Text(experimental)
+                        .font(SD.Typography.caption)
+                        .foregroundStyle(SD.Colors.warning)
+                        .fixedSize(horizontal: false, vertical: true)
+                }
+                // How far it is validated, as the device reports it: said once,
+                // quietly, under the name (the mode library's treatment).
+                Label(shown.badge, systemImage: "seal")
+                    .font(SD.Typography.caption.weight(.medium))
+                    .foregroundStyle(SD.Colors.warning)
+                    .fixedSize(horizontal: false, vertical: true)
+                    .padding(.top, 2)
             }
-            Spacer(minLength: SD.Space.xs)
-            SDEyebrow(shown.badge, color: SD.Colors.warning)
-                .multilineTextAlignment(.trailing)
+            Spacer(minLength: 0)
         }
         .accessibilityElement(children: .combine)
-        .accessibilityLabel("\(shown.title): \(shown.stateText). \(shown.badge)")
+        .accessibilityLabel("\(shown.title): \(shown.stateText). \(shown.badge)"
+            + (NodePresentation.experimentalNote(node).map { ". \($0)" } ?? ""))
         .accessibilityIdentifier("node.\(node.id)")
     }
 
@@ -799,8 +1159,13 @@ struct DeviceDetailView: View {
                     Text("Also count people")
                         .font(SD.Typography.body)
                         .foregroundStyle(SD.Colors.textPrimary)
+                    // How far it is validated comes from the device's report when it
+                    // is running (it said "Experimental" here while the device called
+                    // it "Not yet validated · simulated tests"); never "validated".
                     Text(pending ? "Waiting for \(device.name) to confirm…"
-                         : "Occupancy, from the same detections. Experimental.")
+                         : "Occupancy, from the same detections. "
+                            + (report.node("people_counter").map { NodePresentation.badge($0) + "." }
+                               ?? "Not yet validated."))
                         .font(SD.Typography.caption)
                         .foregroundStyle(SD.Colors.textSecondary)
                         .fixedSize(horizontal: false, vertical: true)
@@ -831,7 +1196,8 @@ struct DeviceDetailView: View {
                 state.expireSession(error.message)
             } catch let error as APIError {
                 nodeRequest = nil
-                nodeError = error.endpointMissing ? ServerSupport.notSupported : error.message
+                nodeError = error.endpointMissing ? ServerSupport.notSupported
+                    : RefusalText.message(code: error.code, reason: error.message, fallback: error.message)
             } catch {
                 nodeRequest = nil
                 nodeError = error.localizedDescription
@@ -839,161 +1205,256 @@ struct DeviceDetailView: View {
         }
     }
 
-    @ViewBuilder
-    private func modeRow(_ preset: CatalogPreset) -> some View {
-        // The single source of truth for this row's state — see
-        // ModeSwitchState.swift for why "active"/"switching" alone weren't
-        // enough: no distinct failure state, no offline state, no timeout.
-        // `now: .now` is what lets a stuck switch age past switchTimeout and
-        // flip to failed on the app's own 4s refresh cycle, with no separate
-        // timer needed.
-        // Only custom rules that REPLACE the modes stop a mode row reading active;
-        // rules running alongside (an additive role) leave the mode running.
-        let rowState = ModeSwitchState.state(
+    /// The single source of truth for a mode row's state — see
+    /// ModeSwitchState.swift for why "active"/"switching" alone weren't
+    /// enough: no distinct failure state, no offline state, no timeout.
+    /// `now: .now` is what lets a stuck switch age past switchTimeout and
+    /// flip to failed on the app's own 4s refresh cycle, with no separate
+    /// timer needed.
+    /// Only custom rules that REPLACE the modes stop a mode row reading active;
+    /// rules running alongside (an additive role) leave the mode running.
+    private func rowState(_ preset: CatalogPreset) -> ModeRowState {
+        ModeSwitchState.state(
             for: preset.id, activeBase: activeBase, customMonitoringActive: customReplacesModes,
-            pending: pendingSwitch, deviceOnline: device.online, failure: failedSwitch, now: .now,
-            unavailable: unavailableReason(preset.id), notMonitoring: notMonitoringReason
+            pending: pendingSwitch, deviceOnline: deviceLive, failure: failedSwitch, now: .now,
+            unavailable: unavailableReason(preset.id), notMonitoring: notMonitoringReason,
+            unconfirmed: unconfirmedReason
         )
-        let isActive = rowState.isSelected
-        let isUnavailable = rowState.isUnavailable
-        let validation = libraryCatalog.isBuiltIn ? nil
+    }
+
+    private func validation(_ preset: CatalogPreset) -> ValidationPresentation? {
+        libraryCatalog.isBuiltIn ? nil
             : ValidationPresentation.make(devicePresets?.state(for: preset.id)?.validationStatus ?? preset.validation.status)
+    }
 
-        VStack(alignment: .leading, spacing: SD.Space.xs) {
-            HStack(spacing: SD.Space.xs) {
-            // One activation path: the row opens the preset's details, where
-            // its capabilities (from the device), validation and settings are
-            // shown and Activate waits for the device's own confirmation. A
-            // bare tap used to switch at once, sending the base name and so
-            // dropping a running variant.
-            Button { presetSheet = preset } label: {
-                HStack(spacing: SD.Space.sm) {
-                    Image(systemName: Preset.icon(for: preset.id))
-                        .font(.system(size: 15))
-                        .frame(width: 26)
-                        .foregroundStyle(isActive ? SD.Colors.textPrimary : SD.Colors.textDisabled)
-                    VStack(alignment: .leading, spacing: 1) {
-                        // Unavailable reads quieter than the others, at a contrast
-                        // that can still be read (textDisabled is 3.9:1).
-                        Text(preset.title)
-                            .font(SD.Typography.body)
-                            .foregroundStyle(isUnavailable ? SD.Colors.textTertiary : SD.Colors.textPrimary)
-                        switch rowState {
-                        case .failed(let message):
-                            Text(message)
-                                .font(SD.Typography.caption)
-                                .foregroundStyle(SD.Colors.danger)
-                        case .unavailable(let reason):
-                            Text(reason)
-                                .font(SD.Typography.caption)
-                                .foregroundStyle(SD.Colors.textTertiary)
-                        case .queuedOffline:
-                            Text("Device offline — will apply when it reconnects")
-                                .font(SD.Typography.caption)
-                                .foregroundStyle(SD.Colors.warning)
-                        case .activeNotMonitoring(let message):
-                            Text(message)
-                                .font(SD.Typography.caption)
-                                .foregroundStyle(SD.Colors.danger)
-                                .fixedSize(horizontal: false, vertical: true)
-                        case .inactive, .switching, .active:
-                            Text(preset.description)
-                                .font(SD.Typography.caption)
-                                .foregroundStyle(SD.Colors.textTertiary)
-                                .fixedSize(horizontal: false, vertical: true)
-                        }
-                        // How far it has been validated, from the catalog. Only
-                        // "validated on device" is ever green.
-                        if let validation {
-                            SDEyebrow(validation.chip,
-                                      color: validation.isValidated ? SD.Colors.success : SD.Colors.warning)
-                                .padding(.top, 2)
-                        }
-                    }
-                    Spacer(minLength: SD.Space.xxs)
-                    switch rowState {
-                    case .active:
-                        Image(systemName: "checkmark.circle.fill")
-                            .foregroundStyle(SD.Colors.success)
-                    case .switching:
-                        ProgressView().controlSize(.small).tint(SD.Colors.textSecondary)
-                    case .queuedOffline:
-                        Image(systemName: "wifi.slash")
-                            .foregroundStyle(SD.Colors.warning)
-                    case .failed:
-                        Image(systemName: "exclamationmark.triangle.fill")
-                            .foregroundStyle(SD.Colors.danger)
-                    case .activeNotMonitoring:
-                        // Selected, not protecting: never the green check.
-                        Image(systemName: "exclamationmark.circle.fill")
-                            .foregroundStyle(SD.Colors.danger)
-                    case .inactive, .unavailable:
-                        EmptyView()
-                    }
-                }
-                .contentShape(Rectangle())
+    private func modeRow(_ preset: CatalogPreset, featured: Bool) -> some View {
+        let state = rowState(preset)
+        return VStack(alignment: .leading, spacing: SD.Space.sm) {
+            HStack(alignment: featured ? .top : .center, spacing: SD.Space.xxs) {
+                modeRowButton(preset, state: state, featured: featured)
+                modeInfoButton(preset)
             }
-            .buttonStyle(SDUndimmedButtonStyle())
-            // Opens even when the preset can't be picked, so the reason can be
-            // read in full; the sheet's Activate is what is disabled.
-            // The row's state was a checkmark or spinner alone: said here too.
-            .accessibilityValue(rowState.spokenValue)
-            .accessibilityHint("Opens what it detects, its settings and Activate")
-            .accessibilityAddTraits(isActive ? .isSelected : [])
-            .accessibilityIdentifier("preset.row.\(preset.id)")
-
-            // Details, settings and validation. Enabled even when the preset
-            // can't be picked, so the reason can be read in full.
-            Button { presetSheet = preset } label: {
-                Image(systemName: "info.circle")
-                    .font(.system(size: 15))
-                    .foregroundStyle(SD.Colors.textSecondary)
-                    .frame(width: 32, height: 32)
-                    .contentShape(Rectangle())
-            }
-            .buttonStyle(.plain)
-            .accessibilityLabel("\(preset.title) details and settings")
-            .accessibilityIdentifier("preset.info.\(preset.id)")
-            }
-
             // Tuning variants, shown only for the mode currently running.
-            if isActive && !preset.variants.isEmpty {
-                ScrollView(.horizontal, showsIndicators: false) {
-                    HStack(spacing: SD.Space.xs) {
-                        ForEach(preset.variants) { variant in
-                            let selected = (activeVariant ?? preset.variants.first?.id) == variant.id
-                            Button {
-                                setMode("\(preset.id):\(variant.id)")
-                            } label: {
-                                Text(variant.title)
-                                    .font(SD.Typography.caption.weight(.semibold))
-                                    .padding(.horizontal, SD.Space.sm)
-                                    .padding(.vertical, SD.Space.xxs + 3)
-                                    .background(
-                                        Capsule().fill(selected ? SD.Colors.accent : SD.Colors.surfaceRaised)
-                                    )
-                                    .overlay(
-                                        Capsule().strokeBorder(
-                                            selected ? .clear : SD.Colors.border, lineWidth: 1
-                                        )
-                                    )
-                                    .foregroundStyle(
-                                        selected ? SD.Colors.textOnAccent : SD.Colors.textSecondary
-                                    )
-                            }
-                            .buttonStyle(.plain)
-                            // Selection was shown by colour only.
-                            .accessibilityAddTraits(selected ? .isSelected : [])
-                            .accessibilityLabel("\(preset.title): \(variant.title)")
-                            .accessibilityIdentifier("preset.variant.\(variant.id)")
-                        }
-                    }
-                    .padding(.leading, 26 + SD.Space.sm)
-                    .padding(.vertical, 2)
-                }
+            if state.isSelected && !preset.variants.isEmpty {
+                variantChips(preset, featured: featured)
             }
         }
-        .padding(.vertical, SD.Space.xxs)
+        .padding(featured ? SD.Space.md : 0)
+        .background {
+            if featured {
+                RoundedRectangle(cornerRadius: SD.Radius.camera, style: .continuous)
+                    .fill(SD.Colors.surface)
+            }
+        }
+        .sdZoomSource(.mode(preset.id), in: zoomNS,
+                      cornerRadius: featured ? SD.Radius.camera : SD.Radius.lg, enabled: zoomEnabled)
+    }
+
+    /// One activation path: the row opens the preset's details, where its
+    /// capabilities (from the device), validation and settings are shown and
+    /// Activate waits for the device's own confirmation. A bare tap used to
+    /// switch at once, sending the base name and so dropping a running variant.
+    private func modeRowButton(_ preset: CatalogPreset, state: ModeRowState, featured: Bool) -> some View {
+        Button { presetSheet = preset } label: {
+            Group {
+                if featured {
+                    // The featured mode reads as a title block: its symbol and
+                    // state on one line, then its name and words at full width.
+                    VStack(alignment: .leading, spacing: SD.Space.sm) {
+                        HStack(alignment: .center, spacing: SD.Space.sm) {
+                            modeGlyph(preset.id, featured: true, active: state.isSelected,
+                                      unavailable: state.isUnavailable)
+                            modeStateGlyph(state)
+                            Spacer(minLength: 0)
+                        }
+                        modeRowText(preset, state: state, featured: true)
+                            .frame(maxWidth: .infinity, alignment: .leading)
+                    }
+                } else {
+                    HStack(alignment: .center, spacing: SD.Space.sm) {
+                        modeGlyph(preset.id, featured: false, active: state.isSelected,
+                                  unavailable: state.isUnavailable)
+                        modeRowText(preset, state: state, featured: false)
+                        Spacer(minLength: SD.Space.xxs)
+                        modeStateGlyph(state)
+                    }
+                    .padding(.vertical, SD.Space.sm)
+                }
+            }
+            .contentShape(Rectangle())
+        }
+        .buttonStyle(SDUndimmedButtonStyle())
+        // Opens even when the preset can't be picked, so the reason can be
+        // read in full; the sheet's Activate is what is disabled.
+        // The row's state was a checkmark or spinner alone: said here too.
+        .accessibilityValue(state.spokenValue)
+        .accessibilityHint("Opens what it detects, its settings and Activate")
+        .accessibilityAddTraits(state.isSelected ? .isSelected : [])
+        .accessibilityIdentifier("preset.row.\(preset.id)")
+    }
+
+    private func modeRowText(_ preset: CatalogPreset, state: ModeRowState, featured: Bool) -> some View {
+        VStack(alignment: .leading, spacing: 2) {
+            if featured, let context = ModeEditorial.context(preset.id) {
+                SDEyebrow(context, color: SD.Colors.textTertiary)
+                    .padding(.bottom, 2)
+            }
+            // Unavailable reads quieter than the others, at a contrast that can
+            // still be read (textDisabled is 3.9:1).
+            Text(preset.title)
+                .font(featured ? SD.Typography.title : SD.Typography.body)
+                .foregroundStyle(state.isUnavailable ? SD.Colors.textTertiary : SD.Colors.textPrimary)
+                .fixedSize(horizontal: false, vertical: true)
+            modeRowDetail(preset, state: state, featured: featured)
+            // How far it has been validated, from the catalog. Only "validated
+            // on device" is ever green; said quietly, once.
+            // Not for a mode this device can't run: its reason is the news.
+            if let validation = validation(preset), !state.isUnavailable {
+                Label(validation.chip, systemImage: validation.isValidated ? "checkmark.seal" : "seal")
+                    .font(SD.Typography.caption.weight(.medium))
+                    .foregroundStyle(validation.isValidated ? SD.Colors.success : SD.Colors.warning)
+                    .padding(.top, 2)
+            }
+        }
+    }
+
+    /// The line under a mode's name: its state when that is the news, else what
+    /// it watches for.
+    @ViewBuilder
+    private func modeRowDetail(_ preset: CatalogPreset, state: ModeRowState, featured: Bool) -> some View {
+        switch state {
+        case .failed(let message):
+            detailLine(message, SD.Colors.danger)
+        case .unavailable(let reason):
+            // textSecondary: the reason is the point of the row, and
+            // textTertiary at caption size failed the audit's contrast.
+            detailLine(reason, SD.Colors.textSecondary)
+        case .queuedOffline:
+            detailLine("Device offline — will apply when it reconnects", SD.Colors.warning)
+        case .activeNotMonitoring(let message):
+            detailLine(message, SD.Colors.danger)
+        case .activeUnconfirmed(let message):
+            detailLine(message, SD.Colors.warning)
+        case .switching:
+            detailLine("Switching — waiting for \(device.name) to confirm", SD.Colors.textSecondary)
+        case .inactive, .active:
+            if !preset.description.isEmpty {
+                Text(preset.description)
+                    .font(featured ? SD.Typography.callout : SD.Typography.caption)
+                    .foregroundStyle(featured ? SD.Colors.textSecondary : SD.Colors.textTertiary)
+                    .multilineTextAlignment(.leading)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+        }
+    }
+
+    private func detailLine(_ text: String, _ color: Color) -> some View {
+        Text(text)
+            .font(SD.Typography.caption)
+            .foregroundStyle(color)
+            .multilineTextAlignment(.leading)
+            .fixedSize(horizontal: false, vertical: true)
+    }
+
+    /// Details, settings and validation. Enabled even when the preset can't be
+    /// picked, so the reason can be read in full.
+    private func modeInfoButton(_ preset: CatalogPreset) -> some View {
+        Button { presetSheet = preset } label: {
+            Image(systemName: "info.circle")
+                .font(.system(size: 15))
+                .foregroundStyle(SD.Colors.textSecondary)
+                .frame(width: 44, height: 44)  // the minimum touch target
+                .contentShape(Rectangle())
+        }
+        .buttonStyle(.plain)
+        .accessibilityLabel("\(preset.title) details and settings")
+        .accessibilityIdentifier("preset.info.\(preset.id)")
+    }
+
+    /// The running mode's tuning variants. Selected from what the device
+    /// reports, never from the tap.
+    private func variantChips(_ preset: CatalogPreset, featured: Bool) -> some View {
+        ScrollView(.horizontal, showsIndicators: false) {
+            HStack(spacing: SD.Space.xs) {
+                ForEach(preset.variants) { variant in
+                    variantChip(preset, variant)
+                }
+            }
+            .padding(.leading, featured ? 0 : 28 + SD.Space.sm)
+        }
+    }
+
+    private func variantChip(_ preset: CatalogPreset, _ variant: PresetVariantInfo) -> some View {
+        let selected = (activeVariant ?? preset.variants.first?.id) == variant.id
+        return Button {
+            setMode("\(preset.id):\(variant.id)")
+        } label: {
+            Text(variant.title)
+                .font(SD.Typography.caption.weight(.semibold))
+                .foregroundStyle(selected ? SD.Colors.textOnAccent : SD.Colors.textSecondary)
+                .padding(.horizontal, SD.Space.sm + 2)
+                .frame(minHeight: 34)
+                .background(Capsule().fill(selected ? SD.Colors.accent : SD.Colors.surfaceRaised))
+                .frame(minHeight: 44)
+                .contentShape(Rectangle())
+        }
+        .buttonStyle(SDPressStyle(scale: 0.95))
+        // Selection was shown by colour only.
+        .accessibilityAddTraits(selected ? .isSelected : [])
+        .accessibilityLabel("\(preset.title): \(variant.title)")
+        .accessibilityIdentifier("preset.variant.\(variant.id)")
+    }
+
+    /// The mode's symbol: on a raised tile for the featured mode, bare in the
+    /// list. Bone when it runs, steel otherwise.
+    @ViewBuilder
+    private func modeGlyph(_ id: String, featured: Bool, active: Bool, unavailable: Bool) -> some View {
+        let color = active ? SD.Colors.textPrimary : (unavailable ? SD.Colors.textTertiary : SD.Colors.textSecondary)
+        if featured {
+            Image(systemName: Preset.icon(for: id))
+                .font(.system(size: 19, weight: .regular))
+                .foregroundStyle(color)
+                .frame(width: 44, height: 44)
+                .background(
+                    RoundedRectangle(cornerRadius: SD.Radius.lg, style: .continuous)
+                        .fill(SD.Colors.surfaceRaised)
+                )
+                .accessibilityHidden(true)
+        } else {
+            Image(systemName: Preset.icon(for: id))
+                .font(.system(size: 15, weight: .regular))
+                .foregroundStyle(color)
+                .frame(width: 28)
+                .accessibilityHidden(true)
+        }
+    }
+
+    /// The row's state as a symbol (its words are in the row and its value).
+    @ViewBuilder
+    private func modeStateGlyph(_ rowState: ModeRowState) -> some View {
+        switch rowState {
+        case .active:
+            Image(systemName: "checkmark.circle.fill")
+                .foregroundStyle(SD.Colors.success)
+        case .switching:
+            ProgressView().controlSize(.small).tint(SD.Colors.textSecondary)
+        case .queuedOffline:
+            Image(systemName: "wifi.slash")
+                .foregroundStyle(SD.Colors.warning)
+        case .failed:
+            Image(systemName: "exclamationmark.triangle.fill")
+                .foregroundStyle(SD.Colors.danger)
+        case .activeNotMonitoring:
+            // Selected, not protecting: never the green check.
+            Image(systemName: "exclamationmark.circle.fill")
+                .foregroundStyle(SD.Colors.danger)
+        case .activeUnconfirmed:
+            // Selected, but not confirmed: neither green nor a failure.
+            Image(systemName: "questionmark.circle.fill")
+                .foregroundStyle(SD.Colors.warning)
+        case .inactive, .unavailable:
+            EmptyView()
+        }
     }
 
     // MARK: Preset library
@@ -1012,7 +1473,7 @@ struct DeviceDetailView: View {
     /// server has GET /v1/devices/{id}/presets, else the role in `status`.
     private func unavailableReason(_ id: String) -> String? {
         if let devicePresets {
-            let availability = PresetAvailability.make(devicePresets.state(for: id))
+            let availability = PresetAvailability.make(devicePresets.state(for: id), roleTitle: device.status?.roleTitle)
             return availability.blocksSelection ? (availability.note ?? "Not available on this device") : nil
         }
         return MonitoringStatusPresentation.presetUnavailableReason(id, status: device.status)
@@ -1042,23 +1503,10 @@ struct DeviceDetailView: View {
         }
     }
 
-    /// What an unreported device means for the person: when it was last
-    /// heard from, and that changes are kept until it is back.
-    private var staleDeviceMessage: String {
-        var text = "Its status is unknown"
-        if let lastSeen = device.lastSeen {
-            let date = Date(timeIntervalSince1970: lastSeen)
-            text += " — last heard from \(Self.relative.localizedString(for: date, relativeTo: .now))"
-        } else {
-            text += " — it hasn't reported yet"
-        }
-        return text + ". Check it has power and Wi-Fi. Changes you make are saved and apply when it reconnects."
-    }
-
     // MARK: Custom rules
 
     /// Online and reporting. Nothing is shown as running otherwise.
-    private var deviceLive: Bool { device.status?.isLive(online: device.online) ?? device.online }
+    private var deviceLive: Bool { presence.isOnline }
 
     private func loadRules() async {
         if rulesLoad == .unsupported { return }
@@ -1097,24 +1545,27 @@ struct DeviceDetailView: View {
     // MARK: Stop / resume
 
     private var protectionReport: ProtectionReport {
-        ProtectionReport(protection: device.status?.protection, monitoringState: device.status?.monitoringState,
-                         lastCommandID: device.status?.lastCommandID, live: deviceLive)
+        ProtectionReport(status: device.status, live: deviceLive)
     }
 
-    /// One row in Manage: the action the device's state calls for, what is in
-    /// flight, and what the device confirmed. Never "Stopped" before the
-    /// device says so.
-    @ViewBuilder private var protectionRow: some View {
+    /// The control the device's state calls for, beside the readout: Stop
+    /// while it monitors, Resume (the primary action) once it has stopped.
+    /// Never "Stopped" before the device says so: what is in flight is said
+    /// under the readout (`protectionNote`) until the device confirms.
+    @ViewBuilder private var protectionControl: some View {
         let report = protectionReport
         let phase = ProtectionControl.phase(protectionRequest, report: report, now: .now)
         let action = protectionRequest?.action ?? ProtectionControl.offeredAction(report)
         let pending: Bool = { if case .pending = phase { return true }; return false }()
         let busy = protectionSending || pending
+        let disabled = busy || protectionUnsupported != nil || device.status == nil
+        let resume = action == .resume
+        let title = busy ? "\(action.progressive)…" : action.verb
         let detail: String = {
             switch phase {
             case .pending: return "Waiting for \(device.name) to confirm"
             case .overdue: return "Not confirmed yet — tap to send again"
-            case .confirmed(let text): return text
+            case .confirmed(let text), .failed(let text), .mismatch(let text): return text
             case .idle: break
             }
             if let notice = protectionNotice, Date().timeIntervalSince(notice.at) < 20 { return notice.text }
@@ -1125,45 +1576,59 @@ struct DeviceDetailView: View {
             case nil: return "Status unknown — the device isn't reporting"
             }
         }()
-        let note: (text: String, color: Color)? = {
-            if let protectionUnsupported { return (protectionUnsupported, SD.Colors.textTertiary) }
-            if let protectionError { return (protectionError, SD.Colors.danger) }
-            switch phase {
-            case .pending(let text): return (text, SD.Colors.textSecondary)
-            case .overdue(let text): return (text, SD.Colors.warning)
-            default: break
-            }
-            if device.status == nil {
-                return ("This server doesn't report monitoring state, so a stop or resume couldn't be confirmed.",
-                        SD.Colors.textTertiary)
-            }
-            return nil
-        }()
 
         Button {
+            protectionTaps += 1
             if action == .stop { confirmStop = true } else { sendProtection(.resume) }
         } label: {
-            OrynNavRow(
-                icon: action == .stop ? "pause.circle" : "play.circle",
-                title: busy ? "\(action.progressive)…" : action.verb,
-                detail: detail,
-                trailing: nil,
-                showsChevron: false
-            )
+            HStack(spacing: 6) {
+                if busy {
+                    ProgressView().controlSize(.small)
+                        .tint(resume ? SD.Colors.textOnAccent : SD.Colors.textPrimary)
+                } else {
+                    Image(systemName: resume ? "play.fill" : "pause.fill")
+                        .font(.system(size: 11, weight: .bold))
+                }
+                Text(title)
+                    .font(SD.Typography.label.weight(.semibold))
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+            .foregroundStyle(resume ? SD.Colors.textOnAccent : SD.Colors.textPrimary)
+            .padding(.horizontal, SD.Space.md)
+            .frame(minHeight: 44)
+            .background(Capsule().fill(resume ? SD.Colors.accent : SD.Colors.surfaceRaised))
+            .contentShape(Capsule())
+            .opacity(disabled ? 0.45 : 1)
         }
-        .buttonStyle(SDRowButtonStyle(minHeight: 60))
-        .disabled(busy || protectionUnsupported != nil || device.status == nil)
+        .buttonStyle(SDPressStyle(scale: 0.96))
+        .disabled(disabled)
+        .sensoryFeedback(.impact(weight: .light), trigger: protectionTaps)
+        .accessibilityLabel("\(title), \(detail)")
         .accessibilityIdentifier("detail.protection")
+    }
 
-        if let note {
-            Text(note.text)
-                .font(SD.Typography.caption)
-                .foregroundStyle(note.color)
-                .fixedSize(horizontal: false, vertical: true)
-                .padding(.horizontal, SD.Space.sm)
-                .padding(.bottom, SD.Space.xs)
-                .frame(maxWidth: .infinity, alignment: .leading)
+    /// What a stop or resume is doing, or why it can't be offered: said under
+    /// the readout, in the device's terms.
+    private var protectionNote: (text: String, color: Color)? {
+        let report = protectionReport
+        let phase = ProtectionControl.phase(protectionRequest, report: report, now: .now)
+        if let protectionUnsupported { return (protectionUnsupported, SD.Colors.textTertiary) }
+        if let protectionError { return (protectionError, SD.Colors.danger) }
+        switch phase {
+        case .pending(let text): return (text, SD.Colors.textSecondary)
+        case .overdue(let text): return (text, SD.Colors.warning)
+        case .confirmed(let text): return (text, SD.Colors.textSecondary)
+        case .failed(let text), .mismatch(let text): return (text, SD.Colors.warning)
+        case .idle: break
         }
+        if let notice = protectionNotice, Date().timeIntervalSince(notice.at) < 20 {
+            return (notice.text, notice.confirmed ? SD.Colors.textSecondary : SD.Colors.warning)
+        }
+        if device.status == nil {
+            return ("This server doesn't report monitoring state, so a stop or resume couldn't be confirmed.",
+                    SD.Colors.textTertiary)
+        }
+        return nil
     }
 
     private func sendProtection(_ action: ProtectionAction) {
@@ -1198,11 +1663,14 @@ struct DeviceDetailView: View {
     /// tracking it: a later stop or resume from elsewhere must not be read
     /// against this one.
     private func settleProtection() {
+        // Any final outcome (M8.3: confirmed, failed, mismatch) ends the wait.
         guard let request = protectionRequest,
-              case .confirmed(let text) = ProtectionControl.phase(request, report: protectionReport, now: Date())
+              case let phase = ProtectionControl.phase(request, report: protectionReport, now: Date()),
+              phase.isFinal, let text = phase.text
         else { return }
         protectionRequest = nil
-        protectionNotice = (text, Date())
+        let confirmed: Bool = { if case .confirmed = phase { return true }; return false }()
+        protectionNotice = (text, Date(), confirmed)
     }
 
     // Recent activity moved to EventHistoryView (Manage → Event history). The
@@ -1279,15 +1747,25 @@ struct DeviceDetailView: View {
         // which is the only distinction that matters for not clobbering it.
         let reloadStartedAt = Date()
         do {
-            if let fresh = try await state.backend.devices().first(where: { $0.id == device.id }) {
-                guard reloadGuard.isLatest(token) else { return }
-                device = fresh
-                syncPendingSwitch(from: fresh, reloadStartedAt: reloadStartedAt)
-                settleProtection()
+            let all = try await state.backend.devices()
+            guard reloadGuard.isLatest(token) else { return }
+            guard let fresh = all.first(where: { $0.id == device.id }) else {
+                // Removed from the account (or moved to another): it used to keep
+                // the last reading on screen, ONLINE, polling for ever in silence.
+                errorTitle = "\(device.name) is no longer on this account"
+                errorMessage = "The server no longer lists this device for your account. Go back to Your Devices."
+                hasLoaded = true
+                return
             }
+            device = fresh
+            now = Date()
+            syncPendingSwitch(from: fresh, reloadStartedAt: reloadStartedAt)
+            settleProtection()
             let fetchedEvents = try await state.backend.events(deviceID: device.id, limit: 200)
             guard reloadGuard.isLatest(token) else { return }
-            events = fetchedEvents
+            // Merged like Activity (M8.3 EventFeed): one copy per event, a
+            // newer alert report never replaced by a stale poll, newest first.
+            events = EventFeed.merge(events, fetchedEvents)
             // The library, the device's availability and its rules. Each says
             // "not supported by this server" on its own when the endpoint is
             // missing, and none of them fails the screen.
@@ -1299,12 +1777,14 @@ struct DeviceDetailView: View {
             // works on every screen. Announcing here as well duplicated the
             // work on the one screen that was already the busiest.
             errorMessage = nil
+            errorTitle = nil
         } catch let error as APIError where error.isAuthFailure {
             guard reloadGuard.isLatest(token) else { return }
             state.expireSession(error.message)
         } catch {
             guard reloadGuard.isLatest(token) else { return }
             errorMessage = error.localizedDescription
+            errorTitle = (error as? APIError)?.title
         }
         if reloadGuard.isLatest(token) { hasLoaded = true }
     }
@@ -1346,73 +1826,6 @@ struct DeviceDetailView: View {
         // timestamp for something first noticed this moment.
         pendingSwitch = ModeSwitchState.PendingSwitch(targetBase: desiredBase, requestedAt: Date())
     }
-}
-
-// MARK: - Event row
-
-struct EventRow: View {
-    let event: EventItem
-
-    private var tint: Color {
-        switch event.severity {
-        case "loud": SD.Colors.danger
-        case "soft": SD.Colors.warning
-        default: SD.Colors.textTertiary
-        }
-    }
-
-    /// Event types arrive as backend identifiers ("phone_use_while_distracted").
-    /// Showing those raw is the fastest way to make a consumer product feel like
-    /// a debug console.
-    private var title: String {
-        event.type
-            .replacingOccurrences(of: "_", with: " ")
-            .capitalized
-    }
-
-    var body: some View {
-        HStack(alignment: .top, spacing: SD.Space.sm) {
-            Circle()
-                .fill(tint)
-                .frame(width: 8, height: 8)
-                .padding(.top, 6)
-            VStack(alignment: .leading, spacing: 2) {
-                Text(title)
-                    .font(SD.Typography.body)
-                    .foregroundStyle(SD.Colors.textPrimary)
-                if let signals = event.signals, !signals.isEmpty {
-                    Text(signals)
-                        .font(SD.Typography.caption)
-                        .foregroundStyle(SD.Colors.textSecondary)
-                        .lineLimit(2)
-                }
-            }
-            Spacer(minLength: SD.Space.xxs)
-            if let date = event.date {
-                // Abbreviated ("3 min. ago") rather than the live ".relative"
-                // style ("2 min, 52 sec"), which was wide enough to wrap the
-                // event title onto two lines.
-                Text(date, format: .relative(presentation: .numeric, unitsStyle: .abbreviated))
-                    .font(SD.Typography.mono)
-                    .foregroundStyle(SD.Colors.textTertiary)
-                    .lineLimit(1)
-                    .fixedSize()
-            }
-        }
-        .padding(.vertical, SD.Space.xxs)
-        // The dot's colour is the severity; say it.
-        .accessibilityElement(children: .ignore)
-        .accessibilityLabel(EventAccessibility.label(
-            title: title, severity: event.severity, signals: event.signals,
-            when: event.date.map { Self.spokenAge.localizedString(for: $0, relativeTo: .now) }))
-        .accessibilityIdentifier("event.row")
-    }
-
-    private static let spokenAge: RelativeDateTimeFormatter = {
-        let formatter = RelativeDateTimeFormatter()
-        formatter.unitsStyle = .full
-        return formatter
-    }()
 }
 
 /// An Ask Jupiter screen to present, with the request it opens with.

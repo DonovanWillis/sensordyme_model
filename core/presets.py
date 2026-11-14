@@ -62,7 +62,7 @@ CAPABILITY_KINDS = frozenset({
     "camera", "inference", "face", "objects", "hands", "pose", "alert_output", "audible_alert",
 })
 _OUTPUT_KINDS = frozenset({"alert_output", "audible_alert"})
-_TEMPORAL_KEYS = frozenset({"event", "description", "sustain_s", "window_s", "setting"})
+_TEMPORAL_KEYS = frozenset({"event", "description", "sustain_s", "window_s", "setting", "experimental", "config_key"})
 _PATTERN_KEYS = frozenset({"tone", "events", "description"})
 
 #: Availability codes for one preset on one device (docs/PRESET_LIBRARY.md).
@@ -597,7 +597,8 @@ def device_availability(entry: dict, *, role: Any = None, capabilities: Optional
         if refusal:
             return CODE_ROLE_FORBIDS, refusal
     if stale:
-        return CODE_STALE, "the device has not reported recently, so what it can run now is unknown"
+        return CODE_STALE, ("the device's monitoring status is not current (no recent report, or its health has not "
+                            "been updated), so what it can run now is unknown")
     impaired = {item.get("name"): item.get("reason") for item in (capabilities or {}).get("impaired") or []
                 if isinstance(item, dict)}
     for kind in entry.get("required_capabilities") or []:

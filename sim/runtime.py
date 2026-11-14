@@ -24,10 +24,12 @@ import logging
 from pathlib import Path
 from typing import Optional
 
+from core import device_health
 from core.alerts import AlertCategory, AlertLevel, AlertPattern
 from core.events import Event
 from services.runtime import DeviceRuntime
 from sim import perception
+from sim.fidelity import STAND_INS
 
 log = logging.getLogger("sensordyme.sim")
 
@@ -40,18 +42,41 @@ class SimBuzzerSink:
     """
 
     name, kind, audible = "sim_buzzer", "buzzer", True
+    #: Reports each actuation like the GPIO buzzer does (M8.3 delivery evidence),
+    #: and says it is simulated: its "played" can never read as a real sound.
+    reports_completion = True
+    simulated = True
 
     def __init__(self, echo: bool = False) -> None:
         self.played: list[tuple[str, str, str]] = []
         self._echo = echo
+        #: Fault injection: the next actuations report this error instead of playing.
+        self.fail: Optional[str] = None
+        #: Hold reports until release() (an output still rendering its pattern).
+        self.hold = False
+        self._held: list = []
 
     def readiness(self) -> tuple[bool, str]:
         return True, "SIMULATED buzzer: actuations are recorded, nothing makes a sound"
 
-    def play(self, pattern: AlertPattern, event: Event, category: AlertCategory) -> None:
-        self.played.append((event.type, category.name, pattern.name))
+    def play(self, pattern: AlertPattern, event: Event, category: AlertCategory, report=None) -> None:
+        if self.fail is None:
+            self.played.append((event.type, category.name, pattern.name))
         if self._echo:
             print(f"[SIM BUZZER] {category.name}/{pattern.name}: {event.type}")
+        if report is None:
+            return
+        outcome = ("failed", self.fail) if self.fail is not None else ("played", None)
+        if self.hold:
+            self._held.append((report, outcome))
+        else:
+            report(*outcome)
+
+    def release(self) -> None:
+        """Deliver the held reports (the patterns finished rendering)."""
+        held, self._held = self._held, []
+        for report, outcome in held:
+            report(*outcome)
 
     def emit(self, event: Event, level: AlertLevel) -> None:
         self.played.append((event.type, level.value, level.value))
@@ -158,15 +183,29 @@ class SimRuntime(DeviceRuntime):
             "faults": faults.describe(),
             "perception": "scripted (no camera, no models)" if self._scripted()
                           else "not simulated for this module (real code, no models on this host)",
-            "not_simulated": ["camera sensor", "Hailo NPU", "BLE provisioning", "GPIO buzzer",
-                              "Wi-Fi", "thermals"],
+            # M8.4: every component this device fakes (sim/fidelity.py, docs/DIGITAL_TWIN.md).
+            "stand_ins": sorted(STAND_INS),
+            "not_simulated": ["camera sensor", "Hailo NPU", "BLE provisioning", "GPIO buzzer", "Wi-Fi",
+                              *(() if faults.soc_temp_c is not None or faults.throttle else ("thermals",))],
         }
+        if faults.soc_temp_c is not None or faults.throttle:
+            # M8.3: a simulated thermal fault shows on the health card as on a Pi.
+            hot = device_health.thermal_condition(faults.soc_temp_c, list(faults.throttle), False)
+            report["system"] = {"state": "warning" if hot else "ok",
+                                "detail": f"SIMULATED: {hot or 'nominal'}",
+                                "metrics": {"temperature_c": faults.soc_temp_c,
+                                            "throttle_now": list(faults.throttle)}}
         report["network"] = (
             {"state": "failed", "detail": "SIMULATED network outage", "metrics": {}}
             if faults.network_down else
             {"state": "ok", "detail": "SIMULATED: host network, no Wi-Fi radio", "metrics": {}}
         )
         return report
+
+    def _thermal_reading(self) -> tuple[Optional[float], list[str]]:
+        """The scenario's SoC temperature and throttle flags (M8.3 fault hook)."""
+        faults = self.sim.state.current()
+        return faults.soc_temp_c, list(faults.throttle)
 
     def _monitoring_check(self) -> tuple[bool, str]:
         result = super()._monitoring_check()

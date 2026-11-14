@@ -109,10 +109,11 @@ the state back).
   (picamera2, libcamera, hailo_platform, gpiozero, dbus, gi) or a listed Mac-only
   import (torch, ultralytics, anthropic, each confined to its file); and no
   test/dev/research package is pinned. `tests/test_device_dependencies.py` enforces it.
-* `requirements-device.lock`: hash-locked for CPython 3.11 aarch64 (Bookworm), 37
-  packages, from metadata only. **Not yet used** by `setup_pi.sh` or `make deploy`
-  (the least-privilege plan installs it with `--require-hashes`); adopt after one
-  install on a real Pi.
+* `requirements-device.lock`: hash-locked for CPython 3.11 aarch64 (Bookworm), from
+  metadata only. **M8.5: the only device install** (`--require-hashes
+  --only-binary=:all:`) in `setup_pi.sh`, `make deploy`'s staged install and the
+  rollback (docs/DEPLOYMENT.md §5); gpiozero/lgpio are in it. Its first install
+  on a real Pi is still hardware-pending.
 * Pre-existing finding, not changed: mediapipe 0.10.14 also pulls
   `opencv-contrib-python==4.11.0.86` beside the pinned `opencv-python==4.10.0.84`.
   Both install a `cv2` package and the last one installed wins, so the device may not

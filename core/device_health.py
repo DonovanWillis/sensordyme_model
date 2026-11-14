@@ -32,7 +32,7 @@ from dataclasses import asdict, dataclass, field
 from typing import Optional
 
 from core import accel, identity
-from core.thermal import SOFT_THROTTLE_C
+from core.thermal import SOFT_THROTTLE_C, WARN_C
 
 # States the app understands. Kept deliberately small so every surface can
 # render the same vocabulary.
@@ -128,6 +128,38 @@ def _decode_throttled(raw: Optional[str]) -> tuple[list[str], list[str]]:
     live = [name for bit, name in _THROTTLE_LIVE.items() if value >> bit & 1]
     sticky = [name for bit, name in _THROTTLE_STICKY.items() if value >> bit & 1]
     return live, sticky
+
+
+def thermal_reading() -> tuple[Optional[float], list[str]]:
+    """(SoC temperature in °C or None, the throttle flags happening NOW).
+
+    Reads sysfs and runs `vcgencmd get_throttled` (up to 2 s): call it from the
+    health thread, never from the inference loop. Off a Pi: (None, [])."""
+    return _read_temperature_c(), _decode_throttled(_read_throttled())[0]
+
+
+def thermal_condition(temperature_c: Optional[float], live_flags: list[str],
+                      was_degraded: bool) -> Optional[str]:
+    """Why sustained heat (or a sagging supply) is slowing this device now, or None (M8.3).
+
+    The device keeps monitoring when hot: the firmware protects the hardware by
+    lowering clocks, so frames are analysed more slowly. That is DEGRADED, with
+    this reason, never READY. Uses the Pi's published limits unchanged
+    (core/thermal.py): it enters at the soft throttle point (80 °C) or on any
+    live throttle bit, and, once entered, holds until the SoC is below the
+    warning point (75 °C) with no live bit, so a device hovering at the limit
+    does not flap between READY and DEGRADED every reading.
+    """
+    hot = temperature_c is not None and temperature_c >= SOFT_THROTTLE_C
+    still_warm = temperature_c is not None and temperature_c >= WARN_C
+    if not (hot or live_flags or (was_degraded and still_warm)):
+        return None
+    where = f"SoC at {temperature_c:.1f}°C" if temperature_c is not None else "SoC temperature unknown"
+    if live_flags:
+        return f"{where}, {' and '.join(live_flags)} now: analysis may be slower than designed"
+    if hot:
+        return f"{where}, at or above the {SOFT_THROTTLE_C:.0f}°C throttle point: analysis may be slower"
+    return f"{where}, cooling after throttling (clears below {WARN_C:.0f}°C): analysis may be slower"
 
 
 def _read_memory() -> tuple[Optional[int], Optional[int]]:
@@ -271,6 +303,7 @@ def collect(
     detection_degraded: Optional[str] = None,
     caller: str = "default",
     detector_required: bool = True,
+    detector_unavailable: Optional[str] = None,
 ) -> dict:
     """Assemble the health report the device sends upstream each sync.
 
@@ -317,6 +350,14 @@ def collect(
         )
 
     accelerator = _accelerator()
+    if detector_required and detector_unavailable:
+        # M8: the accelerator branch above cannot see that NOTHING detects. With no
+        # Hailo and no CPU backend (a device: ultralytics is not installed) it said
+        # "OK, running on CPU" while the module ran without object detection.
+        accelerator = Component(
+            WARNING, f"object detection unavailable — {detector_unavailable}",
+            {**accelerator.metrics, "detector_available": False},
+        )
     # A detector that dies at frame 10,000 must flip this too, not just one that
     # was missing at boot. `detection_degraded` is set once, during startup, so on
     # its own it would leave monitoring_active True for a device whose NPU stopped

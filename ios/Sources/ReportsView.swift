@@ -13,7 +13,8 @@ struct DeviceReport {
     let byType: [(type: String, count: Int)]
 
     static func compute(from events: [EventItem]) -> DeviceReport {
-        let alerts = events.filter { $0.severity == "loud" || $0.severity == "soft" }
+        // An experimental observation (M8.4) is never counted as an alert.
+        let alerts = events.filter { !$0.isExperimental && ($0.severity == "loud" || $0.severity == "soft") }
         let loud = alerts.filter { $0.severity == "loud" }.count
 
         var hourBuckets: [Date: Int] = [:]

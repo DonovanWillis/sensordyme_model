@@ -225,5 +225,20 @@ check(ModeSwitchState.state(for: "elderly_monitoring", activeBase: "driver_safet
                             notMonitoring: "x") == .inactive, "only the running mode carries it")
 check(notMonitoring.spokenValue == "Selected, not monitoring", "spoken")
 
+print("\nan unconfirmed status (stale health) is never the green check (M8.1):")
+let unconfirmed = ModeSwitchState.state(for: "driver_safety", activeBase: "driver_safety", customMonitoringActive: false,
+                                        pending: nil, deviceOnline: true, failure: nil, now: t0,
+                                        unconfirmed: "Status unknown — not updated for 45 s")
+check(unconfirmed == .activeUnconfirmed("Status unknown — not updated for 45 s"), "stale status: not .active")
+check(unconfirmed.isSelected && !(unconfirmed == .active), "still the selected mode")
+check(unconfirmed.spokenValue == "Selected, status unknown", "spoken")
+check(ModeSwitchState.state(for: "driver_safety", activeBase: "driver_safety", customMonitoringActive: false,
+                            pending: nil, deviceOnline: true, failure: nil, now: t0,
+                            notMonitoring: "Stopped", unconfirmed: "Status unknown")
+      == .activeNotMonitoring("Stopped"), "a reported failure/stop outranks unknown")
+check(ModeSwitchState.state(for: "elderly_monitoring", activeBase: "driver_safety", customMonitoringActive: false,
+                            pending: nil, deviceOnline: true, failure: nil, now: t0,
+                            unconfirmed: "x") == .inactive, "only the running mode carries it")
+
 print("\n\(failures == 0 ? "PASSED" : "\(failures) FAILED")")
 exit(failures == 0 ? 0 : 1)

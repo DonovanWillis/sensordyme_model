@@ -32,6 +32,10 @@ struct Device: Codable, Identifiable, Hashable {
     /// (DeviceStatus.swift, docs/APP_STATUS_CONTRACT.md). nil from a backend
     /// that predates it. Every monitoring indicator reads this, not `health`.
     var status: DeviceStatus? = nil
+    /// When the phone received the reply this came in (stamped by
+    /// `APIClient.devices()`), so every screen can tell a current reading from
+    /// an old one (ConnectionTruth). Not part of the JSON.
+    var receivedAt: Date? = nil
 
     enum CodingKeys: String, CodingKey {
         case id, name, online, health, monitoring, status
@@ -161,10 +165,32 @@ extension StatusTone {
 }
 
 extension Device {
+    /// What this reading says about the device now (ConnectionTruth): online
+    /// only with fresh telemetry in a current reply.
+    func presence(now: Date = .now, lastRefreshFailed: Bool = false) -> ConnectionTruth.Presence {
+        ConnectionTruth.presence(
+            ConnectionTruth.Reading(online: online, stale: status?.stale, lastSeen: lastSeen, receivedAt: receivedAt,
+                                    linkStale: status?.linkStale,
+                                    healthStale: status?.monitoringEvidenceStale,
+                                    healthAge: status?.healthFreshness?.ageS),
+            lastRefreshFailed: lastRefreshFailed, now: now)
+    }
+
+    /// Online and reporting, judged by ConnectionTruth. What every screen
+    /// passes where it used to pass the raw `online` flag, so a stale or
+    /// unconfirmed reading never renders as live anywhere.
+    func isLive(now: Date = .now, lastRefreshFailed: Bool = false) -> Bool {
+        presence(now: now, lastRefreshFailed: lastRefreshFailed).isOnline
+    }
+
     /// The monitoring state in words, from `status`. nil only for an online
     /// device behind a backend that predates the status contract.
     var monitoringPresentation: MonitoringStatusPresentation? {
-        MonitoringStatusPresentation.make(status: status, online: online)
+        monitoringPresentation(live: isLive())
+    }
+
+    func monitoringPresentation(live: Bool) -> MonitoringStatusPresentation? {
+        MonitoringStatusPresentation.make(status: status, online: live)
     }
 
     /// What custom rules do on the device right now: nothing, replace the
@@ -217,6 +243,9 @@ extension EventItem {
     /// Matches jupiter/explain.py's severity mapping, so the app and the
     /// explanation endpoint never disagree about how alarming something is.
     var severityStatus: SDStatus {
+        // An experimental observation (M8.4) is never an alert, whatever
+        // severity or type it carries: no alert colour, no notification.
+        if isExperimental { return .online }
         if ["fall", "on_floor", "safe_zone_exit", "zone_violation"].contains(type.split(separator: ":").first.map(String.init) ?? type) {
             return .alert
         }
@@ -292,7 +321,9 @@ struct Preset: Identifiable, Hashable {
                           .init(name: "teen_driver", title: "Teen Driver"),
                           .init(name: "long_haul", title: "Long Haul")]),
         Preset(name: "baby_monitoring", title: "Baby Monitoring",
-               subtitle: "Face covered, crying, movement", icon: "figure.child",
+               // presets.yaml's own description (M8.4): nothing here detects a
+               // covered face, and with no microphone nothing hears crying.
+               subtitle: "Presence, safe zones, stillness & frantic movement", icon: "figure.child",
                // Must match presets.yaml. "newborn" and "toddler" were offered
                // here and exist on no device — tapping them queued a variant
                // the device could never apply, which the backend then re-sent
@@ -301,7 +332,7 @@ struct Preset: Identifiable, Hashable {
                           .init(name: "nap_time", title: "Nap Time"),
                           .init(name: "play_area", title: "Play Area")]),
         Preset(name: "elderly_monitoring", title: "Elderly Monitoring",
-               subtitle: "Fall detection & inactivity", icon: "figure.fall",
+               subtitle: "Falls & unusual stillness", icon: "figure.fall",
                variants: [.init(name: "standard", title: "Standard"),
                           .init(name: "post_surgery", title: "Post-Surgery"),
                           .init(name: "active_senior", title: "Active Senior")]),

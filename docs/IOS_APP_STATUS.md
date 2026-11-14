@@ -1,7 +1,8 @@
 # iOS app status (ORYN EDGE)
 
-What every visible action in the iPhone app (`ios/`) does, as of branch
-`m6/ios-app` (2026-11-11). The rule this audit enforces: an action either
+What every visible action in the iPhone app (`ios/`) does, as of the M6
+audit (branch `m6/ios-app`, 2026-11-11), with the Mission 8 changes
+(2026-11-12) in the section below. The rule this audit enforces: an action either
 performs the real operation, shows an understandable error, or says the
 capability is not supported yet. Silent success is allowed only in demo mode
 (`MockAPI`, entered with "Try the demo" or `-orynDemo`), which every screen
@@ -14,6 +15,226 @@ screen says "Not supported by this server yet". **demo-only**: exists only in
 demo mode and is labelled simulated.
 
 Line numbers refer to `ios/Sources/` at the commit that added this file.
+
+## Mission 8 (Checkpoint F): what changed, and how it is checked
+
+### Presence comes from fresh device telemetry (ConnectionTruth.swift)
+
+ONLINE used to be the backend's `online` flag from whatever reply the screen
+last kept. It is now decided by `ConnectionTruth.presence` from three things:
+the device's own `last_seen` / `status.stale`, how old the reply carrying them
+is on the phone's clock (`Device.receivedAt`, stamped by `APIClient.devices()`),
+and whether the latest refresh failed.
+
+| Presence | When | Shown as |
+|---|---|---|
+| Online | reply ≤ 30 s old, `online`, not `status.stale`, `last_seen` within 30 s + 30 s clock tolerance | green ONLINE |
+| Stale | the reply says online but the telemetry is old (`status.stale`, or `last_seen` > 60 s ago: a cached or replayed reply) | amber STALE; card "No report for 2 minutes — showing its last report"; device screen banner "… may no longer be true" |
+| Offline | the backend says it has not reported | OFFLINE; "Last seen 5 minutes ago" |
+| Unknown | the refresh failed, or the reply is > 30 s old (polling paused, request hanging) | UNKNOWN; "Not updated for 45 seconds" |
+
+Every screen reads the same function: the device card and the "N online"
+summary (which used to count raw `online` flags even after a failed refresh),
+the device screen's presence pill, its monitoring pill (never "All clear" on
+telemetry that is not live), health and capability cards (hidden when not
+live), mode rows, rules, nodes, protection, the preset details and Ask Jupiter
+sheets, and the Connection doctor. A device the server no longer lists for the
+account says so instead of polling its last reading for ever.
+
+### Replies the app cannot use are said in words (ServerReply.swift)
+
+| Reply | Headline | Message |
+|---|---|---|
+| 4xx/5xx with FastAPI `detail` (string) | "The server refused the request" / "The server reported a problem" | the detail, trimmed to 280 characters; never if it is itself markup or JSON |
+| 422 validation list | "The server refused the request" | "The server couldn't accept that — name: field required." |
+| `{"detail": {...}}`, `{"error": ...}`, `{"message": ...}` | as above | that sentence |
+| HTML / plain text / empty error body | by status | 502/503/504 → gateway couldn't get an answer, try again in a moment; 500 → internal error; 404 uncoded → "Not supported by this server"; 403, 408, 413, 429 explained |
+| 200 with a web page | "Something else answered at this address" | Wi-Fi sign-in page or another app; check Settings → Server |
+| 200 empty | "The server's reply couldn't be read" | empty reply |
+| 200 broken JSON | "The server's reply couldn't be read" | unchanged (ReplyError.unreadable) |
+
+`getJSON`/`postJSON` (Ask Jupiter, explanations) used to let a raw `URLError`
+through ("Could not connect to the server."); they now use the same
+transport wording as every other request. Banners on the device list and
+device screen take their headline from the error, so a reply the server did
+send is never headed "Can't reach the server". Coded refusals from the device
+(`last_rejection.code`: `role_forbids_preset`, `unknown_node`,
+`invalid_setting`, `profile_fixed`, `firmware_unsupported`) and per-device
+preset reasons written for developers ("preset 'x' would stop
+driver_attention; allowed: …") are put into sentences
+(RefusalText, PresetAvailability.readableReason).
+
+A 401 while the app believes it is signed in ends the session with a reason,
+even when no token could be sent (it used to show "missing bearer token" on
+every refresh, for ever). The session token is read from the Keychain once
+and kept in memory, instead of being re-read for every request.
+
+### Capabilities and nodes (M8 DRIVER / NODES)
+
+`attention` (the driver's calibrated forward gaze) is titled "Attention" and,
+while STARTING, explained: "Calibrating to the driver — look ahead normally;
+usually done within 30 seconds" (amber hourglass, never red; it does not block
+activation). The status reason "attention: starting" reads "Attention:
+calibrating to the driver …". Calibrated, the row says "Calibrated to the
+driver's forward gaze". A node's `experimental_features` are listed under it
+as "Experimental: Flailing (off), Choking hazard (off)".
+
+### Notifications
+
+A tapped notification opens its own device; when that device is not on the
+account (or an old notification names none on a multi-device account) the
+app says "Couldn't open that alert" with the reason instead of opening the
+first device, which then ignored it. An alert the device screen can't find is
+its own banner, no longer headed "Can't reach the server" (which also turned
+the presence pill to Unknown).
+
+### Accessibility
+
+- 44 pt targets: Add device / Bluetooth header buttons, the device menu, the
+  preset ⓘ buttons, the Ask Jupiter send button, banner "Try again", the
+  Event history timeline dots (the drawn sizes are unchanged).
+- Large text: the presence and monitoring pills wrap instead of truncating to
+  "ON…"/"AL…"; the device screen's status row, the device card's pill and id,
+  and the Ask Jupiter caption/Examples stack at accessibility sizes; event
+  signals and mode-row reasons wrap in full.
+- Eyebrow labels (SDEyebrow, pills): `Font.caption.weight(.medium).monospaced()`
+  and no tracking on SDEyebrow. Three Simulator audit runs isolated the
+  findings: tracking caused "text clipped"; "Dynamic Type partially
+  unsupported" was the caption2 text style itself (pinned at 11 pt from Extra
+  Small to Large), not the font construction (`system(_:design:)`,
+  `.monospaced()` and `fontDesign` all gave the same finding). The labels are
+  1 pt larger at the default size as a result.
+- Contrast: unavailable-mode reasons and the sign-in "Welcome back" use
+  textSecondary. The audit waits 3 s for late content to settle, and contrast
+  findings on text under the translucent tab bar or the navigation bar's
+  scroll edge are re-measured with the element scrolled clear
+  (AccessibilityAuditUITests).
+- VoiceOver: presence is spoken with its meaning ("Stale data, no report for
+  2 minutes"); the Ask Jupiter title offers the Large Content Viewer.
+
+### Journeys added or changed (ios/UITests, scripts/sim/uitest_control.py)
+
+- 10 (Ask Jupiter): reveals the field clear of the tab bar, then requires the
+  keyboard and keyboard focus, and that focus survives the screen's refreshes,
+  then types into the focused element. What was found: with temporary
+  focus/lifetime logging, nine runs showed the field and the device screen
+  are never re-created by the 4 s refresh and focus holds until submit; one
+  run showed XCUITest briefly unable to resolve the field ~20 s after the tap
+  while it was still focused on screen; and the full run caught the same
+  error on the sign-in screen (journey 02) with `typeText` issued 0.46 s after
+  the tap: XCUITest waits for the app to go idle, not for focus, and SwiftUI
+  makes a tapped field first responder a beat later. The old journey typed
+  straight after the tap through a re-resolved element. Every journey that
+  types now taps, waits for keyboard focus (one more tap after 5 s), and types
+  into the focused element.
+- 24 (companion node): flips the switch by its knob; the nodes section is its
+  own accessibility element so the switch keeps its identifier.
+- The controller gives its own logins a separate rate-limit key (the backend
+  allows 10 logins per address per 5 minutes; it signs in once per launch).
+- 26 Stale telemetry: the proxy replays the last device list (`/mode?m=freeze`);
+  card, count and device screen go Stale together, never "All clear", and
+  recover together.
+- 27 Unreadable replies: `/mode?m=html|empty|error500|gateway` on the list,
+  and `error500` on `/v1/ai/configure` only (`&path=`), each with a readable
+  headline and message.
+
+## Mission 8.1: the UI-test suite is order-independent
+
+The M8 full run passed 26 of 27 with journey 03 (discovery) SKIPPED. Cause:
+XCTest runs test classes alphabetically, so `AccessibilityAuditUITests` ran
+first, and its setUp called `Stack.prepare()`, which claimed the single
+virtual device for the shared demo account; 03 found the device already
+claimed and skipped. The journeys also leaned on each other the other way
+("03 claims the device every later journey uses").
+
+Every test now starts from its own world. `Stack.fresh` (from the setUp of
+both test classes) calls the controller's `POST /fresh`, which stops the
+device and backend, deletes their data and starts a new backend and a newly
+provisioned device with a new account, then claims the device and waits for
+it to report ready (or leaves it unclaimed, for 03). About 13 s per test,
+2 s for 03.
+
+| Concern | How it is handled |
+|---|---|
+| Device pairing | a new device per test; claimed by the controller, or unclaimed for 03, which pairs it through Add device. 03 asserts the unclaimed start (it no longer skips) |
+| Account and auth state | a new account per test (`uitest-<n>@sensordyme.local`); every launch passes `-orynSignOut` and then `-orynSession` with a token from a real `/v1/login` to that test's backend. A new account also runs the app's own per-account reset (`AppState.claimLocalState`: paired camera, announced alerts, SMS number) |
+| Login limiter | the backend's limiters live in its process, which is replaced per test; the controller's own logins still use their own rate-limit key (`SENSORDYME_CLIENT_IP_HEADER`), the app's are limited as in production |
+| Event history | a new database per test; the controller's event count is no longer capped at 50 (it stopped growing, so a "more events than before" wait could never finish) |
+| Rules, modes, nodes, zones, Ask Jupiter drafts | a new database and a new device state directory per test; 24 now asserts the companion starts off instead of switching off one left by another journey |
+| Proxy faults | `/fresh` puts the proxy back to `pass` and listening, and clears the replay cache used by `freeze` |
+| Simulator state | before the run the script uninstalls the app and its runner and resets the Simulator keychain; each test's tearDown terminates the app |
+| Shared fixtures (Stack.swift) | stateless apart from the controller; only transport failures are retried, a controller error fails the test with its message; with the controller missing, a scripted run FAILS (`ORYN_UITEST_REQUIRE_STACK=1`) instead of skipping |
+| Parallel testing | off: one controller on fixed ports, one Simulator and one app install cannot serve two tests. XcodeGen's scheme leaves it off, and the script forces it off (`-parallel-testing-enabled NO` and `ParallelizationEnabled` in the .xctestrun) |
+| Order | any: `ORDER=random scripts/sim/ios_uitest.sh` writes `TestExecutionOrdering=random` into the .xctestrun; summary.md lists the tests in the order they ran |
+| Retries | none: `-retry-tests-on-failure` and `-test-iterations` are never passed. summary.md counts skipped and never-reported tests, and the script exits non-zero unless every test passed |
+
+Health freshness (M8.1): a new presence state, `monitoringStale(age)`
+(ConnectionTruth). The device is still polling, but its health sample is
+older than the backend's 30 s (`status.health_stale`). It is never online
+(`isOnline` is false and it is not counted in "N online"). The card shows the
+amber Stale pill and "Connected — monitoring status not updated for N". The
+device screen shows "Status unknown", never "All clear", and withholds the
+health and capability rows.
+
+Journey 28 (frozen health snapshot): `POST /health?freeze=1` sends SIGUSR1 to
+the virtual device (`sim/virtual_device.py`). Its uplink keeps polling with the
+last health sample, which is the same fault as
+tests/test_m81_health_freshness_sim.py. The journey waits past the threshold
+and checks, on the card: the spoken label "Connected, monitoring status not
+updated for N", the card line, no Online/All clear/Protecting, and "0 online".
+On the device screen it checks: presence Stale, monitoring "Status unknown",
+the banner "It is connected, but its monitoring status hasn't been updated
+for N, so whether it is watching is unknown", the health card withheld, and
+the capabilities "Unknown" notice. After `freeze=0` it checks that Online and
+"All clear" come back. The time the recovery took goes into the result bundle
+(`28_recovery_time`).
+
+The audit's re-check of text found under the bars was itself order- and
+timing-dependent. It scrolled with slow swipes that glided about 400 pt and
+overshot. It measured pixels while the page could still be moving, parked
+text at the band's edge inside the tab bar's blur, followed element handles
+that a lazily built list re-binds to other rows, and read each later finding
+at its pre-scroll position. It now drags the page by the exact distance that
+centres the flagged text, with no glide. It measures the page's real
+displacement from two accessibility snapshots, finds the text by label where
+it must now be, and audits it on a still screen. A failing re-check saves the
+screenshot it measured. Journeys tap an element only once its frame has
+stayed put for a second: XCUITest resolves a tap 0.6 s before it synthesizes
+it, and content arriving late above the target once made journey 08's tap
+miss.
+
+Runs (`scripts/sim/ios_uitest.sh`, iPhone 17 Pro Simulator, each run one
+xcodebuild invocation with no retries; evidence in
+`~/sensordyme-audit/2026-11-10/m81-evidence/ios/`):
+
+| Run | Commit | Order | Result |
+|---|---|---|---|
+| pre-merge | 71e1745 | alphabetical (audits first) | 27/27 |
+| A | 3e52700 (+ health freshness, journey 28) | alphabetical | 26/28: both audits failed in the re-check (fixed above) |
+| B | f41bea2 | alphabetical | 27/28: journey 08's tap missed (fixed above) |
+| C | f22564e | alphabetical | 28/28 |
+| D | f22564e | alphabetical (random was asked for; the script missed the build's format-1 .xctestrun, fixed) | 27/28: journey 06's Resume tap changed nothing (no resume reached the device) |
+| E | f22564e build (scripts b4aa2c5) | random | 26/28: 06 (reveal overshoot), 16 (outage-window race), both fixed |
+| F | 72aa192 | alphabetical | 28/28 |
+| G | 72aa192 | random | 28/28 |
+
+Runs F and G, back to back on the same build, each passed every test
+(both audits and journeys 01–20 and 23–28) in one invocation with no
+retries. Journey 28's recovery took 13 s (F) and 8 s (G) after the thaw.
+
+`reveal()` in the journeys used to swipe up only, and each swipe glided
+about 400 pt. In the stopped-device layout one swipe could carry the Resume
+button from below the window to above it: the tap then hit the navigation
+bar (run D), or the button was never reachable again (run E). It now drags
+the page by the exact distance that centres the element between the
+navigation bar and the tab bar, in either direction and with no glide. An
+element that dragging cannot move (a sheet's pinned action bar, the end of
+a page) is taken where it is if it can be hit. Journey 16 no longer waits
+for "All clear" before the scripted outage. That state fits only in the gap
+between the restarted device's first report and the outage being noticed,
+and run E's device made its first report 1 s before the outage.
+
+<!-- M81-RESULTS -->
 
 ## Screen-by-screen audit
 
@@ -181,7 +402,13 @@ Debug launch flags (DEBUG builds only, DebugLaunch.swift): `-orynDemo`,
 ## Tests
 
 `bash ios/Tests/run.sh` runs the Foundation-only logic tests (each
-`<Name>Tests.swift` is concatenated with `Sources/<Name>.swift`). New in M6:
+`<Name>Tests.swift` is concatenated with `Sources/<Name>.swift`). New in M8:
+`ConnectionTruthTests` (presence from telemetry age, reply age and refresh
+outcome; the summary count), `ServerReplyTests` (every reply shape to a
+headline and sentence), and additions to `NotificationPolicyTests` (routing),
+`PresetLibraryTests` (developer-worded reasons), `DeviceStatusTests`
+(attention calibrating) and `PerceptionStatusTests` (starting verdict,
+experimental features, coded refusals). New in M6:
 
 - `PresetLibraryTests`: catalog and per-device decoding (lenient, lossy),
   availability reasons per code, validation never overstated, the
@@ -212,5 +439,6 @@ Debug launch flags (DEBUG builds only, DebugLaunch.swift): `-orynDemo`,
 - Shop has no payment; orders are requests.
 - Push alerts while the app is closed go through ntfy (no APNs without a paid
   Apple Developer membership).
-- A UI test target does not exist. Verification is the logic suite plus a
-  Simulator build and a demo-mode launch smoke test.
+- XCUITest journeys (ios/UITests) run the real app in the Simulator against
+  the real backend and the virtual device: `scripts/sim/ios_uitest.sh`. They
+  need the Simulator, so they are not part of `make verify-release`.

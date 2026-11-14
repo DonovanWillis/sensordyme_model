@@ -41,7 +41,7 @@ modules:
     uses: [pose]
     source: modules/fall_detection.py (MediaPipe Pose on every frame)
   baby_monitoring:
-    uses: [objects, pose]                 # pose: enable_pose (default true) -- flailing, choking_hazard
+    uses: [objects, pose]                 # pose: enable_pose (default false since M8; experimental) -- flailing, choking_hazard
     source: modules/baby_monitoring.py
   occupancy:
     uses: [objects]
@@ -90,7 +90,10 @@ monitoring_nodes:
       Drowsiness, gaze and phone events are exercised on the virtual device and
       in unit tests; no in-cabin event-level evidence exists. behavior_v2
       (hand-phone interaction, long glances, glance budgets, gaze zones) is
-      experimental and off by default.
+      experimental and off by default. M8.4: the composite risk score
+      (high_risk, elevated_risk) and erratic_hand_movement are EXPERIMENTAL
+      observations -- logged, never audible or pushed without an explicit owner
+      opt-in -- and the M8.4 behaviour engine's verdicts run in shadow only.
   elderly_monitoring:
     kind: preset
     preset: elderly_monitoring
@@ -249,8 +252,14 @@ models:
     task: face_landmarks
     artifacts:
       # Bundled inside the mediapipe==0.10.14 wheel; refine_landmarks=True
-      # selects the attention model. Hashes are of the macOS arm64 wheel's
-      # copies (2026-11-11); the Pi's aarch64 wheel copies are not yet hashed.
+      # selects the attention model. The same bytes ship in the macOS arm64
+      # wheel (2026-11-11, m84 evidence) and in the Pi's cp311 aarch64 wheel
+      # (whose own sha256 is pinned in requirements-device.lock; extracted
+      # 2026-11-13, m85 evidence mediapipe_tflite_sha256_aarch64_wheel.txt), so
+      # one pin per file serves both platforms. Verified at install (staged
+      # release) and at every boot (core/model_registry.py
+      # verify_bundled_artifacts; a mismatch refuses that graph and reports
+      # the capability impaired). Same for the hands and pose cards below.
       - path: mediapipe/modules/face_detection/face_detection_short_range.tflite
         sha256: "bbff11cebd1eb27a1e004cae0b0e63ec8c551cbf34a4451148b4908b8db3eca8"
         size: 229714

@@ -2,9 +2,15 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+import uuid
+from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from typing import Optional
+
+
+def new_event_id() -> str:
+    """A fresh event identity: 32 lowercase hex characters (uuid4)."""
+    return uuid.uuid4().hex
 
 
 @dataclass(frozen=True)
@@ -23,6 +29,11 @@ class Event:
         contributing_signals: Optional free-text summary of what fed this event (e.g.
             "gaze_off + phone + hand_overlap"), for CSV analyzability. Empty string
             (the default) for modules that don't populate it.
+        event_id: This occurrence's identity, minted once when the Event is built
+            (M8.3, docs/EVENT_PIPELINE.md). The alert policy records what it did
+            with the event under this id, and the uplink sends it as `event_key`,
+            the key the backend stores the event under exactly once. Not part of
+            equality or repr: two Events with the same fields still compare equal.
     """
 
     timestamp: datetime
@@ -31,6 +42,7 @@ class Event:
     confidence: Optional[float]
     module_name: str
     contributing_signals: str = ""
+    event_id: str = field(default_factory=new_event_id, compare=False, repr=False)
 
     @staticmethod
     def now(

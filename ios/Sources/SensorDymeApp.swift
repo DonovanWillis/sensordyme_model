@@ -50,6 +50,10 @@ struct RootView: View {
                     state.signIn(AuthResponse(token: session.token, email: session.email))
                 }
                 if DebugLaunch.demo && !state.isSignedIn { state.enterDemo() }
+                if let feed = DebugLaunch.deviceFeed {
+                    state.deviceLocalURL = feed.url
+                    state.deviceToken = feed.token
+                }
                 if let requested = DebugLaunch.tab.flatMap(Tab.init(rawValue:)) { tab = requested }
             }
             .onChange(of: scenePhase) { _, phase in

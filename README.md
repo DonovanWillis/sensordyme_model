@@ -1,50 +1,704 @@
 # SensorDyme
 
-A modular edge computer-vision platform. One codebase, two targets:
+A modular edge computer-vision platform built around a driver-safety camera. One
+codebase, every part of the product:
 
-- **Raspberry Pi 5 + Camera Module 3** — the production target, running headless as a systemd service.
-- **Mac (M3 / any macOS)** — the dev target, using your built-in webcam, with a live debug window.
-
-The platform auto-detects which one it's on at startup (by trying to import `picamera2`) — no flags, no branching config.
+- **the device** — Raspberry Pi 5 + AI HAT+ (Hailo-8L) + Camera Module 3 Wide
+  NoIR, running headless as a systemd service (`main.py`, `core/`, `modules/`,
+  `services/`);
+- **the backend** (`cloud/`) — accounts, device pairing, alert relay and remote
+  commands; runs on a Mac as a LaunchAgent or hosted (Fly.io);
+- **the iPhone app** (`ios/`) — pairing, live view, presets, alert history;
+- **a Mac dev profile** that runs the same pipeline on a webcam.
 
 > **Detector: DAMO-YOLO on the Hailo-8L. No copyleft in the device image.**
 > The device runs `damoyolo_tinynasL20_T` (Apache-2.0) as a checksum-pinned Hailo
-> `.hef` — Model Zoo v2.15.0, sha256 `e69136d3…`, verified at install by
-> `setup_pi.sh`, which refuses to install a mismatch. `requirements-device.txt`
-> ships neither `ultralytics` nor `torch`, and `make deploy` excludes `*.pt` and
-> `*.hef` so a model can only arrive through pinned provisioning.
->
-> **This replaced an AGPL-3.0 dependency.** Until Phase 4 the detector was
-> Ultralytics YOLO11n, whose AGPL network clause is triggered by conveying
-> inference over a network — which this device does, via `/stream` and its event
-> uplink. That migration is complete: `core/detectors.py` reaches `ultralytics`
-> only as an optional *developer-machine* fallback, inside a `try`, and it is
-> absent from the device entirely. `docs/LICENSING.md` carries the full analysis
-> and the remaining open items; `docs/PHASE5_DEMO_READINESS.md` §8 records what
-> was actually verified on the hardware; `docs/THIRD_PARTY_NOTICES.md` is the
-> attribution file for what the device image contains — **it is incomplete, and
-> the Apache-2.0 §4(d) attribution obligation is not yet satisfied.**
->
-> This is a factual account of dependency licences, not legal advice — get counsel
-> before a commercial release.
+> `.hef` — Model Zoo v2.15.0, sha256 `e69136d3…`, verified at install **and at
+> load** (a mismatch is refused, fail closed). `requirements-device.lock` ships
+> neither `ultralytics` nor `torch`; every install path is hash-pinned and
+> wheels-only, and a model can only arrive through pinned provisioning.
+> `docs/LICENSING.md` carries the full analysis. This is a factual account of
+> dependency licences, not legal advice — get counsel before a commercial release.
+
+---
+
+# Quick Start — SensorDyme + iPhone
+
+For a device that has already been through first-time setup (below):
+
+1. **Power on SensorDyme** (plug it in). It boots on its own: the service
+   starts, saved Wi-Fi reconnects, the camera and the pinned detector load, and
+   the preset, zones and rules you last chose are restored. Nothing to press.
+2. **Open the SensorDyme app** on your iPhone. You stay signed in; the app
+   finds its server again by itself and your device appears in *Your Devices*
+   with its real, current state within roughly 30 seconds of the Pi booting.
+3. **Confirm the status is genuine.** The device card shows the true monitoring
+   state ("All clear" appears only when the device itself reports ready and
+   fresh — never from stale data). A device that is still booting shows as
+   starting; a problem names its reason.
+4. **Review or change the mode** from the device screen (Driver Safety and its
+   variants; refusals are explained). A deliberate *Stop monitoring* is never
+   persisted — after any reboot the device comes back protecting.
+5. **Watch the live feed** (phone on the same Wi-Fi as the device) and open the
+   activity timeline for alert history.
+
+No terminal, no SSH, no reconfiguration, no re-pairing, no re-entering Wi-Fi.
+If any of that seems needed, something is wrong — see
+[Phase 9 — Troubleshooting](#phase-9--troubleshooting).
+
+**First time?** The one-time setup below takes an afternoon: assemble the
+hardware, flash the Pi, install the verified release, install the app on your
+iPhone, pair, verify. After that, the loop above is the whole experience.
+
+---
+
+# Complete Setup Guide — From Unboxing to iPhone Monitoring
+
+This is the authoritative zero-to-ready path. Follow the phases in order. Every
+command here is either a standard OS procedure or a script that exists in this
+repository; commands that can only run on the physical Pi are marked **(Pi)**.
+Nothing in this guide has been run on the real hardware yet — hardware-dependent
+results are marked **NOT YET VERIFIED** until the device arrives and
+`docs/SUNDAY_DEVICE_ACTIVATION.md` is executed. The software behind every step
+is verified at release `f63ddd9`: the full Python suite (3,956 passed, 0
+failed), every software acceptance suite and the 30-journey matrix
+(simulated), and the 28 iPhone UI journeys (26 in the full run; the 2 that
+failed while the Mac was overloaded passed on a quiet rerun).
+
+### How the pieces talk (read this once)
+
+```
+ iPhone app ──(HTTPS/HTTP, accounts+status+events+commands)──▶  backend  ◀──(outbound only)── Pi device
+ iPhone app ──(MJPEG over your Wi-Fi, direct, token-gated)──────────────────────────────────▶ Pi device
+ iPhone app ──(Bluetooth LE, first-time Wi-Fi setup only)───────────────────────────────────▶ Pi device
+```
+
+- **The backend is required** for pairing, status, history and remote commands.
+  Two supported homes:
+  - **A Mac on your home network** (the verified path):
+    `./scripts/install_backend_mac.sh` installs it as a LaunchAgent that
+    survives reboots and advertises itself over mDNS. The Mac then acts as the
+    home server appliance — it is not needed *near* the device, just powered on
+    and on the same network. Note it starts at login, so the Mac should
+    auto-login or stay logged in.
+  - **Hosted (Fly.io)** for status and alerts away from home: `fly.toml` +
+    `cloud/README.md` give real HTTPS with no app changes. The device reaches
+    out only (no inbound ports, NAT-friendly).
+- **Live video never goes through the backend.** The app streams directly from
+  the device over your Wi-Fi, so the live feed needs the phone and the device
+  on the same network. Away from home you still get status, alerts and history
+  (with a hosted backend); you do not get live video. Frames never leave the
+  device otherwise — see `docs/PRIVACY.md`.
+- **The device needs no development machine.** Once installed it talks to its
+  configured backend by name (`cloud.base_url`) and runs fully standalone when
+  offline: capture, inference, local buzzer alerts and the on-device dashboard
+  all continue, and events queue on disk until the uplink returns.
+
+### Development machines (not part of the product)
+
+These exist for building and validating SensorDyme. **None of them is required
+for ordinary operation** — the finished camera needs only power, Wi-Fi, a
+running backend, and your iPhone.
+
+| Machine | Role |
+|---|---|
+| **MacBook Pro** | development controller: Xcode/iPhone installs, release builds, SSH orchestration during install sessions, and (optionally) the home of the backend LaunchAgent |
+| **oryn** (Windows desktop, RTX 4060) | primary CUDA compute worker for model training/evaluation, via `~/sensordyme-fleet/sdrun` |
+| **quantcompute** (ASUS laptop, RX 7700S) | secondary evaluation worker (DirectML) |
+
+---
+
+## Phase 1 — Hardware assembly
+
+### Parts
+
+Street-price estimates, not quotes. The AI accelerator was added to the build
+after the original sub-$200 list; the realistic total is now **~$250**.
+
+| # | Part | Est. | Why this one |
+|---|---|---|---|
+| 1 | **Raspberry Pi 5 (4 GB)** | $60 | The compute. 4 GB, not 8/16: this workload is not RAM-bound. |
+| 2 | **Raspberry Pi AI HAT+ 13 TOPS (Hailo-8L)** | $70 | Runs the pinned DAMO-YOLO detector. There is deliberately no CPU fallback on the device (`docs/ACCELERATOR.md`) — without the HAT the device boots degraded and says so. |
+| 3 | **Camera Module 3 NoIR (Wide) + IR illuminator + Pi 5 camera cable (22-pin → 15-pin)** | $47 | Night vision is when drowsiness detection matters most; Wide FoV because the camera won't be dead-centre. **The adapter cable is not optional**: the Pi 5 has 22-pin mini camera connectors and the camera ships with a 15-pin cable that won't fit. IR: 850 nm is brighter with a faint red glow, 940 nm is invisible but dimmer; prefer a USB/5 V illuminator. |
+| 4 | **Active Cooler (official)** | $5 | Sustained CV inference throttles an uncooled Pi 5, especially in a car. |
+| 5 | **High-endurance microSD, 64 GB** | $13 | Abrupt power loss is the #1 field failure; dashcam-rated cards are built for it. 64 GB is plenty — frames are never written to disk. |
+| 6 | **USB-C PD car charger (27 W+, must state 5V⎓5A) + e-marked cable** | $26 | Chargers that top out at 5 V/3 A cause throttling and brownouts under CV load. Verify later with `vcgencmd get_throttled` (`0x0` = healthy). |
+| 7 | **Active piezo buzzer, 2-wire, rated for 3.3 V logic, + 2 female-female jumper wires** | $3 | The audible alert (`core/alerts.py` GPIOBuzzerSink). **Must be 3.3 V-compatible** — see the wiring rule below. |
+| 8 | **Dashcam-style case + heavy-duty suction mount (¼-20)** | $29 | A cheap mount vibrates loose and un-aims the camera. 3D-printing: PETG/ABS/ASA only (never PLA — dashboards exceed 70 °C), open holes in front of camera and IR LEDs, real airflow for the cooler, and rigid — a flexing mount invalidates the head-pose calibration. |
+
+### Assembly order
+
+No soldering. Do all of it **before first power-on**.
+
+1. **Clip the Active Cooler onto the Pi 5** and plug its fan lead into the fan
+   connector.
+2. **Mount the AI HAT+** on the GPIO stacking header and standoffs it ships
+   with, and connect its **PCIe FFC ribbon to the Pi's PCIe connector, locked
+   at both ends**. The stacking header passes the 40-pin GPIO through the HAT
+   so the buzzer pins stay reachable. ⚠ **Confirm at assembly:** that your
+   HAT+ kit includes the taller standoffs/header for use above the Active
+   Cooler, and that pins 9/11 are accessible once seated — if not, stop and
+   resolve the stacking before continuing.
+3. **Connect the camera**: 22-pin end into one of the Pi 5's two camera
+   connectors (either works; the software finds it), 15-pin end into the
+   camera. **Ribbon orientation:** the exposed metal contacts must face the
+   connector's own contacts at each end. ⚠ **Confirm at assembly** against
+   Raspberry Pi's official Camera Module 3 / Pi 5 camera-cable guide (or the
+   diagram shipped with the adapter cable) — this repository does not pin the
+   per-connector orientation, and it has not been checked on this hardware
+   yet. The latch lifts, the ribbon seats fully and squarely, the latch
+   closes. A reversed ribbon shows no camera; re-seat with the power off only.
+4. **Wire the buzzer**: positive lead → **GPIO 17 (BCM 17 = physical pin 11)**,
+   negative lead → any ground pin (physical **pin 9** is adjacent). This
+   matches `gpio_buzzer_pin: 17` in `config.yaml`.
+   **The electrical rule (non-negotiable):** Pi GPIO is **3.3 V**, a few mA.
+   - An **active piezo buzzer rated for 3 V/3.3 V logic at low current** may be
+     driven directly from the pin — this is the intended part.
+   - **Never connect a 5 V-only buzzer, or anything inductive or
+     higher-current (speakers, relays, motors), directly to a GPIO pin.** A
+     part like that needs a transistor driver off the 5 V rail.
+   - ⚠ **Confirm at assembly:** if your buzzer's logic rating or current draw
+     is unmarked or unknown, treat the wiring as an open decision — the
+     hardware checklist (`docs/MONDAY_OPERATOR_CHECKLIST.md` §1) makes "5 V
+     buzzer driven straight from GPIO" an explicit do-not-power-on stop.
+5. **Insert the flashed microSD** (Phase 2), close the case, fit the mount.
+6. **Aim** the camera at where the driver's face will be. You will calibrate
+   for the exact mounting angle later — off-centre is fine, loose is not.
+
+### Verify before supplying power
+
+- HAT seated flat, PCIe ribbon locked at both ends, no bent GPIO pins.
+- Camera ribbon fully seated at both ends, latches closed, contacts oriented
+  as above.
+- Buzzer on pins 11 (GPIO 17) and 9 (GND) — and rated for 3.3 V (the rule above).
+- Cooler fan lead connected; nothing blocking airflow.
+- Power supply label says **5V⎓5A** (or it's the official 27 W PSU for bench
+  setup).
+
+Then power on. First-boot electrical health check **(Pi)**:
+`vcgencmd get_throttled` → `throttled=0x0`.
+
+---
+
+## Phase 2 — Prepare the Raspberry Pi
+
+### Operating system
+
+- **Raspberry Pi OS Bookworm, 64-bit (aarch64)** — this is the release's
+  compatibility floor (Python 3.11, cp311 wheels, HailoRT 4.x from apt).
+  32-bit or older OS versions will not run this release.
+- Storage: the high-endurance microSD from the parts list.
+
+### If the device may already contain an installation — inspect first
+
+**Do not reflash a card you haven't looked at.** Boot it (or mount the card)
+and inspect read-only **(Pi)**:
+
+```bash
+cat /etc/os-release | head -2            # which OS is on it
+ls ~/sensordyme 2>/dev/null && echo "existing install present"
+ls ~/sensordyme.releases 2>/dev/null     # staged-release layout already adopted?
+systemctl status sensordyme 2>/dev/null | head -5
+cat ~/sensordyme/config.yaml >/dev/null 2>&1 && echo "config present (do NOT copy it anywhere public: it can hold the device key)"
+```
+
+- **Existing install found** → take backups before anything else, then use the
+  **upgrade-in-place** path (Phase 3B). Backup procedure: runbook sections E1
+  (tree + config archive, hash-verified off-device) and E5 (full SD image) in
+  `docs/MONDAY_RUNBOOK.md`; the clean-install-vs-upgrade decision criteria are
+  E6. Nothing below E-backups should modify a device with history on it.
+- **Blank or expendable card** → clean install (next).
+
+### Clean install
+
+1. **Raspberry Pi Imager** (on the Mac) → *Raspberry Pi OS (64-bit)* (Bookworm)
+   → your SD card.
+2. In the Imager's settings gear before writing — this is the secure way to
+   enable access, instead of enabling anything after boot:
+   - hostname: something you'll recognise (e.g. `sensordyme-pi`);
+   - **enable SSH with a public key** (not password auth);
+   - your Wi-Fi SSID/password (so the first session needs no cable) and locale.
+3. Boot the Pi on it.
+
+### Find it on the network and confirm the OS
+
+From the Mac:
+
+```bash
+ping sensordyme-pi.local         # mDNS: Raspberry Pi OS advertises <hostname>.local
+ssh <user>@sensordyme-pi.local   # your Imager-configured user and key
+```
+
+On the Pi, confirm the floor before installing anything:
+
+```bash
+grep VERSION_CODENAME /etc/os-release   # bookworm
+uname -m                                # aarch64
+python3 --version                       # 3.11.x
+```
+
+---
+
+## Phase 3 — Install SensorDyme software
+
+Everything a device needs — including one with no internet — comes from **one
+verified directory**: the transfer package.
+
+### The five entrypoints (there are no others)
+
+| Step | One command |
+|---|---|
+| Build the verified package (Mac) | `make transfer-package REF=<release commit>` |
+| Preflight (read-only, Pi) | `scripts/hw_validation/sunday_preflight.py` |
+| Install / update (Pi) | `setup_pi.sh` (first time) · `release_guard.py stage/activate` or `make deploy` (updates) |
+| Post-install verification | `release_guard.py status --wait` + the preflight again |
+| Rollback | `release_guard.py switch --to previous` (or `make deploy-rollback`) |
+
+### 3.0 The package
+
+The current tested release is **`f63ddd9454f2`** (commit
+`f63ddd9454f27a387623722fb948140dce61912d`). Its package is already built at
+`~/sensordyme-release/transfer-f63ddd9454f2/` on the MacBook; rebuild it for
+any release with `make transfer-package REF=<commit>` (deterministic: the same
+commit yields byte-identical content). It contains the release bundle +
+per-file sha256 manifest, all 40 device wheels (hash-locked, for offline
+install), the production `.hef` (verified against its pin before packing), a
+config template, the install scripts, and a generated **`INSTALL.md` that pins
+the exact commands and hashes for that release** — when in doubt, that file
+wins over this section.
+
+Verify the package, then copy it to the Pi:
+
+```bash
+# Mac
+cd ~/sensordyme-release/transfer-f63ddd9454f2 && shasum -a 256 -c SHA256SUMS   # every line: OK
+scp -r ~/sensordyme-release/transfer-f63ddd9454f2 <user>@sensordyme-pi.local:transfer
+```
+
+### 3A. Fresh device (no SensorDyme install yet)
+
+**(Pi)** — from the copied package directory:
+
+```bash
+cd ~/transfer
+sha256sum -c SHA256SUMS                                  # verify again, on the device
+mkdir -p ~/sensordyme && tar -xzf bundle/sensordyme-f63ddd9454f2.tar.gz -C ~/sensordyme
+mkdir -p ~/sensordyme/models && cp models/*.hef ~/sensordyme/models/
+cp -r wheels ~/sensordyme.wheels                         # enables the offline install
+cd ~/sensordyme && bash setup_pi.sh
+```
+
+What `setup_pi.sh` does (and what you should see):
+
+- installs apt packages: picamera2/libcamera, BLE, mDNS, alsa-utils, and
+  **`hailo-all`** (HailoRT + drivers). If `hailo-all` cannot install it says so
+  loudly — the device would boot degraded with no detector;
+- creates the venv and installs **only the hashed lock**
+  (`pip install --require-hashes --only-binary=:all: -r
+  requirements-device.lock`) — no package code runs at install time;
+- **verifies the model** against
+  `e69136d3ebf3cc8ebaf3da5417a59962b139f3d3d67d715e9a9b1ae10963960e` and
+  refuses a mismatch; MediaPipe's bundled `.tflite` files are verified too
+  (and re-verified at every boot, fail closed);
+- installs and starts `sensordyme.service` (systemd: starts on every boot,
+  `Restart=always`, watchdog, bounded reboot budget).
+
+Then adopt the staged-release layout **once** (this is what makes every future
+update atomic and self-rolling-back):
+
+```bash
+sudo systemctl stop sensordyme.service
+python3 ~/transfer/install/release_guard.py adopt --root ~/sensordyme
+sudo systemctl start sensordyme.service
+```
+
+Check it's alive:
+
+```bash
+sudo systemctl status sensordyme     # active (running)
+journalctl -u sensordyme -f          # live logs
+```
+
+### 3B. Update an existing (adopted) device — the normal update
+
+From the Mac with this repo: one command, which stages beside the live release,
+verifies every file against the manifest, switches with a single atomic
+`rename(2)`, and **rolls itself back** (no network, no pip) if the new release
+doesn't stay healthy:
+
+```bash
+make verify-release REF=<commit>       # must print: RELEASE VERIFICATION: PASS
+make deploy DEVICE=<user>@sensordyme-pi.local DIR=sensordyme REF=<commit> ROLE=driver_safety
+```
+
+By hand with only the package (e.g. no internet on the Pi): the exact staged
+commands, with this release's hashes filled in, are in the package's
+`INSTALL.md` §B. A deploy interrupted by a power cut leaves a `pending.json`
+that the next deploy refuses until resolved — `docs/DEPLOYMENT.md` §4 covers
+both resolution commands.
+
+**Rollback (any time):**
+
+```bash
+# on the device, no Mac needed:
+python3 ~/sensordyme/scripts/release/release_guard.py switch --root ~/sensordyme --to previous --user $(id -un)
+# or from the Mac:
+make deploy-rollback DEVICE=<user>@sensordyme-pi.local DIR=sensordyme
+```
+
+Device state (`config.yaml`, calibration, events, the model) lives outside the
+releases and survives every switch in both directions.
+
+---
+
+## Phase 4 — Configure and verify the AI camera
+
+### One read-only command checks everything
+
+**(Pi)** — from the installed tree (the preflight ships with the release):
+
+```bash
+~/sensordyme/.venv/bin/python ~/sensordyme/scripts/hw_validation/sunday_preflight.py \
+    --install-dir ~/sensordyme --expect-commit f63ddd9454f27a387623722fb948140dce61912d
+```
+
+It writes one JSON+Markdown summary and prints the next manual step. The checks
+and their expected answers (each is **NOT YET VERIFIED** on hardware until it
+actually passes on your Pi):
+
+| Check | What "good" looks like |
+|---|---|
+| Camera | `rpicam-hello --list-cameras` lists `imx708_wide_noir` |
+| Hailo-8L | `lspci` shows "Hailo Technologies"; `/dev/hailo0` exists; `hailortcli scan` finds one device |
+| Production model | sha256 of `models/damoyolo_tinynasL20_T.hef` equals the pin `e69136d3…` |
+| Decoder config | `pins` check: config / setup_pi.sh / model registry agree, decoder **`legacy`** (do not switch it — the alternative decoder is a measured candidate awaiting on-device INT8 parity, `docs/DECODER_CANDIDATE.md`) |
+| Facial landmarks | MediaPipe `.tflite` files match their registry pins (also enforced at every boot) |
+| Service | unit active, zero restarts, correct working directory |
+| Health truth | `/api/health` reports ready; accelerator `running on the Hailo-8 accelerator` with rising inference count; no invariant violations |
+
+### Role and monitoring
+
+The device ships with `role: driver_safety` and `module: driver_attention` in
+`config.yaml` — the production configuration; nothing to select. The role is a
+safety floor: presets that would stop driver monitoring are refused by design
+(you'll see the refusal, with its reason, if you try from the app). Confirm
+monitoring is genuinely operational **(Pi)**:
+
+```bash
+TOKEN=<dashboard token>   # set in Phase 6
+curl -s -H "X-Device-Token: $TOKEN" localhost:8899/api/health | python3 -m json.tool | head -40
+# monitoring state "ready", protection "protecting", camera "capturing", accelerator "ok"
+```
+
+The first ~10 seconds after a start calibrate the driver's eye baseline and
+neutral head pose; the state is `starting` until then, and the app never says
+"All clear" before the device itself reports ready. After mounting the camera
+in its final position, recalibrate once while looking at the road normally:
+
+```bash
+sudo systemctl stop sensordyme
+cd ~/sensordyme && sudo -u $(id -un) .venv/bin/python main.py --no-display --recalibrate   # Ctrl-C after "calibration saved"
+sudo systemctl start sensordyme
+```
+
+### Buzzer test, safely
+
+The buzzer is loud at 50 cm — warn anyone nearby, then run the dedicated stage
+in a stopped window (it stops monitoring, runs every production alert pattern,
+and always restarts the service):
+
+```bash
+~/sensordyme/.venv/bin/python ~/sensordyme/scripts/hw_validation/sunday_preflight.py \
+    --install-dir ~/sensordyme --expect-commit <commit> --with-stopped-stages --with-buzzer
+```
+
+A person must actually hear each pattern — the stored event field `output:
+sounded` means "the GPIO pattern was driven", never "someone heard it". **No
+audible alert is a hard stop** (the product's core claim), not a tuning issue.
+
+**Model policy:** the production `.hef` + `legacy` decoder is the only shipped
+configuration. Experimental artifacts (the EXP-08 3-class model) are registry-
+marked experiment-only and are not promoted by any install path. No INT8
+accuracy or real-camera performance number is claimed anywhere until the
+on-device stages above produce one.
+
+---
+
+## Phase 5 — Install the iPhone app
+
+Personal Apple ID, free personal team, no App Store or paid membership needed.
+Full detail and current blockers: `docs/IOS_DEVICE_BUILD.md`. One-time, ~5
+minutes of clicking plus the build:
+
+1. **Sign into Xcode**: Xcode → Settings… → Accounts → `+` → your Apple ID
+   (the one that owns the personal team in `ios/project.yml`). This is the one
+   step no script can do.
+2. **Connect the iPhone by USB cable** (first time; Wi-Fi works after). Unlock
+   it and tap **Trust This Computer**.
+3. **Developer Mode** on the phone: Settings → Privacy & Security → Developer
+   Mode → on → the phone restarts → confirm. (If the switch isn't visible yet,
+   run step 4 once — the first install attempt makes it appear.)
+4. **Build and install** — either open `ios/SensorDyme.xcodeproj` in Xcode,
+   pick your iPhone in the run-destination bar, press **Run (⌘R)** — or from
+   the terminal:
+
+   ```bash
+   cd ios && xcodegen generate && cd ..
+   xcodebuild -project ios/SensorDyme.xcodeproj -scheme SensorDyme \
+     -configuration Debug -destination 'id=<your iPhone's UDID>' \
+     -derivedDataPath /tmp/sd-device-dd -allowProvisioningUpdates build
+   xcrun devicectl device install app --device <UDID> \
+     /tmp/sd-device-dd/Build/Products/Debug-iphoneos/SensorDyme.app
+   ```
+
+   Signing is already configured in `ios/project.yml` (automatic signing); on a
+   first build Xcode mints the provisioning profile itself once you're signed
+   in with the phone attached.
+5. **Trust the developer** on the phone at first launch: Settings → General →
+   VPN & Device Management → trust your certificate.
+6. **Permissions the app asks for, when it first needs them:** Local Network
+   (to find your server and camera — declining makes discovery impossible, and
+   the app says so), Bluetooth (only when you open device setup), and
+   Notifications (when you first open a device's screen; alerts are local
+   notifications — no push service to configure).
+
+**Know it's the real device build:** it's running on your physical iPhone (the
+Simulator can't do Bluetooth), and the release-configuration audit
+(`ios/Tests/release_config_audit.sh`) proves a Release product carries no debug
+affordances or simulated transports.
+
+**Free-team expiry:** a personal team's app signature lasts **7 days**. After
+that the icon stays but won't launch — plug in (or share Wi-Fi with a paired
+Xcode) and press Run again. Your session, paired camera and settings all
+survive reinstalls; only deleting the app loses them.
+
+---
+
+## Phase 6 — Pair SensorDyme with your iPhone
+
+### Two different codes — don't mix them up
+
+| Code | Looks like | Comes from | Used for |
+|---|---|---|---|
+| **Claim code** | `1A2B-3C4D-5E6F` (hex) | printed once by the backend's `create-device` — "the card in the box" | adding the device to **your account** |
+| **Setup code** | `XXXX-XXXX-XXXX` (letters+digits) + QR | generated **on the device**, printed on its label | proving to the device over **Bluetooth** that you're its owner (only when `auth: pop` is enabled; the default `legacy` build skips this screen) |
+
+### One-time operator step (before the app can pair)
+
+The device cannot register itself with the backend — a device row and its
+credentials are created deliberately, once, where the backend runs:
+
+```bash
+# on the backend host (Mac):
+.venv/bin/python cloud/manage.py create-device "Car unit"
+#   -> prints device_key (dk_…)  and  claim_code (1A2B-3C4D-5E6F)
+```
+
+Then put the credentials on the Pi **(Pi)** — edit `~/sensordyme/config.yaml`
+in place (never copy the repo's config over it):
+
+```yaml
+cloud:
+  enabled: true
+  base_url: http://sensordyme-backend.local:8787   # the backend's own stable mDNS name — never a bare IP (docs/NETWORKING.md)
+dashboard:
+  token: <output of: openssl rand -hex 16>          # gates the live feed
+```
+
+Put the `dk_…` key in `cloud.device_key` (or better, a 0600 file via
+`cloud.device_key_file` — `scripts/migrate_device_key.py`), then
+`chmod 600 ~/sensordyme/config.yaml && sudo systemctl restart sensordyme`.
+Keep the claim code and the dashboard token for the app steps below. For a
+hosted backend use its `https://…` URL as `base_url`.
+
+### The pairing journey in the app
+
+1. **Power on SensorDyme.** Whenever it has no Wi-Fi it advertises for setup;
+   after each boot it also accepts setup for 5 minutes even when online —
+   so to re-run setup on a working device, just power-cycle it.
+2. **Open the app and sign in** (create the account on first use). The app
+   finds the backend by itself on your Wi-Fi (allow Local Network when asked).
+3. Tap the **antenna button — "Connect over Bluetooth"** on the home screen.
+   Allow Bluetooth when asked.
+4. **It finds "SensorDyme-XXXX"** and shows it; tap **Connect**. (It won't
+   appear in iOS Bluetooth Settings — that's normal; find it in the app.)
+5. **Prove it's yours** *(only on a `pop`-configured device)*: type the setup
+   code from the device's label, or paste the QR text. Wrong code: the device
+   refuses, and after 5 tries locks setup for a while — the app counts the
+   lockout down. The default development build (`auth: legacy`) skips this
+   screen entirely.
+6. **Choose its Wi-Fi**: the list is what the *device* can see. Pick the
+   network, enter the password (8+ characters). The device joins and — by
+   design — drops Bluetooth when it succeeds. The joined network is **saved
+   with autoconnect** on the device, permanently.
+7. **Add it to your account**: enter the **claim code** (the app reminds you:
+   "Not the setup code — it's on the card in the box").
+8. **Wait for it to report in**: the app polls until the device shows online
+   (typically well under a minute).
+9. **Choose what it watches for** (Driver Safety) and **Start watching** — or
+   "Not now".
+10. **Live feed token**: on the device's screen, Settings → Live feed → enter
+    the dashboard token from the operator step. Status and alerts work without
+    it; the video needs it.
+
+**Already-on-network device** (configured over SSH, no Bluetooth needed): the
+**＋ Add device** button keeps a claim-only path — tap through to the pair step
+and enter the claim code.
+
+### When pairing fails
+
+The app explains each failure in place; the facts behind the messages:
+
+| Symptom | Cause / fix |
+|---|---|
+| Device never found over Bluetooth | It's online (window closed): unplug/replug — setup is open for 5 min after boot. Or Bluetooth permission denied: the app shows an Open Settings card. |
+| "The setup code was wrong" | Check the label; each challenge allows one guess; 5 misses = device-held lockout (30 s doubling to 1 h, survives reconnects; a power cycle clears it). |
+| Wi-Fi join fails | Usually the password; also captive-portal networks and 5 GHz-only networks. A phone hotspot is the most reliable fallback. The device stays on its previous network if it had one (a failed join rolls back). |
+| "Already on another account" (409) | By design there is no self-service release. Sign in with the first account — its Wi-Fi setup did still apply. Account deletion releases its devices. |
+| "That claim code isn't one the server knows" (404) | Typo, or the backend you reached isn't yours (the app pins your server's identity — Settings → Manual server address → Forget remembered server if you rebuilt the backend). |
+| Joined Wi-Fi but "hasn't reported to the server yet" (120 s) | On a real device this almost always means the operator step is incomplete: `cloud.enabled` false, wrong `device_key`, or a `base_url` that doesn't resolve. Check **(Pi)** `sudo journalctl -u sensordyme -n 50 \| grep cloud_uplink` — it prints exactly what it can't reach and why. |
+| Too many claim attempts (429) | Rate-limited (10/IP/5 min). Wait a few minutes. |
+
+---
+
+## Phase 7 — Automatic reconnection after first setup
+
+This is the designed normal experience, and each piece is implemented and
+covered by named tests (simulated end-to-end; the physical run is the Phase 8
+checklist):
+
+**Power on → monitoring, untouched:**
+
+| What happens by itself | How |
+|---|---|
+| Service starts on boot, restarts on failure | systemd `WantedBy=multi-user.target`, `Restart=always`, watchdog; bounded reboot budget as last resort |
+| Wi-Fi rejoins | NetworkManager autoconnect on the saved profile (BLE provisioning saves it `autoconnect yes` and prefers the newest network) |
+| Identity restored | `SD-XXXXXXXX` is derived from the SoC serial — stable across reboots, reflashes of the same board, and network changes |
+| Credentials restored | `cloud.device_key`/`base_url` + dashboard token live in the device's config (0600); a damaged config boots on the last-known-good copy and reports the fault |
+| Monitoring configuration restored | preset, zones, companion nodes (`data/device_state.json`) and custom rules (`data/monitoring.json`) are re-applied at boot, re-validated against the role floor |
+| A deliberate Stop is **not** restored | by design: a reboot always comes back protecting (`stop` lives only in memory and the backend withdraws an undelivered stop after 30 s) |
+| Backend uplink reconnects | 2 s cadence, backoff capped at 30 s, instant recovery on first success; events queued on disk through outages and power cuts, delivered exactly once |
+| Models verified, honestly | the `.hef` and `.tflite` pins are re-checked at every boot; a mismatch runs degraded **and says so** — the device never reports protection while a required component is missing |
+
+**Open the app → your device, signed in, true state:**
+
+| What happens by itself | How |
+|---|---|
+| Still signed in | the session token lives in the Keychain; **the backend renews it once per app launch** (`/v1/session/refresh`), so a session used at least once a month never ages out onto the sign-in screen |
+| Server found again | known addresses are health-checked first, then Bonjour; a discovered server must prove the pinned identity; 20 s heartbeat + revalidate-on-foreground afterwards |
+| Device list + real state | fetched on open and every 10 s; "All clear" is shown only from a fresh, device-reported ready |
+| Live feed reconnects | direct LAN stream re-uses the cached address, re-discovers when stale, and if the Pi finishes booting *after* you opened the app, the device list takes a throttled re-look at the LAN once the backend sees it online |
+| Paired camera remembered | the linked camera id + address and the device token survive relaunches, re-installs, and even session expiry |
+| Revoked/expired credentials handled truthfully | an expired or signed-out session lands on sign-in with an explanation; an operator-revoked device key is named as the first reason on the device card (never a bare, indefinite "status unknown") |
+
+**What iOS actually permits in the background (no overpromising):** reconnection
+above happens **when you open the app** (or return to it). In the background
+the app does not keep connections alive; alert delivery while closed goes
+through the notification path, and opening the app is what refreshes state.
+There is no claim of continuous background streaming or polling — Apple does
+not permit it for an app like this.
+
+**What the app needs where:** on your home Wi-Fi — everything. Elsewhere —
+status, alerts, history and commands via a hosted (HTTPS) backend; live video
+is LAN-only by design. With the Mac backend and the phone away from home, the
+app says truthfully that it can't reach the server.
+
+**Power-cycle test plan** (run after first setup, and after any update): unplug
+the device mid-monitoring → plug it back in → do not touch anything → within
+~2 minutes the app's device card must return to the same preset, protecting,
+with the same device id, and a test look-away must alert. That exact loop is
+Phase 8's items 12–13 and `docs/SUNDAY_DEVICE_ACTIVATION.md` steps 16/20/25
+(runbook K1/K3).
+
+---
+
+## Phase 8 — Verify the complete product
+
+Every row has a concrete method; rows marked **HW** are **NOT YET VERIFIED**
+until run on the physical device (they are the Sunday session's steps —
+`docs/SUNDAY_DEVICE_ACTIVATION.md` has each one's full procedure, expected
+values and rollback).
+
+| # | Check | How to verify | Status |
+|---|---|---|---|
+| 1 | Pi boots | power on → `systemctl status sensordyme` active | HW |
+| 2 | Camera works | preflight `camera` → `imx708_wide_noir`; live feed shows the seat | HW |
+| 3 | Hailo recognised | preflight `hailo` → `/dev/hailo0`, `hailortcli scan` | HW |
+| 4 | Models load, pins hold | preflight `model_artifact` + `/api/health` accelerator `ok`, inferences rising | HW |
+| 5 | Monitoring health correct | `check_live_status.py --device …` → zero invariant violations | HW |
+| 6 | Paired to the account | app *Your Devices* row online; backend `hardware_id` = device id | HW |
+| 7 | iPhone sees it | device card live state = device's own `/api/health` state | HW |
+| 8 | Distracted Driving activates | select in app → confirmed only when the device reports running it | HW |
+| 9 | Live preview works | LIVE badge; stream headers fresh (`check_live_status.py --stream-seconds 6`) | HW |
+| 10 | Controlled events appear | scripted scenarios (consenting adult, stationary; Sunday §5) → alert + one history row each | HW |
+| 11 | Buzzer verified safely | buzzer stage + a human listener at 50 cm/1 m | HW |
+| 12 | Reconnects after reboot | the power-cycle loop above; same id, same preset, app online ≤ ~30 s | HW |
+| 13 | Survives network interruption | AP off 3 min: local alert still sounds; on reconnect the queued alert is delivered exactly once | HW |
+| 14 | Stopped-device camera privacy | while stopped, a remote stream request gets `camera_off_while_stopped`, no frames (Sunday step 22) | HW |
+| 15 | Settings restored | preset, zones, rules back after reboot (also pinned by `tests/test_m8_lifecycle_e2e.py`, `tests/test_m85_journeys_app.py`) | HW (sim ✓) |
+| 16 | No false protection claims | cover the lens: alert within ~2.5 s, never a silent "All clear" (also `tests/test_m84_reliability_recovery.py`) | HW (sim ✓) |
+
+Software-side, the same claims are already held by `make acceptance-full`: all
+30 owner journeys, 893 checks, with the real backend, real device runtime and
+real app code — camera, models and radios simulated, and every report labelled
+`simulated: true`.
+
+---
+
+## Phase 9 — Troubleshooting
+
+First reflex for anything device-side: **(Pi)** `sudo journalctl -u sensordyme
+-n 50 --no-pager` — the device explains itself. For app-vs-server confusion:
+**(Mac)** `.venv/bin/python scripts/diagnose_backend_mac.py <pi-hostname>` —
+one report that says which side is actually broken.
+
+| Problem | Diagnose → fix |
+|---|---|
+| Pi won't boot | Red PWR LED only / no green activity: re-seat the SD card, re-flash if unreadable elsewhere. Check PSU is 5V/5A (`vcgencmd get_throttled` once up). |
+| Camera not detected | `rpicam-hello --list-cameras` (service stopped — it holds the camera while running: a busy camera is BLOCKED, not broken). Nothing listed → power off, re-seat both ribbon ends, check orientation (Phase 1.3). |
+| Hailo missing | `lspci \| grep -i hailo`; nothing → power off, re-seat the PCIe FFC; `dtparam=pciex1` and the HAT EEPROM per `docs/MONDAY_RUNBOOK.md` D1. `hailortcli scan` needs the service stopped. |
+| Model file invalid | Health says `model integrity: … refused` — the designed fail-closed state. Re-stage the release (Phase 3B) or `release_guard.py switch` to a good one. **Never edit a pin to match a file.** |
+| Decoder mismatch | preflight `pins` FAIL → the config was hand-edited; restore `accelerator.yolo_decoder: legacy`. |
+| Not discoverable over Bluetooth | It's online (window closed) → power-cycle for a 5-min window. `auth: pop` with a broken code file keeps Bluetooth shut *by design* — health says "setup code unusable"; fix the file (0600, service user). |
+| Wrong setup code / lockout | See Phase 6 failure table. |
+| Wi-Fi provisioning fails | Phase 6 failure table; the device rolls back to its previous network, so nothing is lost. |
+| "Already claimed" | Phase 6 failure table (409). |
+| iPhone can't connect / app offline | `diagnose_backend_mac.py` (above): is the backend process actually running? Is its mDNS record current? Then: phone on the same Wi-Fi? Local Network permission granted? A guest/hotel network with client isolation blocks discovery entirely — phone hotspot is the reliable fallback (`docs/NETWORKING.md`). |
+| Device shows offline but works locally | Classic cause: `cloud.base_url` holds a bare IP or a dead hostname. The journal names the exact address it can't reach. Fix: `http://sensordyme-backend.local:8787` (the backend's own stable name), restart the service. |
+| No video feed | Same-LAN only. Then: dashboard token entered in the app (Settings → Live feed) and equal to `dashboard.token`? The device rejects a token with a stray trailing space (the app trims; a hand-typed curl might not). While *stopped*, no remote video is the privacy design, not a fault. |
+| Degraded monitoring reported | Read the reason in the app or `/api/health` — it names the component. The device deliberately never hides this. Lens covered/dirty → `attention_lost` alerts; that's detection, not a fault. |
+| Buzzer silent | Event shows `output: sounded` but no sound → wiring (pin 11/GND), buzzer type (3.3 V-rated? active, not passive?), or a driver stage needed (Phase 1.4). This is a hard stop until fixed. |
+| Device restarts repeatedly | `systemctl status` + journal. A config error exits 78 and *stops* (no loop) with the reason; a damaged config auto-falls back to last-known-good and reports `config_fault`. Thermal: `vcgencmd measure_temp`, check the cooler. |
+| Loses network | `nmcli connection show` — profile present with autoconnect? Signal? The device keeps monitoring and alerting locally throughout; events queue and deliver once on return. |
+| Update fails | It rolls itself back automatically and records why (`data/release/rolled_back.json`). A deploy interrupted mid-flight: `release_guard.py confirm-or-rollback` resolves it either way (`docs/DEPLOYMENT.md` §4). |
+| Need to go back | Phase 3's rollback one-liner. Releases keep their venv and config, so rollback needs no network and loses no state. |
+
+**Never** reset/reflash or delete user data as a first step: the config holds
+the device's credentials, `data/` holds its calibration and history, and nearly
+everything above is diagnosable read-only. Backups (runbook E1/E5) come before
+any destructive recovery.
+
+---
+
+# Development
+
+Everything below is for working on SensorDyme itself.
 
 ## Source of truth
 
-This repository (`sensordyme_model`) is the one SensorDyme codebase: the on-device
-detector (`main.py`, `core/`, `modules/`, `services/`), the backend (`cloud/`), the
-VLM rule interpreter (`jupiter/`), and the iOS app (`ios/`). An older checkout named
-`sensordyne-models` was a second clone of this same repository; it holds no code that
-is not here.
+This repository (`sensordyme_model`) is the one SensorDyme codebase: the
+on-device detector (`main.py`, `core/`, `modules/`, `services/`), the backend
+(`cloud/`), the VLM rule interpreter (`jupiter/`), and the iOS app (`ios/`).
 
 What is deliberately **not** in git, and must be carried by hand when moving a
-running installation from one checkout to another (all paths gitignored):
+running installation between checkouts (all gitignored):
 
 | Path | What it is | If it is missing |
 |---|---|---|
 | `cloud/sensordyme.db` | accounts, devices, events | backend starts empty |
 | `cloud/.jwt_secret` | session signing key (mode 600) | a new one is minted; every signed-in phone must sign in again |
-| `cloud/.backend_id` | stable identity in the `_sensordyme-api._tcp` TXT record and `/v1/health` | a new one is minted, and phones that pinned the old one refuse it until Settings → Manual server address → Forget remembered server (docs/NETWORKING.md) |
-| `data/` | device calibration, `monitoring.json`, preflight results, datasets | recalibration on first run; `make accuracy-dataset` needs `data/state_farm` |
+| `cloud/.backend_id` | stable backend identity (mDNS TXT + `/v1/health`) | a new one is minted; phones that pinned the old one refuse it until Settings → Manual server address → Forget remembered server |
+| `data/` | device calibration, `monitoring.json`, preflight results, datasets | recalibration on first run |
 | `ios/SensorDyme.xcodeproj`, `ios/Info.plist` | generated by `cd ios && xcodegen generate` from `ios/project.yml` | regenerate; never hand-edit |
 
 Stop the backend before copying the database, or copy it with
@@ -58,343 +712,145 @@ source .venv/bin/activate
 python main.py
 ```
 
-A window pops up showing your webcam with a live face mesh overlay, EAR and yaw readouts. The first 10 seconds calibrate your personal EAR baseline *and* your neutral head pose — keep your eyes open and look at the camera (or wherever you'll actually be looking, if the camera isn't centered) during that window. After that, close your eyes for 2+ seconds or turn your head away for 3+ seconds and **the whole screen flashes red with an ALERT banner** — briefly (~1.5s), the moment the event fires, not for as long as the condition stays true: it's tied to the event itself (see `services/runtime.py`'s `_FLASH_DURATION_S`), not to whether your eyes are still closed, so a sustained closure flashes once on confirmation rather than staying red the whole time. Hold a phone up (real or a hand mimicking one) while looking away and you'll see an orange box appear around it, turning red once `phone_use` fires. Press `q` or Ctrl+C to quit; events land in `data/events.csv`.
+A window opens on your webcam with the live face mesh, EAR/yaw readouts and the
+full alert pipeline; the first 10 seconds calibrate your EAR baseline and
+neutral head pose. `make dev-debug` adds every raw signal to the overlay.
+Events land in `data/events.csv`.
 
-Want to see every signal while tuning thresholds? Run `make dev-debug` (or `python main.py --debug`) for a window with EAR, yaw, pitch, PERCLOS%, YOLO/hand boxes, and the current state label all overlaid.
+## The virtual device and acceptance
 
-## Quickstart: Raspberry Pi 5
-
-```bash
-# from your Mac, after cloning this repo onto the Pi (or via `make deploy` below)
-./setup_pi.sh
-```
-
-This installs apt packages (`python3-picamera2`, etc.), creates a venv, installs Python deps, and installs + starts `sensordyme.service` (systemd, `Restart=always`, headless — no display on the Pi by default).
-
-```bash
-sudo systemctl status sensordyme   # check it's running
-journalctl -u sensordyme -f        # tail logs
-```
-
-## Hardware: building the physical device
-
-Optimized for two things at once: the fewest parts and least assembly time, **and** a hard budget of under $200 — every dollar spent where it actually improves detection accuracy or reliability, nowhere else. Seven shopping-list items (a couple are small two-part bundles), no soldering, no display, roughly 10 minutes to assemble, **~$180 total**, leaving headroom under $200 for tax/shipping/price drift.
-
-Prices below are realistic street prices at the time of writing, not live quotes — they'll drift with the market and your region/retailer. Treat the total as a target to shop toward, not a guarantee.
-
-| # | Part | Est. price | Why this one, specifically |
-|---|------|-----------|------|
-| 1 | **Raspberry Pi 5 (4GB)** | $60 | The compute. 4GB, not 8/16GB — this workload is CPU-bound, not RAM-bound, so the extra $20–$40 for more RAM buys literally nothing here. This is where NOT spending more matters most. |
-| 2 | **Camera Module 3 NoIR (Wide) + IR illuminator board + Pi 5 camera cable (22-pin → 15-pin)** | $47 | The single highest-leverage spend in the whole build: without IR, the device is blind at night, which is exactly when drowsiness detection matters most. Wide FoV matters too, since the camera won't be dead-center on the dash (see the calibration note below). **The cable is not optional**: the Pi 5 uses a 22-pin mini camera connector, and Camera Module 3 ships with a 15-pin cable that won't fit — order the ~$3 adapter cable with the camera. IR wavelength: 850nm gives a brighter image (sensors are 2–4× more responsive) but emits a faint visible red glow; 940nm is fully invisible but dimmer — either works, pick per your glow tolerance. Prefer a USB/5V-powered illuminator so you don't need a second 12V feed in the car. |
-| 3 | **Raspberry Pi 5 Active Cooler (official)** | $5 | Cheapest official accessory that exists, and not optional — sustained CV inference throttles the Pi 5 without it, especially in a hot car. Best dollar-for-dollar spend in the list. |
-| 4 | **High-endurance microSD card (64GB)** | $13 | The single biggest field-failure mode for always-on Pi devices is SD corruption from abrupt power loss when the car shuts off. A dashcam/security-camera-rated "high endurance" card (SanDisk High Endurance, WD Purple SC, etc.) is built for exactly this continuous-write pattern, for about the same price as a standard card — pure upside, no reason to skip it. 64GB, not more: frames are never written to disk (see the privacy statement below), so capacity is never the bottleneck. |
-| 5 | **USB-C PD car charger (30W, 5V/5A) + an e-marked USB-C cable** | $26 | Must explicitly support 5V/5A — the Pi 5 negotiates full power over USB-C PD, and cheap car chargers/cables that top out at 5V/2.4A under-power it, causing throttling or random brownouts in the field. This is the one place a "cheaper" option actively breaks the device, so it's worth the extra few dollars over the bargain-bin charger. **Reusing a charger you already own?** Check its label for a `5V⎓5A` output line (most phone chargers only do 5V/3A — the Pi boots but throttles under sustained CV load), then verify in the field with `vcgencmd get_throttled` (`0x0` = healthy; anything else means under-voltage occurred mid-drive). |
-| 6 | **5V GPIO piezo buzzer (2-wire, active) + 2× female-female jumper wires** | $3 | The audible alert — two jumper wires to a GPIO pin and GND, already wired up in software via `core/alerts.py`'s `GPIOBuzzerSink`. The Pi 5 has no 3.5mm audio jack, so this is also the *cheapest* way to get sound, not a compromise. Don't forget the jumper wires — buzzer modules ship with bare pins. |
-| 7 | **Dashcam-style case (camera cutout + cooling clearance) + heavy-duty suction dash mount (1/4-20 thread)** | $29 | A cheap suction mount will vibrate loose on rough roads within weeks; the extra few dollars for a heavy-duty one is the difference between a device that stays aimed at your face and one that doesn't. **DIY/3D-printed alternative ($0–5 in filament):** print in **PETG/ABS/ASA, never PLA** (dashboards exceed 70°C in the sun; PLA sags at ~60°C), leave real airflow openings for the Active Cooler (a sealed box is a heater), use open holes — not printed "windows" — in front of the camera and IR LEDs (plastic attenuates IR), and make the mount rigid: a mount that flexes invalidates the calibrated head-pose baseline, so re-run `--recalibrate` any time it shifts. |
-| | **Total** | **~$180** | **~$20 under the $200 cap**, intentionally — real prices vary by retailer/region/tariffs, and this leaves room to absorb that without blowing the budget. |
-
-If you end up with slack in the budget, the highest-value places to spend it, in order: (1) a slightly better dash mount if yours will see rough roads, (2) a name-brand car charger over a generic one (power reliability, not raw wattage, is the actual risk), (3) a second high-endurance microSD as a spare. Going from 4GB to 8GB RAM on the Pi 5 is deliberately *not* on that list — it's the classic way to overspend on this build for zero real-world benefit.
-
-**Assembly** (no tools beyond a small screwdriver for the case, no soldering):
-1. Clip the Active Cooler onto the Pi 5.
-2. Connect the camera ribbon cable to the Pi's camera port.
-3. Connect the buzzer's two wires to a GPIO pin and a GND pin (matching `gpio_buzzer_pin` in `config.yaml`, default BCM 17).
-4. Flash the microSD card, insert it, close the case.
-5. Mount the case on the windshield/dash mount, angled toward the driver's face.
-6. Plug the USB-C car charger into the Pi and the car's 12V socket.
-7. Power on and run `./setup_pi.sh` (one time) — it installs everything and starts the service on every boot from then on.
-
-**Deliberately left out of the core list** (add only if you need it):
-- *A UPS/supercapacitor HAT* for guaranteed clean shutdown — the high-endurance SD card in slot 4 covers most of this risk far more cheaply; add a UPS HAT only if you're seeing corruption in practice.
-- *An NVMe/SSD HAT* for storage — adds a HAT + drive (2 more parts, more assembly) for a workload that doesn't need the extra speed or endurance beyond what the high-endurance SD card already provides.
-- *A cellular modem or Wi-Fi dongle for remote monitoring* — deliberately absent: it would let frames or events leave the device, in tension with the privacy design below. Only add this if you specifically want fleet-style remote reporting, and audit what it transmits.
-
-Since the camera won't be perfectly centered on the dash with this mount, run `python main.py --recalibrate` once installed, in the final mounted position, looking at the road normally — see [Driver attention module](#driver-attention-module) below for why that matters.
+`make sim` runs a complete virtual device against the real backend;
+`make acceptance` runs every software suite plus the owner's 30-journey matrix
+(~25 min, no Simulator), and `make acceptance-full` adds all 28 XCUITest
+journeys (`docs/ACCEPTANCE.md`, `docs/VIRTUAL_DEVICE.md`, `docs/DIGITAL_TWIN.md`).
 
 ## mac_max profile: what it's for (and what it isn't)
 
-**The pi profile above is the shipping product.** `mac_max` is an additive, Mac-only profile for three things: live demos, generating ground-truth comparisons, and establishing a GPU-backed accuracy ceiling to measure the nano/edge models against. It requires Apple Silicon + torch MPS, refuses to start otherwise, and never reads or affects anything under `modules:` — selecting it is entirely opt-in and every default stays on `profile: pi`.
+**The pi profile is the shipping product.** `mac_max` is an additive, Mac-only
+profile for live demos, ground-truth comparisons and a GPU-backed accuracy
+ceiling. It requires Apple Silicon + torch MPS and never affects `profile: pi`
+defaults.
 
 ```bash
-make dev-max
-# or: python main.py --profile mac_max --debug
+make dev-max      # = python main.py --profile mac_max --debug
 ```
 
-On first run it prompts **"LOOK AT THE SCREEN CENTER"** for 3 seconds — this calibrates your personal EAR baseline and a neutral forward-gaze baseline together (persisted to `data/gaze_calibration.json`, separate from the pi profile's `data/calibration.json`). After that you get a full tuning overlay: a gaze-vector arrow drawn from your eyes, on/off-road status, EAR + blink count + blink rate + PERCLOS%, YOLO boxes with confidence, hand-phone IoU, the fused state, and a rolling 12-second glance-budget bar.
-
-What's different from the pi profile, in order of how much it changes the *signal quality* (not just the compute budget):
-
-1. **A more elaborate gaze fusion.** MediaPipe Face Mesh's refined iris landmarks (indices 468/473) let `_compute_gaze_components` measure where the eyes are pointing *within* the eye socket, added to head yaw/pitch to produce a gaze vector. The pi profile (`modules/driver_attention.py` + `core/eye_signal.py`'s `eye_gaze_offset_deg`) fuses the same iris signal onto head pose too (`enable_gaze: true`, on by default — iris landmarks are already computed there, so this costs no extra inference); mac_max additionally layers tiered drowsiness, blink-rate tracking, and confidence-stacked object fusion on top (points 2–5 below), which the pi profile does not.
-2. **Tiered drowsiness with a real blink-rate signal.** Instead of one sustained-closure threshold, three tiers: ignore closures <500ms entirely (a normal blink), 0.5–1.5s sustained → `microsleep_warning` (soft), >1.5s → `drowsiness` (loud) — plus `BlinkRateTracker`, which compares your current blinks/min against your own first-5-minute session baseline and flags a sustained anomalous rate as `fatigue_pattern` (log-only, feeds the FATIGUED state).
-3. **Confidence-stacked phone/object fusion**, not one binary check: phone alone (0.3, log-only — a mounted GPS is legitimate) → phone + hand overlap (0.7, `phone_in_hand`, soft) → phone + hand overlap + eyes off-road, sustained (0.95, `phone_use_while_distracted`, loudest tier). Eating/drinking additionally requires *repeated* hand-to-face motion (≥2 approaches in 30s), not just a food class + a nearby hand.
-4. **Detection runs on the full frame, every frame, on MPS** — YOLO11-x by default (`detector_weights` swaps to `rtdetr-l.pt` for A/B testing, same `ultralytics.YOLO(...)` loader either way), classes: `cell phone`, `cup`, `bottle`, `sandwich`, `banana`, `donut`, plus `person`. MediaPipe Hands also runs every frame (no stride) — Mac can afford both.
-5. **Temporal smoothing.** Every raw signal (EAR, gaze yaw/pitch, and the phone/hand-overlap booleans) passes through a ~5-frame rolling median (`RollingMedianFilter`) before it reaches any threshold, so a single flickered detector reading can't flip a state on its own.
-
-All of it still funnels through the exact same `core/alerts.py` `AlertManager` and `core/logger.py` `EventLogger` as the pi profile — nothing about alert escalation/cooldown or CSV logging was forked. Every event also carries a `contributing_signals` string (e.g. `"phone + hand_overlap + gaze_off"`) in a new, purely-additive CSV column, so `data/events.csv` stays analyzable for either profile.
-
-Every threshold's real-world basis is cited directly in `config.yaml` under `mac_max:` (NHTSA visual-manual glance guidelines, PERCLOS drowsiness-research cutoffs, normal blink duration/rate ranges, etc.) — read it there rather than here, since the comments are next to the numbers they justify.
+What it layers on (in order of signal impact): iris-refined gaze fusion, tiered
+drowsiness (microsleep → drowsiness) with a personal blink-rate baseline,
+confidence-stacked phone/object fusion (phone alone is log-only; phone + hand +
+eyes-off-road is the loud tier), full-frame YOLO11-x every frame on MPS, and
+~5-frame rolling-median smoothing of every raw signal. All of it funnels
+through the same `core/alerts.py` AlertManager and event log as the pi profile.
+Threshold citations (NHTSA glance guidance, PERCLOS cutoffs, blink norms) are
+comments in `config.yaml` under `mac_max:`, next to the numbers they justify.
 
 ### The frontier VLM judge (mac_max only)
 
-On top of the local pipeline, mac_max runs a **Claude vision model (`claude-opus-4-8`) as a slow, precise second tier** — the same verifier-not-hot-path split commercial driver-monitoring stacks use. Every `vlm.interval_s` (default 4s), an in-memory JPEG of the current frame goes to the Anthropic API and comes back as a strict-JSON verdict: `attentive / distracted / drowsy / phone_use / eating_drinking`, with a confidence and a one-sentence evidence string. This is what buys enterprise-grade *judgment*: the VLM understands the whole scene — mounted GPS vs. a phone in hand, asleep vs. glancing down, a wallet vs. a phone — in ways geometric signals can't.
+A slow, precise second tier: every `vlm.interval_s` a burst of frames goes to a
+vision model and returns a strict-JSON verdict; an alert fires only after
+`confirm_judgments` consecutive confident verdicts, so one flaky classification
+never makes a sound. Backend-pluggable via `vlm.provider`:
 
-The judge sees **motion, not a snapshot**: each judgment sends a burst of `vlm.burst_frames` frames (default 3) captured `vlm.burst_spacing_s` apart (default 0.7s), in chronological order. A single frame cannot distinguish a blink from a microsleep or a mirror check from a stare; a ~1.4s burst can, and the prompt explicitly tells the judge to use the motion across frames. This costs ~3× the image tokens per judgment — set `burst_frames: 1` to restore the original single-frame mode.
+| `provider` | Runs | Frames leave the Mac? |
+|---|---|---|
+| `anthropic` (default) | Claude vision via the Anthropic API | Yes (API) |
+| `ollama` | a local model (e.g. `qwen2.5vl:7b`) | **No — fully on-device** |
+| `openai_compatible` | NVIDIA NIM, LM Studio, vLLM, Gemini's OpenAI endpoint | depends on `base_url` |
 
-The timing discipline is the point:
-- The judge runs in a **daemon thread with a one-slot mailbox** — the camera loop is never blocked, ever.
-- Every verdict is logged to `data/events.csv` as a `vlm_judgment` (log-only, with the evidence in `contributing_signals`).
-- An alert (`vlm_confirmed_phone_use`, `vlm_confirmed_drowsiness`, `vlm_confirmed_distraction` — loud; `vlm_confirmed_eating` — soft) fires only after **`confirm_judgments` consecutive same-state verdicts** (default 2) at or above `min_confidence` (default 0.7). One flaky classification never makes a sound; a real phone-in-hand session confirms in ~2×`interval_s`.
-- **Graceful without credentials**: no `ANTHROPIC_API_KEY` (and no `ant auth login` profile) → the judge prints one line telling you exactly what to set, disables itself, and the local pipeline continues untouched. Same on repeated API errors or unusable answers — empty, non-JSON or off-schema verdicts count too (`max_consecutive_failures`); an explicit refusal does not. A confirmed VLM state also expires once verdicts stop arriving, so a judge that goes quiet cannot hold the alert on. The Anthropic backend's answer budget is `vlm.max_tokens`.
-- The debug HUD (`make dev-max`) shows a live `VLM: PHONE_USE 0.92 (3s ago)` line, and the fused state shows `VLM:<STATE>` when a confirmed verdict is driving the alert.
+Graceful without credentials: no key → one clear line, the judge disables
+itself, the local pipeline continues. **Privacy tradeoff, stated plainly:**
+with `vlm.enabled: true` frames are transmitted (in memory, never to disk) to
+the configured API. Mac-only, announced at startup, one config line to turn
+off; the pi profile never constructs the judge.
 
-**Privacy tradeoff, stated plainly:** with `vlm.enabled: true`, frames are transmitted (in memory — still never written to disk) to the Anthropic API for classification. This is a deliberate exception to the "nothing leaves the device" property, exists only in this Mac-only profile, is announced in the terminal at startup, and turns off with one config line (`vlm.enabled: false`). The pi profile never constructs the judge and is entirely unaffected.
+### Measuring accuracy
 
-To use it: `export ANTHROPIC_API_KEY=sk-ant-...` (or `ant auth login`) before `make dev-max`. Each judgment is one small vision request; at the default 4s interval that's ~900 requests per driving hour — set `interval_s` higher if you want to spend less.
-
-#### Swapping the judge model (Qwen, NVIDIA, anything OpenAI-compatible)
-
-The judge is backend-pluggable via `vlm.provider` — swap one config line to A/B different VLMs on the identical harness (same prompt, same confirmation debounce, same event log, so `data/events.csv` verdicts are directly comparable across providers):
-
-| `provider` | What it runs | Frames leave the Mac? | Accuracy / cost |
-|---|---|---|---|
-| `anthropic` (default) | Claude (`claude-opus-4-8`) | Yes (API) | The accuracy ceiling; per-request cost |
-| `ollama` | A local model via Ollama — e.g. **Qwen2.5-VL** | **No — fully on-device** | Free; noticeably below frontier at 7B; seconds per judgment on an M3 |
-| `openai_compatible` | Any OpenAI-compatible endpoint: **NVIDIA NIM** (build.nvidia.com), LM Studio, vLLM | Depends on `base_url` | Varies by model |
-
-**Qwen2.5-VL locally (fully private, free):**
-```bash
-# one-time: install Ollama from ollama.com, then
-ollama pull qwen2.5vl:7b
-```
-```yaml
-vlm:
-  provider: ollama
-  model: qwen2.5vl:7b
-  interval_s: 12.0   # a 7B VLM takes several seconds per frame on an M3 — pace accordingly
-```
-With a local provider the startup notice flips to "frames stay ON-DEVICE" — the full privacy invariant holds again.
-
-**NVIDIA NIM (cloud):** create an API key at build.nvidia.com, pick a vision model there and copy its exact model ID, then:
-```yaml
-vlm:
-  provider: openai_compatible
-  model: <exact model id from build.nvidia.com>
-  base_url: https://integrate.api.nvidia.com/v1
-  api_key_env: NVIDIA_API_KEY
-```
-```bash
-export NVIDIA_API_KEY=nvapi-...
-make dev-max
-```
-
-**Google Gemini (cloud):** frontier-class vision with a fast/cheap Flash tier that suits a periodic judge well. Google exposes an OpenAI-compatible endpoint, so this needs no code — grab a key from [aistudio.google.com](https://aistudio.google.com), then:
-```yaml
-vlm:
-  provider: openai_compatible
-  model: gemini-2.5-flash            # check ai.google.dev for the latest model IDs
-  base_url: https://generativelanguage.googleapis.com/v1beta/openai
-  api_key_env: GEMINI_API_KEY
-```
-```bash
-export GEMINI_API_KEY=...
-make dev-max
-```
-
-Implementation notes: the Anthropic backend uses server-enforced structured outputs (the verdict is guaranteed-valid JSON); Ollama uses its schema-constrained `format` parameter; generic OpenAI-compatible endpoints get the JSON contract in the prompt with fence/prose-tolerant parsing. All three degrade the same way — a clear one-line instruction (missing key, Ollama not running, model not pulled) and self-disable, with the local pipeline unaffected.
-
-### A/B testing the detector
-
-```yaml
-mac_max:
-  driver_attention:
-    detector_weights: yolo11x.pt   # or: rtdetr-l.pt
-```
-
-Both load through the same `core/detectors.py::get_yolo_model(weights, device)` — swapping the weights string is the entire A/B test; no code changes.
-
-### Measuring accuracy (scripted protocol)
-
-`benchmarks/accuracy_protocol.py` turns "how accurate is it?" into a number. With `make dev-max` running and calibrated in one terminal, run `make accuracy` in another: it walks you through a timed scenario script (attentive baseline, sustained eye closure, look-away, eyes-down, phone-in-hand, a mounted-phone false-positive control, drinking) and records each phase's UTC window to `benchmarks/results/protocol_<ts>.json`. Then:
-
-```bash
-python benchmarks/accuracy_protocol.py grade --protocol benchmarks/results/protocol_<ts>.json
-```
-
-grades `data/events.csv` against the script: per-phase PASS/MISS (did any expected event type fire inside the phase window + grace period?), false positives (alertable events firing where nothing was expected — including during the mounted-phone control phase), and an overall recall figure. A `_report.json` lands next to the protocol for tracking across config changes.
-
-### Benchmarking pi vs. mac_max
-
-```bash
-python benchmarks/run_benchmarks.py --profile pi      --video clip.mp4 --minutes 2
-python benchmarks/run_benchmarks.py --profile mac_max --video clip.mp4 --minutes 2
-```
-
-Same video, two profiles — this is the "what does 10x compute buy" comparison row: diff the FPS/latency in `benchmarks/results/{profile}_driver_attention_*.json` (pi's own filenames are unchanged — no `pi_` prefix — since `pi` remains the default `--profile`).
+`make accuracy` walks a timed scenario protocol and grades `data/events.csv`
+against it (per-phase recall, false positives, a mounted-phone control);
+`benchmarks/run_benchmarks.py --profile pi|mac_max --video clip.mp4` is the
+same-video FPS/latency comparison. See `docs/EVALUATION.md` for the real-video
+evaluation pipeline and `docs/DETECTION_THRESHOLDS.md` for the detector
+confidence pins. For behaviour tuning, every `driver_attention` knob is
+documented next to its default in `config.yaml`.
 
 ## Architecture
 
 ```
 sensordyme/
-├── main.py                  # entrypoint: loads config.yaml, starts camera, runs selected module
+├── main.py                  # entrypoint: config, camera, module, runtime
 ├── config.yaml              # module: driver_attention  <- one line switches the product
-├── requirements.txt         # pinned versions; Pi-only extras noted at the bottom
-├── setup_pi.sh              # one-shot Pi setup: apt packages, pip installs, systemd service
-├── setup_mac.sh             # one-shot Mac dev setup (venv, pip)
-├── sensordyme.service       # systemd unit: runs main.py on boot, Restart=always
-├── core/
-│   ├── camera.py            # Picamera2 on Pi / cv2.VideoCapture(0) on Mac, auto-detected
-│   ├── events.py            # Event dataclass: timestamp, type, duration, confidence, module_name
-│   ├── alerts.py            # console / sound / GPIO buzzer sinks + escalation + cooldown
-│   ├── detectors.py         # shared YOLO model cache + IoU helper (occupancy + driver_attention)
-│   ├── logger.py            # appends events to data/events.csv (never writes frames)
-│   ├── telemetry.py         # throttled raw-signal log to data/telemetry.csv (future model training)
-│   └── reports.py           # weekly summary PDF (matplotlib charts + reportlab layout)
-├── modules/
-│   ├── base.py              # VisionModule ABC + registry + SustainedConditionTracker
-│   ├── driver_attention.py  # calibrated EAR + PERCLOS (drowsiness), yaw/pitch (distraction),
-│   │                        #   DAMO-YOLO on Hailo + MediaPipe Hands (phone/food) -- see below
-│   ├── driver_attention_max.py # mac_max profile ONLY: gaze fusion, tiered drowsiness,
-│   │                        #   confidence-stacked phone fusion -- see "mac_max profile" below
-│   ├── occupancy.py         # DAMO-YOLO person counting -> occupancy_change events
-│   └── fall_detection.py    # MediaPipe Pose: drop-then-stillness -> fall events
-├── benchmarks/
-│   ├── run_benchmarks.py    # per-module latency/FPS/thermal -> JSON + summary CSV
-│   ├── plot_results.py      # FPS bar chart, latency box plot, thermal line chart (300dpi PNGs)
-│   └── sample_data/         # drop test videos here
-├── tests/                   # pytest suite (no camera required)
-├── data/                    # gitignored: events.csv, reports/
-└── Makefile                 # make dev | bench | report | deploy
+├── setup_pi.sh              # one-shot Pi install (hashed lock, pinned model, systemd)
+├── core/                    # camera, events, alerts, detectors/accel, state model,
+│                            #   identity, config LKG, uplink, secret store, releases
+├── modules/                 # driver_attention (product), occupancy, fall_detection,
+│                            #   baby_monitoring, comparison modules
+├── services/                # runtime coordinator, dashboard, BLE provisioning (+PoP)
+├── cloud/                   # FastAPI backend: accounts, claim, events, commands
+├── ios/                     # the SensorDyme (ORYN EDGE) iPhone app + logic tests
+├── sim/                     # the virtual device / digital twin
+├── evaluation/, research/   # eval harness; CV research (fleet-run)
+├── scripts/                 # hw_validation/, release/, sim/, provisioning tools
+├── deploy/                  # systemd, launchd, avahi, polkit, sudoers, udev
+├── tests/                   # ~3,950 tests; no camera or hardware required
+└── benchmarks/              # latency/FPS/thermal + accuracy protocol
 ```
 
-### Data flow
+Key design docs: `ARCHITECTURE.md`, `docs/STATE_MODEL.md` (monitoring truth),
+`docs/EVENT_PIPELINE.md` (event identity and delivery evidence),
+`docs/VIDEO_TRANSPORT.md` (stream liveness), `docs/BEHAVIOR_ENGINE.md`,
+`docs/DEVICE_AUTH_CONTRACT.md` (signed commands), `docs/CREDENTIAL_STORAGE.md`,
+`docs/LEAST_PRIVILEGE.md`, `docs/PRIVACY.md`.
 
-```
-        ┌─────────────┐     frame      ┌──────────────────┐   Event(s)   ┌─────────────┐
-Camera  │ Picamera2 / │ ─────────────▶ │  VisionModule    │ ───────────▶ │ EventLogger  │──▶ data/events.csv
-(auto-  │ cv2 webcam  │                │ (config-selected) │              └─────────────┘
-detect) └─────────────┘                └────────┬─────────┘
-                                                  │ alert-worthy events
-                                                  ▼
-                                          ┌───────────────┐
-                                          │ AlertManager  │──▶ console / sound / GPIO buzzer
-                                          │ (escalation + │
-                                          │  cooldown)    │
-                                          └───────────────┘
-```
+## Driver attention module (how detection works)
 
-## How the platform is auto-detected
-
-`core/camera.py` tries `import picamera2` at startup. If it succeeds, you're on a Pi and frames come from Picamera2 at the Camera Module 3's native pipeline. If it fails (e.g. on a Mac, where picamera2 isn't installable), frames come from `cv2.VideoCapture(0)` — your built-in webcam. `main.py` prints which mode it picked on every run.
-
-## Adding a new module (3 steps)
-
-1. Create `modules/your_module.py`, subclassing `VisionModule` and decorating the class with `@register_module("your_module")`.
-2. Add a `modules.your_module: {...thresholds...}` block to `config.yaml`.
-3. Set `module: your_module` in `config.yaml`.
-
-That's it — `main.py` never needs editing. `modules/__init__.py` auto-discovers every file in `modules/` via `pkgutil`, so the `@register_module` decorator always runs and your module shows up in the registry.
-
-## Driver attention module
-
-Real testing surfaced three failure modes with a naive "raw threshold" approach: ordinary blinks tripped drowsiness, brief mirror/blindspot glances tripped distraction, and the module was blind to anything that wasn't a face (phone in hand, food, etc). Each is addressed with a dedicated mechanism rather than a bigger threshold:
-
-- **Drowsiness (blink-proof).** The eye-closure tracker only fires once EAR has stayed below the personal threshold for `drowsy_seconds` (default **2.0s**) of *closed* time, measured in monotonic time — a blink (a few hundred ms) followed by a real reopening resets it to zero, no partial credit. Only a 1–2 frame landmark glitch (`eye_closure_release_frames`) is bridged, and bridged frames pause the clock rather than count toward it, so a flurry of ordinary blinks never adds up to a "continuous" closure. A second, slower signal, **PERCLOS** (% of the last `perclos_window_s` spent with eyes closed), catches the driver who blinks heavily but never has one single long closure — it fires the softer `fatigue_warning`. PERCLOS counts a *deeper* closure than the drowsiness check (`perclos_closure_ratio`, default 0.4 × the open-eye EAR — the P80 definition its 0.15 cutoff comes from), so squinting or glancing down doesn't inflate it.
-- **Per-user EAR calibration + neutral head pose.** `AttentionCalibrator` runs once at startup: for `calibration_duration_s` (default 10s), look at the road as you normally would. It learns two things from that window, not just one:
-  - your resting EAR (different faces have different resting EAR — a single fixed threshold misfires across users), setting the operative threshold to `ear_threshold_ratio * baseline`;
-  - a **neutral yaw/pitch baseline** — "looking at the road" is *not* yaw=0/pitch=0 unless the camera is mounted dead-center on the dashboard. A camera mounted off to the side (phone/Pi next to the wheel rather than centered) sees your ordinary forward gaze at some nonzero angle; the baseline is learned as a head *rotation*, and every subsequent reading is the head's rotation relative to it before any threshold is applied. That makes the mounting position not matter for side offsets *and* for a camera below or above the eye line — a per-axis `raw − baseline` subtraction (what earlier builds did) turned a pure head turn into pitch on a typical low dash mount, so a 70° blind-spot check read as "eyes up". If you use the Camera Module 3 Wide, set `camera_hfov_deg: 102` for accurate angles.
-
-  Both are persisted together to `data/calibration.json`; delete that file or pass `--recalibrate` to redo it (e.g. after a different person, or a different mounting position, starts using the same install). The file also records `enable_gaze`, `eye_gaze_scale_deg` and `camera_hfov_deg`; changing any of them, or upgrading from a build with an older calibration format, makes the device recalibrate automatically on the next start. If you glance away during the calibration window, it waits until the most recent `calibration_duration_s` are steady, rather than averaging the glance in.
-- **Distraction (glance-tolerant).** The same sustained-condition mechanism, applied to the *calibrated* yaw, means a normal 1–2s mirror or blindspot check resets cleanly and never fires `distraction` (default sustain: `distraction_seconds` = **3.0s**, `yaw_threshold_deg` = 35°). A separate `GlanceCounter` watches for the pattern single-glance logic misses: `glance_min_count` (default 5) short off-center glances within `glance_window_s` (default 45s) fires `frequent_glancing` — texting while still looking up periodically.
-- **Eyes down (separate from sideways).** Looking down at a lap is more dangerous and less often legitimate than a sideways glance, so calibrated pitch gets its own, more sensitive check: `pitch_threshold_deg` (default -20°) sustained for `eyes_down_seconds` (default 2.5s) fires `eyes_down`, independent of the yaw-based `distraction` event.
-- **Full-frame object scanning, with a visible bounding box.** The detector (DAMO-YOLO on the Hailo-8L; shared via `core/detectors.py` so `occupancy.py` doesn't load a second copy) scans the *entire* frame — not just near the face — on every `yolo_every_n_frames`-th frame (default 3) so Face Mesh keeps full frame rate. It covers everything a driver's hands might realistically hold: `cell phone`, plus 17 food/drink classes (`cup`, `bottle`, `wine glass`, `bowl`, `banana`, `apple`, `orange`, `broccoli`, `carrot`, `hot dog`, `pizza`, `donut`, `cake`, `sandwich`, `fork`, `knife`, `spoon`) via the `yolo_classes` config block. Boxes are drawn live in the **default** window (not just `--debug`) — orange while just visible, red once it's driving a `phone_use` alert. A phone alone is not an alert — a dashboard-mounted phone/GPS is legitimate and only logs `phone_detected`. It becomes the loud `phone_use` alert only when the phone is visible **and** the eyes are off the road (`distraction` or `eyes_down` condition) for `phone_use_seconds` (default 2.0s). If MediaPipe Hands (`enable_hands`, default on) finds a hand overlapping the phone box (IoU > `hand_phone_iou_threshold`), confidence is raised — someone visibly holding it is more certain than a phone merely in frame. Hands are drawn in the default view too. Any failure loading YOLO/Hands is caught, printed once to the terminal, and disables that subsystem gracefully instead of crashing the video loop or failing silently — check the terminal for `driver_attention: object detection ready (...)` to confirm it's active.
-- **Face lost.** If the camera can't find a face at all (turned fully away, slumped over, obstructed) for `face_lost_seconds` (default 2.5s), that's treated as a risk signal in its own right — `attention_lost` fires (loud) — rather than silently reported as "nothing going on," which is what naive per-signal logic does by default.
-- **Risk fusion — reasoning across signals, not just within each one.** `RiskFusion` combines every signal above into one continuous, smoothed 0–100% score, shown as a live bar in both the default and debug windows. This is the part that actually reasons about the driver holistically: independent thresholds each catch their own failure mode but miss *compound* danger — a driver who's a little drowsy AND glancing away is more dangerous than either fact alone (a microsleep is worse if attention is already split), so eye-risk and gaze-risk being simultaneously elevated adds a corroboration bonus on top of their weighted sum. The composite score fires its own `elevated_risk` (soft) / `high_risk` (loud) events for combinations that never cross any single signal's own bar. See `RiskFusion`'s docstring in `modules/driver_attention.py` for the full weighting rationale (`risk_ema_alpha`, `risk_elevated_threshold`, `risk_high_threshold`, `risk_confirm_seconds` in config).
-- **Patient alerting.** The alert cooldown (`alerts.cooldown_s`, default 15s) keeps any single event type from re-alerting too soon, on top of each signal's own sustained-duration/rolling-window debounce above.
-- **Debug overlay.** `make dev-debug` (or `python main.py --debug`) shows every raw signal — EAR, calibrated yaw/pitch (plus the raw values and learned baseline, so you can sanity-check calibration itself), PERCLOS%, glance count, the risk bar, and the current state label — essential for on-device tuning.
-- **Telemetry for a future learned model.** Hand-tuned thresholds are a starting point, not the destination — the real accuracy lever is training a model on labeled real-world driving data. Every frame's raw signals (EAR, yaw, pitch, PERCLOS, risk score, phone/hand/eating context) are available via `get_telemetry_snapshot()`, and `main.py` logs a throttled stream of them to `data/telemetry.csv` (`logging.telemetry_interval_s`, default one row per 0.5s) regardless of whether anything fired. Run real sessions, label the false positives/negatives, and that CSV becomes the training set for a small temporal classifier that could eventually replace this hand-tuned fusion layer entirely.
-
-### Tuning guide
-
-| Symptom | Change this |
-|---|---|
-| Too many drowsiness alerts on normal blinking | Increase `drowsy_seconds`, or lower `ear_threshold_ratio` (a smaller ratio = a stricter, lower threshold, so only deeper closures count) |
-| Drowsiness never fires even when eyes are clearly closed | Increase `ear_threshold_ratio` toward 1.0, or run `--recalibrate` if the baseline was captured with sunglasses/bad lighting/eyes not fully open |
-| Missed "drowsy but blinking a lot" drivers | Lower `perclos_threshold`, raise `perclos_closure_ratio` (counts shallower closures), or shorten `perclos_window_s` so it reacts faster |
-| Mirror/blindspot checks still trigger distraction | Increase `distraction_seconds` |
-| Distraction never fires on real sustained turns | Lower `yaw_threshold_deg` or `distraction_seconds` |
-| Texting-while-glancing-up isn't caught | Lower `glance_min_count` or increase `glance_window_s` |
-| `eyes_down` fires on normal driving posture | Make `pitch_threshold_deg` more negative (e.g. -30), or increase `eyes_down_seconds` |
-| Missed phone use | Lower `phone_use_seconds`, lower `yolo_confidence_threshold`, or decrease `yolo_every_n_frames` for more frequent YOLO sampling (costs FPS — check with `make bench`) |
-| Mounted phone/GPS triggers loud alerts | This shouldn't happen (mounted phone + eyes-on-road only logs `phone_detected`) — if it does, `yaw_threshold_deg`/`pitch_threshold_deg` are probably too loose |
-| Too much CPU/latency from object detection | Increase `yolo_every_n_frames`, or set `enable_hands: false` |
-| Wrong alert loudness for an event type | Edit `alerts.loud_types` / `alerts.soft_types` in `config.yaml` |
-| Alerts feel too eager overall | Increase `alerts.cooldown_s` |
-| Camera mounted to the side of the dashboard (not facing the driver head-on) fires `distraction`/`eyes_down` while looking straight at the road | Run `--recalibrate` with the camera in its final mounted position and look at the road normally for the first 10s — this learns the neutral yaw/pitch for *that* mount. Check `make dev-debug`'s "Raw yaw/pitch ... (baseline ...)" line: if the baseline is still near 0 despite an off-center mount, recalibration didn't run (delete `data/calibration.json` and restart, or pass `--recalibrate`) |
-| `high_risk`/`elevated_risk` fire too easily on combinations that feel benign | Raise `risk_elevated_threshold`/`risk_high_threshold`, or lower `RiskFusion.CORROBORATION_BONUS` in `modules/driver_attention.py` if the eye+gaze combination specifically feels oversensitive |
-| `high_risk`/`elevated_risk` never fire even when things feel clearly compounding | Lower the thresholds, or increase `risk_ema_alpha` so the score reacts faster to fresh signal |
-| `attention_lost` fires during normal driving (e.g. looking far to check a mirror/blindspot) | Increase `face_lost_seconds` — Face Mesh naturally loses tracking briefly on extreme turns |
-| Want to know if object detection is actually running | Check the terminal for `driver_attention: object detection ready (...)` on startup and `driver_attention: phone detected in frame` when one appears; the video window also shows "object detection: OFF (see terminal)" if it failed to load |
-| Missed a food/drink item entirely | Confirm it's a COCO class SensorDyme lists (`yolo_classes` in config.yaml) — the detector only knows COCO's 80 classes, so novel objects (a specific snack brand, a thermos) won't be recognized by name, only as the closest COCO class if at all |
-
-## Occupancy module: first-run note
-
-`occupancy` shares one detector with `driver_attention` through the cache in `core/detectors.py`, so only one model is ever loaded.
-
-**On the device** that detector is the pinned DAMO-YOLO `.hef` on the Hailo-8L, provisioned and checksum-verified by `setup_pi.sh`. Nothing is downloaded at run time, and there is no CPU fallback: `ultralytics` is not installed. If the accelerator or the model is unavailable the service boots into a **degraded** state — it serves health and the dashboard and reports `monitoring_active: false` with the reason — rather than silently detecting nothing.
-
-**On a developer machine** the same call resolves to ultralytics, which auto-downloads `yolo11n.pt` on first use. That path is dev-only; see `docs/LICENSING.md`.
-
-## Benchmarking
-
-```bash
-make bench                                  # all modules, 1 min each, live camera
-python benchmarks/run_benchmarks.py --modules driver_attention --minutes 5
-python benchmarks/plot_results.py           # renders charts from the latest results
-```
-
-Results land in `benchmarks/results/{module}_{timestamp}.json`, a `summary_{timestamp}.csv`, and three 300dpi PNGs (FPS bar chart with a real-time threshold line, latency box plots, and — on a Pi — a CPU-temperature-over-time line chart via `vcgencmd`).
-
-Each module is benchmarked under its exact `config.yaml` settings (each result JSON embeds that config under `module_config`), so `driver_attention`'s numbers include its real detector + MediaPipe Hands stride — not a Face-Mesh-only fast path. If you want the isolated Face Mesh cost, temporarily set `yolo_every_n_frames` very high (e.g. `1000000`) before benchmarking.
-
-## Weekly reports
-
-```bash
-make report
-```
-
-Reads `data/events.csv` and writes a PDF to `data/reports/` with events-per-day, events-per-type, and events-per-hour-of-day charts.
+Calibrated, per-user, and blink/glance-proof by construction: a personal EAR
+baseline + neutral head pose learned in the first 10 s (`--recalibrate` after
+re-mounting; `camera_hfov_deg: 102` for the Wide lens); sustained-condition
+tracking in monotonic time so blinks and mirror checks reset cleanly; PERCLOS
+for the heavy blinker; separate, more sensitive eyes-down detection; full-frame
+DAMO-YOLO on the Hailo plus MediaPipe Hands for phone/food context — **a
+visible phone alone is never an alert** (mounted GPS is legitimate; M8.5:
+`phone_use` additionally requires a handling cue — a mounted, unheld phone you
+glance at is judged by eyes-down/distraction rules only); face-lost as its own
+risk signal; and RiskFusion combining everything into one smoothed score with
+corroboration for compound danger. Experimental alert families
+(`elevated_risk`/`high_risk`/`erratic_hand_movement`) are logged observations,
+never audible, by default. Full rationale in the module docstrings and
+`docs/BEHAVIOUR_REASONING.md`.
 
 ## Privacy design statement
 
-**SensorDyme never writes a camera frame or video clip to disk, ever.** Only *derived* signals are persisted: an `Event` (timestamp, type, duration, confidence, module name) to `data/events.csv`, and a throttled numeric snapshot (EAR, yaw, pitch, PERCLOS, risk score, object-presence booleans/counts — never pixels) to `data/telemetry.csv` for future model training. Frames exist solely as in-memory numpy arrays for the duration of one processing loop iteration and are discarded immediately after. The single point in the codebase where a frame is produced is marked with a grep-able comment:
-
-**One deliberate, opt-out exception:** the Mac-only mac_max profile's VLM judge (`vlm.enabled: true`) transmits in-memory JPEG frames to the Anthropic API for classification — announced in the terminal at startup, disabled with one config line, and never part of the pi profile. The no-disk-writes invariant holds everywhere regardless.
+**SensorDyme never writes a camera frame or video clip to disk, ever.** Only
+derived signals are persisted (events, numeric telemetry). Frames exist as
+in-memory arrays for one loop iteration. The single frame-producing point is
+marked with a grep-able comment:
 
 ```bash
 grep -rn "PRIVACY: frames are never persisted" .
 ```
 
-This is enforced by design (there is no code path in `core/`, `modules/`, or `main.py` that writes a frame to a file, socket, or external service), not by a runtime check — read `core/camera.py` to verify it yourself.
+The one deliberate, opt-in exception is the Mac-only VLM judge above. On the
+device: remote live view is token-gated; while monitoring is stopped, no camera
+picture reaches a remote viewer unless the owner explicitly enables camera-only
+mode (`docs/PRIVACY.md`).
 
 ## Testing
 
 ```bash
-make test
-# or: .venv/bin/python -m pytest -q
+make test            # the Python suite (~3,950 tests; no camera needed)
+make test-ios        # the Swift logic tests (~1,700 checks)
+make acceptance      # every suite + the 30-journey matrix (evidence in data/acceptance/)
+make verify-release REF=<commit>   # the release gates
 ```
-
-The suite covers EAR math and the blink-proof drowsiness state machine (synthetic EAR time series), the glance-tolerant distraction state machine and repeated-glance counter (synthetic yaw time series), EAR + head-pose calibration persistence, the RiskFusion cross-signal engine (corroboration bonus, smoothing, hysteresis), telemetry throttling/persistence, IoU box math, alert escalation/cooldown (including the fixed loud/soft type overrides), config loading, and the module registry — all mocking the frame source (plain numpy arrays) or driving the underlying trackers directly with synthetic timestamps, so it runs on a Mac with no camera at all.
-
-`tests/test_driver_attention_max.py` covers the mac_max profile the same way — via synthetic signal timelines against the underlying trackers (`GazeCalibrator`, `BlinkRateTracker`, `CumulativeConditionTracker`, `RollingMedianFilter`), not the full `DriverAttentionMaxModule` (which eagerly loads MediaPipe and, since mac_max runs detection every frame with no stride, lazily downloads a ~109MB YOLO11-x checkpoint on its very first `process()` call) — so this suite stays fast and needs no GPU, camera, or network either. It proves: 20 normal blinks → zero events, a 1.2s mirror check → zero `eyes_off_road` events, three short glances totaling 5s in a 12s window → `excessive_glancing` fires even though no single glance crossed the 2s threshold, and a phone visible with eyes forward never reaches the AlertManager (only `phone_in_hand`/`phone_use_while_distracted` do).
 
 ## Makefile targets
 
-| Target          | What it does                                                       |
-|-----------------|---------------------------------------------------------------------|
-| `make dev`      | Runs `main.py` — on a Mac, opens the webcam with the live overlay    |
-| `make dev-debug`| Runs `main.py --debug` — full tuning overlay (EAR/yaw/pitch/PERCLOS/boxes/state) |
-| `make dev-max`  | Runs `main.py --profile mac_max --debug` — the Mac-only high-accuracy profile |
-| `make bench`    | Runs `benchmarks/run_benchmarks.py` for all registered modules       |
-| `make report`   | Generates the weekly summary PDF from `data/events.csv`              |
-| `make deploy`   | rsyncs the repo to `pi@sensordyme.local` and restarts the service    |
-| `make test`     | Runs the pytest suite                                                |
+| Target | What it does |
+|---|---|
+| `make dev` / `dev-debug` / `dev-max` | run on the Mac webcam (normal / tuning overlay / mac_max) |
+| `make test` / `test-ios` / `check` | Python suite / Swift logic tests / every CI gate |
+| `make sim` / `sim-e2e` / `acceptance` / `acceptance-full` | virtual device / e2e / full software acceptance (+iOS) |
+| `make transfer-package REF=` | the verified install package for a device |
+| `make deploy DEVICE= DIR= REF=` | staged, verified, atomic deploy with auto-rollback |
+| `make deploy-adopt` / `deploy-status` / `deploy-rollback` | one-time layout adoption / outcome / switch back |
+| `make bench` / `report` | benchmarks / weekly PDF report |

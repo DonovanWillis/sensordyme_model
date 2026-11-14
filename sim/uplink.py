@@ -67,18 +67,39 @@ class TestClientTransport:
     def __init__(self, client) -> None:
         self._client = client
 
-    def post(self, url: str, *, json=None, headers=None, timeout=None, verify=None,
+    def retarget(self, client) -> None:
+        """Point at another TestClient (a restarted backend) without rebuilding the link."""
+        self._client = client
+
+    def post(self, url: str, *, json=None, data=None, headers=None, timeout=None, verify=None,
              allow_redirects: bool = True):
         del timeout, verify  # meaningless in-process
         parts = urlsplit(url)
         path = parts.path + (f"?{parts.query}" if parts.query else "")
+        if data is not None:
+            # cloud.command_auth: required signs the exact body bytes (X-SD-Auth), so
+            # they must reach the backend unchanged, with the caller's Content-Type.
+            content = data.encode() if isinstance(data, str) else data
+            return _Response(self._client.post(path, content=content, headers=headers,
+                                               follow_redirects=allow_redirects))
         return _Response(self._client.post(path, json=json, headers=headers,
                                            follow_redirects=allow_redirects))
 
 
 class SimUplink(CloudUplink):
+    #: Every event this device sends carries `simulated: true` (M8.3): the
+    #: backend stores it and the app labels it, so a rehearsal is never shown
+    #: as a real detection.
+    SIMULATED = True
+    #: M8.4: when set (a sim.faults.EventLedger), every event any SimUplink
+    #: queues is recorded there -- "generated on the device", for comparing with
+    #: what the backend stored (soaks, data-integrity tests).
+    LEDGER: Optional[Any] = None
+
     def __init__(self, config: dict, *, transport: Optional[Any] = None, manual: bool = False) -> None:
         super().__init__(config)
+        if self.LEDGER is not None:
+            self.LEDGER.attach(self)
         if transport is not None:
             self._requests = transport
         self.manual = manual
