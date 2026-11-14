@@ -34,7 +34,7 @@ Use RB-0 unchanged, with one change: the release candidate is now the M8.4 candi
 
 ```bash
 # Mac
-export RC=06dbca3b181449da5f253612f4d17a55ec7efcb4   # M8.4 tested candidate (feat/m8.4-leapfrog; later commits are docs only); pending owner approval
+export RC=378c1894cc967d9c8754f246c0261e2ddd2450dd   # M8.5 tested candidate (feat/m8.5-pre-hardware: acceptance-full 893/0, 30/30 journeys, XCUITest 28/28); supersedes the M8.4 candidate 06dbca3
 export PI=<user>@<pi-host>  REL=~/sensordyme-release  VENV=$HOME/.venvs/sensordyme-m01/bin
 # Pi (RB-0 / RB-C1: discover U and D from the unit first)
 export U=<service user>  D=/home/$U/sensordyme  PY=$D/.venv/bin/python
@@ -530,7 +530,7 @@ signs the decision line in `$EV/LOG.md`.
 
 ## 7. TODO-INTEGRATOR
 
-1. ~~Record the candidate commit~~ (done: `06dbca3`; Python 3,741 passed / 0 failed, XCUITest 28/28 one invocation, `make acceptance` PASS (simulated), verify-release PASS; use `--expect-commit 06dbca3b181449da5f253612f4d17a55ec7efcb4`).
+1. ~~Record the candidate commit~~ (M8.5 supersedes: `378c189`; Python 3,952 passed / 0 failed, XCUITest 28/28 one invocation, `make acceptance-full` PASS 893/0 with all 30 owner journeys (simulated), verify-release PASS; use `--expect-commit 378c1894cc967d9c8754f246c0261e2ddd2450dd`; transfer package `~/sensordyme-release/transfer-378c1894cc96`).
 2. ~~Step 22: PRIVSEC's names~~ (done: `status.camera_mode`, `POST /v1/devices/{id}/camera-mode`, `camera_only` / `camera_local` labels; `check_live_status.py` judges them).
 3. ~~§2: link PRIVSEC's matrix~~ (done: `docs/SECURITY_REVIEW_M6.md` §7).
 4. ~~§5 rows B1, B3, B4~~ (done: re-read against ALPHA's merge; Decisions A and B; the mounted-phone `phone_use` look is an open owner decision).

@@ -164,9 +164,11 @@ network:
   provisioning:
     method: ble # ble | hotspot (legacy scripts/provisioning_hotspot.sh) | off
     # 0 = open the Bluetooth setup window the moment the device is offline.
-    # It closes again the instant Wi-Fi comes up, so a normal boot on a known
-    # network advertises for a second or two and nobody sees it. A longer wait
-    # only ever punishes the person standing there trying to set the device up.
+    # While offline it stays open; once Wi-Fi is up it still accepts setup for
+    # `reconfigure_window_s` (default 300 s) after each boot — the app tells
+    # people "unplug and replug it" to reopen it — and closes early once a
+    # setup succeeds this session. A longer grace only ever punishes the
+    # person standing there trying to set the device up.
     grace_s: 0 # seconds offline before the BLE setup window opens
     poll_s: 10 # how often to re-check connectivity
     # Who may hand the device a network over Bluetooth:
