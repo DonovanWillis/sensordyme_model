@@ -82,6 +82,17 @@ SINGLE_PERSON_RATIO = 0.8
 #: last driver face, seen within this many seconds, is the same face.
 CONTINUITY_S = 1.0
 CONTINUITY_FACE_WIDTHS = 1.5
+#: M10.1 -- the driver's BODY track: the person box the driver's face was last
+#: on, followed box to box (IoU) while the face is not seen, for at most this
+#: long without a matching box. Positions only: no face is recognised.
+BODY_TRACK_S = 2.0
+BODY_TRACK_MIN_IOU = 0.3
+#: M10.1 -- re-acquiring a driver's face lost toward a passenger (slumping): a
+#: NEW face (continuing no other occupant's face track) on a person box that
+#: already carries a tracked occupant's face, within this many face widths of
+#: where the driver's face was last seen, at most this long ago.
+REACQUIRE_S = 5.0
+REACQUIRE_FACE_WIDTHS = 3.0
 #: Frames whose aspect ratio differs from the calibration's by more than this
 #: (relative) cannot reuse a normalised region.
 ASPECT_TOLERANCE = 0.02
@@ -331,14 +342,103 @@ class FaceChoice:
     verified: bool = False  # continuity, or the only face in the driver region
 
 
+def _iou(a: Box, b: Box) -> float:
+    ix = max(0.0, min(a[2], b[2]) - max(a[0], b[0]))
+    iy = max(0.0, min(a[3], b[3]) - max(a[1], b[1]))
+    inter = ix * iy
+    union = (a[2] - a[0]) * (a[3] - a[1]) + (b[2] - b[0]) * (b[3] - b[1]) - inter
+    return inter / union if union > 0 else 0.0
+
+
 class DriverFaceSelector:
+    """Which face is the driver's: tracks, region, person boxes -- positions only.
+
+    M10.1 adds two tracks beside the driver's face track, both by position
+    continuity (no face is recognised, nothing is enrolled):
+
+    * the driver's BODY: the person box the driver's face was on, followed
+      box to box while the face is not seen (turned away, occluded). A face in
+      the driver region that is on ANOTHER person's box, and not on the
+      driver's body, is a passenger leaning in: it is not measured while the
+      driver's body is still in the seat (docs/DRIVER_ASSOCIATION.md 8, the
+      first open edge case);
+    * the OTHER occupants' faces seen recently. When the driver's face is lost
+      and a new face, continuing none of them, appears on a passenger's box
+      that already carries that passenger's tracked face, near where the
+      driver's face was lost, it is the driver slumped toward the passenger:
+      measured, `uncertain` (the second open edge case). Anything less clear
+      stays not measured, with the reason.
+    """
+
     def __init__(self, continuity_s: float = CONTINUITY_S, continuity_face_widths: float = CONTINUITY_FACE_WIDTHS):
         self.continuity_s = continuity_s
         self.continuity_face_widths = continuity_face_widths
         self._track: Optional[tuple[float, float, float, float, bool]] = None  # cx, cy, width, t, verified
+        self._body: Optional[tuple[Box, float]] = None  # the driver's person box, last matched at t
+        self._others: list[tuple[float, float, float, float]] = []  # other occupants' faces: cx, cy, w, t
 
     def reset(self) -> None:
         self._track = None
+        self._body = None
+        self._others = []
+
+    # ------------------------------------------------------------------ M10.1 tracks
+    def _body_now(self, people: Optional[list[Box]], now: float) -> Optional[Box]:
+        """The driver's body box on this tick (best IoU with the last one), or None."""
+        if self._body is None or people is None:
+            return None
+        last, seen = self._body
+        best = max(people, key=lambda p: _iou(p, last), default=None)
+        if best is not None and _iou(best, last) >= BODY_TRACK_MIN_IOU:
+            self._body = (best, now)
+            return best
+        if now - seen > BODY_TRACK_S:
+            self._body = None
+        return None
+
+    def _claimed_by_others(self, centres: list[tuple[float, float]], now: float) -> set[int]:
+        """Faces that continue another occupant's recent face track. Each sighting
+        claims only its NEAREST face (within the continuity radius): one person
+        has one face, so a second face beside a passenger's is not theirs."""
+        claimed: set[int] = set()
+        for x, y, w, t in self._others:
+            if now - t > self.continuity_s or not centres:
+                continue
+            dist, nearest = min((math.hypot(c[0] - x, c[1] - y), i) for i, c in enumerate(centres))
+            if dist <= self.continuity_face_widths * max(w, 1.0):
+                claimed.add(nearest)
+        return claimed
+
+    def _remember_others(self, faces: list[Box], chosen: Optional[int], now: float) -> None:
+        kept = [o for o in self._others if now - o[3] <= self.continuity_s]
+        for i, f in enumerate(faces):
+            if i != chosen:
+                cx, cy = box_center(f)
+                kept.append((cx, cy, f[2] - f[0], now))
+        self._others = kept[-8:]
+
+    def _reacquire(self, faces: list[Box], centres: list[tuple[float, float]], people: Optional[list[Box]],
+                   now: float) -> Optional[int]:
+        """A slumped driver's face on a passenger's box (class docstring), or None."""
+        track = self._track
+        if track is None or people is None or now - track[3] > REACQUIRE_S:
+            return None
+        tx, ty, tw, _t, _v = track
+        reach = REACQUIRE_FACE_WIDTHS * max(tw, 1.0)
+        claimed = self._claimed_by_others(centres, now)
+        new = [i for i, c in enumerate(centres)
+               if i not in claimed and math.hypot(c[0] - tx, c[1] - ty) <= reach]
+        if len(new) != 1:
+            return None
+        candidate = new[0]
+        for box in people:
+            if face_fit(box, centres[candidate]) is None:
+                continue
+            occupant = [i for i, c in enumerate(centres)
+                        if i != candidate and i in claimed and face_fit(box, c) is not None]
+            if occupant:
+                return candidate
+        return None
 
     @staticmethod
     def _rank(indices: list[int], faces: list[Box], anchor: Optional[tuple[float, float, float]],
@@ -363,7 +463,24 @@ class DriverFaceSelector:
                people: Optional[list[Box]]) -> FaceChoice:
         """``people``: this detector tick's person boxes (pixels), or None when
         the detector cannot say (stale / failed / not started)."""
+        choice = self._choose(faces, now, region, anchor=anchor, people=people)
+        self._remember_others(faces, choice.index, now)
+        if choice.index is not None and people is not None:
+            # The driver's body: the box the selected face is on (the one that
+            # best continues the last body box, if the face is on several).
+            centre = box_center(faces[choice.index])
+            under = [p for p in people if face_fit(p, centre) is not None]
+            if under:
+                last = self._body[0] if self._body is not None else None
+                body = max(under, key=lambda p: _iou(p, last)) if last is not None else min(
+                    under, key=lambda p: face_fit(p, centre) or 0.0)
+                self._body = (body, now)
+        return choice
+
+    def _choose(self, faces: list[Box], now: float, region: Box, *, anchor: Optional[tuple[float, float, float]],
+                people: Optional[list[Box]]) -> FaceChoice:
         n = len(faces)
+        body = self._body_now(people, now)
         if n == 0:
             return FaceChoice(None, 0, NOT_VISIBLE, "no face")
         centres = [box_center(f) for f in faces]
@@ -382,8 +499,19 @@ class DriverFaceSelector:
                     verified = inside == [index]
                 choice = FaceChoice(index, n, IDENTIFIED if verified else UNCERTAIN,
                                     "continues the driver's face track", verified)
+        # M10.1: with the driver's body still in the seat and its face not seen,
+        # a face that is on another person's box and not on the driver's body is
+        # that person's (a passenger leaning in), wherever it is.
+        foreign: set[int] = set()
+        if choice is None and body is not None and people is not None:
+            for i, c in enumerate(centres):
+                if face_fit(body, c) is None and any(face_fit(p, c) is not None for p in people if p != body):
+                    foreign.add(i)
         if choice is None:
-            inside = [i for i, c in enumerate(centres) if box_contains_point(region, c)]
+            inside = [i for i, c in enumerate(centres) if box_contains_point(region, c) and i not in foreign]
+            if not inside and any(box_contains_point(region, centres[i]) for i in foreign):
+                return FaceChoice(None, n, NOT_VISIBLE, "the face in the driver region is on another person's "
+                                  "box (a passenger leaning in); the driver is still in the seat, face not seen")
             if len(inside) == 1:
                 choice = FaceChoice(inside[0], n, IDENTIFIED, "the face in the driver region", True)
             elif inside:
@@ -403,9 +531,14 @@ class DriverFaceSelector:
                 def on(boxes: list[Box], c: tuple[float, float]) -> bool:
                     return any(face_fit(p, c) is not None for p in boxes)
 
-                on_seat = [i for i, c in enumerate(centres) if on(seat, c)]
+                on_seat = [i for i, c in enumerate(centres) if on(seat, c) and i not in foreign]
                 unclaimed = [i for i, c in enumerate(centres) if not on(seat, c) and not on(others, c)]
-                if on_seat:
+                slumped = None if on_seat or unclaimed else self._reacquire(faces, centres, people, now)
+                if slumped is not None:
+                    choice = FaceChoice(slumped, n, UNCERTAIN,
+                                        "a new face near where the driver's face was lost, on a passenger's box "
+                                        "that already carries the passenger's face (slumped toward them)")
+                elif on_seat:
                     choice = FaceChoice(self._rank(on_seat, faces, anchor, region), n, UNCERTAIN,
                                         "outside the driver region, on the person in the driver's seat (leaning)")
                 elif unclaimed:
@@ -421,6 +554,7 @@ class DriverFaceSelector:
         cx, cy = centres[choice.index]
         self._track = (cx, cy, f[2] - f[0], now, choice.verified)
         return choice
+
 
 
 # ---------------------------------------------------------------------------- facade
