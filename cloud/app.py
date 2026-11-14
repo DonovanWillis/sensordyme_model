@@ -3960,8 +3960,9 @@ def toggle_rule(device_id: int, rule_id: str, body: RuleToggleBody, uid: int = D
 #      the model cannot claim a detection the device doesn't support;
 #   3. anything unsupported comes back with WHY and what it would need, instead
 #      of being silently accepted.
-# Without an ANTHROPIC_API_KEY the deterministic keyword fallback still returns
-# valid (if less nuanced) configurations, so the demo never dies with the network.
+# Without a reachable model (the local Ollama server by default, or the opt-in
+# Anthropic fallback) the deterministic policy parser and keyword fallback still
+# return valid (if less nuanced) configurations, so the demo never dies with the network.
 
 def _modes() -> tuple[str, ...]:
     """The whole-scenario modes a proposal is allowed to name.
@@ -4268,8 +4269,14 @@ def _ai_fallback(prompt: str) -> dict:
         ),
         "unsupported": [{
             "request": prompt,
-            "reason": "the language service that interprets custom requests is not configured",
-            "requires": "set ANTHROPIC_API_KEY on the backend and restart it",
+            "reason": "the language service that interprets custom requests is not available",
+            # Both ways it can be made available. The default interpreter is the
+            # LOCAL model server (jupiter/router.py: Ollama at localhost:11434 on
+            # the backend's machine), and the Anthropic path is an opt-in cloud
+            # fallback (SENSORDYME_ALLOW_EXTERNAL_AI) -- so naming only the API
+            # key sent people to set a variable that, alone, changes nothing.
+            "requires": ("run the local model server (Ollama) on the backend's computer, or set "
+                         "ANTHROPIC_API_KEY and SENSORDYME_ALLOW_EXTERNAL_AI=1 on the backend and restart it"),
             "support": "unsupported",
             "alternatives": [],
             "code": "interpreter_unavailable",
