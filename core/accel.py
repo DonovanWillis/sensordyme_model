@@ -67,6 +67,15 @@ COCO_NAMES = {
     77: "teddy bear", 78: "hair drier", 79: "toothbrush",
 }
 
+#: Compiled artifacts whose class head is COCO-80 plus the network's own extra
+#: (mmdet-style background) channel 80, which is NOT a class. Mapping an extra
+#: class onto one of these (`accelerator.yolo_extra_classes`) would report that
+#: background slot as e.g. "hand", so it is refused at load (M10). The shipping
+#: .hef is the only one pinned today (config.yaml accelerator.yolo_hef_sha256).
+COCO80_ONLY_HEF_SHA256 = frozenset({
+    "e69136d3ebf3cc8ebaf3da5417a59962b139f3d3d67d715e9a9b1ae10963960e",
+})
+
 
 @dataclass(frozen=True)
 class AcceleratorInfo:
@@ -332,7 +341,8 @@ def maybe_hailo_yolo(weights: str):
                 "Pin it so a replaced or corrupted model is refused.", hef_path, actual,
             )
         try:
-            model = HailoYOLO(hef_path, sha256=actual, decoder=_accel_cfg.get("yolo_decoder", "legacy"))
+            model = HailoYOLO(hef_path, sha256=actual, decoder=_accel_cfg.get("yolo_decoder", "legacy"),
+                              extra_classes=_accel_cfg.get("yolo_extra_classes"))
         except Exception as exc:  # noqa: BLE001 - never let the accelerator kill startup
             _refuse(f"Hailo init failed ({exc}) — running on CPU")
             return None
@@ -477,10 +487,16 @@ class HailoYOLO:
     _REFERENCE_MAX_DETECTIONS = 500
 
     def __init__(self, hef_path: str, nms_iou: Optional[float] = None, sha256: Optional[str] = None,
-                 decoder: str = "legacy") -> None:
+                 decoder: str = "legacy", extra_classes: Optional[dict] = None) -> None:
         if decoder not in self.DECODERS:
             raise ValueError(f"unknown decoder {decoder!r}; expected one of {self.DECODERS}")
         self.decoder = decoder
+        # M10, opt-in (accelerator.yolo_extra_classes): class-head channels beyond
+        # COCO-80 that are real classes, e.g. {80: "hand"} for the EXP-08
+        # device-layout export. Empty = today's decode, bit for bit. Refused
+        # before the device is touched when the mapping is malformed or the
+        # artifact is one whose channel 80 is known not to be a class.
+        self._set_extra_classes(extra_classes, sha256)
         from hailo_platform import (  # imported here: only exists on the Pi
             HEF,
             ConfigureParams,
@@ -504,8 +520,10 @@ class HailoYOLO:
         self._closed = False
         self._nms_iou = self._DEFAULT_NMS_IOU if nms_iou is None else float(nms_iou)
 
-        self.names = dict(COCO_NAMES)
+        self.names = {**COCO_NAMES, **self._extra_classes}
         self._hef = HEF(hef_path)
+        # Before the (exclusive) device is opened, so a refusal leaves the chip free.
+        self._check_class_map_fits(self._hef.get_output_vstream_infos(), hef_path)
         self._vdevice = VDevice()
         configure_params = ConfigureParams.create_from_hef(
             self._hef, interface=HailoStreamInterface.PCIe
@@ -561,6 +579,67 @@ class HailoYOLO:
                 "recall regardless of the `conf` passed to predict()",
                 os.path.basename(hef_path),
             )
+        if self._extra_classes:
+            log.warning("accel: EXPERIMENT-ONLY class map active: %s (accelerator.yolo_extra_classes)",
+                        self._extra_classes)
+
+    def _set_extra_classes(self, extra_classes: Optional[dict], sha256: Optional[str]) -> None:
+        """Validate and install the extra-class map (see __init__). Raises ValueError."""
+        from core.config_schema import parse_yolo_extra_classes
+
+        mapped = parse_yolo_extra_classes(extra_classes)
+        if mapped and sha256 and sha256.lower() in COCO80_ONLY_HEF_SHA256:
+            raise ValueError(
+                f"accelerator.yolo_extra_classes {mapped} cannot be applied to the COCO-80 .hef "
+                f"(sha256 {sha256[:12]}…): its channel 80 is the network's background slot, not a class"
+            )
+        self._extra_classes: dict[int, str] = mapped
+        #: The class-head channels the decoders read, in column order: COCO-80 then the mapped extras.
+        self._class_channels = np.asarray([*range(len(COCO_NAMES)), *mapped], dtype=np.int64)
+
+    def _check_class_map_fits(self, out_infos, hef_path: str) -> None:
+        """Fail closed when the .hef cannot carry the configured extra classes (M10).
+
+        Only with an extra-class map; without one nothing here runs. Refused:
+        an on-chip-NMS build (its class list is fixed by the compiler, a channel
+        map has nothing to address) and any class head narrower than the
+        highest mapped channel + 1 (the mapped class would silently never be
+        read, or a later head would be indexed out of range).
+        """
+        if not self._extra_classes:
+            return
+        name = os.path.basename(hef_path)
+        if len(out_infos) <= 1:
+            raise RuntimeError(f"accelerator.yolo_extra_classes {self._extra_classes} needs a raw-head "
+                               f"(no on-chip NMS) .hef; {name} has on-chip NMS")
+        need = self._class_head_width()
+        for info in out_infos:
+            channels = info.shape[-1]
+            if channels != 4 * self._DFL_BINS and channels < need:
+                raise RuntimeError(
+                    f"accelerator.yolo_extra_classes {self._extra_classes} needs class heads with at least "
+                    f"{need} channels; {name} output {info.name} has {channels}. Refusing to load rather than "
+                    "never reporting the mapped class."
+                )
+
+    def _class_head_width(self) -> int:
+        """The fewest class-head channels this decode needs: 80, or the highest mapped channel + 1."""
+        extra = getattr(self, "_extra_classes", None)
+        return max(len(COCO_NAMES), max(extra) + 1) if extra else len(COCO_NAMES)
+
+    def _class_scores(self, cls_raw: np.ndarray) -> tuple[np.ndarray, Optional[np.ndarray]]:
+        """(scores (anchors, K), channel id of each column or None when column == COCO id).
+
+        Without an extra-class map this is exactly the pre-M10 slice
+        ``[:, :80]`` (channel 80 is dropped as padding/background). With one,
+        the mapped channels are appended as further columns, so a mapped class
+        competes in the legacy argmax and is a candidate in the reference
+        multilabel selection like any COCO class.
+        """
+        flat = cls_raw.reshape(-1, cls_raw.shape[-1])
+        if not getattr(self, "_extra_classes", None):
+            return flat[:, : len(COCO_NAMES)], None
+        return flat[:, self._class_channels], self._class_channels
 
     def _group_raw_outputs(self, out_infos) -> list[dict]:
         """Pair each scale's box head with its class head, by grid size.
@@ -735,7 +814,9 @@ class HailoYOLO:
           * class head, already sigmoid'd probabilities in [0,1] — verified by
             feeding a real driver image and finding channel 0 (COCO `person`)
             at 0.85, channel 56 (`chair`) and 67 (`cell phone`) plausibly lit.
-            Channels beyond the COCO 80 are padding and are dropped.
+            Channels beyond the COCO 80 are padding and are dropped -- unless
+            accelerator.yolo_extra_classes (M10, opt-in, experiment-only) maps
+            one to a class, e.g. {80: hand} for a 3-class device-layout export.
         """
         if getattr(self, "decoder", "legacy") == "reference":
             return self._decode_reference(raw, scale, left, top, w, h, classes, conf)
@@ -750,9 +831,12 @@ class HailoYOLO:
 
             # Only the real COCO classes; anything past 80 is padding, and letting
             # it through would invent detections for classes that do not exist.
-            scores = cls_raw.reshape(-1, cls_raw.shape[-1])[:, : len(COCO_NAMES)]
+            # (M10: plus any channel accelerator.yolo_extra_classes names a class.)
+            scores, channels = self._class_scores(cls_raw)
 
             best_cls = scores.argmax(axis=1)
+            if channels is not None:
+                best_cls = channels[best_cls]
             best_score = scores.max(axis=1)  # max propagates NaN: one check covers every anchor
             self._finite_or_raise(best_score, f"class scores at grid {grid}")
             keep = best_score >= conf
@@ -845,14 +929,15 @@ class HailoYOLO:
             class, so a phone sharing an anchor with a stronger person is kept.
 
         Channel mapping: the class head carries len(COCO_NAMES) = 80 sigmoid
-        probabilities; any further channels are padding and are dropped. The box
+        probabilities; any further channels are padding and are dropped, unless
+        accelerator.yolo_extra_classes names one a class (M10, opt-in). The box
         head carries 4 x _DFL_BINS raw logits (l, t, r, b); a distance is the
         softmax expectation over its bins, in stride units. Suppression is
         class-aware NMS at this model's IoU, then the top
         _REFERENCE_MAX_DETECTIONS by score. Boxes are mapped back through the
         letterbox and clipped to the frame exactly as on the legacy path.
         """
-        num_classes = len(COCO_NAMES)
+        num_classes = self._class_head_width()
         wanted = {int(c) for c in classes} if classes is not None else None
         all_boxes: list[np.ndarray] = []
         all_scores: list[np.ndarray] = []
@@ -862,13 +947,14 @@ class HailoYOLO:
             if cls_raw.shape[-1] < num_classes:
                 raise RuntimeError(f"class head has {cls_raw.shape[-1]} channels, expected >= {num_classes}")
             grid, stride = spec["grid"], spec["stride"]
-            scores = cls_raw.reshape(-1, cls_raw.shape[-1])[:, :num_classes]
+            scores, channels = self._class_scores(cls_raw)
             # One reduction (NaN/inf propagate through a sum) instead of a full isfinite pass.
             self._finite_or_raise(scores.sum(), f"class scores at grid {grid}")
-            anchor_idx, class_idx = np.nonzero(scores >= conf)
+            anchor_idx, col_idx = np.nonzero(scores >= conf)
+            class_idx = col_idx if channels is None else channels[col_idx]
             if wanted is not None:
                 keep = np.isin(class_idx, list(wanted))
-                anchor_idx, class_idx = anchor_idx[keep], class_idx[keep]
+                anchor_idx, col_idx, class_idx = anchor_idx[keep], col_idx[keep], class_idx[keep]
             if anchor_idx.size == 0:
                 continue
             dfl = box_raw.reshape(-1, 4, self._DFL_BINS)[anchor_idx]
@@ -883,7 +969,7 @@ class HailoYOLO:
                 px - dist[:, 0] * stride, py - dist[:, 1] * stride,
                 px + dist[:, 2] * stride, py + dist[:, 3] * stride,
             ], axis=1))
-            all_scores.append(scores[anchor_idx, class_idx])
+            all_scores.append(scores[anchor_idx, col_idx])
             all_classes.append(class_idx)
         if not all_boxes:
             return [_ShimResult([])]
