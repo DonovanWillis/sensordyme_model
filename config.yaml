@@ -80,6 +80,11 @@ dashboard:
   # Live-feed cost controls. Annotating + JPEG-encoding competes with the detector for
   # CPU on the Pi, so frames are only encoded while someone is actually watching /stream.
   # Lower either value if detection framerate drops while the app's feed is open.
+  # M10 (docs/DIAGNOSTICS.md): GET /api/diagnostics -- detections, evidence, open
+  # conditions, model versions and per-stage latency, for developers. OFF here and
+  # on every shipped device. When true it is still served ONLY with the token
+  # above (403 without one, even on loopback), never uploaded, never a frame.
+  developer_diagnostics: false
   jpeg_quality: 60 # 1-100; 80 was the old default, 50-60 is fine on a phone screen
   stream_fps: 12 # frames/sec pushed to a viewer; detection still runs at full camera fps
   # M8.4 owner Decision C (docs/PRIVACY.md): while monitoring is STOPPED, /stream

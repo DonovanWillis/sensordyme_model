@@ -39,6 +39,7 @@ from typing import Optional
 
 import numpy as np
 
+from core import stage_timing  # M10: always-on, bounded per-stage timing (stdlib only)
 from core.logging_setup import get_logger
 
 log = get_logger("accel")
@@ -667,6 +668,7 @@ class HailoYOLO:
             # The input vstream is UINT8. A float frame would otherwise reach the
             # chip as whatever bytes the cast or the runtime makes of it (M8.3).
             raise TypeError(f"HailoYOLO.predict needs a uint8 BGR frame, got {getattr(frame, 'dtype', type(frame))}")
+        started = time.perf_counter()
         h, w = frame.shape[:2]
         scale, left, top = letterbox_transform(w, h, self._input_w, self._input_h)
         new_w, new_h = round(w * scale), round(h * scale)
@@ -678,11 +680,14 @@ class HailoYOLO:
         )
         rgb = cv2.cvtColor(letterboxed, cv2.COLOR_BGR2RGB)
         batch = np.expand_dims(rgb, axis=0)
+        stage_timing.TIMINGS.add_since("hailo_preprocess", started)
 
         with self._lock:
             pipeline = self._ensure_ready()
             try:
+                infer_started = time.perf_counter()
                 raw = pipeline.infer({self._input_name: batch})
+                stage_timing.TIMINGS.add_since("hailo_inference", infer_started)
             except Exception:
                 # The device may have reset under us: drop the held contexts so
                 # the next frame rebuilds them instead of reusing dead streams.
@@ -694,8 +699,11 @@ class HailoYOLO:
         # reflects work the Hailo actually completed.
         record_inference()
 
+        decode_started = time.perf_counter()
         if self._raw_outputs:
-            return self._decode_raw(raw, scale, left, top, w, h, classes, conf)
+            decoded = self._decode_raw(raw, scale, left, top, w, h, classes, conf)
+            stage_timing.TIMINGS.add_since("decoder_cpu", decode_started)
+            return decoded
 
         # One output tensor (NMS postprocess): per image, a list per class of Nx5 rows.
         per_class = raw[next(iter(raw))][0]
@@ -716,6 +724,7 @@ class HailoYOLO:
                 x2 = min(max((xmax * self._input_w - left) / scale, 0.0), w)
                 y2 = min(max((ymax * self._input_h - top) / scale, 0.0), h)
                 boxes.append(_ShimBox(np.asarray([x1, y1, x2, y2]), cls_id, score))
+        stage_timing.TIMINGS.add_since("decoder_cpu", decode_started)
         return [_ShimResult(boxes)]
 
     # -------------------------------------------------------------- raw decode

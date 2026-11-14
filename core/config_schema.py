@@ -163,6 +163,16 @@ def validate(config: dict) -> tuple[list[str], list[str]]:
         host = dashboard.get("host", "127.0.0.1")
         _check(errors, isinstance(host, str) and host != "",
                f"`dashboard.host:` must be an IPv4 address or hostname, got {host!r}")
+        # M10 (docs/DIAGNOSTICS.md): developer diagnostics, OFF by default. A bool and
+        # nothing else: "yes" or 1 must not switch on a view of what the camera sees.
+        diagnostics = dashboard.get("developer_diagnostics", False)
+        _check(errors, isinstance(diagnostics, bool),
+               f"`dashboard.developer_diagnostics:` must be true or false, got {diagnostics!r}")
+        if diagnostics is True and not dashboard.get("token"):
+            warnings.append(
+                "dashboard.developer_diagnostics is true but dashboard.token is not set: "
+                "/api/diagnostics refuses every request (403) until a token is configured"
+            )
         if dashboard.get("token") and str(dashboard.get("host")) not in ("127.0.0.1", "localhost"):
             warnings.append(
                 "dashboard.token is set with a non-localhost host: make sure the app "

@@ -12,6 +12,7 @@ from __future__ import annotations
 import threading
 import time
 
+from core import stage_timing
 from core.camera import Camera, CameraError
 from core.frame_bus import FrameBus
 from core.health import HealthMonitor
@@ -147,7 +148,9 @@ class CaptureService:
             last_read = time.monotonic()
 
             try:
+                read_started = time.perf_counter()
                 frame = self._camera.read()
+                stage_timing.TIMINGS.add_since("camera_read", read_started)  # M10
             except CameraError as exc:
                 consecutive_failures += 1
                 if self._health is not None:
