@@ -65,6 +65,7 @@ from dataclasses import dataclass, field
 from enum import Enum
 from typing import Any, ClassVar, Optional, Protocol
 
+from core import stage_timing
 from core.behavior.experimental import is_experimental
 from core.events import Event
 from core.logging_setup import get_logger
@@ -208,7 +209,11 @@ class _PatternPlayer:
     def __init__(self, render_step) -> None:
         self._render_step = render_step  # callable(on_s) -> Optional[str] error; blocks for on_s
         self._lock = threading.Lock()
-        self._pending: list[tuple[int, AlertPattern, Optional[Report]]] = []
+        #: (rank, pattern, report, monotonic time it was commanded)
+        self._pending: list[tuple[int, AlertPattern, Optional[Report], float]] = []
+        #: M10: while the FIRST step of a pattern renders, when that pattern was
+        #: commanded; the output reads it once to time command -> pin driven.
+        self.first_step_commanded_at: Optional[float] = None
         self._wake = threading.Event()
         self._thread: Optional[threading.Thread] = None
 
@@ -227,7 +232,7 @@ class _PatternPlayer:
             else:
                 queued = True
             if queued:
-                self._pending.append((rank, pattern, report))
+                self._pending.append((rank, pattern, report, time.monotonic()))
                 if self._thread is None or not self._thread.is_alive():
                     self._thread = threading.Thread(target=self._run, daemon=True)
                     self._thread.start()
@@ -241,10 +246,12 @@ class _PatternPlayer:
                     self._thread = None
                     return
                 best = max(range(len(self._pending)), key=lambda i: self._pending[i][0])
-                _, pattern, report = self._pending.pop(best)
+                _, pattern, report, commanded_at = self._pending.pop(best)
             error: Optional[str] = None
+            self.first_step_commanded_at = commanded_at
             for on_s, off_s in pattern.steps:
                 step_error = self._render_step(on_s)
+                self.first_step_commanded_at = None
                 if step_error and error is None:
                     error = str(step_error)
                 if off_s:
@@ -460,7 +467,7 @@ class GPIOBuzzerSink:
         if level == AlertLevel.SUPPRESSED:
             return
         on_s = 0.15 if level == AlertLevel.SOFT else 0.6
-        threading.Thread(target=self._buzz, args=(on_s,), daemon=True).start()
+        threading.Thread(target=self._buzz, args=(on_s, time.monotonic()), daemon=True).start()
 
     def play(self, pattern: AlertPattern, event: Event, category: AlertCategory,
              report: Optional[Report] = None) -> None:
@@ -474,12 +481,22 @@ class GPIOBuzzerSink:
             self._player = _PatternPlayer(self._buzz)
         self._player.play(pattern, category.name, report)
 
-    def _buzz(self, on_s: float) -> Optional[str]:
-        """Drive the pin on for on_s. Returns None, or the GPIO error."""
+    def _buzz(self, on_s: float, commanded_at: Optional[float] = None) -> Optional[str]:
+        """Drive the pin on for on_s. Returns None, or the GPIO error.
+
+        M10: the first pulse of a commanded pattern records command -> pin driven
+        (stage `alert_output`, core/stage_timing.py): the queue wait on the player
+        thread plus the GPIO write itself. Pin driven, not sound heard.
+        """
+        player = getattr(self, "_player", None)
+        if commanded_at is None and player is not None:
+            commanded_at = player.first_step_commanded_at
         try:
             with self._lock:
                 self._off_at = max(self._off_at, time.monotonic() + on_s)
                 self._buzzer.on()
+            if commanded_at is not None:
+                stage_timing.record("alert_output", (time.monotonic() - commanded_at) * 1000.0)
             time.sleep(on_s)
             with self._lock:
                 # A later or longer request extended _off_at: leave it on.

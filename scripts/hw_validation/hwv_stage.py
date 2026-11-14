@@ -11,6 +11,8 @@
     $PY $V/hwv_stage.py latency               # per-frame latency + accelerator duty cycle   [Pi, service stopped]
     $PY $V/hwv_stage.py thermal               # 30-min soak under the real service          [Pi, service RUNNING]
     $PY $V/hwv_stage.py buzzer                # commanded pattern timing (+ a person listens) [Pi, service stopped]
+    $PY $V/hwv_stage.py observe --minutes 10  # the runtime's own per-stage timings, recorded  [Pi, service RUNNING]
+    $PY $V/hwv_stage.py arch --second-hef B.hef  # single vs dual detector, equal conditions   [Pi, service stopped]
     python hwv_stage.py all --fake            # every stage against fakes, for a dry run
 
 Exit codes: 0 PASS, 1 FAIL, 2 BLOCKED (a prerequisite is missing: no Hailo device,
@@ -77,7 +79,12 @@ STAGES: dict[str, tuple[str, str, str]] = {
     "latency": ("yes", "stopped", "predict() p50/p95 per stage vs the production stride; accelerator duty cycle"),
     "thermal": ("yes", "running", "30-min soak: never throttled, ARM clock held, fps stable"),
     "buzzer": ("yes (+ a person)", "stopped", "every pattern commanded with the designed timing; audibility by ear"),
+    "observe": ("yes", "running", "M10: record /api/health per-stage timings, fps, RSS, temp, throttle for N min"),
+    "arch": ("yes (+ a 2nd .hef)", "stopped", "M10: Arch A (production .hef) vs Arch B (+ --second-hef), ABBA blocks"),
 }
+#: Stages `all` never runs: they need an input only the operator has (a second .hef)
+#: or the service in the other state than the rest of `all`.
+_NOT_IN_ALL = ("observe", "arch")
 
 
 # ------------------------------------------------------------------ reporting
@@ -677,9 +684,263 @@ def stage_buzzer(rep: Report, args) -> int:
     return PASS
 
 
+def stage_observe(rep: Report, args) -> int:
+    """The runtime's own always-on stage timings (core/stage_timing.py), recorded."""
+    import stage_timing as st
+
+    out_dir = args.out / f"observe_{'SIMULATED_' if args.fake else ''}{time.strftime('%Y%m%dT%H%M%S')}"
+    if args.fake:
+        # The real recording code against a real dashboard and a real performance
+        # block whose only samples come from the production HailoYOLO on the FAKE
+        # chip: every number in it is SIMULATED and labelled so by the platform tag.
+        sys.path.insert(0, str(hc.REPO_ROOT))
+        from core import stage_timing as core_st
+        from core.dashboard import DashboardServer
+
+        with fake_device() as install:
+            config, _ = load_config(install)
+            accel, model = load_production_model(install, config)
+            try:
+                for _, frame in known_good_frames():
+                    model.predict(frame, conf=0.2)
+            finally:
+                model.close()
+                accel.release_hailo_models()
+        import secrets
+
+        token = secrets.token_hex(8)  # this dry run's own throwaway token
+        server = DashboardServer(host="127.0.0.1", port=0, token=token, health_provider=lambda: {
+            "state": "ok", "device": {"monitoring": {"state": "simulated", "model": None}},
+            "performance": core_st.report(simulated=True)})
+        url = server.start() + "/api/health"
+        try:
+            code, summary = st.record(url, token, 3 / 60, 1.0, out_dir, args.install_dir, hc.REPO_ROOT)
+        finally:
+            server.close()
+    else:
+        if (b := service_must_be(rep, "running", args)) is not None:
+            return b
+        token = os.environ.get("SENSORDYME_TOKEN") or None
+        code, summary = st.record(args.url, token, args.minutes, args.interval, out_dir, args.install_dir,
+                                  hc.REPO_ROOT)
+        if code == BLOCKED:
+            return rep.block("the service's /api/health did not answer with a `performance` block (see above)")
+    rep.values.update({"out_dir": str(out_dir), "summary": summary})
+    rep.check("polls recorded", bool(summary) and summary.get("polls", 0) > 0, summary.get("polls") if summary else 0)
+    stages = (summary or {}).get("stages") or {}
+    rep.check("Hailo inference timed by the running runtime", bool(stages.get("hailo_inference")),
+              (stages.get("hailo_inference") or {}).get("window_p95_ms"))
+    if args.fake:
+        rep.values["platform_check"] = "not judged under --fake (SIMULATED by construction)"
+    else:
+        rep.check("the numbers are a Raspberry Pi measurement (platform class 'pi')",
+                  bool(summary.get("is_pi_measurement")), summary.get("platform_classes"))
+        rep.check("never throttled during the recording", not summary.get("throttled_any"),
+                  summary.get("throttle_values"), provisional=True)
+    return PASS
+
+
+def _arch_frames(args, config: dict):
+    """A frame source that gives every block the same frames: the known-good images
+    (--fake), a video rewound per block (--video), or the live camera in its configured
+    mode. Returns (reset, next_frame, close)."""
+    import cv2
+
+    if args.video:
+        video = str(Path(args.video).expanduser())
+        state: dict = {}
+
+        def reset():
+            if state.get("cap") is not None:
+                state["cap"].release()
+            state["cap"] = cv2.VideoCapture(video)
+
+        def nxt():
+            ok, frame = state["cap"].read()
+            if not ok:  # loop the clip: a block longer than the clip sees it again
+                reset()
+                ok, frame = state["cap"].read()
+            return frame if ok else None
+
+        return reset, nxt, lambda: state.get("cap") and state["cap"].release()
+    if args.fake:
+        frames = [f for _, f in known_good_frames()]
+        pos = {"i": 0}
+
+        def reset_list():
+            pos["i"] = 0
+
+        def nxt_list():
+            frame = frames[pos["i"] % len(frames)]
+            pos["i"] += 1
+            return frame
+
+        return reset_list, nxt_list, lambda: None
+    from core.camera import Camera
+
+    camera = Camera(config.get("camera") or {})
+    return (lambda: None), (lambda: camera.read(timeout_s=5.0)), camera.release
+
+
+def stage_arch(rep: Report, args) -> int:
+    """Arch A (production: one .hef) vs Arch B (production .hef + a second .hef) at equal
+    operating conditions: same frames / camera mode, same detector stride, same pacing,
+    each block started in the same thermal state, ABBA order to cancel drift."""
+    second = Path(args.second_hef).expanduser() if args.second_hef else None
+    if second is None:
+        return rep.block("--second-hef PATH is required: Arch B's compiled .hef. This tool never creates one")
+    if not second.is_file():
+        return rep.block(f"{second} does not exist: Arch B needs its own compiled .hef, and this tool never "
+                         "fabricates one")
+    second_sha = hc.sha256_file(second)
+    second_pin = (args.second_hef_sha256 or "").strip().lower() or None
+    if second_pin and second_sha != second_pin:
+        return rep.block(f"{second} sha256 {second_sha[:16]} != --second-hef-sha256 {second_pin[:16]}: refusing it")
+    if (b := service_must_be(rep, "stopped", args)) is not None:
+        return b
+    if not args.fake and not os.path.exists("/dev/hailo0"):
+        return rep.block("no /dev/hailo0: the AI HAT+ is not seated or its driver is not loaded")
+    config, cfg_path = load_config(args.install_dir)
+    hef, pin = hef_path_and_pin(args.install_dir, config)
+    if not hef.exists() or hc.sha256_file(hef) != pin:
+        return rep.block(f"{hef} missing or not the pinned production model: run the model stage first")
+    if not args.fake:
+        try:
+            import hailo_platform  # noqa: F401
+        except ImportError as exc:
+            return rep.block(f"hailo_platform does not import ({exc}); sudo apt install hailo-all")
+
+    import stage_timing as st
+
+    sys.path.insert(0, str(hc.REPO_ROOT))
+    from core import accel, detectors
+    from core import stage_timing as core_st
+    from modules import get_module_class
+
+    module_name = args.module or config.get("module") or "driver_attention"
+    module_cfg = dict((config.get("modules") or {}).get(module_name) or {})
+    every = max(1, int(module_cfg.get("yolo_every_n_frames", 3)))
+    camera = dict(config.get("camera") or {})
+    fps = float(camera.get("fps", 30))
+    seconds = min(args.block_seconds, 2.0) if args.fake else float(args.block_seconds)
+    order = list("ABBA") * max(1, args.rounds)
+    acc = dict(config.get("accelerator") or {})
+    acc["yolo_hef"] = str(hef)
+    info = (accel.AcceleratorInfo(True, True, "hailo", "SIMULATED Hailo (fake_hailo)")
+            if getattr(sys.modules.get("hailo_platform"), "SIMULATED", False) else None)
+    accel.configure(acc, info=info)
+    platform_tag = core_st.platform_tag(simulated=args.fake)
+    rep.values.update({
+        "conditions": {"module": module_name, "camera_mode": camera, "camera_fps": fps,
+                       "detector_stride_frames": every, "block_seconds": seconds, "order": "".join(order),
+                       "frames": "known-good images (SIMULATED)" if args.fake else (args.video or "live camera"),
+                       "arch_a_scheduler": "HailoRT ROUND_ROBIN" if args.a_scheduled else "none (production)",
+                       "arch_b_scheduler": "HailoRT ROUND_ROBIN (two network groups, one VDevice)",
+                       "temp_tolerance_c": args.temp_tolerance_c},
+        "models": {"production": {"path": str(hef), "sha256": pin, "pin": pin, "decoder": acc.get("yolo_decoder")},
+                   "second": {"path": str(second), "sha256": second_sha, "pin": second_pin or "UNPINNED"}},
+        "platform": platform_tag, "config_sha256": hc.sha256_file(cfg_path),
+    })
+    reset, next_frame, close_frames = _arch_frames(args, config)
+    blocks: list[dict] = []
+    baseline = st.thermal_now()
+    target = args.start_temp_c if args.start_temp_c is not None else baseline["soc_temp_c"]
+    try:
+        for index, arm in enumerate(order):
+            before = st.wait_for_thermal_state(target, args.temp_tolerance_c,
+                                               0.0 if args.fake else args.cooldown_max_s)
+            reset()
+            with contextlib.ExitStack() as stack:
+                if arm == "B" or args.a_scheduled:
+                    stack.enter_context(st.scheduled_chip())
+                module = get_module_class(module_name)(module_cfg)
+                stack.callback(detectors.release_all)
+                stack.callback(getattr(module, "close", lambda: None))
+                second_model = None
+                if arm == "B":
+                    second_model = accel.HailoYOLO(str(second), sha256=second_sha,
+                                                   decoder=acc.get("yolo_decoder", "legacy"))
+                    stack.callback(second_model.close)
+                result = st.run_block(module=module, second=second_model, next_frame=next_frame, every=every,
+                                      fps=fps, seconds=seconds, warmup=max(2, every + 1) + args.warmup)
+            after = st.thermal_now()
+            result.update({"block": index, "arm": arm, "thermal_start": before, "thermal_end": after})
+            blocks.append(result)
+            s = result["summary"]
+            print(f"  block {index} arch {arm}: {result['achieved_fps']} fps, frame p95 "
+                  f"{(s.get('frame_total') or {}).get('p95')} ms, detector p95 {(s.get('detector_total') or {}).get('p95')}"
+                  f" ms, B p95 {(s.get('b_detector_total') or {}).get('p95')} ms, temp {before['soc_temp_c']}->"
+                  f"{after['soc_temp_c']}", flush=True)
+    finally:
+        close_frames()
+        detectors.release_all()
+    arms = {arm: _arch_aggregate([b for b in blocks if b["arm"] == arm]) for arm in ("A", "B")}
+    deltas = {k: (None if arms["A"].get(k) is None or arms["B"].get(k) is None
+                  else round(arms["B"][k] - arms["A"][k], 3))
+              for k in ("frame_total_p50", "frame_total_p95", "process_total_p95", "achieved_fps", "rss_mb_max")}
+    rep.values.update({"blocks": blocks, "arms": arms, "b_minus_a": deltas})
+    label = "SIMULATED_" if args.fake else ""
+    csv_path = args.out / f"arch_blocks_{label}{time.strftime('%Y%m%dT%H%M%S')}.csv"
+    args.out.mkdir(parents=True, exist_ok=True)
+    with csv_path.open("w", newline="") as fh:
+        writer = csv.writer(fh)
+        writer.writerow(["simulated", "platform_class", "block", "arm", "stage", "n", "p50_ms", "p95_ms", "max_ms",
+                         "achieved_fps", "late_frames", "rss_mb", "temp_start_c", "temp_end_c", "throttled_end"])
+        for b in blocks:
+            for stage, stats in b["summary"].items():
+                if isinstance(stats, dict) and "p50" in stats:
+                    writer.writerow([args.fake, platform_tag["class"], b["block"], b["arm"], stage, stats["n"],
+                                     round(stats["p50"], 3), round(stats["p95"], 3), round(stats["max"], 3),
+                                     b["achieved_fps"], b["late_frames"], b["rss_mb"],
+                                     b["thermal_start"]["soc_temp_c"], b["thermal_end"]["soc_temp_c"],
+                                     b["thermal_end"]["throttled_raw"]])
+    rep.values["csv"] = str(csv_path)
+    print(f"  A vs B (B - A): {deltas}   [{platform_tag['note']}]")
+    rep.check("every block of both arms processed frames", all(b["frames"] > 0 for b in blocks),
+              [b["frames"] for b in blocks])
+    rep.check("Arch B ran its second detector on every stride", all(
+        (b["summary"].get("b_detector_total") or {}).get("n", 0) > 0 for b in blocks if b["arm"] == "B"))
+    if args.fake:
+        rep.values["thermal_check"] = "not judged under --fake (no SoC sensor; SIMULATED)"
+    else:
+        rep.check(f"every block started within {args.temp_tolerance_c} C of the same temperature",
+                  all(b["thermal_start"]["within_target"] is not False for b in blocks),
+                  [b["thermal_start"]["soc_temp_c"] for b in blocks], provisional=True)
+        rep.check("never throttled during the comparison",
+                  all(not b["thermal_end"]["throttle_now"] for b in blocks),
+                  [b["thermal_end"]["throttled_raw"] for b in blocks])
+        rep.check("measured on a Raspberry Pi", platform_tag["class"] == "pi", platform_tag["class"])
+    rep.manual.append("Arch B's scheduler path (HailoRT ROUND_ROBIN) is unverified until this first Pi run; if "
+                      "the second network group fails to configure, the report says so and nothing is inferred")
+    return PASS
+
+
+def _arch_aggregate(blocks: list[dict]) -> dict:
+    """One arm across its blocks: the mean of each block's p50 / p95, the worst max."""
+    if not blocks:
+        return {}
+    out: dict = {"blocks": len(blocks)}
+    for stage in ("capture", "detector_total", "hailo_infer", "decode", "preprocess", "facemesh", "hands",
+                  "module_logic", "process_total", "frame_total", "b_detector_total", "b_hailo_infer", "b_decode"):
+        stats = [b["summary"].get(stage) for b in blocks if b["summary"].get(stage)]
+        if stats:
+            out[f"{stage}_p50"] = round(float(np.mean([s["p50"] for s in stats])), 3)
+            out[f"{stage}_p95"] = round(float(np.mean([s["p95"] for s in stats])), 3)
+            out[f"{stage}_max"] = round(float(max(s["max"] for s in stats)), 3)
+    fps = [b["achieved_fps"] for b in blocks if b["achieved_fps"] is not None]
+    out["achieved_fps"] = round(float(np.mean(fps)), 2) if fps else None
+    rss = [b["rss_mb"] for b in blocks if b["rss_mb"] is not None]
+    out["rss_mb_max"] = max(rss) if rss else None
+    temps = [b["thermal_end"]["soc_temp_c"] for b in blocks if b["thermal_end"]["soc_temp_c"] is not None]
+    out["soc_temp_end_max_c"] = max(temps) if temps else None
+    out["throttled_any"] = any(bool(b["thermal_end"]["throttle_now"]) for b in blocks)
+    return out
+
+
 RUNNERS: dict[str, Callable[[Report, Any], int]] = {
     "pins": stage_pins, "model": stage_model, "parse-hef": stage_parse_hef, "capture": stage_capture,
     "parity": stage_parity, "latency": stage_latency, "thermal": stage_thermal, "buzzer": stage_buzzer,
+    "observe": stage_observe, "arch": stage_arch,
 }
 
 
@@ -687,7 +948,7 @@ def run_stage(name: str, args) -> int:
     print(f"== STAGE {name}{' [--fake: stand-ins, NOT evidence]' if args.fake else ''}", flush=True)
     rep = Report(name, args.fake)
     try:
-        if args.fake and name in ("model", "capture", "latency", "buzzer"):
+        if args.fake and name in ("model", "capture", "latency", "buzzer", "arch"):
             with fake_device() as install:
                 saved = args.install_dir
                 args.install_dir = install
@@ -726,6 +987,23 @@ def main(argv: Optional[list[str]] = None) -> int:
     p.add_argument("--seconds", type=int, default=60, help="latency: paced run length")
     p.add_argument("--patterns", default=None, help="buzzer: comma list (default: every production pattern)")
     p.add_argument("--no-service-check", action="store_true", help="ONLY on a machine with no systemd service")
+    # M10 observe / arch
+    p.add_argument("--url", default="http://127.0.0.1:8899/api/health", help="observe: the service's health URL "
+                   "(token from SENSORDYME_TOKEN, never printed)")
+    p.add_argument("--interval", type=float, default=10.0, help="observe: seconds between polls")
+    p.add_argument("--second-hef", default=None, help="arch: Arch B's second .hef (must exist; never created)")
+    p.add_argument("--second-hef-sha256", default=None, help="arch: pin for --second-hef (refused on mismatch)")
+    p.add_argument("--block-seconds", type=float, default=120.0, help="arch: length of one timed block")
+    p.add_argument("--rounds", type=int, default=2, help="arch: ABBA rounds (2 = ABBAABBA)")
+    p.add_argument("--warmup", type=int, default=30, help="arch: extra untimed frames per block")
+    p.add_argument("--video", default=None, help="arch: a video instead of the live camera (same frames per block)")
+    p.add_argument("--module", default=None, help="arch: module to run (default: config.yaml's)")
+    p.add_argument("--a-scheduled", action="store_true",
+                   help="arch: run Arch A under the HailoRT scheduler too (isolates the second network's cost)")
+    p.add_argument("--start-temp-c", type=float, default=None,
+                   help="arch: start every block at or below this SoC temperature (default: the temperature at start)")
+    p.add_argument("--temp-tolerance-c", type=float, default=2.0, help="arch: allowed start-temperature spread")
+    p.add_argument("--cooldown-max-s", type=float, default=900.0, help="arch: longest wait for the start temperature")
     args = p.parse_args(argv)
     sys.dont_write_bytecode = True
     if args.out is None:
@@ -743,6 +1021,9 @@ def main(argv: Optional[list[str]] = None) -> int:
         return run_stage(args.stage, args)
     results = {}
     for name in STAGES:
+        if name in _NOT_IN_ALL:
+            print(f"== STAGE {name}: not part of `all` (run it on its own; see `list`)")
+            continue
         if name == "parity" and args.bundle is None:
             results[name] = BLOCKED
             print("== STAGE parity: needs --bundle (in `all`, it uses the capture stage's bundle)")

@@ -61,6 +61,7 @@ from collections.abc import Callable, Iterable, Iterator, Mapping
 from dataclasses import dataclass, field
 from typing import Any, Optional, Union
 
+from core import stage_timing
 from core.detections import Detection, DetectionFrame
 from core.tracking import ObjectTracker, Track, box_iou
 
@@ -87,6 +88,8 @@ _MAX_CONSUMERS = 32
 _MAX_WRAPPED = 32
 #: Run-time EMA weight for each new sample.
 _EMA = 0.2
+#: Which core/stage_timing.py stage a graph component's runs are timed under.
+_GRAPH_STAGE = {"face_landmarks": "face_landmarks", "hand_landmarks": "hands"}
 
 
 # ---------------------------------------------------------------------- the observation contract
@@ -426,7 +429,11 @@ class SharedDetector:
         key = engine.frame_key(frame)
         if key is None:
             self.passthrough_runs += 1
-            return self.wrapped.predict(frame, verbose=verbose, classes=classes, conf=conf, **kwargs)
+            started = time.perf_counter()
+            try:
+                return self.wrapped.predict(frame, verbose=verbose, classes=classes, conf=conf, **kwargs)
+            finally:  # a crop run is model time too, not the module's reasoning (M10)
+                engine.note_model_ms((time.perf_counter() - started) * 1000.0)
         wanted = None if classes is None else frozenset(int(c) for c in classes)
         conf = float(conf)
         self._learn(wanted, conf)
@@ -482,7 +489,11 @@ class SharedGraph:
         key = engine.graph_key(image)
         if key is None:
             self.passthrough_runs += 1
-            return self.wrapped.process(image)
+            started = time.perf_counter()
+            try:
+                return self.wrapped.process(image)
+            finally:  # a crop run is model time too, not the module's reasoning (M10)
+                engine.note_model_ms((time.perf_counter() - started) * 1000.0)
         engine.note_consumer(self.component)
         if self._key == key:
             if self._error is not None:
@@ -547,6 +558,11 @@ class PerceptionEngine:
         self._detections: Optional[tuple[ObjectDetection, ...]] = None
         self._detections_at: Optional[float] = None
         self.frames = 0
+        #: M10: model + tracker milliseconds spent inside the frame in flight, so the
+        #: runtime can report the module's own reasoning as process() minus this.
+        self.frame_model_ms = 0.0
+        #: Where per-stage timings go (core/stage_timing.py); tests may pass their own.
+        self.timings = stage_timing.TIMINGS
 
     # ------------------------------------------------------------------ time
     def _now(self) -> float:
@@ -701,6 +717,11 @@ class PerceptionEngine:
             self._face_result = None
             self._hands_result = None
             self.frames += 1
+            self.frame_model_ms = 0.0
+
+    def note_model_ms(self, ms: float) -> None:
+        """Model time spent inside the frame in flight that no stage owns (crop runs)."""
+        self.frame_model_ms += ms
 
     def note_consumer(self, component: str) -> None:
         with self._lock:
@@ -732,7 +753,12 @@ class PerceptionEngine:
             now = self._now()
             self._components[OBJECT_DETECTOR].ok(now, elapsed_ms)
             # One association per detector run, for every consumer at once.
+            track_started = time.perf_counter()
             ids = self.tracker.update([(d.label, d.box, d.confidence) for d in parsed], now)
+            track_ms = (time.perf_counter() - track_started) * 1000.0
+            self.timings.add("detector_total", elapsed_ms)
+            self.timings.add("tracking", track_ms)
+            self.frame_model_ms += elapsed_ms + track_ms
             self._detections = tuple(dataclasses.replace(d, track_id=tid) for d, tid in zip(parsed, ids, strict=True))
             self._detections_at = now
             self._ran.add(OBJECT_DETECTOR)
@@ -740,6 +766,10 @@ class PerceptionEngine:
     def graph_ran(self, component: str, result: Any, elapsed_ms: float) -> None:
         with self._lock:
             self._components[component].ok(self._now(), elapsed_ms)
+            self.frame_model_ms += elapsed_ms
+            stage = _GRAPH_STAGE.get(component)
+            if stage is not None:
+                self.timings.add(stage, elapsed_ms)
             self._ran.add(component)
             if component == FACE_LANDMARKS:
                 self._face_result = result

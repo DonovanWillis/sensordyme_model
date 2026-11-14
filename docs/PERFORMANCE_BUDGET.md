@@ -638,6 +638,14 @@ whose loudest alert is structurally impossible without the NPU.
 
 ### Open measurements, in priority order
 
+M10 (2026-11-14): items 1, 2, 4 and the inference / RSS parts of 3 are now
+measured by the running device itself, always on (`/api/health` `performance`,
+docs/DIAGNOSTICS.md §2: per-stage p50/p95/max over a 256-sample window,
+`frame_interval` → processed fps, `alert_dispatch`, `alert_output`, RSS, SoC
+temperature, throttle). `hwv_stage.py observe` records them on the Pi with
+provenance. No Pi numbers exist yet: none of the figures in this document has
+been replaced.
+
 1. **p99 / max inference latency**, and the cause of mean > p95 (§1, §3.1). Everything
    about tail behaviour and the <1.0 s stall constraint rests on this.
 2. **Maximum inter-frame interval** under real load, not the mean (§2.3, §9).
