@@ -141,12 +141,13 @@ No soldering. Do all of it **before first power-on**.
    resolve the stacking before continuing.
 3. **Connect the camera**: 22-pin end into one of the Pi 5's two camera
    connectors (either works; the software finds it), 15-pin end into the
-   camera. **Ribbon orientation:** the exposed metal contacts face the
-   connector's contacts — on the Pi 5, contacts face inward toward the USB
-   ports side of the latch; on the camera board, contacts face the board. The
-   latch slides out, the ribbon seats fully and squarely, the latch clicks
-   back. A backwards ribbon simply shows no camera — it doesn't damage, but
-   re-seat with power off only.
+   camera. **Ribbon orientation:** the exposed metal contacts must face the
+   connector's own contacts at each end. ⚠ **Confirm at assembly** against
+   Raspberry Pi's official Camera Module 3 / Pi 5 camera-cable guide (or the
+   diagram shipped with the adapter cable) — this repository does not pin the
+   per-connector orientation, and it has not been checked on this hardware
+   yet. The latch lifts, the ribbon seats fully and squarely, the latch
+   closes. A reversed ribbon shows no camera; re-seat with the power off only.
 4. **Wire the buzzer**: positive lead → **GPIO 17 (BCM 17 = physical pin 11)**,
    negative lead → any ground pin (physical **pin 9** is adjacent). This
    matches `gpio_buzzer_pin: 17` in `config.yaml`.
