@@ -34,7 +34,10 @@ ALERTABLE = frozenset({"drowsiness", "fatigue_warning", "distraction", "frequent
                        "eyes_up", "phone_use", "attention_lost"})
 
 #: (fps, jitter) every scenario runs at unless it pins its own.
-RATES: tuple[tuple[float, float], ...] = ((30.0, 0.0), (10.0, 0.0), (5.0, 0.0), (30.0, 0.3), (10.0, 0.3))
+#: M10.1 adds 15 fps and jittered 5 fps: 5 fps is the lowest rate the eye rules are
+#: verified at (below it the module reports eye_evidence impaired).
+RATES: tuple[tuple[float, float], ...] = ((30.0, 0.0), (15.0, 0.0), (10.0, 0.0), (5.0, 0.0), (30.0, 0.3),
+                                          (10.0, 0.3), (5.0, 0.3))
 
 
 @dataclass(frozen=True)
@@ -106,9 +109,9 @@ SCENARIOS: tuple[Scenario, ...] = (
              (Expect("drowsiness", latency=(2.0, 2.0)), Expect("fatigue_warning", latency=(2.0, 4.0)))),
     Scenario("heavy_long_blinks", "0.7 s closures every 2 s for 30 s (35 % closed)",
              lambda fps: [Seg(10.0, face()), *_blinks(30.0, 0.7, 2.0)],
-             (Expect("fatigue_warning", latency=(0.0, 30.0), rates=(30.0, 10.0)),),
-             notes="Frame-rate dependent (open item): the 5-frame EAR median erases most of a 0.7 s "
-                   "closure at 5 fps (3.5 frames), so PERCLOS stays under 0.15 and nothing fires."),
+             (Expect("fatigue_warning", latency=(0.0, 30.0)),),
+             notes="M10.1: fires at every rate. It did not at 5 fps: the raw per-frame iris veto "
+                   "against the lagging EAR median cut 2 frames off every closure (O2)."),
     Scenario("look_down_lowered_lids", "30 deg look into the lap; lids lowered to 0.67 x open, iris visible",
              lambda fps: [Seg(2.0, face()), Seg(5.0, face(pitch=-30, lid=LOWERED)), Seg(2.0, face())],
              (Expect("eyes_down", latency=(2.5, 2.5)),)),
@@ -191,10 +194,11 @@ SCENARIOS: tuple[Scenario, ...] = (
     Scenario("face_lost_brief_mid_closure", "1.5 s shut, face lost 0.3 s (body seen), 1.0 s shut",
              lambda fps: [Seg(2.0, face()), Seg(1.5, face(lid=SHUT)), Seg(0.3, None), Seg(1.0, face(lid=SHUT)),
                           Seg(2.0, face())],
-             (Expect("drowsiness", count=None, at_most=1),),
-             notes="Frame-rate dependent by design (open item): face loss feeds the closure tracker "
-                   "'not closed', bridged for eye_closure_release_frames (2) frames -- 0.07 s at 30 fps, "
-                   "0.4 s at 5 fps. The shadow engine coasts instead (core/behavior/eye_state.py)."),
+             (Expect("drowsiness", seg=3, latency=(0.5, 0.5)),),
+             notes="M10.1: the same at every rate. The 0.3 s face loss holds the closure (nothing "
+                   "credited) instead of counting as open eyes, so 1.5 s + 0.5 s observed fires 0.5 s "
+                   "into the second closure. Before, the reset took 2 frames: 0.07 s at 30 fps, 0.4 s at "
+                   "5 fps, so it fired only at 5 fps (O1)."),
     # ------------------------------------------------------------ stalls and frame rate
     Scenario("stall_three_closed_frames", "three closed frames, 3 s camera stalls between them",
              lambda fps: [Seg(ONE_FRAME, face(lid=SHUT)), Seg(3.0, stall=True), Seg(ONE_FRAME, face(lid=SHUT)),

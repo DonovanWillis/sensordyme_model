@@ -111,7 +111,7 @@ _FLASH_DURATION_S = 1.5
 _NOT_PAUSED_WHEN_STOPPED = frozenset({"camera", "audible_alert", "alert_output"})
 #: Capabilities that are analysis results (M8.3): never "available" while the
 #: camera or the inference loop that feeds them is impaired.
-_ANALYSIS_CAPABILITIES = frozenset({"face", "objects", "hands", "pose", "attention"})
+_ANALYSIS_CAPABILITIES = frozenset({"face", "objects", "hands", "pose", "attention", "eye_timing"})
 #: The stop reason in words for the app ("by uplink" was internal jargon).
 _STOP_SOURCE_WORDS = {"uplink": "from the app", "dashboard": "from the device's dashboard"}
 _MAX_SWAP_S = 120.0

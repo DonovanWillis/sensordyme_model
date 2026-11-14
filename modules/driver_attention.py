@@ -147,7 +147,13 @@ from core.confidence import (
 from core.detections import Detection, DetectionFrame
 from core.detectors import Box, get_yolo_model, iou, upper_region
 from core.events import Event
-from core.eye_signal import AdaptiveBaseline, SignalSmoother, eye_gaze_offset_deg, iris_openness
+from core.eye_signal import (
+    AdaptiveBaseline,
+    AlignedOptionalSmoother,
+    SignalSmoother,
+    eye_gaze_offset_deg,
+    iris_openness,
+)
 from core.monitoring_state import IMPAIRED, STARTING, Capability
 from core.tracking import MAX_MATCH_DISTANCE_DIAGONAL_HAND, BoxTracker
 from modules.base import (
@@ -1298,6 +1304,12 @@ class DriverAttentionModule(VisionModule):
         self._ear_smoother = SignalSmoother(smoothing_window)
         self._yaw_smoother = SignalSmoother(smoothing_window)
         self._pitch_smoother = SignalSmoother(smoothing_window)
+        # The iris second opinion on a closure, median-smoothed over the SAME
+        # frames as the EAR it vetoes (M10.1, AlignedOptionalSmoother): a raw
+        # per-frame veto against a lagging EAR median cut the last
+        # (window-1)/2 frames off every closure, a cut that grows as the frame
+        # rate falls.
+        self._iris_smoother = AlignedOptionalSmoother(smoothing_window)
         # Each decision signal's own noise, measured live, so an event's
         # confidence says how far past its threshold the reading was in units
         # of that noise -- see core/confidence.py. Floors are the signals'
@@ -1347,6 +1359,7 @@ class DriverAttentionModule(VisionModule):
             release_frames=int(config.get("eye_closure_release_frames", 2)),
             count_true_time_only=True,
         )
+        self._eye_face_loss_hold_s = float(config.get("eye_closure_face_loss_hold_s", release_s))
         self._perclos_tracker = PerclosTracker(float(config.get("perclos_window_s", 60.0)))
         self._perclos_threshold = float(config.get("perclos_threshold", 0.15))
         self._fatigue_warned = False
@@ -1524,6 +1537,12 @@ class DriverAttentionModule(VisionModule):
         self._gaze_clock = StallAwareEvidenceClock(float(config.get("max_evidence_gap_s", 0.5)))
         self._eye_clock = StallAwareEvidenceClock(float(config.get("max_evidence_gap_s", 0.5)))
         self._current_frame_t = 0.0  # this frame's capture time (process())
+        # M10.1: the rate frames actually reach this module, for capability
+        # "eye_timing". The eye rules (drowsiness, PERCLOS fatigue) are verified
+        # from eye_timing_min_fps up (tests/test_m10_temporal_scenarios.py);
+        # below it they are reported impaired instead of claimed.
+        self._frame_intervals: deque[float] = deque(maxlen=15)
+        self._eye_timing_min_fps = float(config.get("eye_timing_min_fps", 4.5))
         # Is the driver's phone held? (PhoneHoldEvidence; hand boxes on detector ticks.)
         self._phone_hold = PhoneHoldEvidence(
             hold_ticks=int(config.get("phone_hold_ticks", 3)),
@@ -2261,6 +2280,8 @@ class DriverAttentionModule(VisionModule):
         # The raw capture time is kept for behaviour reasoning v2, which must SEE
         # stalls (it credits nothing across them) rather than receive them clamped.
         frame_t = self.frame_time()
+        if self._frame_intervals.maxlen and self._current_frame_t and frame_t > self._current_frame_t:
+            self._frame_intervals.append(frame_t - self._current_frame_t)
         self._current_frame_t = frame_t
         now = self._evidence_clock.advance(frame_t)
         events: list[Event] = []
@@ -2331,10 +2352,14 @@ class DriverAttentionModule(VisionModule):
             coasted_eyes_down = coast and self._last_pitch < self._pitch_threshold_deg
             coasted_eyes_up = coast and self._last_pitch > self._pitch_up_threshold_deg
 
-            # Eye state has no such physical continuity to coast on (closed eyes
-            # do not imply anything about the next moment), so drowsiness still
-            # resets on face loss exactly as before.
-            self._drowsy_tracker.update(False, now)
+            # Eye state has no physical continuity to coast on (closed eyes do
+            # not imply anything about the next moment), so nothing is credited
+            # while the face is lost. Nor is a lost face an OPEN eye (M10.1):
+            # the closure episode is held, uncredited, for at most
+            # eye_closure_face_loss_hold_s, then reset -- the same time at every
+            # frame rate (fed False, the reset took 2 frames: 0.07 s at 30 fps,
+            # 0.4 s at 5 fps).
+            self._drowsy_tracker.hold(now, self._eye_face_loss_hold_s)
             # Every gaze tracker is fed on this frame (coasted or False), so it
             # is gaze evidence time for them.
             gaze_now = self._gaze_clock.advance(frame_t)
@@ -2457,6 +2482,7 @@ class DriverAttentionModule(VisionModule):
             self._ear_smoother.reset()
             self._yaw_smoother.reset()
             self._pitch_smoother.reset()
+            self._iris_smoother.reset()
             for noise in (self._ear_noise, self._yaw_noise, self._pitch_noise):
                 noise.observe(None)  # a gap is motion, not noise
         self._face_lost_active = False
@@ -2489,6 +2515,9 @@ class DriverAttentionModule(VisionModule):
         # frames better than the eyelid contour this EAR is built from.
         iris_ratio = iris_openness(points)
         self._last_iris = iris_ratio
+        # In step with `ear` (same window, same frames): the closure decisions
+        # below compare the two, so they must describe the same moment.
+        closure_iris = self._iris_smoother.update(iris_ratio)
 
         image_points = np.array(
             [
@@ -2568,9 +2597,9 @@ class DriverAttentionModule(VisionModule):
         iris_reference = self._iris_baseline.reference(None)
         iris_vetoes_closure = (
             self._iris_veto
-            and iris_ratio is not None
+            and closure_iris is not None
             and iris_reference is not None
-            and iris_ratio >= max(
+            and closure_iris >= max(
                 _IRIS_CLEARLY_OPEN,
                 min(1.0, self._ear_threshold_ratio + _IRIS_VETO_MARGIN) * iris_reference,
             )
@@ -2602,7 +2631,7 @@ class DriverAttentionModule(VisionModule):
         # classifier, the same rule behavior_v2 uses); a lid covering the iris
         # is a closure whatever the head does (a nodding-off head pitches too).
         looking_down = self._closure_is_looking_down(
-            ear, effective_threshold, iris_ratio, iris_vetoes_closure, rotation, gaze_offset)
+            ear, effective_threshold, closure_iris, iris_vetoes_closure, rotation, gaze_offset)
         drowsy_condition = ear < effective_threshold and not iris_vetoes_closure and not looking_down
         self._frame_signals["eye_state"] = shared_perception.EyeState(
             ear=float(ear), iris_openness=None if iris_ratio is None else float(iris_ratio),
@@ -3214,9 +3243,12 @@ class DriverAttentionModule(VisionModule):
     #: Capabilities computed by this module from a model capability rather than
     #: produced by a model. core/model_registry.yaml lists models only, so these
     #: are excluded from its `uses`; each maps to the model capability it is built on.
-    DERIVED_CAPABILITIES: ClassVar[dict[str, str]] = {"attention": "face"}
+    #: "eye_timing" (M10.1): frames arrive fast enough to time eye closure.
+    DERIVED_CAPABILITIES: ClassVar[dict[str, str]] = {"attention": "face", "eye_timing": "face"}
+    _EYE = frozenset({"face", "eye_timing"})
     _EVENT_REQUIREMENTS: ClassVar[dict[str, frozenset[str]]] = {
-        **dict.fromkeys(("drowsiness", "fatigue_warning", "attention_lost", "elevated_risk", "high_risk"), _FACE),
+        **dict.fromkeys(("drowsiness", "fatigue_warning"), _EYE),
+        **dict.fromkeys(("attention_lost", "elevated_risk", "high_risk"), _FACE),
         **dict.fromkeys(("distraction", "frequent_glancing", "eyes_down", "eyes_up"), _GAZE),
         "phone_detected": _OBJECTS,
         "eating_drinking": _OBJECTS,
@@ -3262,7 +3294,34 @@ class DriverAttentionModule(VisionModule):
             Capability() if self._calibrator.is_calibrated
             else Capability(STARTING, "calibrating this driver's forward gaze (look at the road)")
         )
+        status["eye_timing"] = self._eye_timing_capability()
         return status
+
+    def processing_fps(self) -> Optional[float]:
+        """Frames per second reaching this module: the median of the last 15
+        intervals, so one stall or one burst does not move it. None until 5
+        intervals are known."""
+        if len(self._frame_intervals) < 5:
+            return None
+        median = statistics.median(self._frame_intervals)
+        return 1.0 / median if median > 0 else None
+
+    def _eye_timing_capability(self) -> Capability:
+        """Whether eye closure can be timed at the rate frames arrive (M10.1).
+
+        Drowsiness (2 s of observed closure) and PERCLOS fatigue are verified
+        from 5 fps up in the scenario suite; eye_timing_min_fps allows 10 %
+        timing jitter under that. Below it a closure is a frame or two, the
+        5-frame median spans a second or more, and a frame interval over
+        max_evidence_gap_s credits nothing at all -- so the device says those
+        two alerts are not reliable now, instead of implying it is watching."""
+        fps = self.processing_fps()
+        if fps is None:
+            return Capability(STARTING, "measuring the frame rate")
+        if fps < self._eye_timing_min_fps:
+            return Capability(IMPAIRED, f"frames arrive at {fps:.1f}/s; eye-closure timing (drowsiness, "
+                                        f"fatigue) is verified from {self._eye_timing_min_fps:g}/s")
+        return Capability()
 
     def perception_signals(self) -> dict:
         """Eye state, head pose and gaze measured on the last frame (core/perception.py

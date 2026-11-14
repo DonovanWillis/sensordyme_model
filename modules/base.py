@@ -352,6 +352,7 @@ class GracedConditionTracker:
         self._false_frames = 0
         self._true_time = 0.0
         self._last_update: Optional[tuple[float, bool]] = None
+        self._held_since: Optional[float] = None  # last measured frame before a hold (hold())
 
     def _reset(self) -> None:
         self._start = None
@@ -359,6 +360,7 @@ class GracedConditionTracker:
         self._false_since = None
         self._false_frames = 0
         self._true_time = 0.0
+        self._held_since = None
 
     def update(self, condition: bool, now: float) -> Optional[float]:
         """Advance with this frame's condition. Returns the sustained duration
@@ -366,6 +368,7 @@ class GracedConditionTracker:
         SustainedConditionTracker)."""
         previous = self._last_update
         self._last_update = (now, condition)
+        self._held_since = None
         if (
             self._count_true_only
             and self._start is not None
@@ -399,6 +402,40 @@ class GracedConditionTracker:
         if released:
             self._reset()
         return None
+
+    def hold(self, now: float, max_hold_s: float) -> None:
+        """This frame says NOTHING about the condition (M10.1): hold the episode.
+
+        For a frame on which the condition could not be measured at all (eye
+        closure with the face lost). It is not a False frame, so it neither
+        counts toward `release_frames` nor starts the `release_s` grace, and
+        not a True one, so it credits nothing: with `count_true_time_only`
+        the interval up to this frame is owned by the previous update as
+        usual, and nothing after it is credited until the condition is seen
+        again. A hold longer than `max_hold_s` of continuous unmeasurable time
+        ends the episode, so evidence is never carried indefinitely.
+
+        Feeding these frames as False made the reset depend on the frame
+        rate: `release_frames` (2) unmeasurable frames are 0.07 s at 30 fps
+        and 0.4 s at 5 fps.
+        """
+        previous = self._last_update
+        if (
+            self._count_true_only
+            and self._start is not None
+            and previous is not None
+            and previous[1]
+            and now > previous[0]
+        ):
+            self._true_time += now - previous[0]
+        self._last_update = (now, False)
+        if self._start is None:
+            return
+        if self._held_since is None:
+            # Unmeasured since the last frame that WAS measured.
+            self._held_since = previous[0] if previous is not None else now
+        if now - self._held_since > max_hold_s + 1e-9:
+            self._reset()
 
     @property
     def is_active(self) -> bool:

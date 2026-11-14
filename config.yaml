@@ -281,6 +281,16 @@ alerts:
   # anyway changes nothing: core/alerts.py refuses them, and services/runtime.py
   # tags them "log", unless this is the boolean true (core/behavior/experimental.py).
   experimental_alerts_audible: false
+  # M10.1 relapse escalation -- OFF; enabling it is an owner decision (docs/ESCALATION_POLICY.md).
+  # An episode ends when its condition clears, so a driver who keeps relapsing (5 s away,
+  # 2 s back, again...) starts every episode at the onset pattern and never hears "urgent".
+  # When enabled: the ALERTED time of a run of these types' episodes counts toward the
+  # category's escalate_after_s (warning: 10 s, unchanged); recovery_s with none of them
+  # alerting ends the run. Changes only which pattern sounds, never whether/when one fires.
+  relapse_escalation:
+    enabled: false
+    types: [distraction, eyes_down, eyes_up, phone_use]
+    recovery_s: 60
   loud_types: [drowsiness, phone_use, eyes_down, eyes_up, attention_lost, # always the loud/continuous tone
                distraction, # sustained sideways head turn (3s+). Was in NEITHER list: locally it
                # escalated by repetition (a deliberate mechanism), but its severity tag fell back to
@@ -389,6 +399,13 @@ modules:
     # Unlike a head turn, an eye genuinely reopens between blinks: a 0.4 s grace bridged
     # those reopenings, so a flurry of ordinary 0.25 s blinks read as one continuous
     # 2 s closure and fired "drowsiness". 1-2 frames covers a landmark glitch at any fps.
+    eye_timing_min_fps: 4.5 # M10.1: below this many processed frames/s, capability "eye_timing" is
+    # impaired and drowsiness / fatigue_warning are reported unavailable (monitoring DEGRADED)
+    # instead of implied. 5 fps is the lowest rate the scenario suite verifies; 4.5 allows jitter.
+    eye_closure_face_loss_hold_s: 0.4 # M10.1: a frame with NO face is not an "open" frame.
+    # The closure episode is held (nothing credited) for up to this long without a face,
+    # then reset. Fed as "open" before, the reset took 2 frames: 0.07 s at 30 fps, 0.4 s at
+    # 5 fps. 0.4 = signal_release_s, the grace every other condition gives a dropout.
     ear_baseline_window_s: 60.0 # session open-eye reference window: the effective closure
     # threshold follows the upper percentile of the last minute's EAR, so putting
     # glasses on (which shifts the whole EAR distribution) doesn't leave the

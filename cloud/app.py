@@ -1446,7 +1446,7 @@ _ACTUATOR_KEYS = ("name", "kind", "audible", "ready", "detail", "commands_ok", "
 # ---------------------------------------------------------------- M8.3 truth (docs/STATE_MODEL.md)
 #: Capabilities that are analysis results, as opposed to the pipeline that feeds
 #: them (camera, inference) and the hardware outputs (alert_output, audible_alert).
-_ANALYSIS_CAPABILITIES = frozenset({"face", "objects", "hands", "pose", "attention"})
+_ANALYSIS_CAPABILITIES = frozenset({"face", "objects", "hands", "pose", "attention", "eye_timing"})
 #: How long a stop/resume may go unacknowledged before its outcome is `timed_out`
 #: (the app's ProtectionControl.timeout: stopping drains the pipeline).
 PROTECTION_ACK_TIMEOUT_S = 45.0
