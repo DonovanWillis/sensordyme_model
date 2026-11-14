@@ -157,10 +157,12 @@ def graph_facts(path: Path) -> dict[str, Any]:
         outs.append({"name": o.name, "shape": shapes.get(o.name) or dims(o),
                      "producer": node.name if node is not None else None,
                      "op": node.op_type if node is not None else None})
-    # live class rows: for each Sigmoid output whose producer is a Conv, rows with any non-zero weight
+    # live class rows: for each Sigmoid that IS a graph output (a class head, not a SiLU inside the
+    # backbone) and whose producer is a Conv, the rows with any non-zero weight
+    graph_outputs = {o.name for o in g.output}
     live: dict[str, Any] = {}
     for n in g.node:
-        if n.op_type != "Sigmoid":
+        if n.op_type != "Sigmoid" or n.output[0] not in graph_outputs:
             continue
         src = producer.get(n.input[0])
         if src is None or src.op_type != "Conv" or len(src.input) < 2 or src.input[1] not in inits:
@@ -213,25 +215,31 @@ def damo_facts(damo: Path, config: str) -> dict[str, Any]:
     base = damo / "damo" / "config" / "base.py"
     base_text = base.read_text() if base.exists() else ""
     keys = ("image_mean", "image_std", "image_max_range", "keep_ratio", "nms_conf_thre", "nms_iou_thre",
-            "num_classes", "reg_max", "input_size", "size_divisibility", "flip_prob", "autoaug_dict")
+            "num_classes", "reg_max", "input_size", "size_divisibility", "input_to_bgr255", "to_bgr255")
+    sources = [("config", cfg_text), ("base.py", base_text)]
+    for py in sorted((damo / "damo" / "config").rglob("*.py")) if (damo / "damo" / "config").exists() else []:
+        if py != base:
+            sources.append((str(py.relative_to(damo)), py.read_text(errors="replace")))
     for k in keys:
         hits = []
-        for where, text in (("config", cfg_text), ("base.py", base_text)):
-            for m in re.finditer(rf"^\s*[\w.\[\]'\"]*{k}\w*\s*[=:]\s*(.+)$", text, re.M):
-                hits.append(f"{where}: {m.group(0).strip()[:160]}")
+        for where, text in sources:
+            for m in re.finditer(rf"^.*\b{k}\b.*$", text, re.M):
+                hits.append(f"{where}:{text[:m.start()].count(chr(10)) + 1}: {m.group(0).strip()[:160]}")
         if hits:
-            out[k] = hits[:4]
-    # how images are decoded for training/eval (PIL RGB vs cv2 BGR)
-    dataset_dir = damo / "damo" / "dataset"
+            out[k] = hits[:6]
+    # how images are decoded and channel-ordered for training/eval, with 3 lines of context each
     colour = []
-    if dataset_dir.exists():
-        for py in sorted(dataset_dir.rglob("*.py")):
+    pkg = damo / "damo"
+    if pkg.exists():
+        for py in sorted(pkg.rglob("*.py")):
             text = py.read_text(errors="replace")
+            lines = text.splitlines()
             for pat in (r"convert\(['\"]RGB['\"]\)", r"cv2\.imread", r"COLOR_BGR2RGB", r"COLOR_RGB2BGR",
-                        r"\[\s*:\s*,\s*:\s*,\s*::-1\s*\]", r"to_bgr255", r"Image\.open"):
+                        r"::-1\s*\]", r"to_bgr255", r"Image\.open", r"imdecode"):
                 for m in re.finditer(pat, text):
-                    line = text[:m.start()].count("\n") + 1
-                    colour.append(f"{py.relative_to(damo)}:{line}: {text.splitlines()[line - 1].strip()[:140]}")
+                    line = text[:m.start()].count("\n")
+                    ctx = " | ".join(x.strip() for x in lines[max(0, line - 3):line + 2])
+                    colour.append(f"{py.relative_to(damo)}:{line + 1}: {ctx[:400]}")
     out["image_decode_sites"] = colour[:30]
     return out
 
@@ -310,6 +318,11 @@ def compare(product: dict, graphs: dict[str, dict], damo: Optional[dict], runtim
                 add(f"class map: {name}", "match", product["decode"]["class_channels_read"],
                     {"live_rows": rows, "channel_80": "the network's own background slot (not a class)"},
                     "class-conv weights; fleet job 20261113-043857-f182d1 channel-80 max 0.0079")
+    # dynamic range of the heads (what an 8-bit output quantiser has to cover)
+    if runtime and "value_ranges" in runtime:
+        add("head value ranges (INT8 output range)", "recorded", "FLOAT32 outputs dequantised by HailoRT",
+            runtime["value_ranges"], "float ONNX on the known-good frames, letterboxed as the device does; a wider "
+            "box-logit range means coarser 8-bit steps for the same bit width")
     # NMS / thresholds
     if damo:
         add("NMS IoU", "deliberate difference", product["decode"]["nms_iou"], damo.get("nms_iou_thre"),
