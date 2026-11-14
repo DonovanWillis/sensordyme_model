@@ -231,6 +231,10 @@ def main(argv: Optional[list[str]] = None) -> int:
     config_bytes = config_path.read_bytes()
     config = yaml.safe_load(config_bytes) or {}
     hef_path, pin = resolve_model(args.install_dir, config)
+    # M10.1: the installed config's extra-class map (a 3-class candidate .hef), so
+    # the offline decode counts the classes the device decodes.
+    raw_extra = (config.get("accelerator") or {}).get("yolo_extra_classes") or {}
+    extra = {int(k): str(v) for k, v in raw_extra.items()} if isinstance(raw_extra, dict) else {}
     actual = hc.sha256_file(hef_path)
     ok, why = hc.verify_pin(actual, pin)
     print(f"model: {hef_path}: {why}")
@@ -276,7 +280,7 @@ def main(argv: Optional[list[str]] = None) -> int:
         },
         "hailo": hc.hailo_runtime_info(),
         "environment": hc.environment(),
-        "decode": {"conf": args.conf,
+        "decode": {"conf": args.conf, "extra_classes": {str(k): v for k, v in extra.items()},
                    "variants": {k: dataclasses.asdict(v) for k, v in hd.VARIANTS.items()}},
         "modes": modes,
         "samples": [],
@@ -345,7 +349,7 @@ def main(argv: Optional[list[str]] = None) -> int:
                 counts = {}
                 for name, spec in (("legacy", hd.LEGACY), ("reference", hd.REFERENCE)):
                     d0 = time.perf_counter_ns()
-                    dets = hd.decode(outs, scales, spec, args.conf)
+                    dets = hd.decode(outs, scales, spec, args.conf, extra_classes=extra or None)
                     timing[f"decode_{name}"] = _ms(d0, time.perf_counter_ns())
                     counts[name] = len(dets)
                 sample_id = f"{len(manifest['samples']):05d}_{mode}"

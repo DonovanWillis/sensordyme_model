@@ -213,6 +213,9 @@ def main(argv: Optional[list[str]] = None) -> int:
     parser.add_argument("--reference-nms-iou", type=float, default=None)
     parser.add_argument("--reference-max-det", type=int, default=None)
     parser.add_argument("--limit", type=int, default=None)
+    parser.add_argument("--extra-classes", default=None,
+                        help="M10.1: class-head channels beyond COCO-80 that are classes, e.g. 80:hand (a 3-class "
+                             "candidate .hef; the bundle records the device's own map, which wins)")
     parser.add_argument("--out", type=Path, required=True)
     args = parser.parse_args(argv)
 
@@ -222,6 +225,9 @@ def main(argv: Optional[list[str]] = None) -> int:
     conf = args.conf if args.conf is not None else float(manifest["decode"]["conf"])
     mean = [float(v) for v in args.mean.split(",")]
     std = [float(v) for v in args.std.split(",")]
+    extra = hd.parse_extra_classes(args.extra_classes) or {
+        int(k): v for k, v in ((manifest.get("decode") or {}).get("extra_classes") or {}).items()}
+    product_classes = {**PRODUCT_CLASSES, **extra}
     variants = dict(hd.VARIANTS)
     variants["reference"] = hd.with_overrides(hd.REFERENCE, nms_iou=args.reference_nms_iou,
                                               max_det=args.reference_max_det)
@@ -259,12 +265,15 @@ def main(argv: Optional[list[str]] = None) -> int:
             parity.setdefault(row["hef"], hc.ParityAccumulator()).add(dev, ref, sample["id"])
             float_outs[row["hef"]] = ref
             if row["role"] == "cls" and dev.shape[-1] > hd.NUM_CLASSES:
-                padding_max = max(padding_max, float(np.abs(dev[..., hd.NUM_CLASSES:]).max()))
+                # Padding = channels past COCO-80 that are NOT mapped classes (M10.1).
+                pad = [c for c in range(hd.NUM_CLASSES, dev.shape[-1]) if c not in extra]
+                if pad:
+                    padding_max = max(padding_max, float(np.abs(dev[..., pad]).max()))
         mode, geom = sample["mode"], sample["geometry"]
         decoded = {}
         for name, spec in variants.items():
-            dev_d = hd.decode(hef_outs, scales, spec, conf)
-            flt_d = hd.decode(float_outs, scales, spec, conf)
+            dev_d = hd.decode(hef_outs, scales, spec, conf, extra_classes=extra or None)
+            flt_d = hd.decode(float_outs, scales, spec, conf, extra_classes=extra or None)
             int8_vs_float[(name, mode)].add(dev_d, flt_d)
             decoded[name] = (dev_d, flt_d)
         for (a, b, m), acc in cross_decoder.items():
@@ -302,7 +311,7 @@ def main(argv: Optional[list[str]] = None) -> int:
             chans = acc.per_channel(scale)
             entry["per_channel"] = chans
             entry["worst_channels"] = sorted(chans, key=lambda r: -r["mean_abs_err"])[:5]
-            entry["product_channels"] = [dict(chans[c], name=n) for c, n in PRODUCT_CLASSES.items()
+            entry["product_channels"] = [dict(chans[c], name=n) for c, n in product_classes.items()
                                          if c < len(chans)]
         tensor_rows.append(entry)
 
@@ -313,7 +322,7 @@ def main(argv: Optional[list[str]] = None) -> int:
                    "code": manifest.get("code"), "hailo": manifest.get("hailo"),
                    "samples_used": len(samples)},
         "onnx": {**onnx_info, **sess_meta, "mean": mean, "std": std, "swap_rb": args.swap_rb},
-        "decode": {"conf": conf, "match_iou": args.match_iou,
+        "decode": {"conf": conf, "match_iou": args.match_iou, "extra_classes": extra,
                    "variants": {k: dataclasses.asdict(v) for k, v in variants.items()}},
         "tensor_mapping": mapping,
         "tensors": tensor_rows,
