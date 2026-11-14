@@ -111,6 +111,36 @@ def test_the_heap_check_catches_one_object_retained_per_frame(tmp_path):
     assert objects >= MAX_OBJECT_GROWTH and blocks >= MAX_BLOCK_GROWTH, (objects, blocks)
 
 
+def _live(*names: str) -> dict[str, int]:
+    counts = dict.fromkeys(names, 0)
+    for obj in gc.get_objects():
+        name = type(obj).__name__
+        if name in counts:
+            counts[name] += 1
+    return counts
+
+
+def test_a_restarted_runtime_releases_the_previous_one(tmp_path):
+    """The live soak's RSS steps up at every in-process runtime rebuild (a scenario
+    reboot). Nothing of the old runtime may stay reachable -- the step is the C
+    allocator's, not a retained runtime, module, uplink or alert policy."""
+    SimUplink.LEDGER = None
+    names = ("SimRuntime", "DriverAttentionModule", "SimUplink", "AlertManager", "PerceptionEngine",
+             "FrameBus", "HealthMonitor")
+    with SimStack(tmp_path) as stack:
+        scenario = _busy(2)
+        device = stack.boot(scenario)
+        stack.claim()
+        device.advance(C + 30.0)
+        counts = []
+        for _ in range(3):
+            device = stack.restart(scenario)
+            device.advance(20.0)
+            counts.append(_heap()[0])
+            assert _live(*names) == dict.fromkeys(names, 1), _live(*names)
+    assert max(counts) - min(counts) < 300, counts
+
+
 # ---------------------------------------------------------------------- per-event caps
 def _event(i: int, kind: str = "drowsiness"):
     from core.events import Event
