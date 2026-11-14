@@ -27,11 +27,18 @@ shipping `.hef`'s layout (80/40/20 grids, 68-channel DFL box heads, 81-channel c
 `core/accel.py` loads it unchanged; the hand channel is read only with the opt-in
 `accelerator.yolo_extra_classes: {80: hand}` (M10).
 
-**Parse risk to check first.** M8.4's structural diff of `heads81` against the zoo's own cut of the
-shipping graph: identical Conv count and kernels, but the export contains `Cast` (3) and `Constant`
-(28) nodes that the zoo graph does not, and `Slice` 6 vs 9, `Concat` 12 vs 15 (export vs zoo). If the DFC parser
-rejects them, constant-fold the graph (e.g. `onnxsim`) and re-verify float parity with ONNX Runtime
-(max |Δ| on the known-good frames) before going on; record the new sha256.
+**Parse risk to check first.** Op histograms (M10 contract job `20261114-035955-9ffec6`) of `heads81`
+and of the zoo graph cut at its own end nodes (`zoo.heads.extracted.onnx`, sha256 `4b0550f7…f84`, the
+graph behind the shipping `.hef`): identical Conv 77, Relu 69, Add 20, Concat 12, MaxPool 3, Resize 2,
+Mul 5, Sigmoid 5; the export additionally has `Cast` 3 and `Constant` 28 and has `Slice` 6 vs 8 (the
+Focus-stem slicing is expressed differently). If the DFC parser rejects them, constant-fold the graph
+(e.g. `onnxsim`) and re-verify float parity with ONNX Runtime (max |Δ| on the known-good frames) before
+going on; record the new sha256.
+
+**Quantisation risk to watch.** On the six known-good frames the EXP-08 box heads span
+−20.4…33.0 logits against −6.4…11.6 for the shipping weights (same job): about 3× the range for the
+same 8-bit output, so coarser DFL steps if the outputs are quantised per tensor. M8.4's host-simulated
+"uint8 outputs only" variant was harmless for the shipping weights (§5.5); it has not been run for EXP-08.
 
 ## Pins
 

@@ -82,7 +82,10 @@ def test_experiment_only_and_pending_evidence_supports_nothing():
     assert "phone_detection.oi7_val.reference" not in out["phone_detection"]["evidence"]
     hand = out["hand_box_detection"]
     assert hand["evidence"] == [] and hand["model_deployment"] == "candidate"
-    assert set(hand["experiment_evidence"]) == {"hand_box_detection.exp08a_rerun", "hand_box_detection.exp08_full60"}
+    assert set(hand["experiment_evidence"]) == {"hand_box_detection.exp08a_rerun", "hand_box_detection.exp08_full60",
+                                                # M10: the opt-in class-map decode, recorded and supporting nothing
+                                                "hand_box_detection.extra_class_decoder_synthetic",
+                                                "hand_box_detection.exp08_device_path_class_map"}
 
 
 def test_the_60_epoch_run_is_recorded_and_stays_experiment_only(doc):
