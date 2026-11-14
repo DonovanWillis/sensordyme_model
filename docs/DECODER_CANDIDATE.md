@@ -83,6 +83,51 @@ No single threshold gives both high recall and few false phones on these web pho
 
 **Pi CPU cost:** host decode measured 2.6 ms (legacy) vs 5.9 ms (reference) on the worker CPU at a 0.05 floor. The device decodes at the module threshold (0.20+), so fewer candidates, but the Pi CPU is slower. Measure it with `stage_timing.py`.
 
+## Extra class channels (`accelerator.yolo_extra_classes`, M10): EXPERIMENT-ONLY
+
+**Status: experiment-only. Absent from `config.yaml`; never set it on a production unit.**
+
+Both decoders read the 80 COCO class channels and drop channel 80. A 3-class device-layout export
+(`research/m84/device_export.py`: person → 0, phone → 67, hand → 80 of an 81-channel class head)
+therefore reported person and phone but never hand. The opt-in map names which channels beyond COCO-80
+are classes:
+
+```yaml
+accelerator:
+  yolo_hef: <a 3-class candidate .hef, NOT models/damoyolo_tinynasL20_T.hef>
+  yolo_hef_sha256: <its own pin>
+  yolo_extra_classes: {80: hand}     # experiment-only
+```
+
+- **Absent or empty = the pre-M10 decode, bit for bit** (checked byte-for-byte against the pre-M10
+  `core/accel.py` on 291,205 boxes from random heads; `tests/test_m10_hand_class_decode.py`).
+- With the map, a mapped channel is one more class column: it competes in the legacy argmax and is a
+  candidate in the reference multilabel selection, goes through the same class-wise NMS, and appears in
+  `model.names` (`names[80] == "hand"`).
+- **Fail closed at load**, before the exclusive chip is opened: a class head narrower than the highest
+  mapped channel + 1, an on-chip-NMS build, and the shipping COCO-80 `.hef` (sha256 `e69136d3…960e`,
+  whose channel 80 is the network's own background slot, max 0.0079 on val in M8.3 job
+  `20261113-043857-f182d1`). `core/config_schema.py` refuses COCO channels (< 80), non-integer channels,
+  and empty, duplicate or COCO-colliding names.
+- Measured on Open Images val through this decode path (float ONNX on x86, L1, fake chip; oryn job
+  `20261114-034527-625fa0`): EXP-08 hand AP50 0.723 with `reference`, 0.619 with `legacy`. Details and
+  CIs: `docs/research/M10_MODEL_CANDIDATES.md`. No INT8, `.hef` or Pi evidence exists for this mapping.
+
+**How a consumer reads hands** (nothing in the product does today; hand boxes are not wired into
+`driver_attention` or any rule): ask for the class id and read boxes as for any class,
+
+```python
+model = core.detectors.get_yolo_model(weights)           # HailoYOLO when the candidate .hef is configured
+hand_id = next((k for k, v in model.names.items() if v == "hand"), None)
+if hand_id is not None:                                    # None on the shipping .hef: no hand class
+    (res,) = model.predict(frame, classes=[hand_id], conf=hand_threshold)
+    hands = [(b.xyxy[0], float(b.conf[0])) for b in res.boxes]   # frame pixels, like every class
+```
+
+Look the id up by name rather than hard-coding 80, and treat "no hand class" as "no hand evidence",
+not "no hand". A hand threshold must be derived for the model, decoder and (later) INT8 scores; the
+float precision-0.80 hand threshold is in the M10 report and does not transfer to INT8.
+
 ## To promote (all required)
 
 1. INT8 parity and agreement on the Pi (hardware package §capture/compare) within the stated tolerances.
