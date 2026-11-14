@@ -48,7 +48,7 @@ section 10's refer to the M8.5 phone-handling commit (M8.5 shifted
 | Missing face = risk / no eye state = open | face-lost risk; drowsiness resets on face loss | Engine: eye state / gaze MISSING -> ABSTAIN, bounded coast (1 s), never "open"/"on road". |
 | Occlusion vs behaviour | sunglasses read whatever EAR the landmarks guess | Engine: dark, flat eye patch -> eye state MISSING -> drowsiness ABSTAIN. A dark cabin without IR also reads occluded (reported, honest). |
 | Camera misalignment vs behaviour | calibration taken once | Engine: a near-motionless off-road pose for 30 s -> ABSTAIN "camera may have moved (recalibrate)". Production keeps alerting. |
-| Device performance failure vs safe driving | stalls | Production credits one frame interval per stall; engine credits nothing across a stall; detector failure -> phone evidence INSUFFICIENT. |
+| Device performance failure vs safe driving | stalls | Production credits one frame interval per stall, and since M10 the same for an unreadable head pose (gaze trackers pause) and a lost face (PERCLOS pauses) -- docs/TEMPORAL_REASONING.md; engine credits nothing across a stall, and on the frame after one a claim whose condition holds is ABSTAIN "frame gap", never NOT_SUPPORTED (M10); detector failure -> phone evidence INSUFFICIENT. |
 | Empty vehicle vs absent driver | attention_lost repeats | Engine: nobody for 30 s -> ABSTAIN "vehicle may be empty"; blocked lens named as the cause. |
 
 ## 2. Decision A: experimental families are observations
