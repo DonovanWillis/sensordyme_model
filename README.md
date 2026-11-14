@@ -470,7 +470,11 @@ minutes of clicking plus the build:
    (to find your server and camera — declining makes discovery impossible, and
    the app says so), Bluetooth (only when you open device setup), and
    Notifications (when you first open a device's screen; alerts are local
-   notifications — no push service to configure).
+   notifications the app posts while it is open, with the iPhone's alert sound
+   once per new alert — no push service to configure). The app doesn't watch
+   in the background: closed or locked, nothing arrives from it, and Silent Mode
+   or Focus can mute the sound. The device's own buzzer is the safety alert and
+   needs no phone (`docs/IOS_APP_STATUS.md`, "Alert sound on this iPhone").
 
 **Know it's the real device build:** it's running on your physical iPhone (the
 Simulator can't do Bluetooth), and the release-configuration audit
@@ -603,8 +607,10 @@ checklist):
 
 **What iOS actually permits in the background (no overpromising):** reconnection
 above happens **when you open the app** (or return to it). In the background
-the app does not keep connections alive; alert delivery while closed goes
-through the notification path, and opening the app is what refreshes state.
+the app does not keep connections alive or look for alerts; alert delivery
+while it is closed goes only through the optional ntfy push (Settings → Alerts
+→ When the app is closed; there is no APNs), and opening the app is what
+refreshes state.
 There is no claim of continuous background streaming or polling — Apple does
 not permit it for an app like this.
 

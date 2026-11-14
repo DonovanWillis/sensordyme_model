@@ -68,7 +68,7 @@ struct DemoTriggerView: View {
             Text("Rehearse an alert")
                 .font(SD.Typography.title)
                 .foregroundStyle(SD.Colors.textPrimary)
-            Text("Each one creates a simulated event and sends it through the app's own alert handling: its severity, the notification and the timeline. No camera or device detects anything, and nothing sounds.")
+            Text("Each one creates a simulated event and sends it through the app's own alert handling: its severity, the notification and the timeline. No camera or device detects anything and no device buzzer sounds; the iPhone may play its alert sound, on a notification marked Simulated.")
                 .font(SD.Typography.callout)
                 .foregroundStyle(SD.Colors.textSecondary)
                 .fixedSize(horizontal: false, vertical: true)

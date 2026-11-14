@@ -118,6 +118,35 @@ do {
     check(poll("quiet", [newest + 1, 1000]) == [newest + 1], "while its genuinely new event still is")
 }
 
+// The app watches only in the foreground. Whatever arrived while it was not
+// watching is history when it looks again: never announced, never sounded.
+print("\nthe first poll after the app (re)starts watching is history, not news:")
+check(NotificationPolicy.freshEvents(ids: [42, 41, 40], mark: 30, baselined: false) == ([], 42),
+      "events that arrived while the app was in the background are not announced on return; the mark moves to the newest")
+check(NotificationPolicy.freshEvents(ids: [], mark: 30, baselined: false) == ([], 30),
+      "no events: the mark is kept")
+check(NotificationPolicy.freshEvents(ids: [5], mark: 900, baselined: false) == ([], 5),
+      "a reset backend is re-seeded on the baseline poll too")
+check(NotificationPolicy.freshEvents(ids: [300], mark: nil, baselined: false) == ([], 300),
+      "a never-seen device: the same seed as before")
+do {
+    // One watch: launch (baseline), then a new alert arrives while in the foreground.
+    var mark: Int? = 30
+    var baselined = false
+    func poll(_ ids: [Int]) -> [Int] {
+        let (fresh, next) = NotificationPolicy.freshEvents(ids: ids, mark: mark, baselined: baselined)
+        mark = next
+        baselined = true
+        return fresh
+    }
+    check(poll([41, 40]) == [], "launch: the backlog (40, 41) is not announced")
+    check(poll([42, 41, 40]) == [42], "then a genuinely new alert (42) is, exactly once")
+    check(poll([42, 41, 40]) == [], "and the next poll does not announce it again")
+    baselined = false                    // backgrounded, then back in the foreground
+    check(poll([44, 43, 42]) == [], "what arrived in the background (43, 44) stays history on return")
+    check(poll([45, 44, 43]) == [45], "and the next new one is announced")
+}
+
 print("\na tapped notification opens its own device, or says why it can't:")
 check(NotificationRouting.route(pendingDeviceID: 7, deviceIDs: [3, 7]) == .open(7), "its device")
 check(NotificationRouting.route(pendingDeviceID: 9, deviceIDs: [3, 7]) == .deviceNotOnAccount,

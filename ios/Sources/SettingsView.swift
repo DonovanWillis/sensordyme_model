@@ -14,6 +14,8 @@ struct SettingsView: View {
     @EnvironmentObject private var state: AppState
     @State private var findMessage: String?
     @Environment(\.dynamicTypeSize) private var typeSize
+    /// "Alert sound on this iPhone": on unless turned off (AlertNotifier reads it).
+    @AppStorage(AlertSound.enabledKey) private var alertSound = true
 
     var body: some View {
         NavigationStack {
@@ -72,7 +74,14 @@ struct SettingsView: View {
                     Text("Bluetooth setup is for a new device, or one moved somewhere new. Live feed is the picture on this Wi-Fi: finding the device, its token and its health.")
                 }
 
-                Section("Alerts") {
+                Section {
+                    // AlertSound.swift: the iPhone's sound for a new alert. A
+                    // convenience the footer says is one; the device's buzzer
+                    // is the safety alert and never depends on this switch.
+                    Toggle(isOn: $alertSound) {
+                        Label("Alert sound on this iPhone", systemImage: "speaker.wave.2")
+                    }
+                    .accessibilityIdentifier("settings.alertSound")
                     NavigationLink {
                         BackgroundAlertsSettingsView()
                     } label: {
@@ -85,6 +94,10 @@ struct SettingsView: View {
                         Label("Text messages", systemImage: "message")
                     }
                     .accessibilityIdentifier("settings.textAlerts")
+                } header: {
+                    Text("Alerts")
+                } footer: {
+                    Text("While ORYN EDGE is open, a new alert plays this iPhone's notification sound once. It's a convenience, not the safety alert: Silent Mode and Focus can mute it, and with the app closed or the phone locked the app can't post it at all. Your SensorDyme's own buzzer is the safety alert, and it sounds whether or not a phone is connected.")
                 }
 
                 // Every "can't reach the backend" message in the app tells the

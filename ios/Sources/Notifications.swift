@@ -14,10 +14,18 @@ import UserNotifications
 /// thing to show someone evaluating the product.
 ///
 /// **The honest limit**, which matters for how you demo: the app posts these,
-/// so it must be running or recently backgrounded. Force-quit the app and
-/// nothing arrives. iOS also decides how often a backgrounded app may poll. For
-/// a demo — phone in hand, app open or just backgrounded — this behaves exactly
-/// like the real thing. For a shipping product it does not replace APNs.
+/// so it must be running. It looks for new alerts only while it is in the
+/// foreground (AlertWatcher stops when the app leaves it); backgrounded,
+/// suspended or force-quit, nothing arrives from the app, and alerts that
+/// arrived meanwhile are in the timeline, not announced when you come back.
+/// For a demo — phone in hand, app open — this behaves like the real thing.
+/// For a shipping product it does not replace APNs, which this app does not use.
+///
+/// **The sound** (AlertSound.swift): a new driver alert, or any other alert
+/// this posts, plays the standard notification sound once, when "Alert sound
+/// on this iPhone" is on. iOS decides whether it is heard: Silent Mode, Focus
+/// and the notification settings silence it, and nothing here overrides them.
+/// The device's own buzzer is the safety alert and never depends on the phone.
 @MainActor
 final class AlertNotifier: NSObject, ObservableObject {
     static let shared = AlertNotifier()
@@ -71,6 +79,23 @@ final class AlertNotifier: NSObject, ObservableObject {
         set { UserDefaults.standard.set(newValue, forKey: Self.marksKey) }
     }
 
+    /// Devices whose first poll since the app last started watching has been
+    /// taken. That first poll only seeds the mark (see `beginWatching`).
+    private var baselinedDevices: Set<String> = []
+
+    /// Every event that has played the alert sound on this phone, so none plays
+    /// it twice. Persisted: the same event re-read after a relaunch stays quiet.
+    private static let soundedKey = "soundedAlertEvents"
+    private var sounded: SoundedEvents {
+        get { SoundedEvents(UserDefaults.standard.stringArray(forKey: Self.soundedKey) ?? []) }
+        set { UserDefaults.standard.set(newValue.identities, forKey: Self.soundedKey) }
+    }
+
+    /// "Alert sound on this iPhone" (Settings → Alerts). On unless turned off.
+    nonisolated static var soundEnabled: Bool {
+        UserDefaults.standard.object(forKey: AlertSound.enabledKey) as? Bool ?? true
+    }
+
     private override init() {
         super.init()
         UNUserNotificationCenter.current().delegate = self
@@ -84,6 +109,14 @@ final class AlertNotifier: NSObject, ObservableObject {
     /// afterwards cannot turn old history into a burst of alerts.
     func forgetAnnounced() {
         UserDefaults.standard.removeObject(forKey: Self.marksKey)
+    }
+
+    /// The app has (re)started watching: launch, or back in the foreground.
+    /// The next poll of each device is history, not news. The app does not
+    /// watch in the background, so an alert from an hour ago must not arrive
+    /// now as if it had just happened, with a sound.
+    func beginWatching() {
+        baselinedDevices.removeAll()
     }
 
     func requestPermission() async {
@@ -111,9 +144,11 @@ final class AlertNotifier: NSObject, ObservableObject {
         let key = String(device.id)
         var allMarks = marks
         let (fresh, mark) = NotificationPolicy.freshEvents(
-            ids: events.compactMap(\.eventID), mark: allMarks[key]
+            ids: events.compactMap(\.eventID), mark: allMarks[key],
+            baselined: baselinedDevices.contains(key)
         )
         allMarks[key] = mark
+        baselinedDevices.insert(key)
         // Stored before anything is awaited. The decision below is made, and
         // `lastNotifiedAt` moved, before posting too: posting suspends, and a
         // second poll arriving in that gap (a quick inactive -> active, which
@@ -164,20 +199,39 @@ final class AlertNotifier: NSObject, ObservableObject {
     }
 
     private func post(_ event: EventItem, device: Device, simulated: Bool) async {
+        let isSimulated = simulated || event.isSimulated
         let content = UNMutableNotificationContent()
-        content.title = event.isCritical ? "SensorDyme Alert" : "SensorDyme"
-        content.subtitle = event.title
+        // Never let a demo alert be mistaken for a real detection. This is the
+        // difference between a demo and a misrepresentation. The event itself
+        // says so too (M8.3): a virtual device's alert, reaching a real account,
+        // is labelled the same way, in the headline and the subtitle.
+        content.title = AlertSound.title(type: event.type, critical: event.isCritical, simulated: isSimulated)
+        content.subtitle = isSimulated ? "\(event.title) (simulated)" : event.title
         content.body = body(for: event, device: device) + " Tap to view details."
-        content.sound = event.isCritical ? .defaultCritical : .default
         content.userInfo = ["eventID": event.eventID ?? -1, "deviceID": device.id]
         content.threadIdentifier = "device-\(device.id)"
 
-        if simulated || event.isSimulated {
-            // Never let a demo alert be mistaken for a real detection. This is
-            // the difference between a demo and a misrepresentation. The event
-            // itself says so too (M8.3): a virtual device's alert, reaching a
-            // real account, is labelled the same way.
-            content.subtitle = "\(event.title) (simulated)"
+        // The standard sound, once per event (AlertSound.swift). Not
+        // `.defaultCritical`: a critical sound needs Apple's Critical Alerts
+        // entitlement, which this app does not have, so asking for one only
+        // suggested a Silent Mode bypass the app cannot make.
+        var log = sounded
+        let identity = AlertSound.identity(eventKey: event.eventKey, eventID: event.eventID)
+        let decision = AlertSound.decide(
+            type: event.type, severity: event.severity, experimental: event.isExperimental,
+            deliveredLate: event.deliveryDelay != nil,
+            alreadySounded: identity.map { log.contains($0) } ?? true,
+            soundEnabled: Self.soundEnabled
+        )
+        if decision == .play, let identity {
+            content.sound = .default
+            log.insert(identity)
+            sounded = log
+        } else {
+            content.sound = nil
+            if decision == .silent(.deliveredLate), let delay = event.deliveryDelay {
+                content.body += " Reached the server \(Int(delay / 60)) min after it happened."
+            }
         }
         // `.timeSensitive` needs an entitlement a free account may not carry, so
         // this stays at the default level rather than risk failing to provision.
@@ -218,13 +272,16 @@ final class AlertNotifier: NSObject, ObservableObject {
 }
 
 extension AlertNotifier: UNUserNotificationCenterDelegate {
-    /// Show the banner even while the app is open, so a demo works without
-    /// backgrounding the app first.
+    /// Show the banner even while the app is open, so an alert reaches you on
+    /// whatever screen you are on. `.sound` plays the notification's own
+    /// sound, which `post` sets only for an alert that should sound
+    /// (AlertSound.swift); it is left out while "Alert sound on this iPhone" is
+    /// off. iOS still applies Silent Mode and Focus to it.
     nonisolated func userNotificationCenter(
         _ center: UNUserNotificationCenter,
         willPresent notification: UNNotification
     ) async -> UNNotificationPresentationOptions {
-        [.banner, .sound, .list]
+        AlertNotifier.soundEnabled ? [.banner, .sound, .list] : [.banner, .list]
     }
 
     nonisolated func userNotificationCenter(
