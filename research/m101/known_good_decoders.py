@@ -110,8 +110,11 @@ def main(argv=None) -> int:
     fake_hailo.install(backend)
     accel.record_inference = lambda: None
     made = {}
+    # One model: the (fake) chip is exclusive, as the real one is. Its decoder is
+    # switched between runs, as research/m83/inference_path_val.py does.
+    model = HailoYOLO("damoyolo_tinynasL20_T.hef (simulated: float ONNX)", decoder="legacy")
     for decoder in ("legacy", "reference"):
-        model = HailoYOLO(f"damoyolo_tinynasL20_T.hef (simulated: float ONNX, {decoder})", decoder=decoder)
+        model.decoder = decoder
         sub = args.out / decoder
         sub.mkdir(exist_ok=True)
         result = ipv.known_good(model, fake_hailo, hd, sub, captured)
