@@ -91,10 +91,12 @@ on Linux; on macOS it is the PEAK RSS (`rss_source` says so).
 
 Overhead, measured by `tests/test_m10_observe.py::test_the_instrumentation_is_cheap`
 on the development Mac (Apple Silicon, Python 3.12; **a desktop figure, not a Pi
-figure**): `add()` 0.42 µs, `snapshot()` 0.015 ms. A frame records about a
-dozen samples (~5 µs), about 0.015 % of a 33 ms frame. The Pi's Cortex-A76 is
-slower per call; re-measure it there with the same test before quoting a Pi
-number.
+figure**): `add()` 0.42 µs, `snapshot()` 0.015 ms. A/B over the real
+shared-perception path (detector + two graph proxies + the tracker, stand-in
+models), `benchmarks/stage_timing_overhead.py`: 3.6–4.8 µs per frame with the
+recording live vs no-op, about 0.01 % of a 33 ms frame (two runs, 2026-11-14,
+same Mac). The Pi's Cortex-A76 is slower per call; re-run both there before
+quoting a Pi number.
 
 ## 3. `GET /api/diagnostics` (sd-diagnostics/1)
 
