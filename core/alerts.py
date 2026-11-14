@@ -42,6 +42,19 @@ output that cannot report is "unconfirmed", never "played". The uplink sends
 the summary with the event, so the app can say "the alert sounded on the
 device" only when the device itself said so.
 
+Relapse escalation (M10.1, OFF unless the owner enables it). An episode ends
+when its condition clears, so a driver who looks away for 5 s, back for 2 s,
+away again, ... opens a new "warning" episode each time, every one starting at
+the onset pattern: however long the relapsing goes on, `urgent` is never heard
+(docs/TEMPORAL_REASONING.md O4). `RelapseEscalation` keeps the episodes
+separate and adds one bounded fact across them: the ALERTED time of a run of
+episodes of the listed types, where a run is broken only by `recovery_s` with
+none of them open (genuine recovery). An episode whose run has already reached
+its category's `escalate_after_s` (10 s for "warning", the same bar a single
+continuous episode must reach) plays the escalated pattern from its onset. It
+changes which pattern sounds, never whether or when anything fires: no event,
+episode, repeat interval, repeat bound or cooldown changes.
+
 Experimental observations (M8.4, owner decision A). The experimental alert
 families (core/behavior/experimental.py: high_risk, elevated_risk,
 erratic_hand_movement) are REFUSED by this policy unless it was built with
@@ -704,6 +717,36 @@ class AlertDelivery:
                 log.warning("alert delivery listener failed: %s", exc)
 
 
+@dataclass(frozen=True)
+class RelapseEscalation:
+    """Escalation carried across episodes broken by brief recoveries (module docstring).
+
+    enabled:    False ships the M0.1 policy unchanged (each episode escalates on
+                its own duration only). Turning it on is an owner decision.
+    types:      the event types whose alerted time counts toward one run (one
+                run for all of them: looking down at a phone and turning away
+                are the same inattention).
+    recovery_s: seconds with none of `types` alerting that end a run.
+    """
+
+    enabled: bool = False
+    types: frozenset = frozenset()
+    recovery_s: float = 60.0
+
+    def __post_init__(self) -> None:
+        if not 5.0 <= float(self.recovery_s) <= 600.0:
+            raise ValueError("relapse_escalation.recovery_s must be in [5, 600]")
+
+
+@dataclass
+class _Run:
+    """The current run of relapse-escalation episodes (RelapseEscalation)."""
+
+    alerted_s: float = 0.0      # union of the run's ended episodes' alerted time
+    covered_until: float = 0.0  # end of that union (concurrent episodes count once)
+    last_end: float = 0.0
+
+
 @dataclass
 class _Episode:
     key: str
@@ -716,6 +759,8 @@ class _Episode:
     repeats: int = 0
     escalated: bool = False
     tracked: bool = False
+    #: Alerted time carried in from earlier episodes of the same run (RelapseEscalation).
+    carried_s: float = 0.0
     ended_at: Optional[float] = None
     delivery: Optional[AlertDelivery] = field(default=None, repr=False)
 
@@ -726,6 +771,7 @@ class _Episode:
             "state": "active" if self.ended_at is None else "ended",
             "started_at": self.started_at, "ended_at": self.ended_at,
             "actuations": 1 + self.repeats, "escalated": self.escalated,
+            "carried_s": round(self.carried_s, 3),
         }
 
 
@@ -749,6 +795,7 @@ class AlertManager:
         type_categories: Optional[dict[str, str]] = None,
         duplicate_window_s: float = 2.0,
         experimental_audible: bool = False,
+        relapse: Optional[RelapseEscalation] = None,
     ) -> None:
         """Create the policy.
 
@@ -768,6 +815,8 @@ class AlertManager:
             experimental_audible: The owner's explicit opt-in for the experimental
                 alert families (core/behavior/experimental.py). False (default):
                 they are refused, whatever fixed_levels/type_categories say.
+            relapse: Escalation carried across briefly-recovered episodes
+                (RelapseEscalation). None or disabled: the M0.1 policy, unchanged.
         """
         self.experimental_audible = experimental_audible is True
         fixed_levels = dict(fixed_levels or {})
@@ -787,6 +836,8 @@ class AlertManager:
         self._categories = dict(DEFAULT_CATEGORIES if categories is None else categories)
         self._type_categories = type_categories
         self._duplicate_window_s = max(0.0, float(duplicate_window_s))
+        self._relapse = relapse if relapse is not None and relapse.enabled else None
+        self._run: Optional[_Run] = None
         self._last_start: dict[str, float] = {}
         self._open: dict[str, _Episode] = {}
         self._recent: deque = deque(maxlen=self._RECENT)
@@ -913,14 +964,38 @@ class AlertManager:
             self._next_id += 1
             delivery = self._record_delivery(
                 event, AlertDelivery("alerted", self._episode_ref(self._next_id), cat.name))
+            carried = self._carried_alerted_time(event.type, cat, now)
+            escalated = carried > 0.0 and carried >= cat.escalate_after_s
             episode = _Episode(
                 key=episode_key, event=event, source=source, category=cat,
                 episode_id=self._next_id, started_at=now, last_actuation_at=now, delivery=delivery,
+                escalated=escalated, carried_s=carried,
             )
             self._open[episode_key] = episode
             self._last_start[episode_key] = now
-        self._actuate(PATTERNS[cat.initial_pattern], event, cat, chosen, delivery)
+        onset = cat.escalated_pattern if escalated else cat.initial_pattern
+        self._actuate(PATTERNS[onset], event, cat, chosen, delivery)
         return chosen
+
+    def _relapse_counts(self, event_type: str, cat: AlertCategory) -> bool:
+        return (self._relapse is not None and event_type in self._relapse.types
+                and cat.escalated_pattern != cat.initial_pattern)
+
+    def _carried_alerted_time(self, event_type: str, cat: AlertCategory, now: float) -> float:
+        """Alerted time a new episode inherits from its run (caller holds the lock).
+
+        0.0 with relapse escalation off, for a type it does not cover, or after
+        a genuine recovery (`recovery_s` with no covered episode open), which
+        also ends the run."""
+        if not self._relapse_counts(event_type, cat) or self._run is None:
+            return 0.0
+        assert self._relapse is not None
+        others_open = any(self._relapse_counts(e.event.type, e.category) for e in self._open.values()
+                          if e.event.type != event_type)
+        if not others_open and now - self._run.last_end > self._relapse.recovery_s:
+            self._run = None
+            return 0.0
+        return self._run.alerted_s
 
     # ------------------------------------------------------------------ episode progress
     def observe(
@@ -958,7 +1033,7 @@ class AlertManager:
                         and episode.repeats < cat.max_repeats
                         and now - episode.last_actuation_at >= cat.repeat_s
                     ):
-                        escalate = now - episode.started_at >= cat.escalate_after_s
+                        escalate = now - episode.started_at + episode.carried_s >= cat.escalate_after_s
                         episode.escalated = episode.escalated or escalate
                         episode.repeats += 1
                         episode.last_actuation_at = now
@@ -996,6 +1071,12 @@ class AlertManager:
         episode.ended_at = now
         self._open.pop(episode.key, None)
         self._recent.append(episode.describe())
+        if self._relapse_counts(episode.event.type, episode.category):
+            run = self._run or _Run(covered_until=episode.started_at)
+            run.alerted_s += max(0.0, now - max(episode.started_at, run.covered_until))
+            run.covered_until = max(run.covered_until, now)
+            run.last_end = max(run.last_end, now)
+            self._run = run
 
     def _actuate(self, pattern: AlertPattern, event: Event, category: AlertCategory, level: AlertLevel,
                  delivery: Optional[AlertDelivery] = None) -> None:

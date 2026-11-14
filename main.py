@@ -21,7 +21,14 @@ from typing import Optional, Union
 
 import yaml
 
-from core.alerts import AlertLevel, AlertManager, ConsoleSink, SoundSink, UnavailableSink
+from core.alerts import (
+    AlertLevel,
+    AlertManager,
+    ConsoleSink,
+    RelapseEscalation,
+    SoundSink,
+    UnavailableSink,
+)
 from modules import available_modules, get_module_class
 
 # Event types that reach the AlertManager at all, per profile. Anything else (e.g.
@@ -230,6 +237,20 @@ def build_alert_manager(alert_cfg: dict, is_pi: bool,
         # M8.4 owner decision A: experimental families sound only on an explicit
         # boolean opt-in (core/behavior/experimental.py), whatever the lists say.
         experimental_audible=experimental_opted_in(alert_cfg),
+        relapse=relapse_escalation(alert_cfg),
+    )
+
+
+def relapse_escalation(alert_cfg: dict) -> Optional[RelapseEscalation]:
+    """`alerts.relapse_escalation:` (M10.1). Off unless `enabled` is the boolean
+    true: carrying escalation across episodes is an owner decision."""
+    block = alert_cfg.get("relapse_escalation")
+    if not isinstance(block, dict) or block.get("enabled") is not True:
+        return None
+    return RelapseEscalation(
+        enabled=True,
+        types=frozenset(block.get("types") or ()),
+        recovery_s=float(block.get("recovery_s", 60.0)),
     )
 
 

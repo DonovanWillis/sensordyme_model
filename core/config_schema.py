@@ -121,6 +121,20 @@ def _validate_alerts(alerts: dict, where: str, errors: list[str], warnings: list
     categories = alerts.get("categories")
     if categories is not None:
         _validate_categories(categories, where, errors)
+    relapse = alerts.get("relapse_escalation")
+    if relapse is not None:
+        if not isinstance(relapse, dict):
+            errors.append(f"`{where}.relapse_escalation:` must be a mapping, got {relapse!r}")
+        else:
+            enabled = relapse.get("enabled", False)
+            _check(errors, isinstance(enabled, bool),
+                   f"`{where}.relapse_escalation.enabled:` must be true or false, got {enabled!r}")
+            types = relapse.get("types", [])
+            _check(errors, isinstance(types, list) and all(isinstance(t, str) and t for t in types),
+                   f"`{where}.relapse_escalation.types:` must be a list of names like [a, b], got {types!r}")
+            recovery = relapse.get("recovery_s", 60)
+            _check(errors, _is_num(recovery) and 5 <= recovery <= 600,
+                   f"`{where}.relapse_escalation.recovery_s:` must be a number in [5, 600], got {recovery!r}")
     for key in ("sinks", "loud_types", "soft_types", "critical_types"):
         if key not in alerts:
             continue
