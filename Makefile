@@ -334,3 +334,14 @@ release-verify: ## compare SNAPSHOT= (device snapshot JSON) against $(RELEASE_DI
 # units, focused tests). Seconds on the Mac; changes nothing. See docs/RELEASE_MANIFEST.md.
 verify-release: ## offline release verification of REF= (default HEAD): deps, gates, units, focused tests
 	bash scripts/release/verify.sh $(REF)
+
+# =============================================================================
+# Transfer package (M8.5 PACKAGE): everything the Pi needs, in one verified
+# directory under $(RELEASE_DIR)/transfer-<id>/ — the release bundle + manifest,
+# the hashed aarch64/cp311 wheel set, the pinned .hef (verified before
+# inclusion), config template, install scripts, generated INSTALL.md/MODELS.md
+# and SHA256SUMS. See docs/DEPLOYMENT.md "Transfer package".
+# =============================================================================
+.PHONY: transfer-package
+transfer-package: ## build the Pi transfer package for REF= (default HEAD) into $(RELEASE_DIR)/transfer-<id>/
+	$(VENV)/python scripts/release/build_transfer_package.py --ref $(REF) --out-root $(RELEASE_DIR)
