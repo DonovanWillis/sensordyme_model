@@ -106,8 +106,9 @@ import numpy as np
 from core import perception as shared_perception
 from core.behavior import BehaviorFrame, BehaviorReasoner, parse_behavior
 from core.behavior import signals as sig
-from core.behavior.association import DriverAssociation, associate_driver
+from core.behavior.association import DriverAssociation
 from core.behavior.camera_model import CameraIntrinsics
+from core.behavior.driver_identity import DriverIdentity, landmark_box, parse_driver_identity
 from core.behavior.engine import BehaviorEngine, EngineConfig, FrameEvidence, frame_quality
 from core.behavior.experimental import observation_detail
 from core.behavior.eye_state import CLOSED as EYE_CLOSED
@@ -1520,6 +1521,15 @@ class DriverAttentionModule(VisionModule):
         region = behavior_section.get("driver_region") if behavior_section else None
         self._seat_region_norm: Optional[tuple[float, float, float, float]] = (
             tuple(float(v) for v in region) if isinstance(region, (list, tuple)) and len(region) == 4 else None)
+        # M10 (core/behavior/driver_identity.py): which face is the driver's and
+        # which person; the region precedence configured > installation-calibrated.
+        self._identity = DriverIdentity(
+            parse_driver_identity(config), configured_region=self._seat_region_norm,
+            calibration_path=Path(config.get("calibration_path", "data/calibration.json")),
+            force_recalibrate=bool(config.get("recalibrate", False)),
+            window_s=float(config.get("calibration_duration_s", 10.0)),
+            attention_calibrated=self._calibrator.is_calibrated,
+        )
         self._driver: Optional[DriverAssociation] = None
         self._phone_evidence: PhoneEvidence = self._engine.phone_evidence
         self._last_detection_at: Optional[float] = None  # evidence time of the last successful detector tick
@@ -1574,7 +1584,9 @@ class DriverAttentionModule(VisionModule):
         # field trades a little landmark quality for far fewer dropouts, and
         # that trade should not require a code change to make.
         self._face_mesh = mp.solutions.face_mesh.FaceMesh(
-            max_num_faces=1,
+            # 2 only with a driver region known at start-up (M10): the driver's
+            # face is then selected among them (_select_driver_face).
+            max_num_faces=self._identity.max_faces,
             refine_landmarks=True,
             min_detection_confidence=float(config.get("face_detection_confidence", 0.5)),
             min_tracking_confidence=float(config.get("face_tracking_confidence", 0.5)),
@@ -1727,9 +1739,10 @@ class DriverAttentionModule(VisionModule):
         difference between an object being in the car and an object being at
         the driver's face, at the fidelity a box detector can support.
 
-        The largest person box is taken as the driver: in a driver-facing
-        camera the driver is the nearest and largest person in frame, and a
-        rear-seat passenger's snack is not this module's event to fire.
+        The largest of `person_boxes` is taken as the driver. Since M10 the
+        caller passes only the associated driver's box (core/behavior/
+        driver_identity.py), or none when the driver cannot be identified: a
+        passenger's or rear-seat passenger's snack is not this module's event.
 
         With NO person detected there is nothing to be near, so nothing
         qualifies. That is the same direction this module already fails in
@@ -1835,7 +1848,13 @@ class DriverAttentionModule(VisionModule):
         self._last_person_visible = bool(person_boxes)
         self._last_person_boxes = person_boxes
         self._last_person_confidences = person_confidences
-        eating_boxes = self._eating_boxes_near_face(eating_boxes, person_boxes)
+        # The driver is the person the driver-identity layer associates (M10:
+        # configured region > calibrated region > the box holding the measured
+        # face > the only person); food and phones are related to that person
+        # only, never to an ambiguous or unresolved one.
+        association = self._identity.associate(list(person_boxes), self._last_face_box, w, h)
+        eating_boxes = self._eating_boxes_near_face(
+            eating_boxes, [] if association.driver_box is None else [association.driver_box])
 
         hand_boxes: list[Box] = []
         hands_ran = self._hands is not None and self._should_run_hands(bool(phone_boxes))
@@ -1860,14 +1879,8 @@ class DriverAttentionModule(VisionModule):
         self._last_hand_boxes = hand_boxes
         self._last_overlay_boxes = overlay_boxes
         self._last_overlay_confidences = overlay_confidences
-        # M8.5: the driver is the person associate_driver picks (seat region,
-        # else the box holding the measured face, else the largest box -- the
-        # shipped proxy), so a larger passenger's phone is not the driver's.
-        seat = None
-        if self._seat_region_norm is not None:
-            x1, y1, x2, y2 = self._seat_region_norm
-            seat = (x1 * w, y1 * h, x2 * w, y2 * h)
-        association = associate_driver(list(person_boxes), self._last_face_box, seat)
+        # M8.5: the driver is the associated person (above), so a larger
+        # passenger's phone is not the driver's.
         self._phone_association = association
         self._phone_driver_box = association.driver_box
         driver_phones = phones_for_associated_driver(phone_boxes, person_boxes, association)
@@ -1922,6 +1935,25 @@ class DriverAttentionModule(VisionModule):
                 erratic = True
         self._hands_erratic_raw = erratic
         self._finish_detection_tick(phone_boxes, eating_boxes)
+
+    def _select_driver_face(self, results, w: int, h: int, now: float):
+        """The FaceMesh face that is the DRIVER's (M10), or None when none is.
+
+        Without face selection (no driver region at start-up: FaceMesh runs
+        with one face) this is the face model's first face, as before. With it,
+        core/behavior/driver_identity.DriverFaceSelector picks among up to two:
+        a passenger's face is never the one EAR / gaze / head pose are read
+        from, and when only a passenger's face is seen the driver's face is
+        reported not visible (the face-lost path: coasting, attention_lost).
+        """
+        faces = list(results.multi_face_landmarks or [])
+        if not self._identity.selection_active:
+            return faces[self._identity.first_face(len(faces)).index or 0] if faces else None
+        boxes = [landmark_box(face.landmark, w, h) for face in faces]
+        detector_fresh = (self._object_detection_error is None and self._last_detection_at is not None
+                          and now - self._last_detection_at <= 1.0)
+        choice = self._identity.select_face(boxes, w, h, now, list(self._last_person_boxes) if detector_fresh else None)
+        return None if choice.index is None else faces[choice.index]
 
     def _should_run_hands(self, phone_seen: bool) -> bool:
         """Whether MediaPipe Hands runs on this detector tick (HANDS_POLICIES)."""
@@ -2128,12 +2160,8 @@ class DriverAttentionModule(VisionModule):
             detector_reason = "object-detector result stale"
         else:
             detector_reason = ""
-        seat = None
-        if self._seat_region_norm is not None:
-            x1, y1, x2, y2 = self._seat_region_norm
-            seat = (x1 * w, y1 * h, x2 * w, y2 * h)
         face_box = self._last_face_box if face_found else None
-        driver = (associate_driver(list(self._last_person_boxes), face_box, seat) if detector_ok
+        driver = (self._identity.associate(list(self._last_person_boxes), face_box, w, h) if detector_ok
                   else DriverAssociation("unknown", None, 0, None, detector_reason))
         self._driver = driver
         driver_box = driver.driver_box
@@ -2226,6 +2254,7 @@ class DriverAttentionModule(VisionModule):
 
         rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
         results = self._face_mesh.process(rgb)
+        face_proto = self._select_driver_face(results, w, h, now)
 
         # Whether the driver's phone is being HANDLED (M8.5) is decided per
         # frame below, where the face box and the downward-gaze condition are
@@ -2245,7 +2274,7 @@ class DriverAttentionModule(VisionModule):
                 observation_detail("sustained rapid, chaotic hand motion"),
             ))
 
-        if not results.multi_face_landmarks:
+        if face_proto is None:  # no face, or (M10) no face that is the driver's
             self._last_face_proto = None
             # A significant head turn is a common way to LOSE FaceMesh lock
             # entirely -- it is tuned for near-frontal faces, so "no landmarks"
@@ -2402,7 +2431,6 @@ class DriverAttentionModule(VisionModule):
                 noise.observe(None)  # a gap is motion, not noise
         self._face_lost_active = False
 
-        face_proto = results.multi_face_landmarks[0]
         self._last_face_proto = face_proto
         landmarks = face_proto.landmark
         points = [(lm.x * w, lm.y * h) for lm in landmarks]
@@ -2477,6 +2505,9 @@ class DriverAttentionModule(VisionModule):
                 yaw_offset_deg=float(gaze_offset[0]), pitch_offset_deg=float(gaze_offset[1]))
 
         self._calibrator.observe(ear, rotation, gaze_offset, now)
+        self._identity.observe_calibration(
+            now, calibrated=self._calibrator.is_calibrated, face_landmarks=landmarks,
+            person_boxes=self._last_person_boxes, detection_tick=self._detection_tick, w=w, h=h)
 
         # --- drowsiness: calibrated EAR against a session-adaptive reference ---
         # The stored calibration answers "what does an open eye measure" for
@@ -2844,6 +2875,9 @@ class DriverAttentionModule(VisionModule):
             # skipped tick means "not looked for", never "no hands"), and the
             # engine's shadow verdicts / phone evidence / driver association.
             "hands_ran_last_tick": self._hands_ran_last_tick,
+            # M10: whose face / which person the signals are about (identified /
+            # uncertain / not_visible / unknown), and how that was decided.
+            **self._identity.snapshot(self._driver),
             **self._engine.snapshot(),
             **(self._behavior.snapshot() if self._behavior is not None else {}),
         }
@@ -2949,6 +2983,7 @@ class DriverAttentionModule(VisionModule):
             # M8.4: typed-evidence engine in SHADOW (no alert depends on it), the
             # experimental observations' status, and hand-model scheduling.
             "engine": self._engine.report(),
+            "driver_identity": self._identity.report(self._driver),
             "experimental_observations": {
                 "high_risk_active": self._risk_fusion.is_high_risk_active,
                 "erratic_hands_active": self._erratic_hands_active,
