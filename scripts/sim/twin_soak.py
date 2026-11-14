@@ -75,6 +75,8 @@ CYCLE: tuple[tuple[float, Scene, Faults], ...] = (
     (230.0, ATTENTIVE, Faults(camera="frozen")), (245.0, ATTENTIVE, Faults()),   # camera freeze 15 s
     (260.0, ATTENTIVE, Faults(detector_failing=True)), (280.0, ATTENTIVE, Faults()),  # detector 20 s
 )
+#: --quiet-timeline (M8.5 memory attribution): the same cycle length, nothing happening.
+QUIET_CYCLE: tuple[tuple[float, Scene, Faults], ...] = ((0.0, ATTENTIVE, Faults()),)
 CYCLE_S = 360.0
 QUIET_FROM = 290.0
 STOP_AT, RESUME_AT, DISRUPT_AT = 300.0, 325.0, 345.0
@@ -82,13 +84,15 @@ STOP_AT, RESUME_AT, DISRUPT_AT = 300.0, 325.0, 345.0
 DRAIN_S = 150.0
 
 
-def soak_scenario(total_s: float, *, cycle_s: float = CYCLE_S, reboot_every_s: float = 0.0) -> Scenario:
+def soak_scenario(total_s: float, *, cycle_s: float = CYCLE_S, reboot_every_s: float = 0.0,
+                  quiet: bool = False) -> Scenario:
     """The repeating soak timeline: calibration, cycles, then a fault-free drain."""
+    timeline = QUIET_CYCLE if quiet else CYCLE
     segments = [Segment(0.0)]
     start = CALIBRATION_S
     end = max(start, total_s - DRAIN_S)
     while start + cycle_s <= end:
-        segments += [Segment(start + off, scene, faults) for off, scene, faults in CYCLE]
+        segments += [Segment(start + off, scene, faults) for off, scene, faults in timeline]
         start += cycle_s
     segments.append(Segment(max(start, segments[-1].start + 1.0), ATTENTIVE, Faults()))
     cycles = int((end - CALIBRATION_S) // cycle_s)
@@ -149,6 +153,15 @@ def _free_port() -> int:
 # ====================================================================== live: device process
 def run_device(args: argparse.Namespace) -> int:
     """The device process (spawned by the live controller; restarted after a kill)."""
+    # M8.5: a memory sampler inside this process when the controller asked for one
+    # (SDSOAK_MEMPROF; scripts/sim/memory_profile.py). Started first, so the
+    # Python heap it reports includes the device's imports.
+    sampler = None
+    if os.environ.get("SDSOAK_MEMPROF"):
+        sys.path.insert(0, str(Path(__file__).resolve().parent))
+        import memory_profile
+
+        sampler = memory_profile.start_from_env(label="device")
     from sim.device import VirtualDevice
     from sim.faults import EventLedger
     from sim.uplink import SimUplink
@@ -157,13 +170,33 @@ def run_device(args: argparse.Namespace) -> int:
     factory = json.loads(Path(args.factory).read_text())
     entry = factory["devices"][0]
     elapsed = max(0.0, time.time() - args.start_wall)
-    scenario = soak_scenario(args.total_s, reboot_every_s=args.reboot_every_s)
+    scenario = soak_scenario(args.total_s, reboot_every_s=args.reboot_every_s, quiet=args.quiet_timeline)
     scenario = replace(scenario, reboots=tuple(t for t in scenario.reboots if t > elapsed + 5.0))
     device = VirtualDevice(state_dir=args.state_dir, backend_url=factory["backend_url"], scenario=scenario,
                            device_key=entry["device_key"], claim_code=entry["claim_code"],
                            dashboard_port=args.dashboard_port, fps=args.fps, log_level="warning")
     # Same timeline across process restarts: scenario time is wall time since the soak began.
     device.scenario_clock.origin = time.monotonic() - elapsed
+    if args.driver_attention_override:
+        # One factor at a time (M8.5): e.g. {"hands_policy": "always"}, merged into this
+        # device's modules.driver_attention config at every (re)build.
+        override = json.loads(args.driver_attention_override)
+        base_config = device.config
+
+        def config_with_override() -> dict:
+            config = base_config()
+            config["modules"]["driver_attention"].update(override)
+            return config
+
+        device.config = config_with_override  # type: ignore[method-assign]
+    if sampler is not None:
+        base_build = device.build
+
+        def build_marked():
+            sampler.mark("runtime boot")
+            return base_build()
+
+        device.build = build_marked  # type: ignore[method-assign]
     print(f"device token: {device.dashboard_token}", flush=True)
     device.run()
     return 0
@@ -377,11 +410,22 @@ def run_live(args: argparse.Namespace) -> dict:
     work = Path(tempfile.mkdtemp(prefix="m84-soak-", dir=args.work_dir))
     total_s = args.minutes * 60.0
     start_wall = time.time()
-    scenario = soak_scenario(total_s, reboot_every_s=args.reboot_every_s)
+    scenario = soak_scenario(total_s, reboot_every_s=args.reboot_every_s, quiet=args.quiet_timeline)
     windows = Windows(start_wall, scenario)
     backend_port, dash_port = _free_port(), _free_port()
     backend_dir, state_dir, ledger_path = work / "backend", work / "device", work / "ledger.jsonl"
     py = sys.executable
+    device_env: dict[str, str] = {}
+    if args.mem_profile != "off":
+        device_env["SDSOAK_MEMPROF"] = json.dumps({
+            "out": str(out.resolve()), "interval_s": args.mem_sample_s, "types_every_s": args.mem_types_s,
+            "warmup_s": args.mem_warmup_s, "snapshot_s": args.mem_snapshot_s,
+            "tracemalloc_frames": args.tracemalloc_frames if args.mem_profile == "tracemalloc" else 0})
+    if args.malloc_arena_max:
+        device_env["MALLOC_ARENA_MAX"] = str(args.malloc_arena_max)
+    for item in args.device_env:  # e.g. MALLOC_MMAP_THRESHOLD_=131072 (glibc tunables, M8.5)
+        key, _, value = item.partition("=")
+        device_env[key] = value
 
     def start_backend() -> Proc:
         proc = Proc([py, "-m", "sim.backend", "--port", str(backend_port), "--data-dir", str(backend_dir)],
@@ -394,7 +438,11 @@ def run_live(args: argparse.Namespace) -> dict:
         return Proc([py, "-u", str(Path(__file__).resolve()), "_device", "--factory", str(backend_dir / "factory.json"),
                      "--state-dir", str(state_dir), "--dashboard-port", str(dash_port), "--fps", str(args.fps),
                      "--ledger", str(ledger_path), "--start-wall", repr(start_wall), "--total-s", repr(total_s),
-                     "--reboot-every-s", repr(args.reboot_every_s)], out / "device.log")
+                     "--reboot-every-s", repr(args.reboot_every_s),
+                     *(["--quiet-timeline"] if args.quiet_timeline else []),
+                     *(["--driver-attention-override", args.driver_attention_override]
+                       if args.driver_attention_override else [])],
+                    out / "device.log", env=device_env)
 
     backend = start_backend()
     factory = json.loads((backend_dir / "factory.json").read_text())
@@ -408,8 +456,10 @@ def run_live(args: argparse.Namespace) -> dict:
     deadline = time.time() + 120
     while not token_path.exists() and time.time() < deadline:
         time.sleep(0.5)
-    stream = StreamWatcher(dash_port, token_path, windows)
-    stream.start()
+    # --viewers N: N concurrent /stream readers (the app, a second phone, ...); 0 = none.
+    viewers = [StreamWatcher(dash_port, token_path, windows) for _ in range(args.viewers)]
+    for viewer in viewers:
+        viewer.start()
 
     kill_device_at = sorted(f * total_s for f in args.device_kills)
     restart_backend_at = sorted(f * total_s for f in args.backend_restarts)
@@ -455,14 +505,16 @@ def run_live(args: argparse.Namespace) -> dict:
             in_drain = t > total_s - DRAIN_S
             # ---- scheduled actions (the cycle's quiet tail), never in the final drain
             if off is not None and not in_drain:
-                if off >= STOP_AT and (cycle, "stop") not in done_cycle_actions and off < RESUME_AT:
+                if args.stop_resume and off >= STOP_AT and (cycle, "stop") not in done_cycle_actions \
+                        and off < RESUME_AT:
                     done_cycle_actions.add((cycle, "stop"))
                     r = api.call("POST", f"/v1/devices/{device_id}/protection", json={"action": "stop", "confirm": True})
                     if r is not None and r.status_code == 200:
                         stops += 1
                         commands.append({"action": "stop", "id": r.json()["command_id"], "at": now})
                         windows.add(now, now + (RESUME_AT - STOP_AT) + 10, "monitoring stopped")
-                if off >= RESUME_AT and (cycle, "resume") not in done_cycle_actions and off < DISRUPT_AT:
+                if args.stop_resume and off >= RESUME_AT and (cycle, "resume") not in done_cycle_actions \
+                        and off < DISRUPT_AT:
                     done_cycle_actions.add((cycle, "resume"))
                     r = api.call("POST", f"/v1/devices/{device_id}/protection", json={"action": "resume"})
                     if r is not None and r.status_code == 200:
@@ -545,8 +597,10 @@ def run_live(args: argparse.Namespace) -> dict:
         generated = EventLedger.read(ledger_path)
         integrity = compare(generated, stored)
     finally:
-        stream.stop_flag.set()
-        stream.join(timeout=10)
+        for viewer in viewers:
+            viewer.stop_flag.set()
+        for viewer in viewers:
+            viewer.join(timeout=10)
         device.stop()
         backend.stop()
 
@@ -611,13 +665,29 @@ def run_live(args: argparse.Namespace) -> dict:
         "queue": {"max": max(queue_depths, default=None), "p95": pct([float(q) for q in queue_depths], 0.95),
                   "dropped_max": dropped_max},
         "reconnects_app_online_flips": online_flips,
-        "stream": stream.summary(),
+        "stream": viewers[0].summary() if viewers else None,
+        "viewers": args.viewers, "stop_resume": args.stop_resume, "quiet_timeline": args.quiet_timeline,
+        "driver_attention_override": args.driver_attention_override, "mem_profile": args.mem_profile,
+        "malloc_arena_max": args.malloc_arena_max, "device_env": args.device_env,
         "invariant_violations": dict(violations), "invariant_examples": violation_examples,
         "false_protecting_samples": len(false_protecting), "false_protecting_examples": false_protecting[:10],
         "detector_fault_shown_ready_samples": len(missed_degraded),
         "user_state_transitions": len(user_states), "user_states_seen": sorted(set(user_states)),
         "app_samples": len(samples),
     }
+    # M8.5: the per-sample process time series (the M8.4 summary kept only first/last/max).
+    with open(out / "samples_proc_live.csv", "w", newline="") as handle:
+        writer = csv.writer(handle)
+        writer.writerow(["t", "process", "rss_mb", "cpu_pct", "threads", "fds"])
+        for name, pts in proc_samples.items():
+            for tt, s in pts:
+                writer.writerow([round(tt, 1), name, s.get("rss_mb"), s.get("cpu_pct"), s.get("threads"), s.get("fds")])
+    if args.mem_profile != "off":
+        sys.path.insert(0, str(Path(__file__).resolve().parent))
+        import memory_profile
+
+        with contextlib.suppress(Exception):  # the soak's own results stand without the analysis
+            summary["memory"] = memory_profile.analyze(out, warmup_s=args.mem_warmup_s)
     _write(out, summary, samples)
     return summary
 
@@ -804,6 +874,25 @@ def _parse(argv: Optional[list[str]]) -> argparse.Namespace:
                       help="fractions of the run at which the device process is SIGKILLed and restarted")
     live.add_argument("--backend-restarts", type=float, nargs="*", default=[0.4, 0.6],
                       help="fractions of the run at which the backend process is SIGKILLed and restarted")
+    # M8.5 memory attribution: vary one factor at a time.
+    live.add_argument("--viewers", type=int, default=1, help="concurrent /stream readers (0 = none)")
+    live.add_argument("--no-stop-resume", dest="stop_resume", action="store_false",
+                      help="never stop/resume monitoring through the API")
+    live.add_argument("--quiet-timeline", action="store_true",
+                      help="no scripted events or faults: an attentive driver for the whole soak")
+    live.add_argument("--driver-attention-override", default=None,
+                      help='JSON merged into modules.driver_attention, e.g. \'{"hands_policy": "always"}\'')
+    live.add_argument("--mem-profile", choices=("off", "basic", "tracemalloc"), default="off",
+                      help="sample the device process from inside (scripts/sim/memory_profile.py)")
+    live.add_argument("--mem-sample-s", type=float, default=15.0)
+    live.add_argument("--mem-types-s", type=float, default=300.0, help="object-type census cadence")
+    live.add_argument("--mem-warmup-s", type=float, default=600.0, help="tracemalloc baseline after this")
+    live.add_argument("--mem-snapshot-s", type=float, default=600.0, help="tracemalloc diff cadence")
+    live.add_argument("--tracemalloc-frames", type=int, default=1)
+    live.add_argument("--malloc-arena-max", type=int, default=0,
+                      help="MALLOC_ARENA_MAX for the device process (glibc); 0 = unset")
+    live.add_argument("--device-env", action="append", default=[], metavar="KEY=VALUE",
+                      help="extra environment for the device process (repeatable)")
     simc = sub.add_parser("simclock")
     simc.add_argument("--hours", type=float, default=6.0)
     simc.add_argument("--out", required=True)
@@ -822,6 +911,8 @@ def _parse(argv: Optional[list[str]]) -> argparse.Namespace:
     dev.add_argument("--start-wall", type=float, required=True)
     dev.add_argument("--total-s", type=float, required=True)
     dev.add_argument("--reboot-every-s", type=float, default=0.0)
+    dev.add_argument("--quiet-timeline", action="store_true")
+    dev.add_argument("--driver-attention-override", default=None)
     return parser.parse_args(argv)
 
 
