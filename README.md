@@ -60,9 +60,10 @@ repository; commands that can only run on the physical Pi are marked **(Pi)**.
 Nothing in this guide has been run on the real hardware yet — hardware-dependent
 results are marked **NOT YET VERIFIED** until the device arrives and
 `docs/SUNDAY_DEVICE_ACTIVATION.md` is executed. The software behind every step
-is verified: release `378c189` passed the full suite (3,952 tests), the
-30-journey acceptance matrix (893 checks, simulated), and 28/28 iPhone UI
-journeys in one run.
+is verified at release `f63ddd9`: the full Python suite (3,956 passed, 0
+failed), every software acceptance suite and the 30-journey matrix
+(simulated), and the 28 iPhone UI journeys (26 in the full run; the 2 that
+failed while the Mac was overloaded passed on a quiet rerun).
 
 ### How the pieces talk (read this once)
 
@@ -254,9 +255,9 @@ verified directory**: the transfer package.
 
 ### 3.0 The package
 
-The current tested release is **`378c1894cc96`** (commit
-`378c1894cc967d9c8754f246c0261e2ddd2450dd`). Its package is already built at
-`~/sensordyme-release/transfer-378c1894cc96/` on the MacBook; rebuild it for
+The current tested release is **`f63ddd9454f2`** (commit
+`f63ddd9454f27a387623722fb948140dce61912d`). Its package is already built at
+`~/sensordyme-release/transfer-f63ddd9454f2/` on the MacBook; rebuild it for
 any release with `make transfer-package REF=<commit>` (deterministic: the same
 commit yields byte-identical content). It contains the release bundle +
 per-file sha256 manifest, all 40 device wheels (hash-locked, for offline
@@ -269,8 +270,8 @@ Verify the package, then copy it to the Pi:
 
 ```bash
 # Mac
-cd ~/sensordyme-release/transfer-378c1894cc96 && shasum -a 256 -c SHA256SUMS   # every line: OK
-scp -r ~/sensordyme-release/transfer-378c1894cc96 <user>@sensordyme-pi.local:transfer
+cd ~/sensordyme-release/transfer-f63ddd9454f2 && shasum -a 256 -c SHA256SUMS   # every line: OK
+scp -r ~/sensordyme-release/transfer-f63ddd9454f2 <user>@sensordyme-pi.local:transfer
 ```
 
 ### 3A. Fresh device (no SensorDyme install yet)
@@ -280,7 +281,7 @@ scp -r ~/sensordyme-release/transfer-378c1894cc96 <user>@sensordyme-pi.local:tra
 ```bash
 cd ~/transfer
 sha256sum -c SHA256SUMS                                  # verify again, on the device
-mkdir -p ~/sensordyme && tar -xzf bundle/sensordyme-378c1894cc96.tar.gz -C ~/sensordyme
+mkdir -p ~/sensordyme && tar -xzf bundle/sensordyme-f63ddd9454f2.tar.gz -C ~/sensordyme
 mkdir -p ~/sensordyme/models && cp models/*.hef ~/sensordyme/models/
 cp -r wheels ~/sensordyme.wheels                         # enables the offline install
 cd ~/sensordyme && bash setup_pi.sh
@@ -357,7 +358,7 @@ releases and survives every switch in both directions.
 
 ```bash
 ~/sensordyme/.venv/bin/python ~/sensordyme/scripts/hw_validation/sunday_preflight.py \
-    --install-dir ~/sensordyme --expect-commit 378c1894cc967d9c8754f246c0261e2ddd2450dd
+    --install-dir ~/sensordyme --expect-commit f63ddd9454f27a387623722fb948140dce61912d
 ```
 
 It writes one JSON+Markdown summary and prints the next manual step. The checks
