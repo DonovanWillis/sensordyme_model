@@ -88,6 +88,14 @@ class DecoderSpec:
 LEGACY = DecoderSpec("legacy", anchor_offset=0.5, multilabel=False, nms_iou=0.50)
 REFERENCE = DecoderSpec("reference", anchor_offset=0.0, multilabel=True, nms_iou=0.70,
                         max_det=100, strict_threshold=True)
+#: M10.1: the product's OWN reference decoder (core.accel, accelerator.yolo_decoder:
+#: reference) is not the upstream DAMO transcription above: it keeps score >= conf,
+#: uses the device NMS IoU (HailoYOLO._DEFAULT_NMS_IOU 0.50) and keeps up to
+#: _REFERENCE_MAX_DETECTIONS (500). A parity gate for the decoder that would be
+#: deployed must decode with THIS spec (tests/test_m101_hw_readiness.py pins it
+#: against core.accel); REFERENCE stays the upstream yardstick.
+DEVICE_REFERENCE = DecoderSpec("device_reference", anchor_offset=0.0, multilabel=True, nms_iou=0.50,
+                               max_det=500, strict_threshold=False)
 
 #: Factorial variants: legacy and reference plus one change at a time, so a
 #: difference between the end points can be attributed to offset or to labels.

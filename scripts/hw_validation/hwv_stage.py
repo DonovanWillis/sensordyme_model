@@ -471,7 +471,9 @@ def stage_parity(rep: Report, args) -> int:
         if "legacy" in device_by:
             device_by["legacy"][s["image_id"]] = prod
         if "reference" in device_by:
-            ref = hd.unmap(hd.decode(outs, scales, hd.REFERENCE, expected_by["reference"]["conf"]), s["geometry"])
+            # The product's reference decoder (core.accel), not the upstream DAMO spec (M10.1).
+            ref = hd.unmap(hd.decode(outs, scales, hd.DEVICE_REFERENCE, expected_by["reference"]["conf"]),
+                           s["geometry"])
             device_by["reference"][s["image_id"]] = _rows(ref)
         a = np.array(sorted((round(r["score"], 4), r["cls"]) for r in prod))
         b = np.array(sorted((round(float(x), 4), int(c)) for x, c in zip(offline.scores, offline.classes,

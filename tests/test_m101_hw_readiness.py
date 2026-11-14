@@ -189,3 +189,88 @@ def test_arch_refuses_a_malformed_second_class_map(tmp_path):
               "--second-extra-classes", "67:phone", "--out", str(tmp_path / "out")], tmp_path)
     assert r.returncode == hs.BLOCKED, r.stdout + r.stderr
     assert "COCO channel" in r.stdout + r.stderr
+
+
+# ------------------------------------------------------------------ the offline spec IS the device decoder
+def _random_device_heads(seed: int):
+    rng = np.random.default_rng(seed)
+    heads = {}
+    for stride in (8, 16, 32):
+        g = 640 // stride
+        box = rng.normal(0, 3, (g, g, 68)).astype(np.float32)
+        cls = (rng.random((g, g, 81)) ** 6).astype(np.float32)  # mostly low, a few high scores
+        heads[stride] = (box, cls)
+    return heads
+
+
+@pytest.mark.parametrize("seed", [0, 1, 2])
+@pytest.mark.parametrize("extra", [None, HAND_MAP])
+def test_device_reference_spec_equals_the_products_reference_decoder(seed, extra):
+    """Same tensors through core.accel's reference decoder and hwv_decode.DEVICE_REFERENCE:
+    the same boxes, scores and classes (the parity stage's reference arm decodes with it)."""
+    heads = _random_device_heads(seed)
+    device = _decode("reference", extra, conf=0.35, heads=heads)
+    outputs, shapes = {}, {}
+    for stride, (box, cls) in heads.items():
+        outputs[f"b{stride}"], outputs[f"c{stride}"] = box[None], cls[None]
+        shapes[f"b{stride}"], shapes[f"c{stride}"] = box.shape, cls.shape
+    dets = hd.decode(outputs, hd.group_heads(shapes, 640), hd.DEVICE_REFERENCE, 0.35, extra_classes=extra)
+    # The device maps boxes back to the frame and clips them to it (here 640 x 640,
+    # no letterbox); the raw offline decode clips later, in unmap().
+    clipped = np.clip(dets.boxes, 0.0, 640.0)
+    offline = sorted((int(c), round(float(s), 4), *(round(float(v), 3) for v in b))
+                     for b, s, c in zip(clipped, dets.scores, dets.classes, strict=True))
+    assert len(device) > 20
+    assert len(offline) == len(device)
+    for got, want in zip(offline, device, strict=True):  # float32 on the device, float64 offline
+        assert got[:2] == want[:2], (got, want)
+        assert np.allclose(got[2:], want[2:], atol=0.01), (got, want)
+
+
+def test_the_upstream_reference_spec_differs_from_the_device_one():
+    """Why the parity stage must not use hd.REFERENCE: strict threshold, NMS 0.7, 100 boxes."""
+    assert (hd.REFERENCE.strict_threshold, hd.REFERENCE.nms_iou, hd.REFERENCE.max_det) == (True, 0.70, 100)
+    assert (hd.DEVICE_REFERENCE.strict_threshold, hd.DEVICE_REFERENCE.nms_iou, hd.DEVICE_REFERENCE.max_det) == (
+        False, 0.50, 500)
+
+
+# ------------------------------------------------------------------ threshold calibration procedure
+def test_a_threshold_derived_at_a_precision_reproduces_its_operating_point_on_the_device():
+    """research/m8/analysis.r_at_p (the procedure behind every R@P0.80 threshold in
+    M8-M10) returns the score of the LAST detection it keeps; operating_point keeps
+    score >= threshold, and so do both device decoders (legacy and the product's
+    reference, core.accel `>= conf`). So the derived threshold, set in config,
+    reproduces the measured recall/precision rather than dropping the box that
+    defined it. Hand-computable curve."""
+    from research.detector_bench import oid_eval as oe
+    from research.m8.analysis import r_at_p
+
+    hits = [(0.9, True), (0.8, True), (0.7, False), (0.6, True), (0.5, False), (0.4, False)]
+    result = oe.ClassResult(scored=[oe.Scored(f"i{k}", s, tp, k if tp else None) for k, (s, tp) in enumerate(hits)],
+                            npos=4, images=6)
+    op = r_at_p(result.scored, result.npos, 0.75)
+    assert op == {"recall": 0.75, "threshold": 0.6}
+    applied = oe.operating_point(result, op["threshold"])
+    assert (applied["recall"], applied["precision"]) == (0.75, 0.75)
+    # Both device decoders keep a box scored exactly at the threshold.
+    assert not hd.LEGACY.strict_threshold and not hd.DEVICE_REFERENCE.strict_threshold
+    heads = fake_heads_with_one_box(score=0.6)
+    for spec in (hd.LEGACY, hd.DEVICE_REFERENCE):
+        assert len(hd.decode(heads[0], heads[1], spec, 0.6)) == 1, spec.name
+    assert len(hd.decode(heads[0], heads[1], hd.REFERENCE, 0.6)) == 0  # upstream DAMO keeps > only
+
+
+def fake_heads_with_one_box(score: float):
+    outputs, shapes = {}, {}
+    for stride in (8, 16, 32):
+        g = 640 // stride
+        box = np.full((g, g, 68), -20.0, np.float32)
+        cls = np.zeros((g, g, 81), np.float32)
+        if stride == 16:
+            for side in range(4):
+                box[10, 10, side * 17 + 2] = 20.0
+            cls[10, 10, 67] = np.float32(score)
+        outputs[f"b{stride}"], outputs[f"c{stride}"] = box[None], cls[None]
+        shapes[f"b{stride}"], shapes[f"c{stride}"] = box.shape, cls.shape
+    # Thresholds are compared in float32 on the device as here.
+    return outputs, hd.group_heads(shapes, 640)
