@@ -124,3 +124,14 @@ Exit code: `0` = PASS, `1` = FAIL. Tests: `tests/test_m6_security_release_manife
 * On a staged device the snapshot root is `~/sensordyme`, which is a symlink to the current release. Snapshot it as before: `integrity_manifest.py snapshot --root ~/sensordyme`. The `STAGED.json` and `ARTIFACTS.json` beside the code are release records, not code. `verify` reports them as INFO, as it does `config.yaml.bak-*`.
 * The unit check guesses the service user from `/home/<user>/…`. An install elsewhere reports INFO, not PASS.
 * `pip freeze` in a `--system-site-packages` venv also lists apt packages. Only the pinned names are compared.
+
+## M8.5 PACKAGE: the transfer package
+
+`make transfer-package REF=<rc>` (`scripts/release/build_transfer_package.py`) wraps `bundle`
+into the full carry-to-the-device directory `~/sensordyme-release/transfer-<id>/`: the bundle
+tarball + manifest, the hashed aarch64/cp311 wheel set for offline installs, the production
+`.hef` verified against its pin **before** inclusion, a config template (never a real
+`config.yaml`), install scripts and unit templates, generated `INSTALL.md`/`MODELS.md`, and a
+package-wide `SHA256SUMS` that the build re-verifies before printing its final line. The build
+refuses secrets and device state anywhere in the package. Procedure and contents:
+`docs/DEPLOYMENT.md` §10. Tests: `tests/test_m85_package_transfer.py`.
