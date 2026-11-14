@@ -73,6 +73,11 @@ struct EventItem: Codable, Identifiable, Hashable {
     /// never an alert. Absent from older backends and firmware: nil, and the
     /// event reads exactly as before.
     var experimental: Bool? = nil
+    /// M10: seconds the condition was sustained before the device raised the
+    /// event (core/events.py Event.duration). The backend has stored and
+    /// returned it since M8; the app now reads it. 0 for a one-off event; nil
+    /// from a backend or history without it.
+    var duration: Double? = nil
 
     enum CodingKeys: String, CodingKey {
         case eventID = "id"
@@ -81,7 +86,7 @@ struct EventItem: Codable, Identifiable, Hashable {
         case receivedAt = "received_at"
         case occurredAt = "occurred_at"
         case timeBasis = "time_basis"
-        case alert, simulated, experimental
+        case alert, simulated, experimental, duration
     }
 
     /// Whether the user asked to be told about this specifically.
@@ -349,11 +354,19 @@ struct EventEvidence: Equatable {
     let experimental: Bool
     /// What the record lacks, or why its time is not the device's own.
     let gaps: [String]
+    /// M10: how long the condition lasted before the device raised it, in words;
+    /// nil when the record carries no duration (older backend or history).
+    let lasted: String?
+    /// M10: which exact model produced it ("damoyolo_tinynasL20_T.hef · e69136d3ebf3
+    /// on the Hailo accelerator"); nil when the record names none.
+    let detectedBy: String?
 
     init(_ event: EventItem) {
         inferred = event.title
         let signals = event.signals?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
-        observed = signals.isEmpty ? nil : signals
+        observed = signals.isEmpty ? nil : SignalWords.plain(signals)
+        lasted = event.duration.flatMap(Self.lasted)
+        detectedBy = Self.detectedBy(event.model)
         confidence = event.confidence.map { String(format: "%.2f", $0) }
         simulated = event.isSimulated
         experimental = event.isExperimental
@@ -393,10 +406,70 @@ struct EventEvidence: Equatable {
         }
     }
 
+    /// "Momentary" for a one-off (0 s), else "4 s" / "2 min 5 s". Nil for a value
+    /// that cannot be a duration (negative, NaN).
+    static func lasted(_ seconds: Double) -> String? {
+        guard seconds.isFinite, seconds >= 0 else { return nil }
+        if seconds < 0.5 { return "Momentary (no sustained duration)" }
+        if seconds < 60 { return seconds < 10 ? String(format: "%.1f s", seconds) : "\(Int(seconds.rounded())) s" }
+        let total = Int(seconds.rounded())
+        return total % 60 == 0 ? "\(total / 60) min" : "\(total / 60) min \(total % 60) s"
+    }
+
+    static func detectedBy(_ model: EventModel?) -> String? {
+        guard let model, let summary = model.summary, !summary.isEmpty else { return nil }
+        switch model.detector?.backend {
+        case "hailo": return summary + " on the Hailo accelerator"
+        case "ultralytics": return summary + " on the CPU"
+        default: return summary
+        }
+    }
+
     private static func minutes(_ seconds: Double) -> String {
         let minutes = Int((seconds / 60).rounded())
         if minutes < 60 { return "\(max(1, minutes)) min" }
         let hours = Int((seconds / 3600).rounded())
         return hours < 48 ? "\(hours) h" : "\(Int((seconds / 86_400).rounded())) d"
+    }
+}
+
+/// The device's contributing-signals line in plain words (M10).
+///
+/// Most modules already write sentences ("phone visible; no hand confirmed on
+/// it"); a few older paths write tokens ("phone + hand_overlap"). Known tokens
+/// are translated, internal engine prefixes dropped, and underscores read as
+/// spaces. Nothing is added that the device did not say: an unknown token is
+/// kept, only de-underscored.
+enum SignalWords {
+    /// Whole lines some modules emit as tokens.
+    static let lines: [String: String] = [
+        "phone + hand_overlap": "a phone with a hand overlapping it",
+        "phone_only_eyes_forward": "a phone in view while the eyes stayed on the road",
+        "angle_gt_30deg": "head turned more than 30°",
+        "skinnemoen_perclos_gt_0.8": "eyes closed more than 80% of the time (PERCLOS)",
+    ]
+    /// Tokens inside a line.
+    static let tokens: [String: String] = [
+        "hand_overlap": "hand overlapping the phone",
+        "gaze_off": "eyes off the road",
+        "head_down": "head down",
+        "perclos": "eye closure (PERCLOS)",
+        "ear": "eye openness (EAR)",
+    ]
+    /// Internal engine names that say nothing to a person.
+    static let prefixes = ["behavior_v2: ", "behaviour_v2: "]
+
+    static func plain(_ raw: String) -> String {
+        var text = raw.trimmingCharacters(in: .whitespacesAndNewlines)
+        if let line = lines[text] { return line }
+        for prefix in prefixes where text.hasPrefix(prefix) { text.removeFirst(prefix.count) }
+        let words = text.components(separatedBy: " ").map { word -> String in
+            if word == "+" { return "and" }
+            let core = word.trimmingCharacters(in: CharacterSet(charactersIn: ",;:()"))
+            if let known = tokens[core] { return word.replacingOccurrences(of: core, with: known) }
+            // A token, not a key=value or a number: underscores read as spaces.
+            return word.contains("=") ? word : word.replacingOccurrences(of: "_", with: " ")
+        }
+        return words.joined(separator: " ")
     }
 }

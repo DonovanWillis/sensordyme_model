@@ -246,6 +246,9 @@ struct DeviceHealth: Decodable {
     let uptime_s: Double
     let components: [String: Component]
     var device: Identity? = nil
+    /// M10: whether the device serves developer diagnostics (docs/DIAGNOSTICS.md).
+    /// Nil from older firmware: then the app never offers them.
+    var diagnostics: DiagnosticsFlag? = nil
 
     /// The camera's own SD- id, when it reported one.
     var deviceID: String? { device?.device_id }

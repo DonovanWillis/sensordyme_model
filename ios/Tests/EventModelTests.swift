@@ -197,5 +197,48 @@ check(EventEvidence.requested(decision: nil, experimental: false) == "Not report
       "older firmware's silence is not a 'no'")
 check(EventEvidence.requested(decision: "merged", experimental: false).hasPrefix("Joined"), "merged")
 
+// M10: duration, plain-words signals and the model, end to end from the row the
+// backend already returns (cloud/app.py _event_row selects `duration` and `model`).
+print("\nM10: duration, signals in plain words, model:")
+let m10 = """
+{"events": [
+ {"id": 91, "timestamp": "2026-11-14T08:00:00+00:00", "type": "phone_use", "confidence": 0.64,
+  "signals": "phone + hand_overlap", "severity": "soft", "source": null, "duration": 3.42,
+  "model": {"module": "driver_attention",
+            "detector": {"name": "damoyolo_tinynasL20_T.hef", "sha256": "\(sha)", "backend": "hailo"}}},
+ {"id": 92, "timestamp": "2026-11-14T08:01:00+00:00", "type": "phone_detected", "confidence": 0.3,
+  "signals": "behavior_v2: phone_visible, gaze_off", "severity": "log", "source": null, "duration": 0.0,
+  "model": {"module": "driver_attention", "detector": {"name": "yolo11n.pt", "sha256": null, "backend": "ultralytics"}}},
+ {"id": 93, "timestamp": "2026-11-14T08:02:00+00:00", "type": "drowsiness", "confidence": null,
+  "signals": "eyes closed 2.3 s", "severity": "critical", "source": null, "duration": 125.0, "model": null},
+ {"id": 94, "timestamp": "2026-11-14T08:03:00+00:00", "type": "fall", "confidence": null,
+  "signals": "", "severity": "critical", "source": null}
+]}
+""".data(using: .utf8)!
+let m10rows = (try? JSONDecoder().decode(EventsBody.self, from: m10))?.events ?? []
+check(m10rows.count == 4, "rows with and without `duration` decode")
+if m10rows.count == 4 {
+    let phone = EventEvidence(m10rows[0])
+    check(m10rows[0].duration == 3.42, "duration is read from the row")
+    check(phone.lasted == "3.4 s", "a short duration in seconds")
+    check(phone.observed == "a phone with a hand overlapping it", "a token line reads as words")
+    check(phone.confidence == "0.64", "confidence unchanged")
+    check(phone.detectedBy == "damoyolo_tinynasL20_T.hef · e6e6e6e6e6e6 on the Hailo accelerator",
+          "the exact model and where it ran")
+    let instant = EventEvidence(m10rows[1])
+    check(instant.lasted == "Momentary (no sustained duration)", "0 s is a one-off, not '0 s'")
+    check(instant.observed == "phone visible, eyes off the road", "engine prefix dropped, tokens translated")
+    check(instant.detectedBy == "yolo11n.pt on the CPU", "an unhashed CPU model is named, not invented")
+    let long = EventEvidence(m10rows[2])
+    check(long.lasted == "2 min 5 s", "minutes and seconds")
+    check(long.observed == "eyes closed 2.3 s", "a sentence the device wrote is left alone")
+    check(long.detectedBy == nil, "no model recorded: nothing claimed")
+    let old = EventEvidence(m10rows[3])
+    check(old.lasted == nil && m10rows[3].duration == nil, "a row without duration claims none")
+}
+check(EventEvidence.lasted(-1) == nil && EventEvidence.lasted(.nan) == nil, "an impossible duration is not shown")
+check(SignalWords.plain("zone=pool_deep confirmed after 12.4s") == "zone=pool_deep confirmed after 12.4s",
+      "key=value detail is kept verbatim")
+
 print("\n\(failures == 0 ? "PASSED" : "\(failures) FAILED")")
 exit(failures == 0 ? 0 : 1)

@@ -147,6 +147,25 @@ struct LiveFeedSettingsView: View {
                         Text("Asks the device directly for its own health report.")
                     }
                 }
+
+                // M10, developer-only: shown ONLY when the device itself reports
+                // diagnostics switched on (dashboard.developer_diagnostics) and this
+                // phone holds its token. A shipped device reports them off, so the
+                // consumer never sees this section.
+                if DiagnosticsAccess.available(reported: health?.diagnostics, token: state.deviceToken) {
+                    Section {
+                        NavigationLink {
+                            DeviceDiagnosticsView(baseURL: state.deviceLocalURL, token: state.deviceToken)
+                        } label: {
+                            Label("Developer diagnostics", systemImage: "ladybug")
+                        }
+                        .accessibilityIdentifier("settings.developerDiagnostics")
+                    } header: {
+                        Text("Developer")
+                    } footer: {
+                        Text("What the device detects, the evidence behind its decisions and where each frame's time goes. Read from the device over this Wi-Fi with its token; never sent anywhere else.")
+                    }
+                }
             }
             .orynRows()
         }
