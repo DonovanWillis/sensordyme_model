@@ -668,3 +668,35 @@ evidence_bindings:
       f591a6b6eca94baf has the same head-subgraph compute ops as the zoo graph behind
       the shipping .hef (77 Conv, identical kernels); not compiled for Hailo, INT8
       unvalidated. docs/research/EXP08_FULL_RESULTS.md
+  # M10: the hand channel decoded by the PRODUCT decoder through the opt-in class map
+  # accelerator.yolo_extra_classes {80: hand} (core/accel.py). Experiment-only: the map is
+  # absent from config.yaml, the decoder default stays legacy, nothing is promoted.
+  - id: hand_box_detection.extra_class_decoder_synthetic
+    capability: hand_box_detection
+    tier: synthetic_tests
+    model: damo_yolo_t_exp08_person_phone_hand
+    model_sha256: null
+    decoder: reference
+    test_id: tests/test_m10_hand_class_decode.py
+    dataset_manifest: "synthetic:planted device-layout head tensors (80/40/20, 68 + 81 channels)"
+    hardware_target: dev_cpu
+    status: experiment_only
+    date: "2026-11-14"
+    notes: Both decoders report channel 80 as hand only with the opt-in map; default drops it bit for bit; mismatched heads, on-chip NMS and the COCO-80 shipping .hef are refused at load
+  - id: hand_box_detection.exp08_device_path_class_map
+    capability: hand_box_detection
+    tier: image_level_benchmark
+    model: damo_yolo_t_exp08_person_phone_hand
+    model_sha256: "a0327a25da034e942bb1f6529b7747cb5ddef8c821dc9545ac40ccf394ed7aa1"
+    decoder: reference
+    test_id: research/m10/candidates_val.py + research/m10/compare.py (oryn job 20261114-034527-625fa0)
+    dataset_manifest: b878e8429d221f3f
+    hardware_target: oryn_gpu_float
+    status: experiment_only
+    date: "2026-11-14"
+    metrics: {hand_ap50: 0.723, hand_recall_at_precision_0_80: 0.638, phone_ap50: 0.837, phone_recall_at_precision_0_80: 0.789, person_ap50: 0.697, person_recall_at_precision_0_80: 0.630, large_person_recall_at_precision_0_80: 0.725, hand_ap50_legacy_decoder: 0.619}
+    notes: >-
+      Float heads81 ONNX (device-layout export of best_ckpt baad3842, M8.4 job
+      20261113-090349-6d22e9) through core/accel.py HailoYOLO.predict on fake_hailo,
+      x86 CPU (L1), val split; letterbox, NMS 0.50, class map {80: hand}. Not INT8, not a
+      compiled .hef, not a Pi. docs/research/M10_MODEL_CANDIDATES.md

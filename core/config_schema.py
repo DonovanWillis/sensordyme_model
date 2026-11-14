@@ -30,6 +30,62 @@ _KNOWN_TOP_LEVEL = {
 }
 
 
+#: The class channels every product decoder already reads (COCO-80, core/accel.py COCO_NAMES).
+_COCO_CHANNELS = 80
+
+
+def parse_yolo_extra_classes(value) -> dict[int, str]:
+    """`accelerator.yolo_extra_classes` -> {class-head channel: class name}; {} when absent.
+
+    M10, opt-in and experiment-only. A raw-head .hef whose class head carries a
+    class beyond COCO-80 (the EXP-08 device-layout export puts `hand` in channel
+    80, research/m84/device_export.py) is decoded by both HailoYOLO decoders as
+    if channel 80 were padding, so that class is never reported. This names
+    which extra channels ARE classes. Absent or null keeps today's decode bit
+    for bit.
+
+    Refused (ValueError, the message names the key):
+      * a channel below 80: COCO ids are fixed, remapping one would relabel a
+        class every module and preset already depends on;
+      * a non-integer channel (YAML `80:` and JSON `"80"` are both accepted);
+      * an empty, non-string or COCO-colliding name, or one name twice: a
+        consumer selecting by name must find exactly one channel.
+    Whether the loaded .hef has the channel is checked when it is loaded
+    (core/accel.py), because only the HEF knows its class-head width.
+    """
+    if value is None:
+        return {}
+    key = "`accelerator.yolo_extra_classes:`"
+    if not isinstance(value, dict):
+        raise ValueError(f"{key} must be a mapping of class-head channel -> class name like {{80: hand}}, "
+                         f"got {value!r}")
+    from core.accel import COCO_NAMES  # imported here: config validation must not need it otherwise
+
+    coco_names = set(COCO_NAMES.values())
+    out: dict[int, str] = {}
+    for raw_channel, name in value.items():
+        if isinstance(raw_channel, int) and not isinstance(raw_channel, bool):
+            channel = raw_channel
+        elif isinstance(raw_channel, str) and raw_channel.strip().isdigit():
+            channel = int(raw_channel.strip())
+        else:
+            raise ValueError(f"{key} channel {raw_channel!r} is not an integer")
+        if channel < _COCO_CHANNELS:
+            raise ValueError(f"{key} channel {channel} is a COCO class ({COCO_NAMES.get(channel)!r}); only "
+                             f"channels >= {_COCO_CHANNELS} can be mapped, COCO ids are never relabelled")
+        if not isinstance(name, str) or not name.strip():
+            raise ValueError(f"{key} channel {channel} needs a non-empty class name, got {name!r}")
+        label = name.strip()
+        if label in coco_names:
+            raise ValueError(f"{key} name {label!r} (channel {channel}) collides with a COCO class name")
+        if label in out.values():
+            raise ValueError(f"{key} name {label!r} is mapped to more than one channel")
+        if channel in out:
+            raise ValueError(f"{key} channel {channel} is mapped twice")
+        out[channel] = label
+    return dict(sorted(out.items()))
+
+
 def _check(errors: list[str], condition: bool, message: str) -> None:
     if not condition:
         errors.append(message)
@@ -189,6 +245,10 @@ def validate(config: dict) -> tuple[list[str], list[str]]:
         decoder = accel_cfg.get("yolo_decoder", "legacy")
         _check(errors, decoder in ("legacy", "reference"),
                f"`accelerator.yolo_decoder:` must be legacy|reference, got {decoder!r}")
+        try:
+            parse_yolo_extra_classes(accel_cfg.get("yolo_extra_classes"))
+        except ValueError as exc:
+            errors.append(str(exc))
     else:
         errors.append("`accelerator:` must be a mapping")
 
