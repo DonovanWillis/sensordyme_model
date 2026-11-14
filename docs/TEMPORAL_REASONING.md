@@ -207,7 +207,7 @@ on a checkout of 4dfd761.
 
 ## 7. Open items (measured, not changed)
 
-- **O1 Drowsiness resets on a face loss, and how fast depends on the frame rate.**
+- **O1 (RESOLVED in M10.1, section 8) Drowsiness resets on a face loss, and how fast depends on the frame rate.**
   The closure tracker is fed "not closed" while the face is lost and resets
   after `eye_closure_release_frames` (2) frames. That is 0.07 s at 30 fps and
   0.4 s at 5 fps, so `face_lost_brief_mid_closure` (1.5 s shut, 0.3 s lost, 1 s
@@ -215,7 +215,7 @@ on a checkout of 4dfd761.
   at 30 fps. The shadow engine already coasts closure through a loss of up to
   1 s (`DrowsinessEvidence`). Promoting that is an owner decision, because it
   changes a mandatory rule.
-- **O2 The median filters are sized in frames, not seconds.** `signal_median_window`
+- **O2 (RESOLVED in M10.1, section 8: the cause was the iris veto, not the median) The median filters are sized in frames, not seconds.** `signal_median_window`
   is 5 frames, which is 0.17 s at 30 fps and 1 s at 5 fps. The same 20 %
   long-blink pattern reads PERCLOS 0.147 / 0.101 / 0.057 at 30 / 10 / 5 fps, so
   `heavy_long_blinks` raises no fatigue_warning at 5 fps. Onset latency grows
@@ -228,7 +228,7 @@ on a checkout of 4dfd761.
   are within the rules as written, because 0.5 s below the threshold is just
   past the 0.4 s release. An enter/exit band would be a new policy and needs
   real-cabin data.
-- **O4 Escalation does not carry across a real recovery.** Two distractions 2 s
+- **O4 (REPRODUCED in M10.1; policy proposed, OFF pending owner approval: docs/ESCALATION_POLICY.md) Escalation does not carry across a real recovery.** Two distractions 2 s
   apart are two episodes, and the second one starts again at the onset pattern
   (`test_a_real_recovery_ends_the_episode_and_the_next_one_starts_fresh`). A
   driver who keeps relapsing never hears `urgent`. This is `core/alerts.py`
@@ -242,7 +242,7 @@ on a checkout of 4dfd761.
   seen waits for the 8 s corroborated attention_lost bar. The closure just
   before the loss is not used as evidence against the "turned to a mirror"
   reading. That would be a new policy, so test it in shadow first.
-- **O7 The per-frame iris veto works on raw frames, the EAR median on
+- **O7 (RESOLVED in M10.1, section 8) The per-frame iris veto works on raw frames, the EAR median on
   smoothed ones.** One open glitch frame in five pauses closure accrual (2 s
   of closure takes about 2.5 s) without resetting it. One episode, but later.
 - **O8 A stream slower than 2 fps.** After a drop to 1 fps the stall-aware
@@ -251,3 +251,61 @@ on a checkout of 4dfd761.
   in wall time; the shadow abstains on every frame where a condition holds (T4).
 - All of the above is synthetic. Thresholds and timings need in-cabin
   validation (docs/BEHAVIOUR_REASONING.md).
+
+## 8. M10.1: frame-rate-independent eye evidence
+
+**Root cause of O2 (measured, not assumed).** With the iris veto off, or the
+median at 1 frame, the same 0.7 s long blinks measure the full 10.5 s of
+closure at every rate and fatigue fires at 5 fps. The median itself does not
+shrink a closure; it delays it by 2 frames. The iris veto compared the RAW
+frame's iris openness with that delayed EAR, so on every reopening the smoothed
+EAR still read "closed" for 2 frames while the raw iris already read "open", and
+the veto cancelled those frames: 0.07 s per closure at 30 fps, 0.4 s at 5 fps.
+
+**Fixes** (no threshold changed: drowsy_seconds 2.0, perclos_threshold 0.15,
+perclos_closure_ratio 0.4, signal_median_window 5, eye_closure_release_frames 2):
+
+1. The iris openness gets the same 5-frame median over the same frames as the
+   EAR it vetoes (`core/eye_signal.AlignedOptionalSmoother`); the looking-down
+   attribution uses it too. Gaze gating and the baselines keep the raw value.
+2. A frame with no face is not an "open" frame. The closure episode is HELD,
+   crediting nothing, for `eye_closure_face_loss_hold_s` (0.4 s, the same grace
+   `signal_release_s` gives every other condition), then reset -- the same time
+   at every rate (`GracedConditionTracker.hold`).
+3. New derived capability `eye_timing` (`eye_timing_min_fps` 4.5): below it,
+   drowsiness and fatigue_warning are reported unavailable and monitoring is
+   DEGRADED with the measured rate, instead of being implied. 5 fps is the
+   lowest rate the suite verifies; 4.5 allows timing jitter. It is an analysis
+   capability on the device, the backend and the app (withdrawn with the camera,
+   paused while stopped).
+
+**Before (629f906) / after, same harness and scenarios** (first onset, s from the
+scenario's segment; PERCLOS at the end of the run):
+
+| scenario | 30 fps | 15 fps | 10 fps | 5 fps |
+|---|---|---|---|---|
+| heavy_long_blinks, fatigue_warning | +8.7 / +8.3 | +10.6 / +6.8 | +16.6 / +8.6 | **none** / +7.0 |
+| heavy_long_blinks, PERCLOS (truth 0.263) | 0.226 / 0.250 | 0.214 / 0.261 | 0.178 / 0.249 | 0.142 / 0.283 |
+| face_lost_brief_mid_closure, drowsiness | **none** / +0.57 | **none** / +0.67 | **none** / +0.70 | +0.80 / +0.80 |
+| closure_with_one_frame_glitches, drowsiness | +2.57 / +2.07 | +2.53 / +2.13 | +2.70 / +2.20 | +2.60 / +2.40 |
+| sustained 3 s closure, drowsiness | +2.07 / +2.07 | +2.13 / +2.13 | +2.20 / +2.20 | +2.40 / +2.40 |
+
+What changed at 30 fps, stated plainly: PERCLOS reads closer to the truth (the
+2-frame cut is gone, +0.024 on this pattern), a closure with one landmark glitch
+per 5 frames fires at the sustain time instead of ~0.5 s later, and a face loss
+of up to 0.4 s inside a closure pauses it instead of restarting it. Nothing
+fires on less observed closure than before: normal blinking (0.25 s every 3 s)
+and sub-threshold long blinks (0.4 s every 4 s, 10 %) raise nothing at any rate,
+jittered or not (`tests/test_m101_frame_rate.py`). The 5 fps PERCLOS (0.283)
+sits above the truth because a 0.7 s closure is sampled as 3-4 frames of 0.2 s.
+
+Rates now in the suite: 30, 15, 10, 5 fps, plus 30/10/5 fps with +/-30 %
+jitter (227 cases, `tests/test_m10_temporal_scenarios.py`), and 56 M10.1 cases
+(`tests/test_m101_frame_rate.py`: capability at 1-4 fps, face loss held vs
+reset, partial observation with the head pose unreadable, hold semantics).
+
+**Escalation (O4).** Reproduced as a strict-xfail regression
+(`tests/test_m101_escalation.py`): six 6 s look-aways 2 s apart are six
+episodes of ~3.4 s, ~20 s alerted in 48 s, and only `double` is heard. The
+bounded relapse policy is implemented and OFF; docs/ESCALATION_POLICY.md has
+the decision.

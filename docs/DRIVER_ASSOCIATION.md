@@ -65,6 +65,27 @@ runs with `max_num_faces=2` and `DriverFaceSelector` picks, in order:
 part), so a rear passenger's box that reaches down behind the driver's head
 does not claim the driver's face.
 
+**M10.1: two position tracks (no face is recognised, nothing is enrolled).**
+
+- **The driver's body.** This is the person box the selected driver face was
+  on. It is followed box to box by IoU (≥ 0.3) while the face is not seen, for
+  up to 2 s without a match.
+  - While that body is still in the seat, a face that is on another person's
+    box and not on the driver's body is that person's (a passenger leaning in).
+  - Such a face is excluded from steps 2 and 3 wherever it is. If it was the
+    only face in the region, the result is **no driver face this frame**.
+- **The other occupants' faces seen in the last 1 s.** Each sighting claims
+  only its nearest face: one person has one face.
+  - Re-acquisition needs all of these at once:
+    - the driver's face is lost, and every face is on a passenger's box;
+    - one face is NEW (it continues no other occupant's track);
+    - it sits on a box that also carries a tracked occupant's face;
+    - it is within 3 face widths of where the driver's face was last seen, at
+      most 5 s ago.
+  - When they all hold, that face is the driver slumped toward the passenger,
+    measured as `uncertain`. Anything less clear stays not measured, with the
+    reason.
+
 When no face is the driver's, the module takes the **face-lost path** exactly
 as if FaceMesh had found no face: drowsiness resets (closed eyes cannot be
 measured), distraction / eyes_down / eyes_up / phone_use coast on the driver's
@@ -237,6 +258,21 @@ alert (drowsiness, distraction, eyes_down, eyes_up, phone_use, attention_lost).
 | same, face lost 1.5 s then re-found outside the region | drowsiness | drowsiness 4.05 | drowsiness 4.05 | uncertain |
 | same, detector box misses the head (face on nobody) | drowsiness | drowsiness 4.05 | drowsiness 4.05 | uncertain |
 
+**M10.1** (`tests/test_m101_driver_edges.py`; "before" measured on `629f906`):
+
+| scenario | truth | before (629f906) | after (M10.1) | identity after |
+|---|---|---|---|---|
+| passenger leans into the region (own box outside it), looking ahead, while the driver is turned away | distraction | **nothing (masked)**, identified | distraction 4.15 | not_visible |
+| same, the passenger's box centred in the region too | distraction | **nothing (masked)**, identified | distraction 4.15 | not_visible |
+| driver, eyes shut, slumps onto the passenger's box (face lost 1.5 s); passenger's face visible | drowsiness | **nothing (missed)**, not_visible | drowsiness 5.05 | uncertain |
+| same, the passenger's own face NOT visible | (ambiguous) | nothing | nothing: not measured, by design | not_visible |
+| passenger beside, eyes shut, driver turned away | nothing | nothing | nothing | not_visible |
+| driver's face occluded 0.8 s, passenger visible, then eyes shut 3 s | drowsiness | drowsiness | drowsiness | identified |
+| driver's face lost 3 s (body in the seat), back, eyes shut | drowsiness | drowsiness | drowsiness | identified |
+| seat change: driver leaves 5 s, another person sits, eyes shut | drowsiness | drowsiness | drowsiness | identified |
+
+Every M10 row above is unchanged (`tests/test_m10_driver_scenarios.py`).
+
 (1) With no face on the first frame of a session and two people, the phone is
 no longer lent to the largest person (`unresolved`), so `phone_detected` is
 logged on that frame and `phone_use` starts one frame (50 ms) later.
@@ -288,13 +324,19 @@ no region the cost is unchanged (one face).
   the 80% single-person rule, the 60% head part and the 70% width cap are
   reasoned, not fitted. Synthetic faces are rigid translations / scalings of
   one generator face.
-- A passenger who leans into the driver region while the driver's face is
-  **not** tracked (turned away > 1 s) is taken as the driver's face (region
-  rule) and can mask the driver's coasted distraction. Reported `identified`
-  when it is the only face in the region.
-- A driver whose face leaves the region while lost > 1 s and comes back on a
-  **passenger's** person box (slumped onto the passenger) is not measured; the
-  face-lost path (attention_lost) covers it, later than drowsiness would.
+- RESOLVED in M10.1 (body track): a passenger leaning into the driver region
+  while the driver's face is not tracked was taken as the driver's face. It is
+  still taken when the detector has no box for the driver's body (stale, or
+  the driver's box lost for > 2 s), or when the face lies on both boxes.
+- RESOLVED in M10.1 (re-acquisition), with one limit: a driver who slumps
+  onto a passenger's box is measured (`uncertain`) only while the passenger's
+  own face is visible beside it. Without it the face could be the passenger's,
+  so it stays not measured and attention_lost covers it, later than drowsiness
+  would.
+- New in M10.1: if the detector's box for a returning driver shifts so that the
+  driver's own face lands on a passenger's box only, that face is rejected until
+  continuity or the region settles it. This is reasoned, not measured, and it
+  needs the in-cabin data in section 9.
 - First boot: face selection starts at the next module build (4.3).
 - The calibrated region is per seat, not per person: after a seat swap the new
   driver is selected correctly, but the EAR / neutral-gaze baselines are still

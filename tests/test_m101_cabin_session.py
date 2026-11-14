@@ -134,7 +134,7 @@ def test_unavailable_alerts_follow_the_devices_own_policy_health():
 
 
 def test_a_fake_run_is_labelled_simulated_and_writes_no_frames_or_token(tmp_path, monkeypatch):
-    monkeypatch.setenv("SD_DEVICE_TOKEN", "secret-token-value")
+    monkeypatch.setenv("SENSORDYME_TOKEN", "secret-token-value")
     assert cs.main(["plan", "--blocks", "calibrate,closures", "--out", str(tmp_path)]) == 0
     assert cs.main(["run", "--plan", str(tmp_path), "--subject", "S00", "--session", "S00-f", "--vehicle", "V0",
                     "--lighting", "day", "--eyewear", "none", "--occupancy", "driver_only", "--mount",

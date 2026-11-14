@@ -28,7 +28,7 @@ public road.
 
 `run` talks to the service on this device (default http://127.0.0.1:8899): run it
 ON the Pi so the cue clock and the event log share one clock. With a dashboard
-token configured, export it as SD_DEVICE_TOKEN first; it is sent as the
+token configured, export it as SENSORDYME_TOKEN first; it is sent as the
 X-Device-Token header and never printed or written.
 """
 
@@ -192,7 +192,7 @@ def cmd_run(args) -> int:
     fake = FakeDevice(sustain) if args.fake else None
     health0: dict = {}
     if not args.fake:
-        device = Device(args.url, os.environ.get("SD_DEVICE_TOKEN") or None)
+        device = Device(args.url, os.environ.get("SENSORDYME_TOKEN") or None)
         try:
             health0 = device.health()
         except OSError as exc:

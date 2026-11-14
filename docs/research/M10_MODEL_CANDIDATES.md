@@ -258,10 +258,9 @@ standing rule that nothing deploys before Pi INT8 parity (runbook H1).
 ## 7. Open items
 
 - Compile and every L3/L4 step (needs the DFC, owner approval, a Pi session).
-- `compare_float_vs_int8.py` / `hwv_decode.py` decode `NUM_CLASSES = 80`: tensor parity covers channel 80,
-  detection-level hand agreement needs a class-count option.
-- `capture_hailo_outputs.py` constructs `HailoYOLO` without the class map: captured tensors are complete,
-  but its production-decoder boxes omit hand.
+- CLOSED in M10.1: `hwv_decode.decode(extra_classes=)`, `compare_float_vs_int8.py --extra-classes`, and
+  `capture_hailo_outputs.py` reads the installed map for its offline counts and its `HailoYOLO`
+  (`docs/research/M101_HARDWARE_GATES.md` §3).
 - Two-network support in `core/accel.py` (shared VDevice / scheduler) does not exist; B cannot run on the
   device until it does.
 - EXP-08 host-simulated INT8 (L2, `research/m84/hostquant.py`) was not run; the wider box-logit range
