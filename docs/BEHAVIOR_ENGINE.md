@@ -156,6 +156,12 @@ Shadow vs production on the scripted set, all 24 scenarios
 `ambiguous`, `no_person_detected`. There is no first-boot seat calibration in
 the codebase. The accuracy of every method is **unevaluated**.
 
+**M10:** superseded by `docs/DRIVER_ASSOCIATION.md`: an installation-calibrated
+driver region (`calibrated_seat_region`), driver face selection among two
+FaceMesh faces when a region is known, `unresolved` / `driver_not_in_region`
+outcomes (several people with nothing to tell them apart no longer default to
+the largest), and a `driver_identity` telemetry state.
+
 ## 7. Regression scenarios and evaluation (synthetic)
 
 `sim/scenario.py` `CABIN_SCENARIOS` (24). `scripts/eval_behavior.py` writes the

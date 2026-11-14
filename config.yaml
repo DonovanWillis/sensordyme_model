@@ -615,6 +615,12 @@ modules:
     # read docs/BEHAVIOUR_REASONING.md before turning it on. Optional parameters go in a
     # nested `behavior:` mapping (validated by core/config_schema.py; not preset-overridable).
     behavior_v2: false
+    # M10 driver identity (docs/DRIVER_ASSOCIATION.md). Not set here = the defaults:
+    #   behavior:
+    #     driver_region: null            # [x1, y1, x2, y2] 0..1: the driver's seat, head to lap
+    #     driver_identity:
+    #       face_selection: auto         # with a driver region: FaceMesh 2 faces, the driver's selected; off = 1 face
+    #       calibrated_region: true      # derive data/calibration.driver_region.json during calibration and use it
 
   driver_attention_openpilot:
     # comma.ai openpilot's driver monitoring, verbatim (model + policy from openpilot
