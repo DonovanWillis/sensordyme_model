@@ -96,7 +96,7 @@ final class AccessibilityAuditUITests: XCTestCase {
         var obscured: [Seen] = []
         var unresolvedContrast = 0
         do {
-            try app.performAccessibilityAudit(for: .all) { issue in
+            try audit(for: .all, reset: { lines.removeAll(); obscured.removeAll(); unresolvedContrast = 0 }) { issue in
                 let label = issue.element?.label ?? ""
                 if issue.auditType == .contrast, issue.element == nil {
                     // XCTest gave no element, so it cannot be located or re-checked in
@@ -166,6 +166,26 @@ final class AccessibilityAuditUITests: XCTestCase {
         return frame.minY < band.top || frame.maxY > band.bottom
     }
 
+    /// One audit call, retried ONCE only when XCTest's own audit instrument
+    /// times out before finishing ("Audit failed to complete in time",
+    /// com.apple.xcode.xctest.accessibilityAudit code -56 — first seen on a
+    /// loaded Simulator, M8.5). `reset` clears the caller's accumulators, in
+    /// case the failed attempt delivered some issues before timing out. An
+    /// audit that RAN and reported findings is never retried: the suite's
+    /// no-retries rule is about findings, not about the instrument failing
+    /// to start.
+    private func audit(for types: XCUIAccessibilityAuditType, reset: () -> Void,
+                       _ handler: @escaping (XCUIAccessibilityAuditIssue) throws -> Bool) throws {
+        do {
+            try app.performAccessibilityAudit(for: types, handler)
+        } catch let error as NSError
+            where error.domain == "com.apple.xcode.xctest.accessibilityAudit" && error.code == -56 {
+            reset()
+            _ = XCTWaiter().wait(for: [XCTestExpectation(description: "audit instrument settle")], timeout: 2)
+            try app.performAccessibilityAudit(for: types, handler)
+        }
+    }
+
     /// A contrast finding XCTest reported with NO element (M8.4): it cannot be
     /// scrolled clear like a located one. Seen only with the device name's last
     /// line under the translucent tab bar. Move the page by half the clear band
@@ -177,7 +197,7 @@ final class AccessibilityAuditUITests: XCTestCase {
         _ = stillTexts()  // contrast is sampled from pixels: a still screen
         var remaining = 0
         do {
-            try app.performAccessibilityAudit(for: .contrast) { issue in
+            try audit(for: .contrast, reset: { remaining = 0 }) { issue in
                 if let element = issue.element {
                     if self.obscuredByBars(element.frame) { return true }
                     let known = self.knownIssues.first {
@@ -221,20 +241,30 @@ final class AccessibilityAuditUITests: XCTestCase {
         if frame.height > band.bottom - band.top - 40 {
             return "\(screen)\tcontrast\tunder-bar-unverifiable\tTaller than the clear band between the bars\t\(label)\t"
         }
+        let requested = (band.top + band.bottom) / 2 - (frame.midY + pageOffset)
         let before = stillTexts()
-        dragPage(by: (band.top + band.bottom) / 2 - (frame.midY + pageOffset), within: band)
+        dragPage(by: requested, within: band)
         let after = stillTexts()  // contrast is sampled from pixels: a still screen
-        pageOffset += Self.shift(from: before, to: after, band: band)
+        let moved = Self.shift(from: before, to: after, band: band)
+        pageOffset += moved
         let expected = frame.midY + pageOffset
         let found = after.filter { $0.label == label }.map { $0.frame }
         if let measured = found.min(by: { abs($0.midY - expected) < abs($1.midY - expected) }),
-           abs(measured.midY - expected) < 30,
-           measured.height > band.bottom - band.top - 40 {
-            // The first audit's issue frame can be the element's visible clip,
-            // so the height guard above under-reads elements this tall (M8.5:
-            // the AX-XXXL presence detail centred perfectly — "expected at y
-            // 550, found at [550]" — and still poked under both bars).
-            return "\(screen)\tcontrast\tunder-bar-unverifiable\tTaller than the clear band between the bars\t\(label)\t"
+           abs(measured.midY - expected) < 30, obscuredByBars(measured),
+           measured.height > band.bottom - band.top - 40 || abs(moved - requested) > 24 {
+            // The element is exactly where the tracked page offset says it is,
+            // and it still cannot sit clear of both bars — for one of two
+            // reasons this method cannot cure: it is taller than the clear
+            // band (the first audit's issue frame is the visible clip, so the
+            // pre-drag guard under-reads it; M8.5: "expected at y 550, found
+            // at [550]"), or the page ran out of scroll before it cleared the
+            // bars (M8.5: "expected at y 521, found at [521]" at the end of
+            // the AX-XXXL devices page, still under the tab bar). Both are
+            // the under-bar-unverifiable outcome, not a contrast failure.
+            let why = measured.height > band.bottom - band.top - 40
+                ? "Taller than the clear band between the bars"
+                : "The page ends before this text can clear the bars"
+            return "\(screen)\tcontrast\tunder-bar-unverifiable\t\(why)\t\(label)\t"
         }
         guard let target = found.min(by: { abs($0.midY - expected) < abs($1.midY - expected) }),
               abs(target.midY - expected) < 30, !obscuredByBars(target) else {
@@ -245,7 +275,7 @@ final class AccessibilityAuditUITests: XCTestCase {
         let screenshot = XCUIScreen.main.screenshot()
         var finding: String?
         do {
-            try app.performAccessibilityAudit(for: .contrast) { issue in
+            try audit(for: .contrast, reset: { finding = nil }) { issue in
                 if let f = issue.element?.frame, abs(f.midY - target.midY) < 4, abs(f.midX - target.midX) < 4 {
                     finding = issue.compactDescription
                 }
