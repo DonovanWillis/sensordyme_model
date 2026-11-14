@@ -309,6 +309,16 @@ Each step below: **Do** (commands or references), **Expect**, **Result**, **Evid
 - **If it fails:** cooling/power (RB-B2); fix before any later measurement.
 - **Rollback:** none.
 
+### 3.11a Optional (M10): the runtime's own stage timings, and Arch A vs Arch B
+Optional: skip it if time is short; no later step depends on it. Needs a candidate that contains M10 OBSERVE (`/api/health` has a `performance` block; check with `curl -s -H "X-Device-Token: $SENSORDYME_TOKEN" localhost:8899/api/health | python3 -c 'import json,sys; print("performance" in json.load(sys.stdin))'`). Contract: `docs/DIAGNOSTICS.md`.
+- **Do (service running, read-only, 10 min):** `$PY $V/hwv_stage.py observe --minutes 10 --interval 10 --install-dir $D --out $EV/stages`.
+- **Expect:** `record.summary.json` with `platform_classes` `["pi"]` and `is_pi_measurement: true`; `hailo_inference`, `decoder_cpu`, `face_landmarks`, `frame_to_decision` and `processed_fps` present; `throttled_any: false`. Record frame → decision p95, Hailo inference p95, processed fps, RSS and peak SoC °C. These are the first Pi numbers for those stages: do not compare them to any Mac figure.
+- **Do (optional, stopped window, only if an Arch B `.hef` has been supplied and its sha256 is known):** `$PY $V/hwv_stage.py arch --second-hef <path> --second-hef-sha256 <sha> --install-dir $D --out $EV/stages` (default 2 rounds ABBAABBA × 120 s blocks, plus cool-down waits: allow ~25 min). Without the file the stage is BLOCKED by design; never substitute another file.
+- **Expect:** every block ran; Arch B ran its second detector on every stride; every block started within 2 °C; never throttled; `b_minus_a` recorded. A HailoRT refusal of the two-network scheduler path is a **finding** (FAIL with the error), not a reason to change production code.
+- **Result:** `SUN-11a | ____ |` **Evidence:** `observe_<ts>/record.*`, `arch_<ts>.json`, `arch_blocks_<ts>.csv`.
+- **If it fails:** `observe` BLOCKED → the candidate predates M10 or the token is wrong (`stage_timing.py health` still works, step 10). `arch` FAIL → keep the report; nothing else changes.
+- **Rollback:** none (both read only; `arch` runs in the stopped window and loads models in its own process).
+
 ### 3.12 Step 12: device/backend sync
 - **Do:** RB-L1 (CHANGE: token, `cloud.*`, claim) if not paired. Then `SENSORDYME_BEARER=… $PY $V/check_live_status.py --device http://localhost:8899 --backend https://<backend> --samples 6 --interval 5 --out $EV/SUN-12_sync.json` (or preflight `--backend`).
 - **Expect:** backend row `hardware_id` = the step 1 id; `online: true`, `freshness.state: fresh`, `user_state: ready`; **no** `status_violations`; device and backend agree on `monitoring_state` (a single-sample disagreement is uplink lag; two in a row is a FAIL); journal `cloud_uplink: connected to …` (a `print()` line: wait 30 s before calling it missing, RB-K note).
