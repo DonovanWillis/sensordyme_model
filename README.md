@@ -401,6 +401,16 @@ cd ~/sensordyme && sudo -u $(id -un) .venv/bin/python main.py --no-display --rec
 sudo systemctl start sensordyme
 ```
 
+**Do this calibration with only the driver in view** (no passenger, nobody
+leaning in). The same window also learns where the driver sits and writes
+`data/calibration.driver_region.json`. With that region the device measures
+eyes and gaze on the *driver's* face even when a passenger is in frame, and
+never counts a passenger's phone or drink as the driver's. If the file's
+`region` is null, its `status` says why (usually someone else was in view):
+repeat with the cabin clear. The `systemctl start` above is the restart that
+turns on two-face selection. Full procedure and limits:
+`docs/DRIVER_ASSOCIATION.md` §4.4.
+
 ### Buzzer test, safely
 
 The buzzer is loud at 50 cm — warn anyone nearby, then run the dedicated stage
