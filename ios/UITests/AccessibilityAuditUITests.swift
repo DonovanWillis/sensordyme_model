@@ -227,6 +227,15 @@ final class AccessibilityAuditUITests: XCTestCase {
         pageOffset += Self.shift(from: before, to: after, band: band)
         let expected = frame.midY + pageOffset
         let found = after.filter { $0.label == label }.map { $0.frame }
+        if let measured = found.min(by: { abs($0.midY - expected) < abs($1.midY - expected) }),
+           abs(measured.midY - expected) < 30,
+           measured.height > band.bottom - band.top - 40 {
+            // The first audit's issue frame can be the element's visible clip,
+            // so the height guard above under-reads elements this tall (M8.5:
+            // the AX-XXXL presence detail centred perfectly — "expected at y
+            // 550, found at [550]" — and still poked under both bars).
+            return "\(screen)\tcontrast\tunder-bar-unverifiable\tTaller than the clear band between the bars\t\(label)\t"
+        }
         guard let target = found.min(by: { abs($0.midY - expected) < abs($1.midY - expected) }),
               abs(target.midY - expected) < 30, !obscuredByBars(target) else {
             XCTFail("\(screen): contrast on '\(label)' could not be re-checked clear of the bars "

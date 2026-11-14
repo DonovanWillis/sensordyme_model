@@ -630,10 +630,29 @@ final class OrynJourneysUITests: XCTestCase {
         waitFor(field, keyboardFocus: true, timeout: 10, file: file, line: line)
     }
 
-    /// Focus a field (above), then type into the focused element.
+    /// Focus a field (above), then type into the focused element. typeText can
+    /// drop every character when the Simulator's keyboard channel is still
+    /// connecting even after the field reports keyboard focus (M8.5 acceptance,
+    /// journey 02: email landed, password stayed empty, submit stayed disabled).
+    /// The typed text is verified by the field's value — bullets for a secure
+    /// field, so by length — and a field that stayed empty is retried once; a
+    /// partial landing fails here instead of running on dropped characters.
     private func enter(_ text: String, into field: XCUIElement, file: StaticString = #filePath, line: UInt = #line) {
         focus(field, file: file, line: line)
         app.typeText(text)
+        if !text.isEmpty, landedCount(field) == 0 {
+            focus(field, file: file, line: line)
+            app.typeText(text)
+        }
+        let landed = Stack.waitUntil(timeout: 5) { self.landedCount(field) == text.count }
+        XCTAssertTrue(landed, "typed \(text.count) characters, field shows \(landedCount(field))",
+                      file: file, line: line)
+    }
+
+    /// How many characters the field is showing (0 when it only shows its placeholder).
+    private func landedCount(_ field: XCUIElement) -> Int {
+        guard let value = field.value as? String, value != field.placeholderValue else { return 0 }
+        return value.count
     }
 
     private func hasFocus(_ element: XCUIElement) -> Bool {
