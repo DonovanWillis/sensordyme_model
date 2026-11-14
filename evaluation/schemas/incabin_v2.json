@@ -1,0 +1,67 @@
+{
+  "schema": "sensordyme.incabin.annotation",
+  "version": 2,
+  "notes": "Label vocabulary and per-clip document format for in-cabin clips, version 2 (Mission 10). A superset of incabin_v1: every v1 event and state keeps its name and definition; v1 documents are migrated by evaluation.annotations_v2.migrate_v1 using the manifest item's metadata. Times are seconds from the clip's first frame, on the clip's own clock. An event's start_s IS its onset: the first frame the behaviour begins (not the moment it first meets a duration threshold). Definitions are binding for annotators; change them only by bumping the version.",
+  "document": {
+    "required": ["schema", "version", "item", "annotator", "clip", "scenarios", "tags", "events"],
+    "optional": ["states", "ignore", "uncertain", "notes"],
+    "clip_required": ["subject", "session", "vehicle", "recorded_on", "seat"],
+    "clip_optional": ["duration_s", "occupants", "mount"],
+    "example": {
+      "schema": "sensordyme.incabin.annotation",
+      "version": 2,
+      "item": "S01_day_003",
+      "annotator": "A1",
+      "clip": {"subject": "S01", "session": "S01-2026-12-05-a", "vehicle": "V01", "recorded_on": "2026-12-05",
+               "seat": "driver", "duration_s": 182.4, "occupants": ["S07"], "mount": "dash_centre"},
+      "scenarios": ["E3_sustained_closure"],
+      "tags": {"lighting": "day", "eyewear": "none", "occupancy": "driver_only", "phone": "none"},
+      "events": [{"type": "long_closure", "start_s": 41.0, "end_s": 44.1, "attrs": {"cued_duration_s": 3}}],
+      "states": {"eyes_closed": [[41.0, 44.1]]},
+      "ignore": [{"start_s": 0.0, "end_s": 30.0, "reason": "calibration"}],
+      "uncertain": [{"start_s": 90.2, "end_s": 92.0, "reason": "ambiguous_eye_state", "types": ["long_closure"]}]
+    }
+  },
+  "events": {
+    "phone_use": "Phone in the subject's hand AND the subject's eyes on the phone, sustained >= 1 s. Start: first frame both hold. End: first frame either stops. attrs.position: hand | lap | ear.",
+    "phone_handling": "Phone in hand without eyes on it (picking up, holding at the ear on a call, putting down). attrs.position: hand | lap | ear.",
+    "eyes_off_road": "Gaze outside the windscreen road region for >= 2 s continuously (cluster, infotainment, lap, passenger, phone, mounted phone). Mirror checks are NOT this. attrs.target names where the gaze went.",
+    "glance_mirror_left": "Gaze on the left mirror, 0.3-2 s. Legitimate; must not alert.",
+    "glance_mirror_right": "Gaze on the right mirror, 0.3-2 s. Legitimate; must not alert.",
+    "glance_mirror_rear": "Gaze on the rear-view mirror, 0.3-2 s. Legitimate; must not alert.",
+    "glance_cluster": "Gaze on the instrument cluster, < 2 s. Legitimate; must not alert.",
+    "glance_infotainment": "Gaze on the centre screen, < 2 s.",
+    "glance_passenger": "NEW in v2. Gaze or head turn toward the front passenger, < 2 s. Legitimate; must not alert.",
+    "long_closure": "Both eyes closed >= 1.5 s (acted drowsiness). attrs.cued_duration_s records the cue.",
+    "short_closure": "NEW in v2. Both eyes closed 0.5 s to < 1.5 s (acted microsleep-like closure), not a blink. Natural blinks (< 0.5 s) are NOT events; they are covered by the eyes_closed state.",
+    "yawn": "Mouth open in a yawn, with or without a hand.",
+    "nod": "Head pitch drops and recovers (acted microsleep nod).",
+    "eating_drinking": "Food or drink at the mouth.",
+    "driver_absent": "NEW in v2. The driver's seat is empty, or the driver's head is outside the frame, for >= 1 s. Start: first frame the head leaves the frame. End: first frame the head is back.",
+    "camera_occluded": "NEW in v2. Something covers the lens (card, hand, sticker) for >= 1 s. attrs.extent: partial | full.",
+    "face_occluded": "NEW in v2. Both eyes, or more than half the face, hidden by a hand, hat brim, visor or object for >= 1 s while the driver is present. attrs.by: hand | hat | visor | object.",
+    "passenger_phone_use": "NEW in v2. The front or rear passenger holds or looks at a phone while the driver is attentive. Must not raise the driver's phone_use."
+  },
+  "states": {
+    "eyes_closed": "Both upper lids cover the pupils. Per frame.",
+    "phone_in_hand": "A phone is held in either of the DRIVER's hands. Per frame.",
+    "phone_near_face": "A held phone is within one face-width of the driver's face. Per frame.",
+    "phone_visible": "Any phone is visible in the frame (held, mounted or lying). Per frame.",
+    "face_visible": "At least both eyes and the nose of the driver are visible. Per frame.",
+    "driver_present": "NEW in v2. The driver is in the seat with the head inside the frame. Per frame."
+  },
+  "ignore_reasons": ["calibration", "setup", "operator_in_frame", "camera_obstructed", "consent_withdrawn_segment"],
+  "uncertain_reasons": ["face_not_visible", "ambiguous_gaze", "ambiguous_eye_state", "phone_ownership_unclear",
+                        "annotator_disagreement", "motion_blur", "other"],
+  "uncertain_semantics": "An uncertain span marks time an annotator cannot label. With types listed, the span is unlabelable for those event types only; with no types, for every type. Alerts inside an uncertain span are neither true nor false for the alert types it covers, and its time is not counted in exposure hours. Never mark a whole event uncertain to avoid labelling it: unlabelable time is reported as its own rate.",
+  "seats": ["driver", "front_passenger", "rear_left", "rear_centre", "rear_right"],
+  "agreement": {
+    "event_iou_min": 0.5,
+    "event_f1_min": 0.8,
+    "onset_p90_max_s": 0.5,
+    "state_kappa_min": 0.7,
+    "state_step_s": 0.1,
+    "notes": "Two annotators label every pilot clip independently (INCABIN_PILOT_PROTOCOL.md section 8). Events agree when the same type overlaps with IoU >= event_iou_min (greedy, highest IoU first). A clip pair passes when every type's agreement F1 >= event_f1_min, the p90 onset difference <= onset_p90_max_s, and every labelled state's Cohen's kappa >= state_kappa_min. A failing pair goes to the adjudicator; it is not averaged."
+  },
+  "migration_from_v1": "v1 documents carry only item, events, states and ignore. migrate_v1 fills clip.subject and clip.session from the manifest item, clip.vehicle / recorded_on / seat / occupants from item.conditions (vehicle, recorded_on, seat, occupants as ';'-separated pseudonyms), scenarios from item.conditions.scenarios (';'-separated cell ids), tags from the item.conditions keys that are matrix axes, and annotator 'unknown-v1' (agreement cannot be computed for migrated documents). A v1 document whose manifest item lacks vehicle or recorded_on is refused, not guessed."
+}

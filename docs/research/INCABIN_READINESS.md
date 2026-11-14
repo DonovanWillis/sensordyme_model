@@ -4,6 +4,7 @@
 - The protocol is `INCABIN_PILOT_PROTOCOL.md`.
 - The label vocabulary is `evaluation/schemas/incabin_v1.json`, enforced by `evaluation/annotations.py` (`known_types`).
 - Hardware calibration and validation live in the hardware package (`docs/HAILO_HARDWARE_VALIDATION.md`, branch `feat/m5-hw-validation`).
+- Mission 10 adds the scenario coverage matrix, annotation schema v2, the locked subject split and the event-level report: `M10_EVAL_READINESS.md`. Its protocol additions (per-clip metadata, per-cell recording checklist, split-and-lock order) are proposals, pending G2.
 
 ## Gates (all required before the first participant)
 
