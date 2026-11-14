@@ -296,7 +296,10 @@ def main(argv: Optional[list[str]] = None) -> int:
 
     from core.accel import HailoYOLO
 
-    model = HailoYOLO(str(hef_path), sha256=actual)
+    # The installed extra-class map (M10.1), so the production-decoder boxes include
+    # a mapped hand class as the device reports it. None on the shipping config; a
+    # map on the COCO-80 .hef is refused here exactly as the device refuses it.
+    model = HailoYOLO(str(hef_path), sha256=actual, extra_classes=extra or None)
     try:
         if hc.sha256_file(hef_path) != actual:
             print("REFUSED: the .hef changed while it was being loaded", file=sys.stderr)
