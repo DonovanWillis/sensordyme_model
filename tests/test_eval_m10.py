@@ -611,7 +611,9 @@ def test_replay_with_the_real_module_feeds_latency_and_abstention(tmp_path):
     assert spans is not None
     assert spans["phone_use"] == [(0.0, pytest.approx(10.0))], "no object detector ran: phone_use never evaluable"
     assert spans["eyes_down"][0][0] == 0.0 and 0.5 <= spans["eyes_down"][0][1] <= 2.0, "calibrating first"
-    assert "drowsiness" not in spans, "drowsiness runs on the fallback threshold while calibrating"
+    # Drowsiness runs on the fallback threshold while calibrating; since M10.1 it is
+    # STARTING only until the frame rate is measured (eye_timing: 5 intervals, 0.5 s at 10 fps).
+    assert spans["drowsiness"] == [(0.0, pytest.approx(0.5))], "only while the frame rate is measured"
 
     annotation = _ann(clip={"duration_s": 10.0}, scenarios=["H1_head_orientation"],
                       tags={"lighting": "day", "eyewear": "none", "occupancy": "driver_only", "mount": "dash_centre",
