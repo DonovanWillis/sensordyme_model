@@ -39,6 +39,8 @@ ACCOUNT = {
     ("POST", "/v1/devices/claim"), ("GET", "/v1/presets"), ("GET", "/v1/capability-tiers"),
     # M8.4: deletes the CALLER's account only (password re-checked; tests/test_m84_privsec_account.py).
     ("POST", "/v1/account/delete"),
+    # M8.5: a fresh 30-day token for the CALLING session only (tests/test_phase1_cloud_auth.py).
+    ("POST", "/v1/session/refresh"),
 }
 #: Routes that name a device in the body rather than the path.
 DEVICE_IN_BODY = {("POST", "/v1/ai/configure")}
