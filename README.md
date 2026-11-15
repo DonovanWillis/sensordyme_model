@@ -54,6 +54,13 @@ iPhone, pair, verify. After that, the loop above is the whole experience.
 
 # Complete Setup Guide — From Unboxing to iPhone Monitoring
 
+> **Someone else is setting up the hardware?** Give them
+> [`docs/FRIEND_HARDWARE_SETUP.md`](docs/FRIEND_HARDWARE_SETUP.md): the same path as 28 steps.
+> Each step states the command, the expected result, pass/fail, recovery, whether it changes the
+> Pi, and whether the owner must approve. They share results with one sanitized evidence command
+> (`scripts/hw_validation/collect_evidence.py`). Demo: `docs/INVESTOR_DEMO.md`. Measured accuracy
+> needs independently verified labels: `docs/REAL_DATA_EVALUATION_PROTOCOL.md`.
+
 This is the authoritative zero-to-ready path. Follow the phases in order. Every
 command here is either a standard OS procedure or a script that exists in this
 repository; commands that can only run on the physical Pi are marked **(Pi)**.
