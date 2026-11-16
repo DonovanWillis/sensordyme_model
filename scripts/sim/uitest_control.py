@@ -504,13 +504,16 @@ def control_handler(stack: Stack, app_port: AppPort, stop: threading.Event):
                 try:
                     status, state = stack.local_api("/api/state")
                     _, clients = stack.local_api("/api/local/clients")
+                    # M13.1: the mode the device itself reports running.
+                    _, presets = stack.local_api("/api/presets")
                 except (OSError, ValueError) as e:
                     self._reply(503, {"error": str(e)})
                     return
                 policy = state.get("policy", {}) if isinstance(state, dict) else {}
                 self._reply(200, {"status": status, "protection": policy.get("protection"),
                                   "clients": len((clients or {}).get("clients", [])) if isinstance(clients, dict)
-                                  else 0})
+                                  else 0,
+                                  "preset": presets.get("active") if isinstance(presets, dict) else None})
             else:
                 self._reply(404, {"error": "unknown"})
 
