@@ -1654,6 +1654,12 @@ class DriverAttentionModule(VisionModule):
         self._eyes_down_active = False
         self._eyes_up_active = False
         self._phone_use_active = False
+        # The conditions the drowsiness and phone_use trackers were last fed (M13):
+        # what the live view's "developing" phase reports, so it never shows a
+        # behaviour the module is not actually timing (a passenger's or mounted
+        # phone, a downward look's lowered lids).
+        self._last_drowsy_condition = False
+        self._last_phone_use_condition = False
         self._last_fired_event_types: list[str] = []
 
     def close(self) -> None:
@@ -2403,7 +2409,8 @@ class DriverAttentionModule(VisionModule):
             # Handling cues relative to where the face was last seen, and the
             # coasted downward gaze (M8.5).
             phone_candidate = self._phone_handling_now(self._phone_face_box, coasted_eyes_down)
-            fired = self._phone_use_tracker.update(phone_candidate and coasted_off_road, gaze_now)
+            self._last_phone_use_condition = phone_candidate and coasted_off_road
+            fired = self._phone_use_tracker.update(self._last_phone_use_condition, gaze_now)
             self._phone_use_active = self._phone_use_tracker.is_active
             if fired is not None:
                 off_road_confidence = _extrapolated(max(
@@ -2635,6 +2642,7 @@ class DriverAttentionModule(VisionModule):
         looking_down = self._closure_is_looking_down(
             ear, effective_threshold, closure_iris, iris_vetoes_closure, rotation, gaze_offset)
         drowsy_condition = ear < effective_threshold and not iris_vetoes_closure and not looking_down
+        self._last_drowsy_condition = drowsy_condition
         self._frame_signals["eye_state"] = shared_perception.EyeState(
             ear=float(ear), iris_openness=None if iris_ratio is None else float(iris_ratio),
             # Closed only against a calibrated threshold; before that there is
@@ -2806,6 +2814,8 @@ class DriverAttentionModule(VisionModule):
         # on a one-second pose failure (M10).
         fired = (self._phone_use_tracker.update(phone_use_condition, gaze_now)
                  if gaze_now is not None else None)
+        if gaze_now is not None:  # paused (gaze unreadable): the last fed condition stands
+            self._last_phone_use_condition = phone_use_condition
         # The tracker's own state, like every other condition here: clearing
         # the flag on any single False frame (one stride tick where YOLO missed
         # the phone) dropped the live alert for the rest of the episode, since
@@ -3055,9 +3065,9 @@ class DriverAttentionModule(VisionModule):
             "eyes_down_duration_s": round(self._eyes_down_tracker.elapsed(gaze_now), 1),
             "eyes_up_state": self._phase_label(self._last_pitch > self._pitch_up_threshold_deg, self._eyes_up_tracker),
             "eyes_up_duration_s": round(self._eyes_up_tracker.elapsed(gaze_now), 1),
-            "phone_use_state": self._phase_label(bool(self._last_phone_boxes), self._phone_use_tracker),
+            "phone_use_state": self._phase_label(self._last_phone_use_condition, self._phone_use_tracker),
             "phone_use_duration_s": round(self._phone_use_tracker.elapsed(gaze_now), 1),
-            "drowsy_state": self._phase_label(self._last_ear < self._last_ear_threshold, self._drowsy_tracker),
+            "drowsy_state": self._phase_label(self._last_drowsy_condition, self._drowsy_tracker),
             "risk_score": round(self._last_risk_score, 2),
             "state": self._state_label(),
             "alert_active": self.is_alert_active(),
@@ -3350,10 +3360,16 @@ class DriverAttentionModule(VisionModule):
                 out["face_contours"] = {
                     name: [(round(float(marks[i].x), 3), round(float(marks[i].y), 3)) for i in idx]
                     for name, idx in self._OVERLAY_CONTOURS.items()}
-            out["head"] = {"yaw_deg": round(float(self._last_head_yaw), 1),
-                           "pitch_deg": round(float(self._last_head_pitch), 1),
-                           "calibrated": bool(self._calibrator.is_calibrated),
-                           "direction": self._gaze_label()}
+            # This frame's head pose as perception_signals reports it: relative to
+            # the driver's calibrated neutral when `calibrated` (what the overlay
+            # contract says), else the raw fit. It was the raw Euler angles under
+            # `calibrated: true` -- an upright head read pitch ~+-180 (M13).
+            head_pose = self._frame_signals.get("head_pose")
+            if head_pose is not None:
+                out["head"] = {"yaw_deg": round(float(head_pose.yaw_deg), 1),
+                               "pitch_deg": round(float(head_pose.pitch_deg), 1),
+                               "calibrated": bool(head_pose.calibrated),
+                               "direction": self._gaze_label()}
         driver = self._driver
         if driver is not None:
             out["driver"] = {"box": driver.driver_box, "identity": driver.identity, "method": driver.method,
@@ -3368,8 +3384,11 @@ class DriverAttentionModule(VisionModule):
             ("distraction", abs(self._last_yaw) > self._yaw_threshold_deg, self._distract_tracker),
             ("eyes_down", self._last_pitch < self._pitch_threshold_deg, self._eyes_down_tracker),
             ("eyes_up", self._last_pitch > self._pitch_up_threshold_deg, self._eyes_up_tracker),
-            ("phone_use", bool(self._last_phone_boxes), self._phone_use_tracker),
-            ("drowsiness", self._last_ear < self._last_ear_threshold, self._drowsy_tracker),
+            # The conditions the trackers were fed, not proxies: any visible phone
+            # (a passenger's, a mounted one) read as phone_use "developing", and a
+            # downward look's lowered lids as drowsiness "developing" (M13).
+            ("phone_use", self._last_phone_use_condition, self._phone_use_tracker),
+            ("drowsiness", self._last_drowsy_condition, self._drowsy_tracker),
         ):
             if self._face_lost_active and kind != "phone_use":
                 continue  # nothing measured about the face: no face behaviour is in progress
