@@ -1,0 +1,54 @@
+#!/bin/sh
+# NetworkManager dispatcher script: the firewall for SensorDyme direct mode
+# (docs/DIRECT_MODE.md). NetworkManager runs it as root on every connection
+# event; it acts only on the "sensordyme-direct" profile (the device's own
+# access point) and ignores everything else.
+#
+#   pre-up / up      load /etc/sensordyme/direct_mode.nft (core/ap_firewall.py),
+#                    then write the marker the direct-mode manager waits for.
+#                    If the ruleset does not load, the access point is taken
+#                    down again: it never runs without its firewall.
+#   pre-down / down  remove the marker and the table.
+#
+# Installed by `sudo scripts/direct_mode.py install` as
+# /etc/NetworkManager/dispatcher.d/90-sensordyme-direct (root, 0755) with a link
+# in pre-up.d/. NetworkManager skips dispatcher scripts that are not owned by
+# root or are writable by others. POSIX sh: Pi OS runs it with dash.
+set -u
+
+PATH=/usr/sbin:/usr/bin:/sbin:/bin
+PROFILE=sensordyme-direct
+TABLE=sensordyme_direct
+RULESET=/etc/sensordyme/direct_mode.nft
+RUN_DIR=/run/sensordyme-direct
+MARKER="$RUN_DIR/firewall-active"
+
+say() {
+  logger -t sensordyme-direct "$*" 2>/dev/null || true
+}
+
+[ "${CONNECTION_ID:-}" = "$PROFILE" ] || exit 0
+interface="${1:-}"
+action="${2:-}"
+
+case "$action" in
+  pre-up|up)
+    if nft -f "$RULESET"; then
+      mkdir -p "$RUN_DIR" && chmod 0755 "$RUN_DIR" && : > "$MARKER" && chmod 0644 "$MARKER"
+      say "access-point firewall loaded on ${interface}"
+    else
+      rm -f "$MARKER"
+      say "access-point firewall did NOT load; taking ${PROFILE} down"
+      # In the background: NetworkManager is waiting for this script (pre-up),
+      # so a synchronous call back into it could wait on itself.
+      nmcli connection down id "$PROFILE" >/dev/null 2>&1 &
+      exit 1
+    fi
+    ;;
+  pre-down|down)
+    rm -f "$MARKER"
+    nft delete table inet "$TABLE" >/dev/null 2>&1 || true
+    say "access-point firewall removed"
+    ;;
+esac
+exit 0
