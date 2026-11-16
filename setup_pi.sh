@@ -199,6 +199,28 @@ else
   sudo systemctl disable sensordyme-provisioning.service 2>/dev/null || true
 fi
 
+# >>> direct mode firewall (tests/test_direct_mode_setup.py runs this block)
+# Direct mode (docs/DIRECT_MODE.md) is OFF by default and then nothing here
+# runs. When config.yaml enables it, install the access-point firewall (a root
+# NetworkManager dispatcher script plus its nftables ruleset): without it the
+# device refuses to start its access point. The label passphrase is a separate,
+# per-device factory step and is never generated here.
+DIRECT_MODE_ENABLED="$("${PYTHON:-python3}" - "${SENSORDYME_CONFIG:-config.yaml}" <<'PY' 2>/dev/null || true
+import sys, yaml
+with open(sys.argv[1]) as handle:
+    cfg = yaml.safe_load(handle) or {}
+direct = ((cfg.get("network") or {}).get("direct_mode") or {})
+print("yes" if isinstance(direct, dict) and direct.get("enabled") is True else "no")
+PY
+)"
+if [ "$DIRECT_MODE_ENABLED" = "yes" ]; then
+  echo "==> Installing the direct-mode access-point firewall (network.direct_mode.enabled: true)"
+  sudo "${PYTHON:-.venv/bin/python}" scripts/direct_mode.py install
+  echo "    Label Wi-Fi password, once per device as $SERVICE_USER (output to the label printer only):"
+  echo "    .venv/bin/python scripts/direct_mode_psk.py generate --out /etc/sensordyme/direct_mode_psk"
+fi
+# <<< direct mode firewall
+
 echo "==> Advertising the device over mDNS (app auto-discovery: _sensordyme._tcp)"
 # Generated, not copied: the record carries this board's stable device ID, which
 # is how the app knows a device found at a new IP is one it already has.
