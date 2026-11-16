@@ -20,6 +20,7 @@ struct EventHistoryView: View {
     @State private var selectedEvent: EventItem?
     @State private var filter: Filter = .all
     @State private var reloadGuard = LatestRequestGuard()
+    @State private var localNotes: [String: String] = [:]
 
     enum Filter: String, CaseIterable, Identifiable {
         case all, alerts
@@ -87,7 +88,7 @@ struct EventHistoryView: View {
         } else {
             // A chronological flow grouped by day; a row opens in place and
             // leads to "why this happened".
-            ActivityTimeline(events: visible) { selectedEvent = $0 }
+            ActivityTimeline(events: visible, notes: localNotes) { selectedEvent = $0 }
         }
     }
 
@@ -107,6 +108,21 @@ struct EventHistoryView: View {
             guard reloadGuard.isLatest(token) else { return }
             errorMessage = error.localizedDescription
         }
+        await mergeLocal(token)
         if reloadGuard.isLatest(token) { hasLoaded = true }
+    }
+
+    /// M12 (C4): the camera's own history when it answers this iPhone on this
+    /// network, one row per event_key with the account's. Rows the account
+    /// doesn't have yet say so ("Not yet backed up", "On this camera only").
+    private func mergeLocal(_ token: Int) async {
+        guard !state.isDemo, let hardwareID = device.hardwareId,
+              LocalAccessCenter.shared.device(hardwareID)?.enrolment == .active,
+              let page = try? await LocalAccessCenter.shared.events(hardwareID, limit: 200),
+              reloadGuard.isLatest(token) else { return }
+        let merged = LocalHistory.merge(account: events.filter { $0.eventID != nil }, local: page.events,
+                                        fetchedAt: Date())
+        events = merged.events
+        localNotes = merged.notes
     }
 }

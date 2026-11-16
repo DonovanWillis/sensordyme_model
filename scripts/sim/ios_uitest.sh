@@ -53,7 +53,7 @@ need_space() {  # need_space MB WHAT
   fi
 }
 need_space 1843 "this run"
-for port in 8787 8790 8797; do
+for port in 8787 8790 8797 8899; do
   if lsof -nP -iTCP:$port -sTCP:LISTEN >/dev/null 2>&1; then echo "port $port is in use"; exit 3; fi
 done
 

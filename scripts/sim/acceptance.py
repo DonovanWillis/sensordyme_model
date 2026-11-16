@@ -273,7 +273,7 @@ JOURNEYS: tuple[Journey, ...] = (
             "test_sim_e2e.py::test_backend_outage_goes_stale_device_keeps_monitoring_and_reconnects; "
             "test_m8_lifecycle_e2e.py (local alerts continue, queue bounded, flushed once); twin_faults "
             "(backend restart with a pending stop converges once)",
-            ("test15_Offline",),
+            ("test15_Offline", "test29_OfflineLocalCamera"),
             "modelled as an unreachable network or an instant backend restart; a backend held down for hours "
             "is not simulated"),
     Journey(22, "offline event queue", ("lifecycle", "events", "reliability_storage", "sim_stress"),

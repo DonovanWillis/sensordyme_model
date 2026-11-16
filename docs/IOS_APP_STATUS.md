@@ -16,6 +16,48 @@ demo mode and is labelled simulated.
 
 Line numbers refer to `ios/Sources/` at the commit that added this file.
 
+## Mission 12: the camera works with the backend off (sd-local-v1)
+
+Contract: `docs/LOCAL_ACCESS.md`. Gaps closed: `docs/PORTABLE_OPERATION.md` C1–C6.
+Tested in software only (Swift logic tests, the app's Swift against the device's
+real Python dashboard, one XCUITest journey). **Nothing here has run on a physical
+iPhone, a Secure Enclave, real Bluetooth or a Pi** (LOCAL_ACCESS.md §10 gates).
+
+| Piece | File | What it does |
+|---|---|---|
+| Phone key | `LocalIdentity.swift` | One P-256 key **per paired camera**. Secure Enclave when available (the Keychain holds only the Enclave's encrypted handle); a software key in the Keychain otherwise (Simulator). `AfterFirstUnlockThisDeviceOnly`, never synchronizable, no Face ID prompt, no entitlement. Forgetting a camera destroys its key. |
+| Protocol | `LocalAccess.swift` | Canonical request/session strings, `X-SD-Local` header, device-signature check against the **cached** key, refusal-code table, BLE `enroll` seal/open. Pinned by `tests/local_access_vectors.json` (embedded in `ios/Tests/LocalAccessTests.swift`). |
+| Client | `LocalDeviceClient.swift` | hello → signed `POST /api/local/session` → `X-SD-Session` reads; every write signed over a fresh challenge. Renews a session a minute before it ends and on `session_invalid` (power cycle); an address change drops the session; `unknown_client` → forget, never a retry loop. Stop/resume and mode are confirmed only from `/api/state` / `/api/presets`. |
+| Cache | `TrustedDevices.swift`, `LocalAccessCenter.swift` | Keychain JSON of paired cameras (id, name, account id, last address, last seen, last mode name, device key + fingerprint, client id, how and whether enrolled, owning account). Survives a cold launch and a lost backend. Rediscovery: last address, then Bonjour `_sensordyme._tcp` matched by TXT `id`. |
+| Enrolment | `LocalAccessCenter.enrollViaAccount`, `BLEPoPFlow.sendEnrollment`, `migrateLegacyToken` | Account: `POST /v1/devices/{id}/local-clients` for a device listing `local_identity`, usable once a session succeeds. Bluetooth: `enroll` right after `proven` (first setup or re-pairing; "Keep its current Wi-Fi and finish"). Legacy token: enrol once with `X-Device-Token`, then the stored token is cleared. |
+| Video | `FeedViews.swift`, `MJPEGStream.swift` | The feed's credential is the camera's session (`X-SD-Session`); the pasted token is only the migration path. 401 renews the session, 403 says pair again. A renewed session never interrupts a healthy stream. |
+| Control | `DeviceDetailView.swift`, `LocalDeviceViews.swift` | When the camera answers this iPhone directly, stop/resume (same confirmation dialog) and mode go to it signed; a 409 role-floor refusal shows the camera's reason. Otherwise the account path as before. |
+| History | `LocalEvents.swift`, `EventHistoryView.swift` | `GET /api/events` merged with the account's history by `event_key`; camera-only rows say "Not yet backed up" / "On this camera only" / "Sent to your account"; with no `age_s` the row says its time is from the camera's clock. |
+| Alerts | `AlertWatcher.swift`, `Notifications.swift` | With the account server not connected, the foreground watcher polls `/api/events?after=` every 5 s; first poll is a baseline. Same `NotificationPolicy` + `AlertSound` + `SoundedEvents`; one banner and at most one sound per `event_key` across both transports; never simulated/experimental/log-only, never `age_s` ≥ 60 s. Foreground only. |
+| No account | `AuthView.swift`, `LocalOnlyHomeView` | "Set up a camera nearby" (Bluetooth Wi-Fi hand-off + pairing, no claim) and "Open cameras paired with this iPhone". |
+
+Ownership: an explicit Log out forgets the account's pairings (keys destroyed) and
+keeps ones made with no account; another account signing in never sees a
+previous account's cameras.
+
+Honest status copy: a cached camera is **Offline · last seen 5 min ago** or **Not
+reachable on this network**; **Looking…** while searching; only a local
+`/api/state` read in the last 30 s shows **Protecting / Stopped / Not
+protecting** with "Connected directly on this network". Banners: "Direct
+connection — Your account server can't be reached…", "Not connected to an
+account — no backup, no remote notifications…". Revoked: "This iPhone needs to
+be paired with the camera again."
+
+Tests: `ios/Tests/{LocalAccess,LocalDeviceClient,TrustedDevices,LocalEvents}Tests.swift`
+(IP change, power cycle, revocation, look-alike, lockout, role floor, sound rules),
+`BLEPoPFlowTests` (enrol), `MJPEGStreamTests` (session credential),
+`tests/test_m12_ios_local_access.py` (Swift client ↔ real `DashboardServer`), and
+XCUITest `test29_OfflineLocalCamera` (backend process stopped; cold launch; cached
+camera; live view and a stop over the local session, confirmed by the device as
+`local_app`). Direct-to-device on the test stack: `POST /fresh?dashboard=1` serves
+the virtual device's local API on 127.0.0.1:8899 **with a dashboard token**, so
+loopback grants nothing; `POST /backend/stop`; `GET /device/local`.
+
 ## Mission 8 (Checkpoint F): what changed, and how it is checked
 
 ### Presence comes from fresh device telemetry (ConnectionTruth.swift)

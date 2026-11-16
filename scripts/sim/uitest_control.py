@@ -21,6 +21,13 @@ The UI tests drive scenarios through the control port (127.0.0.1 only):
                                       claimed=0 leaves it unclaimed (the discovery journey pairs it).
                                       Answers once the device has reported to the new backend, so no
                                       test starts against a device that is still booting (~20 s).
+                                      dashboard=1 (M12) also serves the device's local API on 127.0.0.1:8899
+                                      WITH a dashboard token (sim/device.py), so the app's sd-local-v1
+                                      session is what lets it in, never "being on loopback".
+    POST /backend/stop                M12: stop the backend process (the device loses it too) and close the
+                                      app's address: "the MacBook backend is OFF". Only /fresh restarts it.
+    GET  /device/local                M12: the device's own /api/state policy.protection and how many
+                                      phones it trusts, read with its token (what the DEVICE says).
     GET  /state                       mode, device process, scenario, claim code, current account
     GET  /session                     a fresh login for the current account (token, email) for -orynSession
     POST /mode?m=MODE[&path=/v1/...]  what the proxy does with app requests under `path` (default: every
@@ -92,6 +99,9 @@ HOP_HEADERS = {"connection", "keep-alive", "transfer-encoding", "content-length"
 # controller's own logins carry a distinct value each, and the proxy strips it
 # from the app's requests, whose limits are unchanged (keyed on 127.0.0.1).
 CONTROLLER_CLIENT_HEADER = "X-UITest-Controller"
+#: M12: the virtual device's local API (feed, /api/local/*) when a test asks for it
+#: (POST /fresh?dashboard=1). Loopback only, and always with a dashboard token.
+LOCAL_PORT = 8899
 
 
 class Stack:
@@ -102,6 +112,8 @@ class Stack:
         #: stopped device still shows it on the local network.
         self.dashboard_port = dashboard_port
         self.local_camera_while_stopped = local_camera_while_stopped
+        #: M12: this test's device serves its local API on LOCAL_PORT (POST /fresh?dashboard=1).
+        self.local_dashboard = False
         # The account the tests sign in with. /fresh replaces it with a new one.
         self.email, self.password = DEMO_EMAIL, DEMO_PASSWORD
         self.generation = 0
@@ -145,8 +157,12 @@ class Stack:
         with self.lock:
             self._stop_device_locked()
             log = open(self.work / "device.log", "ab")  # noqa: SIM115
-            feed = (["--dashboard-port", str(self.dashboard_port)] if self.dashboard_port
-                    else ["--no-dashboard"])
+            port = self.dashboard_port or (LOCAL_PORT if self.local_dashboard else None)
+            # With a port the virtual device ALWAYS has a dashboard token
+            # (sim/device.py `dashboard_token`): on loopback with no token the
+            # dashboard would let everything in, and a local-access journey
+            # would prove nothing about the phone's own credential.
+            feed = ["--dashboard-port", str(port)] if port else ["--no-dashboard"]
             device_args = ["--backend", self.backend_url, "--factory", str(self.work / "backend" / "factory.json"),
                            "--state-dir", str(self.work / "device"), "--scenario", scenario, *feed]
             if self.local_camera_while_stopped:
@@ -207,7 +223,23 @@ class Stack:
         self.stop_device()
         self.stop_backend()
 
-    def fresh(self, claimed: bool, tag: str) -> dict:
+    def local_api(self, path: str) -> tuple[int, object]:
+        """GET the device's own local API with its dashboard token (M12 journeys).
+
+        The controller's view of what the DEVICE says, independent of the app:
+        e.g. that a stop sent from the app over the local path was applied and
+        recorded as `by: local_app`."""
+        port = self.dashboard_port or LOCAL_PORT
+        token = (self.work / "device" / "dashboard_token").read_text().strip()
+        request = urllib.request.Request(f"http://127.0.0.1:{port}{path}",
+                                         headers={"X-Device-Token": token})
+        try:
+            with urllib.request.urlopen(request, timeout=5) as r:  # noqa: S310 - loopback
+                return r.status, json.loads(r.read() or b"null")
+        except urllib.error.HTTPError as e:
+            return e.code, json.loads(e.read() or b"null")
+
+    def fresh(self, claimed: bool, tag: str, dashboard: bool = False) -> dict:
         """A new world for one test (POST /fresh in the module docstring).
 
         Nothing a previous test did can reach the next one: the backend's whole
@@ -229,6 +261,7 @@ class Stack:
             shutil.rmtree(self.work / name, ignore_errors=True)
         self._token = None
         self.last_devices = None
+        self.local_dashboard = dashboard
         self.start_backend()
         self.start_device("attentive")
         if claimed:
@@ -329,7 +362,10 @@ class Stack:
         return {"token": token, "email": self.email}
 
     def state(self) -> dict:
-        device_id = self.device_id()
+        try:
+            device_id = self.device_id()
+        except OSError:  # the backend was stopped (POST /backend/stop)
+            device_id = None
         events = 0
         if device_id is not None:
             # The backend's largest page: a count capped at 50 stopped growing, and a
@@ -337,6 +373,8 @@ class Stack:
             status, answer = self.api("GET", f"/v1/devices/{device_id}/events?limit=1000")
             events = len(answer.get("events", [])) if status == 200 and isinstance(answer, dict) else 0
         return {"mode": self.mode, "fault_path": self.fault_path, "scenario": self.scenario,
+                "backend_running": bool(self.backend and self.backend.poll() is None),
+                "local_dashboard": self.local_dashboard,
                 "device_running": bool(self.device and self.device.poll() is None),
                 "claim_code": self.factory()["devices"][0]["claim_code"],
                 "email": self.email, "password": self.password, "device_id": device_id, "events": events,
@@ -458,6 +496,18 @@ def control_handler(stack: Stack, app_port: AppPort, stop: threading.Event):
                     self._reply(200, answer)
                 except ValueError as e:
                     self._reply(503, {"error": str(e)})
+            elif path == "/device/local":
+                # M12: what the device itself reports (its local API, with its token).
+                try:
+                    status, state = stack.local_api("/api/state")
+                    _, clients = stack.local_api("/api/local/clients")
+                except (OSError, ValueError) as e:
+                    self._reply(503, {"error": str(e)})
+                    return
+                policy = state.get("policy", {}) if isinstance(state, dict) else {}
+                self._reply(200, {"status": status, "protection": policy.get("protection"),
+                                  "clients": len((clients or {}).get("clients", [])) if isinstance(clients, dict)
+                                  else 0})
             else:
                 self._reply(404, {"error": "unknown"})
 
@@ -478,7 +528,16 @@ def control_handler(stack: Stack, app_port: AppPort, stop: threading.Event):
                 stack.mode = "pass"
                 stack.fault_path = "/v1/"
                 app_port.up()
-                return stack.fresh(claimed=q.get("claimed", "1") != "0", tag=q.get("tag", ""))
+                return stack.fresh(claimed=q.get("claimed", "1") != "0", tag=q.get("tag", ""),
+                                   dashboard=q.get("dashboard") == "1")
+            if path == "/backend/stop":
+                # M12: the MacBook backend OFF. The process is stopped (the device
+                # loses it too) and the app's address stops listening. Only /fresh
+                # brings a backend back.
+                stack.stop_backend()
+                app_port.down()
+                stack.mode = "down"
+                return {"backend_running": False}
             if path == "/mode":
                 if q.get("m") not in MODES:
                     raise ValueError(f"m must be one of {', '.join(MODES)}")

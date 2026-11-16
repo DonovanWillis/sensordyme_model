@@ -24,8 +24,10 @@ reported, never hidden. Each suite runs in its own process (the driver suites
 load real MediaPipe graphs).
 
 `make acceptance-full` must not run while anything else owns the iOS Simulator
-(ports 8787/8790/8797 must be free); `scripts/sim/ios_uitest.sh` builds the real
-app, runs all 28 journeys + 2 accessibility audits in one xcodebuild invocation
+(ports 8787/8790/8797/8899 must be free); `scripts/sim/ios_uitest.sh` builds the real
+app, runs every journey (M12 adds test29_OfflineLocalCamera: a cold launch with the
+backend process stopped opens the previously paired camera over its sd-local-v1
+session, live view and a confirmed local stop; it backs journey 21) + 2 accessibility audits in one xcodebuild invocation
 with no retries, and the acceptance report folds its per-test results in. Plain
 `make acceptance` states explicitly that the iOS half did not run.
 

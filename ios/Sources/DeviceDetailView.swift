@@ -1635,6 +1635,23 @@ struct DeviceDetailView: View {
         protectionSending = true
         protectionError = nil
         protectionNotice = nil
+        // M12 (LOCAL_ACCESS.md): the camera answers this iPhone directly on
+        // this network, so the request goes to it signed, not round the
+        // account server. Confirmed only from the camera's own /api/state; the
+        // account learns of it from the camera's next report.
+        if !state.isDemo, let hardwareID = device.hardwareId, LocalAccessCenter.shared.isReady(hardwareID) {
+            Task {
+                defer { protectionSending = false }
+                switch await LocalAccessCenter.shared.setProtection(hardwareID, stop: action == .stop) {
+                case .success(let outcome):
+                    protectionNotice = ("\(outcome.text) (direct, on this network)", Date(), outcome.isConfirmed)
+                case .failure(let error):
+                    protectionError = error.message
+                }
+                await reload()
+            }
+            return
+        }
         Task {
             defer { protectionSending = false }
             do {
@@ -1716,6 +1733,28 @@ struct DeviceDetailView: View {
         pendingSwitch = ModeSwitchState.PendingSwitch(targetBase: base, requestedAt: requestedAt)
 
         let token = setModeGuard.begin()
+        // M12: directly to the camera when it answers this iPhone on this
+        // network. Its role floor still refuses an unsafe mode (409), and that
+        // reason is shown; success is the camera's own report of the mode.
+        if !state.isDemo, let hardwareID = device.hardwareId, LocalAccessCenter.shared.isReady(hardwareID) {
+            Task {
+                let result = await LocalAccessCenter.shared.setPreset(hardwareID, name: name)
+                guard setModeGuard.isLatest(token) else { return }
+                if pendingSwitch?.targetBase == base { pendingSwitch = nil }
+                switch result {
+                case .success(let outcome) where outcome.isConfirmed:
+                    failedSwitch = nil
+                case .success(let outcome):
+                    failedSwitch = ModeSwitchState.PendingSwitch(targetBase: base, requestedAt: requestedAt,
+                                                                 reason: outcome.text)
+                case .failure(let error):
+                    failedSwitch = ModeSwitchState.PendingSwitch(targetBase: base, requestedAt: requestedAt,
+                                                                 reason: error.message)
+                }
+                await reload()
+            }
+            return
+        }
         Task {
             do {
                 try await state.backend.setPreset(deviceID: device.id, preset: name)

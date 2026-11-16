@@ -20,12 +20,15 @@ final class OrynJourneysUITests: XCTestCase {
 
     /// Journeys that start with the device NOT on the account.
     private static let startUnclaimed: Set<String> = ["test03_Discovery"]
+    /// Journeys whose device also serves its local API (M12), with a token.
+    private static let localDashboard: Set<String> = ["test29_OfflineLocalCamera"]
 
     override func setUpWithError() throws {
         continueAfterFailure = false
         app = XCUIApplication()
         try Stack.requireController()
-        try Stack.fresh(for: self, claimed: !Self.startUnclaimed.contains(Stack.testName(self)))
+        try Stack.fresh(for: self, claimed: !Self.startUnclaimed.contains(Stack.testName(self)),
+                        dashboard: Self.localDashboard.contains(Stack.testName(self)))
     }
 
     /// Set by `record(_:)`. `testRun.hasSucceeded` is not final during tearDown, so it
@@ -687,6 +690,68 @@ final class OrynJourneysUITests: XCTestCase {
             throw XCTSkip("the device/backend don't report status.perception yet (M7 device + backend streams)")
         }
         _ = reveal(section)
+    }
+
+    /// M12 (docs/LOCAL_ACCESS.md, docs/PORTABLE_OPERATION.md C1-C3): the
+    /// previously paired camera opens with the MacBook backend OFF.
+    ///
+    /// 1. Signed in, backend up: the account relays this iPhone's public key to
+    ///    the camera; the app opens a device-signed local session and the live
+    ///    view plays over it. No token is pasted anywhere (`-orynDeviceFeed`
+    ///    gives the camera's last-known address only, token `-` = none), and the
+    ///    camera's local API HAS a dashboard token, so loopback lets nothing in.
+    /// 2. The backend process is stopped; the app cold-launches with the saved
+    ///    session and nothing else: the camera is listed from the paired-camera
+    ///    cache, opens, plays live over a new local session, and a stop sent
+    ///    over the signed local path is confirmed from the camera's own state
+    ///    (and the DEVICE records it as `local_app`).
+    func test29_OfflineLocalCamera() throws {
+        XCTAssertEqual(Stack.state()["local_dashboard"] as? Bool, true, "this journey's device serves its local API")
+        launch(["-orynOpenDevice", "-orynDeviceFeed", "http://127.0.0.1:8899", "-"])
+        let liveness = element("camera.liveness")
+        // The account relays the key on the device's next report (~2 s); the
+        // stream then opens on the phone's own session.
+        waitFor(liveness, labelContains: "Live video", timeout: 120)
+        XCTAssertTrue(Stack.waitUntil(timeout: 30) { (Stack.get("/device/local")["clients"] as? Int ?? 0) >= 1 },
+                      "the camera trusts this iPhone's key: \(Stack.get("/device/local"))")
+        shot("29a_paired_live_over_local_session")
+        app.terminate()
+
+        // The MacBook backend OFF: the app can reach no server at all.
+        let stopped = Stack.post("/backend/stop")
+        XCTAssertEqual(stopped["backend_running"] as? Bool, false, "the backend is stopped: \(stopped)")
+
+        // A cold launch with the existing session and NO other launch arguments.
+        app.launchArguments = ["-orynNoPrompt"] + Stack.extraLaunchArguments
+        app.launch()
+        XCTAssertTrue(app.staticTexts["devices.title"].waitForExistence(timeout: 30), "still signed in")
+        let card = app.buttons["local.card"]
+        XCTAssertTrue(card.waitForExistence(timeout: 30), "the paired camera is listed from the cache with the server down")
+        XCTAssertFalse(card.label.contains("Protecting") && !card.label.contains("Connected"),
+                       "never 'protecting' from the cache alone: \(card.label)")
+        shot("29b_cold_launch_backend_down")
+        waitFor(card, labelContains: "Connected directly on this network", timeout: 60)
+        card.tap()
+        XCTAssertTrue(element("local.banner").waitForExistence(timeout: 15), "the screen says it is a direct connection")
+        XCTAssertTrue(label(containing: "Your account server can't be reached").waitForExistence(timeout: 5),
+                      "and why: the account server is not reachable")
+        waitFor(element("camera.liveness"), labelContains: "Live video", timeout: 90)
+        waitFor(element("local.monitoring"), labelContains: "protecting", timeout: 30)
+        shot("29c_local_live_view")
+
+        let protection = reveal(app.buttons["local.protection"])
+        waitFor(protection, labelContains: "Stop, directly on the camera", timeout: 30)
+        protection.tap()
+        let confirm = app.buttons["Stop monitoring"]
+        XCTAssertTrue(confirm.waitForExistence(timeout: 10), "a stop asks first")
+        confirm.tap()
+        waitFor(element("local.protectionNote"), labelContains: "the camera confirmed it", timeout: 60)
+        waitFor(element("local.monitoring"), labelContains: "Stopped", timeout: 30)
+        let device = Stack.get("/device/local")
+        let applied = device["protection"] as? [String: Any] ?? [:]
+        XCTAssertEqual(applied["state"] as? String, "stopped", "the DEVICE reports the stop: \(device)")
+        XCTAssertEqual(applied["by"] as? String, "local_app", "sent over the signed local path: \(device)")
+        shot("29d_local_stop_confirmed")
     }
 
     static let dwellPrompt = "Alert me if someone stays inside the marked area for longer than 10 seconds"

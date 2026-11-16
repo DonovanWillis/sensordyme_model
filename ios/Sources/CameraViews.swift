@@ -110,7 +110,7 @@ struct CameraViewport: View {
                     .dynamicTypeSize(...DynamicTypeSize.xxxLarge)
                     .accessibilityShowsLargeContentViewer()
             case .live(let url):
-                MJPEGView(url: url, session: session)
+                MJPEGView(url: url, session: session, hardwareID: device.hardwareId)
                 CameraOffCover(reader: session.reader)
             case .none:
                 CameraPlaceholder(interrupted: instrument.isInterrupted)
@@ -307,7 +307,7 @@ struct LiveCameraView: View {
                         .accessibilityShowsLargeContentViewer()
                 case .live(let url):
                     ZStack {
-                        MJPEGView(url: url, session: session)
+                        MJPEGView(url: url, session: session, hardwareID: device.hardwareId)
                         CameraOffCover(reader: session.reader)
                     }
                 case .none:

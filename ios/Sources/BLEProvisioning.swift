@@ -250,7 +250,8 @@ final class BLEProvisioner: ObservableObject {
         scanningNetworks = false
         enrollTimeout?.cancel()
         enrollTimeout = nil
-        if localEnrollment == .enrolling { localEnrollment = .idle }
+        // Per link: a pairing belongs to the device on THIS link.
+        localEnrollment = .idle
     }
 
     private func isCurrent(_ id: UUID) -> Bool { linkID == id }

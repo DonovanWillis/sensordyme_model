@@ -133,6 +133,13 @@ config that reliably breaks the app when the network changes):
    `_sensordyme._tcp` on the LAN.
 5. **Notifications** prompt appears when alerts are first armed (local
    notifications only; no push entitlement, nothing to configure).
+6. **Direct camera access (M12, docs/LOCAL_ACCESS.md)** needs no extra
+   entitlement or capability: the phone's per-camera key is a CryptoKit Secure
+   Enclave key (its handle stored as an ordinary app Keychain item), and the
+   paired-camera list is an ordinary Keychain item. Free personal-team signing
+   is unaffected. No device token has to be pasted: setup over Bluetooth or the
+   account pairs the phone. On a physical phone the Enclave path is used; it
+   has NOT yet been checked on one (LOCAL_ACCESS.md §10 gate 6).
 
 ## Scope note
 

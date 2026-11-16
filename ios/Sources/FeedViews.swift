@@ -227,7 +227,25 @@ struct MJPEGView: View {
     /// The stream this view shows. Nil: the app's shared stream all the same
     /// (every session is a handle on the one connection).
     var session: LiveFeedSession? = nil
+    /// M12: which camera this is (its SD- id), so the feed uses that camera's
+    /// local session. Nil: the linked camera.
+    var hardwareID: String? = nil
+    /// The address comes from the paired-camera connection (LocalDeviceView),
+    /// not from the linked camera's DeviceLink.
+    var managedLocally = false
     @EnvironmentObject private var state: AppState
+    @ObservedObject private var local = LocalAccessCenter.shared
+
+    private var cameraID: String { hardwareID ?? state.linkedDeviceID }
+
+    /// The local session when this iPhone is paired with the camera (no token
+    /// to paste; an empty session until one opens, which the reader answers by
+    /// asking for one); otherwise the legacy device token, for an older install.
+    private var credential: String {
+        if let session = local.streamCredential(cameraID) { return session }
+        if local.device(cameraID)?.isUsable == true { return MJPEGStreamRequest.sessionCredential("") }
+        return state.deviceToken
+    }
     private var feed: LiveFeedSession { session ?? LiveFeedSession.shared }
     private var reader: MJPEGReader { feed.reader }
     /// This view's hold on the shared connection, while it is on screen.
@@ -254,19 +272,34 @@ struct MJPEGView: View {
             // a re-resolve. Adopting the answer needs no code here: DeviceLink
             // writes the device's current address to the same stored key the feed
             // reads, so `onChange(of: url)` below picks it up and reconnects.
-            reader.onAddressLooksStale = { Task { await link.resolve(force: true) } }
+            let camera = cameraID
+            if managedLocally {
+                // A camera opened from the paired-camera list: the local
+                // connection finds it again (Bonjour by its id, or its last
+                // address) and the new address arrives through `url`.
+                reader.onAddressLooksStale = { Task { await LocalAccessCenter.shared.refresh(camera) } }
+            } else {
+                reader.onAddressLooksStale = { Task { await link.resolve(force: true) } }
+            }
+            // M12: a 401 on the local session opens a new one.
+            reader.onSessionRejected = { Task { await LocalAccessCenter.shared.renewSession(camera) } }
             // One lease per view: an appear without a disappear in between
             // (it happens) must not count this view twice and pin the stream.
             if lease == nil {
-                lease = feed.attach(base: url.absoluteString, token: state.deviceToken)
+                lease = feed.attach(base: url.absoluteString, token: credential)
             } else {
-                feed.retarget(base: url.absoluteString, token: state.deviceToken)
+                feed.retarget(base: url.absoluteString, token: credential)
+            }
+            // A paired camera with no session yet (a cold launch): open one.
+            // The session publishes and `onChange(of: credential)` retargets.
+            if local.device(camera)?.isUsable == true, local.streamCredential(camera) == nil {
+                Task { await LocalAccessCenter.shared.refresh(camera, hints: [url.absoluteString]) }
             }
             // An address is not an identity: confirm the camera answering there
             // is still the linked one (a DHCP swap, or two default-named Pis
             // trading `sensordyme.local`). If not, DeviceLink re-resolves and the
             // corrected address arrives through `onChange(of: url)`.
-            Task { await link.ensureConnection() }
+            if !managedLocally { Task { await link.ensureConnection() } }
         }
         .onDisappear {
             if let lease { feed.detach(lease) }
@@ -304,10 +337,11 @@ struct MJPEGView: View {
         // from — or endlessly retrying — whatever it was given when it first
         // appeared.
         .onChange(of: url) { _, newURL in
-            feed.retarget(base: newURL.absoluteString, token: state.deviceToken)
+            feed.retarget(base: newURL.absoluteString, token: credential)
         }
-        .onChange(of: state.deviceToken) { _, newToken in
-            feed.retarget(base: url.absoluteString, token: newToken)
+        // The token, or (M12) a new or renewed local session.
+        .onChange(of: credential) { _, newCredential in
+            feed.retarget(base: url.absoluteString, token: newCredential)
         }
     }
 }
@@ -480,6 +514,9 @@ final class MJPEGReader: NSObject, ObservableObject, URLSessionDataDelegate {
     /// A closure rather than a dependency so this class keeps knowing nothing
     /// about Bonjour, and so the behaviour is testable without a network.
     var onAddressLooksStale: (() -> Void)?
+    /// M12: the camera refused the stream's local session (401): open a new
+    /// one. The new credential arrives through `start` (a retarget).
+    var onSessionRejected: (() -> Void)?
 
     // MARK: Lifecycle
 
@@ -493,7 +530,12 @@ final class MJPEGReader: NSObject, ObservableObject, URLSessionDataDelegate {
             stopped: stopped, state: state,
             currentBase: self.base, currentToken: self.token,
             base: base, token: token
-        ) else { return }
+        ) else {
+            // A renewed local session for a healthy stream: kept for the next
+            // connection, without interrupting this one.
+            self.token = MJPEGReaderPolicy.credentialUpdate(currentToken: self.token, token: token)
+            return
+        }
         teardown()
         self.base = base
         self.token = token
@@ -751,7 +793,20 @@ final class MJPEGReader: NSObject, ObservableObject, URLSessionDataDelegate {
             // the healthy session that had already replaced it.
             self.tracker.connectionClosed(error: MJPEGStreamDiagnosis.describe(error) != nil)
 
-            switch MJPEGReaderPolicy.completion(status: status, error: error, hasToken: !self.token.isEmpty) {
+            let usesSession = MJPEGStreamRequest.session(in: self.token) != nil
+            switch MJPEGReaderPolicy.completion(status: status, error: error, hasToken: !self.token.isEmpty,
+                                                usesSession: usesSession) {
+            case .renewSession:
+                // M12: the camera ended the session (it restarted, or the
+                // session expired): a new one is opened and the stream goes on.
+                self.consecutiveTransportFailures = 0
+                self.onSessionRejected?()
+                self.scheduleReconnect(reason: "renewing the connection to the camera", countsAsTransportFailure: false)
+            case .needsPairing:
+                self.consecutiveTransportFailures = 0
+                self.image = nil
+                self.state = .needsPairing
+                self.teardown()
             case .unauthorized(let hasToken):
                 // No amount of retrying supplies a token. Looping here is what
                 // turned a one-line settings mistake into a permanent spinner.

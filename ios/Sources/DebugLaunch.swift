@@ -56,10 +56,13 @@ enum DebugLaunch {
     /// Point the live feed at a device (`-orynDeviceFeed <url> <token>`), e.g. the
     /// virtual device's own feed (scripts/sim/uitest_control.py
     /// --device-dashboard-port), for renders of the camera states. Applied after
-    /// sign-in (a new account clears the paired camera).
+    /// sign-in (a new account clears the paired camera). A token of `-` means
+    /// none: the M12 journey gives the camera's last-known address only, and
+    /// the app must get in with its own local key.
     static var deviceFeed: (url: String, token: String)? {
         guard let index = args.firstIndex(of: "-orynDeviceFeed"), args.indices.contains(index + 2) else { return nil }
-        return (args[index + 1], args[index + 2])
+        let token = args[index + 2]
+        return (args[index + 1], token == "-" ? "" : token)
     }
 
     private static func value(after flag: String) -> String? {
