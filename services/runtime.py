@@ -54,6 +54,7 @@ from core.alerts import AlertLevel, AlertManager
 from core.behavior.experimental import is_experimental
 from core.camera import Camera, CameraError
 from core.dataset import CaptureStore
+from core.direct_mode import DirectModeManager
 from core.events import Event
 from core.frame_bus import FrameBus
 from core.health import HealthMonitor
@@ -68,6 +69,7 @@ from core.telemetry import TelemetryLogger
 from core.zones import load_zones
 from modules import get_module_class
 from services.capture import CaptureService
+from services.direct_mode import DirectModeService
 from services.provisioning import ProvisioningService
 from services.supervisor import Service, Supervisor
 
@@ -472,6 +474,8 @@ class DeviceRuntime:
         self.dashboard = None
         self.uplink = None
         self.provisioning: Optional[ProvisioningService] = None
+        #: Only when network.direct_mode.enabled (core/direct_mode.py); None otherwise.
+        self.direct_mode: Optional[DirectModeManager] = None
         self.health: Optional[HealthMonitor] = None
         self.supervisor: Optional[Supervisor] = None
         self.logger: Optional[EventLogger] = None
@@ -755,9 +759,17 @@ class DeviceRuntime:
         wifi = WifiManager()
         self.wifi = wifi  # also read by the health report the app displays
         network_cfg = self.config.get("network", {})
+        # Direct mode (the device's own access point, docs/DIRECT_MODE.md): built
+        # only when enabled, so a disabled device runs exactly what it ran before.
+        # When it exists, provisioning treats the AP as offline (R1).
+        self.direct_mode = None
+        direct_cfg = network_cfg.get("direct_mode")
+        if isinstance(direct_cfg, dict) and direct_cfg.get("enabled") is True:
+            self.direct_mode = DirectModeManager(wifi, direct_cfg)
         self.provisioning = ProvisioningService(
             wifi, network_cfg.get("provisioning", {}), version=_VERSION,
             deployment=str(self.config.get("deployment", "development")),
+            direct_mode_active=self.direct_mode.is_active if self.direct_mode is not None else None,
         )
         # M12: a phone that proves the setup code over Bluetooth may enrol for local access.
         self.provisioning.local_authority = self.local_authority
@@ -875,6 +887,10 @@ class DeviceRuntime:
             self._inference_service = _InferenceService(self)
             self.supervisor.add(self._inference_service)
         self.supervisor.add(self.provisioning)
+        if self.direct_mode is not None:
+            direct_service = DirectModeService(self.direct_mode)
+            self.supervisor.add(direct_service)
+            self.health.register("direct_mode", check=direct_service.status, check_interval_s=15.0)
         if self.uplink is not None:
             self.supervisor.add(_HealthReportService(self))
 
