@@ -610,6 +610,9 @@ enum CapabilityHealth {
         // (drowsiness and attention-lost need only the face).
         "attention": ("Attention", "Calibrating to the driver — look ahead normally; usually done within 30 seconds",
                       "Calibrated to the driver's forward gaze"),
+        // M10.1: frames arrive fast enough to time eye closure (drowsiness,
+        // fatigue). Impaired, with the measured rate, when they do not.
+        "eye_timing": ("Eye-closure timing", "Measuring the camera frame rate", nil),
         "face": ("Face", "Finding the driver's face", nil),
         "objects": ("Objects", "Starting object detection", nil),
         "hands": ("Hands", "Starting hand tracking", nil),
@@ -618,7 +621,7 @@ enum CapabilityHealth {
 
     /// Capabilities that are analysis results, fed by the camera and the
     /// inference loop (M8.3; cloud/app.py `_ANALYSIS_CAPABILITIES`).
-    static let analysisCapabilities: Set<String> = ["face", "objects", "hands", "pose", "attention"]
+    static let analysisCapabilities: Set<String> = ["face", "objects", "hands", "pose", "attention", "eye_timing"]
 
     /// What a starting capability is doing, for its row.
     /// What a capability says while monitoring is stopped on purpose (M8.2).

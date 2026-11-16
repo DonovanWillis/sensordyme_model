@@ -14,6 +14,89 @@ buzzer on BCM 17 (`alerts.gpio_buzzer_pin`). Model:
 `e69136d3ebf3cc8ebaf3da5417a59962b139f3d3d67d715e9a9b1ae10963960e`
 (`accelerator.yolo_hef_sha256`).
 
+## M10 additions (2026-11-14): the runtime's own stage timings, and a single- vs dual-detector comparison
+
+Prepared, dry-run on the Mac only (`--fake`, SIMULATED, exit 3). **Not run on hardware.**
+The runtime now times every stage itself, always on and bounded
+(`core/stage_timing.py`, the `performance` block of `/api/health`; contract in
+`docs/DIAGNOSTICS.md` §2). Two new `hwv_stage.py` stages use it; `all` runs
+neither (one needs the service running, the other an operator-supplied `.hef`).
+
+**`observe`** (service RUNNING, read-only). Records the running service's own
+per-stage timings (camera read, frame age, Hailo preprocess / inference /
+decode, Face Mesh, Hands, tracking, behaviour reasoning, alert dispatch, alert
+output command → GPIO, frame → decision, processed fps, RSS, SoC temperature,
+throttle state) every `--interval` s for `--minutes`:
+
+```bash
+SENSORDYME_TOKEN=$TOKEN $PY $V/hwv_stage.py observe --minutes 10 --interval 10 --install-dir $D --out ~/hwval/stages
+# or the bare recorder:
+SENSORDYME_TOKEN=$TOKEN $PY $V/stage_timing.py record --minutes 10 --interval 10 --install-dir $D --out ~/hwval/record_$(date +%s)
+```
+
+Writes `observe_<ts>/record.jsonl` (every poll), `record.csv` (one row per poll,
+`<stage>_p50_ms/_p95_ms/_max_ms/_n/_count` columns) and `record.summary.json`
+(per stage: the windowed p50/p95 across polls and the worst max; fps / RSS /
+temperature percentiles; `throttled_any`; `platform_classes`;
+`is_pi_measurement`) with provenance: git commit, config sha256, the `.hef`
+path / sha256 / pin / decoder, the device-reported model and versions, and the
+host tag. The token is read from `SENSORDYME_TOKEN` and never written. These
+windows are not drained per caller, so the app may stay open (unlike step 3's
+`health`). **Pass:** polls recorded; `hailo_inference` present; the platform
+class is `pi`; never throttled (provisional).
+
+**`arch`** (service STOPPED). Arch A = the production module with the
+production `.hef` (exactly as shipped). Arch B = the same plus a second `.hef`,
+run on the full frame once every `yolo_every_n_frames` frames (the production
+detector stride):
+
+```bash
+$PY $V/hwv_stage.py arch --second-hef /path/to/arch_b.hef --second-hef-sha256 <sha256> \
+    --block-seconds 120 --rounds 2 --install-dir $D --out ~/hwval/stages
+#   --video clip.mp4   identical frames for every block instead of the live camera
+#   --a-scheduled      also run Arch A under the HailoRT scheduler (isolates the scheduler's own cost)
+#   --start-temp-c 55  start every block at or below 55 °C (default: the temperature at the start)
+```
+
+- **Refuses** (BLOCKED, exit 2) without `--second-hef`, when the file does not
+  exist, or when it does not match `--second-hef-sha256`. It never creates,
+  downloads or substitutes a `.hef`. Without a pin it runs and records the
+  second model as `UNPINNED` with its sha256.
+- **Equal operating conditions**: the same camera mode (config.yaml `camera:`;
+  or the same video, rewound per block), the same detector stride, paced at the
+  camera fps; every block waits (up to `--cooldown-max-s`) until the SoC is no
+  hotter than the start temperature + `--temp-tolerance-c` (2 °C); blocks run
+  ABBA (`--rounds 2` = ABBAABBA) so a linear thermal drift cancels; a fresh
+  module per block.
+- **Reports** per block: every stage of `stage_timing.py stages` plus
+  `b_preprocess / b_hailo_infer / b_decode / b_detector_total` for the second
+  detector, achieved fps, late frames, RSS, SoC temperature and throttle state
+  at the start and end; per arm the mean of the block p50/p95 and the worst
+  max; `b_minus_a` deltas; `arch_blocks_<ts>.csv`. **Pass** means the
+  comparison was valid (every block ran, Arch B ran its detector on every
+  stride, equal start temperature, never throttled, measured on a Pi). It
+  is not a verdict on either architecture.
+- **Two networks on one chip.** A second `VDevice()` in one process fails
+  (the chip is exclusive) and two network groups cannot both be held
+  activated, so Arch B runs both on one VDevice under the HailoRT model
+  scheduler (ROUND_ROBIN), patched in the tool's own process only
+  (`stage_timing.py scheduled_chip`); production code is unchanged. This path
+  is **unverified until the first Pi run**. If HailoRT refuses it, the stage
+  ends FAIL with the error and nothing is inferred.
+
+Dry runs on the Mac (2026-11-14, SIMULATED; fake_hailo has no timing, so the
+numbers mean nothing beyond "the code path ran"):
+
+```text
+$ python scripts/hw_validation/hwv_stage.py arch --fake --second-hef <operator placeholder> --rounds 1 --block-seconds 2
+  block 0 arch A: 29.88 fps ... block 1 arch B ... block 2 arch B ... block 3 arch A
+  [ok  ] every block of both arms processed frames: [60, 60, 60, 60]
+  [ok  ] Arch B ran its second detector on every stride
+STAGE arch: SIMULATED-PASS (stand-ins; not evidence)        # exit 3; arch_blocks_SIMULATED_<ts>.csv
+$ python scripts/hw_validation/hwv_stage.py observe --fake
+STAGE observe: SIMULATED-PASS (stand-ins; not evidence)     # exit 3; observe_SIMULATED_<ts>/record.*
+```
+
 ## M8.3 additions (2026-11-13): one command per stage, known-good inputs, the device path checked on the fleet
 
 Still **not executed on hardware**. What M8.3 added on top of the steps below:

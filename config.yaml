@@ -80,6 +80,11 @@ dashboard:
   # Live-feed cost controls. Annotating + JPEG-encoding competes with the detector for
   # CPU on the Pi, so frames are only encoded while someone is actually watching /stream.
   # Lower either value if detection framerate drops while the app's feed is open.
+  # M10 (docs/DIAGNOSTICS.md): GET /api/diagnostics -- detections, evidence, open
+  # conditions, model versions and per-stage latency, for developers. OFF here and
+  # on every shipped device. When true it is still served ONLY with the token
+  # above (403 without one, even on loopback), never uploaded, never a frame.
+  developer_diagnostics: false
   jpeg_quality: 60 # 1-100; 80 was the old default, 50-60 is fine on a phone screen
   stream_fps: 12 # frames/sec pushed to a viewer; detection still runs at full camera fps
   # M8.4 owner Decision C (docs/PRIVACY.md): while monitoring is STOPPED, /stream
@@ -276,6 +281,16 @@ alerts:
   # anyway changes nothing: core/alerts.py refuses them, and services/runtime.py
   # tags them "log", unless this is the boolean true (core/behavior/experimental.py).
   experimental_alerts_audible: false
+  # M10.1 relapse escalation -- OFF; enabling it is an owner decision (docs/ESCALATION_POLICY.md).
+  # An episode ends when its condition clears, so a driver who keeps relapsing (5 s away,
+  # 2 s back, again...) starts every episode at the onset pattern and never hears "urgent".
+  # When enabled: the ALERTED time of a run of these types' episodes counts toward the
+  # category's escalate_after_s (warning: 10 s, unchanged); recovery_s with none of them
+  # alerting ends the run. Changes only which pattern sounds, never whether/when one fires.
+  relapse_escalation:
+    enabled: false
+    types: [distraction, eyes_down, eyes_up, phone_use]
+    recovery_s: 60
   loud_types: [drowsiness, phone_use, eyes_down, eyes_up, attention_lost, # always the loud/continuous tone
                distraction, # sustained sideways head turn (3s+). Was in NEITHER list: locally it
                # escalated by repetition (a deliberate mechanism), but its severity tag fell back to
@@ -384,6 +399,13 @@ modules:
     # Unlike a head turn, an eye genuinely reopens between blinks: a 0.4 s grace bridged
     # those reopenings, so a flurry of ordinary 0.25 s blinks read as one continuous
     # 2 s closure and fired "drowsiness". 1-2 frames covers a landmark glitch at any fps.
+    eye_timing_min_fps: 4.5 # M10.1: below this many processed frames/s, capability "eye_timing" is
+    # impaired and drowsiness / fatigue_warning are reported unavailable (monitoring DEGRADED)
+    # instead of implied. 5 fps is the lowest rate the scenario suite verifies; 4.5 allows jitter.
+    eye_closure_face_loss_hold_s: 0.4 # M10.1: a frame with NO face is not an "open" frame.
+    # The closure episode is held (nothing credited) for up to this long without a face,
+    # then reset. Fed as "open" before, the reset took 2 frames: 0.07 s at 30 fps, 0.4 s at
+    # 5 fps. 0.4 = signal_release_s, the grace every other condition gives a dropout.
     ear_baseline_window_s: 60.0 # session open-eye reference window: the effective closure
     # threshold follows the upper percentile of the last minute's EAR, so putting
     # glasses on (which shifts the whole EAR distribution) doesn't leave the
@@ -615,6 +637,12 @@ modules:
     # read docs/BEHAVIOUR_REASONING.md before turning it on. Optional parameters go in a
     # nested `behavior:` mapping (validated by core/config_schema.py; not preset-overridable).
     behavior_v2: false
+    # M10 driver identity (docs/DRIVER_ASSOCIATION.md). Not set here = the defaults:
+    #   behavior:
+    #     driver_region: null            # [x1, y1, x2, y2] 0..1: the driver's seat, head to lap
+    #     driver_identity:
+    #       face_selection: auto         # with a driver region: FaceMesh 2 faces, the driver's selected; off = 1 face
+    #       calibrated_region: true      # derive data/calibration.driver_region.json during calibration and use it
 
   driver_attention_openpilot:
     # comma.ai openpilot's driver monitoring, verbatim (model + policy from openpilot

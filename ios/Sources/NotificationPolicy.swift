@@ -86,9 +86,17 @@ enum NotificationPolicy {
     /// different history (the backend was reset), so it is re-seeded rather than
     /// silenced for ever.
     ///
+    /// `baselined` is false on the first poll of a device since the app last
+    /// started watching (launch, or coming back to the foreground): that poll
+    /// SEEDS the mark exactly like a first sight. The app does not watch while
+    /// it is in the background, so whatever arrived meanwhile is history by the
+    /// time it looks again -- in the timeline, never announced (and never
+    /// sounded) as if it were happening now, possibly hours later.
+    ///
     /// - Returns: the fresh ids, oldest first, and the mark to store.
-    static func freshEvents(ids: [Int], mark: Int?) -> (fresh: [Int], mark: Int) {
+    static func freshEvents(ids: [Int], mark: Int?, baselined: Bool = true) -> (fresh: [Int], mark: Int) {
         let newest = ids.max()
+        guard baselined else { return ([], newest ?? mark ?? 0) }
         guard let mark else { return ([], newest ?? 0) }
         if let newest, newest < mark { return ([], newest) }
         let fresh = Set(ids.filter { $0 > mark }).sorted()

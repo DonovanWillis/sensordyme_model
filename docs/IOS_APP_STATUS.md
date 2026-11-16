@@ -88,6 +88,45 @@ first device, which then ignored it. An alert the device screen can't find is
 its own banner, no longer headed "Can't reach the server" (which also turned
 the presence pill to Unknown).
 
+**Alert sound on this iPhone (M11).** How an alert reaches the phone: while the
+app is in the foreground, `AlertWatcher` polls every device's latest 25 events
+every 15 s and `AlertNotifier` posts a LOCAL notification
+(`UNUserNotificationCenter`, no push service) for a new red alert or a
+configured rule, at most one per 20 s (`NotificationPolicy`, matching
+cloud/notify.py). `willPresent` shows it as a banner with its sound while the
+app is open. The driver-safety alerts (`distraction`, `eyes_down`, `eyes_up`,
+`phone_use`, `drowsiness`, `attention_lost`: the driver_safety role's
+mandatory alerts, pinned by tests/test_ios_alert_sound_parity.py) arrive
+headed "Driver alert". The sound (`AlertSound.swift`, tested in
+ios/Tests/AlertSoundTests.swift):
+
+- is the standard notification sound (it used to request `.defaultCritical`,
+  which needs Apple's Critical Alerts entitlement this app does not have),
+  played once per event (by event key, else row id; remembered across launches);
+- never for an experimental observation, a "log" record or a log-only type
+  (`phone_detected`, `occupancy_change`, `vlm_judgment`);
+- never for the backlog: the first poll after launch or after returning to the
+  foreground only records where the history ends, so alerts that arrived while
+  the app wasn't watching are in the timeline, never announced as new; an alert
+  the backend received a minute or more after it happened is shown silently,
+  saying how late it was;
+- is labelled: a simulated event's notification is headed "Simulated · …" and
+  its subtitle ends "(simulated)";
+- can be turned off: Settings → Alerts → "Alert sound on this iPhone" (default
+  on), whose footer says what it is.
+
+**What it cannot do, said plainly:** the app posts these notifications itself,
+so it must be open. It does not watch in the background; closed, suspended,
+force-quit, with the phone locked or disconnected, nothing arrives from the
+app, and nothing guarantees the sound is heard even when it is open (Silent
+Mode, Focus and the notification settings apply; the app does not bypass
+them). Delivery while the app is closed would need an APNs push from the
+server, which this app does not have (a paid Apple Developer membership and a
+server-side sender); the optional ntfy channel (Settings → Alerts → When the
+app is closed) is a separate app's push, not this sound. The device's own
+buzzer is the safety alert: it sounds before the device records or uploads
+anything, with or without a phone.
+
 ### Accessibility
 
 - 44 pt targets: Add device / Bluetooth header buttons, the device menu, the
@@ -319,6 +358,7 @@ and run E's device made its first report 1 s before the outage.
 | Check device health | real (device /api/health on the LAN); errors shown | SettingsView.swift:202 |
 | Text-message alerts → Save (changed) | real (POST /v1/account/phone). **Fixed**: the error was set but never displayed. It now says texts are sent only if SMS is set up on the server, and that the server **can't show saved settings back** (there is no GET /v1/account), so the field shows what this phone last entered | SettingsView.swift:222 |
 | Alerts when the app is closed (ntfy) (changed) | real (POST /v1/account/ntfy). **Fixed**: the channel was regenerated on every visit to Settings, which silently replaced the subscribed one; it is now kept in the Keychain (cleared when a different account signs in), "New channel" is explicit, and the screen says whether this channel was saved and that the server can't read it back | BackgroundAlertsSection.swift:93, :145 |
+| Alert sound on this iPhone (M11) | real, phone-only (UserDefaults, default on): whether a new alert's local notification plays the standard sound while the app is open; the footer says it's a convenience, that Silent Mode/Focus can mute it, that nothing arrives with the app closed or the phone locked, and that the device's buzzer is the safety alert. See "Alert sound on this iPhone" above | SettingsView.swift (Alerts section), AlertSound.swift |
 | Exit demo / Log out | real; logout revokes the token server-side (best effort) | SettingsView.swift:30, :259 |
 
 ### Connection doctor (DiagnosticsView)
@@ -402,7 +442,12 @@ Debug launch flags (DEBUG builds only, DebugLaunch.swift): `-orynDemo`,
 ## Tests
 
 `bash ios/Tests/run.sh` runs the Foundation-only logic tests (each
-`<Name>Tests.swift` is concatenated with `Sources/<Name>.swift`). New in M8:
+`<Name>Tests.swift` is concatenated with `Sources/<Name>.swift`). New in M11:
+`AlertSoundTests` (the iPhone alert sound: driver-safety types, never a
+log-only/experimental record, once per event, silent when delivered late or
+turned off, simulated labelled, the backlog never sounds) and additions to
+`NotificationPolicyTests` (the first poll after (re)starting to watch is
+history). New in M8:
 `ConnectionTruthTests` (presence from telemetry age, reply age and refresh
 outcome; the summary count), `ServerReplyTests` (every reply shape to a
 headline and sentence), and additions to `NotificationPolicyTests` (routing),

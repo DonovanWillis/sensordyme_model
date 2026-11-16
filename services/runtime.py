@@ -35,8 +35,18 @@ from typing import Any, Optional, cast
 
 import cv2
 
-from core import accel, device_health, device_state, health_stamp, monitoring_mode, roles, sdnotify
+from core import (
+    accel,
+    device_health,
+    device_state,
+    health_stamp,
+    monitoring_mode,
+    roles,
+    sdnotify,
+    stage_timing,
+)
 from core import camera_privacy as cprivacy
+from core import diagnostics as dx
 from core import monitoring_state as ms
 from core import nodes as monitoring_nodes
 from core import perception as pc
@@ -101,7 +111,7 @@ _FLASH_DURATION_S = 1.5
 _NOT_PAUSED_WHEN_STOPPED = frozenset({"camera", "audible_alert", "alert_output"})
 #: Capabilities that are analysis results (M8.3): never "available" while the
 #: camera or the inference loop that feeds them is impaired.
-_ANALYSIS_CAPABILITIES = frozenset({"face", "objects", "hands", "pose", "attention"})
+_ANALYSIS_CAPABILITIES = frozenset({"face", "objects", "hands", "pose", "attention", "eye_timing"})
 #: The stop reason in words for the app ("by uplink" was internal jargon).
 _STOP_SOURCE_WORDS = {"uplink": "from the app", "dashboard": "from the device's dashboard"}
 _MAX_SWAP_S = 120.0
@@ -270,6 +280,15 @@ class DeviceRuntime:
     #: When to try building an UnavailableModule again (inf: nothing to rebuild).
     _module_rebuild_at = float("inf")
     _module_rebuild_attempts = 0
+    # M10 OBSERVE (docs/DIAGNOSTICS.md): developer diagnostics are OFF unless
+    # dashboard.developer_diagnostics is true; the snapshot is built on the
+    # inference thread only while someone has asked for it recently.
+    _diagnostics_enabled = False
+    _diagnostics_snapshot: Optional[dict] = None
+    _diagnostics_snapshot_at = 0.0
+    _diagnostics_wanted_until = 0.0
+    #: monotonic time the last successfully analysed frame was picked up (frame_interval).
+    _last_processed_at = 0.0
 
     def __init__(
         self,
@@ -326,6 +345,8 @@ class DeviceRuntime:
             if bool(alerts_cfg.get("save_evidence", False)) else None
         )
         self._evidence_max = int(alerts_cfg.get("evidence_max_files", 50))
+        dash_cfg = config.get("dashboard") if isinstance(config.get("dashboard"), dict) else {}
+        self._diagnostics_enabled = dash_cfg.get("developer_diagnostics") is True
 
         # Zones drawn in the app; None until the app has sent any. They are the
         # device's zones whatever mode runs — the app's editor is where a person
@@ -615,8 +636,10 @@ class DeviceRuntime:
                 # because this runs on the HTTP thread on every request while the
                 # inference loop samples on its own cadence. Sharing one baseline
                 # made each consume the other's window and report ~0 fps.
-                health_provider=lambda: {**self.health.snapshot(),
-                                         "device": self._collect_health("dashboard")},
+                health_provider=self._dashboard_health,
+                # M10: GET /api/diagnostics -- off unless configured, token-gated (core/diagnostics.py).
+                diagnostics_provider=self.diagnostics_report,
+                diagnostics_enabled=self._diagnostics_enabled,
                 camera_privacy=self.camera_privacy,
                 local_camera_while_stopped=dash_cfg.get("local_camera_while_stopped", True) is not False,
             )
@@ -1105,6 +1128,55 @@ class DeviceRuntime:
         )
 
     # ------------------------------------------------------------------ health reporting
+    def _dashboard_health(self) -> dict:
+        """GET /api/health: the supervisor's view, the device's own report, and (M10)
+        the per-stage latencies tagged with the host they were measured on."""
+        health = self.health.snapshot() if self.health is not None else {}
+        device = self._collect_health("dashboard")
+        return {**health, "device": device, "performance": self.performance_report(device),
+                "diagnostics": {"enabled": self._diagnostics_enabled, "schema": dx.SCHEMA}}
+
+    def performance_report(self, device: Optional[dict] = None) -> dict:
+        """The `performance` block (core/stage_timing.py, sd-stage-timing/1)."""
+        system = ((device or {}).get("system") or {}).get("metrics") if isinstance(device, dict) else None
+        return stage_timing.report(system_metrics=system if isinstance(system, dict) else None,
+                                   simulated=bool(self._perception_simulated))
+
+    def diagnostics_report(self) -> dict:
+        """GET /api/diagnostics (sd-diagnostics/1). The dashboard has already checked
+        the switch and the device token; this only assembles the body."""
+        now = time.monotonic()
+        self._diagnostics_wanted_until = now + dx.DEMAND_TTL_S
+        device = self._collect_health("diagnostics")
+        monitoring = device.get("monitoring") if isinstance(device.get("monitoring"), dict) else {}
+        snapshot = self._diagnostics_snapshot
+        age = None if snapshot is None else now - self._diagnostics_snapshot_at
+        accel_cfg = self.config.get("accelerator") if isinstance(self.config.get("accelerator"), dict) else {}
+        versions = dx.model_versions(identity=self._model_identity, accel_cfg=accel_cfg,
+                                     software=_VERSION, model_version=self._model_version())
+        return dx.payload(snapshot=snapshot, snapshot_age_s=age, monitoring=monitoring,
+                          performance=self.performance_report(device), versions=versions)
+
+    def _maybe_snapshot_diagnostics(self, module, observation, picked_at: float,
+                                    captured_at: Optional[float]) -> None:
+        """On the inference thread, where the module's state is consistent: at most every
+        SNAPSHOT_INTERVAL_S, and only while a diagnostics request arrived recently."""
+        now = time.monotonic()
+        if now > self._diagnostics_wanted_until or now - self._diagnostics_snapshot_at < dx.SNAPSHOT_INTERVAL_S:
+            return
+        try:
+            hook = getattr(module, "get_debug_state", None)
+            debug = hook() if callable(hook) else None
+            open_episodes = getattr(self.alert_manager, "open_episodes", None)
+            self._diagnostics_snapshot = dx.frame_snapshot(
+                observation=observation, debug_state=debug if isinstance(debug, dict) else None,
+                episodes=open_episodes() if callable(open_episodes) else [], now=now,
+                frame_age_ms=None if captured_at is None else (picked_at - captured_at) * 1000.0,
+                module_name=self.module_name)
+            self._diagnostics_snapshot_at = now
+        except Exception:  # diagnostics never cost a frame
+            log.debug("diagnostics snapshot failed", exc_info=True)
+
     def _collect_health(self, caller: str = "loop") -> dict:
         """This device's real state, for the app's status indicators."""
         report = self._collect_component_health(caller)
@@ -1790,12 +1862,18 @@ class DeviceRuntime:
                            source=self._perception_source, simulated=self._perception_simulated)
         try:
             with engine.activated():
+                started = time.perf_counter()
                 engine.run_due(frame)
                 with engine.consuming(self.module_name):
                     events = module.process(frame)
+                process_ms = (time.perf_counter() - started) * 1000.0
         except Exception:
             self._last_observation = engine.end_frame()
             raise
+        # M10: the module's own reasoning = process() minus every model call and the
+        # tracker inside it (the perception engine adds those up per frame).
+        stage_timing.TIMINGS.add("behaviour_reasoning",
+                                 max(0.0, process_ms - float(getattr(engine, "frame_model_ms", 0.0))))
         observation = engine.end_frame(self._module_signals(module))
         self._last_observation = observation
         return events, observation
@@ -3012,6 +3090,9 @@ class DeviceRuntime:
             self._heartbeat = time.monotonic()
             return True  # timeout: no fresh frame — health watches bus.age_s()
         loop.last_seq = seq
+        picked_at = time.monotonic()
+        if captured_at is not None:
+            stage_timing.TIMINGS.add("frame_age", (picked_at - captured_at) * 1000.0)  # M10
 
         with self._module_lock:
             module = self.module
@@ -3037,6 +3118,9 @@ class DeviceRuntime:
             # Processed-frame cadence, not capture cadence: a stall here is
             # what makes EventEngine drop in-progress evidence.
             self.bus.record_processed()
+            if self._last_processed_at:
+                stage_timing.TIMINGS.add("frame_interval", (picked_at - self._last_processed_at) * 1000.0)
+            self._last_processed_at = picked_at
         except Exception as exc:
             self._consecutive_process_failures += 1
             self._last_process_error = str(exc) or type(exc).__name__
@@ -3059,7 +3143,11 @@ class DeviceRuntime:
             return True
 
         alert_now = time.monotonic()
+        dispatch_started = time.perf_counter()
         evidence_due = self._dispatch_module_events(module, events, alert_now)
+        stage_timing.TIMINGS.add_since("alert_dispatch", dispatch_started)  # M10
+        if captured_at is not None:
+            stage_timing.TIMINGS.add("frame_to_decision", (time.monotonic() - captured_at) * 1000.0)
 
         # Evidence snapshots: OPT-IN (alerts.save_evidence), local-disk only,
         # bounded count — the single, deliberate exception to "frames are never
@@ -3069,6 +3157,8 @@ class DeviceRuntime:
 
         self._evaluate_custom_rules(module, frame, alert_now, observation)
         self._run_nodes(observation, alert_now)
+        if self._diagnostics_enabled:
+            self._maybe_snapshot_diagnostics(module, observation, picked_at, captured_at)
 
         # A periodic frame with nothing happening. Negatives are what stop a
         # detector learning to answer yes to everything, and they are gated

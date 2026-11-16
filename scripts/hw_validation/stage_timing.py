@@ -31,14 +31,29 @@ harness rather than new runtime code:
            rate phone video procedure (docs/HAILO_HARDWARE_VALIDATION.md):
            --trials CSV  columns stimulus_ms, alert_onset_ms[, designed_delay_ms]
            --glass  CSV  columns displayed_ms, captured_ms[, offset_ms]
+
+  record   (Pi, service RUNNING, read-only; M10). Polls /api/health for N
+           minutes and records the runtime's OWN always-on per-stage timings
+           (`performance`, core/stage_timing.py: camera read, frame age, Hailo
+           preprocess / inference / decode, Face Mesh, Hands, tracking,
+           behaviour reasoning, alert dispatch, alert output, frame -> decision,
+           processed fps, RSS, SoC temperature, throttle state) into
+           record.jsonl, record.csv and record.summary.json with the platform
+           tag, the code commit and the model hashes. Unlike `health`, these
+           rolling windows are not drained per caller: other clients may poll.
+
+The architecture comparison (single detector vs production + a second .hef) is
+`hwv_stage.py arch`; its harness (run_block, scheduled_chip) lives here.
 """
 
 from __future__ import annotations
 
 import argparse
+import contextlib
 import csv
 import json
 import os
+import shutil
 import sys
 import time
 import urllib.error
@@ -53,7 +68,9 @@ import hwv_common as hc  # noqa: E402
 import hwv_decode as hd  # noqa: E402
 
 STAGES = ("capture", "preprocess", "hailo_infer", "decode", "detector_total", "facemesh",
-          "hands", "module_logic", "process_total", "frame_total")
+          "hands", "module_logic", "process_total", "frame_total",
+          # M10 arch comparison: the SECOND detector (Arch B), outside module.process().
+          "b_preprocess", "b_hailo_infer", "b_decode", "b_detector_total")
 
 
 # ------------------------------------------------------------------ health (pure)
@@ -172,9 +189,10 @@ class StageRecorder:
         if "process_total" in frame:
             inner = sum(frame.get(k, 0.0) for k in ("detector_total", "facemesh", "hands"))
             frame["module_logic"] = max(0.0, frame["process_total"] - inner)
-        if "detector_total" in frame and "hailo_infer" in frame:
-            frame["preprocess"] = max(0.0, frame["detector_total"] - frame["hailo_infer"]
-                                      - frame.get("decode", 0.0))
+        for prefix in ("", "b_"):
+            if f"{prefix}detector_total" in frame and f"{prefix}hailo_infer" in frame:
+                frame[f"{prefix}preprocess"] = max(0.0, frame[f"{prefix}detector_total"]
+                                                   - frame[f"{prefix}hailo_infer"] - frame.get(f"{prefix}decode", 0.0))
         self.frames.append(frame)
         self._current = {}
         return frame
@@ -221,26 +239,27 @@ class _TimedProxy:
         return getattr(self._hwv_target, name)
 
 
-def instrument_detector(model, recorder: StageRecorder) -> bool:
+def instrument_detector(model, recorder: StageRecorder, prefix: str = "") -> bool:
     """Time predict / pipeline.infer / _decode_raw on a HailoYOLO-shaped object.
 
     Instance attributes shadow the class methods for THIS object only.
     Returns True if it is Hailo-shaped (infer + decode timed), False otherwise
-    (only predict is timed: e.g. the CPU path on a Mac).
+    (only predict is timed: e.g. the CPU path on a Mac). `prefix` ("b_") names
+    the stages of a second detector (the arch comparison's Arch B).
     """
     if getattr(model.predict, "__hwv_timed__", None):
         return hasattr(model, "_ensure_ready")
-    model.predict = timed(model.predict, recorder, "detector_total")
+    model.predict = timed(model.predict, recorder, f"{prefix}detector_total")
     if not (hasattr(model, "_ensure_ready") and hasattr(model, "_decode_raw")):
         return False
     ensure = model._ensure_ready
 
     def ensure_ready_timed():
         pipeline = ensure()
-        return _TimedProxy(pipeline, "infer", recorder, "hailo_infer")
+        return _TimedProxy(pipeline, "infer", recorder, f"{prefix}hailo_infer")
 
     model._ensure_ready = ensure_ready_timed
-    model._decode_raw = timed(model._decode_raw, recorder, "decode")
+    model._decode_raw = timed(model._decode_raw, recorder, f"{prefix}decode")
     return True
 
 
@@ -370,6 +389,270 @@ def cmd_stages(args) -> int:
     return 0
 
 
+# ------------------------------------------------------------------ record (M10, pure parts first)
+def record_row(payload: dict, now_s: float) -> dict:
+    """One poll of /api/health -> a flat row of the runtime's own stage timings."""
+    perf = payload.get("performance")
+    if not isinstance(perf, dict):
+        raise ValueError("this /api/health has no `performance` block: the firmware predates M10 stage timing")
+    platform_tag = perf.get("platform") or {}
+    throttle = perf.get("throttle_now")
+    row: dict = {
+        "t": now_s,
+        "platform_class": platform_tag.get("class"),
+        "processed_fps": perf.get("processed_fps"),
+        "rss_mb": perf.get("rss_mb"),
+        "soc_temperature_c": perf.get("soc_temperature_c"),
+        "throttle_now": "|".join(throttle) if isinstance(throttle, list) else throttle,
+        "throttled_raw": perf.get("throttled_raw"),
+        "monitoring_state": ((payload.get("device") or {}).get("monitoring") or {}).get("state"),
+    }
+    for stage, summary in sorted((perf.get("stages") or {}).items()):
+        if not isinstance(summary, dict):
+            continue
+        for key in ("p50_ms", "p95_ms", "max_ms", "n", "count"):
+            row[f"{stage}_{key}"] = summary.get(key)
+    return row
+
+
+def summarize_record(rows: list[dict]) -> dict:
+    """Across polls: each stage's windowed p50 / p95 (as percentiles) and its worst max."""
+    out: dict = {"polls": len(rows), "platform_classes": sorted({str(r.get("platform_class")) for r in rows})}
+    stages = sorted({k[: -len("_p50_ms")] for r in rows for k in r if k.endswith("_p50_ms")})
+    out["stages"] = {}
+    for stage in stages:
+        p50 = [r[f"{stage}_p50_ms"] for r in rows if r.get(f"{stage}_p50_ms") is not None]
+        p95 = [r[f"{stage}_p95_ms"] for r in rows if r.get(f"{stage}_p95_ms") is not None]
+        worst = [r[f"{stage}_max_ms"] for r in rows if r.get(f"{stage}_max_ms") is not None]
+        counts = [r[f"{stage}_count"] for r in rows if r.get(f"{stage}_count") is not None]
+        out["stages"][stage] = {"window_p50_ms": hd.percentiles(p50), "window_p95_ms": hd.percentiles(p95),
+                                "worst_max_ms": max(worst) if worst else None,
+                                "samples_during_run": (max(counts) - min(counts)) if counts else None}
+    for key in ("processed_fps", "rss_mb", "soc_temperature_c"):
+        out[key] = hd.percentiles([r[key] for r in rows if r.get(key) is not None])
+    out["throttled_any"] = any(bool(r.get("throttle_now")) for r in rows)
+    out["throttle_values"] = sorted({str(r.get("throttled_raw")) for r in rows if r.get("throttled_raw")})
+    out["states_seen"] = sorted({str(r.get("monitoring_state")) for r in rows})
+    out["is_pi_measurement"] = out["platform_classes"] == ["pi"]
+    return out
+
+
+def record_provenance(install_dir: Path, code_root: Path, first: Optional[dict]) -> dict:
+    """What produced the numbers: the code, the config, the model files, the host."""
+    perf = (first or {}).get("performance") or {}
+    monitoring = ((first or {}).get("device") or {}).get("monitoring") or {}
+    config_path = install_dir / "config.yaml"
+    prov: dict = {"git_commit": hc.git_commit(code_root), "code_root": str(code_root),
+                  "platform": perf.get("platform"), "device_model": monitoring.get("model"),
+                  "device_versions": monitoring.get("versions"), "environment": hc.environment()}
+    if config_path.exists():
+        import yaml
+
+        prov["config_sha256"] = hc.sha256_file(config_path)
+        acc = (yaml.safe_load(config_path.read_text()) or {}).get("accelerator") or {}
+        hef = Path(str(acc.get("yolo_hef") or ""))
+        hef = hef if hef.is_absolute() else install_dir / hef
+        prov["hef"] = {"path": str(hef), "pin": acc.get("yolo_hef_sha256"), "decoder": acc.get("yolo_decoder"),
+                       "sha256": hc.sha256_file(hef) if hef.is_file() else None}
+    return prov
+
+
+def record(url: str, token: Optional[str], minutes: float, interval: float, out_dir: Path,
+           install_dir: Path, code_root: Path) -> tuple[int, dict]:
+    """Poll for `minutes`; write record.jsonl / record.csv / record.summary.json. (exit code, summary)"""
+    out_dir.mkdir(parents=True, exist_ok=True)
+    try:
+        first = _fetch(url, token)
+    except urllib.error.URLError as exc:
+        if isinstance(getattr(exc, "reason", None), ConnectionRefusedError) or isinstance(exc, urllib.error.HTTPError):
+            print(f"BLOCKED: {url} answered nothing usable ({exc}). Start sensordyme.service and export the "
+                  "dashboard token in SENSORDYME_TOKEN; this records the running service's own timings.",
+                  file=sys.stderr)
+            return 2, {}
+        raise
+    if not isinstance(first.get("performance"), dict):
+        print("BLOCKED: this /api/health has no `performance` block; the device runs firmware older than M10.",
+              file=sys.stderr)
+        return 2, {}
+    platform_class = (first["performance"].get("platform") or {}).get("class")
+    if platform_class != "pi":
+        print(f"NOTE: the device reports platform class {platform_class!r}: these numbers are NOT a Raspberry Pi "
+              "measurement and are labelled so in every output.", flush=True)
+    rows: list[dict] = []
+    started_utc = hc.utc_now()
+    deadline = time.monotonic() + minutes * 60
+    with (out_dir / "record.jsonl").open("w") as fh:
+        while time.monotonic() < deadline:
+            try:
+                row = record_row(_fetch(url, token), time.monotonic())
+            except Exception as exc:  # noqa: BLE001 - a failed poll is a data point
+                row = {"t": time.monotonic(), "error": repr(exc)[:300]}
+            row["utc"] = hc.utc_now()
+            fh.write(json.dumps(row) + "\n")
+            fh.flush()
+            if "error" not in row:
+                rows.append(row)
+                print(f"{row['utc']}  fps {row.get('processed_fps')}  frame->decision p95 "
+                      f"{row.get('frame_to_decision_p95_ms')} ms  hailo p95 {row.get('hailo_inference_p95_ms')} ms  "
+                      f"temp {row.get('soc_temperature_c')}  [{row.get('platform_class')}]", flush=True)
+            else:
+                print(f"{row['utc']}  poll failed: {row['error']}", flush=True)
+            time.sleep(interval)
+    fields = sorted({k for r in rows for k in r})
+    with (out_dir / "record.csv").open("w", newline="") as fh:
+        writer = csv.DictWriter(fh, fieldnames=fields)
+        writer.writeheader()
+        writer.writerows(rows)
+    summary = summarize_record(rows)
+    summary["provenance"] = record_provenance(install_dir, code_root, first)
+    summary["utc_start"], summary["utc_end"] = started_utc, hc.utc_now()
+    summary["minutes"], summary["interval_s"] = minutes, interval
+    (out_dir / "record.summary.json").write_text(json.dumps(summary, indent=2, default=str))
+    return (0 if rows else 1), summary
+
+
+def cmd_record(args) -> int:
+    code, summary = record(args.url, os.environ.get(args.token_env) or None, args.minutes, args.interval,
+                           Path(args.out), Path(args.install_dir), Path(args.code_root))
+    if summary:
+        print(json.dumps({k: v for k, v in summary.items() if k != "provenance"}, indent=2, default=str))
+    return code
+
+
+# ------------------------------------------------------------------ arch comparison harness (M10)
+@contextlib.contextmanager
+def scheduled_chip():
+    """Every HailoYOLO built inside shares ONE VDevice under the HailoRT model scheduler.
+
+    Two .hefs cannot each own the chip in one process (a second VDevice() is
+    HAILO_OUT_OF_PHYSICAL_DEVICES), and two network groups cannot both be held
+    activated. Arch B therefore needs the scheduler (ROUND_ROBIN), which
+    activates whichever network group has work. Applied to THIS process only
+    (hailo_platform.VDevice and HailoYOLO._ensure_ready are patched for the
+    duration and restored after); production code is unchanged. NOT YET RUN
+    ON HARDWARE: the first Pi run confirms the scheduler path (the tool records
+    the scheduling algorithm in the report).
+    """
+    import hailo_platform as hp
+
+    from core import accel
+
+    real_vdevice = hp.VDevice
+    params = real_vdevice.create_params()
+    params.scheduling_algorithm = hp.HailoSchedulingAlgorithm.ROUND_ROBIN
+    shared = real_vdevice(params=params)
+
+    class _SharedVDevice:
+        def __getattr__(self, name):
+            return getattr(shared, name)
+
+        def release(self) -> None:  # released once, when the arm ends
+            return None
+
+    original_ready = accel.HailoYOLO._ensure_ready
+
+    def ensure_ready_scheduled(self):
+        if self._closed:
+            raise RuntimeError("HailoYOLO used after close()")
+        if self._pipeline is None:
+            session = contextlib.ExitStack()
+            try:
+                pipeline = session.enter_context(self._infer_pipeline)  # no activate(): the scheduler does
+            except Exception:
+                session.close()
+                raise
+            self._session, self._pipeline = session, pipeline
+        return self._pipeline
+
+    hp.VDevice = lambda *a, **k: _SharedVDevice()
+    accel.HailoYOLO._ensure_ready = ensure_ready_scheduled
+    try:
+        yield shared
+    finally:
+        hp.VDevice = real_vdevice
+        accel.HailoYOLO._ensure_ready = original_ready
+        with contextlib.suppress(Exception):
+            shared.release()
+
+
+def thermal_now() -> dict:
+    """SoC temperature and throttle state now (None off a Pi)."""
+    from core import device_health
+
+    temp, live = device_health.thermal_reading()
+    raw = hc.run_text(["vcgencmd", "get_throttled"], timeout=3) if shutil.which("vcgencmd") else None
+    return {"soc_temp_c": temp, "throttle_now": live,
+            "throttled_raw": raw.strip().replace("throttled=", "") if raw else None}
+
+
+def wait_for_thermal_state(target_c: Optional[float], tolerance_c: float, max_wait_s: float,
+                           poll_s: float = 5.0) -> dict:
+    """Wait (up to max_wait_s) until the SoC is no hotter than target + tolerance, so every
+    block of every arm starts in the same thermal state. Off a Pi there is no reading:
+    it returns at once and says so."""
+    started = time.monotonic()
+    reading = thermal_now()
+    while (target_c is not None and reading["soc_temp_c"] is not None
+           and reading["soc_temp_c"] > target_c + tolerance_c and time.monotonic() - started < max_wait_s):
+        time.sleep(poll_s)
+        reading = thermal_now()
+    reading["waited_s"] = round(time.monotonic() - started, 1)
+    reading["within_target"] = (None if target_c is None or reading["soc_temp_c"] is None
+                                else reading["soc_temp_c"] <= target_c + tolerance_c)
+    return reading
+
+
+def run_block(*, module, second, next_frame, every: int, fps: float, seconds: float, warmup: int,
+              second_conf: float = 0.2) -> dict:
+    """One timed block of one arm: the production module on every frame, plus (Arch B)
+    the second detector once every `every` frames -- the production detector stride --
+    paced at the camera's fps. Returns the stage summary, achieved fps, lateness, RSS."""
+    from core.stage_timing import rss_mb
+
+    rec = StageRecorder()
+    for i in range(warmup):  # untimed: lazy model loads, first-run caches
+        frame = next_frame()
+        if frame is None:
+            break
+        module.process(frame)
+        if second is not None and i % every == 0:
+            second.predict(frame, verbose=False, conf=second_conf)
+    if second is not None:
+        instrument_detector(second, rec, prefix="b_")
+    period = 1.0 / fps if fps > 0 else 0.0
+    found: dict = {}
+    n = late = 0
+    t_start = time.perf_counter()
+    nxt = t_start
+    while time.perf_counter() - t_start < seconds:
+        f0 = time.perf_counter()
+        frame = next_frame()
+        f1 = time.perf_counter()
+        if frame is None:
+            break
+        found = instrument_module(module, rec)
+        rec.add("capture", (f1 - f0) * 1000.0)
+        module.process(frame)
+        f2 = time.perf_counter()
+        rec.add("process_total", (f2 - f1) * 1000.0)
+        if second is not None and n % every == 0:
+            second.predict(frame, verbose=False, conf=second_conf)
+        rec.add("frame_total", (time.perf_counter() - f0) * 1000.0)
+        rec.end_frame()
+        n += 1
+        nxt += period
+        delay = nxt - time.perf_counter()
+        if delay > 0:
+            time.sleep(delay)
+        else:
+            late += 1
+    wall = time.perf_counter() - t_start
+    rss, rss_source = rss_mb()
+    return {"frames": n, "wall_s": round(wall, 3), "achieved_fps": round(n / wall, 2) if wall else None,
+            "late_frames": late, "rss_mb": rss, "rss_source": rss_source, "instrumented": found,
+            "summary": rec.summary()}
+
+
 # ------------------------------------------------------------------ latency (pure)
 def analyse_trials(rows: list[dict]) -> dict:
     totals, pipeline = [], []
@@ -425,6 +708,18 @@ def main(argv: Optional[list[str]] = None) -> int:
     s.add_argument("--out", required=True, help="output DIRECTORY (also the working dir)")
     s.add_argument("--no-service-check", action="store_true")
     s.set_defaults(func=cmd_stages)
+
+    r = sub.add_parser("record", help="record the running service's own per-stage timings (M10, read-only)")
+    r.add_argument("--url", default="http://127.0.0.1:8899/api/health")
+    r.add_argument("--token-env", default="SENSORDYME_TOKEN",
+                   help="env var holding the dashboard token (never printed or written)")
+    r.add_argument("--interval", type=float, default=10.0)
+    r.add_argument("--minutes", type=float, default=10.0)
+    r.add_argument("--install-dir", type=Path, default=hc.DEFAULT_INSTALL_DIR,
+                   help="read-only: config.yaml + the .hef are hashed for provenance")
+    r.add_argument("--code-root", default=str(hc.REPO_ROOT))
+    r.add_argument("--out", required=True, help="output DIRECTORY")
+    r.set_defaults(func=cmd_record)
 
     lat = sub.add_parser("latency", help="summarise annotated phone-video trials")
     lat.add_argument("--trials", default=None)

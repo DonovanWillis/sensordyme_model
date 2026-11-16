@@ -205,7 +205,10 @@ def test_shadow_matches_production_on_clean_evidence(traces):
 
 
 def test_driver_identity_is_stated(traces):
-    assert traces["sustained_look_away"]["engine"]["driver"]["driver_identity"] == "face_anchored_person"
+    # M10: the cabin lead-in is the installation calibration (driver alone), so the
+    # calibrated driver region now precedes the face anchor (core/behavior/driver_identity.py).
+    driver = traces["sustained_look_away"]["engine"]["driver"]
+    assert driver["driver_identity"] == "calibrated_seat_region" and driver["identity"] == "identified"
     leaning = traces["passenger_leaning_with_phone"]["engine"]["driver"]
     assert leaning["agrees_with_largest_person"] is False and leaning["accuracy"] == "unevaluated"
 

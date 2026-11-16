@@ -1,0 +1,134 @@
+# Cued stationary in-cabin session, version 1 (M10.1 Priority 6).
+#
+# DATA for scripts/hw_validation/cabin_session.py. A session is a timed script of
+# cues the participant performs IN A PARKED VEHICLE while the device runs; the
+# tool records when each cue ran and what the device raised. NO VIDEO is saved:
+# the ground truth is the cue schedule (plus the operator's void list for cues
+# not performed as cued), scored by evaluation/event_metrics.py against the
+# scenario matrix (incabin_scenarios_v1.yaml), whose safety rules apply in full:
+# stationary only, consenting adults only, acted drowsiness only, operator
+# present, stop any time, never while driving, never on a public road.
+#
+# Every block names the matrix cell its cues count toward. A step's `event` is an
+# annotation v2 event type (role from the matrix: positive / negative /
+# boundary) or null (attentive driving posture: false-alert exposure).
+# Latency is measured from the CUE, so it includes the participant's reaction
+# (typically ~0.3-0.7 s); that is stated in every score output.
+
+schema: sensordyme.incabin.cued_session
+version: 1
+matrix_version: 1
+
+blocks:
+  calibrate:
+    cell: N1_baseline_attentive
+    title: Calibration window (look at the road; nothing is scored)
+    ignore: calibration
+    steps:
+      - {say: "Sit normally, hands on the wheel, look at the road ahead", s: 35, event: null}
+
+  baseline:
+    cell: N1_baseline_attentive
+    title: Attentive baseline, natural blinking (false-alert exposure)
+    steps:
+      - {say: "Look at the road ahead, blink naturally", s: 120, event: null}
+
+  mirror_glances:
+    cell: G1_mirror_glances
+    title: Natural mirror checks (must NOT alert)
+    repeat: 3
+    steps:
+      - {say: "Check the LEFT mirror, about one second, then back", s: 1.5, event: glance_mirror_left}
+      - {say: "Road ahead", s: 6, event: null}
+      - {say: "Check the RIGHT mirror, about one second, then back", s: 1.5, event: glance_mirror_right}
+      - {say: "Road ahead", s: 6, event: null}
+      - {say: "Check the REAR-VIEW mirror, about one second, then back", s: 1.5, event: glance_mirror_rear}
+      - {say: "Road ahead", s: 6, event: null}
+
+  cluster_glances:
+    cell: G2_cluster_glances
+    title: Short instrument-cluster glances (must NOT alert)
+    repeat: 5
+    steps:
+      - {say: "Glance at the speedometer, about one second", s: 1.2, event: glance_cluster}
+      - {say: "Road ahead", s: 5, event: null}
+
+  off_road_prolonged:
+    cell: H1_head_orientation
+    title: Prolonged off-road attention, sideways (must alert)
+    repeat: 3
+    steps:
+      - {say: "Turn your head to the RIGHT target and HOLD until told", s: 5, event: eyes_off_road, attrs: {target: right_45}}
+      - {say: "Road ahead", s: 10, event: null}
+
+  look_down_vs_closure:
+    cell: H1_head_orientation
+    title: Eyes OPEN looking into the lap vs eyes CLOSED head level (drowsiness must fire only for the closure)
+    repeat: 3
+    steps:
+      - {say: "Look DOWN into your lap, eyes OPEN, and HOLD", s: 4, event: eyes_off_road, attrs: {target: lap, eyes: open}}
+      - {say: "Road ahead", s: 10, event: null}
+      - {say: "Head level, CLOSE your eyes and HOLD", s: 3, event: long_closure, attrs: {cued_duration_s: 3}}
+      - {say: "Open your eyes, road ahead", s: 10, event: null}
+
+  closures:
+    cell: E3_sustained_closure
+    title: Sustained eye closure, acted (2 s and 3 s)
+    repeat: 3
+    steps:
+      - {say: "Close your eyes for TWO seconds", s: 2, event: long_closure, attrs: {cued_duration_s: 2}}
+      - {say: "Open, road ahead", s: 10, event: null}
+      - {say: "Close your eyes for THREE seconds", s: 3, event: long_closure, attrs: {cued_duration_s: 3}}
+      - {say: "Open, road ahead", s: 10, event: null}
+
+  phone_handheld:
+    cell: P1_phone_in_hand
+    title: Handheld prop phone, eyes on it (must alert phone_use)
+    repeat: 3
+    steps:
+      - {say: "Hold the PROP phone low and look at it", s: 5, event: phone_use, attrs: {position: hand}}
+      - {say: "Put it down out of view, road ahead", s: 10, event: null}
+
+  phone_mounted:
+    cell: P4_phone_mounted
+    title: Phone in the mount, unused (no phone_use), then looked at
+    steps:
+      - {say: "Phone in the mount, screen on, eyes on the road, hands on the wheel", s: 60, event: null}
+      - {say: "Look at the MOUNTED phone and HOLD", s: 4, event: eyes_off_road, attrs: {target: mounted_phone}}
+      - {say: "Road ahead", s: 10, event: null}
+      - {say: "Look at the MOUNTED phone and HOLD", s: 4, event: eyes_off_road, attrs: {target: mounted_phone}}
+      - {say: "Road ahead", s: 10, event: null}
+
+  passenger_present:
+    cell: M1_multiple_people
+    occupancy: driver_plus_front_passenger
+    title: Driver vs passenger (needs a consenting adult passenger)
+    steps:
+      - {say: "PASSENGER: lean toward the driver and talk; DRIVER: road ahead", s: 30, event: null}
+      - {say: "PASSENGER: use the PROP phone; DRIVER: road ahead", s: 30, event: passenger_phone_use}
+      - {say: "DRIVER: turn to the RIGHT target and HOLD; PASSENGER: lean into the driver's side, look ahead", s: 5, event: eyes_off_road, attrs: {passenger: leaning_in}}
+      - {say: "Both: back to normal", s: 10, event: null}
+      - {say: "DRIVER: close your eyes for THREE seconds; PASSENGER: sit normally", s: 3, event: long_closure, attrs: {cued_duration_s: 3}}
+      - {say: "DRIVER: open, road ahead", s: 10, event: null}
+      - {say: "DRIVER: eyes closed, lean slowly toward the passenger and HOLD (acted; stop if unsafe)", s: 4, event: long_closure, attrs: {posture: slumped_toward_passenger}}
+      - {say: "DRIVER: sit up, road ahead", s: 10, event: null}
+      - {say: "PASSENGER: close your eyes; DRIVER: road ahead", s: 10, event: null}
+
+  driver_absent:
+    cell: A1_driver_absence
+    title: Driver leans fully out of the camera's view
+    repeat: 3
+    steps:
+      - {say: "Lean fully OUT of the camera's view and HOLD", s: 6, event: driver_absent}
+      - {say: "Back in the seat, road ahead", s: 10, event: null}
+
+# Ready-made sessions (the --preset of cabin_session.py plan).
+presets:
+  core: [calibrate, baseline, mirror_glances, cluster_glances, off_road_prolonged, look_down_vs_closure,
+         closures, phone_handheld, phone_mounted, driver_absent]
+  # occupancy driver_plus_front_passenger: only M1 blocks (N1 / G1 cells are driver_only).
+  passenger: [calibrate, passenger_present]
+  # Camera displacement: run `displacement` once as recorded, then nudge the
+  # mount (record the change in --notes, e.g. "mount rotated ~5 deg yaw, no
+  # recalibration") and run it again WITHOUT recalibrating; compare the two scores.
+  displacement: [baseline, off_road_prolonged, look_down_vs_closure, closures, mirror_glances]

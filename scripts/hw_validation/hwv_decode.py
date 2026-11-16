@@ -41,6 +41,38 @@ BOX_CHANNELS = 4 * DFL_BINS
 NUM_CLASSES = 80  # COCO; channels past 80 in the class head are padding
 
 
+def parse_extra_classes(text: Optional[str]) -> dict[int, str]:
+    """`80:hand[,81:x]` -> {80: "hand"} (M10.1): the offline counterpart of
+    accelerator.yolo_extra_classes, for a candidate .hef whose class head carries
+    classes beyond COCO-80. Channels below 80 are COCO and are refused, as the
+    device refuses them (core/config_schema.parse_yolo_extra_classes)."""
+    out: dict[int, str] = {}
+    for raw in (text or "").split(","):
+        part = raw.strip()
+        if not part:
+            continue
+        channel, sep, name = part.partition(":")
+        if not sep or not channel.strip().isdigit() or not name.strip():
+            raise ValueError(f"extra class {part!r}: expected CHANNEL:NAME, e.g. 80:hand")
+        ch = int(channel)
+        if ch < NUM_CLASSES:
+            raise ValueError(f"extra class channel {ch} is a COCO channel (< {NUM_CLASSES})")
+        if ch in out or name.strip() in out.values():
+            raise ValueError(f"extra class {part!r} is listed twice")
+        out[ch] = name.strip()
+    return out
+
+
+def class_columns(extra_classes: Optional[dict[int, str]]) -> Optional[np.ndarray]:
+    """The class-head channel each decoded score column reads, or None for the
+    plain COCO slice [:, :80]: channels 0..79, then the mapped extras in channel
+    order -- exactly core.accel.HailoYOLO._class_scores, so a mapped class competes
+    in the legacy argmax and is a reference multilabel candidate like any COCO class."""
+    if not extra_classes:
+        return None
+    return np.array([*range(NUM_CLASSES), *sorted(extra_classes)], dtype=np.int64)
+
+
 @dataclass(frozen=True)
 class DecoderSpec:
     name: str
@@ -56,6 +88,14 @@ class DecoderSpec:
 LEGACY = DecoderSpec("legacy", anchor_offset=0.5, multilabel=False, nms_iou=0.50)
 REFERENCE = DecoderSpec("reference", anchor_offset=0.0, multilabel=True, nms_iou=0.70,
                         max_det=100, strict_threshold=True)
+#: M10.1: the product's OWN reference decoder (core.accel, accelerator.yolo_decoder:
+#: reference) is not the upstream DAMO transcription above: it keeps score >= conf,
+#: uses the device NMS IoU (HailoYOLO._DEFAULT_NMS_IOU 0.50) and keeps up to
+#: _REFERENCE_MAX_DETECTIONS (500). A parity gate for the decoder that would be
+#: deployed must decode with THIS spec (tests/test_m101_hw_readiness.py pins it
+#: against core.accel); REFERENCE stays the upstream yardstick.
+DEVICE_REFERENCE = DecoderSpec("device_reference", anchor_offset=0.0, multilabel=True, nms_iou=0.50,
+                               max_det=500, strict_threshold=False)
 
 #: Factorial variants: legacy and reference plus one change at a time, so a
 #: difference between the end points can be attributed to offset or to labels.
@@ -189,23 +229,39 @@ def dfl_distances(box_logits: np.ndarray) -> np.ndarray:
 
 
 def decode(outputs: dict, scales: list[Scale], spec: DecoderSpec, conf: float, *,
-           num_classes: int = NUM_CLASSES, classes=None) -> Detections:
-    """Decode one image's raw head tensors into NMS'd detections (input pixels)."""
+           num_classes: int = NUM_CLASSES, classes=None,
+           extra_classes: Optional[dict[int, str]] = None) -> Detections:
+    """Decode one image's raw head tensors into NMS'd detections (input pixels).
+
+    `extra_classes` (M10.1, e.g. {80: "hand"}): class-head channels beyond COCO-80
+    that are classes, read as core.accel does with accelerator.yolo_extra_classes;
+    a detection's class is then the CHANNEL id (80 = hand). None: unchanged."""
     wanted = None if classes is None else np.asarray(sorted({int(c) for c in classes}))
+    columns = class_columns(extra_classes)
+    if columns is not None:
+        needed = int(columns[-1]) + 1
+        narrow = [s.cls for s in scales if _hwc(outputs[s.cls]).shape[-1] < needed]
+        if narrow:
+            raise ValueError(f"extra classes {extra_classes} need class heads with {needed} channels; "
+                             f"{narrow} have fewer")
     all_boxes, all_scores, all_classes, all_strides = [], [], [], []
     for s in scales:
         box_raw = _hwc(outputs[s.box])
         cls_raw = _hwc(outputs[s.cls])
-        scores = cls_raw.reshape(-1, cls_raw.shape[-1])[:, :num_classes]
+        flat = cls_raw.reshape(-1, cls_raw.shape[-1])
+        scores = flat[:, :num_classes] if columns is None else flat[:, columns]
+        ids = np.arange(scores.shape[1]) if columns is None else columns
         if spec.multilabel:
             mask = scores > conf if spec.strict_threshold else scores >= conf
             if wanted is not None:
-                mask &= np.isin(np.arange(scores.shape[1]), wanted)[None, :]
-            anchor_idx, cls_idx = np.nonzero(mask)
-            cls_scores = scores[anchor_idx, cls_idx]
+                mask &= np.isin(ids, wanted)[None, :]
+            anchor_idx, col_idx = np.nonzero(mask)
+            cls_scores = scores[anchor_idx, col_idx]
+            cls_idx = ids[col_idx]
         else:
-            best_cls = scores.argmax(axis=1)
+            best_col = scores.argmax(axis=1)
             best_score = scores.max(axis=1)
+            best_cls = ids[best_col]
             keep = best_score > conf if spec.strict_threshold else best_score >= conf
             if wanted is not None:
                 keep &= np.isin(best_cls, wanted)

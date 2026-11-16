@@ -16,6 +16,21 @@ set -uo pipefail
 cd "$(dirname "$0")/.." || exit 1
 
 MODES=${MODES:-"driver_attention baby_monitoring fall_detection occupancy"}
+# M11: this rehearsal REWRITES `module:` in config.yaml. A device with a role
+# (driver_safety ships that way) may only run its role's mandatory module
+# (core/roles.py), so every other mode would be a config the device refuses --
+# restarts on a safety unit for nothing. Refuse BEFORE anything is written;
+# `make demo-check` (read-only) is the check for a role device.
+ROLE=$(grep -m1 '^role:' config.yaml | awk '{print $2}')
+if [ -n "$ROLE" ] && [ "$ROLE" != "general" ]; then
+  for mode in $MODES; do
+    if [ "$mode" != "driver_attention" ] || [ "$ROLE" != "driver_safety" ]; then
+      echo "REFUSED: this device has role '$ROLE'; cycling module '$mode' would violate its safety floor" >&2
+      echo "         (core/roles.py). Use 'make demo-check' (read-only) on a role device." >&2
+      exit 2
+    fi
+  done
+fi
 PORT=$(.venv/bin/python -c "import yaml;print((yaml.safe_load(open('config.yaml')).get('dashboard') or {}).get('port',8899))")
 # Carry the dashboard token when one is configured. Without it every health poll
 # below 401s and the rehearsal reports every mode as failed on a device that is

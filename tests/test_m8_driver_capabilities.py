@@ -76,8 +76,10 @@ def test_gaze_events_need_the_calibrated_gaze_and_eye_events_do_not(tmp_path):
     reqs = _fresh(tmp_path).event_requirements()
     for event in ("distraction", "eyes_down", "eyes_up", "frequent_glancing", "phone_use"):
         assert "attention" in reqs[event], event
-    for event in ("drowsiness", "fatigue_warning", "attention_lost"):
-        assert reqs[event] == frozenset({"face"}), event
+    # M10.1: the eye events also need frames fast enough to time a closure.
+    for event in ("drowsiness", "fatigue_warning"):
+        assert reqs[event] == frozenset({"face", "eye_timing"}), event
+    assert reqs["attention_lost"] == frozenset({"face"})
     assert reqs["phone_use"] >= {"face", "objects", "attention"}
 
 

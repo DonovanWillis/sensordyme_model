@@ -106,8 +106,9 @@ import numpy as np
 from core import perception as shared_perception
 from core.behavior import BehaviorFrame, BehaviorReasoner, parse_behavior
 from core.behavior import signals as sig
-from core.behavior.association import DriverAssociation, associate_driver
+from core.behavior.association import DriverAssociation
 from core.behavior.camera_model import CameraIntrinsics
+from core.behavior.driver_identity import DriverIdentity, landmark_box, parse_driver_identity
 from core.behavior.engine import BehaviorEngine, EngineConfig, FrameEvidence, frame_quality
 from core.behavior.experimental import observation_detail
 from core.behavior.eye_state import CLOSED as EYE_CLOSED
@@ -146,7 +147,13 @@ from core.confidence import (
 from core.detections import Detection, DetectionFrame
 from core.detectors import Box, get_yolo_model, iou, upper_region
 from core.events import Event
-from core.eye_signal import AdaptiveBaseline, SignalSmoother, eye_gaze_offset_deg, iris_openness
+from core.eye_signal import (
+    AdaptiveBaseline,
+    AlignedOptionalSmoother,
+    SignalSmoother,
+    eye_gaze_offset_deg,
+    iris_openness,
+)
 from core.monitoring_state import IMPAIRED, STARTING, Capability
 from core.tracking import MAX_MATCH_DISTANCE_DIAGONAL_HAND, BoxTracker
 from modules.base import (
@@ -896,6 +903,13 @@ class GlanceCounter:
     chattered across it and was counted as several glances (one 2 s glance
     settling at 37 deg against a 35 deg threshold counted 3+ times in 13% of
     simulated trials). 0 keeps the old every-rising-edge behaviour.
+
+    The return is measured the way GracedConditionTracker measures a release:
+    over the frames actually seen back on centre (first to last), not from the
+    last off-centre frame to the next one. That gap includes a frame interval
+    of off-centre time on each side, so at 5 fps one centred frame (0.2 s)
+    already "lasted" 0.4 s and split one held look into a new glance per frame
+    (M10, tests/test_m10_temporal_defects.py T5).
     """
 
     def __init__(self, window_s: float, min_count: int, release_s: float = 0.0) -> None:
@@ -904,20 +918,31 @@ class GlanceCounter:
         self._release_s = max(0.0, float(release_s))
         self._episode_starts: deque[float] = deque()
         self._was_off_center = False
-        self._last_off_center_at: Optional[float] = None
+        self._seen_off_center = False
+        self._centred_since: Optional[float] = None  # first centred frame after a glance
+        self._centred_last: Optional[float] = None  # latest centred frame
         self._warned = False
 
     def update(self, off_center: bool, now: float) -> bool:
         """Feed the current off-center boolean. Returns True the moment `min_count` is reached."""
         if off_center and not self._was_off_center:
             continuation = (
-                self._last_off_center_at is not None
-                and now - self._last_off_center_at < self._release_s
+                self._seen_off_center
+                and self._centred_since is not None
+                and self._centred_last is not None
+                # 1e-9: three centred frames 0.2 s apart ARE 0.4 s, whatever the
+                # float sum of the timestamps says.
+                and self._centred_last - self._centred_since < self._release_s - 1e-9
             )
             if not continuation:
                 self._episode_starts.append(now)
         if off_center:
-            self._last_off_center_at = now
+            self._seen_off_center = True
+            self._centred_since = self._centred_last = None
+        else:
+            if self._centred_since is None:
+                self._centred_since = now
+            self._centred_last = now
         self._was_off_center = off_center
 
         cutoff = now - self._window_s
@@ -1279,6 +1304,12 @@ class DriverAttentionModule(VisionModule):
         self._ear_smoother = SignalSmoother(smoothing_window)
         self._yaw_smoother = SignalSmoother(smoothing_window)
         self._pitch_smoother = SignalSmoother(smoothing_window)
+        # The iris second opinion on a closure, median-smoothed over the SAME
+        # frames as the EAR it vetoes (M10.1, AlignedOptionalSmoother): a raw
+        # per-frame veto against a lagging EAR median cut the last
+        # (window-1)/2 frames off every closure, a cut that grows as the frame
+        # rate falls.
+        self._iris_smoother = AlignedOptionalSmoother(smoothing_window)
         # Each decision signal's own noise, measured live, so an event's
         # confidence says how far past its threshold the reading was in units
         # of that noise -- see core/confidence.py. Floors are the signals'
@@ -1328,6 +1359,7 @@ class DriverAttentionModule(VisionModule):
             release_frames=int(config.get("eye_closure_release_frames", 2)),
             count_true_time_only=True,
         )
+        self._eye_face_loss_hold_s = float(config.get("eye_closure_face_loss_hold_s", release_s))
         self._perclos_tracker = PerclosTracker(float(config.get("perclos_window_s", 60.0)))
         self._perclos_threshold = float(config.get("perclos_threshold", 0.15))
         self._fatigue_warned = False
@@ -1495,7 +1527,22 @@ class DriverAttentionModule(VisionModule):
         # A gap between frames longer than this is a stall, not evidence (F4);
         # a stall credits one frame interval, not the cap (StallAwareEvidenceClock).
         self._evidence_clock = StallAwareEvidenceClock(float(config.get("max_evidence_gap_s", 0.5)))
+        # M10: the same rule for a SIGNAL that could not be read while frames kept
+        # coming. Each clock advances only on frames whose signal fed its trackers,
+        # so an unreadable stretch counts like a stall (one frame interval), never
+        # as its whole length. Gaze: distraction / eyes_down / eyes_up / glances /
+        # phone_use (a face found with no usable head pose is no gaze evidence; it
+        # used to be credited in full on the next readable frame). Eye: PERCLOS (a
+        # lost face is neither open nor closed time). docs/TEMPORAL_REASONING.md.
+        self._gaze_clock = StallAwareEvidenceClock(float(config.get("max_evidence_gap_s", 0.5)))
+        self._eye_clock = StallAwareEvidenceClock(float(config.get("max_evidence_gap_s", 0.5)))
         self._current_frame_t = 0.0  # this frame's capture time (process())
+        # M10.1: the rate frames actually reach this module, for capability
+        # "eye_timing". The eye rules (drowsiness, PERCLOS fatigue) are verified
+        # from eye_timing_min_fps up (tests/test_m10_temporal_scenarios.py);
+        # below it they are reported impaired instead of claimed.
+        self._frame_intervals: deque[float] = deque(maxlen=15)
+        self._eye_timing_min_fps = float(config.get("eye_timing_min_fps", 4.5))
         # Is the driver's phone held? (PhoneHoldEvidence; hand boxes on detector ticks.)
         self._phone_hold = PhoneHoldEvidence(
             hold_ticks=int(config.get("phone_hold_ticks", 3)),
@@ -1520,6 +1567,15 @@ class DriverAttentionModule(VisionModule):
         region = behavior_section.get("driver_region") if behavior_section else None
         self._seat_region_norm: Optional[tuple[float, float, float, float]] = (
             tuple(float(v) for v in region) if isinstance(region, (list, tuple)) and len(region) == 4 else None)
+        # M10 (core/behavior/driver_identity.py): which face is the driver's and
+        # which person; the region precedence configured > installation-calibrated.
+        self._identity = DriverIdentity(
+            parse_driver_identity(config), configured_region=self._seat_region_norm,
+            calibration_path=Path(config.get("calibration_path", "data/calibration.json")),
+            force_recalibrate=bool(config.get("recalibrate", False)),
+            window_s=float(config.get("calibration_duration_s", 10.0)),
+            attention_calibrated=self._calibrator.is_calibrated,
+        )
         self._driver: Optional[DriverAssociation] = None
         self._phone_evidence: PhoneEvidence = self._engine.phone_evidence
         self._last_detection_at: Optional[float] = None  # evidence time of the last successful detector tick
@@ -1574,7 +1630,9 @@ class DriverAttentionModule(VisionModule):
         # field trades a little landmark quality for far fewer dropouts, and
         # that trade should not require a code change to make.
         self._face_mesh = mp.solutions.face_mesh.FaceMesh(
-            max_num_faces=1,
+            # 2 only with a driver region known at start-up (M10): the driver's
+            # face is then selected among them (_select_driver_face).
+            max_num_faces=self._identity.max_faces,
             refine_landmarks=True,
             min_detection_confidence=float(config.get("face_detection_confidence", 0.5)),
             min_tracking_confidence=float(config.get("face_tracking_confidence", 0.5)),
@@ -1727,9 +1785,10 @@ class DriverAttentionModule(VisionModule):
         difference between an object being in the car and an object being at
         the driver's face, at the fidelity a box detector can support.
 
-        The largest person box is taken as the driver: in a driver-facing
-        camera the driver is the nearest and largest person in frame, and a
-        rear-seat passenger's snack is not this module's event to fire.
+        The largest of `person_boxes` is taken as the driver. Since M10 the
+        caller passes only the associated driver's box (core/behavior/
+        driver_identity.py), or none when the driver cannot be identified: a
+        passenger's or rear-seat passenger's snack is not this module's event.
 
         With NO person detected there is nothing to be near, so nothing
         qualifies. That is the same direction this module already fails in
@@ -1835,7 +1894,13 @@ class DriverAttentionModule(VisionModule):
         self._last_person_visible = bool(person_boxes)
         self._last_person_boxes = person_boxes
         self._last_person_confidences = person_confidences
-        eating_boxes = self._eating_boxes_near_face(eating_boxes, person_boxes)
+        # The driver is the person the driver-identity layer associates (M10:
+        # configured region > calibrated region > the box holding the measured
+        # face > the only person); food and phones are related to that person
+        # only, never to an ambiguous or unresolved one.
+        association = self._identity.associate(list(person_boxes), self._last_face_box, w, h)
+        eating_boxes = self._eating_boxes_near_face(
+            eating_boxes, [] if association.driver_box is None else [association.driver_box])
 
         hand_boxes: list[Box] = []
         hands_ran = self._hands is not None and self._should_run_hands(bool(phone_boxes))
@@ -1860,14 +1925,8 @@ class DriverAttentionModule(VisionModule):
         self._last_hand_boxes = hand_boxes
         self._last_overlay_boxes = overlay_boxes
         self._last_overlay_confidences = overlay_confidences
-        # M8.5: the driver is the person associate_driver picks (seat region,
-        # else the box holding the measured face, else the largest box -- the
-        # shipped proxy), so a larger passenger's phone is not the driver's.
-        seat = None
-        if self._seat_region_norm is not None:
-            x1, y1, x2, y2 = self._seat_region_norm
-            seat = (x1 * w, y1 * h, x2 * w, y2 * h)
-        association = associate_driver(list(person_boxes), self._last_face_box, seat)
+        # M8.5: the driver is the associated person (above), so a larger
+        # passenger's phone is not the driver's.
         self._phone_association = association
         self._phone_driver_box = association.driver_box
         driver_phones = phones_for_associated_driver(phone_boxes, person_boxes, association)
@@ -1922,6 +1981,25 @@ class DriverAttentionModule(VisionModule):
                 erratic = True
         self._hands_erratic_raw = erratic
         self._finish_detection_tick(phone_boxes, eating_boxes)
+
+    def _select_driver_face(self, results, w: int, h: int, now: float):
+        """The FaceMesh face that is the DRIVER's (M10), or None when none is.
+
+        Without face selection (no driver region at start-up: FaceMesh runs
+        with one face) this is the face model's first face, as before. With it,
+        core/behavior/driver_identity.DriverFaceSelector picks among up to two:
+        a passenger's face is never the one EAR / gaze / head pose are read
+        from, and when only a passenger's face is seen the driver's face is
+        reported not visible (the face-lost path: coasting, attention_lost).
+        """
+        faces = list(results.multi_face_landmarks or [])
+        if not self._identity.selection_active:
+            return faces[self._identity.first_face(len(faces)).index or 0] if faces else None
+        boxes = [landmark_box(face.landmark, w, h) for face in faces]
+        detector_fresh = (self._object_detection_error is None and self._last_detection_at is not None
+                          and now - self._last_detection_at <= 1.0)
+        choice = self._identity.select_face(boxes, w, h, now, list(self._last_person_boxes) if detector_fresh else None)
+        return None if choice.index is None else faces[choice.index]
 
     def _should_run_hands(self, phone_seen: bool) -> bool:
         """Whether MediaPipe Hands runs on this detector tick (HANDS_POLICIES)."""
@@ -2128,12 +2206,8 @@ class DriverAttentionModule(VisionModule):
             detector_reason = "object-detector result stale"
         else:
             detector_reason = ""
-        seat = None
-        if self._seat_region_norm is not None:
-            x1, y1, x2, y2 = self._seat_region_norm
-            seat = (x1 * w, y1 * h, x2 * w, y2 * h)
         face_box = self._last_face_box if face_found else None
-        driver = (associate_driver(list(self._last_person_boxes), face_box, seat) if detector_ok
+        driver = (self._identity.associate(list(self._last_person_boxes), face_box, w, h) if detector_ok
                   else DriverAssociation("unknown", None, 0, None, detector_reason))
         self._driver = driver
         driver_box = driver.driver_box
@@ -2206,6 +2280,8 @@ class DriverAttentionModule(VisionModule):
         # The raw capture time is kept for behaviour reasoning v2, which must SEE
         # stalls (it credits nothing across them) rather than receive them clamped.
         frame_t = self.frame_time()
+        if self._frame_intervals.maxlen and self._current_frame_t and frame_t > self._current_frame_t:
+            self._frame_intervals.append(frame_t - self._current_frame_t)
         self._current_frame_t = frame_t
         now = self._evidence_clock.advance(frame_t)
         events: list[Event] = []
@@ -2226,6 +2302,7 @@ class DriverAttentionModule(VisionModule):
 
         rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
         results = self._face_mesh.process(rgb)
+        face_proto = self._select_driver_face(results, w, h, now)
 
         # Whether the driver's phone is being HANDLED (M8.5) is decided per
         # frame below, where the face box and the downward-gaze condition are
@@ -2245,7 +2322,7 @@ class DriverAttentionModule(VisionModule):
                 observation_detail("sustained rapid, chaotic hand motion"),
             ))
 
-        if not results.multi_face_landmarks:
+        if face_proto is None:  # no face, or (M10) no face that is the driver's
             self._last_face_proto = None
             # A significant head turn is a common way to LOSE FaceMesh lock
             # entirely -- it is tuned for near-frontal faces, so "no landmarks"
@@ -2275,11 +2352,18 @@ class DriverAttentionModule(VisionModule):
             coasted_eyes_down = coast and self._last_pitch < self._pitch_threshold_deg
             coasted_eyes_up = coast and self._last_pitch > self._pitch_up_threshold_deg
 
-            # Eye state has no such physical continuity to coast on (closed eyes
-            # do not imply anything about the next moment), so drowsiness still
-            # resets on face loss exactly as before.
-            self._drowsy_tracker.update(False, now)
-            fired = self._distract_tracker.update(coasted_distract, corroborated=coasted_mirror, now=now)
+            # Eye state has no physical continuity to coast on (closed eyes do
+            # not imply anything about the next moment), so nothing is credited
+            # while the face is lost. Nor is a lost face an OPEN eye (M10.1):
+            # the closure episode is held, uncredited, for at most
+            # eye_closure_face_loss_hold_s, then reset -- the same time at every
+            # frame rate (fed False, the reset took 2 frames: 0.07 s at 30 fps,
+            # 0.4 s at 5 fps).
+            self._drowsy_tracker.hold(now, self._eye_face_loss_hold_s)
+            # Every gaze tracker is fed on this frame (coasted or False), so it
+            # is gaze evidence time for them.
+            gaze_now = self._gaze_clock.advance(frame_t)
+            fired = self._distract_tracker.update(coasted_distract, corroborated=coasted_mirror, now=gaze_now)
             self._drowsy_active = self._drowsy_tracker.is_active
             self._distracted_active = self._distract_tracker.is_active
             if fired is not None:
@@ -2289,7 +2373,7 @@ class DriverAttentionModule(VisionModule):
                     "distraction", fired, confidence, self.name,
                     "face lost mid-turn; extrapolated from last known gaze",
                 ))
-            fired = self._eyes_down_tracker.update(coasted_eyes_down, now)
+            fired = self._eyes_down_tracker.update(coasted_eyes_down, gaze_now)
             self._eyes_down_active = self._eyes_down_tracker.is_active
             if fired is not None:
                 events.append(Event.now(
@@ -2298,7 +2382,7 @@ class DriverAttentionModule(VisionModule):
                         self._pitch_threshold_deg - self._last_pitch, self._pitch_noise.sigma)),
                     self.name, "face lost mid-glance; extrapolated from last known gaze",
                 ))
-            fired = self._eyes_up_tracker.update(coasted_eyes_up, now)
+            fired = self._eyes_up_tracker.update(coasted_eyes_up, gaze_now)
             self._eyes_up_active = self._eyes_up_tracker.is_active
             if fired is not None:
                 events.append(Event.now(
@@ -2317,7 +2401,7 @@ class DriverAttentionModule(VisionModule):
             # Handling cues relative to where the face was last seen, and the
             # coasted downward gaze (M8.5).
             phone_candidate = self._phone_handling_now(self._phone_face_box, coasted_eyes_down)
-            fired = self._phone_use_tracker.update(phone_candidate and coasted_off_road, now)
+            fired = self._phone_use_tracker.update(phone_candidate and coasted_off_road, gaze_now)
             self._phone_use_active = self._phone_use_tracker.is_active
             if fired is not None:
                 off_road_confidence = _extrapolated(max(
@@ -2398,11 +2482,11 @@ class DriverAttentionModule(VisionModule):
             self._ear_smoother.reset()
             self._yaw_smoother.reset()
             self._pitch_smoother.reset()
+            self._iris_smoother.reset()
             for noise in (self._ear_noise, self._yaw_noise, self._pitch_noise):
                 noise.observe(None)  # a gap is motion, not noise
         self._face_lost_active = False
 
-        face_proto = results.multi_face_landmarks[0]
         self._last_face_proto = face_proto
         landmarks = face_proto.landmark
         points = [(lm.x * w, lm.y * h) for lm in landmarks]
@@ -2431,6 +2515,9 @@ class DriverAttentionModule(VisionModule):
         # frames better than the eyelid contour this EAR is built from.
         iris_ratio = iris_openness(points)
         self._last_iris = iris_ratio
+        # In step with `ear` (same window, same frames): the closure decisions
+        # below compare the two, so they must describe the same moment.
+        closure_iris = self._iris_smoother.update(iris_ratio)
 
         image_points = np.array(
             [
@@ -2477,6 +2564,9 @@ class DriverAttentionModule(VisionModule):
                 yaw_offset_deg=float(gaze_offset[0]), pitch_offset_deg=float(gaze_offset[1]))
 
         self._calibrator.observe(ear, rotation, gaze_offset, now)
+        self._identity.observe_calibration(
+            now, calibrated=self._calibrator.is_calibrated, face_landmarks=landmarks,
+            person_boxes=self._last_person_boxes, detection_tick=self._detection_tick, w=w, h=h)
 
         # --- drowsiness: calibrated EAR against a session-adaptive reference ---
         # The stored calibration answers "what does an open eye measure" for
@@ -2507,9 +2597,9 @@ class DriverAttentionModule(VisionModule):
         iris_reference = self._iris_baseline.reference(None)
         iris_vetoes_closure = (
             self._iris_veto
-            and iris_ratio is not None
+            and closure_iris is not None
             and iris_reference is not None
-            and iris_ratio >= max(
+            and closure_iris >= max(
                 _IRIS_CLEARLY_OPEN,
                 min(1.0, self._ear_threshold_ratio + _IRIS_VETO_MARGIN) * iris_reference,
             )
@@ -2541,7 +2631,7 @@ class DriverAttentionModule(VisionModule):
         # classifier, the same rule behavior_v2 uses); a lid covering the iris
         # is a closure whatever the head does (a nodding-off head pitches too).
         looking_down = self._closure_is_looking_down(
-            ear, effective_threshold, iris_ratio, iris_vetoes_closure, rotation, gaze_offset)
+            ear, effective_threshold, closure_iris, iris_vetoes_closure, rotation, gaze_offset)
         drowsy_condition = ear < effective_threshold and not iris_vetoes_closure and not looking_down
         self._frame_signals["eye_state"] = shared_perception.EyeState(
             ear=float(ear), iris_openness=None if iris_ratio is None else float(iris_ratio),
@@ -2555,9 +2645,15 @@ class DriverAttentionModule(VisionModule):
         # becomes True once the closure has actually been sustained for drowsy_seconds.
         self._drowsy_active = self._drowsy_tracker.is_active
         if fired is not None:
+            # Before calibration this frame's eye_state says closure cannot be
+            # judged (closed=None) -- yet the rule still runs on the fallback /
+            # session threshold, as it must. The margin is measured against
+            # that uncalibrated threshold, and the event says so (M10).
+            uncalibrated = ("" if self._calibrator.is_calibrated else
+                            "driver not calibrated yet: closure judged against an uncalibrated EAR threshold")
             events.append(Event.now(
                 "drowsiness", fired,
-                margin_confidence(effective_threshold - ear, self._ear_noise.sigma), self.name,
+                margin_confidence(effective_threshold - ear, self._ear_noise.sigma), self.name, uncalibrated,
             ))
 
         # PERCLOS counts a DEEPER closure than drowsy_condition (see
@@ -2573,9 +2669,12 @@ class DriverAttentionModule(VisionModule):
             # a sample at all (neither open nor closed time).
             eye_state = classify_eye_state(behavior_eye, self._behavior.config.eye)
             perclos_closed = perclos_closed and eye_state.state == EYE_CLOSED
-            perclos = self._perclos_tracker.update(perclos_closed, now) if eye_state.known else self._last_perclos
+            perclos = (self._perclos_tracker.update(perclos_closed, self._eye_clock.advance(frame_t))
+                       if eye_state.known else self._last_perclos)
         else:
-            perclos = self._perclos_tracker.update(perclos_closed, now)
+            # Eye evidence time (M10): a face loss between two samples is one
+            # frame interval here, not open-eye (or closed-eye) time.
+            perclos = self._perclos_tracker.update(perclos_closed, self._eye_clock.advance(frame_t))
         self._last_perclos = perclos
         if perclos > self._perclos_threshold and not self._fatigue_warned:
             events.append(Event.now(
@@ -2610,7 +2709,12 @@ class DriverAttentionModule(VisionModule):
         if gaze_delta is None:
             self._yaw_noise.observe(None)
             self._pitch_noise.observe(None)
+        # Gaze evidence time, advanced only when the gaze trackers are fed below.
+        # A face with no usable head pose feeds none of them: they PAUSE, and the
+        # next readable frame is credited one frame interval, not the stretch (M10).
+        gaze_now: Optional[float] = None
         if rotation is not None and not self._calibrator.is_calibrated:
+            gaze_now = pre_calibration_now = self._gaze_clock.advance(frame_t)
             # Not calibrated yet: there is no neutral pose to measure against,
             # so any delta computed now would be against a placeholder and
             # could cross the distraction/eyes_down/eyes_up thresholds on pure
@@ -2622,10 +2726,10 @@ class DriverAttentionModule(VisionModule):
             # call leaves whatever state was already there untouched, while an
             # explicit False update is what actually walks it back to clean
             # over the calibration window, comfortably past release_s.
-            self._distract_tracker.update(False, corroborated=False, now=now)
-            self._glance_counter.update(False, now)
-            self._eyes_down_tracker.update(False, now)
-            self._eyes_up_tracker.update(False, now)
+            self._distract_tracker.update(False, corroborated=False, now=pre_calibration_now)
+            self._glance_counter.update(False, pre_calibration_now)
+            self._eyes_down_tracker.update(False, pre_calibration_now)
+            self._eyes_up_tracker.update(False, pre_calibration_now)
             self._distracted_active = False
             self._eyes_down_active = False
             self._eyes_up_active = False
@@ -2635,6 +2739,7 @@ class DriverAttentionModule(VisionModule):
             # degrees on a single bad frame, and a spike was enough to seed a
             # false glance "episode" in the counter below.
             yaw_delta, pitch_delta = gaze_delta
+            gaze_now = observed_now = self._gaze_clock.advance(frame_t)
             self._yaw_noise.observe(yaw_delta)
             self._pitch_noise.observe(pitch_delta)
             yaw = self._yaw_smoother.update(yaw_delta)
@@ -2644,7 +2749,7 @@ class DriverAttentionModule(VisionModule):
 
             distract_condition = abs(yaw) > self._yaw_threshold_deg
             mirror_check_angle = abs(yaw) > self._mirror_check_yaw_deg
-            fired = self._distract_tracker.update(distract_condition, corroborated=mirror_check_angle, now=now)
+            fired = self._distract_tracker.update(distract_condition, corroborated=mirror_check_angle, now=observed_now)
             # Same fix as drowsiness: the live alert only turns on once the turn has
             # actually been sustained for distraction_seconds (or, for a wide-angle
             # turn the whole time, rearview_tolerance_seconds) -- not on every glance.
@@ -2654,12 +2759,12 @@ class DriverAttentionModule(VisionModule):
                 detail = "" if not self._distract_tracker.corroborated else "sustained wide-angle turn (mirror/blind-spot check taking too long)"
                 events.append(Event.now("distraction", fired, confidence, self.name, detail))
 
-            if self._glance_counter.update(distract_condition, now):
+            if self._glance_counter.update(distract_condition, observed_now):
                 # A count crossing a limit: no graded evidence to report.
                 events.append(Event.now("frequent_glancing", 0.0, None, self.name))
 
             eyes_down_condition = pitch < self._pitch_threshold_deg
-            fired = self._eyes_down_tracker.update(eyes_down_condition, now)
+            fired = self._eyes_down_tracker.update(eyes_down_condition, observed_now)
             self._eyes_down_active = self._eyes_down_tracker.is_active
             if fired is not None:
                 events.append(Event.now(
@@ -2668,7 +2773,7 @@ class DriverAttentionModule(VisionModule):
                 ))
 
             eyes_up_condition = pitch > self._pitch_up_threshold_deg
-            fired = self._eyes_up_tracker.update(eyes_up_condition, now)
+            fired = self._eyes_up_tracker.update(eyes_up_condition, observed_now)
             self._eyes_up_active = self._eyes_up_tracker.is_active
             if fired is not None:
                 events.append(Event.now(
@@ -2693,7 +2798,12 @@ class DriverAttentionModule(VisionModule):
         looking_down = gaze_delta is not None and self._last_pitch < self._pitch_threshold_deg
         phone_candidate = self._phone_handling_now(self._last_face_box, looking_down)
         phone_use_condition = phone_candidate and eyes_off_road
-        fired = self._phone_use_tracker.update(phone_use_condition, now)
+        # Gaze unreadable this frame (face found, no usable pose): "eyes off the
+        # road" is unknown, not False, so phone_use PAUSES like the gaze trackers
+        # instead of walking back -- a live phone_use alert used to drop and re-fire
+        # on a one-second pose failure (M10).
+        fired = (self._phone_use_tracker.update(phone_use_condition, gaze_now)
+                 if gaze_now is not None else None)
         # The tracker's own state, like every other condition here: clearing
         # the flag on any single False frame (one stride tick where YOLO missed
         # the phone) dropped the live alert for the rest of the episode, since
@@ -2844,6 +2954,9 @@ class DriverAttentionModule(VisionModule):
             # skipped tick means "not looked for", never "no hands"), and the
             # engine's shadow verdicts / phone evidence / driver association.
             "hands_ran_last_tick": self._hands_ran_last_tick,
+            # M10: whose face / which person the signals are about (identified /
+            # uncertain / not_visible / unknown), and how that was decided.
+            **self._identity.snapshot(self._driver),
             **self._engine.snapshot(),
             **(self._behavior.snapshot() if self._behavior is not None else {}),
         }
@@ -2894,6 +3007,7 @@ class DriverAttentionModule(VisionModule):
         wire it into a local-only view if one is added.
         """
         now = self._evidence_clock.now  # the trackers' clock
+        gaze_now = self._gaze_clock.now  # the gaze trackers' clock (M10)
         phone_confidence = None
         if self._last_phone_boxes and self._last_overlay_confidences:
             phone_confidences = [
@@ -2934,13 +3048,13 @@ class DriverAttentionModule(VisionModule):
             "erratic_hands_state": self._phase_label(self._hands_erratic_raw, self._erratic_hands_tracker),
             "erratic_hands_duration_s": round(self._erratic_hands_tracker.elapsed(now), 1),
             "distraction_state": self._phase_label(abs(self._last_yaw) > self._yaw_threshold_deg, self._distract_tracker),
-            "distraction_duration_s": round(self._distract_tracker.elapsed(now), 1),
+            "distraction_duration_s": round(self._distract_tracker.elapsed(gaze_now), 1),
             "eyes_down_state": self._phase_label(self._last_pitch < self._pitch_threshold_deg, self._eyes_down_tracker),
-            "eyes_down_duration_s": round(self._eyes_down_tracker.elapsed(now), 1),
+            "eyes_down_duration_s": round(self._eyes_down_tracker.elapsed(gaze_now), 1),
             "eyes_up_state": self._phase_label(self._last_pitch > self._pitch_up_threshold_deg, self._eyes_up_tracker),
-            "eyes_up_duration_s": round(self._eyes_up_tracker.elapsed(now), 1),
+            "eyes_up_duration_s": round(self._eyes_up_tracker.elapsed(gaze_now), 1),
             "phone_use_state": self._phase_label(bool(self._last_phone_boxes), self._phone_use_tracker),
-            "phone_use_duration_s": round(self._phone_use_tracker.elapsed(now), 1),
+            "phone_use_duration_s": round(self._phone_use_tracker.elapsed(gaze_now), 1),
             "drowsy_state": self._phase_label(self._last_ear < self._last_ear_threshold, self._drowsy_tracker),
             "risk_score": round(self._last_risk_score, 2),
             "state": self._state_label(),
@@ -2949,6 +3063,7 @@ class DriverAttentionModule(VisionModule):
             # M8.4: typed-evidence engine in SHADOW (no alert depends on it), the
             # experimental observations' status, and hand-model scheduling.
             "engine": self._engine.report(),
+            "driver_identity": self._identity.report(self._driver),
             "experimental_observations": {
                 "high_risk_active": self._risk_fusion.is_high_risk_active,
                 "erratic_hands_active": self._erratic_hands_active,
@@ -3128,9 +3243,12 @@ class DriverAttentionModule(VisionModule):
     #: Capabilities computed by this module from a model capability rather than
     #: produced by a model. core/model_registry.yaml lists models only, so these
     #: are excluded from its `uses`; each maps to the model capability it is built on.
-    DERIVED_CAPABILITIES: ClassVar[dict[str, str]] = {"attention": "face"}
+    #: "eye_timing" (M10.1): frames arrive fast enough to time eye closure.
+    DERIVED_CAPABILITIES: ClassVar[dict[str, str]] = {"attention": "face", "eye_timing": "face"}
+    _EYE = frozenset({"face", "eye_timing"})
     _EVENT_REQUIREMENTS: ClassVar[dict[str, frozenset[str]]] = {
-        **dict.fromkeys(("drowsiness", "fatigue_warning", "attention_lost", "elevated_risk", "high_risk"), _FACE),
+        **dict.fromkeys(("drowsiness", "fatigue_warning"), _EYE),
+        **dict.fromkeys(("attention_lost", "elevated_risk", "high_risk"), _FACE),
         **dict.fromkeys(("distraction", "frequent_glancing", "eyes_down", "eyes_up"), _GAZE),
         "phone_detected": _OBJECTS,
         "eating_drinking": _OBJECTS,
@@ -3176,7 +3294,34 @@ class DriverAttentionModule(VisionModule):
             Capability() if self._calibrator.is_calibrated
             else Capability(STARTING, "calibrating this driver's forward gaze (look at the road)")
         )
+        status["eye_timing"] = self._eye_timing_capability()
         return status
+
+    def processing_fps(self) -> Optional[float]:
+        """Frames per second reaching this module: the median of the last 15
+        intervals, so one stall or one burst does not move it. None until 5
+        intervals are known."""
+        if len(self._frame_intervals) < 5:
+            return None
+        median = statistics.median(self._frame_intervals)
+        return 1.0 / median if median > 0 else None
+
+    def _eye_timing_capability(self) -> Capability:
+        """Whether eye closure can be timed at the rate frames arrive (M10.1).
+
+        Drowsiness (2 s of observed closure) and PERCLOS fatigue are verified
+        from 5 fps up in the scenario suite; eye_timing_min_fps allows 10 %
+        timing jitter under that. Below it a closure is a frame or two, the
+        5-frame median spans a second or more, and a frame interval over
+        max_evidence_gap_s credits nothing at all -- so the device says those
+        two alerts are not reliable now, instead of implying it is watching."""
+        fps = self.processing_fps()
+        if fps is None:
+            return Capability(STARTING, "measuring the frame rate")
+        if fps < self._eye_timing_min_fps:
+            return Capability(IMPAIRED, f"frames arrive at {fps:.1f}/s; eye-closure timing (drowsiness, "
+                                        f"fatigue) is verified from {self._eye_timing_min_fps:g}/s")
+        return Capability()
 
     def perception_signals(self) -> dict:
         """Eye state, head pose and gaze measured on the last frame (core/perception.py

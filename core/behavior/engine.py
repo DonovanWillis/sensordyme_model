@@ -20,7 +20,10 @@ degraded evidence -- on clean evidence the thresholds and timings are the
 shipped ones, from the same config keys):
 
   * unobserved time is never credited (FrameGapGuard); production's
-    StallAwareEvidenceClock credits one frame interval per stall;
+    StallAwareEvidenceClock credits one frame interval per stall. On the frame
+    after such a gap a claim whose condition holds but could not accrue is
+    ABSTAIN ("frame gap"), never NOT_SUPPORTED: on a stream slower than
+    ``max_gap_s`` the shadow can support nothing, and says so (M10);
   * a missing gaze or eye state is ABSTAIN, never "on road"/"open": progress
     is HELD (not grown) for at most ``coast_s``, then dropped. Production
     coasts the last gaze reading while a body is detected and resets eye
@@ -50,7 +53,7 @@ from typing import Optional
 
 from core.behavior.association import DriverAssociation
 from core.behavior.evidence import Assessment, FrameGapGuard, unknown
-from core.behavior.eye_state import LOOKING_DOWN, OPEN, DrowsinessEvidence
+from core.behavior.eye_state import CLOSED, LOOKING_DOWN, OPEN, DrowsinessEvidence
 from core.behavior.phone_evidence import (
     ACTIVE,
     HELD,
@@ -251,6 +254,8 @@ class BehaviorEngine:
         }
         verdicts[PHONE_USE] = self._phone(frame, t, dt, verdicts)
         verdicts[ATTENTION_LOST] = self._attention_lost(frame, dt)
+        if stalled:
+            verdicts = self._unobserved(frame, verdicts)
         self.verdicts = verdicts
         self.started = [claim for claim, v in verdicts.items()
                         if v.state == SUPPORTED and before.get(claim) != SUPPORTED]
@@ -266,6 +271,29 @@ class BehaviorEngine:
         return verdicts
 
     # ------------------------------------------------------------------ claims
+    def _unobserved(self, frame: FrameEvidence, verdicts: dict[str, Verdict]) -> dict[str, Verdict]:
+        """After a frame gap nothing was credited (FrameGapGuard), so a claim whose
+        condition HOLDS on this frame but is not yet supported has no answer:
+        ABSTAIN, not NOT_SUPPORTED. Without this a stream slower than max_gap_s
+        reported "closed 0.0s: not drowsy" about eyes shut on every frame (M10)."""
+        c = self.config
+        holds: dict[str, bool] = {DROWSINESS: self._eye_assessment(frame).state == CLOSED}
+        gaze = frame.signals.get(GAZE)
+        if gaze is not None and gaze.usable():
+            yaw, pitch = gaze.value
+            holds[DISTRACTION] = abs(yaw) > c.yaw_threshold_deg
+            holds[EYES_DOWN] = pitch < c.pitch_threshold_deg
+        face = frame.signals.get(FACE)
+        holds[ATTENTION_LOST] = not (face is not None and face.value is True)
+        inp = frame.phone
+        holds[PHONE_USE] = bool(inp.detector_ok and inp.driver_phone and inp.hold == "held" and inp.eyes_off_road)
+        why = f"frame gap over {c.max_gap_s:g}s: unobserved time is not credited"
+        out = dict(verdicts)
+        for claim, verdict in verdicts.items():
+            if verdict.state == NOT_SUPPORTED and holds.get(claim, False):
+                out[claim] = Verdict(claim, ABSTAIN, f"{why} ({verdict.reason})", verdict.evidence)
+        return out
+
     def _eye_assessment(self, frame: FrameEvidence) -> Assessment:
         eye = frame.signals.get(EYE_STATE)
         if eye is None:

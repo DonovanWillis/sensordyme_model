@@ -18,6 +18,7 @@ from core.behavior.association import (
     CONFIGURED_SEAT,
     FACE_ANCHORED,
     NO_PERSON,
+    UNRESOLVED,
     associate_driver,
 )
 from core.behavior.engine import (
@@ -328,7 +329,10 @@ FACE = (274.0, 190.0, 366.0, 308.0)
 
 def test_driver_association_states_its_method():
     assert associate_driver([]).method == NO_PERSON
-    assert associate_driver([DRIVER, PASSENGER]).method == ASSUMED_LARGEST
+    assert associate_driver([DRIVER]).method == ASSUMED_LARGEST
+    # M10: several people and nothing to tell them apart is no longer "the largest".
+    unresolved = associate_driver([DRIVER, PASSENGER])
+    assert unresolved.method == UNRESOLVED and unresolved.driver_box is None
     anchored = associate_driver([DRIVER, LEANING], FACE)
     assert anchored.method == FACE_ANCHORED and anchored.driver_box == DRIVER
     assert anchored.agrees_with_largest is False  # the shipped largest-person proxy would pick the passenger

@@ -8,12 +8,16 @@ import SwiftUI
 /// telling, and never when you were on the Devices list, in Settings, or
 /// looking at something else — which is every moment a notification is for.
 ///
-/// **The honest limit**, unchanged and worth stating plainly: these are local
-/// notifications, so the app posts them. It must be running or very recently
-/// backgrounded — iOS suspends timers in a backgrounded app and decides for
-/// itself when to let one run again. Force-quit the app and nothing arrives.
-/// That is the difference between this and APNs, and it is why this is a demo
-/// path rather than the shipping one.
+/// **The honest limit**, worth stating plainly: these are local notifications,
+/// so the app posts them. The watcher runs only while the app is in the
+/// foreground (RootView stops it on any other scene phase), so backgrounded,
+/// suspended or force-quit, nothing arrives from the app. That is the
+/// difference between this and APNs, and it is why this is a demo path rather
+/// than the shipping one.
+///
+/// Each start is a new watch: the first poll of each device only records where
+/// the history ends (AlertNotifier.beginWatching), so nothing that arrived
+/// while the app was not watching is announced, or sounded, as if it were new.
 @MainActor
 final class AlertWatcher: ObservableObject {
     private let notifier = AlertNotifier.shared
@@ -34,6 +38,7 @@ final class AlertWatcher: ObservableObject {
 
     func start(state: AppState) {
         guard task == nil else { return }
+        notifier.beginWatching()
         task = Task { [weak self] in
             while !Task.isCancelled {
                 await self?.poll(state: state)

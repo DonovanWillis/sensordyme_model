@@ -30,6 +30,62 @@ _KNOWN_TOP_LEVEL = {
 }
 
 
+#: The class channels every product decoder already reads (COCO-80, core/accel.py COCO_NAMES).
+_COCO_CHANNELS = 80
+
+
+def parse_yolo_extra_classes(value) -> dict[int, str]:
+    """`accelerator.yolo_extra_classes` -> {class-head channel: class name}; {} when absent.
+
+    M10, opt-in and experiment-only. A raw-head .hef whose class head carries a
+    class beyond COCO-80 (the EXP-08 device-layout export puts `hand` in channel
+    80, research/m84/device_export.py) is decoded by both HailoYOLO decoders as
+    if channel 80 were padding, so that class is never reported. This names
+    which extra channels ARE classes. Absent or null keeps today's decode bit
+    for bit.
+
+    Refused (ValueError, the message names the key):
+      * a channel below 80: COCO ids are fixed, remapping one would relabel a
+        class every module and preset already depends on;
+      * a non-integer channel (YAML `80:` and JSON `"80"` are both accepted);
+      * an empty, non-string or COCO-colliding name, or one name twice: a
+        consumer selecting by name must find exactly one channel.
+    Whether the loaded .hef has the channel is checked when it is loaded
+    (core/accel.py), because only the HEF knows its class-head width.
+    """
+    if value is None:
+        return {}
+    key = "`accelerator.yolo_extra_classes:`"
+    if not isinstance(value, dict):
+        raise ValueError(f"{key} must be a mapping of class-head channel -> class name like {{80: hand}}, "
+                         f"got {value!r}")
+    from core.accel import COCO_NAMES  # imported here: config validation must not need it otherwise
+
+    coco_names = set(COCO_NAMES.values())
+    out: dict[int, str] = {}
+    for raw_channel, name in value.items():
+        if isinstance(raw_channel, int) and not isinstance(raw_channel, bool):
+            channel = raw_channel
+        elif isinstance(raw_channel, str) and raw_channel.strip().isdigit():
+            channel = int(raw_channel.strip())
+        else:
+            raise ValueError(f"{key} channel {raw_channel!r} is not an integer")
+        if channel < _COCO_CHANNELS:
+            raise ValueError(f"{key} channel {channel} is a COCO class ({COCO_NAMES.get(channel)!r}); only "
+                             f"channels >= {_COCO_CHANNELS} can be mapped, COCO ids are never relabelled")
+        if not isinstance(name, str) or not name.strip():
+            raise ValueError(f"{key} channel {channel} needs a non-empty class name, got {name!r}")
+        label = name.strip()
+        if label in coco_names:
+            raise ValueError(f"{key} name {label!r} (channel {channel}) collides with a COCO class name")
+        if label in out.values():
+            raise ValueError(f"{key} name {label!r} is mapped to more than one channel")
+        if channel in out:
+            raise ValueError(f"{key} channel {channel} is mapped twice")
+        out[channel] = label
+    return dict(sorted(out.items()))
+
+
 def _check(errors: list[str], condition: bool, message: str) -> None:
     if not condition:
         errors.append(message)
@@ -65,6 +121,20 @@ def _validate_alerts(alerts: dict, where: str, errors: list[str], warnings: list
     categories = alerts.get("categories")
     if categories is not None:
         _validate_categories(categories, where, errors)
+    relapse = alerts.get("relapse_escalation")
+    if relapse is not None:
+        if not isinstance(relapse, dict):
+            errors.append(f"`{where}.relapse_escalation:` must be a mapping, got {relapse!r}")
+        else:
+            enabled = relapse.get("enabled", False)
+            _check(errors, isinstance(enabled, bool),
+                   f"`{where}.relapse_escalation.enabled:` must be true or false, got {enabled!r}")
+            types = relapse.get("types", [])
+            _check(errors, isinstance(types, list) and all(isinstance(t, str) and t for t in types),
+                   f"`{where}.relapse_escalation.types:` must be a list of names like [a, b], got {types!r}")
+            recovery = relapse.get("recovery_s", 60)
+            _check(errors, _is_num(recovery) and 5 <= recovery <= 600,
+                   f"`{where}.relapse_escalation.recovery_s:` must be a number in [5, 600], got {recovery!r}")
     for key in ("sinks", "loud_types", "soft_types", "critical_types"):
         if key not in alerts:
             continue
@@ -163,6 +233,16 @@ def validate(config: dict) -> tuple[list[str], list[str]]:
         host = dashboard.get("host", "127.0.0.1")
         _check(errors, isinstance(host, str) and host != "",
                f"`dashboard.host:` must be an IPv4 address or hostname, got {host!r}")
+        # M10 (docs/DIAGNOSTICS.md): developer diagnostics, OFF by default. A bool and
+        # nothing else: "yes" or 1 must not switch on a view of what the camera sees.
+        diagnostics = dashboard.get("developer_diagnostics", False)
+        _check(errors, isinstance(diagnostics, bool),
+               f"`dashboard.developer_diagnostics:` must be true or false, got {diagnostics!r}")
+        if diagnostics is True and not dashboard.get("token"):
+            warnings.append(
+                "dashboard.developer_diagnostics is true but dashboard.token is not set: "
+                "/api/diagnostics refuses every request (403) until a token is configured"
+            )
         if dashboard.get("token") and str(dashboard.get("host")) not in ("127.0.0.1", "localhost"):
             warnings.append(
                 "dashboard.token is set with a non-localhost host: make sure the app "
@@ -179,6 +259,10 @@ def validate(config: dict) -> tuple[list[str], list[str]]:
         decoder = accel_cfg.get("yolo_decoder", "legacy")
         _check(errors, decoder in ("legacy", "reference"),
                f"`accelerator.yolo_decoder:` must be legacy|reference, got {decoder!r}")
+        try:
+            parse_yolo_extra_classes(accel_cfg.get("yolo_extra_classes"))
+        except ValueError as exc:
+            errors.append(str(exc))
     else:
         errors.append("`accelerator:` must be a mapping")
 

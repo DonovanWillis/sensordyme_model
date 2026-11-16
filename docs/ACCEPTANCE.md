@@ -29,6 +29,35 @@ app, runs all 28 journeys + 2 accessibility audits in one xcodebuild invocation
 with no retries, and the acceptance report folds its per-test results in. Plain
 `make acceptance` states explicitly that the iOS half did not run.
 
+### Simulator readiness and the audit instrument (M11)
+
+In the M8.5 (f63ddd9) and M10.1 (5ed3e59) full runs, `test21_AuditDefaultTextSize`
+failed with XCTest's own audit error ("Audit failed to complete in time",
+accessibilityAudit -56, then "Timed out while running accessibility audit")
+and passed when re-run alone. It was never one screen: the sign-in screen
+failed in one run, the device screen and Ask Jupiter in the other. Both times
+it was the FIRST test after the build and a cold Simulator boot, and the whole
+Simulator was slow for its duration: the first app launch took 119 s and 66 s
+(5-12 s in every passing run), one element query took 38 s, a relaunch 128 s,
+and "App event loop idle notification not received" -- while the backend's
+own `/fresh` for that test took its normal ~18 s, and test22, starting 20
+minutes later, ran normally (`retest22b` at 50981e3: test22 alone, first after
+boot, hit -56 the same way).
+
+So `ios_uitest.sh` now waits, bounded (`SIM_READY_MAX_S`, default 600 s), until
+the Simulator launches Settings at normal speed twice in a row (under
+`SIM_READY_LAUNCH_S`, default 5 s) before the first test, and summary.md's second
+line records the result (`sim_ready.txt` has every launch time). A Simulator
+that never settles is recorded as NOT SETTLED and the tests run anyway.
+
+The audit test also runs an audit again, at most twice, ONLY when XCTest's
+audit instrument did not finish (-56, or XCTFuture 1000 "Timed out while
+running accessibility audit"), after the screen is still. A finding is never
+retried, no audit type or accepted issue changes, and a last attempt that
+also fails fails the test. Each retry is in the screen's `audit_<screen>.txt`
+(an `audit-retry` line), in xcodebuild.log ("ORYN audit retry"), and listed at
+the end of summary.md.
+
 ## The journey matrix
 
 `acceptance.md` ends with one row per required journey (1–30):

@@ -240,7 +240,13 @@ def test_missing_language_service_is_stated_not_papered_over(backend):
     data = configure(client, headers, "alert me if my dog gets on the couch")
 
     assert data["source"] == "unavailable"
-    assert "ANTHROPIC_API_KEY" in data["unsupported"][0]["requires"]
+    requires = data["unsupported"][0]["requires"]
+    # The remedy names BOTH ways to make an interpreter available: the default
+    # local model server, and the opt-in cloud fallback, which needs its switch
+    # as well as the key (jupiter/router.py cloud_fallback_config). The key
+    # alone, which is all this used to say, enables nothing by default.
+    assert "Ollama" in requires
+    assert "ANTHROPIC_API_KEY" in requires and "SENSORDYME_ALLOW_EXTERNAL_AI=1" in requires
     assert "nothing has been changed" in data["explanation"].lower()
 
 

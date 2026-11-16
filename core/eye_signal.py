@@ -218,6 +218,41 @@ class SignalSmoother:
         self._samples.clear()
 
 
+class AlignedOptionalSmoother:
+    """A SignalSmoother for a signal that is sometimes unmeasurable (None).
+
+    Exists to keep a SECOND opinion in step with a median-smoothed first one
+    (M10.1). The iris veto used the raw per-frame iris-openness against the
+    5-frame EAR median, which runs (window-1)/2 frames late: on every
+    reopening the smoothed EAR still read "closed" for two frames while the
+    raw iris already read "open", so the veto cancelled the last two frames
+    of every closure. That is 0.07 s at 30 fps and 0.4 s at 5 fps, which is
+    why PERCLOS fell from 0.23 to 0.14 for the same blinks at 5 fps and
+    fatigue_warning never fired (docs/TEMPORAL_REASONING.md, open item O2).
+
+    The window holds the same number of FRAMES as the signal it is compared
+    with, unmeasurable frames included, so both medians describe the same
+    frames. The median is over the measurable samples; None when there are
+    none (no opinion, never a made-up one).
+    """
+
+    def __init__(self, window: int = 5) -> None:
+        self._samples: deque[Optional[float]] = deque(maxlen=max(1, int(window)))
+
+    def update(self, value: Optional[float]) -> Optional[float]:
+        self._samples.append(None if value is None else float(value))
+        known = sorted(v for v in self._samples if v is not None)
+        if not known:
+            return None
+        mid = len(known) // 2
+        if len(known) % 2:
+            return known[mid]
+        return (known[mid - 1] + known[mid]) / 2.0
+
+    def reset(self) -> None:
+        self._samples.clear()
+
+
 class AdaptiveBaseline:
     """A slow rolling estimate of this session's open-eye signal level.
 

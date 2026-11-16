@@ -196,11 +196,16 @@ def test_a_larger_passengers_phone_is_not_the_drivers():
     assert phones_for_associated_driver([PASSENGER_PHONE, LAP], persons, association) == [LAP]
 
 
-def test_without_a_face_the_shipped_largest_person_proxy_applies():
+def test_without_a_face_several_people_lend_the_driver_no_phone():
+    """M10: was the shipped largest-person proxy (the leaning passenger's phone was
+    the driver's). Several people and nothing to tell them apart now relate no
+    phone; a single person is still the driver."""
     persons = [DRIVER_BOX, PASSENGER_LEANING]
     association = associate_driver(persons, None)
-    assert association.driver_box == PASSENGER_LEANING
-    assert phones_for_associated_driver([PASSENGER_PHONE], persons, association) == [PASSENGER_PHONE]
+    assert association.driver_box is None and association.identity == "uncertain"
+    assert phones_for_associated_driver([PASSENGER_PHONE], persons, association) == []
+    alone = associate_driver([DRIVER_BOX], None)
+    assert phones_for_associated_driver([LAP], [DRIVER_BOX], alone) == [LAP]
 
 
 def test_an_ambiguous_driver_relates_no_phone_and_no_person_relates_every_phone():

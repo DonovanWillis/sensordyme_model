@@ -159,7 +159,15 @@ struct EventDetailView: View {
             recordRow("Observed", evidence.observed ?? "Not recorded")
             recordRow("Device's conclusion", evidence.inferred)
             recordRow("Confidence the device recorded", evidence.confidence ?? "Not recorded")
+            // M10: shown only when the record carries them -- no "not recorded"
+            // rows added for history that predates them.
+            if let lasted = evidence.lasted {
+                recordRow("How long it lasted", lasted)
+            }
             recordRow("Alert requested", evidence.alertRequested)
+            if let detectedBy = evidence.detectedBy {
+                recordRow("Detected by", detectedBy)
+            }
             if !evidence.gaps.isEmpty {
                 VStack(alignment: .leading, spacing: 2) {
                     ForEach(evidence.gaps, id: \.self) { gap in

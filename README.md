@@ -54,6 +54,13 @@ iPhone, pair, verify. After that, the loop above is the whole experience.
 
 # Complete Setup Guide — From Unboxing to iPhone Monitoring
 
+> **Someone else is setting up the hardware?** Give them
+> [`docs/FRIEND_HARDWARE_SETUP.md`](docs/FRIEND_HARDWARE_SETUP.md): the same path as 28 steps.
+> Each step states the command, the expected result, pass/fail, recovery, whether it changes the
+> Pi, and whether the owner must approve. They share results with one sanitized evidence command
+> (`scripts/hw_validation/collect_evidence.py`). Demo: `docs/INVESTOR_DEMO.md`. Measured accuracy
+> needs independently verified labels: `docs/REAL_DATA_EVALUATION_PROTOCOL.md`.
+
 This is the authoritative zero-to-ready path. Follow the phases in order. Every
 command here is either a standard OS procedure or a script that exists in this
 repository; commands that can only run on the physical Pi are marked **(Pi)**.
@@ -401,6 +408,16 @@ cd ~/sensordyme && sudo -u $(id -un) .venv/bin/python main.py --no-display --rec
 sudo systemctl start sensordyme
 ```
 
+**Do this calibration with only the driver in view** (no passenger, nobody
+leaning in). The same window also learns where the driver sits and writes
+`data/calibration.driver_region.json`. With that region the device measures
+eyes and gaze on the *driver's* face even when a passenger is in frame, and
+never counts a passenger's phone or drink as the driver's. If the file's
+`region` is null, its `status` says why (usually someone else was in view):
+repeat with the cabin clear. The `systemctl start` above is the restart that
+turns on two-face selection. Full procedure and limits:
+`docs/DRIVER_ASSOCIATION.md` §4.4.
+
 ### Buzzer test, safely
 
 The buzzer is loud at 50 cm — warn anyone nearby, then run the dedicated stage
@@ -460,7 +477,11 @@ minutes of clicking plus the build:
    (to find your server and camera — declining makes discovery impossible, and
    the app says so), Bluetooth (only when you open device setup), and
    Notifications (when you first open a device's screen; alerts are local
-   notifications — no push service to configure).
+   notifications the app posts while it is open, with the iPhone's alert sound
+   once per new alert — no push service to configure). The app doesn't watch
+   in the background: closed or locked, nothing arrives from it, and Silent Mode
+   or Focus can mute the sound. The device's own buzzer is the safety alert and
+   needs no phone (`docs/IOS_APP_STATUS.md`, "Alert sound on this iPhone").
 
 **Know it's the real device build:** it's running on your physical iPhone (the
 Simulator can't do Bluetooth), and the release-configuration audit
@@ -593,8 +614,10 @@ checklist):
 
 **What iOS actually permits in the background (no overpromising):** reconnection
 above happens **when you open the app** (or return to it). In the background
-the app does not keep connections alive; alert delivery while closed goes
-through the notification path, and opening the app is what refreshes state.
+the app does not keep connections alive or look for alerts; alert delivery
+while it is closed goes only through the optional ntfy push (Settings → Alerts
+→ When the app is closed; there is no APNs), and opening the app is what
+refreshes state.
 There is no claim of continuous background streaming or polling — Apple does
 not permit it for an app like this.
 

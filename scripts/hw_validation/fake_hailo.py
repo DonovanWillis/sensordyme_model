@@ -135,8 +135,18 @@ class VDevice:
         if state.vdevice_open:
             raise RuntimeError("fake HEF: HAILO_OUT_OF_PHYSICAL_DEVICES (the chip is exclusive)")
         state.vdevice_open = True
+        params = kwargs.get("params", args[0] if args else None)
+        #: M10 arch comparison: the HailoRT model scheduler lets several network
+        #: groups share one VDevice. Recorded, not modelled: the fake has no timing.
+        self.scheduling_algorithm = getattr(params, "scheduling_algorithm", None)
+        self.configured = 0
+
+    @staticmethod
+    def create_params():
+        return types.SimpleNamespace(scheduling_algorithm=None)
 
     def configure(self, hef, params):
+        self.configured += 1
         return [_NetworkGroup()]
 
     def release(self) -> None:
@@ -181,6 +191,7 @@ def module() -> types.ModuleType:
         "HEF": HEF, "VDevice": VDevice, "InferVStreams": InferVStreams, "Device": _Device,
         "ConfigureParams": types.SimpleNamespace(create_from_hef=lambda hef, interface=None: {}),
         "HailoStreamInterface": types.SimpleNamespace(PCIe="pcie"),
+        "HailoSchedulingAlgorithm": types.SimpleNamespace(NONE="none", ROUND_ROBIN="round_robin"),
         "FormatType": types.SimpleNamespace(UINT8="uint8", FLOAT32="float32", AUTO="auto"),
         "InputVStreamParams": types.SimpleNamespace(make=lambda ng, format_type=None: {}),
         "OutputVStreamParams": types.SimpleNamespace(make=lambda ng, format_type=None: {}),

@@ -231,6 +231,9 @@ single event) drop it, so that one bad batch cannot block every newer alert.
 
 Losing the backend costs you the app and remote configuration. It does **not**
 stop the device working: capture, inference, rule evaluation, local alerts and
-the on-device dashboard all continue, and events queue in memory until the
-uplink returns. That is by design — a safety device that stops watching because
-a server is unreachable would be worse than useless.
+the on-device dashboard all continue, and events queue (bounded, and spooled to
+disk beside `events.csv` so a power cut keeps them — `core/uplink.py`,
+`tests/test_m8_lifecycle_uplink.py`) until the uplink returns. That is by
+design — a safety device that stops watching because a server is unreachable
+would be worse than useless. For what each feature needs, network by network,
+see `docs/PORTABLE_OPERATION.md`.

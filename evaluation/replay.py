@@ -50,6 +50,26 @@ class ReplayResult:
     source_fps: float
     frames_read: int
     settings: dict = field(default_factory=dict)
+    #: Alert types the module said it could NOT evaluate after each processed frame
+    #: (a capability its event_requirements() names was not available: starting,
+    #: impaired, calibrating). Empty sets when the module declares no requirements;
+    #: ``settings["availability_declared"]`` says which.
+    unavailable: list[frozenset[str]] = field(default_factory=list)
+
+    def unavailable_spans(self) -> Optional[dict[str, list[tuple[float, float]]]]:
+        """Per alert type, [start, end) clip-time spans it could not be evaluated; None if undeclared."""
+        if not self.settings.get("availability_declared"):
+            return None
+        spans: dict[str, list[tuple[float, float]]] = {}
+        for n, (t, kinds) in enumerate(zip(self.times, self.unavailable, strict=True)):
+            end = self.times[n + 1] if n + 1 < len(self.times) else self.duration_s
+            for kind in sorted(kinds):
+                runs = spans.setdefault(kind, [])
+                if runs and abs(runs[-1][1] - t) < 1e-9:
+                    runs[-1] = (runs[-1][0], end)
+                else:
+                    runs.append((t, end))
+        return spans
 
 
 class ReplayClock:
@@ -107,6 +127,22 @@ def read_frames(path: str, *, target_fps: Optional[float] = None, resize: Option
     return fps, frames()
 
 
+def unavailable_alerts(module: object) -> Optional[frozenset[str]]:
+    """Event types ``module`` cannot evaluate right now; None if it declares no requirements."""
+    requirements = getattr(module, "event_requirements", None)
+    status = getattr(module, "capability_status", None)
+    if not callable(requirements) or not callable(status):
+        return None
+    needs = requirements()
+    if not isinstance(needs, dict) or not needs:
+        return None
+    caps = status()
+    if not isinstance(caps, dict):
+        return None
+    return frozenset(event for event, required in needs.items()
+                     if any(name in caps and not caps[name].available for name in required))
+
+
 def replay(module_factory: Callable[[], object], path: str, *, target_fps: Optional[float] = None,
            resize: Optional[tuple[int, int]] = (640, 480), fps_override: Optional[float] = None) -> ReplayResult:
     """Run one clip through a fresh module built by ``module_factory``."""
@@ -116,6 +152,8 @@ def replay(module_factory: Callable[[], object], path: str, *, target_fps: Optio
     times: list[float] = []
     active: list[frozenset[str]] = []
     cost: list[float] = []
+    unavailable: list[frozenset[str]] = []
+    declared = False
     with clock.installed():
         module = module_factory()  # built on the replay clock: its start-up timestamps are clip time too
         try:
@@ -131,6 +169,9 @@ def replay(module_factory: Callable[[], object], path: str, *, target_fps: Optio
                                                  getattr(e, "contributing_signals", "") or ""))
                 conditions = getattr(module, "active_alert_conditions", None)
                 active.append(frozenset(conditions() if conditions else ()))
+                cannot = unavailable_alerts(module)
+                declared = declared or cannot is not None
+                unavailable.append(cannot or frozenset())
         finally:
             close = getattr(module, "close", None)
             if close:
@@ -138,4 +179,5 @@ def replay(module_factory: Callable[[], object], path: str, *, target_fps: Optio
     duration = (times[-1] + 1.0 / fps) if times else 0.0
     return ReplayResult(events, times, active, cost, duration, fps, len(times),
                         {"target_fps": target_fps, "resize": list(resize) if resize else None,
-                         "fps_override": fps_override, "timebase": "frame_index/fps"})
+                         "fps_override": fps_override, "timebase": "frame_index/fps",
+                         "availability_declared": declared}, unavailable)

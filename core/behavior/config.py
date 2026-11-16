@@ -110,7 +110,8 @@ def validate_behavior(module_cfg: dict) -> list[str]:
         return errors
     if not isinstance(section, dict):
         return [*errors, f"`modules.driver_attention.behavior:` must be a mapping, got {section!r}"]
-    top = {"phone", "glance", "eye", "max_frame_gap_s", "face_loss_coast_s", "driver_region", "eye_occlusion_check"}
+    top = {"phone", "glance", "eye", "max_frame_gap_s", "face_loss_coast_s", "driver_region", "eye_occlusion_check",
+           "driver_identity"}
     for key in section:
         if key not in top:
             errors.append(f"`modules.driver_attention.behavior.{key}:` unknown key (known: {sorted(top)})")
@@ -147,6 +148,10 @@ def validate_behavior(module_cfg: dict) -> list[str]:
                 errors.append("`modules.driver_attention.behavior.glance.legit_zones:` cannot include `road`")
     if "eye" in section:
         _validate_group("eye", section["eye"], EyeConfig, errors)
+    if "driver_identity" in section:
+        from core.behavior.driver_identity import validate_driver_identity
+
+        errors.extend(validate_driver_identity(section["driver_identity"]))
     return errors
 
 

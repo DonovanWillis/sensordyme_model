@@ -46,6 +46,7 @@ import cv2
 import numpy as np
 
 from core import camera_privacy as cp
+from core import diagnostics as dx
 from core.logging_setup import get_logger
 
 #: This module had no logger at all. It needs exactly one — the open-dashboard
@@ -270,6 +271,8 @@ class DashboardServer:
         stream_send_timeout_s: float = _STREAM_SEND_TIMEOUT_S,
         camera_privacy: Optional[cp.CameraPrivacy] = None,
         local_camera_while_stopped: bool = True,
+        diagnostics_provider: Optional[Callable[[], dict]] = None,
+        diagnostics_enabled: bool = False,
     ) -> None:
         self._host = host
         self._port = port
@@ -290,6 +293,10 @@ class DashboardServer:
         self._token = str(token) if token not in (None, "") else None
         self._events_csv_path = events_csv_path
         self._health_provider = health_provider  # () -> dict, from core/health.py
+        #: M10 developer diagnostics (core/diagnostics.py): OFF unless the config
+        #: says `dashboard.developer_diagnostics: true`, and then never without a token.
+        self._diagnostics_provider = diagnostics_provider
+        self._diagnostics_enabled = diagnostics_enabled is True
         self._jpeg_quality = max(1, min(100, int(jpeg_quality)))
         self._stream_interval = 1.0 / max(1.0, float(stream_fps))
         self._pending_preset: Optional[str] = None
@@ -529,6 +536,9 @@ class DashboardServer:
                     elif self.path.startswith("/api/health"):
                         provider = dashboard._health_provider
                         self._json(provider() if provider is not None else {"state": "unknown"})
+                    elif urlsplit(self.path).path == "/api/diagnostics":
+                        body, status = dashboard.diagnostics_response()
+                        self._json(body, status)
                     elif self.path.startswith("/api/history"):
                         limit = 200
                         if "limit=" in self.path:
@@ -587,6 +597,26 @@ class DashboardServer:
         self._thread = thread  # is_alive() checks this, not merely that _httpd exists
         thread.start()
         return self.url
+
+    def diagnostics_response(self) -> tuple[dict, int]:
+        """GET /api/diagnostics, AFTER the request passed the device-token check.
+
+        404 while the switch is off, 403 when no device token is configured (never
+        served unauthenticated, not even on loopback), 503 with no provider. The
+        body of a failure is a fixed sentence: no traceback, no state.
+        """
+        if not self._diagnostics_enabled:
+            return {"error": dx.DISABLED_REASON, "enabled": False, "schema": dx.SCHEMA}, 404
+        if self._token is None:
+            return {"error": dx.UNCONFIGURED_REASON, "enabled": True, "schema": dx.SCHEMA}, 403
+        provider = self._diagnostics_provider
+        if provider is None:
+            return {"error": "diagnostics are not available in this process", "schema": dx.SCHEMA}, 503
+        try:
+            return provider(), 200
+        except Exception:
+            log.exception("building /api/diagnostics failed")
+            return {"error": "diagnostics could not be assembled; see the device log", "schema": dx.SCHEMA}, 500
 
     @property
     def url(self) -> str:
