@@ -1,0 +1,16 @@
+# DEVELOPMENT OVERLAY -- NOT INSTALLED, NOT A DEFAULT (M13).
+#
+# Selects the opt-in DAMO-YOLO `reference` decoder for the shipping .hef
+# (candidate B, docs/research/M101_HARDWARE_GATES.md). Nothing reads this file
+# by itself: setup_pi.sh does not copy it, the service never loads it, and
+# config.yaml keeps `accelerator.yolo_decoder: legacy`.
+#
+# It is merged onto a COPY of a device's config by
+#   scripts/hw_validation/dev_config.py --install-dir $D --out ~/hwval/dev/config.reference.yaml
+# which validates the result with core/config_schema.py, prints the exact
+# difference (this one key) and refuses to write inside the installed tree.
+# A development run then points main.py at that copy explicitly
+# (docs/research/M13_PERFORMANCE.md section 6). Promotion rules for B are in
+# docs/research/M101_HARDWARE_GATES.md section 2; owner approval is required.
+accelerator:
+  yolo_decoder: reference

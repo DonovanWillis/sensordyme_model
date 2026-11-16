@@ -534,6 +534,14 @@ def stage_latency(rep: Report, args) -> int:
         args.iterations, args.seconds = min(args.iterations, 30), min(args.seconds, 2)
     else:
         os.environ.setdefault("HAILO_MONITOR", "1")  # lets `hailortcli monitor` see this process
+    # M13: which decoder(s) the burst times. "installed" (the default) is exactly the
+    # pre-M13 stage. legacy / reference / both select the decoder IN THIS PROCESS only
+    # (an isolated development setting): the installed config.yaml is read, never written.
+    installed_decoder = str((config.get("accelerator") or {}).get("yolo_decoder", "legacy"))
+    which = getattr(args, "latency_decoder", "installed") or "installed"
+    decoders = ([installed_decoder] if which == "installed" else ["legacy", "reference"] if which == "both"
+                else [which])
+    rep.values["latency_decoders"] = {"installed": installed_decoder, "timed": decoders}
     accel, model = load_production_model(args.install_dir, config)
     if model is None:
         return rep.block(f"the model did not load: {accel.failure_reason()}")
@@ -549,12 +557,35 @@ def stage_latency(rep: Report, args) -> int:
             model.predict(frames[0], conf=0.2)
         rec.frames.clear()
         rec._current = {}
-        # Burst: back-to-back, the worst case for the host side.
-        for i in range(args.iterations):
-            model.predict(frames[i % len(frames)], conf=0.2)
-            rec.end_frame()
-        burst = rec.summary()
-        # Paced: the production rate (camera fps / yolo_every_n_frames) for --seconds.
+        # Burst: back-to-back, the worst case for the host side. With two decoders,
+        # interleaved in blocks (ABAB) so drift and heating land on both.
+        per_decoder: dict[str, list] = {d: [] for d in decoders}
+        blocks = 2 if len(decoders) > 1 else 1
+        for block in range(blocks):
+            for dec in (decoders if block % 2 == 0 else list(reversed(decoders))):
+                model.decoder = dec
+                rec.frames.clear()
+                rec._current = {}
+                for i in range(args.iterations // blocks):
+                    model.predict(frames[i % len(frames)], conf=0.2)
+                    rec.end_frame()
+                per_decoder[dec].extend(rec.frames)
+        model.decoder = decoders[0]
+        rec.frames = [f for dec in decoders for f in per_decoder[dec]]
+        if len(decoders) > 1:
+            by_dec = {}
+            for dec in decoders:
+                rec_d = st.StageRecorder()
+                rec_d.frames = per_decoder[dec]
+                by_dec[dec] = rec_d.summary()
+            rep.values["burst_by_decoder"] = by_dec
+            print("  burst by decoder: " + "; ".join(
+                f"{d} decode p50 {(s.get('decode') or {}).get('p50')} p95 {(s.get('decode') or {}).get('p95')} ms"
+                for d, s in by_dec.items()))
+        burst = rec.summary() if len(decoders) == 1 else rep.values["burst_by_decoder"][decoders[0]]
+        # Paced: the production rate (camera fps / yolo_every_n_frames) for --seconds,
+        # with the installed decoder (or the one asked for).
+        model.decoder = installed_decoder if which in ("installed", "both") else decoders[0]
         rec.frames.clear()
         period = budget_ms / 1000.0
         t_end = time.perf_counter() + args.seconds
@@ -597,6 +628,10 @@ def stage_latency(rep: Report, args) -> int:
               and bool(infer))
     rep.check(f"predict() p95 <= the production stride budget {budget_ms:.0f} ms",
               bool(total) and total["p95"] <= budget_ms, total.get("p95"))
+    for dec, s in (rep.values.get("burst_by_decoder") or {}).items():
+        t = s.get("detector_total") or {}
+        rep.check(f"[{dec} decoder] predict() p95 <= the production stride budget {budget_ms:.0f} ms",
+                  bool(t) and t["p95"] <= budget_ms, t.get("p95"))
     if args.fake:  # a 2-second run on a busy laptop says nothing about pacing; record, do not judge
         rep.values["paced_check"] = "not judged under --fake"
     else:
@@ -1028,6 +1063,9 @@ def main(argv: Optional[list[str]] = None) -> int:
                         "device tensors; the production decoder is never switched)")
     p.add_argument("--csv", type=Path, default=None, help="thermal: analyse this soak CSV instead of running one")
     p.add_argument("--minutes", type=int, default=30, help="thermal soak length")
+    p.add_argument("--latency-decoder", choices=("installed", "legacy", "reference", "both"), default="installed",
+                   help="latency (M13): the decoder(s) the burst times, selected in this process only; the "
+                        "installed config is never written. both = legacy and reference interleaved ABAB")
     p.add_argument("--iterations", type=int, default=300, help="latency: back-to-back frames")
     p.add_argument("--seconds", type=int, default=60, help="latency: paced run length")
     p.add_argument("--patterns", default=None, help="buzzer: comma list (default: every production pattern)")

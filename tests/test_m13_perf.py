@@ -8,10 +8,20 @@
    same float32 scores, same order, same refusals) against the pre-M13
    formulation, frozen below, on random and planted heads, with and without a
    class filter and the extra-class map, at every threshold edge.
+3. core/eye_signal.AdaptiveBaseline keeps its window sorted as samples arrive
+   and leave, instead of sorting up to 1,800 floats twice per frame. Its
+   reference() is pinned to the pre-M13 sort on random streams with ties,
+   signed zeros, infinities, NaNs, irregular time steps and resets.
+4. The isolated reference-decoder development config (deploy/dev overlay +
+   scripts/hw_validation/dev_config.py) changes exactly one key, validates, and
+   is refused inside the installed tree; config.yaml keeps the legacy default.
+   `hwv_stage.py latency --latency-decoder` times either or both decoders in
+   process, and its default is the pre-M13 stage.
 """
 
 from __future__ import annotations
 
+import math
 import sys
 import threading
 import time
@@ -317,3 +327,140 @@ def test_a_planted_phone_beside_a_stronger_person_survives_both_decoders(chip):
     labels = [COCO_NAMES[int(b.cls[0])] for b in model._decode_raw(raw, 1.0, 0, 80, 640, 480, None, 0.2)[0].boxes]
     assert labels == ["person"]
     assert accel.HailoYOLO.DECODERS == ("legacy", "reference")
+
+
+# ---------------------------------------------------------------------- 3. adaptive baseline
+class _PreM13Baseline:
+    """core/eye_signal.AdaptiveBaseline as it was before M13 (sort per reference())."""
+
+    def __init__(self, window_s=60.0, percentile=0.90, band_low=0.6, band_high=1.4, min_samples=30):
+        from collections import deque
+
+        self._window_s, self._percentile = window_s, percentile
+        self._band_low, self._band_high, self._min_samples = band_low, band_high, min_samples
+        self._samples = deque()
+
+    def observe(self, value, now):
+        self._samples.append((now, float(value)))
+        cutoff = now - self._window_s
+        while self._samples and self._samples[0][0] < cutoff:
+            self._samples.popleft()
+
+    def reference(self, calibrated):
+        if len(self._samples) < self._min_samples:
+            return calibrated
+        ordered = sorted(value for _, value in self._samples)
+        index = min(len(ordered) - 1, int(len(ordered) * self._percentile))
+        session = ordered[index]
+        if calibrated is None:
+            return session
+        return max(self._band_low * calibrated, min(self._band_high * calibrated, session))
+
+    def reset(self):
+        self._samples.clear()
+
+
+def _same(a, b) -> bool:
+    if a is None or b is None:
+        return a is b
+    if a != a or b != b:  # NaN
+        return (a != a) and (b != b)
+    return a == b and math.copysign(1.0, a) == math.copysign(1.0, b)
+
+
+@pytest.mark.parametrize("seed", range(8))
+@pytest.mark.parametrize("calibrated", [None, 0.30])
+def test_adaptive_baseline_reference_is_identical_to_the_pre_m13_sort(seed, calibrated):
+    from core.eye_signal import AdaptiveBaseline
+
+    rng = np.random.default_rng(seed)
+    kwargs = {"window_s": float(rng.choice([2.0, 5.0, 60.0])), "min_samples": int(rng.choice([1, 10, 30])),
+              "percentile": float(rng.choice([0.5, 0.9, 1.0, 0.0]))}
+    new, old = AdaptiveBaseline(**kwargs), _PreM13Baseline(**kwargs)
+    now = 1000.0
+    pool = [0.0, -0.0, 0.25, 0.25, 0.31, float("inf"), float("-inf")]
+    for i in range(3000):
+        now += float(rng.choice([0.0, 1 / 30, 0.05, 0.5, 3.0], p=[0.05, 0.75, 0.1, 0.07, 0.03]))
+        r = rng.random()
+        if seed % 2 and r < 0.01:
+            value = float("nan")  # odd seeds only: exercises the fallback to the original sort
+        elif r < 0.3:
+            value = float(rng.choice(pool))
+        else:
+            value = float(np.round(rng.normal(0.28, 0.05), int(rng.choice([2, 6]))))
+        new.observe(value, now)
+        old.observe(value, now)
+        assert _same(new.reference(calibrated), old.reference(calibrated)), i
+        if i == 1500:
+            new.reset()
+            old.reset()
+
+
+def test_adaptive_baseline_window_still_evicts_by_time():
+    from core.eye_signal import AdaptiveBaseline
+
+    b = AdaptiveBaseline(window_s=1.0, min_samples=1, percentile=1.0)
+    b.observe(0.9, 0.0)
+    b.observe(0.2, 0.5)
+    assert b.reference(None) == 0.9
+    b.observe(0.3, 1.6)  # the 0.9 at t=0 and the 0.2 at t=0.5 are older than 1 s
+    assert b.reference(None) == 0.3
+    assert b._ordered == [0.3]
+    assert b._nans == 0
+
+
+# ---------------------------------------------------------------------- 4. isolated dev config + latency option
+def test_the_reference_decoder_dev_config_changes_exactly_one_key_and_validates(tmp_path):
+    import dev_config
+    import yaml
+
+    base = yaml.safe_load((ROOT / "config.yaml").read_text())
+    assert base["accelerator"]["yolo_decoder"] == "legacy"  # the shipped default is untouched
+    overlay = yaml.safe_load(dev_config.DEFAULT_OVERLAY.read_text())
+    merged, diff, errors, _warnings = dev_config.build(base, overlay)
+    assert errors == []
+    assert diff == [("accelerator.yolo_decoder", "legacy", "reference")]
+    assert merged["accelerator"]["yolo_hef_sha256"] == base["accelerator"]["yolo_hef_sha256"]
+    out = tmp_path / "dev" / "config.reference.yaml"
+    install = tmp_path / "install"
+    install.mkdir()
+    assert dev_config.main(["--install-dir", str(install), "--out", str(out)]) == 0
+    written = yaml.safe_load(out.read_text())
+    assert written["accelerator"]["yolo_decoder"] == "reference"
+    assert out.read_text().startswith("# DEVELOPMENT CONFIG -- NOT INSTALLED")
+    # never inside the installed tree
+    assert dev_config.main(["--install-dir", str(install), "--out", str(install / "config.yaml")]) == 2
+    assert not (install / "config.yaml").exists()
+
+
+def test_a_dev_overlay_that_breaks_the_schema_writes_nothing(tmp_path):
+    import dev_config
+
+    bad = tmp_path / "bad.yaml"
+    bad.write_text("accelerator:\n  yolo_decoder: fastest\n")
+    out = tmp_path / "out.yaml"
+    assert dev_config.main(["--install-dir", str(tmp_path / "none"), "--overlay", str(bad), "--out", str(out)]) == 1
+    assert not out.exists()
+
+
+@pytest.mark.parametrize("which", ["installed", "both"])
+def test_latency_stage_times_the_asked_decoders_in_process_only(tmp_path, which):
+    import json
+    import subprocess
+
+    hwv = ROOT / "scripts" / "hw_validation"
+    r = subprocess.run([sys.executable, str(hwv / "hwv_stage.py"), "latency", "--fake",  # noqa: S603
+                        "--latency-decoder", which, "--iterations", "8", "--seconds", "1", "--out", str(tmp_path)],
+                       cwd=tmp_path, capture_output=True, text=True, timeout=300, check=False)
+    out = r.stdout + r.stderr
+    assert "Traceback" not in out, out
+    assert r.returncode == 3, out  # SIMULATED: a --fake run is never a PASS
+    report = json.loads(next(tmp_path.glob("latency_*.json")).read_text())
+    values = report["values"]
+    assert values["latency_decoders"]["installed"] == "legacy"
+    if which == "installed":
+        assert values["latency_decoders"]["timed"] == ["legacy"]
+        assert "burst_by_decoder" not in values
+    else:
+        assert set(values["burst_by_decoder"]) == {"legacy", "reference"}
+        assert all((s.get("decode") or {}).get("n") for s in values["burst_by_decoder"].values())
