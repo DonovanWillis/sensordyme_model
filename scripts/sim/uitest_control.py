@@ -24,6 +24,9 @@ The UI tests drive scenarios through the control port (127.0.0.1 only):
                                       dashboard=1 (M12) also serves the device's local API on 127.0.0.1:8899
                                       WITH a dashboard token (sim/device.py), so the app's sd-local-v1
                                       session is what lets it in, never "being on loopback".
+                                      scenario=NAME (M13, default attentive) starts the new device
+                                      with that sim/scenario.py scenario, e.g. showcase (presentation
+                                      mode's repeating, simulated distraction demo).
     POST /backend/stop                M12: stop the backend process (the device loses it too) and close the
                                       app's address: "the MacBook backend is OFF". Only /fresh restarts it.
     GET  /device/local                M12: the device's own /api/state policy.protection and how many
@@ -239,7 +242,7 @@ class Stack:
         except urllib.error.HTTPError as e:
             return e.code, json.loads(e.read() or b"null")
 
-    def fresh(self, claimed: bool, tag: str, dashboard: bool = False) -> dict:
+    def fresh(self, claimed: bool, tag: str, dashboard: bool = False, scenario: str = "attentive") -> dict:
         """A new world for one test (POST /fresh in the module docstring).
 
         Nothing a previous test did can reach the next one: the backend's whole
@@ -263,7 +266,7 @@ class Stack:
         self.last_devices = None
         self.local_dashboard = dashboard
         self.start_backend()
-        self.start_device("attentive")
+        self.start_device(scenario)
         if claimed:
             status, answer = self.api("POST", "/v1/devices/claim",
                                       {"claim_code": self.factory()["devices"][0]["claim_code"]})
@@ -529,7 +532,7 @@ def control_handler(stack: Stack, app_port: AppPort, stop: threading.Event):
                 stack.fault_path = "/v1/"
                 app_port.up()
                 return stack.fresh(claimed=q.get("claimed", "1") != "0", tag=q.get("tag", ""),
-                                   dashboard=q.get("dashboard") == "1")
+                                   dashboard=q.get("dashboard") == "1", scenario=q.get("scenario", "attentive"))
             if path == "/backend/stop":
                 # M12: the MacBook backend OFF. The process is stopped (the device
                 # loses it too) and the app's address stops listening. Only /fresh

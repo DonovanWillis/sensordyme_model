@@ -21,14 +21,17 @@ final class OrynJourneysUITests: XCTestCase {
     /// Journeys that start with the device NOT on the account.
     private static let startUnclaimed: Set<String> = ["test03_Discovery"]
     /// Journeys whose device also serves its local API (M12), with a token.
-    private static let localDashboard: Set<String> = ["test29_OfflineLocalCamera"]
+    private static let localDashboard: Set<String> = ["test29_OfflineLocalCamera", "test30_PresentationMode"]
+    /// Journeys whose virtual device runs another scenario than "attentive".
+    private static let scenarios: [String: String] = ["test30_PresentationMode": "showcase"]
 
     override func setUpWithError() throws {
         continueAfterFailure = false
         app = XCUIApplication()
         try Stack.requireController()
-        try Stack.fresh(for: self, claimed: !Self.startUnclaimed.contains(Stack.testName(self)),
-                        dashboard: Self.localDashboard.contains(Stack.testName(self)))
+        let name = Stack.testName(self)
+        try Stack.fresh(for: self, claimed: !Self.startUnclaimed.contains(name),
+                        dashboard: Self.localDashboard.contains(name), scenario: Self.scenarios[name] ?? "attentive")
     }
 
     /// Set by `record(_:)`. `testRun.hasSucceeded` is not final during tearDown, so it
@@ -758,7 +761,74 @@ final class OrynJourneysUITests: XCTestCase {
         shot("29d_local_stop_confirmed")
     }
 
-    static let dwellPrompt = "Alert me if someone stays inside the marked area for longer than 10 seconds"
+    /// M13 (docs/LIVE_OVERLAY.md): presentation mode on the virtual device.
+    ///
+    /// The device runs the `showcase` scenario (a simulated head-turn every 40 s)
+    /// and streams sd-overlay/1 over the phone's own local session. The device
+    /// screen starts on the clean picture; presentation mode opens with the AI
+    /// view on, the Simulated badge (the document says `sim: true`), the
+    /// analysis state and the device's measured frame rate -- all read from the
+    /// overlay. The driver panel then shows the simulated distraction as the
+    /// device reports it, and the mode switch changes the mode the DEVICE
+    /// reports (Driver Safety Standard -> Strict) without leaving the screen.
+    func test30_PresentationMode() throws {
+        launch(["-orynOpenDevice", "-orynDeviceFeed", "http://127.0.0.1:8899", "-"])
+        waitFor(element("camera.liveness"), labelContains: "Live video", timeout: 120)
+        let inlineToggle = element("ai.toggle")
+        XCTAssertTrue(inlineToggle.waitForExistence(timeout: 10), "the live camera offers the AI view")
+        XCTAssertEqual(inlineToggle.value as? String, "Off, picture only", "the clean picture is the default")
+        XCTAssertTrue(element("ai.simulated").waitForExistence(timeout: 30),
+                      "the simulated source is badged in the clean view too")
+        shot("30a_device_clean_view")
+
+        reveal(app.buttons["detail.present"]).tap()
+        XCTAssertTrue(element("present.close").waitForExistence(timeout: 15), "presentation mode opens")
+        XCTAssertTrue(element("ai.simulated").waitForExistence(timeout: 30), "Simulated badge in presentation")
+        let toggle = element("ai.toggle")
+        XCTAssertEqual(toggle.value as? String, "On, showing what the AI sees", "presentation opens on the AI view")
+        waitFor(element("ai.state"), labelContains: "AI view: ", timeout: 30)
+        waitFor(element("ai.perf"), labelContains: " fps", timeout: 30)
+        XCTAssertFalse(element("ai.perf").label.contains("%"), "no percentages: \(element("ai.perf").label)")
+        XCTAssertEqual(element("present.mode.driver_safety:standard").value as? String, "Active",
+                       "the running mode, as the device reports it")
+        shot("30b_presentation_ai_view")
+
+        // The scenario's head-turn, as the device's overlay reports it.
+        let panelState = element("driver.panel.state")
+        waitFor(panelState, labelContains: "Head turned away", timeout: 100)
+        shot("30c_presentation_distraction")
+
+        // Landscape: the picture beside the panel; the exit and the switch still there.
+        // Recorded rather than asserted: whether iOS rotates the app is the
+        // app's orientation setting, not this screen's (the result names it).
+        XCUIDevice.shared.orientation = .landscapeLeft
+        let rotated = Stack.waitUntil(timeout: 10) {
+            let close = self.element("present.close").frame
+            return close.minX < 120 && self.app.windows.firstMatch.frame.width > self.app.windows.firstMatch.frame.height
+        }
+        XCTAssertTrue(element("present.close").waitForExistence(timeout: 10))
+        XCTAssertTrue(element("ai.simulated").exists, "the Simulated badge stays in landscape")
+        Stack.saveText("landscape: \(rotated ? "rotated" : "did not rotate"); window \(app.windows.firstMatch.frame)",
+                       name: "30_landscape", test: self)
+        shot("30c2_presentation_landscape")
+        XCUIDevice.shared.orientation = .portrait
+        _ = Stack.waitUntil(timeout: 10) {
+            self.app.windows.firstMatch.frame.height > self.app.windows.firstMatch.frame.width
+        }
+
+        let strict = element("present.mode.driver_safety:strict")
+        XCTAssertTrue(strict.waitForExistence(timeout: 10))
+        strict.tap()
+        waitFor(strict, selected: true, timeout: 60)  // from what the device reports, not the tap
+        XCTAssertNotEqual(element("present.mode.driver_safety:standard").value as? String ?? "", "Active",
+                          "only one mode is active")
+        shot("30d_presentation_switched")
+
+        element("present.close").tap()
+        XCTAssertTrue(app.buttons["detail.present"].waitForExistence(timeout: 15), "back on the device screen")
+    }
+
+    static let dwellPrompt ="Alert me if someone stays inside the marked area for longer than 10 seconds"
 
     private var monitoring: XCUIElement { element("detail.monitoring") }
 

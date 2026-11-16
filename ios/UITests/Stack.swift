@@ -36,10 +36,13 @@ enum Stack {
     /// Throws, failing the test in setUp, when the controller could not build it.
     /// `dashboard: true` (M12) also serves the device's local API on
     /// 127.0.0.1:8899, with a dashboard token, for the direct-connection journey.
-    static func fresh(for test: XCTestCase, claimed: Bool = true, dashboard: Bool = false) throws {
+    /// `scenario` (M13) starts the new device with that sim/scenario.py scenario
+    /// (`showcase`: a repeating simulated distraction for presentation mode).
+    static func fresh(for test: XCTestCase, claimed: Bool = true, dashboard: Bool = false,
+                      scenario: String = "attentive") throws {
         let tag = testName(test)
-        let answer = try request("POST", "/fresh?claimed=\(claimed ? 1 : 0)&dashboard=\(dashboard ? 1 : 0)&tag=\(tag)",
-                                 timeout: 150)
+        let answer = try request("POST", "/fresh?claimed=\(claimed ? 1 : 0)&dashboard=\(dashboard ? 1 : 0)"
+                                 + "&scenario=\(scenario)&tag=\(tag)", timeout: 150)
         guard answer["device_running"] as? Bool == true, (answer["device_id"] is Int) == claimed else {
             throw ControllerError(message: "the fresh state for \(tag) is not what was asked for: \(answer)")
         }
