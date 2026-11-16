@@ -49,6 +49,7 @@ from core import camera_privacy as cprivacy
 from core import diagnostics as dx
 from core import monitoring_state as ms
 from core import nodes as monitoring_nodes
+from core import overlay as overlay_mod
 from core import perception as pc
 from core.alerts import AlertLevel, AlertManager
 from core.behavior.experimental import is_experimental
@@ -251,6 +252,7 @@ class DeviceRuntime:
     _perception_source = "camera"
     _perception_simulated = False
     _last_observation = None
+    _overlay = overlay_mod.OverlayBuilder()  # replaced per instance in __init__
     _detector_unavailable = None
     _node_zone_signature = None
     _preset_nodes_suspended = False
@@ -387,6 +389,8 @@ class DeviceRuntime:
         self._perception_source = "camera"
         self._perception_simulated = False
         self._last_observation: Optional[pc.Observation] = None
+        #: M13: sd-overlay/1 documents for viewers that draw the analysis (core/overlay.py).
+        self._overlay = overlay_mod.OverlayBuilder()
         self._detector_unavailable: Optional[str] = None
 
         # AI-configured rules. A rule naming "pool" resolves against the same
@@ -1939,6 +1943,18 @@ class DeviceRuntime:
         return events, observation
 
     @staticmethod
+    def _module_overlay_extras(module) -> dict:
+        hook = getattr(module, "overlay_extras", None)
+        if not callable(hook):
+            return {}
+        try:
+            extras = hook()
+        except Exception:  # a broken hook loses the module's half, never the frame
+            log.debug("overlay_extras() failed", exc_info=True)
+            return {}
+        return extras if isinstance(extras, dict) else {}
+
+    @staticmethod
     def _module_signals(module) -> Optional[dict]:
         hook = getattr(module, "perception_signals", None)
         if not callable(hook):
@@ -3176,6 +3192,7 @@ class DeviceRuntime:
             if callable(setter):
                 setter(captured_at)  # decisions rest on when the frame was SEEN
             events, observation = self._perceive(module, frame, seq, captured_at)
+            self._overlay.note_frame(captured_at)  # M13: processed-fps, analysed frames only
             self._consecutive_process_failures = 0
             self._last_process_error = None
             # Processed-frame cadence, not capture cadence: a stall here is
@@ -3274,7 +3291,21 @@ class DeviceRuntime:
             and now - self._last_stream_push >= loop.stream_interval
         )
         view = None
-        if self.display or want_stream:
+        if want_stream and self.dashboard.wants_overlay():
+            # M13 sd-overlay/1: the clean frame + what the AI saw on it, for a
+            # viewer that draws the analysis itself (core/overlay.py). Presentation
+            # only: a failure here never touches detection.
+            try:
+                doc = self._overlay.build(
+                    self._last_observation, self._module_overlay_extras(module), module=self.module_name,
+                    mode=self.active_preset, last_event=self.dashboard.last_event_summary(),
+                    alert_active=module.is_alert_active() or self.rule_engine.is_alert_active(),
+                    captured_at=captured_at)
+                self.dashboard.push_overlay_frame(frame, overlay_mod.encode_header(doc), captured_at=captured_at)
+                self._last_stream_push = now
+            except Exception:
+                log.exception("the sd-overlay/1 frame could not be built; detection is unaffected")
+        if self.display or (want_stream and self.dashboard.wants_annotated()):
             # Guarded exactly like module.process() above, and for a sharper
             # reason: this call happens ONLY while someone is watching the
             # live feed (see `want_stream`). Unguarded, a module that drew

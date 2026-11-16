@@ -148,6 +148,9 @@ class _StreamFrame:
     seq: int  # dashboard-wide, strictly increasing across annotated + camera frames
     captured_at: float  # time.monotonic() of the CAMERA capture this frame shows
     source: str  # "annotated" (the runtime's analysed view) | "camera" (fallback, unanalysed)
+    #: M13 sd-overlay/1 (core/overlay.py): the analysis of THIS frame, header-encoded.
+    #: Only on the clean slot; sent only to viewers that asked for it.
+    overlay: Optional[str] = None
 
 
 #: A loopback viewer while monitoring is stopped (local maintenance; never remote).
@@ -180,7 +183,8 @@ class _StreamClient:
     last_seq: int = 0
 
 
-def _part_header(frame: _StreamFrame, stream_id: str, now: float, source: Optional[str] = None) -> bytes:
+def _part_header(frame: _StreamFrame, stream_id: str, now: float, source: Optional[str] = None,
+                 overlay: bool = False) -> bytes:
     """One multipart part header for a JPEG.
 
     The first three lines are exactly what the stream always sent, so a client
@@ -201,6 +205,9 @@ def _part_header(frame: _StreamFrame, stream_id: str, now: float, source: Option
                        restarted and the seq started again
     """
     age_ms = max(0, int((now - frame.captured_at) * 1000))
+    # M13: X-SD-Overlay (sd-overlay/1) -- only for a viewer that asked, and only
+    # when this frame was analysed (a camera fallback frame carries none).
+    extra = f"X-SD-Overlay: {frame.overlay}\r\n" if overlay and frame.overlay else ""
     return (
         "--frame\r\n"
         "Content-Type: image/jpeg\r\n"
@@ -209,6 +216,7 @@ def _part_header(frame: _StreamFrame, stream_id: str, now: float, source: Option
         f"X-Frame-Age-Ms: {age_ms}\r\n"
         f"X-Frame-Source: {source or frame.source}\r\n"
         f"X-Stream-Id: {stream_id}\r\n"
+        f"{extra}"
         "\r\n"
     ).encode()
 
@@ -318,6 +326,10 @@ class DashboardServer:
         self._lock = threading.Lock()
         #: The ONE latest-frame slot (see _StreamFrame). Replaced, never queued.
         self._frame: Optional[_StreamFrame] = None
+        #: M13: the clean (unannotated) analysed frame + its sd-overlay/1 analysis,
+        #: for viewers that draw the overlay themselves. Encoded only while one watches.
+        self._clean_frame: Optional[_StreamFrame] = None
+        self._overlay_viewers = 0
         self._jpeg_seq = 0
         #: monotonic time of the runtime's last annotated push (fallback gate).
         self._annotated_at = 0.0
@@ -699,6 +711,9 @@ class DashboardServer:
                         self._json(dashboard.stream_stats())
                     elif self.path.startswith("/stream"):
                         heartbeat = self.headers.get("X-Stream-Heartbeat", "") == "1"
+                        # M13 sd-overlay/1: clean frames + the analysis as a header.
+                        overlay = (self.headers.get("X-Stream-Overlay", "") == "1"
+                                   or (parse_qs(urlsplit(self.path).query).get("overlay") or [""])[0] == "1")
                         local = cp.peer_is_local(self.client_address[0] if self.client_address else None)
                         self.send_response(200)
                         self.send_header(
@@ -710,6 +725,8 @@ class DashboardServer:
                         # M8.4: what this viewer may see right now (it can change
                         # mid-stream; heartbeats carry the change).
                         self.send_header("X-Stream-Camera", dashboard.stream_access(local))
+                        if overlay:
+                            self.send_header("X-Stream-Overlay", "sd-overlay/1")
                         if heartbeat:
                             self.send_header(
                                 "X-Stream-Heartbeat-Interval-Ms", str(int(dashboard.HEARTBEAT_INTERVAL_S * 1000))
@@ -729,7 +746,8 @@ class DashboardServer:
 
                             def peer_gone() -> bool:
                                 return self._peer_gone() or not authority.client_active(client_id)
-                        dashboard.serve_stream(self.wfile.write, peer_gone, heartbeat=heartbeat, local=local)
+                        dashboard.serve_stream(self.wfile.write, peer_gone, heartbeat=heartbeat, local=local,
+                                               overlay=overlay)
                     else:
                         self.send_response(404)
                         self.end_headers()
@@ -825,13 +843,27 @@ class DashboardServer:
     def stream_interval(self) -> float:
         return self._stream_interval
 
-    def viewer_joined(self) -> None:
+    def viewer_joined(self, overlay: bool = False) -> None:
         with self._lock:
             self._viewers += 1
+            if overlay:
+                self._overlay_viewers += 1
 
-    def viewer_left(self) -> None:
+    def viewer_left(self, overlay: bool = False) -> None:
         with self._lock:
             self._viewers = max(0, self._viewers - 1)
+            if overlay:
+                self._overlay_viewers = max(0, self._overlay_viewers - 1)
+
+    def wants_overlay(self) -> bool:
+        """M13: a viewer is drawing sd-overlay/1 itself (clean frames + analysis)."""
+        with self._lock:
+            return self._overlay_viewers > 0
+
+    def wants_annotated(self) -> bool:
+        """A viewer wants the device-drawn view (the browser page, an older app)."""
+        with self._lock:
+            return self._viewers > self._overlay_viewers
 
     def has_viewers(self) -> bool:
         """True while at least one client is reading /stream."""
@@ -852,7 +884,7 @@ class DashboardServer:
         self._frame_source = source
 
     def serve_stream(self, write: Callable[[bytes], object], peer_gone: Callable[[], bool],
-                     heartbeat: bool = False, local: bool = False) -> None:
+                     heartbeat: bool = False, local: bool = False, overlay: bool = False) -> None:
         """Feed one viewer until it leaves. Runs on that viewer's handler thread.
 
         Latest-frame-only by construction: each pass reads the ONE shared slot
@@ -878,7 +910,7 @@ class DashboardServer:
             self._stream_counts["connections_total"] += 1
         # Registering as a viewer is what makes the main loop start annotating
         # and encoding at all -- see has_viewers().
-        self.viewer_joined()
+        self.viewer_joined(overlay)
         last_write = time.monotonic()
         try:
             # `not peer_gone()`, not `while True`: the loop used to learn that a
@@ -899,7 +931,7 @@ class DashboardServer:
                             self._stream_counts["privacy_heartbeats"] += 1
                     time.sleep(self.stream_interval)
                     continue
-                frame = self._current_frame()
+                frame = self._current_frame(overlay)
                 now = time.monotonic()
                 if frame is not None and frame.seq != client.last_seq:
                     if now - frame.captured_at > self.MAX_FRAME_AGE_S:
@@ -911,7 +943,7 @@ class DashboardServer:
                         # One write per part: header, JPEG and trailer together
                         # (the handler's wfile is unbuffered -- four writes were
                         # four syscalls per frame).
-                        header = _part_header(frame, self._stream_id, now, _source_for(frame, access))
+                        header = _part_header(frame, self._stream_id, now, _source_for(frame, access), overlay)
                         payload = b"".join((header, frame.jpeg, b"\r\n"))
                         write(payload)
                         skipped = max(0, frame.seq - client.last_seq - 1) if client.last_seq else 0
@@ -943,7 +975,7 @@ class DashboardServer:
         finally:
             with self._lock:
                 self._clients.pop(key, None)
-            self.viewer_left()
+            self.viewer_left(overlay)
 
     # ------------------------------------------------------------------ camera privacy (M8.4)
     def stream_access(self, local: bool = False) -> str:
@@ -976,8 +1008,20 @@ class DashboardServer:
         return self._camera_privacy.report(stopped=stopped, dashboard=True,
                                            local_while_stopped=self._local_camera_while_stopped)
 
-    def _current_frame(self) -> Optional[_StreamFrame]:
-        """The slot's frame, refreshed from the camera when the runtime is not drawing."""
+    def _current_frame(self, overlay: bool = False) -> Optional[_StreamFrame]:
+        """The slot's frame, refreshed from the camera when the runtime is not drawing.
+
+        `overlay`: the clean analysed frame while the runtime is drawing; otherwise
+        the same camera fallback every viewer gets (no analysis, so no overlay).
+        """
+        if overlay:
+            with self._lock:
+                clean, annotated_at = self._clean_frame, self._annotated_at
+            if annotated_at and time.monotonic() - annotated_at < self.ANNOTATION_GAP_S:
+                # The runtime is drawing: this viewer gets the clean analysed frame
+                # (None for the one tick before the first one is encoded), never the
+                # device-drawn picture with graphics burned in.
+                return clean
         with self._lock:
             frame, annotated_at = self._frame, self._annotated_at
         source = self._frame_source
@@ -1082,6 +1126,19 @@ class DashboardServer:
                 )
                 self._annotated_at = now
 
+    def push_overlay_frame(self, clean_bgr: np.ndarray, overlay_header: str,
+                           captured_at: Optional[float] = None) -> None:
+        """M13: the clean analysed frame and its sd-overlay/1 header (core/overlay.py)."""
+        ok, buf = cv2.imencode(".jpg", clean_bgr, [int(cv2.IMWRITE_JPEG_QUALITY), self._jpeg_quality])
+        if ok:
+            now = time.monotonic()
+            with self._lock:
+                self._jpeg_seq += 1
+                self._clean_frame = _StreamFrame(
+                    buf.tobytes(), self._jpeg_seq, now if captured_at is None else float(captured_at), "annotated",
+                    overlay=overlay_header)
+                self._annotated_at = now
+
     def push_event(self, event, severity: str = "log") -> None:
         """Record one Event for the timeline. severity: 'loud' | 'soft' | 'log'.
 
@@ -1104,6 +1161,9 @@ class DashboardServer:
             )
             self._counts[event.type] += 1
             self._flash_until = time.time() + FLASH_DURATION_S
+            # M13: the newest event, for the live overlay's "why" line.
+            self._last_event = {"type": event.type, "signals": str(event.contributing_signals or "")[:200],
+                                "severity": severity, "at": time.monotonic()}
         journal = self.event_journal
         if journal is not None:
             # M12: the same event_id the uplink sends as event_key (core/local_events.py).
@@ -1113,6 +1173,20 @@ class DashboardServer:
                 with contextlib.suppress(Exception):
                     delivery = lookup(event)
             journal.record(event, severity, delivery=delivery)
+
+    _last_event: Optional[dict] = None
+
+    def last_event_summary(self, max_age_s: float = 30.0) -> Optional[dict]:
+        """The newest event while it is recent: what the device itself wrote about it."""
+        with self._lock:
+            last = self._last_event
+        if last is None:
+            return None
+        age = time.monotonic() - last["at"]
+        if age > max_age_s:
+            return None
+        return {"type": last["type"], "signals": last["signals"], "severity": last["severity"],
+                "age_s": round(age, 1)}
 
     #: Set by the runtime (the alert policy's `delivery`): what each event actuated.
     delivery_lookup: Optional[Callable] = None

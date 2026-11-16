@@ -63,6 +63,8 @@ class StreamClient:
         recv_buffer: Optional[int] = None,
         host: str = "127.0.0.1",
         keep_bodies: bool = True,
+        overlay: bool = False,
+        session: Optional[str] = None,
     ) -> None:
         #: False for long runs: keep each part's headers and timing, not its JPEG.
         self.keep_bodies = keep_bodies
@@ -79,6 +81,10 @@ class StreamClient:
             lines.append(f"X-Device-Token: {token}")
         if heartbeat:
             lines.append("X-Stream-Heartbeat: 1")
+        if overlay:  # M13 sd-overlay/1: clean frames + X-SD-Overlay
+            lines.append("X-Stream-Overlay: 1")
+        if session is not None:  # M12 sd-local-v1 session
+            lines.append(f"X-SD-Session: {session}")
         self.sock.sendall(("\r\n".join(lines) + "\r\n\r\n").encode())
         self._buffer = b""
         self.status = 0

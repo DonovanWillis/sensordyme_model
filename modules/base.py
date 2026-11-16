@@ -90,6 +90,16 @@ class VisionModule(ABC):
         """
         return frame
 
+    def overlay_extras(self) -> dict:
+        """What this module derived on its last frame, for the sd-overlay/1 live view
+        (core/overlay.py): driver association, behaviour phases, face outline.
+
+        Only real, current observations; a key is absent when not measured. The
+        default adds nothing: the overlay then shows the shared perception
+        engine's own detections and nothing module-specific.
+        """
+        return {}
+
     def annotate_debug(self, frame: np.ndarray) -> np.ndarray:
         """Draw the full tuning overlay (used by `make dev-debug`).
 

@@ -1738,6 +1738,7 @@ class DriverAttentionModule(VisionModule):
             self._last_hand_boxes = []
             self._last_overlay_boxes = []
             self._last_overlay_confidences = []
+            self._last_driver_phone_boxes = []
             self._hand_overlaps_phone = False
             self._phone_hold.reset()
             self._phone_placement.reset()
@@ -1930,6 +1931,7 @@ class DriverAttentionModule(VisionModule):
         self._phone_association = association
         self._phone_driver_box = association.driver_box
         driver_phones = phones_for_associated_driver(phone_boxes, person_boxes, association)
+        self._last_driver_phone_boxes = list(driver_phones)
         self._hand_overlaps_phone = any(
             iou(hand_box, phone_box) > self._hand_phone_iou_threshold
             for hand_box in hand_boxes
@@ -3322,6 +3324,63 @@ class DriverAttentionModule(VisionModule):
             return Capability(IMPAIRED, f"frames arrive at {fps:.1f}/s; eye-closure timing (drowsiness, "
                                         f"fatigue) is verified from {self._eye_timing_min_fps:g}/s")
         return Capability()
+
+    #: MediaPipe FaceMesh contours, in drawing order (the face oval and each eye).
+    _OVERLAY_CONTOURS: ClassVar[dict[str, tuple[int, ...]]] = {
+        "oval": (10, 338, 297, 332, 284, 251, 389, 356, 454, 323, 361, 288, 397, 365, 379, 378, 400, 377,
+                 152, 148, 176, 149, 150, 136, 172, 58, 132, 93, 234, 127, 162, 21, 54, 103, 67, 109),
+        "eye_l": (362, 382, 381, 380, 374, 373, 390, 249, 263, 466, 388, 387, 386, 385, 384, 398),
+        "eye_r": (33, 7, 163, 144, 145, 153, 154, 155, 133, 173, 157, 158, 159, 160, 161, 246),
+    }
+
+    def overlay_extras(self) -> dict:
+        """The live view's module half (core/overlay.py, sd-overlay/1).
+
+        Every value is what this module measured or decided on its last frame:
+        the face outline the landmark model returned, the person the driver
+        layer associated (and how), which phone box is the driver's, the head
+        orientation (head pose, NOT eye gaze), and each behaviour's phase.
+        Nothing here is estimated for display.
+        """
+        out: dict = {"state": self._state_label()}
+        proto = self._last_face_proto
+        if proto is not None and not self._face_lost_active:
+            marks = getattr(proto, "landmark", None) or ()
+            if len(marks) >= 468:
+                out["face_contours"] = {
+                    name: [(round(float(marks[i].x), 3), round(float(marks[i].y), 3)) for i in idx]
+                    for name, idx in self._OVERLAY_CONTOURS.items()}
+            out["head"] = {"yaw_deg": round(float(self._last_head_yaw), 1),
+                           "pitch_deg": round(float(self._last_head_pitch), 1),
+                           "calibrated": bool(self._calibrator.is_calibrated),
+                           "direction": self._gaze_label()}
+        driver = self._driver
+        if driver is not None:
+            out["driver"] = {"box": driver.driver_box, "identity": driver.identity, "method": driver.method,
+                             "people": driver.people}
+        region = getattr(self._identity, "region", None)
+        if region is not None:
+            out["driver_region"] = {"box": tuple(region.box), "source": region.source}
+        out["driver_phone_boxes"] = list(getattr(self, "_last_driver_phone_boxes", []) or [])
+        gaze_now = self._gaze_clock.now
+        phases = []
+        for kind, condition, tracker in (
+            ("distraction", abs(self._last_yaw) > self._yaw_threshold_deg, self._distract_tracker),
+            ("eyes_down", self._last_pitch < self._pitch_threshold_deg, self._eyes_down_tracker),
+            ("eyes_up", self._last_pitch > self._pitch_up_threshold_deg, self._eyes_up_tracker),
+            ("phone_use", bool(self._last_phone_boxes), self._phone_use_tracker),
+            ("drowsiness", self._last_ear < self._last_ear_threshold, self._drowsy_tracker),
+        ):
+            if self._face_lost_active and kind != "phone_use":
+                continue  # nothing measured about the face: no face behaviour is in progress
+            phase = self._phase_label(condition, tracker)
+            if phase != "NONE":
+                phases.append({"type": kind, "phase": phase.lower(),
+                               "for_s": round(float(tracker.elapsed(gaze_now)), 1)})
+        if self._face_lost_active:
+            phases.append({"type": "face_not_visible", "phase": "confirmed", "for_s": None})
+        out["behaviours"] = phases
+        return out
 
     def perception_signals(self) -> dict:
         """Eye state, head pose and gaze measured on the last frame (core/perception.py
