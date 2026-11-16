@@ -74,7 +74,8 @@ import numpy as np  # noqa: E402
 
 #: Stages this harness adds on top of core/stage_timing.STAGES.
 HARNESS_STAGES = (
-    "pass_total", "capture_pick", "perceive_total", "engine_begin_frame", "engine_end_frame",
+    # pass_total includes the wait for the next camera frame in paced mode; pass_work excludes it.
+    "pass_total", "pass_work", "capture_pick", "perceive_total", "engine_begin_frame", "engine_end_frame",
     "alert_dispatch_call", "rules", "nodes", "telemetry", "push_status", "annotate", "jpeg_encode_annotated",
     "overlay_build", "overlay_header_encode", "overlay_jpeg_encode",
 )
@@ -333,7 +334,9 @@ def run_once(args, frames: list[np.ndarray], runtime, rec: Recorder) -> dict:
         before = runtime._last_processed_at
         t0 = time.perf_counter()
         runtime._inference_pass(loop, stop)
-        rec.add("pass_total", (time.perf_counter() - t0) * 1000.0)
+        pass_ms = (time.perf_counter() - t0) * 1000.0
+        rec.add("pass_total", pass_ms)
+        rec.add("pass_work", max(0.0, pass_ms - rec.frame.get("capture_pick", 0.0)))
         did = runtime._last_processed_at != before
         rec.end_frame(did)
         processed += int(did)
@@ -443,7 +446,7 @@ def main(argv: Optional[list[str]] = None) -> int:
     if args.out:
         args.out.parent.mkdir(parents=True, exist_ok=True)
         args.out.write_text(text + "\n")
-    summary_keys = ("pass_total", "detector_total", "hailo_preprocess", "decoder_cpu", "face_landmarks", "hands",
+    summary_keys = ("pass_total", "pass_work", "detector_total", "hailo_preprocess", "decoder_cpu", "face_landmarks", "hands",
                     "tracking", "behaviour_reasoning", "engine_end_frame", "alert_dispatch", "rules", "nodes",
                     "telemetry", "push_status", "annotate", "jpeg_encode_annotated", "overlay_build",
                     "overlay_header_encode", "overlay_jpeg_encode", "frame_age", "frame_to_decision", "capture_pick")

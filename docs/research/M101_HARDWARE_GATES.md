@@ -107,6 +107,7 @@ $PY $V/hwv_stage.py parse-hef --install-dir $D
 $PY $V/hwv_stage.py capture --install-dir $D --bundle ~/hwval/capture_kg
 $PY $V/hwv_stage.py parity --bundle ~/hwval/capture_kg --decoder both
 $PY $V/hwv_stage.py latency --install-dir $D
+$PY $V/hwv_stage.py latency --install-dir $D --latency-decoder both   # M13: B's decode cost on the A76, in process only
 sudo systemctl start sensordyme.service && systemctl is-active sensordyme.service
 SENSORDYME_TOKEN=$TOKEN $PY $V/hwv_stage.py thermal --minutes 30   # service running
 ```
