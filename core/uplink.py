@@ -214,6 +214,12 @@ class CloudUplink:
         #: envelope (set by _authenticated_command).
         self._command_verified = False
         self._stop = threading.Event()
+        #: M13: set when push_event() queues an alert, so the worker sends it now
+        #: rather than after the rest of the poll interval (on average half of
+        #: poll_interval_s of avoidable delay before the backend could notify
+        #: anyone). It never shortens the reconnection backoff: while syncs fail,
+        #: the worker waits exactly as before (see _wait_for_next_sync).
+        self._wake = threading.Event()
         self._connected = False
         self._explained_failure = False
         #: Consecutive failed syncs; drives the reconnection backoff.
@@ -420,6 +426,7 @@ class CloudUplink:
 
     def close(self) -> None:
         self._stop.set()
+        self._wake.set()  # a worker waiting for its next sync stops now
 
     # ------------------------------------------------------------------ main-loop side
     def push_event(
@@ -539,6 +546,7 @@ class CloudUplink:
                 self._alert_followups[event_key] = item
                 while len(self._alert_followups) > _ALERT_FOLLOWUP_MEMORY:
                     self._alert_followups.popitem(last=False)
+        self._wake.set()  # M13: send it on the next cycle, now, not after the poll interval
         if delivery is not None and not delivery.final:
             delivery.subscribe(lambda summary, key=event_key: self._alert_reported(key, summary))
             # A report that landed between summary() above and subscribe() is not lost.
@@ -706,8 +714,23 @@ class CloudUplink:
     # ------------------------------------------------------------------ worker
     def _run(self) -> None:
         while not self._stop.is_set():
+            # Cleared BEFORE the cycle: an alert queued while it runs (after its
+            # batch was taken) leaves the flag set, so the next cycle starts at once.
+            self._wake.clear()
             more_waiting = self.sync_once()
-            self._stop.wait(0 if more_waiting else self.next_delay())
+            if not more_waiting:
+                self._wait_for_next_sync(self.next_delay())
+
+    def _wait_for_next_sync(self, delay: float) -> None:
+        """Wait `delay` (the poll interval, or the backoff after a failure) before the
+        next sync. While connected, an alert queued meanwhile ends the wait early
+        (M13): the event goes up within one round trip instead of up to
+        poll_interval_s later. After a failed sync nothing ends it but close():
+        new alerts must not turn the reconnection backoff into a retry storm."""
+        if self._failures:
+            self._stop.wait(delay)
+        else:
+            self._wake.wait(delay)
 
     def sync_once(self) -> bool:
         """One sync cycle: push queued events + health, apply any command answered.
