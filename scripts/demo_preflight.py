@@ -23,6 +23,7 @@ Usage:
 from __future__ import annotations
 
 import argparse
+import contextlib
 import hashlib
 import importlib.util
 import json
@@ -111,6 +112,63 @@ def _get(url: str, token: str | None, timeout: float = 8.0) -> dict | None:
             return json.loads(response.read())
     except (urllib.error.URLError, OSError, ValueError, TimeoutError):
         return None
+
+
+def _overlay_sample(host: str, port: int, token: str | None, seconds: float = 4.0) -> dict:
+    """M13: read /stream as the app's AI view does (X-Stream-Overlay: 1) for a few
+    seconds. Read-only: a viewer like any other, never the camera or the NPU.
+
+    Returns {"frames", "analysed", "last": <the newest sd-overlay/1 document or None>}.
+    """
+    import base64
+    import socket
+
+    out: dict = {"frames": 0, "analysed": 0, "last": None, "error": None}
+    try:
+        sock = socket.create_connection((host, port), timeout=3)
+    except OSError as exc:
+        out["error"] = f"cannot connect ({type(exc).__name__})"
+        return out
+    try:
+        lines = ["GET /stream HTTP/1.1", f"Host: {host}", "X-Stream-Overlay: 1"]
+        if token:
+            lines.append(f"X-Device-Token: {token}")
+        sock.sendall(("\r\n".join(lines) + "\r\n\r\n").encode())
+        buffer, deadline = b"", time.monotonic() + seconds
+        while time.monotonic() < deadline:
+            sock.settimeout(max(0.05, deadline - time.monotonic()))
+            try:
+                chunk = sock.recv(65536)
+            except (TimeoutError, OSError):
+                break
+            if not chunk:
+                break
+            buffer += chunk
+            while True:
+                start = buffer.find(b"--frame\r\n")
+                end = buffer.find(b"\r\n\r\n", start) if start >= 0 else -1
+                if end < 0:
+                    break
+                headers = {}
+                for line in buffer[start:end].decode("latin-1").split("\r\n")[1:]:
+                    name, _, value = line.partition(":")
+                    headers[name.strip().lower()] = value.strip()
+                length = int(headers.get("content-length", "0") or 0)
+                if len(buffer) < end + 4 + length:
+                    break
+                buffer = buffer[end + 4 + length:]
+                if headers.get("content-type") == "image/jpeg":
+                    out["frames"] += 1
+                    value = headers.get("x-sd-overlay")
+                    if value:
+                        out["analysed"] += 1
+                        with contextlib.suppress(ValueError):
+                            out["last"] = json.loads(base64.urlsafe_b64decode(value + "=" * (-len(value) % 4)))
+            if len(buffer) > 4 * 1024 * 1024:
+                buffer = buffer[-1024 * 1024:]
+    finally:
+        sock.close()
+    return out
 
 
 def _health(host: str, port: int, token: str | None = None, timeout: float = 8.0) -> dict | None:
@@ -404,6 +462,23 @@ def run(host: str, port: int) -> Report:
             "the dashboard cannot report events, so nothing will appear on stage "
             "even if the pipeline produces them",
         )
+
+    # ---- M13: the live AI view the demo shows (sd-overlay/1) ----------------
+    sample = _overlay_sample(host, port, token)
+    last = sample.get("last") or {}
+    perf = last.get("perf") or {}
+    stopped = ((device.get("protection") or {}).get("state") == "stopped")
+    report.add(
+        "live AI view (overlay)",
+        sample["analysed"] > 0 and not last.get("sim", False),
+        (f"{sample['analysed']}/{sample['frames']} analysed frames in 4 s; "
+         f"{perf.get('fps')} fps processed, detector {perf.get('object_detector_ms')} ms, "
+         f"face {perf.get('face_landmarks_ms')} ms; unavailable: {last.get('unavailable') or 'none'}"
+         + ("; SIMULATED source" if last.get("sim") else ""))
+        if sample["frames"] or sample["analysed"] else (sample.get("error") or "no frames in 4 s"),
+        "the app's AI view will be empty: check the stream (step 4) and that monitoring is running",
+        warn_only=stopped,
+    )
 
     # ---- network exposure, stated plainly every single run -------------------
     # The dashboard serves the live camera on 0.0.0.0 by default with no token,

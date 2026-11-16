@@ -179,3 +179,24 @@ def test_the_driver_modules_extras_are_what_it_measured(tmp_path, monkeypatch):
 
     attentive = run(tmp_path, monkeypatch, [Seg(3.0, face())])
     assert attentive.module.overlay_extras()["behaviours"] == []
+
+
+def test_the_demo_preflight_samples_the_live_ai_view(tmp_path, monkeypatch):
+    import importlib.util
+    import sys
+    from pathlib import Path
+
+    spec = importlib.util.spec_from_file_location(
+        "sensordyme_demo_preflight_m13", Path(__file__).resolve().parents[1] / "scripts" / "demo_preflight.py")
+    preflight = importlib.util.module_from_spec(spec)
+    sys.modules[spec.name] = preflight
+    spec.loader.exec_module(preflight)
+    monkeypatch.setattr(runtime_module, "Camera", FakeCamera)
+    module = OverlayModule({})
+    runtime = _runtime(tmp_path, module, "overlay_probe")
+    with _Running(runtime, module):
+        sample = preflight._overlay_sample("127.0.0.1", runtime.dashboard._port, TOKEN, seconds=3.0)
+        refused = preflight._overlay_sample("127.0.0.1", runtime.dashboard._port, "wrong", seconds=1.0)
+    assert sample["analysed"] >= 3 and sample["last"]["schema"] == "sd-overlay/1"
+    assert sample["last"]["perf"]["fps"] is not None
+    assert refused["frames"] == 0 and refused["analysed"] == 0
