@@ -161,6 +161,15 @@ test-cov: ## Run the tests with a coverage report over the decision-making code
 	@echo "on purpose — including them inflates the number without telling you"
 	@echo "anything about whether a fall still gets detected."
 
+# The quick loop on a non-Mac machine (docs/DEVELOPER_SETUP.md): the backend +
+# device files listed in scripts/dev/backend_tests.txt, which
+# scripts/dev/bootstrap_python.sh also runs as its smoke test. With a venv outside
+# the checkout: make test-backend VENV="$HOME/.venvs/sensordyme/bin"
+.PHONY: test-backend
+test-backend: ## Backend + device test subset (scripts/dev/backend_tests.txt); no macOS/Xcode/GPU needed
+	PYTHONDONTWRITEBYTECODE=1 MPLBACKEND=Agg $(VENV)/python -m pytest -q -p no:cacheprovider \
+		$$(sed -e 's/#.*//' scripts/dev/backend_tests.txt)
+
 lint: ## Lint with ruff (rule set pinned in ruff.toml)
 	$(RUFF) check .
 

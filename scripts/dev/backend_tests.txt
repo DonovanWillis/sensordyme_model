@@ -1,0 +1,18 @@
+# Backend + device test files that need no macOS, Xcode, camera, GPU or network.
+#
+# One file, two readers: `make test-backend` and scripts/dev/bootstrap_python.sh
+# (its smoke test). Paths are relative to the repository root; `#` starts a
+# comment. Keep it to fast files: this is the quick loop on a non-Mac machine
+# (docs/DEVELOPER_SETUP.md). The full suite (`make test`) also runs on Linux.
+tests/test_cloud_backend.py
+tests/test_phase1_cloud_auth.py
+tests/test_m7_backend.py
+tests/test_m8_security_backend.py
+tests/test_m83_events_backend.py
+tests/test_command_auth_backend.py
+tests/test_capabilities.py
+tests/test_m6_security_device.py
+tests/test_m8_lifecycle_uplink.py
+tests/test_secret_store.py
+tests/test_ble_pop.py
+tests/test_sim_e2e.py
