@@ -47,6 +47,10 @@ final class FakeDevice: LocalTransport, @unchecked Sendable {
     var protection = "protecting"
     var active = "driver_safety"
     var roleForbids: Set<String> = ["general"]
+    /// False: the device answers 202 to a mode switch and never applies it.
+    var appliesPreset = true
+    /// What `policy` says beyond protection (role, mode), as the device sends it.
+    var policyExtra: [String: Any] = [:]
     var lockedOut = false
     var applyStopAfterReads = 1            // the runtime applies a stop a little later
     private var readsSinceStop = -1
@@ -112,7 +116,7 @@ final class FakeDevice: LocalTransport, @unchecked Sendable {
                 if roleForbids.contains(name) {
                     return reply(["error": "role 'driver_safety' requires driver_attention", "refused": true], 409)
                 }
-                active = name
+                if appliesPreset { active = name }
                 return reply(["ok": true, "switching_to": name], 202)
             case "/api/local/revoke":
                 trusted.remove(client.id)
@@ -136,11 +140,13 @@ final class FakeDevice: LocalTransport, @unchecked Sendable {
                     pendingStop = nil
                 }
             }
-            return reply(["module": "driver_attention", "alert_active": false,
-                          "policy": ["protection": ["state": protection, "role": "driver_safety", "reasons": []]]])
+            var policy: [String: Any] = ["protection": ["state": protection, "role": "driver_safety", "reasons": []]]
+            policy.merge(policyExtra) { _, new in new }
+            return reply(["module": "driver_attention", "alert_active": false, "policy": policy])
         case "/api/presets":
             return reply(["active": active, "presets": [["name": "driver_safety", "title": "Driver Safety", "active": true,
-                                                         "variants": [["name": "strict", "title": "Strict"]]]]])
+                                                         "variants": [["name": "standard", "title": "Standard"],
+                                                                      ["name": "strict", "title": "Strict"]]]]])
         case "/api/events":
             _ = query
             return reply(["schema": "sd-local-events/1", "events": events, "latest_seq": events.count, "boot_id": "b1"])
@@ -238,9 +244,43 @@ device.applyStopAfterReads = 1
 check(try! await c.setProtection(stop: false).isConfirmed, "resume confirmed")
 
 print("\nmode selection and the role floor:")
-check(try! await c.setPreset("driver_safety:strict").isConfirmed, "a switch confirmed from /api/presets (active base)")
+// M13.1: a switch between two variants of the running preset is confirmed by
+// the VARIANT the device reports; the base was running before the tap.
+device.appliesPreset = false
+let unapplied = try! await c.setPreset("driver_safety:strict", attempts: 3)
+check(!unapplied.isConfirmed, "a 202 for a variant the device never applied is NOT confirmed by its base")
+device.appliesPreset = true
+check(try! await c.setPreset("driver_safety:strict").isConfirmed, "a switch confirmed from /api/presets (the variant)")
+check(device.active == "driver_safety:strict", "the device runs it")
+check(try! await c.setPreset("driver_safety:standard").isConfirmed, "and back to Standard")
 let floor = await error { try await c.setPreset("general") }
 check(floor == .presetRefused("role 'driver_safety' requires driver_attention"), "a 409 role-floor refusal carries the device's reason")
+
+print("\nwhat the device reports running (LocalPresets.reports):")
+let variants: [LocalPresets.Variant] = [.init(name: "standard", title: "Standard"), .init(name: "strict", title: "Strict")]
+func presetsRunning(_ active: String?) -> LocalPresets {
+    LocalPresets(active: active, presets: [.init(name: "driver_safety", title: "Driver Safety", variants: variants),
+                                           .init(name: "occupancy", title: "Occupancy")])
+}
+check(presetsRunning("driver_safety").reports("driver_safety:standard"), "a bare preset runs as its first variant")
+check(!presetsRunning("driver_safety").reports("driver_safety:strict"), "and not as another")
+check(presetsRunning("driver_safety:strict@sustain=3").reports("driver_safety:strict"), "settings do not change the mode")
+check(presetsRunning("driver_safety:strict").reports("driver_safety"), "a bare request: the base is enough")
+check(!presetsRunning("occupancy").reports("driver_safety"), "another preset is not it")
+check(!presetsRunning(nil).reports("driver_safety"), "the device said nothing: not confirmed")
+check(!presetsRunning("driver_safety").reports(""), "an empty request is never confirmed")
+
+print("\nthe role and the monitoring mode, read leniently from /api/state:")
+device.policyExtra = ["mode": "standard_plus_custom",
+                      "role": ["name": "driver_safety", "title": "Driver Safety", "allowed_presets": ["driver_safety"]]]
+let withRole = try! await c.state()
+check(withRole.policy?.role?.allowedPresets == ["driver_safety"] && withRole.policy?.mode == "standard_plus_custom",
+      "role.allowed_presets and policy.mode")
+device.policyExtra = ["role": "driver_safety", "mode": 3]
+let oddRole = try? await c.state()
+check(oddRole?.protection == "protecting" && oddRole?.policy?.role == nil && oddRole?.policy?.mode == nil,
+      "a role or mode this build cannot read is absent, never a failed read")
+device.policyExtra = [:]
 
 print("\na stale challenge is retried once with a new one:")
 check(LocalDeviceClient.refusal(status: 401, data: Data(#"{"code":"stale_challenge"}"#.utf8)) == .refused(.retrySignature),

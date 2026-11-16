@@ -73,9 +73,56 @@ struct LocalDeviceState: Decodable, Equatable {
         var reasons: [String]?
     }
 
+    /// The device's role (core/roles.py `Role.describe()`): which presets it
+    /// may run. `allowedPresets` nil: the device did not say, or any preset.
+    struct Role: Decodable, Equatable {
+        var name: String?
+        var title: String?
+        var allowedPresets: [String]?
+
+        enum CodingKeys: String, CodingKey {
+            case name, title
+            case allowedPresets = "allowed_presets"
+        }
+
+        init(name: String? = nil, title: String? = nil, allowedPresets: [String]? = nil) {
+            self.name = name
+            self.title = title
+            self.allowedPresets = allowedPresets
+        }
+
+        init(from decoder: Decoder) throws {
+            let c = try decoder.container(keyedBy: CodingKeys.self)
+            name = try? c.decodeIfPresent(String.self, forKey: .name)
+            title = try? c.decodeIfPresent(String.self, forKey: .title)
+            allowedPresets = try? c.decodeIfPresent([String].self, forKey: .allowedPresets)
+        }
+    }
+
     struct Policy: Decodable, Equatable {
         var protection: Protection?
+        /// The monitoring mode (core/monitoring_mode.py): "standard", "off",
+        /// "ai_custom" (Jupiter's rules replace the preset) or
+        /// "standard_plus_custom" (they run beside it).
         var mode: String?
+        var role: Role?
+
+        enum CodingKeys: String, CodingKey { case protection, mode, role }
+
+        init(protection: Protection? = nil, mode: String? = nil, role: Role? = nil) {
+            self.protection = protection
+            self.mode = mode
+            self.role = role
+        }
+
+        /// Lenient: a field this build cannot read is absent, never a failed read
+        /// of the whole state (which would make the camera look unreachable).
+        init(from decoder: Decoder) throws {
+            let c = try decoder.container(keyedBy: CodingKeys.self)
+            protection = try? c.decodeIfPresent(Protection.self, forKey: .protection)
+            mode = try? c.decodeIfPresent(String.self, forKey: .mode)
+            role = try? c.decodeIfPresent(Role.self, forKey: .role)
+        }
     }
 
     var module: String?
@@ -110,6 +157,28 @@ struct LocalPresets: Decodable, Equatable {
 
     /// The base of the running preset ("driver_safety" for "driver_safety:strict").
     var activeBase: String? { active.map { String($0.split(separator: ":", maxSplits: 1).first ?? "") } }
+
+    /// The device reports `requested` running: the same base, and -- when a
+    /// variant was asked for -- that variant. A switch between two variants
+    /// of one preset is confirmed by the variant, never by the base alone
+    /// (which was already running before the tap).
+    func reports(_ requested: String) -> Bool {
+        let want = Self.parts(requested), have = Self.parts(active)
+        guard !want.base.isEmpty, want.base == have.base else { return false }
+        guard let variant = want.variant else { return true }
+        // The device runs the bare preset as its first variant ("driver_safety"
+        // is "driver_safety:standard").
+        let first = presets.first { $0.name == want.base }?.variants?.first?.name
+        return (have.variant ?? first) == variant
+    }
+
+    /// "driver_safety:strict@k=v" -> ("driver_safety", "strict").
+    static func parts(_ name: String?) -> (base: String, variant: String?) {
+        guard let name, !name.isEmpty else { return ("", nil) }
+        let mode = name.split(separator: "@", maxSplits: 1, omittingEmptySubsequences: false).first.map(String.init) ?? name
+        let parts = mode.split(separator: ":", maxSplits: 1).map(String.init)
+        return (parts.first ?? "", parts.count > 1 ? parts[1] : nil)
+    }
 }
 
 /// How a stop/resume or a mode switch ended, as the DEVICE reported it
@@ -297,10 +366,9 @@ actor LocalDeviceClient {
     func setPreset(_ name: String, attempts: Int = 12, interval: TimeInterval = 1) async throws -> LocalCommandOutcome {
         let body = (try? JSONSerialization.data(withJSONObject: ["preset": name])) ?? Data()
         _ = try await signedPost("/api/preset", body: body)
-        let base = String(name.split(separator: ":", maxSplits: 1).first ?? "")
         for attempt in 0..<max(1, attempts) {
             if attempt > 0 { await pause(interval) }
-            if let presets = try? await presets(), presets.activeBase == base {
+            if let presets = try? await presets(), presets.reports(name) {
                 return .confirmed("Switched — the camera confirmed the new mode.")
             }
         }
