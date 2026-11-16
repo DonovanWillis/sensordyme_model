@@ -828,7 +828,7 @@ final class OrynJourneysUITests: XCTestCase {
         XCTAssertTrue(app.buttons["detail.present"].waitForExistence(timeout: 15), "back on the device screen")
     }
 
-    static let dwellPrompt ="Alert me if someone stays inside the marked area for longer than 10 seconds"
+    static let dwellPrompt = "Alert me if someone stays inside the marked area for longer than 10 seconds"
 
     private var monitoring: XCUIElement { element("detail.monitoring") }
 

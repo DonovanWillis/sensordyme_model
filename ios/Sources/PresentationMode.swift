@@ -187,7 +187,6 @@ struct PresentationModeView: View {
             }
         }
         .animation(SD.Motion.resolved(SD.Motion.status, reduceMotion: reduceMotion), value: alerting)
-        .accessibilityIdentifier("present.screen")
     }
 
     // MARK: Header: exit, mode, monitoring state, simulated
