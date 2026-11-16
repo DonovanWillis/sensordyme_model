@@ -33,7 +33,8 @@ import Foundation
 ///   - Once per event: `SoundedEvents` remembers the identity of every event
 ///     that sounded, so the same event never sounds twice.
 ///   - The person can turn it off ("Alert sound on this iPhone", default on).
-///   - A simulated event that sounds says so in the notification itself.
+///   - A simulated event never sounds (M12, mission rule: no live-safety sound
+///     for a rehearsal). It is still shown, its headline saying "Simulated".
 enum AlertSound {
     /// The validated driver-safety alerts: the driver_safety role's mandatory,
     /// loud alert types (core/roles.py `ROLES["driver_safety"]
@@ -66,6 +67,8 @@ enum AlertSound {
             case deliveredLate
             /// This event already sounded once.
             case alreadySounded
+            /// A simulated event (the virtual device, a demo trigger): shown, never sounded.
+            case simulated
         }
     }
 
@@ -86,12 +89,14 @@ enum AlertSound {
         experimental: Bool,
         deliveredLate: Bool,
         alreadySounded: Bool,
-        soundEnabled: Bool
+        soundEnabled: Bool,
+        simulated: Bool = false
     ) -> Decision {
         if !soundEnabled { return .silent(.turnedOff) }
         if experimental || severity == "log" || logOnlyTypes.contains(baseType(type)) {
             return .silent(.notAnAlert)
         }
+        if simulated { return .silent(.simulated) }
         if alreadySounded { return .silent(.alreadySounded) }
         if deliveredLate { return .silent(.deliveredLate) }
         return .play

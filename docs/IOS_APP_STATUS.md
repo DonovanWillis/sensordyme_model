@@ -487,7 +487,7 @@ Debug launch flags (DEBUG builds only, DebugLaunch.swift): `-orynDemo`,
 `<Name>Tests.swift` is concatenated with `Sources/<Name>.swift`). New in M11:
 `AlertSoundTests` (the iPhone alert sound: driver-safety types, never a
 log-only/experimental record, once per event, silent when delivered late or
-turned off, simulated labelled, the backlog never sounds) and additions to
+turned off, simulated labelled (and, since M12, never sounded), the backlog never sounds) and additions to
 `NotificationPolicyTests` (the first poll after (re)starting to watch is
 history). New in M8:
 `ConnectionTruthTests` (presence from telemetry age, reply age and refresh

@@ -88,7 +88,7 @@ var noAge = fresh; noAge.ageS = nil
 check(LocalAlerts.soundDecision(noAge, sounded: sounded, soundEnabled: true) == .silent(.deliveredLate),
       "no age (an earlier power-on): silent")
 var simulated = fresh; simulated.simulated = true
-check(LocalAlerts.soundDecision(simulated, sounded: sounded, soundEnabled: true) == .silent(.notAnAlert), "simulated: silent")
+check(LocalAlerts.soundDecision(simulated, sounded: sounded, soundEnabled: true) == .silent(.simulated), "simulated: silent")
 var experimental = fresh; experimental.experimental = true
 check(LocalAlerts.soundDecision(experimental, sounded: sounded, soundEnabled: true) == .silent(.notAnAlert), "experimental: silent")
 var logged = fresh; logged.severity = "log"

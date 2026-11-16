@@ -175,15 +175,13 @@ enum LocalAlerts {
     }
 
     /// The sound decision for one local event NotificationPolicy decided to
-    /// announce. A simulated event never sounds on this path (it is still shown,
-    /// labelled); otherwise exactly AlertSound.decide with the same identity
-    /// (`key:<event_key>`) the account path uses.
+    /// announce: exactly AlertSound.decide (a simulated event never sounds on
+    /// either path), with the same identity (`key:<event_key>`) the account path uses.
     static func soundDecision(_ event: LocalEvent, sounded: SoundedEvents, soundEnabled: Bool) -> AlertSound.Decision {
-        if event.simulated == true, soundEnabled { return .silent(.notAnAlert) }
         let identity = AlertSound.identity(eventKey: event.eventKey, eventID: nil)
         return AlertSound.decide(type: event.type, severity: event.severity,
                                  experimental: event.experimental == true, deliveredLate: isLate(event),
                                  alreadySounded: identity.map { sounded.contains($0) } ?? true,
-                                 soundEnabled: soundEnabled)
+                                 soundEnabled: soundEnabled, simulated: event.simulated == true)
     }
 }

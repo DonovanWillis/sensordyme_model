@@ -301,7 +301,8 @@ final class AlertNotifier: NSObject, ObservableObject {
             type: event.type, severity: event.severity, experimental: event.isExperimental,
             deliveredLate: event.deliveryDelay != nil,
             alreadySounded: identity.map { log.contains($0) } ?? true,
-            soundEnabled: Self.soundEnabled
+            soundEnabled: Self.soundEnabled,
+            simulated: event.isSimulated
         )
         if decision == .play, let identity {
             content.sound = .default
