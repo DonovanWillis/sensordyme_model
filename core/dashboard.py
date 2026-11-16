@@ -1162,8 +1162,12 @@ class DashboardServer:
             self._counts[event.type] += 1
             self._flash_until = time.time() + FLASH_DURATION_S
             # M13: the newest event, for the live overlay's "why" line.
+            key = getattr(event, "event_id", None)
             self._last_event = {"type": event.type, "signals": str(event.contributing_signals or "")[:200],
-                                "severity": severity, "at": time.monotonic()}
+                                "severity": severity, "at": time.monotonic(),
+                                # The history row's event_key (core/local_events.py), so the app
+                                # can tie the live "why" line to its row and sync badge.
+                                "event_key": key if isinstance(key, str) and 0 < len(key) <= 64 else None}
         journal = self.event_journal
         if journal is not None:
             # M12: the same event_id the uplink sends as event_key (core/local_events.py).
@@ -1185,8 +1189,11 @@ class DashboardServer:
         age = time.monotonic() - last["at"]
         if age > max_age_s:
             return None
-        return {"type": last["type"], "signals": last["signals"], "severity": last["severity"],
-                "age_s": round(age, 1)}
+        out = {"type": last["type"], "signals": last["signals"], "severity": last["severity"],
+               "age_s": round(age, 1)}
+        if last.get("event_key"):
+            out["event_key"] = last["event_key"]
+        return out
 
     #: Set by the runtime (the alert policy's `delivery`): what each event actuated.
     delivery_lookup: Optional[Callable] = None

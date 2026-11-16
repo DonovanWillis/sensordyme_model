@@ -60,13 +60,13 @@ A real example, made by `core/overlay.py` from a fabricated observation:
 | `face` | `null` = face model not run this frame; `{"visible":false}` = looked, no face | |
 | `face.contours` | FaceMesh points in drawing order (oval 36, each eye 16), normalised | thin outline, not the full mesh |
 | `face.eyes_closed` | absent until a calibrated threshold exists | "Eyes closed" only when `true` |
-| `face.head_pose` | **head** orientation in degrees; `calibrated` = relative to this driver's neutral pose; `direction` = Left/Right/Up/Down/Forward | label it "Head", **never** "gaze" or "looking at" |
+| `face.head_pose` | **head** orientation in degrees; `calibrated` = relative to this driver's neutral pose; `direction` = Left/Right/Up/Down/Forward. `pitch_deg` is always in ±90: an uncalibrated raw fit (upright ≈ ±180 in its Euler convention) is wrapped by 180° | label it "Head", **never** "gaze" or "looking at" |
 | `hands` | hand boxes when the hand model ran this frame (it is scheduled, not every frame) | |
 | `driver`, `driver_region` | the person the driver layer associated, how (`basis`), and the configured or calibrated seat region | outline the driver; dashed region |
 | `behaviours[]` | each behaviour in progress: `phase` = `developing` (condition true, not yet sustained) or `confirmed` (the module's alert condition); `for_s` = how long | "Head turned away · 2.1 s" developing, then confirmed |
 | `state` | the module's dominant state label | |
 | `alert_active` | an alert condition is active now | |
-| `last_event` | the newest event, at most 30 s old, with the text **the device wrote** | the "why" line |
+| `last_event` | the newest event, at most 30 s old, with the text **the device wrote** (`signals`); `event_key` is the same key as that event's `/api/events` row | the "why" line, tied to its history row |
 | `unavailable` | components not working (stale, failed, unavailable) | hide or label those capabilities |
 | `perf.fps` | the processed-frame rate, measured on this device | "14 fps" |
 | `perf.<component>_ms` | each model's own run-time EMA, measured on this device | "Detector 11.8 ms" |

@@ -104,6 +104,33 @@ def test_the_header_round_trips_and_stays_small():
     assert len(header) < 4096
 
 
+def test_an_uncalibrated_raw_pitch_is_shown_in_range_and_a_calibrated_one_unchanged():
+    """The raw Euler fit puts an upright head near +-180 deg; the overlay shows ~0."""
+    def pitch(p, calibrated, extras=False):
+        face = pc.FaceObservation(468, eye_state=pc.EyeState(closed=False),
+                                  head_pose=pc.HeadPose(3.0, p, calibrated))
+        ex = {"head": {"yaw_deg": 3.0, "pitch_deg": p, "calibrated": calibrated, "direction": "Forward"}} if extras else {}
+        return ov.OverlayBuilder().build(_obs(face_visible=True, face=face), ex)["face"]["head_pose"]["pitch_deg"]
+
+    for via_module in (False, True):
+        assert pitch(178.0, False, via_module) == -2.0
+        assert pitch(-176.5, False, via_module) == 3.5
+        assert pitch(-12.0, False, via_module) == -12.0
+        assert pitch(-4.0, True, via_module) == -4.0
+
+
+def test_the_last_event_carries_its_history_event_key():
+    from core.dashboard import DashboardServer
+    from core.events import Event
+
+    server = DashboardServer(host="127.0.0.1", port=0, module_name="driver_attention")
+    event = Event.now("distraction", 2.0, None, "driver_attention", "turned 40 deg left of forward + held 2.0 s")
+    server.push_event(event, "loud")
+    summary = server.last_event_summary()
+    assert isinstance(event.event_id, str) and summary["event_key"] == event.event_id
+    assert summary["signals"].startswith("turned 40 deg left")
+
+
 # ------------------------------------------------------------------ through the running runtime
 class OverlayModule(VisionModule):
     """Draws a white square when annotating: an overlay viewer must never see it."""

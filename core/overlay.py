@@ -56,6 +56,22 @@ def _norm_box(box: Any, w: int, h: int) -> Optional[list[float]]:
     return [_n(x1, w), _n(y1, h), _n(x2, w), _n(y2, h)]
 
 
+def _display_pitch(pitch: float, calibrated: bool) -> float:
+    """Pitch for display, in [-90, 90].
+
+    A calibrated pitch is relative to the driver's neutral pose and already in
+    range. An uncalibrated one is the raw Euler fit, whose convention puts an
+    upright head near +-180; it is wrapped by 180 deg so "forward" reads ~0.
+    """
+    p = float(pitch)
+    if not calibrated:
+        if p > 90.0:
+            p -= 180.0
+        elif p < -90.0:
+            p += 180.0
+    return round(max(-90.0, min(90.0, p)), 1)
+
+
 def _iou(a, b) -> float:
     ix = max(0.0, min(a[2], b[2]) - max(a[0], b[0]))
     iy = max(0.0, min(a[3], b[3]) - max(a[1], b[1]))
@@ -143,8 +159,11 @@ class OverlayBuilder:
                 f["head_pose"] = {**head, "kind": "head_pose"}  # never eye gaze
             elif face.head_pose is not None:
                 f["head_pose"] = {"yaw_deg": round(face.head_pose.yaw_deg, 1),
-                                  "pitch_deg": round(face.head_pose.pitch_deg, 1),
+                                  "pitch_deg": face.head_pose.pitch_deg,
                                   "calibrated": bool(face.head_pose.calibrated), "kind": "head_pose"}
+            hp = f.get("head_pose")
+            if hp is not None and hp.get("pitch_deg") is not None:
+                hp["pitch_deg"] = _display_pitch(hp["pitch_deg"], bool(hp.get("calibrated")))
             doc["face"] = f
 
         if observation.hands is not None:
