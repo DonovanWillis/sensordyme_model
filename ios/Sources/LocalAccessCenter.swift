@@ -109,6 +109,12 @@ final class LocalAccessCenter: ObservableObject {
         do {
             let session = try await client.validSession()
             sessions[Self.id(hardwareID)] = session
+            // A session the camera signed proves it trusts this phone: record
+            // it like any fresh read (address, last seen, an account pairing
+            // the camera has now confirmed becomes active).
+            if let state = try? await client.state() {
+                await record(hardwareID, url: await client.baseURL.absoluteString, state: state, client: client)
+            }
         } catch {
             await handle(error, hardwareID)
         }

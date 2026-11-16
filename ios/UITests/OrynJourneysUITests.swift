@@ -729,6 +729,10 @@ final class OrynJourneysUITests: XCTestCase {
         XCTAssertTrue(card.waitForExistence(timeout: 30), "the paired camera is listed from the cache with the server down")
         XCTAssertFalse(card.label.contains("Protecting") && !card.label.contains("Connected"),
                        "never 'protecting' from the cache alone: \(card.label)")
+        XCTAssertFalse(card.label.contains("Waiting for camera"),
+                       "the pairing the camera confirmed in the first launch was remembered: \(card.label)")
+        XCTAssertTrue(element("local.caption").label.contains("can't be reached"),
+                      "the list says why these are direct connections: \(element("local.caption").label)")
         shot("29b_cold_launch_backend_down")
         waitFor(card, labelContains: "Connected directly on this network", timeout: 60)
         card.tap()

@@ -35,11 +35,20 @@ struct DevicesView: View {
     /// cold launch with the server down (C1), and any paired over Bluetooth
     /// that isn't on the account.
     private var localOnly: [TrustedDevice] {
-        state.isDemo ? [] : TrustedDevices.unlisted(local.devices, accountHardwareIDs: devices.map(\.hardwareId))
+        if state.isDemo { return [] }
+        // With the server answering, wait for its list: a camera that IS on
+        // the account must not flash up here first as "not on your account".
+        if serverConnected && !hasLoaded { return [] }
+        return TrustedDevices.unlisted(local.devices, accountHardwareIDs: devices.map(\.hardwareId))
+    }
+
+    private var serverConnected: Bool {
+        if case .connected = state.backendStatus { return true }
+        return false
     }
 
     private var localCaption: String? {
-        if errorMessage != nil {
+        if errorMessage != nil || !serverConnected {
             return "Your account server can't be reached. These cameras are paired with this iPhone and open directly on this network."
         }
         return "Not on your account: no backup or remote notifications for these."
