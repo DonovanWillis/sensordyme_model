@@ -92,7 +92,9 @@ if let o = decode(example) {
     check(OverlayPerfReadout.components(o.perf) == ["Detector 11.8 ms", "Face 9.4 ms", "Hands 7.0 ms"], "components")
     let state = LiveAnalysisState.make(o, overlayCapable: true, live: true)
     check(state.kind == .alert && state.headline == "Head turned away · 3.4 s", "panel: \(state.headline)")
-    check(HeadIndicator.make(o) == HeadIndicator(text: "Head · Left", yawDeg: 34.2, calibrated: true), "head indicator")
+    check(HeadIndicator.make(o) == HeadIndicator(text: "Head · Left · pitch \u{2212}3°", yawDeg: 34.2, calibrated: true,
+                                                 direction: "Left", pitchDeg: -3.1),
+          "head indicator: \(HeadIndicator.make(o)?.text ?? "nil")")
     check(!SimulatedBadge.shows(current: o, streamSeenSimulated: false), "a real camera has no Simulated badge")
     let panel = DriverPanelModel.make(o, overlayCapable: true, live: true)
     check(!panel.eyesClosed && panel.unavailable == nil, "no eyes-closed chip, nothing unavailable")
@@ -288,6 +290,42 @@ let w1 = summary(#"{"schema":"sd-overlay/1","analysed":true,"det":[],"face":{"vi
 let w2 = summary(#"{"schema":"sd-overlay/1","analysed":true,"det":[],"face":{"visible":true},"last_event":{"type":"distraction","signals":"x","severity":"loud","age_s":1.1}}"#)
 check(w1.key == w2.key, "an event growing older is not a change of meaning")
 check(!LiveOverlaySummary.shouldPublish(old: w1, new: w2, sinceLast: 0.05), "so it is throttled like a tick")
+
+print("== M13.1: head pitch in the Head chip, never gaze")
+func head(_ pose: String) -> HeadIndicator? {
+    HeadIndicator.make(decode(#"{"schema":"sd-overlay/1","analysed":true,"face":{"visible":true,"head_pose":\#(pose)}}"#))
+}
+check(head(#"{"yaw_deg":2,"pitch_deg":4.4,"calibrated":true,"direction":"Forward"}"#)?.text == "Head · Forward · pitch +4°",
+      "a positive pitch is signed")
+check(head(#"{"yaw_deg":2,"pitch_deg":-0.4,"calibrated":false,"direction":"Forward"}"#)?.text == "Head · Forward · pitch 0°",
+      "an uncalibrated wrapped pitch near 0 reads 0°")
+check(head(#"{"yaw_deg":2,"pitch_deg":-90,"direction":"Down"}"#)?.pitchDeg == -90, "the ±90 edge is kept")
+check(head(#"{"yaw_deg":2,"pitch_deg":-178.5,"direction":"Forward"}"#)?.text == "Head · Forward",
+      "an unwrapped raw pitch (older firmware) is not shown")
+check(head(#"{"yaw_deg":2,"direction":"Left"}"#)?.text == "Head · Left", "no pitch: the direction alone")
+check(head(#"{"yaw_deg":2,"pitch_deg":true,"direction":"Left"}"#)?.pitchDeg == nil, "a bool is not a pitch")
+for pose in [#"{"pitch_deg":12,"direction":"Up"}"#, #"{"pitch_deg":-12,"direction":"Down"}"#] {
+    let text = head(pose)?.text.lowercased() ?? ""
+    check(text.hasPrefix("head") && !text.contains("gaze") && !text.contains("looking"), "Head, never gaze: \(text)")
+}
+let p1 = summary(#"{"schema":"sd-overlay/1","analysed":true,"det":[],"face":{"visible":true,"head_pose":{"yaw_deg":1,"pitch_deg":3.0,"direction":"Forward"}}}"#)
+let p2 = summary(#"{"schema":"sd-overlay/1","analysed":true,"det":[],"face":{"visible":true,"head_pose":{"yaw_deg":1,"pitch_deg":7.0,"direction":"Forward"}}}"#)
+let p3 = summary(#"{"schema":"sd-overlay/1","analysed":true,"det":[],"face":{"visible":true,"head_pose":{"yaw_deg":1,"pitch_deg":7.0,"direction":"Up"}}}"#)
+check(p1.key == p2.key && p1 != p2, "a pitch digit moving is a tick, not a change of meaning")
+check(!LiveOverlaySummary.shouldPublish(old: p1, new: p2, sinceLast: 0.05), "so it is throttled")
+check(p2.key != p3.key, "the device's direction word changing is news")
+
+print("== M13.1: last_event.event_key ties the why line to its history row")
+let keyed = decode(#"{"schema":"sd-overlay/1","analysed":true,"last_event":{"type":"distraction","signals":"head turned away 3.4 s","severity":"loud","age_s":0.4,"event_key":"evt-7f3a"}}"#)
+check(keyed?.lastEvent?.eventKey == "evt-7f3a", "event_key decoded")
+check(OverlayWhyLine.make(keyed)?.eventKey == "evt-7f3a", "and carried by the why line")
+let unkeyed = decode(#"{"schema":"sd-overlay/1","analysed":true,"last_event":{"type":"distraction","severity":"loud","event_key":""}}"#)
+check(unkeyed?.lastEvent?.eventKey == nil, "an empty key is no key")
+let longKey = String(repeating: "k", count: 65)
+check(decode(#"{"schema":"sd-overlay/1","last_event":{"type":"distraction","severity":"loud","event_key":"\#(longKey)"}}"#)?
+        .lastEvent?.eventKey == nil, "a key longer than the device ever sends (64) is refused")
+check(decode(#"{"schema":"sd-overlay/1","last_event":{"type":"distraction","severity":"loud","event_key":7}}"#)?
+        .lastEvent?.eventKey == nil, "a non-string key is ignored")
 
 print(failures == 0 ? "\nall passed" : "\n\(failures) FAILED")
 exit(failures == 0 ? 0 : 1)

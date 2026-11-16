@@ -124,6 +124,9 @@ struct LiveOverlay: Equatable {
         var signals: String?
         var severity: String?
         var ageS: Double?
+        /// The same key as this event's `/api/events` row (and the account's
+        /// `event_key`): what ties the live "why" line to its history row.
+        var eventKey: String? = nil
     }
 
     struct Perf: Equatable {
@@ -269,7 +272,8 @@ struct LiveOverlay: Equatable {
         alertActive = root["alert_active"] as? Bool ?? false
         if let e = root["last_event"] as? [String: Any], let type = Self.text(e["type"]) {
             lastEvent = LastEvent(type: type, signals: Self.text(e["signals"]), severity: Self.text(e["severity"]),
-                                  ageS: Self.number(e["age_s"]))
+                                  ageS: Self.number(e["age_s"]),
+                                  eventKey: Self.text(e["event_key"]).flatMap { $0.count <= 64 ? $0 : nil })
         }
         unavailable = (root["unavailable"] as? [Any])?.compactMap { Self.text($0) } ?? []
         if let p = root["perf"] as? [String: Any] {
@@ -424,6 +428,8 @@ struct OverlayWhyLine: Equatable {
     let ageText: String?
     let isAlert: Bool
     var ageS: Double? = nil
+    /// The history row this event is (`last_event.event_key`), when the device said.
+    var eventKey: String? = nil
 
     /// Only events that are alerts (severity loud or soft): a "log" record
     /// such as "monitoring ready" is not a reason for anything on screen.
@@ -436,7 +442,8 @@ struct OverlayWhyLine: Equatable {
             because: event.signals,
             ageText: event.ageS.map { $0 < 1 ? "just now" : "\(DriverBehaviourCopy.duration($0)) ago" },
             isAlert: severity == "loud",
-            ageS: event.ageS)
+            ageS: event.ageS,
+            eventKey: event.eventKey)
     }
 
     /// What an alert banner says while the analysis reports an alert condition
@@ -496,17 +503,35 @@ enum SimulatedBadge {
 
 /// The head-orientation indicator. "Head" always; never gaze.
 struct HeadIndicator: Equatable {
-    /// "Head · Left"
+    /// "Head · Left · pitch −3°"
     let text: String
     /// Needle angle, -90...90 degrees (yaw), or nil when no usable yaw.
     let yawDeg: Double?
     let calibrated: Bool
+    /// The device's own word (Left / Right / Up / Down / Forward), or "—".
+    /// What changes the meaning of the chip; the pitch digits do not.
+    var direction: String = "—"
+    /// The device's head pitch in -90...90 degrees (M13: always sent in that
+    /// range, an uncalibrated raw fit wrapped by 180°), or nil when absent or
+    /// out of range. Shown as the device's signed number: no up/down word is
+    /// derived from it here -- the direction word is the device's.
+    var pitchDeg: Double? = nil
 
     static func make(_ overlay: LiveOverlay?) -> HeadIndicator? {
         guard let face = overlay?.face, face.visible, let pose = face.headPose else { return nil }
         let direction = pose.direction ?? "—"
         let yaw = pose.yawDeg.flatMap { abs($0) <= 90 ? $0 : nil }
-        return HeadIndicator(text: "Head · \(direction)", yawDeg: yaw, calibrated: pose.calibrated == true)
+        let pitch = pose.pitchDeg.flatMap { abs($0) <= 90 ? $0 : nil }
+        let text = "Head · \(direction)" + (pitch.map { " · pitch \(degrees($0))" } ?? "")
+        return HeadIndicator(text: text, yawDeg: yaw, calibrated: pose.calibrated == true,
+                             direction: direction, pitchDeg: pitch)
+    }
+
+    /// "+4°", "−3°" (a real minus sign), "0°": whole degrees, signed.
+    static func degrees(_ value: Double) -> String {
+        let whole = Int(value.rounded())
+        if whole == 0 { return "0°" }
+        return whole > 0 ? "+\(whole)°" : "\u{2212}\(abs(whole))°"
     }
 }
 
@@ -674,6 +699,7 @@ struct LiveOverlaySummary: Equatable {
         let why: String?
         let unavailable: String?
         let eyesClosed: Bool
+        /// The head's direction WORD: a pitch digit moving is a tick, not news.
         let head: String?
         let simulated: Bool
         let alertActive: Bool
@@ -683,7 +709,7 @@ struct LiveOverlaySummary: Equatable {
     var key: Key {
         Key(kind: panel.state.kind, behaviours: panel.behaviours.map { "\($0.type):\($0.tone)" },
             why: panel.why.map { "\($0.title)|\($0.because ?? "")|\($0.isAlert)" }, unavailable: panel.unavailable, eyesClosed: panel.eyesClosed,
-            head: panel.head?.text, simulated: simulated, alertActive: alertActive, mode: mode)
+            head: panel.head?.direction, simulated: simulated, alertActive: alertActive, mode: mode)
     }
 
     /// Whether a new summary must be published now: a change of meaning at
