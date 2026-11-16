@@ -602,6 +602,12 @@ class SimBLEDevice:
             ble_server_factory=functools.partial(SimulatedGattServer, peripheral=self.peripheral),
             identity=(self.device_id, self.name), radio_available=lambda: True, pop_limits=spec.limits,
         )
+        # M12 sd-local-v1: a phone that proves the setup code may enrol, exactly as on
+        # the device (services/runtime.py hands the same LocalAuthority over).
+        from core import local_auth
+
+        self.local_authority, _ = local_auth.build_authority(self.device_id, {}, state_dir / "local")
+        self.service.local_authority = self.local_authority
         self._tcp: Optional[_Server] = None
         self._tcp_thread: Optional[threading.Thread] = None
 
