@@ -65,8 +65,8 @@ def main(argv=None) -> int:
     print(f"\n{STAMP} -- alert {result.latency_s} s after the person entered the area "
           f"(device clock; dwell {demo.DWELL_S:g} s); overall {'PASS' if result.ok else 'FAIL'}")
     if result.backend_events:
-        print(f"{STAMP} -- known gap J1: the alert's duration field reads {result.backend_events[0]['duration']} s "
-              f"(the rule engine's confirmation step), not the time the person stayed")
+        print(f"{STAMP} -- the alert's duration field: {result.backend_events[0]['duration']} s "
+              f"(the person's continuous time in the area; M13 J1)")
     return 0 if result.ok else 1
 
 

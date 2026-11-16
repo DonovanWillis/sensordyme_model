@@ -24,7 +24,8 @@ All scenarios are **stationary**. Never rehearse them while driving.
 Run them from the repo root with the project venv. For example,
 `.venv/bin/python scripts/demo/flagship_rehearsal.py`. Both scripts stamp every
 line SIMULATED. `flagship_rehearsal.py` exits 0 when every FAIL is a recorded
-known gap, and 1 on any unexpected FAIL. `jupiter_rehearsal.py` exits 0 when
+known gap, and 1 on any unexpected FAIL. **Current result: `SIMULATED -- 10 PASS,
+0 FAIL on known gaps only, 0 FAIL unexpected, of 10`** (no open gaps). `jupiter_rehearsal.py` exits 0 when
 every step held.
 
 ## 1. What every scenario must show
@@ -44,7 +45,8 @@ For each scenario the system must:
 6. Say why the event occurred, in the event's own `contributing_signals`.
 
 A requirement the product does not meet is a **FAIL tagged with a known gap**
-(section 4). The test pins it as a strict xfail. Nothing was tuned to make a
+(section 4). The test pins it as a strict xfail. All three gaps found in M13
+(G1, G2, J1) are now fixed, and their xfails are ordinary passing tests. Nothing was tuned to make a
 row pass.
 
 ## 2. The 10 flagship scenarios
@@ -59,14 +61,14 @@ means it is the module's alert condition.
 |---|---|---|---|---|---|
 | 1 | Normal forward attention | 20 s attentive, hands on the wheel | no alert; face measured every frame; driver identified | no alert; no behaviour phase; face measured every frame; driver `identified` | PASS |
 | 2 | Short ordinary glance | one 1.5 s glance, 40° sideways | distraction developing, never confirmed; no alert | `distraction:developing` only (never reached 3.0 s); no alert | PASS |
-| 3 | Prolonged attention away | head turned 40° for 6 s | developing → confirmed; one loud distraction at ~3.0 s | `distraction` at +3.2 s; developing → confirmed; signals `''` | FAIL (known gap G2) |
+| 3 | Prolonged attention away | head turned 40° for 6 s | developing → confirmed; one loud distraction at ~3.0 s | `distraction` at +3.2 s; developing → confirmed; signals "turned 40 deg right of forward (limit 35 deg) + held 3.0 s" | PASS (G2 fixed) |
 | 4 | Phone visible in a mount | dash-mounted phone, hands on the wheel, eyes on the road, one 1.2 s glance down | no alert; never phone_use developing | no alert; only `eyes_down:developing` for the glance; phone role `driver` (in the driver's space, not in use); `phone_detected` logged, never alerted | PASS |
-| 5 | Phone held | phone in the lap with a hand on it, looked at for 6 s | phone_use at ~2.0 s, eyes_down at ~2.5 s, both loud | `phone_use` +2.2 s ("hand overlapping the phone (experimental hand tracking)"); `eyes_down` +2.7 s with signals `''` | FAIL (known gap G2) |
-| 6 | Passenger using a phone | seated passenger holding a phone; driver watches the road, one 1 s glance across | no alert; the phone is never the driver's (role `other`) | no alert; never a driver phone box; never phone_use developing; overlay phone role **absent** | FAIL (known gap G1) |
-| 7 | Driver's eyes closed | eyes closed for 4 s | drowsiness at ~2.0 s, loud (critical for the role) | `drowsiness` +2.2 s (signals `''`); `fatigue_warning` +2.8 s (soft, PERCLOS over a short session, allowed once) | FAIL (known gap G2) |
+| 5 | Phone held | phone in the lap with a hand on it, looked at for 6 s | phone_use at ~2.0 s, eyes_down at ~2.5 s, both loud | `phone_use` +2.2 s ("hand overlapping the phone (experimental hand tracking)"); `eyes_down` +2.7 s ("looking 30 deg below forward (limit 20 deg) + held 2.5 s") | PASS (G2 fixed) |
+| 6 | Passenger using a phone | seated passenger holding a phone; driver watches the road, one 1 s glance across | no alert; the phone is never the driver's (role `other`) | no alert; never a driver phone box; never phone_use developing; overlay phone role `other` | PASS (G1 fixed) |
+| 7 | Driver's eyes closed | eyes closed for 4 s | drowsiness at ~2.0 s, loud (critical for the role) | `drowsiness` +2.2 s ("eyes closed 2.0 s + eye openness 0.07 under 0.30"); `fatigue_warning` +2.8 s (soft, PERCLOS over a short session, allowed once) | PASS (G2 fixed) |
 | 8 | Driver briefly occluded | face hidden for 3 s, body still detected | no alert; face reported not visible; face rules abstain | no alert (`attention_lost` waits 8 s with a body); overlay `face: {visible: false}` for 3.0 s; engine abstained on distraction, drowsiness and eyes_down; driver still `identified` | PASS |
 | 9 | Camera unavailable | virtual device: camera frozen 20 s | FAILED / not protecting, naming the camera; no alert from stale frames; the driver is told | device FAILED +2.25 s, app `not_protecting` +2.25 s, reason "camera: no new frame…"; `monitoring_impaired` event and impaired tone; no driver alert | PASS |
-| 10 | Monitoring restored | camera back; 12 s later eyes closed 4 s | READY / protecting without recalibration; the buzzer alert path resumes | device READY +0.25 s, app protecting +0.25 s; `drowsiness` loud and alerted, buzzer at +2.25 s; same event_key in the device's `/api/events`; signals `''` | FAIL (known gap G2) |
+| 10 | Monitoring restored | camera back; 12 s later eyes closed 4 s | READY / protecting without recalibration; the buzzer alert path resumes | device READY +0.25 s, app protecting +0.25 s; `drowsiness` loud and alerted, buzzer at +2.25 s; same event_key in the device's `/api/events`; signals "eyes closed 2.0 s + eye openness 0.07 under 0.30" | PASS (G2 fixed) |
 
 `flagship_rehearsal.py` prints the same table with these columns: events,
 phases, attribution, evidence, why, latency and verdict.
@@ -103,7 +105,7 @@ call fail.
 | 4 | `POST /v1/devices/{id}/preset {preset: "", rules, draft_version}` | HTTP 200, `rules_active 1` |
 | 5 | (uplink) | mode `ai_custom`; the rule engine runs `('lingering', 'person', 'entrance', 10.0)` on the shared detector and tracker |
 | 6 | scripted people | 9 s inside the area: nothing. 15 s outside it: nothing. 15 s inside: **one alert at +10.25 s** (device clock, 0.25 s sampling). |
-| 7 | `GET /v1/devices/{id}/events`, device `GET /api/events` | backend: `person`, signals "A person remains in this area for 10 seconds", severity soft (warning), alert `alerted` / `simulated`. Device: the same `event_key`, sync `sent`, read through a sd-local-v1 session. |
+| 7 | `GET /v1/devices/{id}/events`, device `GET /api/events` | backend: `person`, signals "A person remains in this area for 10 seconds", duration 10.1 s (the time in the area, J1 fixed), severity soft (warning), alert `alerted` / `simulated`. Device: the same `event_key`, sync `sent`, read through a sd-local-v1 session. |
 | 8 | `POST /v1/ai/configure` "…a stranger remains…" | refused (`identity`); the running rule is kept |
 
 **Other phrasings the parser reads to the same policy:**
@@ -126,7 +128,22 @@ phrasing above.
 
 ## 4. Known gaps (measured, not tuned away)
 
-| Id | Gap | Measured | Classification | Smallest fix |
+**All three are fixed** on `feat/m13-showstopper` (commit `61d0f59`), each with
+the formerly strict-xfail test now passing. The table is kept as the record of
+what the scenarios found. No threshold, timing or alert decision changed; the
+fixes are labelling (G1), the free-text reason (G2) and a reported number (J1).
+
+* **G1 fix:** a phone is `driver` when it matches one of the driver's phones,
+  else `other` whenever the driver is known.
+* **G2 fix:** the module writes one measured line per event, joined with " + ":
+  for example "turned 40 deg right of forward (limit 35 deg) + held 3.0 s",
+  "looking 30 deg below forward (limit 20 deg) + held 2.5 s", "eyes closed
+  2.0 s + eye openness 0.07 under 0.30". The wording is the engineering default,
+  and the owner may still revise it.
+* **J1 fix:** a dwell alert's `duration_s` is the dwell plus the confirmation
+  step: 10.1 s in the demo.
+
+| Id | Gap (as found) | Measured | Classification | Smallest fix |
 |---|---|---|---|---|
 | G1 | A passenger's phone has no overlay role | `core/overlay.py` assigns a phone role only when the driver has a phone of their own. In scenario 6 the passenger's phone is sent with **no** `role`. It is not mis-attributed to the driver, but it is not marked `other` either, so the app cannot tell "not the driver's" from "undecided". | Defect (overlay labelling only; no alert or attribution decision is affected) | `core/overlay.py`: `elif d.label == "cell phone" and (driver_phones or driver_box is not None):`. Not made here, because `core/overlay.py` was outside M13's write scope. |
 | G2 | `distraction`, `drowsiness` and `eyes_down` carry an empty `contributing_signals` | The ordinary events say why only through their type and duration (the sustained seconds). The overlay's "why" line (`last_event.signals`) and the history detail are blank. Only phone_use and the special paths (a wide-angle turn, a face-lost extrapolation, an uncalibrated closure) write a reason. | Limitation (the alert is correct and identified by type + duration; the free-text reason is missing) | The module writes one measured line, for example "head turned 40° from your forward pose for 3.0 s" or "eyes closed 2.0 s". This needs an owner decision on the wording, because `jupiter/explain.py` splits module signals into facts and the app shows them. |
@@ -192,7 +209,7 @@ run by hand with the operator's own cue, and are watched with
 | 3 | Look away and hold | `off_road_prolonged` | `H1_head_orientation` | distraction ~3 s, loud tone; the overlay goes developing → confirmed |
 | 4 | Phone in a dash mount, hands on the wheel | `phone_mounted` | `P4_phone_mounted` | no phone_use; a long look down at it is eyes_down, never phone_use |
 | 5 | Pick the phone up and look at it | `phone_handheld` | `P1_phone_in_hand`, `P2_phone_in_lap` | phone_use ~2 s, then eyes_down |
-| 6 | The passenger uses a (prop) phone | `passenger_present` (`--preset passenger`; a consenting adult passenger with their own form) | `P5_passenger_phone` | no alert; the driver's phone highlight never lands on it (overlay role: see G1) |
+| 6 | The passenger uses a (prop) phone | `passenger_present` (`--preset passenger`; a consenting adult passenger with their own form) | `P5_passenger_phone` | no alert; the driver's phone highlight never lands on it (overlay role `other`) |
 | 7 | **Acted** eye closure for 3–4 s | `closures`, `look_down_vs_closure` | `E3_sustained_closure` | drowsiness ~2 s, loud (critical) tone |
 | 8 | Pass a hand in front of the face for 2–3 s | none (by hand) | `O1_occlusion_hand` | no alert; the overlay shows face not visible, then the face again |
 | 9 | Cover the lens for 15 s | none (by hand) | `O3_lens_occlusion` | the app says monitoring cannot run, with no driver alert. **Do not unplug the camera ribbon while powered.** A true camera fault (no frames at all) is rehearsed on the virtual device only (scenario 9 here). |
