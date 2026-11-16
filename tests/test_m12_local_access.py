@@ -252,7 +252,7 @@ def test_repeated_bad_signatures_lock_the_peer_out_with_backoff(authority):
 
 
 def test_a_phone_idle_past_the_expiry_must_enrol_again(tmp_path, authority):
-    wall = [1_000_000.0]
+    wall = [1_750_000_000.0]
     store = la.ClientStore(tmp_path / "c.json")
     auth = la.LocalAuthority(DEVICE, authority.identity, store, idle_expiry_days=30, wall=lambda: wall[0])
     key = PhoneKey()
@@ -363,3 +363,18 @@ def test_nothing_secret_appears_in_the_report_or_the_client_view(authority, tmp_
     pem = Path(tmp_path / "local_identity.pem").read_text()
     assert "PRIVATE" not in text and pem.splitlines()[1] not in text
     assert key.client_id in text
+
+
+def test_a_wrong_wall_clock_never_expires_a_phone(tmp_path, authority):
+    """A Pi with no RTC battery boots in 1970, then NTP corrects it."""
+    wall = [86_400.0]  # 1970-01-02
+    store = la.ClientStore(tmp_path / "c.json")
+    auth = la.LocalAuthority(DEVICE, authority.identity, store, idle_expiry_days=30, wall=lambda: wall[0])
+    key = PhoneKey()
+    auth.enroll(la.b64u(key.public_key), "p", "ble")
+    wall[0] = 1_800_000_000.0  # the clock is right again, decades "later"
+    challenge = auth.issue_challenge()
+    header = la.format_header(key.client_id, challenge,
+                              key.sign(la.request_message(DEVICE, key.client_id, challenge, "POST", "/x", b"")))
+    assert auth.verify_request(header, "POST", "/x", b"", "p").client_id == key.client_id
+    assert auth.store.clients[key.client_id].last_seen == 1_800_000_000.0

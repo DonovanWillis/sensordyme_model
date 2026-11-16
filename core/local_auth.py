@@ -86,6 +86,10 @@ FAIL_WINDOW_S = 60.0
 LOCKOUT_BASE_S = 60.0
 LOCKOUT_MAX_S = 3600.0
 MAX_NAME = 64
+#: A wall clock before this (2023-11-14) is not trusted for idle expiry: a Pi
+#: with no RTC battery and no network can boot in 1970, and a phone stamped then
+#: must not read as 50 years idle once NTP corrects the clock.
+PLAUSIBLE_WALL = 1_700_000_000
 
 HEADER = "X-SD-Local"
 SESSION_HEADER = "X-SD-Session"
@@ -569,15 +573,23 @@ class LocalAuthority:
             self._drop_sessions(gone)
 
     def _seen(self, client: Client) -> None:
-        client.last_seen = self._wall()
+        now = self._wall()
+        if now < PLAUSIBLE_WALL:
+            return  # an implausible clock is never written as "last seen"
+        client.last_seen = now
         if client.last_seen - client.persisted_seen >= LAST_SEEN_PERSIST_S:
             self.store.save()
 
     def _expire_idle(self) -> None:
         if self._idle_expiry_s <= 0:
             return
-        cutoff = self._wall() - self._idle_expiry_s
-        stale = [cid for cid, c in self.store.clients.items() if c.last_seen < cutoff]
+        now = self._wall()
+        if now < PLAUSIBLE_WALL:
+            return  # this clock cannot tell how long anyone has been away
+        cutoff = now - self._idle_expiry_s
+        # A stamp from an implausible clock says nothing about idleness: kept, and
+        # refreshed at the phone's next use.
+        stale = [cid for cid, c in self.store.clients.items() if PLAUSIBLE_WALL <= c.last_seen < cutoff]
         if stale:
             for cid in stale:
                 del self.store.clients[cid]
