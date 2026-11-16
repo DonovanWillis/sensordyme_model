@@ -96,11 +96,12 @@ final class AccessibilityAuditUITests: XCTestCase {
         var obscured: [Seen] = []
         var unresolvedContrast = 0
         var dynamicTypeSuspects: [String] = []
+        var contrastSuspects: [String] = []
         instrumentRetries = []
         do {
             try audit(for: .all, screen: screen,
                       reset: { lines.removeAll(); obscured.removeAll(); unresolvedContrast = 0
-                               dynamicTypeSuspects.removeAll() }) { issue in
+                               dynamicTypeSuspects.removeAll(); contrastSuspects.removeAll() }) { issue in
                 let label = issue.element?.label ?? ""
                 if issue.auditType == .contrast, issue.element == nil {
                     // XCTest gave no element, so it cannot be located or re-checked in
@@ -126,6 +127,13 @@ final class AccessibilityAuditUITests: XCTestCase {
                     dynamicTypeSuspects.append(label)
                     return true
                 }
+                if issue.auditType == .contrast, known == nil {
+                    // Located and clear of the bars (both handled above): contrast is
+                    // sampled from pixels, and text in the clear band at 17:1 and 10:1
+                    // has "failed" (M11, M13.1). A real one fails the re-check too.
+                    contrastSuspects.append(label)
+                    return true
+                }
                 let where_ = issue.element.map { "\($0.elementType.rawValue)@\(Int($0.frame.minX)),\(Int($0.frame.minY)),"
                     + "\(Int($0.frame.width))x\(Int($0.frame.height))" } ?? "unresolved"
                 let line = "\(screen)\t\(Self.name(issue.auditType))\t\(known == nil ? "NEW" : "known")\t"
@@ -147,7 +155,10 @@ final class AccessibilityAuditUITests: XCTestCase {
             lines.append(recheckUnresolvedContrast(count: unresolvedContrast, screen: screen))
         }
         if !dynamicTypeSuspects.isEmpty {
-            lines += recheckDynamicType(dynamicTypeSuspects, screen: screen)
+            lines += recheckOnStillScreen(.dynamicType, dynamicTypeSuspects, screen: screen)
+        }
+        if !contrastSuspects.isEmpty {
+            lines += recheckOnStillScreen(.contrast, contrastSuspects, screen: screen)
         }
         // Said, never hidden: an audit that needed its instrument run again.
         lines += instrumentRetries
@@ -233,24 +244,30 @@ final class AccessibilityAuditUITests: XCTestCase {
         }
     }
 
-    /// Dynamic Type findings are audited ONCE more, Dynamic Type only, on the
-    /// unchanged screen once it is still (M13.1). A text that does not scale
-    /// does not scale every time, so a finding the second audit reports again
-    /// fails the test as NEW, with both audits' evidence. A finding the second
-    /// audit does not reproduce is written as `not-reproduced`, never hidden.
+    /// A Dynamic Type finding, or a contrast finding on a located element in the
+    /// clear band, that is not an accepted issue (M13.1): audited once more, for
+    /// that type only, on the unchanged screen once it is still. Both audits read
+    /// the same pixels and the same text, so a real finding reproduces and fails
+    /// the test as NEW; one the re-check does not reproduce is written down as
+    /// `not-reproduced`, never dropped. XCTest has flagged every text on a screen
+    /// for Dynamic Type at once, and texts at 17:1 and 10:1 for contrast, on
+    /// screens that passed in the other runs.
     /// Why: test21 failed 1 run in 4 on UNCHANGED code (M13 faae3de and M13.1
     /// 20bf68a alike, run alone with -test-iterations 4), each time with every
-    /// text on the Ask Jupiter sheet flagged at once -- headings, body, the
-    /// input field -- and the identical screen passing the other 3 runs.
-    /// docs/ACCEPTANCE.md "The Dynamic Type re-check".
-    private func recheckDynamicType(_ suspects: [String], screen: String) -> [String] {
-        XCTContext.runActivity(named: "ORYN audit retry 1/1 \(screen) [dynamicType]: "
-                               + "\(suspects.count) Dynamic Type finding(s) re-checked on the still screen") { _ in }
-        _ = XCTWaiter().wait(for: [XCTestExpectation(description: "dynamic type re-check settle")], timeout: 2)
+    /// text on the Ask Jupiter sheet flagged at once; and at bd9ff99 the device
+    /// row's name and mode (#F2F1ED, #B6BABE on #0A0B0C: 17.4:1, 10.1:1 measured
+    /// from the screenshot) failed contrast in the same audit pass as 3 Dynamic
+    /// Type findings that did not reproduce. docs/ACCEPTANCE.md "The re-check".
+    private func recheckOnStillScreen(_ type: XCUIAccessibilityAuditType, _ suspects: [String],
+                                      screen: String) -> [String] {
+        let kind = Self.name(type)
+        XCTContext.runActivity(named: "ORYN audit retry 1/1 \(screen) [\(kind)]: "
+                               + "\(suspects.count) finding(s) re-checked on the still screen") { _ in }
+        _ = XCTWaiter().wait(for: [XCTestExpectation(description: "\(kind) re-check settle")], timeout: 2)
         _ = stillTexts()
-        var again: [String] = []
+        var again: [(label: String, what: String)] = []
         do {
-            try audit(for: .dynamicType, screen: screen, reset: { again.removeAll() }) { issue in
+            try audit(for: type, screen: screen, reset: { again.removeAll() }) { issue in
                 let label = issue.element?.label ?? ""
                 let known = self.knownIssues.first {
                     $0.screen == screen.components(separatedBy: "_").first && $0.type == issue.auditType
@@ -258,25 +275,31 @@ final class AccessibilityAuditUITests: XCTestCase {
                                                          && issue.element?.elementType == .staticText
                                                      : label.hasPrefix($0.label))
                 }
-                if known == nil { again.append(label) }
+                // Contrast under the bars, or with no element, has its own check
+                // above (the bar re-checks may have moved the page meanwhile).
+                if type == .contrast, issue.element.map({ self.obscuredByBars($0.frame) }) ?? true,
+                   !suspects.contains(label) {
+                    return true
+                }
+                if known == nil { again.append((label, issue.compactDescription)) }
                 return true
             }
         } catch {
             XCTFail("\(screen): \(error)")
         }
-        let persistent = again.filter { suspects.contains($0) }
-        let fresh = again.filter { !suspects.contains($0) }
         var out: [String] = []
-        for label in persistent + fresh {
-            out.append("\(screen)\tdynamicType\tNEW\tDynamic Type font sizes are partially unsupported "
-                       + "(\(persistent.contains(label) ? "in both audits" : "in the re-check"))\t\(label)\t\t")
+        for item in again {
+            let both = suspects.contains(item.label)
+            out.append("\(screen)\t\(kind)\tNEW\t\(item.what) (\(both ? "in both audits" : "in the re-check"))"
+                       + "\t\(item.label)\t\t")
         }
         if !out.isEmpty {
-            XCTFail("\(screen): \(out.count) Dynamic Type finding(s) reproduced by the re-check")
+            XCTFail("\(screen): \(out.count) \(kind) finding(s) reproduced by the re-check")
         }
-        let gone = suspects.filter { !again.contains($0) }
+        let seenAgain = Set(again.map(\.label))
+        let gone = suspects.filter { !seenAgain.contains($0) }
         if !gone.isEmpty {
-            out.append("\(screen)\tdynamicType\tnot-reproduced\tFlagged by the first audit only; the re-check "
+            out.append("\(screen)\t\(kind)\tnot-reproduced\tFlagged by the first audit only; the re-check "
                        + "of the still screen found none of these\t\(gone.joined(separator: " | "))\t\tx\(gone.count)")
         }
         return out

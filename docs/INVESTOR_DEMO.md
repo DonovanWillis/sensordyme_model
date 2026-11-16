@@ -76,6 +76,15 @@ Contents:
   with their durations, eyes closed, head direction, and the last event's
   "why" line.
 
+**M13.1 (Simulator-verified only):** the **AI view** toggle and **Present** are
+also on the paired-camera screen, the one the app opens from the phone's local
+pairing. They work with the backend **stopped**: live video, the overlay, the
+panel and a device-confirmed mode switch all go phone ↔ device over the signed
+local path (sd-local-v1). UI journey 31 (`test31_LocalPresentation`) proves
+this with the backend process stopped. On the device, drawing the face mesh
+into the stream costs 0.90 ms instead of 2.31 ms (p50, Mac M3; pixel-identical
+to the previous drawing).
+
 ## 2. The 90-second demo
 
 For a meeting slot, a booth or a video call. One presenter (a consenting
@@ -164,8 +173,8 @@ simulated recording.**
   - A SIMULATED badge is on every live frame.
   - A burned-in bar says it is a virtual device in the iOS Simulator, not a Pi.
   - **Say so out loud when you play it.**
-- **Provenance:** one continuous cut from UI-test journey 30 of the final 30/30
-  XCUITest run.
+- **Provenance:** one continuous cut from UI-test journey 30 of the M13 final
+  XCUITest run (30/30 at faae3de; M13.1 added journey 31).
 
 ## 6. If the hardware is not ready: the labelled simulator
 
@@ -192,7 +201,8 @@ measurement** (MacBook M3, or the x86 fleet worker), labelled with its host.
 | Alert → backend stored | p50 1,285 ms → 10.7 ms (Mac, software) | "Alerts reach the app history almost instantly" (software measurement) |
 | Decisive frame → buzzer commanded | ~1 ms (SIMULATED, Mac) | "The device alerts locally, without a round trip" |
 | Camera fault → "not protecting" in the app | 2.25 s (SIMULATED) | "It tells you when it can't see" |
-| Hailo-8L inference, Pi fps, thermal behaviour, INT8 parity | **not measured** | Do not quote. Hardware gates H1–H3 |
+| Face mesh drawn into the streamed frame | 2.31 → 0.90 ms p50 (Mac M3; M13.1, pixel-identical) | Engineering detail |
+| Hailo-8L inference, Pi fps, thermal behaviour, INT8 parity | **not measured** (the Pi was also unreachable throughout M13.1) | Do not quote. Hardware gates H1–H3 |
 
 The overlay itself shows **live, measured** fps and per-model run times on the
 device. That is the only performance number to show during a live demo, and it

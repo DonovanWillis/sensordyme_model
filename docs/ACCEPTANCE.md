@@ -71,16 +71,28 @@ unsupported" for the headings, the body text and the input field). The
 identical screen, with the same screenshot, passed in the other runs. Nothing
 on the sheet uses a fixed text size.
 
+**Also observed (contrast).** In the full run at bd9ff99, the device list's
+row name and mode ("Virtual SensorDyme 1 (SIMULATED)", "Driver Safety") failed
+contrast. Both are in the clear band, and measured from that run's own
+screenshot they are 17.4:1 (#F2F1ED) and 10.1:1 (#B6BABE) on #0A0B0C, against
+the 4.5:1 required. The same audit pass also produced 3 Dynamic Type findings
+that the re-check did not reproduce. It is the same pair of colours M11
+recorded "failing" mid-fade. The device list is unchanged in M13.1, and
+earlier runs had passed it.
+
 **Rule.** This is the one exception to "a finding is never retried":
 
-* It covers **Dynamic Type only**.
-* A Dynamic Type finding that is not an accepted issue is audited **once more**,
-  for Dynamic Type only, on the unchanged screen once it is still.
-* Any finding the second audit reports again fails the test as NEW. A real
-  non-scaling text fails every time, so it still fails.
+* It covers **Dynamic Type** findings, and **contrast** findings on a located
+  element in the clear band. Contrast under the bars or with no element keeps
+  its own M8.4 check.
+* A finding of either kind that is not an accepted issue is audited **once
+  more**, for that type only, on the unchanged screen once it is still.
+* Any finding the second audit reports fails the test as NEW. Both audits read
+  the same text and the same pixels, so a real non-scaling or low-contrast text
+  fails both and still fails the test.
 * A finding the second audit does not reproduce is written in
   `audit_<screen>.txt` as a `not-reproduced` line with its labels.
-* Each re-check is logged as "ORYN audit retry 1/1 <screen> [dynamicType]" and
+* Each re-check is logged as "ORYN audit retry 1/1 <screen> [<type>]" and
   listed in summary.md.
 
 The owner may reverse this rule. Without it, the full suite fails about one run
