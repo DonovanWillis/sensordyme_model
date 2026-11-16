@@ -147,6 +147,17 @@ struct MJPEGPartMeta: Equatable {
     var status: String?
     /// `X-Camera-Age-Ms` on a heartbeat: how old the camera's own newest frame is.
     var cameraAgeMs: Int?
+    /// M13 `X-SD-Overlay` (sd-overlay/1, docs/LIVE_OVERLAY.md): what the AI saw
+    /// on THIS part's frame, still encoded (LiveOverlay.decode). Nil when the
+    /// part carries none -- a camera fallback frame, a viewer that didn't ask,
+    /// older firmware -- or when it was refused for its size.
+    var overlay: String?
+    /// The part carried an `X-SD-Overlay` larger than `maxOverlayBytes`; it was
+    /// dropped unread, and the frame is shown as not analysed.
+    var overlayRefused = false
+
+    /// The largest `X-SD-Overlay` kept (the device bounds it below 4 KB).
+    static let maxOverlayBytes = 16 * 1024
 
     /// Header names, spelled once (they must match core/dashboard.py).
     enum Header {
@@ -157,6 +168,7 @@ struct MJPEGPartMeta: Equatable {
         static let heartbeat = "x-stream-heartbeat"
         static let status = "x-stream-status"
         static let cameraAge = "x-camera-age-ms"
+        static let overlay = "x-sd-overlay"
     }
 
     /// Parse one part's header block. Lines that are not `Name: value` (the
@@ -183,6 +195,9 @@ struct MJPEGPartMeta: Equatable {
         meta.isHeartbeat = fields[Header.heartbeat] == "1"
         meta.status = fields[Header.status]
         meta.cameraAgeMs = fields[Header.cameraAge].flatMap { Int($0) }
+        if let overlay = fields[Header.overlay], !overlay.isEmpty {
+            if overlay.utf8.count <= maxOverlayBytes { meta.overlay = overlay } else { meta.overlayRefused = true }
+        }
         return meta
     }
 }
@@ -218,6 +233,25 @@ enum MJPEGResponse: Equatable {
         let meta = MJPEGPartMeta.from(fields: fields)
         return meta.isHeartbeat ? .heartbeat(meta) : .frameHeader(meta)
     }
+
+    /// M13: whether the stream's response says it carries sd-overlay/1
+    /// (`X-Stream-Overlay: sd-overlay/1`). A device that predates it ignores the
+    /// request header and answers without this: its frames then carry the
+    /// device-drawn picture and no analysis, and the app says so.
+    static func overlayCapable(headers: [String: String]) -> Bool {
+        headers.first { $0.key.lowercased() == "x-stream-overlay" }?.value
+            .trimmingCharacters(in: .whitespaces) == LiveOverlayRequest.schema
+    }
+}
+
+/// M13: the sd-overlay/1 request (docs/LIVE_OVERLAY.md).
+enum LiveOverlayRequest {
+    /// Asks for CLEAN frames with an `X-SD-Overlay` analysis per part. Asked on
+    /// every connection: the clean picture is the consumer view, and the AI
+    /// view draws the analysis over the same frames. Grants nothing (auth is
+    /// the session or token).
+    static let header = "X-Stream-Overlay"
+    static let schema = "sd-overlay/1"
 }
 
 /// One complete thing the stream delivered.
@@ -246,7 +280,9 @@ struct MJPEGFrameParser {
     private static let headerEnd = Data("\r\n\r\n".utf8)
     /// A header block longer than this is not one; a non-image body longer
     /// than this is not a heartbeat. Both are discarded rather than held.
-    static let maxHeaderBytes = 4096
+    /// M13: room for an `X-SD-Overlay` line (kept up to
+    /// MJPEGPartMeta.maxOverlayBytes) beside the other part headers.
+    static let maxHeaderBytes = 20 * 1024
 
     /// Hard ceiling on retained bytes. A stream that never yields a complete
     /// frame -- a wrong endpoint, a truncated encoder, a corrupted link -- must
@@ -451,6 +487,9 @@ enum MJPEGStreamRequest {
         // unknown request header; one that knows them answers with
         // X-Stream-Heartbeat-Interval-Ms. It grants nothing: auth is the token.
         request.setValue("1", forHTTPHeaderField: heartbeatHeader)
+        // M13: clean frames + what the AI saw on each (sd-overlay/1). A device
+        // that predates it ignores the header and sends what it always sent.
+        request.setValue("1", forHTTPHeaderField: LiveOverlayRequest.header)
         return request
     }
 

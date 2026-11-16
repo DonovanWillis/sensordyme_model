@@ -453,5 +453,49 @@ do {
           "moving from the legacy token to a session reconnects")
 }
 
+print("\nM13: sd-overlay/1 rides with its own frame:")
+do {
+    let request = MJPEGStreamRequest.make(base: "http://192.168.1.20:8899", token: "secret")
+    check(request?.value(forHTTPHeaderField: "X-Stream-Overlay") == "1",
+          "every /stream request asks for clean frames + the analysis")
+    check(MJPEGResponse.overlayCapable(headers: ["X-Stream-Overlay": "sd-overlay/1"]),
+          "a device that answers sd-overlay/1 sends it")
+    check(!MJPEGResponse.overlayCapable(headers: ["Content-Type": "multipart/x-mixed-replace"]),
+          "older firmware (no answer) does not")
+    check(!MJPEGResponse.overlayCapable(headers: ["x-stream-overlay": "sd-overlay/2"]), "another schema is not read")
+
+    // Byte-stream framing: each part's overlay arrives with THAT part's JPEG.
+    func overlayPart(_ frame: Data, seq: Int, overlay: String?) -> Data {
+        var head = "--frame\r\nContent-Type: image/jpeg\r\nContent-Length: \(frame.count)\r\nX-Frame-Seq: \(seq)\r\n"
+        if let overlay { head += "X-SD-Overlay: \(overlay)\r\n" }
+        var out = Data((head + "\r\n").utf8)
+        out.append(frame)
+        out.append(Data("\r\n".utf8))
+        return out
+    }
+    let doc = String(repeating: "eyJzY2hlbWEiOiJzZC1vdmVybGF5LzEifQ", count: 60)  // ~2 KB, like the device's
+    var parser = MJPEGFrameParser()
+    var stream = overlayPart(jpeg([1]), seq: 1, overlay: doc)
+    stream.append(overlayPart(jpeg([2]), seq: 2, overlay: nil))  // a camera fallback part: no analysis
+    stream.append(overlayPart(jpeg([3]), seq: 3, overlay: "abc"))
+    // Split mid-header, the way TCP delivers it.
+    let cut = 1500
+    var parts = parser.appendParts(stream.prefix(cut))
+    parts += parser.appendParts(stream.suffix(from: cut))
+    let metas: [MJPEGPartMeta] = parts.compactMap { if case let .frame(_, m) = $0 { return m }; return nil }
+    check(metas.map(\.seq) == [1, 2, 3], "three frames, in order")
+    check(metas.map(\.overlay) == [doc, nil, "abc"], "each with its own overlay; the fallback part with none")
+
+    let huge = String(repeating: "A", count: MJPEGPartMeta.maxOverlayBytes + 1)
+    let refused = MJPEGPartMeta.from(fields: ["x-sd-overlay": huge])
+    check(refused.overlay == nil && refused.overlayRefused, "an oversized overlay is refused, never kept")
+    if case .frameHeader(let meta) = MJPEGResponse.classify(status: 200, mimeType: "image/jpeg",
+                                                            headers: ["X-SD-Overlay": "abc", "X-Frame-Seq": "9"]) {
+        check(meta.overlay == "abc" && meta.seq == 9, "URLSession's per-part response carries it too")
+    } else {
+        check(false, "a part response is a frame header")
+    }
+}
+
 print(failures == 0 ? "\nPASSED" : "\n\(failures) FAILURE(S)")
 exit(failures == 0 ? 0 : 1)
