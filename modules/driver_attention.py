@@ -91,6 +91,7 @@ frames at a time. Three layers, all arithmetic, no new inference:
 from __future__ import annotations
 
 import contextlib
+import functools
 import json
 import math
 import statistics
@@ -357,6 +358,57 @@ def _camera_matrix(
         [[focal_length, 0, w / 2.0], [0, focal_length, h / 2.0], [0, 0, 1]],
         dtype=np.float64,
     )
+
+
+@functools.lru_cache(maxsize=1)
+def _tessellation_edges() -> np.ndarray:
+    return np.array(sorted(mp.solutions.face_mesh.FACEMESH_TESSELATION), dtype=np.int64)
+
+
+#: mediapipe's default face-mesh tessellation style (drawing_styles), BGR.
+_TESSELATION_COLOR = (128, 128, 128)
+
+
+def draw_face_tessellation(frame: np.ndarray, landmark_list) -> None:
+    """Draw the face-mesh tessellation, pixel-identical to mediapipe's
+    `draw_landmarks(..., FACEMESH_TESSELATION, landmark_drawing_spec=None,
+    connection_drawing_spec=<default tessellation style>)`, in one
+    `cv2.polylines` call instead of 2,556 Python `cv2.line` calls.
+
+    M13 measured the mediapipe path at ~3.4 ms per streamed frame (only while
+    a viewer watches the device-drawn stream); tests/test_m131_annotate.py
+    pins the pixels against mediapipe and the speed-up.
+
+    Same rules as mediapipe: a landmark is skipped when it carries a
+    visibility or presence below 0.5, or lies outside [0, 1]; an edge is drawn
+    only when both ends are kept; pixel = min(floor(v * size), size - 1).
+    """
+    marks = getattr(landmark_list, "landmark", None)
+    if not marks:
+        return
+    rows, cols = frame.shape[:2]
+    n = len(marks)
+    xy = np.empty((n, 2), dtype=np.float64)
+    keep = np.ones(n, dtype=bool)
+    for i, lm in enumerate(marks):
+        xy[i, 0] = lm.x
+        xy[i, 1] = lm.y
+        has = getattr(lm, "HasField", None)
+        if has is not None and ((has("visibility") and lm.visibility < 0.5)
+                                or (has("presence") and lm.presence < 0.5)):
+            keep[i] = False
+    keep &= (xy[:, 0] >= 0) & (xy[:, 0] <= 1) & (xy[:, 1] >= 0) & (xy[:, 1] <= 1)
+    edges = _tessellation_edges()
+    if int(edges.max()) >= n:
+        raise ValueError("Landmark index is out of range. Invalid connection")
+    edges = edges[keep[edges[:, 0]] & keep[edges[:, 1]]]
+    if not len(edges):
+        return
+    xy = np.where(keep[:, None], xy, 0.0)  # dropped points (NaN, off-frame) never reach the cast
+    px = np.empty((n, 2), dtype=np.int32)
+    px[:, 0] = np.minimum(np.floor(xy[:, 0] * cols), cols - 1)
+    px[:, 1] = np.minimum(np.floor(xy[:, 1] * rows), rows - 1)
+    cv2.polylines(frame, list(px[edges]), False, _TESSELATION_COLOR, 1)
 
 
 def estimate_head_rotation(
@@ -3133,13 +3185,7 @@ class DriverAttentionModule(VisionModule):
     def annotate(self, frame: np.ndarray) -> np.ndarray:
         """Draw the face mesh, EAR/yaw readouts, and any detected phone/food/hand boxes on `frame`."""
         if self._last_face_proto is not None:
-            mp.solutions.drawing_utils.draw_landmarks(
-                image=frame,
-                landmark_list=self._last_face_proto,
-                connections=mp.solutions.face_mesh.FACEMESH_TESSELATION,
-                landmark_drawing_spec=None,
-                connection_drawing_spec=mp.solutions.drawing_styles.get_default_face_mesh_tesselation_style(),
-            )
+            draw_face_tessellation(frame, self._last_face_proto)
         cv2.putText(frame, f"EAR: {self._last_ear:.2f}", (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
         cv2.putText(frame, f"Yaw: {self._last_yaw:.1f} deg", (10, 60), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
         self._draw_risk_bar(frame)
