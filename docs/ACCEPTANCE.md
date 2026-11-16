@@ -60,6 +60,32 @@ also fails fails the test. Each retry is in the screen's `audit_<screen>.txt`
 (an `audit-retry` line), in xcodebuild.log ("ORYN audit retry"), and listed at
 the end of summary.md.
 
+### The Dynamic Type re-check (M13.1)
+
+**Observed.** `test21_AuditDefaultTextSize` failed intermittently on the Ask
+Jupiter sheet: in both M13.1 full runs (96afa1d, 20bf68a), and in 1 of 4 runs
+alone on the M13.1 code (`-test-iterations 4`). On the **unchanged M13 code
+(faae3de)** it failed the same way, also 1 run in 4. Each time XCTest flagged
+**every** text on the sheet at once ("Dynamic Type font sizes are partially
+unsupported" for the headings, the body text and the input field). The
+identical screen, with the same screenshot, passed in the other runs. Nothing
+on the sheet uses a fixed text size.
+
+**Rule.** This is the one exception to "a finding is never retried":
+
+* It covers **Dynamic Type only**.
+* A Dynamic Type finding that is not an accepted issue is audited **once more**,
+  for Dynamic Type only, on the unchanged screen once it is still.
+* Any finding the second audit reports again fails the test as NEW. A real
+  non-scaling text fails every time, so it still fails.
+* A finding the second audit does not reproduce is written in
+  `audit_<screen>.txt` as a `not-reproduced` line with its labels.
+* Each re-check is logged as "ORYN audit retry 1/1 <screen> [dynamicType]" and
+  listed in summary.md.
+
+The owner may reverse this rule. Without it, the full suite fails about one run
+in four on unchanged code.
+
 ## The journey matrix
 
 `acceptance.md` ends with one row per required journey (1–30):
