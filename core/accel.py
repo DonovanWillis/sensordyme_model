@@ -843,10 +843,13 @@ class HailoYOLO:
             # (M10: plus any channel accelerator.yolo_extra_classes names a class.)
             scores, channels = self._class_scores(cls_raw)
 
-            best_cls = scores.argmax(axis=1)
-            if channels is not None:
-                best_cls = channels[best_cls]
-            best_score = scores.max(axis=1)  # max propagates NaN: one check covers every anchor
+            best_col = scores.argmax(axis=1)
+            best_cls = best_col if channels is None else channels[best_col]
+            # The score AT the argmax is the row maximum, read with one gather instead
+            # of a second full pass over the (anchors x classes) scores (M13). NaN still
+            # propagates: argmax returns the first NaN of a row, so one check covers
+            # every anchor exactly as max() did.
+            best_score = scores[np.arange(best_col.size), best_col]
             self._finite_or_raise(best_score, f"class scores at grid {grid}")
             keep = best_score >= conf
             if wanted is not None:
@@ -959,7 +962,14 @@ class HailoYOLO:
             scores, channels = self._class_scores(cls_raw)
             # One reduction (NaN/inf propagate through a sum) instead of a full isfinite pass.
             self._finite_or_raise(scores.sum(), f"class scores at grid {grid}")
-            anchor_idx, col_idx = np.nonzero(scores >= conf)
+            # Only an anchor whose best class reaches conf can hold a candidate: find those
+            # with one per-anchor max, then threshold just their rows (M13). The same
+            # (anchor, class) pairs in the same row-major order as np.nonzero over the whole
+            # (anchors x classes) mask, without building and scanning that 2-D mask -- most
+            # of this decoder's time on a frame with few candidates.
+            rows = np.flatnonzero(scores.max(axis=1) >= conf)
+            sub_row, col_idx = np.nonzero(scores[rows] >= conf)
+            anchor_idx = rows[sub_row]
             class_idx = col_idx if channels is None else channels[col_idx]
             if wanted is not None:
                 keep = np.isin(class_idx, list(wanted))
