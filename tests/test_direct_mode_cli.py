@@ -138,16 +138,27 @@ def test_install_dry_run_lists_every_step():
     result = _cli(str(REPO / "scripts" / "direct_mode.py"), "install", "--dry-run")
     assert result.returncode == 0
     lines = result.stdout.splitlines()
-    assert lines[0].endswith(ap_firewall.RULESET_PATH)
-    assert lines[1].endswith(ap_firewall.DISPATCHER_PATH)
-    assert lines[2].endswith(ap_firewall.PRE_UP_LINK)
-    assert lines[3].startswith(f"nft -c -f {ap_firewall.RULESET_PATH}")
+    assert lines[0].startswith("nft -c -f <rendered ruleset for wlan0>"), "checked before anything is installed"
+    assert lines[1].endswith(ap_firewall.RULESET_PATH)
+    assert lines[2].endswith(ap_firewall.DISPATCHER_PATH)
+    assert lines[3].endswith(ap_firewall.PRE_UP_LINK)
+    assert lines[4].endswith("/etc/polkit-1/rules.d/11-sensordyme-direct-mode.rules")
 
 
 @pytest.mark.skipif(hasattr(os, "geteuid") and os.geteuid() == 0, reason="checks the non-root refusal")
 def test_install_needs_root():
     result = _cli(str(REPO / "scripts" / "direct_mode.py"), "install")
     assert result.returncode == 1 and "root" in result.stderr
+
+
+def test_the_polkit_grant_is_protected_sharing_only():
+    """Never wifi.share.open: the service cannot raise an open access point even by mistake."""
+    rule = (REPO / "deploy" / "polkit" / "11-sensordyme-direct-mode.rules").read_text()
+    code = "\n".join(line for line in rule.splitlines() if not line.lstrip().startswith("//"))
+    assert '"org.freedesktop.NetworkManager.wifi.share.protected"' in code
+    assert "wifi.share.open" not in code
+    assert code.count("org.freedesktop.") == 1
+    assert 'subject.isInGroup("netdev")' in code
 
 
 def test_install_writes_the_ruleset_the_dispatcher_and_its_pre_up_link(tmp_path):
@@ -162,5 +173,8 @@ def test_install_writes_the_ruleset_the_dispatcher_and_its_pre_up_link(tmp_path)
     assert stat.S_IMODE(dispatcher.stat().st_mode) == 0o755
     assert link.is_symlink() and os.readlink(link) == "../90-sensordyme-direct"
     assert link.resolve() == dispatcher.resolve()
+    polkit = tmp_path / "etc/polkit-1/rules.d/11-sensordyme-direct-mode.rules"
+    assert polkit.read_bytes() == (REPO / "deploy" / "polkit" / "11-sensordyme-direct-mode.rules").read_bytes()
+    assert stat.S_IMODE(polkit.stat().st_mode) == 0o644
     # Idempotent: a second install replaces, never duplicates or fails.
     assert _cli(str(REPO / "scripts" / "direct_mode.py"), "install", "--root", str(tmp_path)).returncode == 0

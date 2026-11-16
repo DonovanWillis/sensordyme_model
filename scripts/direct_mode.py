@@ -21,10 +21,13 @@ rollback line can name the real previous network; without NetworkManager (a
 development Mac) it runs nothing at all.
 
 `install` (root) renders the ruleset for the configured interface and
-dashboard port into /etc/sensordyme/direct_mode.nft, installs the dispatcher
-script deploy/networkmanager/90-sensordyme-direct (root, 0755) and its pre-up
-link, and checks the ruleset with `nft -c -f` when nft is present. Until it has
-run, `enter` refuses: the access point never runs without its firewall.
+dashboard port, checks it with `nft -c -f` when nft is present (nothing is
+installed if nft rejects it), and installs it as /etc/sensordyme/direct_mode.nft,
+the dispatcher script deploy/networkmanager/90-sensordyme-direct (root, 0755)
+with its pre-up link, and the polkit grant
+deploy/polkit/11-sensordyme-direct-mode.rules (wifi.share.protected only; never
+wifi.share.open). Until it has run, `enter` refuses: the access point never
+runs without its firewall.
 """
 
 from __future__ import annotations
@@ -47,6 +50,10 @@ from core.network import WifiManager
 
 REPO = Path(__file__).resolve().parent.parent
 DISPATCHER_SOURCE = REPO / "deploy" / "networkmanager" / "90-sensordyme-direct"
+#: NetworkManager asks polkit for wifi.share.protected before it raises a shared
+#: Wi-Fi AP; the base rule (10-sensordyme-network.rules) does not grant it.
+POLKIT_SOURCE = REPO / "deploy" / "polkit" / "11-sensordyme-direct-mode.rules"
+POLKIT_TARGET = "/etc/polkit-1/rules.d/11-sensordyme-direct-mode.rules"
 
 
 def _load_config(path: str) -> dict:
@@ -72,18 +79,20 @@ def _under(root: str, path: str) -> Path:
 
 
 def install(config: dict, *, dry_run: bool, root: str = "") -> int:
-    """Install the ruleset and the dispatcher script. Root only, unless --root points elsewhere."""
+    """Install the ruleset, the dispatcher script and the polkit grant. Root only, unless --root."""
     interface = str(_direct_config(config).get("interface", "wlan0"))
     ruleset = ap_firewall.render_ruleset(interface, _dashboard_port(config))
     ruleset_path = _under(root, ap_firewall.RULESET_PATH)
     dispatcher_path = _under(root, ap_firewall.DISPATCHER_PATH)
     link_path = _under(root, ap_firewall.PRE_UP_LINK)
+    polkit_path = _under(root, POLKIT_TARGET)
     nft = shutil.which("nft")
     steps = [
-        f"install -D -m 0644 -o root -g root <rendered ruleset for {interface}> {ruleset_path}",
+        f"nft -c -f <rendered ruleset for {interface}>" + ("" if nft else "    # skipped: nft not installed here"),
+        f"install -D -m 0644 -o root -g root <rendered ruleset> {ruleset_path}",
         f"install -D -m 0755 -o root -g root {DISPATCHER_SOURCE} {dispatcher_path}",
         f"ln -sfn ../{dispatcher_path.name} {link_path}",
-        f"nft -c -f {ruleset_path}" + ("" if nft else "    # skipped: nft not installed here"),
+        f"install -D -m 0644 -o root -g root {POLKIT_SOURCE} {polkit_path}",
     ]
     if dry_run:
         print("\n".join(steps))
@@ -92,27 +101,31 @@ def install(config: dict, *, dry_run: bool, root: str = "") -> int:
         print("refused: install writes /etc and must run as root (sudo)", file=sys.stderr)
         return 1
     as_root = hasattr(os, "geteuid") and os.geteuid() == 0
-    for path, data, mode in ((ruleset_path, ruleset, 0o644),
-                             (dispatcher_path, DISPATCHER_SOURCE.read_text(encoding="utf-8"), 0o755)):
+    files = ((ruleset_path, ruleset, 0o644),
+             (dispatcher_path, DISPATCHER_SOURCE.read_text(encoding="utf-8"), 0o755),
+             (polkit_path, POLKIT_SOURCE.read_text(encoding="utf-8"), 0o644))
+    for path, data, mode in files:
         path.parent.mkdir(parents=True, exist_ok=True)
         tmp = path.with_name(f".{path.name}.tmp")
         tmp.write_text(data, encoding="utf-8")
         os.chmod(tmp, mode)
         if as_root:
             os.chown(tmp, 0, 0)
+        if path == ruleset_path and nft and not root:
+            # Checked before anything is replaced: a ruleset nft rejects is never installed.
+            check = subprocess.run([nft, "-c", "-f", str(tmp)],  # fixed argv; -c only checks
+                                   capture_output=True, text=True, check=False)
+            if check.returncode != 0:
+                tmp.unlink()
+                print(f"refused: nft rejected the ruleset; nothing installed: {check.stderr.strip()}",
+                      file=sys.stderr)
+                return 1
         os.replace(tmp, path)
-    link_path.parent.mkdir(parents=True, exist_ok=True)
     if link_path.is_symlink() or link_path.exists():
         link_path.unlink()
+    link_path.parent.mkdir(parents=True, exist_ok=True)
     link_path.symlink_to(f"../{dispatcher_path.name}")
-    if nft and not root:
-        check = subprocess.run([nft, "-c", "-f", str(ruleset_path)],  # fixed argv; -c only checks
-                               capture_output=True, text=True, check=False)
-        if check.returncode != 0:
-            ruleset_path.unlink()
-            print(f"refused: nft rejected the ruleset, removed it: {check.stderr.strip()}", file=sys.stderr)
-            return 1
-    print(f"installed {ruleset_path}, {dispatcher_path} and {link_path}")
+    print(f"installed {ruleset_path}, {dispatcher_path} (+ {link_path}) and {polkit_path}")
     return 0
 
 
