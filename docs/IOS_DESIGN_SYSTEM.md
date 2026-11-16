@@ -469,4 +469,5 @@ What the device's AI saw is drawn by the app over the clean picture
   of an alert or while the analysis reports an alert condition, in the device's
   words; the driver panel and the mode chips (bone when the device reports the
   mode, a spinner on the tapped chip until it does). Wider than tall: picture on
-  the left, panel and chips in a 360 pt column.
+  the left, panel and chips in a 360 pt column. The mode chips are pinned under
+  the scrolling panel, so a banner arriving never moves them under a finger.

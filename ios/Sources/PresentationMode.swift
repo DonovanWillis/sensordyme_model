@@ -144,8 +144,14 @@ struct PresentationModeView: View {
                             header
                             video.frame(maxHeight: .infinity)
                         }
-                        ScrollView {
-                            sidePanel.padding(.vertical, SD.Space.xs)
+                        // The mode switch is pinned under the scrolling panel:
+                        // an alert banner arriving above never moves it under a
+                        // finger that is about to tap.
+                        VStack(alignment: .leading, spacing: SD.Space.sm) {
+                            ScrollView {
+                                sidePanel.padding(.vertical, SD.Space.xs)
+                            }
+                            modeSwitch
                         }
                         .frame(width: min(360, geo.size.width * 0.38))
                     }
@@ -160,6 +166,9 @@ struct PresentationModeView: View {
                                 .padding(.horizontal, SD.Space.md)
                                 .padding(.bottom, SD.Space.md)
                         }
+                        modeSwitch
+                            .padding(.horizontal, SD.Space.md)
+                            .padding(.bottom, SD.Space.xs)
                     }
                     .padding(.top, SD.Space.xs)
                 }
@@ -345,8 +354,6 @@ struct PresentationModeView: View {
                                       hasLiveFeed: { if case .live = source.kind { return true }; return false }(),
                                       lastEvent: lastDriverEvent, onDark: true)
             }
-
-            modeSwitch
         }
     }
 
@@ -378,6 +385,7 @@ struct PresentationModeView: View {
                     .accessibilityIdentifier("present.switching")
             }
         }
+        .frame(maxWidth: .infinity, alignment: .leading)
         .sensoryFeedback(.impact(weight: .light), trigger: switchTaps)
     }
 

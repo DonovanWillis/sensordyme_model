@@ -738,10 +738,19 @@ final class OrynJourneysUITests: XCTestCase {
                       "the list says why these are direct connections: \(element("local.caption").label)")
         shot("29b_cold_launch_backend_down")
         waitFor(card, labelContains: "Connected directly on this network", timeout: 60)
-        // The card grows a line as it connects; tap it once it has stayed put
-        // (M13 full run: the tap landed during that re-layout and opened nothing).
+        // The card grows a line as it connects; tap it once it has stayed put.
+        // M13: in 2 of 4 runs the synthesized tap reached the app (UIKit logged
+        // the touch) and the link did not open; the card is redrawn every
+        // second while the list is live. One more tap only if the card is still
+        // there, the way focus() taps a field once more -- a push that already
+        // happened leaves no card to tap.
         settle(card)
         card.tap()
+        if !element("local.banner").waitForExistence(timeout: 5), card.exists, card.isHittable {
+            Stack.saveText("the first tap on the paired camera opened nothing; tapped once more",
+                           name: "29_second_tap", test: self)
+            card.tap()
+        }
         XCTAssertTrue(element("local.banner").waitForExistence(timeout: 15), "the screen says it is a direct connection")
         XCTAssertTrue(label(containing: "Your account server can't be reached").waitForExistence(timeout: 5),
                       "and why: the account server is not reachable")
@@ -821,7 +830,15 @@ final class OrynJourneysUITests: XCTestCase {
 
         let strict = element("present.mode.driver_safety:strict")
         XCTAssertTrue(strict.waitForExistence(timeout: 10))
+        // The alert banner above the chips comes and goes with the scenario's
+        // events and moves them: tap once they have stayed put (settle).
+        settle(strict)
         strict.tap()
+        if !Stack.waitUntil(timeout: 5, { self.element("present.switching").exists || strict.isSelected }) {
+            Stack.saveText("the first tap on Strict started nothing; tapped once more", name: "30_second_tap", test: self)
+            settle(strict)
+            strict.tap()
+        }
         waitFor(strict, selected: true, timeout: 60)  // from what the device reports, not the tap
         XCTAssertNotEqual(element("present.mode.driver_safety:standard").value as? String ?? "", "Active",
                           "only one mode is active")
