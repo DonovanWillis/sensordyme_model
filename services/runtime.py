@@ -113,7 +113,8 @@ _NOT_PAUSED_WHEN_STOPPED = frozenset({"camera", "audible_alert", "alert_output"}
 #: camera or the inference loop that feeds them is impaired.
 _ANALYSIS_CAPABILITIES = frozenset({"face", "objects", "hands", "pose", "attention", "eye_timing"})
 #: The stop reason in words for the app ("by uplink" was internal jargon).
-_STOP_SOURCE_WORDS = {"uplink": "from the app", "dashboard": "from the device's dashboard"}
+_STOP_SOURCE_WORDS = {"uplink": "from the app", "dashboard": "from the device's dashboard",
+                      "local_app": "from the app on the device's network"}
 _MAX_SWAP_S = 120.0
 #: Quiet time after which a run of last-resort reboots counts as over.
 _REBOOT_CAMPAIGN_RESET_S = 24 * 3600.0
@@ -611,6 +612,22 @@ class DeviceRuntime:
         # M8.4 Decision C: the owner's camera-only setting, OFF unless saved ON
         # (core/camera_privacy.py). Loaded even without a dashboard: it is reported.
         self.camera_privacy = cprivacy.CameraPrivacy.load()
+        # M12 sd-local-v1 (core/local_auth.py, docs/LOCAL_ACCESS.md): per-phone
+        # local access, and the event journal enrolled phones read. Beside the
+        # event log; a key or store that cannot be used turns local access off,
+        # said in health -- the device protects exactly the same either way.
+        from core import local_auth, local_events
+
+        local_dir = Path(str(logging_config.get("csv_path", "data/events.csv"))).parent
+        self.local_authority, self._local_access_off = local_auth.build_authority(
+            self._local_device_id(), self.config.get("local_access"), local_dir)
+        if self._local_access_off:
+            print(f"SensorDyme: {self._local_access_off}")
+        journal_cfg = (self.config.get("local_access") or {}) if isinstance(self.config.get("local_access"),
+                                                                            dict) else {}
+        self.event_journal = local_events.LocalEventJournal(
+            journal_cfg.get("events_path") or local_dir / "local_events.jsonl",
+            max_events=int(journal_cfg.get("events_max", local_events.DEFAULT_MAX_EVENTS)))
         if bool(dash_cfg.get("enabled", False)):
             from core.dashboard import DashboardServer
 
@@ -642,7 +659,10 @@ class DeviceRuntime:
                 diagnostics_enabled=self._diagnostics_enabled,
                 camera_privacy=self.camera_privacy,
                 local_camera_while_stopped=dash_cfg.get("local_camera_while_stopped", True) is not False,
+                local_authority=self.local_authority,
+                event_journal=self.event_journal,
             )
+            self.dashboard.delivery_lookup = getattr(self.alert_manager, "delivery", None)
             # Refuse a role-violating preset at the request, with the reason, rather
             # than accept it and silently drop it in the inference loop.
             from main import resolve_preset
@@ -698,6 +718,12 @@ class DeviceRuntime:
             # M8.3: every event pushed carries what the alert policy did with it
             # and what the in-cabin outputs reported (docs/EVENT_PIPELINE.md).
             self.uplink.delivery_lookup = getattr(self.alert_manager, "delivery", None)
+            # M12: the owner's account can trust (signed) or revoke phones locally,
+            # and the local event list reports what is still waiting to go up.
+            self.uplink.local_authority = self.local_authority
+            self.event_journal.simulated = bool(getattr(self.uplink, "SIMULATED", False))
+            if self.dashboard is not None:
+                self.dashboard.pending_event_keys = self.uplink.pending_event_keys
             self.uplink.set_active_preset(self.active_preset)
             # Report the restored configuration at startup too, not only when a
             # new one arrives — otherwise a device that rebooted into a custom
@@ -733,6 +759,8 @@ class DeviceRuntime:
             wifi, network_cfg.get("provisioning", {}), version=_VERSION,
             deployment=str(self.config.get("deployment", "development")),
         )
+        # M12: a phone that proves the setup code over Bluetooth may enrol for local access.
+        self.provisioning.local_authority = self.local_authority
 
         # Hardware HAL: null implementations today; health-visible either way.
         from hardware.hal import build_hardware
@@ -1177,6 +1205,12 @@ class DeviceRuntime:
         except Exception:  # diagnostics never cost a frame
             log.debug("diagnostics snapshot failed", exc_info=True)
 
+    def _local_device_id(self) -> str:
+        """The SD- id local signatures are bound to (the one health reports)."""
+        from core import device_health
+
+        return device_health._device_id()
+
     def _collect_health(self, caller: str = "loop") -> dict:
         """This device's real state, for the app's status indicators."""
         report = self._collect_component_health(caller)
@@ -1196,6 +1230,13 @@ class DeviceRuntime:
         if callable(backlog):
             report["uplink_backlog"] = backlog()
         report["storage"] = self._storage_report(report.get("uplink_backlog"))
+        # M12 sd-local-v1: the device's public key and which phones it trusts
+        # locally (ids only). The backend converges its set_local_clients on this.
+        authority = getattr(self, "local_authority", None)
+        if authority is not None:
+            report["local_access"] = authority.report()
+        elif getattr(self, "_local_access_off", None):
+            report["local_access"] = {"contract": "sd-local-v1", "unavailable": self._local_access_off}
         # Stamped HERE, where the sample is taken, not where it is sent (M8.1): a
         # snapshot re-sent unchanged keeps its generation, so the backend can tell
         # a frozen report from a new one whatever the device's wall clock says.
@@ -2613,6 +2654,9 @@ class DeviceRuntime:
         handled -- applied or refused -- so the backend converges on THIS request.
         """
         action = str((request or {}).get("action", "")).lower()
+        if source == "dashboard" and (request or {}).get("by") == "local_app":
+            # M12: a signed request from an enrolled phone on the LAN (sd-local-v1).
+            source = "local_app"
         command_id = (request or {}).get("id")
         if command_id:
             self._last_protection_command = str(command_id)

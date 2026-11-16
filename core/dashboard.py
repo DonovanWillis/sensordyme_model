@@ -273,8 +273,18 @@ class DashboardServer:
         local_camera_while_stopped: bool = True,
         diagnostics_provider: Optional[Callable[[], dict]] = None,
         diagnostics_enabled: bool = False,
+        local_authority=None,
+        event_journal=None,
+        pending_event_keys: Optional[Callable[[], set]] = None,
     ) -> None:
         self._host = host
+        #: M12 sd-local-v1 (core/local_auth.py): per-phone keys enrolled through an
+        #: authorised path. None: only the legacy shared token opens /api and /stream.
+        self.local_authority = local_authority
+        #: M12: the bounded journal behind GET /api/events (core/local_events.py).
+        self.event_journal = event_journal
+        #: () -> event_keys still waiting for the uplink; None when there is no uplink.
+        self.pending_event_keys = pending_event_keys
         self._port = port
         #: Whether this bind is reachable from anything but this machine.
         #:
@@ -362,6 +372,52 @@ class DashboardServer:
             def log_message(self, *args) -> None:  # silence per-request logging
                 pass
 
+            # -- M12 sd-local-v1 ------------------------------------------------------
+            #: The enrolled phone this request is from (session or signature), or None.
+            local_client = None
+            _body_cache: Optional[bytes] = None
+
+            def _peer(self) -> Optional[str]:
+                return self.client_address[0] if self.client_address else None
+
+            def _session_client(self):
+                """A phone's read session (X-SD-Session), GET only. Never opens a write."""
+                authority = dashboard.local_authority
+                if authority is None or self.command != "GET":
+                    return None
+                sent = self.headers.get("X-SD-Session", "")
+                return authority.check_session(sent, self._peer()) if sent else None
+
+            def _signed_client(self, path: str):
+                """The phone that signed THIS write over a fresh challenge, else LocalAuthError."""
+                from core import local_auth as la
+
+                authority = dashboard.local_authority
+                if authority is None:
+                    raise la.LocalAuthError("local_access_off", 401)
+                return authority.verify_request(self.headers.get(la.HEADER), self.command, path,
+                                                self._raw_body(), self._peer())
+
+            def _local_refusal(self, exc) -> None:
+                body = {"error": "local access refused", "code": exc.reason}
+                if exc.retry_after_s is not None:
+                    body["retry_after_s"] = exc.retry_after_s
+                self._json(body, exc.status)
+
+            def _raw_body(self) -> bytes:
+                """The request body, read once and bounded (64 KiB); b"" for anything else."""
+                if self._body_cache is not None:
+                    return self._body_cache
+                try:
+                    length = int(self.headers.get("Content-Length", 0))
+                except ValueError:
+                    length = 0
+                self._body_cache = self.rfile.read(length) if 0 < length <= 64 * 1024 else b""
+                return self._body_cache
+
+            def _token_ok(self) -> bool:
+                return dashboard._token is not None and self._authorized()
+
             def _authorized(self) -> bool:
                 """When a device token is configured, require it on every /api and /stream path."""
                 if dashboard._token is None:
@@ -444,21 +500,68 @@ class DashboardServer:
                 and an unbounded Content-Length is memory on the device's
                 terms. A malformed length used to raise into a traceback.
                 """
-                try:
-                    length = int(self.headers.get("Content-Length", 0))
-                except ValueError:
-                    return {}
-                if not 0 < length <= 64 * 1024:
+                raw = self._raw_body()
+                if not raw:
                     return {}
                 try:
-                    payload = json.loads(self.rfile.read(length))
+                    payload = json.loads(raw)
                 except (ValueError, UnicodeDecodeError):
                     return {}
                 return payload if isinstance(payload, dict) else {}
 
-            def do_POST(self) -> None:
+            def _local_post(self, path: str) -> bool:
+                """sd-local-v1 endpoints that are their own authentication. True if handled."""
+                from core import local_auth as la
+
+                authority = dashboard.local_authority
+                if path not in ("/api/local/session", "/api/local/enroll", "/api/local/revoke"):
+                    return False
+                if authority is None:
+                    self._json({"error": "local access is not available on this device",
+                                "code": "local_access_off"}, 404)
+                    return True
                 try:
-                    if not self._authorized():
+                    if path == "/api/local/session":
+                        reply = authority.open_session(self.headers.get(la.HEADER), path, self._raw_body(),
+                                                       self._peer())
+                        self._json(reply, 200)
+                    elif path == "/api/local/enroll":
+                        # Only the holder of the legacy device token (an install
+                        # that already had one) enrols over the LAN. A new phone
+                        # with no token enrols over Bluetooth (PoP) or through the
+                        # owner's account -- never by being on the network.
+                        if not self._token_ok():
+                            self._json({"error": "enrolling over the network needs the device token",
+                                        "code": "token_required"}, 401)
+                            return True
+                        payload = self._read_json()
+                        self._json(authority.enroll(payload.get("public_key"), payload.get("name"), "token"), 201)
+                    else:  # /api/local/revoke: any enrolled phone (the owner's) or the token holder
+                        if not self._token_ok():
+                            self._signed_client(path)
+                        payload = self._read_json()
+                        revoked = authority.revoke(payload.get("client_id"))
+                        self._json({"ok": revoked, "revoked": payload.get("client_id") if revoked else None},
+                                   200 if revoked else 404)
+                except la.LocalAuthError as exc:
+                    self._local_refusal(exc)
+                return True
+
+            def do_POST(self) -> None:
+                from core import local_auth as la
+
+                try:
+                    path = urlsplit(self.path).path
+                    if self._local_post(path):
+                        return
+                    if self.headers.get(la.HEADER) and dashboard.local_authority is not None:
+                        # A phone's signed write: verified over the exact body bytes.
+                        try:
+                            self.local_client = self._signed_client(path)
+                        except la.LocalAuthError as exc:
+                            self._local_refusal(exc)
+                            return
+                    elif not self._authorized():
                         self._json({"error": "invalid or missing device token"}, 401)
                         return
                     if self.path.startswith("/setup/wifi"):
@@ -491,7 +594,11 @@ class DashboardServer:
                         if action == "stop" and payload.get("confirm") is not True:
                             self._json({"error": "stopping monitoring requires \"confirm\": true"}, 400)
                             return
-                        dashboard.request_protection({"action": action, "confirm": payload.get("confirm") is True})
+                        request = {"action": action, "confirm": payload.get("confirm") is True}
+                        if self.local_client is not None:
+                            # Recorded as the app on this network, with which phone.
+                            request.update(by="local_app", client=self.local_client.client_id)
+                        dashboard.request_protection(request)
                         self._json({"ok": True, "requested": action}, 202)
                     else:
                         self.send_response(404)
@@ -501,9 +608,31 @@ class DashboardServer:
 
             def do_GET(self) -> None:
                 try:
-                    if (self.path.startswith("/api") or self.path.startswith("/stream")) and not self._authorized():
-                        self._json({"error": "invalid or missing device token"}, 401)
+                    path = urlsplit(self.path).path
+                    if path == "/api/local/hello":
+                        # Unauthenticated by design: it hands out a single-use
+                        # challenge and the device's public-key fingerprint (both
+                        # useless without an enrolled key), nothing else.
+                        authority = dashboard.local_authority
+                        if authority is None:
+                            self._json({"error": "local access is not available on this device",
+                                        "code": "local_access_off"}, 404)
+                            return
+                        from core import local_auth as la
+
+                        self._json({"contract": la.CONTRACT, "device_id": authority.device_id,
+                                    "device_key_fp": authority.identity.fingerprint,
+                                    "challenge": authority.issue_challenge(),
+                                    "challenge_ttl_s": int(la.CHALLENGE_TTL_S),
+                                    "token_enrollment": dashboard._token is not None})
                         return
+                    if path.startswith(("/api", "/stream")):
+                        self.local_client = self._session_client()
+                        if self.local_client is None and not self._authorized():
+                            # A phone whose session ended is told so, and opens a new one.
+                            code = "session_invalid" if self.headers.get("X-SD-Session") else "unauthorized"
+                            self._json({"error": "invalid or missing device token", "code": code}, 401)
+                            return
                     # Compare the PATH, not the raw request line. An operator
                     # opens the page as `/?token=...` when a token is configured,
                     # and an exact match on "/" 404s that -- so the one URL the
@@ -545,6 +674,16 @@ class DashboardServer:
                             with contextlib.suppress(ValueError):
                                 limit = min(2000, int(self.path.rsplit("limit=", 1)[1].split("&")[0]))
                         self._json({"events": dashboard.history(limit)})
+                    elif path == "/api/events":
+                        self._json(*dashboard.events_response(parse_qs(urlsplit(self.path).query)))
+                    elif path == "/api/local/clients":
+                        authority = dashboard.local_authority
+                        if authority is None:
+                            self._json({"error": "local access is not available on this device",
+                                        "code": "local_access_off"}, 404)
+                        else:
+                            self._json({"clients": authority.clients_view(),
+                                        "this_client": self.local_client.client_id if self.local_client else None})
                     elif self.path.startswith("/api/stream/stats"):
                         self._json(dashboard.stream_stats())
                     elif self.path.startswith("/stream"):
@@ -569,7 +708,17 @@ class DashboardServer:
                         # its own thread, and only this long (_STREAM_SEND_TIMEOUT_S).
                         with contextlib.suppress(OSError):
                             self.connection.settimeout(dashboard._stream_send_timeout_s)
-                        dashboard.serve_stream(self.wfile.write, self._peer_gone, heartbeat=heartbeat, local=local)
+                        peer_gone = self._peer_gone
+                        if self.local_client is not None:
+                            # A phone's stream ends the moment that phone is revoked.
+                            # (Session expiry is checked at connect; the app renews
+                            # before it ends, and a stream is not cut mid-view.)
+                            client_id = self.local_client.client_id
+                            authority = dashboard.local_authority
+
+                            def peer_gone() -> bool:
+                                return self._peer_gone() or not authority.client_active(client_id)
+                        dashboard.serve_stream(self.wfile.write, peer_gone, heartbeat=heartbeat, local=local)
                     else:
                         self.send_response(404)
                         self.end_headers()
@@ -944,6 +1093,42 @@ class DashboardServer:
             )
             self._counts[event.type] += 1
             self._flash_until = time.time() + FLASH_DURATION_S
+        journal = self.event_journal
+        if journal is not None:
+            # M12: the same event_id the uplink sends as event_key (core/local_events.py).
+            delivery = None
+            lookup = self.delivery_lookup
+            if callable(lookup):
+                with contextlib.suppress(Exception):
+                    delivery = lookup(event)
+            journal.record(event, severity, delivery=delivery)
+
+    #: Set by the runtime (the alert policy's `delivery`): what each event actuated.
+    delivery_lookup: Optional[Callable] = None
+
+    def events_response(self, query: dict) -> tuple[dict, int]:
+        """GET /api/events (sd-local-events/1): newest first, or `after=<seq>` oldest first."""
+        journal = self.event_journal
+        if journal is None:
+            return {"error": "this device keeps no local event journal", "code": "no_journal"}, 404
+        try:
+            limit = int((query.get("limit") or ["100"])[0])
+            raw_after = (query.get("after") or [None])[0]
+            after = None if raw_after in (None, "") else int(raw_after)
+        except (TypeError, ValueError):
+            return {"error": "limit and after must be integers", "code": "bad_request"}, 400
+        provider = self.pending_event_keys
+        pending: Optional[set] = None
+        if callable(provider):
+            try:
+                pending = set(provider())
+            except Exception:  # noqa: BLE001 - unknown backlog: say "pending", never "sent"
+                pending = None
+        page = journal.page(after=after, limit=limit, pending_keys=pending or set(), uplink=callable(provider))
+        if callable(provider) and pending is None:
+            for item in page["events"]:
+                item["sync"] = "unknown"
+        return page, 200
 
     def flash_active(self, now: Optional[float] = None) -> bool:
         """True for FLASH_DURATION_S after the most recent push_event() call.

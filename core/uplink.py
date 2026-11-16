@@ -813,6 +813,8 @@ class CloudUplink:
                     print("cloud_uplink: ignored a malformed set_nodes command")
             if "set_camera_mode" in command:
                 self._accept_camera_mode(command.get("set_camera_mode"))
+            if "set_local_clients" in command:
+                self._accept_local_clients(command.get("set_local_clients"))
             if "set_zones" in command:
                 zones = command.get("set_zones")
                 with self._lock:
@@ -924,6 +926,16 @@ class CloudUplink:
                         f"newer ones kept"
                     )
         return more_waiting
+
+    def pending_event_keys(self) -> set[str]:
+        """event_keys not yet acknowledged by the backend (queued or in flight).
+
+        M12: the device's local event list (GET /api/events) says "pending" for
+        these and "sent" for the rest, so the phone shows sync state honestly.
+        """
+        with self._lock:
+            return {item["event_key"] for item in (*self._inflight, *self._queue)
+                    if isinstance(item, dict) and isinstance(item.get("event_key"), str)}
 
     # ------------------------------------------------------------------ backlog spool (M8)
     def backlog(self) -> dict:
@@ -1072,6 +1084,34 @@ class CloudUplink:
             return
         with self._lock:
             self._pending_camera_mode = request
+
+    #: M12 sd-local-v1: the device's LocalAuthority (core/local_auth.py), set by
+    #: the runtime. None: the device has no local access, and the command is ignored.
+    local_authority: Any = None
+
+    def _accept_local_clients(self, raw) -> None:
+        """The owner's phones to trust (or forget) locally, from their account (M12).
+
+        Adding a phone grants it the live camera and stop/resume on the LAN, so
+        it is applied ONLY under a verified signed envelope -- whatever
+        `cloud.command_auth` says, as for camera-only ON. A revocation is the
+        safe direction and is applied like any other command. Applied here, on
+        the uplink thread: the store is thread-safe and the next report carries
+        the new client list, which is what the backend converges on.
+        """
+        authority = self.local_authority
+        if authority is None or not isinstance(raw, dict):
+            return
+        change = {"revoke": raw.get("revoke") if isinstance(raw.get("revoke"), list) else []}
+        if raw.get("add"):
+            if not getattr(self, "_command_verified", False):
+                self._refuse_command("local_clients_require_signed_command")
+            else:
+                change["add"] = raw.get("add")
+        applied = authority.apply_remote(change)
+        if applied["added"] or applied["revoked"] or applied["refused"]:
+            print(f"cloud_uplink: local access: {len(applied['added'])} phone(s) trusted, "
+                  f"{len(applied['revoked'])} revoked, {len(applied['refused'])} refused")
 
     def pop_pending_camera_mode(self) -> Optional[dict]:
         """The owner's camera-only setting awaiting the main loop, if any.

@@ -282,6 +282,52 @@ def open_credentials(keys: SessionKeys, iv: bytes, ciphertext: bytes) -> Optiona
         return None
 
 
+#: M12 sd-local-v1 enrolment inside a proven session (docs/LOCAL_ACCESS.md §4.1).
+ENROLL_AAD = b"local-enroll"
+ENROLLED_AAD = b"local-enrolled"
+
+
+def _canonical(obj: dict) -> bytes:
+    return json.dumps(obj, ensure_ascii=False, separators=(",", ":"), sort_keys=True).encode()
+
+
+def seal_enrollment(keys: SessionKeys, public_key_b64u: str, name: str, iv: bytes) -> bytes:
+    """The app's half: its public key and name, sealed to this proven session."""
+    _, _, aesgcm, _, _ = _crypto()
+    return aesgcm(keys.enc).encrypt(iv, _canonical({"name": name, "public_key": public_key_b64u}),
+                                    ENROLL_AAD + keys.transcript)
+
+
+def open_enrollment(keys: SessionKeys, iv: bytes, ciphertext: bytes) -> Optional[dict]:
+    from cryptography.exceptions import InvalidTag
+
+    _, _, aesgcm, _, _ = _crypto()
+    try:
+        plaintext = aesgcm(keys.enc).decrypt(iv, ciphertext, ENROLL_AAD + keys.transcript)
+        doc = json.loads(plaintext)
+    except (InvalidTag, ValueError, UnicodeDecodeError):
+        return None
+    return doc if isinstance(doc, dict) else None
+
+
+def seal_enrolled(keys: SessionKeys, reply: dict, iv: bytes) -> bytes:
+    """The device's answer: the phone's client id and the device's public key, sealed."""
+    _, _, aesgcm, _, _ = _crypto()
+    body = {k: reply[k] for k in ("client_id", "device_id", "device_public_key")}
+    return aesgcm(keys.enc).encrypt(iv, _canonical(body), ENROLLED_AAD + keys.transcript)
+
+
+def open_enrolled(keys: SessionKeys, iv: bytes, ciphertext: bytes) -> Optional[dict]:
+    from cryptography.exceptions import InvalidTag
+
+    _, _, aesgcm, _, _ = _crypto()
+    try:
+        doc = json.loads(aesgcm(keys.enc).decrypt(iv, ciphertext, ENROLLED_AAD + keys.transcript))
+    except (InvalidTag, ValueError, UnicodeDecodeError):
+        return None
+    return doc if isinstance(doc, dict) else None
+
+
 def b64e(data: bytes) -> str:
     return base64.b64encode(data).decode("ascii")
 
@@ -325,6 +371,7 @@ class _Session:
     nonce_device: bytes
     keys: SessionKeys
     at: float
+    enrolled: bool = False
 
 
 @dataclass
@@ -341,6 +388,9 @@ class PopAuthenticator:
     clock: Callable[[], float] = time.monotonic
     rng: Callable[[int], bytes] = os.urandom
     limits: Limits = field(default_factory=Limits)
+    #: M12: (public_key_b64u, name) -> the LocalAuthority's enrolment reply, or raises.
+    #: None: this device has no local access and answers `enroll` with an error.
+    enroller: Optional[Callable[[str, str], dict]] = None
 
     def __post_init__(self) -> None:
         self._code_key = derive_code_key(normalize_setup_code(self.setup_code), self.device_id)
@@ -409,7 +459,40 @@ class PopAuthenticator:
             return self._proof(msg)
         if op == "creds":
             return self._creds(msg)
+        if op == "enroll":
+            return self._enroll(msg)
         return _error("malformed", "unknown op")
+
+    def _enroll(self, msg: dict) -> Reply:
+        """M12: trust this phone's key for local access, inside the proven session.
+
+        Allowed only in PROVEN (the phone holds the setup code), once per
+        session, and leaves the state PROVEN so Wi-Fi credentials may follow.
+        Both directions are AES-GCM under the session key: a look-alike cannot
+        read the phone's key or swap in its own device key.
+        """
+        iv = _b64d(msg.get("iv"), GCM_IV_BYTES)
+        ciphertext = _b64d(msg.get("ct"))
+        if iv is None or ciphertext is None or len(ciphertext) <= 16:
+            return _error("malformed", "iv must be 12 bytes and ct non-empty")
+        if self.state is not State.PROVEN or self._session is None:
+            return _error("unexpected", f"enrolment needs a proof first (setup is {self.state.value})")
+        if self.enroller is None:
+            return _error("unsupported", "this device has no local access")
+        session = self._session
+        if getattr(session, "enrolled", False):
+            return _error("unexpected", "this session already enrolled a phone")
+        doc = open_enrollment(session.keys, iv, ciphertext)
+        if doc is None:
+            return _error("malformed", "enrolment did not authenticate")
+        try:
+            reply = self.enroller(str(doc.get("public_key", "")), str(doc.get("name", "")))
+        except Exception as exc:  # noqa: BLE001 - LocalAuthError and anything else: a refusal, never a crash
+            return _error("refused", "the device could not enrol this phone", code=getattr(exc, "reason", "error"))
+        session.enrolled = True
+        reply_iv = self.rng(GCM_IV_BYTES)
+        return Reply({"op": "enrolled", "iv": b64e(reply_iv), "ct": b64e(seal_enrolled(session.keys, reply,
+                                                                                         reply_iv))})
 
     def _hello(self, msg: dict) -> Reply:
         if msg.get("v") != PROTOCOL_VERSION:

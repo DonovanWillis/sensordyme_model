@@ -464,6 +464,9 @@ class ProvisioningService:
             code = load_setup_code(self._setup_code_path)  # SetupCodeError: caller fails closed
             self._pop = PopAuthenticator(device_id=self._device_id(), setup_code=code,
                                          limits=self._pop_limits or Limits())
+        # M12 sd-local-v1: a proven phone may enrol its key for local access.
+        authority = getattr(self, "local_authority", None)
+        self._pop.enroller = (lambda key, name: authority.enroll(key, name, "ble")) if authority else None
         return self._pop
 
     def _open_ble_window(self) -> None:

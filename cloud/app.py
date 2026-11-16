@@ -20,6 +20,8 @@ Create device: .venv/bin/python cloud/manage.py create-device "Car unit"
 from __future__ import annotations
 
 import asyncio
+import base64
+import binascii
 import dataclasses
 import hashlib
 import hmac
@@ -692,6 +694,7 @@ def init_db() -> None:
         # full scan of the largest table, on a write transaction.
         conn.execute("CREATE INDEX IF NOT EXISTS idx_events_received ON events(received_at)")
         _init_device_auth_tables(conn)
+        _init_local_access_tables(conn)
         _backfill_auth_kids(conn)
 
 
@@ -711,6 +714,20 @@ def _backfill_auth_kids(conn) -> None:
             except ValueError:
                 kids.append(None)
         conn.execute("UPDATE devices SET auth_kid = ?, previous_auth_kid = ? WHERE id = ?", (*kids, row[0]))
+
+
+def _init_local_access_tables(conn) -> None:
+    """M12 sd-local-v1 (docs/LOCAL_ACCESS.md §4.2): the owner's phones the backend
+    asks a device to trust locally. PUBLIC keys only: the backend can never act
+    on the LAN itself, it can only relay which phones the owner trusts."""
+    conn.execute(
+        "CREATE TABLE IF NOT EXISTS local_clients (device_id INTEGER NOT NULL, client_id TEXT NOT NULL,"
+        " public_key TEXT NOT NULL, name TEXT NOT NULL, state TEXT NOT NULL, owner_id INTEGER,"
+        " created_at REAL NOT NULL, updated_at REAL NOT NULL, PRIMARY KEY (device_id, client_id))")
+    # What the device last reported about its local access: its PUBLIC key and
+    # the ids it trusts. Kept when health goes stale -- it names the camera.
+    with suppress(sqlite3.OperationalError):
+        conn.execute("ALTER TABLE devices ADD COLUMN local_identity TEXT")
 
 
 def _init_device_auth_tables(conn) -> None:
@@ -2802,7 +2819,154 @@ def claim_device(body: ClaimBody, request: Request, uid: int = Depends(current_u
             conn.execute("UPDATE devices SET camera_mode = ? WHERE id = ?",
                          (json.dumps({"camera_only": False, "id": secrets.token_hex(6),
                                       "requested_at": time.time()}), row["id"]))
+            # M12: nor any phone someone else enrolled locally. Every id the
+            # device last reported trusting is asked to be revoked.
+            _revoke_reported_local_clients(conn, row["id"], row["local_identity"])
     return {"ok": True, "device_id": row["id"], "name": row["name"]}
+
+
+# ------------------------------------------------------------------------- local access (M12)
+_LOCAL_CLIENT_ID = re.compile(r"^[0-9a-f]{16}$")
+_B64U = re.compile(r"^[A-Za-z0-9_-]{86,88}={0,2}$")
+
+
+def _p256_point(public_key: str) -> Optional[bytes]:
+    """The uncompressed P-256 point a phone sent, or None. (The device validates
+    the curve itself before trusting it; this keeps junk out of the table.)"""
+    if not isinstance(public_key, str) or not _B64U.match(public_key):
+        return None
+    try:
+        raw = base64.urlsafe_b64decode(public_key + "=" * (-len(public_key) % 4))
+    except (ValueError, binascii.Error):
+        return None
+    return raw if len(raw) == 65 and raw[0] == 0x04 else None
+
+
+def _local_identity(raw: Optional[str]) -> Optional[dict]:
+    try:
+        value = json.loads(raw or "null")
+    except (TypeError, ValueError):
+        return None
+    return value if isinstance(value, dict) else None
+
+
+def _revoke_reported_local_clients(conn: sqlite3.Connection, device_id: int, raw_identity: Optional[str]) -> None:
+    identity = _local_identity(raw_identity) or {}
+    now = time.time()
+    conn.execute("UPDATE local_clients SET state = 'revoked', updated_at = ? WHERE device_id = ?", (now, device_id))
+    for client_id in identity.get("clients") or []:
+        if isinstance(client_id, str) and _LOCAL_CLIENT_ID.match(client_id):
+            conn.execute(
+                "INSERT INTO local_clients (device_id, client_id, public_key, name, state, owner_id, created_at,"
+                " updated_at) VALUES (?, ?, '', '', 'revoked', NULL, ?, ?)"
+                " ON CONFLICT(device_id, client_id) DO UPDATE SET state = 'revoked', updated_at = excluded.updated_at",
+                (device_id, client_id, now, now))
+
+
+def _local_client_rows(conn: sqlite3.Connection, device_id: int, identity: Optional[dict]) -> list[dict]:
+    on_device = set((identity or {}).get("clients") or [])
+    rows = conn.execute("SELECT client_id, name, state, created_at, updated_at FROM local_clients"
+                        " WHERE device_id = ? AND public_key != '' ORDER BY created_at", (device_id,)).fetchall()
+    return [{"client_id": r["client_id"], "name": r["name"], "state": r["state"],
+             "on_device": r["client_id"] in on_device, "created_at": r["created_at"]} for r in rows]
+
+
+def _public_local_identity(identity: Optional[dict]) -> Optional[dict]:
+    """The part of a device's local identity the owner's app needs: its public key."""
+    if not identity:
+        return None
+    return {k: identity.get(k) for k in ("contract", "device_public_key", "device_key_fp", "reported_at")}
+
+
+class LocalClientBody(BaseModel):
+    """M12: this phone's PUBLIC key (uncompressed P-256, base64url) to trust locally."""
+
+    public_key: str
+    name: str = ""
+
+
+@app.post("/v1/devices/{device_id}/local-clients")
+def add_local_client(device_id: int, body: LocalClientBody, uid: int = Depends(current_user)):
+    """Ask the owner's device to trust this phone on its LAN (sd-local-v1).
+
+    Delivered as a SIGNED `set_local_clients` command; the device refuses an
+    unsigned one. The response says whether the device already reports it
+    (`on_device`); until then the app keeps using the account path.
+    """
+    raw = _p256_point(body.public_key)
+    if raw is None:
+        raise CodedError(400, "bad_public_key", "public_key must be an uncompressed P-256 point, base64url")
+    client_id = hashlib.sha256(raw).hexdigest()[:16]
+    name = "".join(ch for ch in (body.name or "").strip() if ch.isprintable())[:64] or "iPhone"
+    now = time.time()
+    with db() as conn:
+        device = _owned_device(conn, device_id, uid)
+        count = conn.execute("SELECT COUNT(*) FROM local_clients WHERE device_id = ? AND state = 'active'"
+                             " AND client_id != ?", (device_id, client_id)).fetchone()[0]
+        if count >= 16:
+            raise CodedError(409, "too_many_clients", "this device already trusts 16 phones; revoke one first")
+        conn.execute(
+            "INSERT INTO local_clients (device_id, client_id, public_key, name, state, owner_id, created_at,"
+            " updated_at) VALUES (?, ?, ?, ?, 'active', ?, ?, ?)"
+            " ON CONFLICT(device_id, client_id) DO UPDATE SET public_key = excluded.public_key,"
+            " name = excluded.name, state = 'active', owner_id = excluded.owner_id, updated_at = excluded.updated_at",
+            (device_id, client_id, body.public_key, name, uid, now, now))
+        identity = _local_identity(device["local_identity"])
+    return {"ok": True, "client_id": client_id, "state": "active",
+            "on_device": client_id in set((identity or {}).get("clients") or []),
+            "local_identity": _public_local_identity(identity)}
+
+
+@app.get("/v1/devices/{device_id}/local-clients")
+def list_local_clients(device_id: int, uid: int = Depends(current_user)):
+    with db() as conn:
+        device = _owned_device(conn, device_id, uid)
+        identity = _local_identity(device["local_identity"])
+        return {"clients": _local_client_rows(conn, device_id, identity),
+                "local_identity": _public_local_identity(identity)}
+
+
+@app.delete("/v1/devices/{device_id}/local-clients/{client_id}")
+def revoke_local_client(device_id: int, client_id: str, uid: int = Depends(current_user)):
+    """Forget a phone locally (a lost phone): delivered until the device stops reporting it."""
+    if not _LOCAL_CLIENT_ID.match(client_id):
+        raise CodedError(400, "bad_client_id", "client_id is 16 lowercase hex characters")
+    now = time.time()
+    with db() as conn:
+        _owned_device(conn, device_id, uid)
+        conn.execute(
+            "INSERT INTO local_clients (device_id, client_id, public_key, name, state, owner_id, created_at,"
+            " updated_at) VALUES (?, ?, '', '', 'revoked', ?, ?, ?)"
+            " ON CONFLICT(device_id, client_id) DO UPDATE SET state = 'revoked', updated_at = excluded.updated_at",
+            (device_id, client_id, uid, now, now))
+    return {"ok": True, "client_id": client_id, "state": "revoked"}
+
+
+def _converge_local_clients(conn: sqlite3.Connection, device_id: int, health: Any) -> Optional[dict]:
+    """Record what the device reports and return the `set_local_clients` still needed.
+
+    Only for firmware that reports an sd-local-v1 block (it understands the
+    command). Adds every active phone it does not yet trust; revokes every
+    revoked id it still reports. Idempotent: resent until the report matches.
+    """
+    block = health.get("local_access") if isinstance(health, dict) else None
+    if not isinstance(block, dict) or block.get("contract") != "sd-local-v1" \
+            or not isinstance(block.get("clients"), list):
+        return None
+    reported = {c for c in block["clients"] if isinstance(c, str) and _LOCAL_CLIENT_ID.match(c)}
+    key = block.get("device_public_key")
+    identity = {"contract": "sd-local-v1", "clients": sorted(reported)[:64], "reported_at": time.time(),
+                "device_public_key": key if _p256_point(key) else None,
+                "device_key_fp": str(block.get("device_key_fp") or "")[:16] or None}
+    conn.execute("UPDATE devices SET local_identity = ? WHERE id = ?", (json.dumps(identity), device_id))
+    rows = conn.execute("SELECT client_id, public_key, name, state FROM local_clients WHERE device_id = ?",
+                        (device_id,)).fetchall()
+    add = [{"public_key": r["public_key"], "name": r["name"]} for r in rows
+           if r["state"] == "active" and r["public_key"] and r["client_id"] not in reported]
+    revoke = [r["client_id"] for r in rows if r["state"] == "revoked" and r["client_id"] in reported]
+    if not add and not revoke:
+        return None
+    return {"add": add[:16], "revoke": revoke[:64]}
 
 
 def _owned_device(conn: sqlite3.Connection, device_id: int, uid: int) -> sqlite3.Row:
@@ -2840,6 +3004,10 @@ def list_devices(uid: int = Depends(current_user)):
                 # Whether the backend accepts this device's credentials, and why not
                 # (revoked, clock, unsigned): "offline" alone hid a lockout.
                 "credentials": _credentials_status(r),
+                # M12: the device's PUBLIC local-access key (sd-local-v1), kept when
+                # health is stale: the app checks the device's session signatures
+                # against it on the LAN. Never anything secret.
+                "local_identity": _public_local_identity(_local_identity(r["local_identity"])),
             }
             for r in rows
         ]
@@ -5397,6 +5565,9 @@ def ingest(body: IngestBody, background_tasks: BackgroundTasks, request: Request
                 )
             desired_nodes = remaining
 
+        # M12 sd-local-v1: the owner's phones the device should trust (or forget) locally.
+        local_change = _converge_local_clients(conn, device["id"], body.health)
+
     # Push is the path that works when the app is closed, so it is the path
     # that most needs a filter. It had none: every "loud" event became a push,
     # which on a real device is around 960 in two days. The app filtered
@@ -5533,6 +5704,10 @@ def ingest(body: IngestBody, background_tasks: BackgroundTasks, request: Request
     if reported_camera is not None and (reported_camera.get("camera_only") is True) != camera_mode["camera_only"]:
         command = dict(command or {})
         command["set_camera_mode"] = {"camera_only": camera_mode["camera_only"], "id": camera_mode["id"]}
+
+    if local_change:
+        command = dict(command or {})
+        command["set_local_clients"] = local_change
 
     # An explicit, confirmed stop/resume, until the device reports it (one-shot).
     if protection_action in ("stop", "resume"):

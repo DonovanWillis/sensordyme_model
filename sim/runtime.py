@@ -171,6 +171,10 @@ class SimRuntime(DeviceRuntime):
             "detector": {"name": perception.ScriptedDetector.model_name, "sha256": None, "backend": "simulated"},
         }
 
+    def _local_device_id(self) -> str:
+        """The virtual device's SD-SIM- id: local signatures bind to what health reports."""
+        return self.sim.identity.hardware_id
+
     def _collect_health(self, caller: str = "loop") -> dict:
         report = super()._collect_health(caller)
         faults = self.sim.state.current()
