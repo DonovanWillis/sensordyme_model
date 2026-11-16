@@ -171,7 +171,7 @@ class DirectModeConfig:
     channel: int = 6
     address: str = "10.42.0.1/24"
     ap_timeout_s: float = 30.0
-    psk_path: str = DEFAULT_PSK_PATH
+    passphrase_path: str = DEFAULT_PSK_PATH
     state_path: str = "data/direct_mode.json"
     fallback_enabled: bool = False
     fallback_after_s: float = 600.0
@@ -188,7 +188,7 @@ class DirectModeConfig:
             channel=int(raw.get("channel", defaults.channel)),
             address=defaults.address,
             ap_timeout_s=float(raw.get("ap_timeout_s", defaults.ap_timeout_s)),
-            psk_path=str(raw.get("psk_path", defaults.psk_path)),
+            passphrase_path=str(raw.get("passphrase_path", defaults.passphrase_path)),
             state_path=str(raw.get("state_path", defaults.state_path)),
             fallback_enabled=raw.get("fallback_enabled", defaults.fallback_enabled) is True,
             fallback_after_s=float(raw.get("fallback_after_s", defaults.fallback_after_s)),
@@ -262,7 +262,7 @@ class DirectModeManager:
             return (f"the access-point firewall is not installed ({', '.join(missing)} missing); "
                     "run `sudo scripts/direct_mode.py install`")
         try:
-            load_psk(self.config.psk_path)
+            load_psk(self.config.passphrase_path)
         except PskError as exc:
             return f"direct-mode passphrase unusable: {exc}"
         return None
@@ -319,7 +319,7 @@ class DirectModeManager:
             return False, problem
         if self.is_active():
             return True, f"already in direct mode as '{self.ssid}'"
-        psk = load_psk(self.config.psk_path)  # checked by unavailable_reason() just above
+        psk = load_psk(self.config.passphrase_path)  # checked by unavailable_reason() just above
         previous = self._wifi.active_profile()
         self._transition = "entering"
         log.info("entering direct mode (%s); previous network: %s", reason, previous or "none")

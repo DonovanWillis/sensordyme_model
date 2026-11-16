@@ -44,8 +44,8 @@ def env(tmp_path, monkeypatch):
     monkeypatch.setattr(network, "nmcli_available", lambda: True)
     monkeypatch.setattr(network, "_run", nm.run)
     psk = dm.generate_psk()
-    psk_path = str(tmp_path / "direct_mode_psk")
-    dm.write_psk(psk_path, psk)
+    passphrase_path = str(tmp_path / "direct_mode_psk")
+    dm.write_psk(passphrase_path, psk)
     firewall = []
     for name in ("direct_mode.nft", "90-sensordyme-direct"):
         (tmp_path / name).write_text("installed\n")
@@ -53,13 +53,13 @@ def env(tmp_path, monkeypatch):
     clock = Clock()
 
     def make(**overrides) -> DirectModeManager:
-        config = {"enabled": True, "psk_path": psk_path, "state_path": str(tmp_path / "state.json"),
+        config = {"enabled": True, "passphrase_path": passphrase_path, "state_path": str(tmp_path / "state.json"),
                   "ap_timeout_s": 5, **overrides}
         return DirectModeManager(WifiManager(), config, device_id=DEVICE, clock=clock, monotonic=clock,
                                  sleep=clock.sleep, has_nmcli=lambda: True, firewall_marker=marker,
                                  firewall_files=tuple(firewall))
 
-    return types_ns(nm=nm, psk=psk, psk_path=psk_path, make=make, clock=clock, tmp=tmp_path, marker=marker,
+    return types_ns(nm=nm, psk=psk, passphrase_path=passphrase_path, make=make, clock=clock, tmp=tmp_path, marker=marker,
                     firewall=firewall)
 
 
@@ -269,9 +269,9 @@ def test_enter_refuses_and_touches_nothing_when_it_cannot_be_safe(env, breakage)
     if breakage == "disabled":
         overrides["enabled"] = False
     elif breakage == "no_psk":
-        os.unlink(env.psk_path)
+        os.unlink(env.passphrase_path)
     elif breakage == "loose_psk":
-        os.chmod(env.psk_path, 0o644)
+        os.chmod(env.passphrase_path, 0o644)
     elif breakage == "no_firewall":
         os.unlink(env.firewall[1])
     manager = env.make(**overrides)

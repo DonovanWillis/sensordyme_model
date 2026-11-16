@@ -28,6 +28,16 @@ def test_the_shipped_config_has_direct_mode_off_and_is_valid():
     assert not any("direct_mode" in w for w in warnings)
 
 
+def test_the_block_passes_the_release_credential_gate():
+    """No key under direct_mode reads as a filled-in credential to the transfer package's gate."""
+    from pathlib import Path
+
+    from scripts.release.build_transfer_package import config_credential_check
+
+    text = (Path(__file__).resolve().parent.parent / "config.yaml").read_text()
+    assert not [f for f in config_credential_check(text) if "direct_mode" in f]
+
+
 def test_the_shipped_values_are_the_code_defaults():
     """Deleting the block from config.yaml changes nothing."""
     shipped = DirectModeConfig.from_dict(load_config("config.yaml")["network"]["direct_mode"])
@@ -55,7 +65,7 @@ def test_only_true_enables_it():
     ("channel", 0), ("channel", 13), ("channel", "6"), ("channel", True),
     ("ap_timeout_s", 1), ("ap_timeout_s", "30"), ("fallback_after_s", 5), ("return_check_s", 0),
     ("interface", ""), ("interface", "wlan0; reboot"), ("interface", "x" * 16),
-    ("fallback_enabled", "no"), ("psk_path", ""), ("state_path", 7),
+    ("fallback_enabled", "no"), ("passphrase_path", ""), ("state_path", 7),
 ])
 def test_bad_values_are_errors_naming_the_key(key, value):
     errors, _ = validate(_base(**{key: value}))

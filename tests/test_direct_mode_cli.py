@@ -100,10 +100,10 @@ def test_enter_with_the_shipped_config_refuses(tmp_path):
 @pytest.fixture()
 def enabled_config(tmp_path):
     config = yaml.safe_load((REPO / "config.yaml").read_text())
-    psk_path = tmp_path / "psk"
+    passphrase_path = tmp_path / "psk"
     psk = dm.generate_psk()
-    dm.write_psk(str(psk_path), psk)
-    config["network"]["direct_mode"].update(enabled=True, psk_path=str(psk_path),
+    dm.write_psk(str(passphrase_path), psk)
+    config["network"]["direct_mode"].update(enabled=True, passphrase_path=str(passphrase_path),
                                             state_path=str(tmp_path / "state.json"))
     path = tmp_path / "config.yaml"
     path.write_text(yaml.safe_dump(config))

@@ -205,7 +205,7 @@ network:
     security: wpa2 # wpa2 (WPA2-PSK, CCMP) | wpa3 (WPA3-SAE only)
     channel: 6 # 2.4 GHz channel, 1-11
     ap_timeout_s: 30 # not up (address + firewall) by then: back to the previous network
-    psk_path: /etc/sensordyme/direct_mode_psk
+    passphrase_path: /etc/sensordyme/direct_mode_psk
     # Start direct mode by itself after this long with no network, and leave it
     # once a saved network is back in range. OFF by default.
     fallback_enabled: false

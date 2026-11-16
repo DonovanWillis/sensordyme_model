@@ -192,7 +192,7 @@ def _validate_categories(categories, where: str, errors: list[str]) -> None:
 
 #: `network.direct_mode:` keys (core/direct_mode.DirectModeConfig).
 _DIRECT_MODE_KEYS = {
-    "enabled", "interface", "security", "channel", "ap_timeout_s", "psk_path", "state_path",
+    "enabled", "interface", "security", "channel", "ap_timeout_s", "passphrase_path", "state_path",
     "fallback_enabled", "fallback_after_s", "return_check_s",
 }
 
@@ -210,7 +210,7 @@ def _validate_direct_mode(direct, config: dict, errors: list[str], warnings: lis
     for key in ("psk", "password", "passphrase"):
         if key in direct:
             errors.append(f"`{where}.{key}:` is refused: the direct-mode passphrase is never set in config.yaml; "
-                          "it is generated per device into `psk_path` (scripts/direct_mode_psk.py)")
+                          "it is generated per device into `passphrase_path` (scripts/direct_mode_psk.py)")
     for key in sorted(set(direct) - _DIRECT_MODE_KEYS - {"psk", "password", "passphrase"}):
         warnings.append(f"`{where}.{key}:` unknown key (typo?) is ignored")
     for key in ("enabled", "fallback_enabled"):
@@ -231,7 +231,7 @@ def _validate_direct_mode(direct, config: dict, errors: list[str], warnings: lis
         value = direct.get(key, default)
         _check(errors, _is_num(value) and low <= value <= high,
                f"`{where}.{key}:` must be a number in [{low}, {high}], got {value!r}")
-    for key in ("psk_path", "state_path"):
+    for key in ("passphrase_path", "state_path"):
         if key in direct:
             _check(errors, isinstance(direct[key], str) and direct[key] != "",
                    f"`{where}.{key}:` must be a path string, got {direct[key]!r}")
