@@ -493,7 +493,7 @@ Simulate a startup crash, e.g. `sudo systemctl edit sensordyme` with `[Service]`
 **L1. Secure iPhone pairing** (CHANGE: config):
 1. Dashboard token: if unset or under 16 characters, generate one on the Pi with `openssl rand -hex 16`, set `dashboard.token` in `$D/config.yaml` (edit in place; never copy the repo's config over it), `chmod 600 $D/config.yaml`, and restart.
 2. Backend: `python cloud/manage.py create-device "Car unit"` on the backend host. Set `cloud.enabled: true`, `cloud.device_key: dk_…` and `cloud.base_url` in the device config. Prefer `https://` with a real certificate, or `ca_cert_path` for a self-signed one. An `http://` base URL works but is announced as cleartext in the journal and the preflight (development only).
-3. In the app: sign in, add the device with the claim code, then enter the dashboard token under Settings → Live feed.
+3. In the app: sign in and add the device with the claim code. Nothing to paste for the live feed (M12, `docs/LOCAL_ACCESS.md`): the app pairs this iPhone with the camera by itself (Bluetooth after the setup code, or through the account once the device reports). The token stays an operator credential for the `curl` checks below. `.venv/bin/python scripts/local_clients.py list` on the Pi shows which iPhones it trusts.
 4. Verify:
    ```bash
    curl -s -o /dev/null -w '%{http_code}\n' localhost:8899/api/health                             # 401
