@@ -69,6 +69,10 @@ enum SetupCodeEntry {
 final class BLEPoPFlow {
     enum Step: Equatable {
         case ready, awaitingChallenge, awaitingProven, proven, awaitingAccepted, accepted
+        /// M12: `enroll` sent inside the proven session; the device's
+        /// `enrolled` (or refusal) is next. Either way the step returns to
+        /// `proven`, so Wi-Fi credentials may still follow.
+        case awaitingEnrolled
         case failed(String)
     }
 
@@ -79,6 +83,12 @@ final class BLEPoPFlow {
         case proven
         /// Credentials accepted: follow the status characteristic as before.
         case accepted
+        /// M12: the device now trusts this phone's key for local access, and
+        /// handed back its own key, sealed to this session (docs/LOCAL_ACCESS.md §4.1).
+        case enrolled(LocalAccess.Enrollment)
+        /// M12: the device would not enrol this phone (no local access, already
+        /// 16 phones, ...). The proof still stands: Wi-Fi setup can go on.
+        case enrollRefused(String)
         case failed(String)
     }
 
@@ -146,9 +156,65 @@ final class BLEPoPFlow {
         }
     }
 
+    /// M12: ask the proven device to trust this phone's local key (§4.1).
+    /// Only after the device proved the code back; the public key and name go
+    /// sealed to this session, so a look-alike can neither read nor swap them.
+    func sendEnrollment(publicKey: Data, name: String, iv: Data = BLEProofOfPossession.randomBytes(12)) -> Action {
+        guard step == .proven, let keys = session.keys, session.deviceVerified else {
+            return fail(.init(kind: .other, message: "The device hasn't confirmed the setup code yet.", retryAfterSeconds: nil))
+        }
+        do {
+            let ct = try LocalEnrollmentBLE.sealEnrollment(keys, publicKey: publicKey,
+                                                           name: LocalEnrollmentBLE.cleanName(name), iv: iv)
+            step = .awaitingEnrolled
+            let message = (try? JSONSerialization.data(
+                withJSONObject: ["op": "enroll", "iv": iv.base64EncodedString(), "ct": ct.base64EncodedString()],
+                options: [.sortedKeys])) ?? Data()
+            return .write(message)
+        } catch {
+            return fail(.init(kind: .other, message: "This phone couldn't prepare the pairing. Try again.", retryAfterSeconds: nil))
+        }
+    }
+
+    /// The device's words for a refused enrolment (services/ble_pop.py
+    /// `_enroll`: `refused` with the LocalAuthError `reason`, or `unsupported`).
+    static func enrollRefusal(error: String?, reason: String?) -> String {
+        switch (error, reason) {
+        case ("unsupported"?, _):
+            return "This camera's software doesn't support direct connections yet. Wi-Fi setup still works."
+        case (_, "too_many_clients"?):
+            return "This camera already trusts 16 phones. Remove one, then pair this iPhone again."
+        case ("unexpected"?, _):
+            return "The camera has already paired a phone in this Bluetooth session. Start the setup again to pair another."
+        default:
+            return "The camera didn't pair this iPhone" + (reason.map { " (\($0))" } ?? "") + ". Wi-Fi setup still works."
+        }
+    }
+
     func handle(reply: Data) -> Action {
         do {
             switch step {
+            case .awaitingEnrolled:
+                let msg = (try? JSONSerialization.jsonObject(with: reply)) as? [String: Any]
+                step = .proven
+                if msg?["op"] as? String == "error" {
+                    return .enrollRefused(Self.enrollRefusal(error: msg?["error"] as? String,
+                                                             reason: msg?["reason"] as? String))
+                }
+                guard msg?["op"] as? String == "enrolled", let keys = session.keys,
+                      let iv = (msg?["iv"] as? String).flatMap({ Data(base64Encoded: $0) }),
+                      let ct = (msg?["ct"] as? String).flatMap({ Data(base64Encoded: $0) }) else {
+                    return .enrollRefused("The camera answered the pairing in a way this app doesn't understand.")
+                }
+                // Sealed to THIS proven session, or it is not from the device
+                // that proved the code: nothing it says is kept.
+                guard let enrollment = LocalEnrollmentBLE.openEnrolled(keys, iv: iv, ciphertext: ct),
+                      enrollment.deviceID == session.label.deviceID else {
+                    return fail(.init(kind: .notAuthentic,
+                                      message: "The camera's pairing answer didn't authenticate, so nothing was kept.",
+                                      retryAfterSeconds: nil))
+                }
+                return .enrolled(enrollment)
             case .awaitingChallenge:
                 let proof = try session.proofMessage(challenge: reply)
                 step = .awaitingProven

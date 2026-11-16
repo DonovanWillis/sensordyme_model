@@ -2,7 +2,7 @@ import CryptoKit
 import Foundation
 
 // Run with ios/Tests/run.sh
-// run.sh deps: BLETransport BLEPoPFlow BLEProofOfPossession ProvisioningStatus
+// run.sh deps: BLETransport BLEPoPFlow BLEProofOfPossession ProvisioningStatus LocalAccess
 //
 // BLEProvisioner over a scripted link: the logic CoreBluetooth used to hide
 // (identify, prove, lockout, send, outcome, drops) without a radio.

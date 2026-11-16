@@ -218,7 +218,7 @@ struct FeedLivenessTracker {
         switch transport {
         case .idle:
             return .idle
-        case .unauthorized, .unusableAddress:
+        case .unauthorized, .unusableAddress, .needsPairing:
             return .refused
         case .connecting:
             return .connecting

@@ -421,5 +421,37 @@ do {
     check(MJPEGReaderPolicy.livenessTick <= 0.5, "liveness is re-evaluated at least twice a second")
 }
 
+
+print("\nM12: a local session as the feed's credential:")
+do {
+    let session = MJPEGStreamRequest.sessionCredential("abc123")
+    let request = MJPEGStreamRequest.make(base: "http://192.168.1.20:8899", token: session)
+    check(request?.value(forHTTPHeaderField: "X-SD-Session") == "abc123", "a session goes out as X-SD-Session")
+    check(request?.value(forHTTPHeaderField: MJPEGStreamRequest.tokenHeader) == nil, "and never as the device token")
+    check(request?.url?.query == nil, "and never in the URL")
+    let legacy = MJPEGStreamRequest.make(base: "http://192.168.1.20:8899", token: "secret")
+    check(legacy?.value(forHTTPHeaderField: MJPEGStreamRequest.tokenHeader) == "secret"
+          && legacy?.value(forHTTPHeaderField: "X-SD-Session") == nil, "a legacy token still goes as X-Device-Token")
+    check(MJPEGReaderPolicy.completion(status: 401, error: nil, hasToken: true, usesSession: true) == .renewSession,
+          "401 on a session: renew it and reconnect, not 'rejected the token'")
+    check(MJPEGReaderPolicy.completion(status: 403, error: nil, hasToken: true, usesSession: true) == .needsPairing,
+          "403 on a session: this iPhone must be paired again")
+    check(!MJPEGStreamState.needsPairing.isRecoverableAutomatically
+          && MJPEGStreamState.needsPairing.message == "this iPhone needs to be paired with the camera again",
+          "needsPairing is not retried, and says what fixes it")
+    let renewed = MJPEGStreamRequest.sessionCredential("def456")
+    check(!MJPEGReaderPolicy.needsRestart(stopped: false, state: .streaming, currentBase: "http://a:1",
+                                          currentToken: session, base: "http://a:1", token: renewed),
+          "a renewed session does not interrupt a healthy stream")
+    check(MJPEGReaderPolicy.credentialUpdate(currentToken: session, token: renewed) == renewed,
+          "but is kept for the next connection")
+    check(MJPEGReaderPolicy.needsRestart(stopped: false, state: .reconnecting(attempt: 1, reason: nil),
+                                         currentBase: "http://a:1", currentToken: session, base: "http://a:1", token: renewed),
+          "a stream that is reconnecting picks the new session up at once")
+    check(MJPEGReaderPolicy.needsRestart(stopped: false, state: .streaming, currentBase: "http://a:1",
+                                         currentToken: "secret", base: "http://a:1", token: session),
+          "moving from the legacy token to a session reconnects")
+}
+
 print(failures == 0 ? "\nPASSED" : "\n\(failures) FAILURE(S)")
 exit(failures == 0 ? 0 : 1)

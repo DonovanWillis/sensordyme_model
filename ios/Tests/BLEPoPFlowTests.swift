@@ -2,7 +2,7 @@ import CryptoKit
 import Foundation
 
 // Run with ios/Tests/run.sh
-// run.sh deps: BLEProofOfPossession
+// run.sh deps: BLEProofOfPossession LocalAccess
 
 var failures = 0
 func check(_ condition: Bool, _ what: String) {
@@ -17,6 +17,11 @@ final class FakeDevice {
     var keys: BLEProofOfPossession.SessionKeys?
     var received: (ssid: String, psk: String?)?
     var lieAboutProof = false
+    let deviceKey = P256.Signing.PrivateKey()
+    var enrolledName: String?
+    var enrollRefusal = false
+    /// A look-alike answering the enrolment under some other key.
+    var sealEnrolledWith: SymmetricKey?
 
     init(deviceID: String, code: String) {
         self.deviceID = deviceID
@@ -54,6 +59,25 @@ final class FakeDevice {
             let creds = try! JSONSerialization.jsonObject(with: plain) as! [String: Any]
             received = (creds["ssid"] as! String, creds["psk"] as? String)
             return json(["op": "accepted"])
+        case "enroll":
+            // services/ble_pop.py `_enroll`: open with the session key, enrol, seal the answer.
+            if enrollRefusal { return json(["op": "error", "error": "refused", "message": "no", "reason": "too_many_clients"]) }
+            let iv = Data(base64Encoded: msg["iv"] as! String)!
+            let ct = Data(base64Encoded: msg["ct"] as! String)!
+            let box = try! AES.GCM.SealedBox(nonce: AES.GCM.Nonce(data: iv), ciphertext: ct.dropLast(16),
+                                             tag: ct.suffix(16))
+            let plain = try! AES.GCM.open(box, using: keys!.enc, authenticating: Data("local-enroll".utf8) + keys!.transcript)
+            let doc = try! JSONSerialization.jsonObject(with: plain) as! [String: String]
+            enrolledName = doc["name"]
+            let phoneKey = LocalAccess.b64uDecode(doc["public_key"], length: 65)!
+            let answer = LocalEnrollmentBLE.canonical([
+                "client_id": LocalAccess.clientID(publicKey: phoneKey), "device_id": deviceID,
+                "device_public_key": LocalAccess.b64u(deviceKey.publicKey.x963Representation)])
+            let replyIV = Data(repeating: 7, count: 12)
+            let sealed = try! AES.GCM.seal(answer, using: sealEnrolledWith ?? keys!.enc, nonce: AES.GCM.Nonce(data: replyIV),
+                                           authenticating: Data("local-enrolled".utf8) + keys!.transcript)
+            return json(["op": "enrolled", "iv": replyIV.base64EncodedString(),
+                         "ct": (sealed.ciphertext + sealed.tag).base64EncodedString()])
         default:
             return json(["op": "error", "error": "malformed"])
         }
@@ -153,6 +177,53 @@ check(sendAction == .accepted && later.received?.ssid == "Home", "the credential
 let notYet = BLEPoPFlow(session: try! BLEProofOfPossession.Session(label: label))
 check(notYet.sendCredentials(ssid: "Home", psk: "x") == .failed("The device hasn't confirmed the setup code yet."),
       "credentials before a proof are refused on the phone")
+
+print("\nM12: enrol this phone for local access inside the proven session:")
+do {
+    let phone = SoftwareSigner()
+    let cam = FakeDevice(deviceID: id, code: code)
+    let flow = BLEPoPFlow(session: try! BLEProofOfPossession.Session(label: label))
+    check(BLEPoPFlow(session: try! BLEProofOfPossession.Session(label: label))
+            .sendEnrollment(publicKey: phone.publicKey, name: "x") == .failed("The device hasn't confirmed the setup code yet."),
+          "no enrolment before the device has proven the code")
+    check(run(flow, cam).0 == .proven, "proven first")
+    var action = flow.sendEnrollment(publicKey: phone.publicKey, name: " Owner's iPhone ")
+    check(flow.step == .awaitingEnrolled, "enroll sent")
+    if case .write(let data) = action { action = flow.handle(reply: cam.reply(to: data)) }
+    if case .enrolled(let enrollment) = action {
+        check(enrollment.clientID == phone.clientID && enrollment.deviceID == id, "the device enrolled THIS phone's key")
+        check(enrollment.devicePublicKeyBytes == cam.deviceKey.publicKey.x963Representation,
+              "and handed back its own public key, sealed to the session")
+    } else {
+        check(false, "enrolled (got \(action))")
+    }
+    check(cam.enrolledName == "Owner's iPhone", "the name went trimmed")
+    check(flow.step == .proven, "still proven: Wi-Fi credentials may follow")
+    var creds = flow.sendCredentials(ssid: "Home", psk: "pw")
+    if case .write(let data) = creds { creds = flow.handle(reply: cam.reply(to: data)) }
+    check(creds == .accepted, "and they do, on the same session (re-pair without changing Wi-Fi is just: stop here)")
+
+    let refusing = FakeDevice(deviceID: id, code: code)
+    refusing.enrollRefusal = true
+    let refusedFlow = BLEPoPFlow(session: try! BLEProofOfPossession.Session(label: label))
+    _ = run(refusedFlow, refusing)
+    var refused = refusedFlow.sendEnrollment(publicKey: phone.publicKey, name: "x")
+    if case .write(let data) = refused { refused = refusedFlow.handle(reply: refusing.reply(to: data)) }
+    check(refused == .enrollRefused("This camera already trusts 16 phones. Remove one, then pair this iPhone again."),
+          "a refusal reads its `reason` (too_many_clients) and says what to do")
+    check(refusedFlow.step == .proven, "and the proof still stands")
+    check(BLEPoPFlow.enrollRefusal(error: "unsupported", reason: nil).contains("doesn't support"), "unsupported firmware")
+
+    let forger = FakeDevice(deviceID: id, code: code)
+    forger.sealEnrolledWith = SymmetricKey(size: .bits256)
+    let forgedFlow = BLEPoPFlow(session: try! BLEProofOfPossession.Session(label: label))
+    _ = run(forgedFlow, forger)
+    var forged = forgedFlow.sendEnrollment(publicKey: phone.publicKey, name: "x")
+    if case .write(let data) = forged { forged = forgedFlow.handle(reply: forger.reply(to: data)) }
+    check(forged == .failed("The camera's pairing answer didn't authenticate, so nothing was kept.")
+          && forgedFlow.rejection?.endsLink == true,
+          "an answer not sealed to this session is refused and ends the link")
+}
 
 print("\na renewed session: same code key, fresh nonce, still proves:")
 let renewed = session.renewed()
