@@ -59,26 +59,12 @@ class Gap:
     fix: str
 
 
-KNOWN_GAPS: dict[str, Gap] = {g.id: g for g in (
-    Gap("G1", "A passenger's phone carries no overlay role (expected role 'other')",
-        "core/overlay.py OverlayBuilder sets a phone's role only when the driver has a phone of their own "
-        "(`elif d.label == \"cell phone\" and driver_phones`). With the driver associated and only the "
-        "passenger's phone in view, the phone box is sent with NO role: not mis-attributed to the driver, "
-        "but not marked 'other' either, so the app cannot tell 'not the driver's' from 'undecided'.",
-        "defect (overlay labelling; no alert or attribution decision is affected)",
-        "core/overlay.py: `elif d.label == \"cell phone\" and (driver_phones or driver_box is not None):` "
-        "-- a phone is 'other' whenever a driver was associated and it is not one of theirs. Not made here: "
-        "core/overlay.py is outside this mission's write scope."),
-    Gap("G2", "distraction / drowsiness / eyes_down events carry an empty contributing_signals",
-        "The module writes contributing_signals only for the special paths (a wide-angle turn, a face-lost "
-        "extrapolation, phone handling, an uncalibrated closure). The ordinary distraction, drowsiness and "
-        "eyes_down events say why through their TYPE and DURATION (the sustained seconds) only; "
-        "signals is \"\", so the overlay's 'why' line (last_event.signals) and the history's detail are blank.",
-        "limitation (the alert is correct and explained by type + duration; the free-text reason is missing)",
-        "modules/driver_attention.py: write a measured one-line reason on these events (e.g. 'head turned "
-        "40 deg from your forward pose for 3.0 s', 'eyes closed 2.0 s'). Needs an owner decision on wording "
-        "because jupiter/explain.py turns module signals into facts and the app shows them."),
-)}
+#: Gaps found by this suite and still open. M13 fixed the first two it found:
+#: G1 (a passenger's phone now carries role "other" whenever the driver is
+#: associated, core/overlay.py) and G2 (distraction / drowsiness / eyes_down now
+#: write a measured one-line reason, modules/driver_attention.py `_why`). A
+#: regression of either is now an UNEXPECTED failure, not a known gap.
+KNOWN_GAPS: dict[str, Gap] = {}
 
 
 @dataclass
@@ -312,7 +298,7 @@ def check_case(result: CaseResult) -> list[Problem]:
     # 3. why: the event's own contributing_signals.
     for e in fired:
         if e["type"] in named and not str(e.get("signals") or "").strip():
-            problems.append(Problem(f"{e['type']} carries no contributing_signals", gap="G2"))
+            problems.append(Problem(f"{e['type']} carries no contributing_signals"))
     # 4. the overlay tells the behaviour's story, and never one that is not happening.
     story = _story(result.frames)
     position = 0
@@ -332,7 +318,7 @@ def check_case(result: CaseResult) -> list[Problem]:
         if not any(f.phone_roles for f in result.frames):
             problems.append(Problem("no phone box ever reached the overlay"))
         elif roles != {case.phone_role}:
-            gap = "G1" if case.phone_role == "other" and roles == {None} else None
+            gap = None
             problems.append(Problem(f"phone role(s) {sorted(roles, key=str)}, expected {case.phone_role!r}", gap=gap))
     if case.phone_role == "other" and any(f.driver_phones for f in result.frames):
         problems.append(Problem("the passenger's phone was counted as the driver's phone"))
@@ -532,7 +518,7 @@ def check_device(r: DeviceResult) -> tuple[list[Problem], list[Problem]]:
         if not drowsy[0].get("simulated"):
             p10.append(Problem("the simulated drowsiness event is not labelled simulated"))
         if not str(drowsy[0].get("signals") or "").strip():
-            p10.append(Problem("drowsiness carries no contributing_signals", gap="G2"))
+            p10.append(Problem("drowsiness carries no contributing_signals"))
     if not any(b[0] == "drowsiness" for b in r.buzzer):
         p10.append(Problem("the buzzer path did not sound for drowsiness after recovery"))
     if not any(e["type"] == "drowsiness" for e in r.local_events):

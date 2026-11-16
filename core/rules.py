@@ -830,7 +830,11 @@ class RuleEngine:
                     severity=rule.severity,
                     notify=rule.notify,
                     confidence=transition.confidence,
-                    duration_s=transition.duration_s,
+                    # A dwell's engine episode starts only once the watcher has
+                    # already seen dwell_s of one subject's continuous presence,
+                    # so its own duration is just the confirmation step (~0.1 s).
+                    # The time in the area is that dwell plus the step (M13 J1).
+                    duration_s=transition.duration_s + (rule.dwell_s or 0.0),
                     zone=rule.zone,
                 ))
         return alerts

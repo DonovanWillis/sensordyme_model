@@ -77,8 +77,7 @@ def test_an_identity_request_is_refused_and_the_running_rule_is_kept(run):
     assert run.steps[8].ok
 
 
-@pytest.mark.xfail(strict=True, reason="J1: a dwell alert's `duration` is the rule engine's confirmation step "
-                                       "(~0.1 s), not the >= 10 s the person stayed (core/rules.py dwell branch)")
-def test_known_gap_the_dwell_alerts_duration_is_the_time_in_the_area(run):
+def test_the_dwell_alerts_duration_is_the_time_in_the_area(run):
+    """M13 J1, fixed: the dwell plus the confirmation step, not the step alone."""
     (event,) = run.backend_events
     assert event["duration"] >= demo.DWELL_S, event["duration"]

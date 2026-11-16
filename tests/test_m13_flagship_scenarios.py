@@ -132,9 +132,8 @@ def test_6_the_passengers_phone_is_never_the_drivers(results):
     assert _unexpected(r.problems) == []
 
 
-@pytest.mark.xfail(strict=True, reason="G1: the overlay sends a passenger's phone with NO role, not 'other' "
-                                       "(core/overlay.py only assigns phone roles when the driver has a phone)")
-def test_6_known_gap_the_passengers_phone_is_marked_other_on_the_overlay(results):
+def test_6_the_passengers_phone_is_marked_other_on_the_overlay(results):
+    """M13 G1, fixed: with the driver associated, a phone that is not theirs is 'other'."""
     assert {role for f in results[6].frames for role in f.phone_roles} == {"other"}
 
 
@@ -159,20 +158,19 @@ def test_8_brief_occlusion_reports_no_face_abstains_and_alerts_nothing(results):
 
 
 # -- why: the event's own contributing_signals
-@pytest.mark.xfail(strict=True, reason="G2: distraction / drowsiness / eyes_down events carry an empty "
-                                       "contributing_signals; the reason is only their type and duration")
-def test_known_gap_every_flagship_alert_says_why_in_its_own_signals(results):
+def test_every_flagship_alert_says_why_in_its_own_signals(results):
+    """M13 G2, fixed: each alert carries the measured reason the device wrote."""
     fired = [e for n in (3, 5, 7) for e in results[n].alerts if e["type"] != "fatigue_warning"]
     assert fired and all(str(e["signals"]).strip() for e in fired), [(e["type"], e["signals"]) for e in fired]
 
 
 def test_the_gap_records_match_what_was_measured(results):
-    """The table's 'known gap' tags are exactly the measured gaps, nothing hidden behind them."""
-    assert _gapped(results[3].problems, "G2") == ["distraction carries no contributing_signals"]
-    assert _gapped(results[5].problems, "G2") == ["eyes_down carries no contributing_signals"]
-    assert _gapped(results[7].problems, "G2") == ["drowsiness carries no contributing_signals"]
-    assert _gapped(results[6].problems, "G1") == ["phone role(s) [None], expected 'other'"]
-    assert set(KNOWN_GAPS) == {"G1", "G2"}
+    """No scenario hides behind a known gap any more: G1 and G2 were fixed in M13."""
+    assert set(KNOWN_GAPS) == set()
+    assert all(p.gap is None for r in results.values() for p in r.problems)
+    why = {e["type"]: e["signals"] for n in (3, 5, 7) for e in results[n].alerts}
+    assert "deg" in why["distraction"] and "held" in why["distraction"]
+    assert "eyes closed" in why["drowsiness"]
 
 
 def test_the_checks_catch_a_regression(results):
@@ -221,4 +219,4 @@ def test_the_rows_print_simulated(results, device):
     rows = [flagship.describe_case(results[n]) for n in range(1, 9)] + flagship.describe_device(device)
     assert [r["number"] for r in rows] == list(range(1, 11))
     assert all(r["harness"].startswith("SIMULATED") for r in rows)
-    assert {r["verdict"] for r in rows} <= {"PASS", "FAIL (known gap G1)", "FAIL (known gap G2)"}
+    assert {r["verdict"] for r in rows} == {"PASS"}

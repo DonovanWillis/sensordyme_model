@@ -1250,6 +1250,12 @@ class RiskFusion:
         return self._high_tracker.is_active
 
 
+def _why(*parts: str) -> str:
+    """An event's own explanation (contributing_signals): measured facts joined with
+    " + ", which jupiter/explain.py turns into one fact each. Empty parts drop out."""
+    return " + ".join(p for p in parts if p)
+
+
 @register_module("driver_attention")
 class DriverAttentionModule(VisionModule):
     """Detects drowsiness, distraction, and phone/food use while tolerating normal behavior."""
@@ -2663,7 +2669,9 @@ class DriverAttentionModule(VisionModule):
                             "driver not calibrated yet: closure judged against an uncalibrated EAR threshold")
             events.append(Event.now(
                 "drowsiness", fired,
-                margin_confidence(effective_threshold - ear, self._ear_noise.sigma), self.name, uncalibrated,
+                margin_confidence(effective_threshold - ear, self._ear_noise.sigma), self.name,
+                _why(f"eyes closed {fired:.1f} s", f"eye openness {ear:.2f} under {effective_threshold:.2f}",
+                     uncalibrated),
             ))
 
         # PERCLOS counts a DEEPER closure than drowsy_condition (see
@@ -2767,7 +2775,8 @@ class DriverAttentionModule(VisionModule):
             if fired is not None:
                 confidence = margin_confidence(abs(yaw) - self._yaw_threshold_deg, self._yaw_noise.sigma)
                 detail = "" if not self._distract_tracker.corroborated else "sustained wide-angle turn (mirror/blind-spot check taking too long)"
-                events.append(Event.now("distraction", fired, confidence, self.name, detail))
+                events.append(Event.now("distraction", fired, confidence, self.name,
+                                        _why(detail, self._turn_signal(yaw), f"held {fired:.1f} s")))
 
             if self._glance_counter.update(distract_condition, observed_now):
                 # A count crossing a limit: no graded evidence to report.
@@ -2780,6 +2789,8 @@ class DriverAttentionModule(VisionModule):
                 events.append(Event.now(
                     "eyes_down", fired,
                     margin_confidence(self._pitch_threshold_deg - pitch, self._pitch_noise.sigma), self.name,
+                    _why(f"looking {-pitch:.0f} deg below forward (limit {-self._pitch_threshold_deg:.0f} deg)",
+                         f"held {fired:.1f} s"),
                 ))
 
             eyes_up_condition = pitch > self._pitch_up_threshold_deg
@@ -2789,6 +2800,8 @@ class DriverAttentionModule(VisionModule):
                 events.append(Event.now(
                     "eyes_up", fired,
                     margin_confidence(pitch - self._pitch_up_threshold_deg, self._pitch_noise.sigma), self.name,
+                    _why(f"looking {pitch:.0f} deg above forward (limit {self._pitch_up_threshold_deg:.0f} deg)",
+                         f"held {fired:.1f} s"),
                 ))
 
             eyes_off_road = distract_condition or eyes_down_condition or eyes_up_condition
@@ -3334,6 +3347,11 @@ class DriverAttentionModule(VisionModule):
             return Capability(IMPAIRED, f"frames arrive at {fps:.1f}/s; eye-closure timing (drowsiness, "
                                         f"fatigue) is verified from {self._eye_timing_min_fps:g}/s")
         return Capability()
+
+    def _turn_signal(self, yaw: float) -> str:
+        """The measured turn, frame-relative ("left"/"right" of the image, not of the car)."""
+        side = "left" if yaw > 0 else "right"  # the same sign convention as _gaze_label
+        return f"turned {abs(yaw):.0f} deg {side} of forward (limit {self._yaw_threshold_deg:.0f} deg)"
 
     #: MediaPipe FaceMesh contours, in drawing order (the face oval and each eye).
     _OVERLAY_CONTOURS: ClassVar[dict[str, tuple[int, ...]]] = {

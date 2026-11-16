@@ -114,7 +114,9 @@ class OverlayBuilder:
                     item["track"] = int(d.track_id)
                 if d.label == "person" and driver_box is not None and _iou(d.box, driver_box) > 0.5:
                     item["role"] = "driver"
-                elif d.label == "cell phone" and driver_phones:
+                elif d.label == "cell phone" and (driver_phones or driver_box is not None):
+                    # The driver is known: a phone that is not one of the driver's is
+                    # someone else's ("other"), never left undecided (M13 G1).
                     item["role"] = "driver" if any(_iou(d.box, p) > 0.5 for p in driver_phones) else "other"
                 boxes.append(item)
             doc["det"] = boxes
