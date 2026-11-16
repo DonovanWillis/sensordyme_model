@@ -378,3 +378,44 @@ def test_a_wrong_wall_clock_never_expires_a_phone(tmp_path, authority):
                               key.sign(la.request_message(DEVICE, key.client_id, challenge, "POST", "/x", b"")))
     assert auth.verify_request(header, "POST", "/x", b"", "p").client_id == key.client_id
     assert auth.store.clients[key.client_id].last_seen == 1_800_000_000.0
+
+
+# ------------------------------------------------------------------ direct mode over the local API
+class _FakeDirect:
+    def __init__(self):
+        import threading
+
+        self.calls: list[tuple[str, str]] = []
+        self.done = threading.Event()
+
+    def status(self):
+        return {"mode": "client", "ssid": "SensorDyme-1A2B", "since": None, "last_error": None,
+                "fallback_enabled": False}
+
+    def enter(self, reason, *, by="explicit"):
+        self.calls.append(("enter", reason))
+        self.done.set()
+        return True, "ok"
+
+    def leave(self, reason):
+        self.calls.append(("leave", reason))
+        self.done.set()
+        return True, "ok"
+
+
+def test_direct_mode_is_read_with_a_session_and_switched_only_by_a_confirmed_signed_request(device, authority):
+    server, url = device
+    phone = _enrolled_phone(url, authority)
+    phone.open_session()
+    assert phone.get("/api/network/direct").status == 404  # not enabled on this device
+    fake = _FakeDirect()
+    server.direct_mode = fake
+    status = phone.get("/api/network/direct")
+    assert status.status == 200 and status.body["ssid"] == "SensorDyme-1A2B" and "psk" not in json.dumps(status.body)
+    assert LocalPhone(url).call("POST", "/api/network/direct", body={"action": "enter", "confirm": True}).status == 401
+    assert phone.signed("POST", "/api/network/direct", {"action": "enter"}).status == 400
+    assert phone.signed("POST", "/api/network/direct", {"action": "sideways", "confirm": True}).status == 400
+    reply = phone.signed("POST", "/api/network/direct", {"action": "enter", "confirm": True})
+    assert reply.status == 202 and reply.body["requested"] == "enter"
+    assert fake.done.wait(5)
+    assert fake.calls == [("enter", "requested from the app on the device's network")]

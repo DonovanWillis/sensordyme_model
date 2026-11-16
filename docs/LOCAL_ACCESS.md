@@ -122,6 +122,8 @@ Session rules:
 | `POST /api/preset` | **signed** or token | unchanged; the device's **role floor still refuses** an unsafe preset (409) |
 | `POST /setup/wifi` | signed or token | unchanged |
 | `GET /api/diagnostics` | token only | unchanged (developer feature) |
+| `GET /api/network/direct` | session or token | the direct-mode status (`docs/DIRECT_MODE.md`); 404 `direct_mode_off` when not enabled. Never the passphrase |
+| `POST /api/network/direct` | **signed** or token | `{"action":"enter"|"leave","confirm":true}` → 202, then the switch runs on the device. The phone loses the device when the radio changes: read the outcome afterwards, on whichever network the phone then shares with the device |
 
 Refusals are JSON `{"error", "code"}`. The codes:
 

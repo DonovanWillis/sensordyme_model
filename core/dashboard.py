@@ -585,6 +585,15 @@ class DashboardServer:
                             return
                         dashboard.request_preset(name)
                         self._json({"ok": True, "switching_to": name}, 202)
+                    elif path == "/api/network/direct":
+                        payload = self._read_json()
+                        if payload.get("confirm") is not True:
+                            self._json({"error": "switching networks requires \"confirm\": true",
+                                        "code": "confirmation_required"}, 400)
+                            return
+                        by = "from the app on the device's network" if self.local_client is not None \
+                            else "with the device token"
+                        self._json(*dashboard.request_direct_mode(str(payload.get("action", "")).lower(), by))
                     elif self.path.startswith("/api/protection"):
                         payload = self._read_json()
                         action = str(payload.get("action", "")).lower()
@@ -674,6 +683,8 @@ class DashboardServer:
                             with contextlib.suppress(ValueError):
                                 limit = min(2000, int(self.path.rsplit("limit=", 1)[1].split("&")[0]))
                         self._json({"events": dashboard.history(limit)})
+                    elif path == "/api/network/direct":
+                        self._json(*dashboard.direct_mode_status())
                     elif path == "/api/events":
                         self._json(*dashboard.events_response(parse_qs(urlsplit(self.path).query)))
                     elif path == "/api/local/clients":
@@ -1105,6 +1116,41 @@ class DashboardServer:
 
     #: Set by the runtime (the alert policy's `delivery`): what each event actuated.
     delivery_lookup: Optional[Callable] = None
+    #: M12: core/direct_mode.DirectModeManager when network.direct_mode.enabled, else None.
+    direct_mode = None
+
+    def direct_mode_status(self) -> tuple[dict, int]:
+        manager = self.direct_mode
+        if manager is None:
+            return {"mode": "unavailable", "reason": "direct mode is not enabled on this device "
+                    "(network.direct_mode.enabled: false)", "code": "direct_mode_off"}, 404
+        return manager.status(), 200
+
+    def request_direct_mode(self, action: str, by: str) -> tuple[dict, int]:
+        """Enter or leave the device's own access point, on a worker thread.
+
+        Answered BEFORE the switch: on home Wi-Fi the phone loses the device the
+        moment the radio changes, so the outcome is read afterwards (status on
+        whichever network the phone then shares with the device), never assumed.
+        """
+        manager = self.direct_mode
+        if manager is None:
+            return self.direct_mode_status()
+        if action not in ("enter", "leave"):
+            return {"error": "action must be 'enter' or 'leave'", "code": "bad_request"}, 400
+        run = manager.enter if action == "enter" else manager.leave
+
+        def worker() -> None:
+            try:
+                if action == "enter":
+                    run(f"requested {by}", by="explicit")
+                else:
+                    run(f"requested {by}")
+            except Exception:  # the manager reports its own errors in status()
+                log.exception("direct mode %s failed", action)
+
+        threading.Thread(target=worker, daemon=True, name=f"direct-mode-{action}").start()
+        return {"ok": True, "requested": action, "status": manager.status()}, 202
 
     def events_response(self, query: dict) -> tuple[dict, int]:
         """GET /api/events (sd-local-events/1): newest first, or `after=<seq>` oldest first."""

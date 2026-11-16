@@ -766,6 +766,9 @@ class DeviceRuntime:
         direct_cfg = network_cfg.get("direct_mode")
         if isinstance(direct_cfg, dict) and direct_cfg.get("enabled") is True:
             self.direct_mode = DirectModeManager(wifi, direct_cfg)
+            if self.dashboard is not None:
+                # M12: GET/POST /api/network/direct for the token holder or an enrolled phone.
+                self.dashboard.direct_mode = self.direct_mode
         self.provisioning = ProvisioningService(
             wifi, network_cfg.get("provisioning", {}), version=_VERSION,
             deployment=str(self.config.get("deployment", "development")),
