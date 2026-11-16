@@ -765,7 +765,9 @@ struct AIConfigureView: View {
 
     /// Ask the device, not the server, whether it runs what was activated:
     /// the device list's status (and the rules list when the server has it)
-    /// every 2 s for up to 20 s.
+    /// for up to 20 s. M13: first after 0.75 s, then every second (it was
+    /// every 2 s), so "Running" appears as soon as the device has said so; it
+    /// is still only ever the device's report.
     private func followDevice(proposal: AIProposal, rulesExpected: Int) async {
         let modeTitle = proposal.isCustom ? nil : Preset.title(for: proposal.preset)
         var last = ActivationFollowUp.waiting("Waiting for \(device.name) to confirm…")
@@ -773,8 +775,10 @@ struct AIConfigureView: View {
         waitingForDevice = true
         defer { waitingForDevice = false }
         let deadline = Date().addingTimeInterval(20)
+        var checks = 0
         while Date() < deadline {
-            try? await Task.sleep(for: .seconds(2))
+            try? await Task.sleep(for: .seconds(checks == 0 ? 0.75 : 1))
+            checks += 1
             guard let fresh = try? await state.backend.devices().first(where: { $0.id == device.id }) else { continue }
             var rules: [DeviceRule]?
             if rulesExpected > 0 { rules = try? await state.backend.deviceRules(deviceID: device.id).rules }

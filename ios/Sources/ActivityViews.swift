@@ -134,6 +134,14 @@ struct TimelineRow: View {
                     HStack(spacing: SD.Space.xs) { badges }
                 }
             }
+            if let meaning = event.meaning {
+                // M13: what this kind of event is, before the device's words.
+                Text(meaning)
+                    .font(SD.Typography.caption)
+                    .foregroundStyle(SD.Colors.textPrimary.opacity(0.85))
+                    .multilineTextAlignment(.leading)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
             if let signals = event.signals, !signals.isEmpty {
                 // Wraps in full: two lines clipped the device's reason (audit).
                 Text(signals)
