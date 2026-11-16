@@ -86,11 +86,16 @@ def device_log():
     """Everything the BLE and provisioning loggers emit (the project's loggers do not reach caplog)."""
     handler = _Lines()
     loggers = [logging.getLogger(f"sensordyme.{n}") for n in ("ble", "provisioning")]
+    # Set, then restored: a simulated-device test earlier in the run configures these
+    # loggers at WARNING, which used to leave this capture empty (order-dependent).
+    levels = [logger.level for logger in loggers]
     for logger in loggers:
         logger.addHandler(handler)
+        logger.setLevel(logging.DEBUG)
     yield handler.lines
-    for logger in loggers:
+    for logger, level in zip(loggers, levels, strict=True):
         logger.removeHandler(handler)
+        logger.setLevel(level)
 
 
 @pytest.fixture
