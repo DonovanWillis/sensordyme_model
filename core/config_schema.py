@@ -27,6 +27,8 @@ _KNOWN_TOP_LEVEL = {
     # development (default) | production: production refuses insecure fallbacks,
     # e.g. unauthenticated Bluetooth setup (services/ble_pop.py, M6.5).
     "deployment",
+    # M12 sd-local-v1: per-phone local access (core/local_auth.py, docs/LOCAL_ACCESS.md).
+    "local_access",
 }
 
 
@@ -218,6 +220,20 @@ def validate(config: dict) -> tuple[list[str], list[str]]:
         _check(errors, _is_num(fps) and 0 < fps <= 240, f"`camera.fps:` must be in (0, 240], got {fps!r}")
     else:
         errors.append("`camera:` must be a mapping")
+
+    local_access = config.get("local_access", {})
+    if isinstance(local_access, dict):
+        enabled = local_access.get("enabled", True)
+        _check(errors, isinstance(enabled, bool),
+               f"`local_access.enabled:` must be true or false, got {enabled!r}")
+        days = local_access.get("idle_expiry_days", 180)
+        _check(errors, _is_num(days) and 0 <= days <= 3650,
+               f"`local_access.idle_expiry_days:` must be 0-3650 (0 = never), got {days!r}")
+        events_max = local_access.get("events_max", 2000)
+        _check(errors, isinstance(events_max, int) and 10 <= events_max <= 100_000,
+               f"`local_access.events_max:` must be an integer 10-100000, got {events_max!r}")
+    elif local_access is not None:
+        errors.append("`local_access:` must be a mapping")
 
     dashboard = config.get("dashboard", {})
     if isinstance(dashboard, dict):

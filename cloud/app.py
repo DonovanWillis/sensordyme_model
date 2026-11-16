@@ -2893,14 +2893,14 @@ def add_local_client(device_id: int, body: LocalClientBody, uid: int = Depends(c
     unsigned one. The response says whether the device already reports it
     (`on_device`); until then the app keeps using the account path.
     """
-    raw = _p256_point(body.public_key)
-    if raw is None:
-        raise CodedError(400, "bad_public_key", "public_key must be an uncompressed P-256 point, base64url")
-    client_id = hashlib.sha256(raw).hexdigest()[:16]
     name = "".join(ch for ch in (body.name or "").strip() if ch.isprintable())[:64] or "iPhone"
     now = time.time()
     with db() as conn:
-        device = _owned_device(conn, device_id, uid)
+        device = _owned_device(conn, device_id, uid)  # first: another account learns nothing
+        raw = _p256_point(body.public_key)
+        if raw is None:
+            raise CodedError(400, "bad_public_key", "public_key must be an uncompressed P-256 point, base64url")
+        client_id = hashlib.sha256(raw).hexdigest()[:16]
         count = conn.execute("SELECT COUNT(*) FROM local_clients WHERE device_id = ? AND state = 'active'"
                              " AND client_id != ?", (device_id, client_id)).fetchone()[0]
         if count >= 16:
@@ -2929,11 +2929,11 @@ def list_local_clients(device_id: int, uid: int = Depends(current_user)):
 @app.delete("/v1/devices/{device_id}/local-clients/{client_id}")
 def revoke_local_client(device_id: int, client_id: str, uid: int = Depends(current_user)):
     """Forget a phone locally (a lost phone): delivered until the device stops reporting it."""
-    if not _LOCAL_CLIENT_ID.match(client_id):
-        raise CodedError(400, "bad_client_id", "client_id is 16 lowercase hex characters")
     now = time.time()
     with db() as conn:
-        _owned_device(conn, device_id, uid)
+        _owned_device(conn, device_id, uid)  # first: another account learns nothing, not even the format
+        if not _LOCAL_CLIENT_ID.match(client_id):
+            raise CodedError(400, "bad_client_id", "client_id is 16 lowercase hex characters")
         conn.execute(
             "INSERT INTO local_clients (device_id, client_id, public_key, name, state, owner_id, created_at,"
             " updated_at) VALUES (?, ?, '', '', 'revoked', ?, ?, ?)"

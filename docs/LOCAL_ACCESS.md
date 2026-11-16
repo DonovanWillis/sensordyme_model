@@ -151,7 +151,7 @@ device -> {"op":"enrolled","iv":<12 bytes b64>,"ct": AES-256-GCM(K_enc, iv', can
 * Canonical JSON means sorted keys, no spaces, UTF-8. BLE messages use
   standard base64; the fields inside are base64url.
 * One enrolment per session. The state stays `proven`, so credentials may follow.
-* Refusals are `{"op":"error","error":"refused","code":<LocalAuthError reason>}`
+* Refusals are `{"op":"error","error":"refused","reason":<LocalAuthError reason>}`
   or `unsupported` (no local access).
 * Works with no network at all. It needs the Bluetooth window to be open: the
   device is offline, within `reconfigure_window_s` after boot, or has

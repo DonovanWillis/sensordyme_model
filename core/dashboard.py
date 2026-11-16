@@ -626,7 +626,7 @@ class DashboardServer:
                                     "challenge_ttl_s": int(la.CHALLENGE_TTL_S),
                                     "token_enrollment": dashboard._token is not None})
                         return
-                    if path.startswith(("/api", "/stream")):
+                    if self.path.startswith("/api") or self.path.startswith("/stream"):
                         self.local_client = self._session_client()
                         if self.local_client is None and not self._authorized():
                             # A phone whose session ended is told so, and opens a new one.

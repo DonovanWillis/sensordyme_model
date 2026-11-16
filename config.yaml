@@ -38,6 +38,14 @@ camera:
 # PRIVACY: annotated frames stream in-memory over HTTP to connected browsers only --
 # never written to disk. host 127.0.0.1 = this machine only; set 0.0.0.0 on the Pi to
 # view from your phone on the same network (an explicit opt-in, like the VLM exception).
+# M12 sd-local-v1 (docs/LOCAL_ACCESS.md): each phone gets its own key, enrolled
+# over Bluetooth (setup code), through the owner's account (signed command), or
+# by a holder of dashboard.token. No shared secret to paste, nothing open on the
+# LAN: a phone that was never enrolled gets 401 on every /api and /stream path.
+local_access:
+  enabled: true
+  idle_expiry_days: 180   # a phone not seen for this long must pair again (0 = never)
+
 dashboard:
   enabled: true
   host: 0.0.0.0

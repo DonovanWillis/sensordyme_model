@@ -106,6 +106,7 @@ def _request(s, method: str, path: str, device_id: int, headers: dict):
     """One call of `method path` naming `device_id`, with a body that validates."""
     node = sorted(s.app.node_catalog())[0]
     url = path.replace("{device_id}", str(device_id)).replace("{event_id}", str(s.event)).replace("{rule_id}", "r1")
+    url = url.replace("{client_id}", "0123456789abcdef")
     bodies = {
         ("POST", "/v1/devices/{device_id}/name"): {"name": "taken over"},
         ("POST", "/v1/devices/{device_id}/protection"): {"action": "stop", "confirm": True},
@@ -115,6 +116,8 @@ def _request(s, method: str, path: str, device_id: int, headers: dict):
         ("POST", "/v1/devices/{device_id}/zones"): {"zones": [{"name": "door", "polygon": [[0, 0], [1, 0], [1, 1]]}]},
         ("POST", "/v1/devices/{device_id}/nodes"): {"node": node, "enabled": True},
         ("PATCH", "/v1/devices/{device_id}/rules/{rule_id}"): {"enabled": False},
+        # M12: which phones a device trusts locally is the owner's alone.
+        ("POST", "/v1/devices/{device_id}/local-clients"): {"public_key": "BA" + "A" * 85, "name": "x"},
         ("POST", "/v1/ai/configure"): {"device_id": device_id, "prompt": "tell me when someone falls"},
     }
     return s.client.request(method, url, json=bodies.get((method, path)), headers=headers)

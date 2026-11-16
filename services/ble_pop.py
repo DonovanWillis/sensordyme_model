@@ -488,7 +488,7 @@ class PopAuthenticator:
         try:
             reply = self.enroller(str(doc.get("public_key", "")), str(doc.get("name", "")))
         except Exception as exc:  # noqa: BLE001 - LocalAuthError and anything else: a refusal, never a crash
-            return _error("refused", "the device could not enrol this phone", code=getattr(exc, "reason", "error"))
+            return _error("refused", "the device could not enrol this phone", reason=getattr(exc, "reason", "error"))
         session.enrolled = True
         reply_iv = self.rng(GCM_IV_BYTES)
         return Reply({"op": "enrolled", "iv": b64e(reply_iv), "ct": b64e(seal_enrolled(session.keys, reply,
