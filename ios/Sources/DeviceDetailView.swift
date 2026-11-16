@@ -56,6 +56,10 @@ struct DeviceDetailView: View {
     /// camera alone and never this screen.
     @State private var feedSession = LiveFeedSession()
     @State private var showCamera = false
+    /// M13: what the AI saw, drawn over the picture. Off: the clean picture is
+    /// the ordinary view, and it is not remembered between visits.
+    @State private var aiView = false
+    @State private var showPresentation = false
     /// Device health opens itself when there is something to see (the device
     /// isn't reporting, or a component isn't working) and stays folded to one
     /// line while everything works. A tap overrides either way.
@@ -133,12 +137,21 @@ struct DeviceDetailView: View {
                 banners
 
                 // The camera is the centrepiece and always comes first.
-                CameraViewport(device: device, instrument: instrument, session: feedSession) { openCamera() }
+                CameraViewport(device: device, instrument: instrument, session: feedSession,
+                               aiView: $aiView) { openCamera() }
                     .sdZoomSource(.camera, in: zoomNS, cornerRadius: SD.Radius.camera, enabled: zoomEnabled)
                     .padding(.top, SD.Space.xs)
 
                 instrumentPanel
                     .padding(.top, SD.Space.lg)
+
+                // M13: what driver monitoring is doing, from the live analysis
+                // when this iPhone shows the camera, else from the history.
+                if showsDriverPanel {
+                    DriverMonitoringPanel(model: feedSession.reader.overlayModel, monitoring: instrument,
+                                          hasLiveFeed: hasLiveFeed, lastEvent: lastDriverEvent)
+                        .padding(.top, SD.Space.lg)
+                }
 
                 actionKeys
                     .padding(.top, SD.Space.lg)
@@ -279,8 +292,25 @@ struct DeviceDetailView: View {
         }
         .fullScreenCover(isPresented: $showCamera) {
             LiveCameraView(device: device, instrument: instrument,
-                           presence: ConnectionTruth.label(presence), session: feedSession)
+                           presence: ConnectionTruth.label(presence), session: feedSession, aiView: $aiView)
                 .sdZoomDestination(.camera, in: zoomNS, enabled: zoomEnabled)
+        }
+        // M13: presentation mode. Built from this screen's own state on every
+        // update (the 4 s poll, a mode confirmed), so it can never disagree
+        // with the device screen underneath it.
+        .fullScreenCover(isPresented: $showPresentation) {
+            PresentationModeView(
+                device: device, instrument: instrument, presence: ConnectionTruth.label(presence),
+                modeTitle: modeLine,
+                customRule: customMonitoringActive
+                    ? device.monitoring.map { ($0.title, $0.summary, customReplacesModes) } : nil,
+                options: presentationOptions,
+                pendingBase: pendingSwitch?.targetBase,
+                failure: failedSwitch.map { $0.reason ?? "Didn't switch — \(device.name) didn't confirm" },
+                latestAlert: alertActive ? events.first { $0.isCritical || $0.isConfigured } : nil,
+                lastDriverEvent: lastDriverEvent,
+                session: feedSession,
+                onSwitch: { setMode($0) })
         }
         .sheet(isPresented: $showZones) {
             ZoneEditorView(device: device)
@@ -365,6 +395,9 @@ struct DeviceDetailView: View {
             } else if let which = DebugLaunch.openEvent {
                 try? await Task.sleep(for: .seconds(1.5))
                 selectedEvent = which == "experimental" ? events.first(where: \.isExperimental) : events.first
+            } else if DebugLaunch.openPresentation {
+                try? await Task.sleep(for: .seconds(1.5))
+                openPresentation()
             } else if DebugLaunch.openCamera || DebugLaunch.openMode != nil {
                 // A beat on the device screen first, so a recording shows the
                 // zoom out of its source.
@@ -432,6 +465,42 @@ struct DeviceDetailView: View {
 
     /// iOS 18 zoom transitions, unless the reader asked for less motion.
     private var zoomEnabled: Bool { !reduceMotion }
+
+    // MARK: M13 live analysis and presentation
+
+    /// This iPhone shows the camera's live picture (and so its analysis).
+    private var hasLiveFeed: Bool {
+        if case .live = CameraSource(state: state, device: device).kind { return true }
+        return false
+    }
+
+    /// The driver panel belongs to Driver Safety (the Distracted Driving
+    /// product), whenever the device runs it and Jupiter's rules haven't
+    /// replaced it.
+    private var showsDriverPanel: Bool { activeBase == "driver_safety" && !customReplacesModes }
+
+    /// The driver-monitoring event types (the driver_safety role's alerts).
+    private static let driverEventTypes: Set<String> = [
+        "distraction", "eyes_down", "eyes_up", "phone_use", "drowsiness", "attention_lost",
+    ]
+
+    /// The newest driver event the history holds (not an experimental note).
+    private var lastDriverEvent: EventItem? {
+        events.first { Self.driverEventTypes.contains($0.type) && !$0.isExperimental }
+    }
+
+    /// The modes presentation mode offers, selected from what the device reports.
+    private var presentationOptions: [PresentationModeOption] {
+        PresentationModeOptions.make(catalog: libraryCatalog, activePreset: device.activePreset,
+                                     customReplacesModes: customReplacesModes,
+                                     isAvailable: { unavailableReason($0) == nil })
+    }
+
+    private func openPresentation() {
+        var transaction = Transaction()
+        transaction.disablesAnimations = reduceMotion
+        withTransaction(transaction) { showPresentation = true }
+    }
 
     private func openCamera() {
         // Under Reduce Motion the camera appears at once rather than sliding
@@ -890,6 +959,15 @@ struct DeviceDetailView: View {
             .buttonStyle(SDPressStyle())
             .accessibilityLabel("Report")
             .accessibilityHint("Estimates from recent events")
+
+            // M13: the camera full screen with what the AI sees, for showing it.
+            Button { openPresentation() } label: {
+                InstrumentKey(icon: "play.rectangle", title: "Present")
+            }
+            .buttonStyle(SDPressStyle())
+            .accessibilityLabel("Presentation mode")
+            .accessibilityHint("Full screen: the camera, what the AI sees, and the mode switch")
+            .accessibilityIdentifier("detail.present")
 
             if state.isDemo {
                 Button { showDemoTrigger = true } label: {

@@ -26,6 +26,8 @@ enum DebugLaunch {
     static var scrollToBottom: Bool { args.contains("-orynScrollBottom") }
     /// Open the full-screen camera from the device screen (to record its zoom).
     static var openCamera: Bool { args.contains("-orynOpenCamera") }
+    /// M13: open presentation mode from the device screen (screenshots, recordings).
+    static var openPresentation: Bool { args.contains("-orynPresent") }
     /// Open one mode's detail from the device screen (`-orynOpenMode driver_safety`).
     static var openMode: String? { value(after: "-orynOpenMode") }
     /// Select a tab: devices, shop or settings.
@@ -77,6 +79,7 @@ enum DebugLaunch {
     static let openEvent: String? = nil
     static let scrollToBottom = false
     static let openCamera = false
+    static let openPresentation = false
     static let openMode: String? = nil
     static let tab: String? = nil
     static let jupiterPrompt: String? = nil
