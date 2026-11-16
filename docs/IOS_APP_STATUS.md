@@ -44,6 +44,15 @@ the overlay's state and fps, shows the simulated distraction in the driver panel
 and switches Driver Safety Standard → Strict as confirmed by the device.
 `tests/test_m13_showcase_scenario.py` pins the scenario and the controller option.
 
+Runs (`scripts/sim/ios_uitest.sh`, iPhone 17 Pro Simulator, iOS 26.1; evidence in
+`~/sensordyme-audit/2026-11-10/m13-evidence/ios/`): full run A (9d0b50d) 29/30, journey 29
+failed (the paired-camera card's tap opened nothing); 29+30 alone (bc49aa1) 0/2: 29 the
+same, 30's Strict tap landed while the alert banner moved the chips. The same journey 29
+passed on the M12 sources (1 run) and once on M13 (debug run), so it is a tap race on a
+card redrawn every second: 29 now settles and taps once more only if nothing opened; the
+presentation mode switch is pinned below the panel. Final full run (214a398): **30/30**,
+no second taps needed, both accessibility audits passed.
+
 ## Mission 12: the camera works with the backend off (sd-local-v1)
 
 Contract: `docs/LOCAL_ACCESS.md`. Gaps closed: `docs/PORTABLE_OPERATION.md` C1–C6.
