@@ -738,6 +738,9 @@ final class OrynJourneysUITests: XCTestCase {
                       "the list says why these are direct connections: \(element("local.caption").label)")
         shot("29b_cold_launch_backend_down")
         waitFor(card, labelContains: "Connected directly on this network", timeout: 60)
+        // The card grows a line as it connects; tap it once it has stayed put
+        // (M13 full run: the tap landed during that re-layout and opened nothing).
+        settle(card)
         card.tap()
         XCTAssertTrue(element("local.banner").waitForExistence(timeout: 15), "the screen says it is a direct connection")
         XCTAssertTrue(label(containing: "Your account server can't be reached").waitForExistence(timeout: 5),
