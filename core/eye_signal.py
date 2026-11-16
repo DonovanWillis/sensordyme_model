@@ -51,6 +51,7 @@ inference, so the Pi's frame budget is untouched.
 
 from __future__ import annotations
 
+import bisect
 import math
 from collections import deque
 from collections.abc import Sequence
@@ -289,12 +290,30 @@ class AdaptiveBaseline:
         self._band_high = band_high
         self._min_samples = min_samples
         self._samples: deque[tuple[float, float]] = deque()
+        #: M13: the window's values kept in sorted order as they arrive and leave,
+        #: so reference() no longer sorts the whole window (up to window_s x fps =
+        #: 1,800 floats at 30 fps, twice per frame for EAR and iris) on every frame.
+        #: Equal values keep their arrival order (insort_right in, the leftmost
+        #: equal out: the oldest), exactly as the stable sort did. NaN has no place
+        #: in an order, so NaNs are counted instead, and while one is in the window
+        #: reference() falls back to the original sort, whatever that gives.
+        self._ordered: list[float] = []
+        self._nans = 0
 
     def observe(self, value: float, now: float) -> None:
-        self._samples.append((now, float(value)))
+        value = float(value)
+        self._samples.append((now, value))
+        if value != value:  # NaN
+            self._nans += 1
+        else:
+            bisect.insort_right(self._ordered, value)
         cutoff = now - self._window_s
         while self._samples and self._samples[0][0] < cutoff:
-            self._samples.popleft()
+            _, old = self._samples.popleft()
+            if old != old:
+                self._nans -= 1
+            else:
+                del self._ordered[bisect.bisect_left(self._ordered, old)]
 
     def reference(self, calibrated: Optional[float]) -> Optional[float]:
         """The open-eye reference to threshold against right now.
@@ -305,7 +324,7 @@ class AdaptiveBaseline:
         """
         if len(self._samples) < self._min_samples:
             return calibrated
-        ordered = sorted(value for _, value in self._samples)
+        ordered = sorted(value for _, value in self._samples) if self._nans else self._ordered
         index = min(len(ordered) - 1, int(len(ordered) * self._percentile))
         session = ordered[index]
         if calibrated is None:
@@ -314,3 +333,5 @@ class AdaptiveBaseline:
 
     def reset(self) -> None:
         self._samples.clear()
+        self._ordered.clear()
+        self._nans = 0
