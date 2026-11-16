@@ -146,9 +146,34 @@ struct LocalDeviceView: View {
     @State private var confirmStop = false
     @State private var confirmForget = false
     @State private var now = Date()
+    /// Held, never observed: frames redraw the camera alone, never this screen.
     @State private var feedSession = LiveFeedSession()
+    /// M13.1: what the AI saw, drawn over the picture. Off: the clean picture
+    /// is the ordinary view, and it is not remembered between visits.
+    @State private var aiView = false
+    @State private var showPresentation = false
+    /// The last mode switch's failure, or the camera not confirming it.
+    @State private var modeFailure: String?
+    @State private var lastPoll = Date.distantPast
+    @Environment(\.accessibilityReduceMotion) private var reduceMotion
 
     private var device: TrustedDevice? { local.device(hardwareID) }
+
+    /// The camera's address when this iPhone can open its stream.
+    private var streamURL: URL? {
+        guard device?.isUsable == true, let address = local.address(hardwareID) else { return nil }
+        return URL(string: address)
+    }
+
+    /// Presentation mode, from this screen's own state (PresentationSource.swift):
+    /// the camera's fresh reading, its own modes and history; nothing from the account.
+    private var presentationSource: PresentationSource {
+        LocalPresentation.source(
+            name: device?.name ?? hardwareID, hardwareID: hardwareID, url: streamURL, presence: presence,
+            state: local.readings[hardwareID.uppercased()]?.state, presets: presets, events: events,
+            fetchedAt: eventsFetchedAt, now: now, pending: switching, failure: modeFailure,
+            isAlert: { $0.isCritical })
+    }
 
     private var context: LocalContext {
         if !state.isSignedIn || state.isDemo { return .noAccount }
@@ -174,6 +199,7 @@ struct LocalDeviceView: View {
                     .accessibilityIdentifier("local.banner")
                 if let device { header(device) }
                 camera
+                presentButton
                 monitoring
                 if live, let presets, !presets.presets.isEmpty { modes(presets) }
                 history
@@ -202,11 +228,28 @@ struct LocalDeviceView: View {
         } message: {
             Text("This iPhone stops trusting the camera and asks it to forget this iPhone. To use it again, pair it over Bluetooth or through your account.")
         }
-        .task {
-            // While on screen: the camera's own state every 4 s, its modes and
-            // history every 10 s. Nothing runs once the screen is gone.
-            var tick = 0
-            while !Task.isCancelled {
+        // M13.1: presentation mode over the direct connection. Rebuilt from this
+        // screen's state on every update (the 4 s read, a mode confirmed); the
+        // mode switch is the signed local command (`choose`).
+        .fullScreenCover(isPresented: $showPresentation) {
+            PresentationModeView(content: presentationSource, session: feedSession, onSwitch: { choose($0) })
+                .task { await poll() }
+        }
+        .task { await poll() }
+    }
+
+    /// While on screen: the camera's own state every 4 s, its modes and
+    /// history every 12 s. Nothing runs once the screen is gone.
+    ///
+    /// Run by this screen and by presentation mode over it (a full-screen
+    /// cover can end the screen's own task), whichever is alive; a loop that
+    /// finds the other has just read the camera skips its turn, so the camera
+    /// is never read twice as often.
+    private func poll() async {
+        var tick = 0
+        while !Task.isCancelled {
+            if Date().timeIntervalSince(lastPoll) >= 3 {
+                lastPoll = Date()
                 now = Date()
                 await local.refresh(hardwareID)
                 now = Date()
@@ -215,8 +258,8 @@ struct LocalDeviceView: View {
                     await loadEvents()
                 }
                 tick += 1
-                try? await Task.sleep(for: .seconds(4))
             }
+            try? await Task.sleep(for: .seconds(4))
         }
     }
 
@@ -253,15 +296,40 @@ struct LocalDeviceView: View {
     @ViewBuilder private var camera: some View {
         let shape = RoundedRectangle(cornerRadius: SD.Radius.camera, style: .continuous)
         Group {
-            if device?.isUsable == true, let address = local.address(hardwareID), let url = URL(string: address) {
+            if let url = streamURL {
                 ZStack {
-                    MJPEGView(url: url, session: feedSession, hardwareID: hardwareID, managedLocally: true)
+                    MJPEGView(url: url, session: feedSession, hardwareID: hardwareID, managedLocally: true,
+                              aiView: aiView)
                     CameraOffCover(reader: feedSession.reader)
                 }
+                // The same chrome as the account's camera (CameraViewport):
+                // the live state and, with the AI view on, what the analysis
+                // says; the Simulated badge whenever the stream says so.
                 .overlay(alignment: .topLeading) {
-                    MJPEGLiveIndicator(reader: feedSession.reader, monitoringStopped: protection == "stopped")
-                        .dynamicTypeSize(...DynamicTypeSize.xxxLarge)
+                    VStack(alignment: .leading, spacing: 6) {
+                        MJPEGLiveIndicator(reader: feedSession.reader, monitoringStopped: protection == "stopped")
+                            .dynamicTypeSize(...DynamicTypeSize.xxxLarge)
+                            .accessibilityShowsLargeContentViewer()
+                        if aiView {
+                            AIViewChrome(model: feedSession.reader.overlayModel, compact: true)
+                                .transition(.opacity)
+                        }
+                    }
+                    .padding(SD.Space.sm)
+                }
+                .overlay(alignment: .topTrailing) {
+                    SimulatedBadgeIfNeeded(model: feedSession.reader.overlayModel)
                         .padding(SD.Space.sm)
+                }
+                .overlay(alignment: .bottomLeading) {
+                    HStack(spacing: SD.Space.xs) {
+                        AIViewToggle(isOn: $aiView)
+                        if aiView { AIPerfReadout(model: feedSession.reader.overlayModel) }
+                    }
+                    .dynamicTypeSize(...DynamicTypeSize.xxxLarge)
+                    .accessibilityShowsLargeContentViewer()
+                    .padding(SD.Space.xxs)
+                    .padding(.leading, SD.Space.xxs)
                 }
             } else {
                 CameraPlaceholder(interrupted: true)
@@ -271,6 +339,22 @@ struct LocalDeviceView: View {
         .frame(maxWidth: .infinity)
         .clipShape(shape)
         .overlay(shape.strokeBorder(Color.white.opacity(0.08), lineWidth: 1))
+    }
+
+    // MARK: presentation
+
+    private var presentButton: some View {
+        Button {
+            var transaction = Transaction()
+            transaction.disablesAnimations = reduceMotion
+            withTransaction(transaction) { showPresentation = true }
+        } label: {
+            Label("Present", systemImage: "play.rectangle")
+        }
+        .buttonStyle(SDButtonStyle(kind: .secondary))
+        .accessibilityLabel("Presentation mode")
+        .accessibilityHint("Full screen: the camera, what the AI sees, and the mode switch, directly on this network")
+        .accessibilityIdentifier("local.present")
     }
 
     // MARK: monitoring and stop / resume
@@ -383,19 +467,27 @@ struct LocalDeviceView: View {
         }
     }
 
+    /// Switch mode over the signed local path (`X-SD-Local`), from this screen's
+    /// list or from presentation. Selected only once the camera reports it
+    /// (`LocalPresets.reports`), then the list is read again from the camera.
     private func choose(_ name: String) {
+        guard switching == nil else { return }
         switching = name
         note = nil
+        modeFailure = nil
         Task {
             defer { switching = nil }
             switch await local.setPreset(hardwareID, name: name) {
             case .success(let outcome):
                 note = (outcome.text, outcome.isConfirmed)
+                if !outcome.isConfirmed { modeFailure = outcome.text }
                 presets = await local.presets(hardwareID)
             case .failure(let error):
                 // A 409 is the camera's role floor: its own reason, verbatim.
                 note = (error.message, false)
+                modeFailure = error.message
             }
+            now = Date()
         }
     }
 

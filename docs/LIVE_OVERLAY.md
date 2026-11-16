@@ -85,6 +85,18 @@ The iPhone app always asks for it and draws it itself: `ios/Sources/LiveOverlay.
 The clean picture is its default view; "AI view" is a toggle. See
 `docs/IOS_APP_STATUS.md`, Mission 13.
 
+M13.1: the same AI view toggle and the **Present** key are on the paired-camera
+screen (`LocalDeviceViews.swift`), which works with the account server down
+over the phone's sd-local-v1 session. Presentation mode is fed by either screen
+through `PresentationSource.swift`: over the direct connection the modes are the
+camera's own `/api/presets` (limited to its role's `allowed_presets`), a switch
+is the signed local command and a chip is selected only once the camera reports
+that variant; the alert evidence is the camera's `/api/events` (last minute, by
+`age_s`) and `alert_active`; `last_event.event_key` names the why line's row in
+that history; Jupiter's rules are said as running from `policy.mode` but their
+wording (kept by the account) is not shown. The Head chip shows `pitch_deg`
+as the device's signed number beside its `direction` word.
+
 ## Cost
 
 * About 1–2 KB per frame (`tests/test_m13_overlay.py` bounds the header below 4 KB).

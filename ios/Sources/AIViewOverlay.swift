@@ -54,40 +54,61 @@ struct AIOverlayCanvas: View {
 
             // 2. Boxes: the detector's latest run. Faded when carried from an
             // earlier run (det_fresh false) -- the device says they are not new.
+            // One path per stroke style, one stroke call each (M13.1): a frame
+            // with a dozen boxes is a handful of strokes, not a dozen; the
+            // tags are drawn after, on the outer context.
             if let detections = overlay.detections {
                 var layer = context
                 layer.opacity = overlay.boxesAreCarried ? 0.45 : 1
+                var strokes: [(color: Color, width: CGFloat, path: Path)] = []
+                var tags: [(label: String, at: CGPoint, color: Color)] = []
                 for d in detections {
                     let style = AIBoxStyle.make(d, alertActive: overlay.alertActive)
                     let r = rect(d.box)
-                    layer.stroke(Path(roundedRect: r, cornerRadius: 6, style: .continuous),
-                                 with: .color(style.color), lineWidth: style.lineWidth)
+                    let box = Path(roundedRect: r, cornerRadius: 6, style: .continuous)
+                    if let i = strokes.firstIndex(where: { $0.color == style.color && $0.width == style.lineWidth }) {
+                        strokes[i].path.addPath(box)
+                    } else {
+                        strokes.append((style.color, style.lineWidth, box))
+                    }
                     if let label = style.label {
-                        // Drawn on the outer context so the tag's plate keeps its contrast.
-                        tag(label, at: CGPoint(x: r.minX, y: r.minY), color: style.color.opacity(
-                            overlay.boxesAreCarried ? 0.6 : 1))
+                        tags.append((label, CGPoint(x: r.minX, y: r.minY),
+                                     style.color.opacity(overlay.boxesAreCarried ? 0.6 : 1)))
                     }
                 }
+                for s in strokes { layer.stroke(s.path, with: .color(s.color), lineWidth: s.width) }
+                // Drawn on the outer context so the tag's plate keeps its contrast.
+                for t in tags { tag(t.label, at: t.at, color: t.color) }
             }
 
-            // 3. Hands, only on frames where the hand model ran.
-            for hand in overlay.hands ?? [] {
-                context.stroke(Path(roundedRect: rect(hand), cornerRadius: 5, style: .continuous),
-                               with: .color(SD.Colors.textSecondary.opacity(0.7)),
+            // 3. Hands, only on frames where the hand model ran: one path.
+            if let hands = overlay.hands, !hands.isEmpty {
+                var path = Path()
+                for hand in hands { path.addRoundedRect(in: rect(hand), cornerSize: CGSize(width: 5, height: 5), style: .continuous) }
+                context.stroke(path, with: .color(SD.Colors.textSecondary.opacity(0.7)),
                                style: StrokeStyle(lineWidth: 1, dash: [2, 3]))
             }
 
             // 4. The face outline and the eyes: a thin contour, never the mesh.
-            let eyesClosed = overlay.face?.eyesClosed == true
-            for name in ["oval", "eye_l", "eye_r"] {
-                guard let points = overlay.drawableContour(name), let first = points.first else { continue }
+            // The oval is one path; both eyes are one path.
+            func contour(_ names: [String]) -> Path? {
                 var path = Path()
-                path.move(to: CGPoint(x: first.x * size.width, y: first.y * size.height))
-                for p in points.dropFirst() { path.addLine(to: CGPoint(x: p.x * size.width, y: p.y * size.height)) }
-                path.closeSubpath()
-                let isEye = name != "oval"
-                let color: Color = isEye && eyesClosed ? SD.Colors.warning : SD.Colors.textPrimary.opacity(isEye ? 0.9 : 0.6)
-                context.stroke(path, with: .color(color), style: StrokeStyle(lineWidth: isEye ? 1.2 : 1, lineJoin: .round))
+                for name in names {
+                    guard let points = overlay.drawableContour(name), let first = points.first else { continue }
+                    path.move(to: CGPoint(x: first.x * size.width, y: first.y * size.height))
+                    for p in points.dropFirst() { path.addLine(to: CGPoint(x: p.x * size.width, y: p.y * size.height)) }
+                    path.closeSubpath()
+                }
+                return path.isEmpty ? nil : path
+            }
+            if let oval = contour(["oval"]) {
+                context.stroke(oval, with: .color(SD.Colors.textPrimary.opacity(0.6)),
+                               style: StrokeStyle(lineWidth: 1, lineJoin: .round))
+            }
+            if let eyes = contour(["eye_l", "eye_r"]) {
+                let eyesClosed = overlay.face?.eyesClosed == true
+                context.stroke(eyes, with: .color(eyesClosed ? SD.Colors.warning : SD.Colors.textPrimary.opacity(0.9)),
+                               style: StrokeStyle(lineWidth: 1.2, lineJoin: .round))
             }
         }
         .allowsHitTesting(false)
@@ -408,6 +429,10 @@ struct DriverMonitoringPanel: View {
     let hasLiveFeed: Bool
     /// The newest driver event in the history, for when no live one is known.
     let lastEvent: EventItem?
+    /// Per history `event_key`, where that row is kept ("In the camera's
+    /// history · Not yet backed up"): the live why line names its row when the
+    /// device sent the key (sd-overlay/1 `last_event.event_key`).
+    var historyNotes: [String: String] = [:]
     var onDark = false
 
     private static let relative: RelativeDateTimeFormatter = {
@@ -496,14 +521,16 @@ struct DriverMonitoringPanel: View {
     /// there is one, else the newest driver event the history holds.
     @ViewBuilder private func lastEventRow(_ panel: DriverPanelModel) -> some View {
         if let why = panel.why {
-            eventRow(title: why.title, words: why.because, when: why.ageText)
+            eventRow(title: why.title, words: why.because, when: why.ageText,
+                     history: why.eventKey.flatMap { historyNotes[$0] })
         } else if let event = lastEvent {
             eventRow(title: event.title, words: event.signals.flatMap { $0.isEmpty ? nil : $0 },
-                     when: event.date.map { Self.relative.localizedString(for: $0, relativeTo: .now) })
+                     when: event.date.map { Self.relative.localizedString(for: $0, relativeTo: .now) },
+                     history: event.eventKey.flatMap { historyNotes[$0] })
         }
     }
 
-    private func eventRow(title: String, words: String?, when: String?) -> some View {
+    private func eventRow(title: String, words: String?, when: String?, history: String?) -> some View {
         VStack(alignment: .leading, spacing: 2) {
             HStack(alignment: .firstTextBaseline, spacing: SD.Space.xs) {
                 Text("Last event")
@@ -527,11 +554,18 @@ struct DriverMonitoringPanel: View {
                     .foregroundStyle(SD.Colors.textSecondary)
                     .fixedSize(horizontal: false, vertical: true)
             }
+            if let history {
+                // The same event's row in the history (matched by its key).
+                Label(history, systemImage: "list.bullet.rectangle")
+                    .font(SD.Typography.caption)
+                    .foregroundStyle(SD.Colors.textTertiary)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
         }
         .padding(.top, SD.Space.xxs)
         .accessibilityElement(children: .ignore)
         .accessibilityLabel("Last event: \(title)\(when.map { ", \($0)" } ?? "")")
-        .accessibilityValue(words.map { "The device says: \($0)" } ?? "")
+        .accessibilityValue([words.map { "The device says: \($0)" }, history].compactMap { $0 }.joined(separator: ". "))
         .accessibilityIdentifier("driver.panel.lastEvent")
     }
 }
