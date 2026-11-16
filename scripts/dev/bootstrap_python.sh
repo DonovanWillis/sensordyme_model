@@ -12,10 +12,13 @@
 #   scripts/dev/bootstrap_python.sh -- tests/test_rules.py -k fall   # your own pytest args
 #
 # Profiles (both resolve the repo's own pin files; nothing is pinned here):
-#   backend  requirements-device.txt + cloud/requirements.txt + requirements-dev.txt
+#   backend  requirements.txt MINUS its torch and ultralytics lines
+#            + cloud/requirements.txt + requirements-dev.txt
 #            Everything the backend, the device runtime and the test suite import,
-#            WITHOUT torch/ultralytics (multi-GB on Linux; only the mac_max profile,
-#            benchmarks and training use them).
+#            without torch/ultralytics (multi-GB on Linux; only the mac_max profile,
+#            benchmarks and training use them). requirements.txt's other dev pins
+#            stay on purpose: anthropic is what brings httpx, which the backend
+#            tests' starlette TestClient needs and no pin file names directly.
 #   full     requirements.txt + cloud/requirements.txt + requirements-dev.txt
 #            Same as the CI test job (.github/workflows/ci.yml). Pulls torch.
 #
@@ -77,8 +80,7 @@ case "$(uname -s)" in
 esac
 
 case "$PROFILE" in
-  backend) REQS=(-r requirements-device.txt -r cloud/requirements.txt -r requirements-dev.txt) ;;
-  full)    REQS=(-r requirements.txt -r cloud/requirements.txt -r requirements-dev.txt) ;;
+  backend|full) ;;
   *) die "unknown profile: $PROFILE (backend|full)" ;;
 esac
 
@@ -129,6 +131,23 @@ fi
   || die "$VPY is $("$VPY" --version 2>&1); SensorDyme needs 3.11 or 3.12 (mediapipe). Delete $VENV and pass --python 3.12"
 
 if [ "$INSTALL" = 1 ]; then
+  if [ "$PROFILE" = full ]; then
+    REQS=(-r requirements.txt -r cloud/requirements.txt -r requirements-dev.txt)
+  else
+    # requirements.txt with its torch/ultralytics pins dropped, written outside the
+    # checkout. Its `-r requirements-device.txt` is made absolute so it still
+    # resolves from there. Refuse rather than guess if the file's shape changed.
+    grep -q '^-r requirements-device.txt' requirements.txt \
+      || die "requirements.txt no longer includes '-r requirements-device.txt'; update the backend profile"
+    TMPREQ=$(mktemp -d "${TMPDIR:-/tmp}/sensordyme-bootstrap.XXXXXX")
+    trap 'rm -f "$TMPREQ/requirements-backend.txt"; rmdir "$TMPREQ" 2>/dev/null || true' EXIT
+    sed -e "s#^-r requirements-device.txt#-r $REPO/requirements-device.txt#" \
+        -e '/^torch==/d' -e '/^ultralytics==/d' requirements.txt > "$TMPREQ/requirements-backend.txt"
+    if grep -qE '^(torch|ultralytics)([^a-z_-]|$)' "$TMPREQ/requirements-backend.txt"; then
+      die "requirements.txt pins torch/ultralytics in a form this script does not filter"
+    fi
+    REQS=(-r "$TMPREQ/requirements-backend.txt" -r cloud/requirements.txt -r requirements-dev.txt)
+  fi
   say "installing the '$PROFILE' profile: ${REQS[*]}"
   t0=$(date +%s)
   if [ -n "$UV" ]; then
