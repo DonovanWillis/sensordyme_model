@@ -440,3 +440,33 @@ Evidence: `~/sensordyme-audit/2026-11-10/m84-evidence/ios/` (`before/`,
 
 - "About this device": Device ID, what it is set up for, last report.
 - Recent activity merges each poll into what it shows (`EventFeed.merge`).
+
+## 11. M13 AI view and presentation mode
+
+What the device's AI saw is drawn by the app over the clean picture
+(sd-overlay/1, `docs/LIVE_OVERLAY.md`); the clean picture stays the default.
+
+- **Marks.** Thin continuous-corner boxes (1–1.6 pt): the driver in bone, other
+  people and another person's phone in steel, the driver's phone in amber; the
+  driver and their phone turn danger only while the device reports an alert
+  condition. Labels are words and tracker ids on 66 % black plates ("Driver #3",
+  "Phone · driver #9"); never a percentage. The face is an outline and two eye
+  contours (amber when the device says the eyes are closed), never the mesh. The
+  seat region is a dashed rounded rectangle labelled "Driver seat". Boxes the
+  device carried from an earlier detector run draw at 45 %.
+- **Chips** over footage use the existing plate (70 % black, hairline): the
+  analysis state with its symbol, behaviours ("Head turned away · 2.1 s", amber
+  dot while developing, danger once confirmed), "Eyes closed", "Head · Left" with
+  a half-dial needle (head yaw; never gaze), the device's measured "14 fps ·
+  Detector 11.8 ms · Frame 83 ms" in mono digits, and SIMULATED in amber for a
+  simulated source, on every frame.
+- **Motion.** Nothing animates by itself: the marks move because the device saw
+  them move. Chips cross-fade (0.2 s) on a change of meaning only; durations tick
+  at most 5×/s, the perf readout once a second.
+- **Presentation mode.** Black, status bar hidden, the picture first with a 1 pt
+  hairline that becomes a 3 pt danger outline during the device screen's alert
+  minute; an alert banner (danger-muted fill, danger hairline) for the first 15 s
+  of an alert or while the analysis reports an alert condition, in the device's
+  words; the driver panel and the mode chips (bone when the device reports the
+  mode, a spinner on the tapped chip until it does). Wider than tall: picture on
+  the left, panel and chips in a 360 pt column.

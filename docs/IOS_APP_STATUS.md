@@ -16,6 +16,34 @@ demo mode and is labelled simulated.
 
 Line numbers refer to `ios/Sources/` at the commit that added this file.
 
+## Mission 13: the AI view and presentation mode (sd-overlay/1)
+
+Contract: `docs/LIVE_OVERLAY.md`. Tested in software only (Swift logic tests, the
+real app in the iOS Simulator against the virtual device). **Nothing here has run
+on a physical iPhone or a Pi.**
+
+| Piece | File | What it does |
+|---|---|---|
+| Request | `MJPEGStream.swift` | Every `/stream` request sends `X-Stream-Overlay: 1`: the device answers with CLEAN frames and an `X-SD-Overlay` per analysed part. The clean picture is the ordinary (default) view. An older device ignores the header (no `X-Stream-Overlay: sd-overlay/1` in its answer) and the app says "Live analysis not available". A part's overlay over 16 KB is refused unread (the part header block limit is now 20 KB). |
+| Model | `LiveOverlay.swift` | Typed sd-overlay/1, lenient (unknown fields ignored, junk entries dropped, numbers clamped to the frame); `det: null` ("could not look") is never `[]` ("nothing there"); another schema is refused. Every word drawn from it is a tested function: the behaviour strip ("Head turned away · 2.1 s", developing amber, confirmed in the alert colour), the why line (the device's `signals`, alerts only), the perf readout ("14 fps · Detector 11.8 ms · Frame 83 ms"), the head chip ("Head · Left", never gaze), the panel state (Not analysed / Detection unavailable / Face not visible / Insufficient evidence / Calibrating / Watching / behaviour / alert), the Simulated badge (sticky for the stream once any document says `sim`). |
+| Frame binding | `FeedViews.swift` (`MJPEGReader.frameOverlay`) | Decoded with its JPEG and published in the same update as the picture; a part without a document clears it (never the previous frame's analysis). The words around the picture come from `LiveOverlayModel`, republished on a change of meaning at once, a ticking duration at most 5×/s and perf once a second, so the chrome never redraws per frame. |
+| AI view | `AIViewOverlay.swift`, `CameraViews.swift` | A toggle on the live camera ("AI view", off by default, not remembered). Draws, in the picture's own rect: thin rounded boxes (driver bright, other people muted, a phone labelled "driver" or "other", tracker ids), the face oval and eye contours (a contour whose points are mostly parked on one spot, like the virtual device's scripted mesh, is not drawn), the dashed driver-seat region, hand boxes when the hand model ran. Boxes fade when `det_fresh` is false; nothing is drawn over a picture that isn't live. No confidence numbers. |
+| Driver panel | `DriverMonitoringPanel` | On the device screen (Driver Safety) and in presentation: the monitoring state word (InstrumentState), the live analysis state, behaviours with durations, eyes closed only when the device says `true`, head, unavailable components in words, and the last event in the device's own words (live ≤ 30 s, else the newest driver event in the history). With no live picture: "Live analysis appears when this iPhone can see the camera on the same network." |
+| Presentation | `PresentationMode.swift` | Device screen → **Present** key. Full screen, status bar hidden, landscape layout when wider than tall; live picture with the AI view on, mode name, the monitoring state and presence, the driver panel, the active Jupiter rule, an alert banner (the existing alert evidence, the device's words, danger outline, VoiceOver announcement; the notification and its sound stay with AlertWatcher / `AlertSound.decide`), and a one-tap mode switch (`setMode`: signed local path when the camera answers this iPhone, the account otherwise; selected only from the device's report). Exit: the × (`present.close`) or the VoiceOver escape gesture. |
+| History | `EventModel.swift` (`meaning`), `ActivityViews.swift` | A driver event's row says what its type means ("The driver's head stayed turned away from straight ahead") above the device's own words. |
+| Jupiter | `AIConfigureView.swift` | After Activate, the device is asked first after 0.75 s and then every second (it was every 2 s) for up to 20 s; "Running" is still only the device's report. |
+
+Tests: `ios/Tests/LiveOverlayTests.swift` (the doc's example, null vs empty, sim badge,
+unknown fields, oversized refused, strip/why/perf/panel wording, throttling),
+additions to `MJPEGStreamTests` (request header, per-part binding across a split,
+size bound) and `EventModelTests` (meanings). XCUITest `test30_PresentationMode`:
+the virtual device runs `showcase` (`sim/scenario.py`: a simulated head-turn every
+40 s, a phone every third time; `POST /fresh?scenario=`), the device screen opens on
+the clean picture with the Simulated badge, presentation opens with the AI view,
+the overlay's state and fps, shows the simulated distraction in the driver panel,
+and switches Driver Safety Standard → Strict as confirmed by the device.
+`tests/test_m13_showcase_scenario.py` pins the scenario and the controller option.
+
 ## Mission 12: the camera works with the backend off (sd-local-v1)
 
 Contract: `docs/LOCAL_ACCESS.md`. Gaps closed: `docs/PORTABLE_OPERATION.md` C1–C6.
@@ -479,7 +507,7 @@ app side.
 
 Debug launch flags (DEBUG builds only, DebugLaunch.swift): `-orynDemo`,
 `-orynOpenDevice`, `-orynOpenJupiter -orynPrompt "<text>"`, `-orynOpenHistory`,
-`-orynScrollBottom`, `-orynTab shop|settings`.
+`-orynScrollBottom`, `-orynTab shop|settings`, `-orynPresent` (M13: presentation mode).
 
 ## Tests
 

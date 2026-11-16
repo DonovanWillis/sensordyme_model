@@ -77,6 +77,14 @@ A real example, made by `core/overlay.py` from a fabricated observation:
 * eye gaze;
 * anything from a frame other than the one it rides with.
 
+## The app side (M13)
+
+The iPhone app always asks for it and draws it itself: `ios/Sources/LiveOverlay.swift`
+(decoding and every word, tested by `ios/Tests/LiveOverlayTests.swift`),
+`AIViewOverlay.swift` (the AI view and the driver panel), `PresentationMode.swift`.
+The clean picture is its default view; "AI view" is a toggle. See
+`docs/IOS_APP_STATUS.md`, Mission 13.
+
 ## Cost
 
 * About 1–2 KB per frame (`tests/test_m13_overlay.py` bounds the header below 4 KB).
