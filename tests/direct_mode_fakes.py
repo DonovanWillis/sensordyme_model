@@ -95,7 +95,7 @@ class FakeNM:
             settings: dict[str, str] = {}
             rest = args[args.index("ifname") + 2:]
             for key, value in zip(rest[::2], rest[1::2], strict=True):
-                settings[_ALIASES.get(key, key)] = value
+                settings[_ALIASES.get(key) or key] = value
             for dropped in self.add_drops:
                 settings.pop(dropped, None)
             self.profiles[name] = settings
@@ -109,7 +109,7 @@ class FakeNM:
             profile = self.profiles.setdefault(args[3], {})
             rest = args[4:]
             for key, value in zip(rest[::2], rest[1::2], strict=True):
-                profile[_ALIASES.get(key, key)] = value
+                profile[_ALIASES.get(key) or key] = value
             return _ok()
         if args[:2] == ["connection", "up"]:
             name = args[-1]

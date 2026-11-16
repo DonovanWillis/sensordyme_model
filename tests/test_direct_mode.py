@@ -164,7 +164,7 @@ def test_no_code_path_can_build_an_open_or_unusable_access_point(security, psk):
 
 
 def test_the_reserved_profile_name_cannot_be_provisioned_as_a_client_network():
-    assert "reserved" in network.credential_problem(DIRECT_PROFILE, "password1")
+    assert "reserved" in (network.credential_problem(DIRECT_PROFILE, "password1") or "")
     assert network.credential_problem("SensorDyme-1A2B", "password1") is None
 
 
