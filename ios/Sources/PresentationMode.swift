@@ -9,11 +9,14 @@ import UIKit
 // monitoring is doing (DriverMonitoringPanel), an alert when one arrives, and
 // a one-tap switch between the modes this device can run.
 //
-// Nothing here decides anything: the state is the device screen's, the mode
-// switch is the device screen's `setMode` (the M12 signed local path when the
-// camera answers this iPhone directly, the account otherwise), the selected
-// mode is what the DEVICE reports, and the alert is the existing foreground
-// alert path (AlertWatcher; its sound policy, AlertSound.decide, is unchanged).
+// Nothing here decides anything. It is fed by whichever screen opened it
+// (PresentationSource.swift): the account device screen, or (M13.1) a paired
+// camera opened directly on the local network with the account server
+// possibly down. The state is that screen's, the mode switch is that screen's
+// (the account's `setMode`, which itself goes local when the camera answers
+// this iPhone, or the M12 signed local command), the selected mode is what
+// the DEVICE reports, and the alert is the screen's own evidence (the
+// foreground alert path's sound policy, AlertSound.decide, is unchanged).
 // No developer detail beyond the device's own measured frame rate and timings
 // in the AI view.
 
@@ -66,62 +69,16 @@ private struct PresentationAlertBanner: View {
     }
 }
 
-/// One mode the switch offers: a preset, or a variant of the running preset.
-struct PresentationModeOption: Identifiable, Equatable {
-    /// What `setMode` sends: "driver_safety" or "driver_safety:strict".
-    let id: String
-    /// "Driver Safety · Strict": what VoiceOver says.
-    let title: String
-    /// "Strict": what the chip says (the mode's name is in the header).
-    let short: String
-    let base: String
-    /// The device reports this mode running (never the tap).
-    let selected: Bool
-}
-
-enum PresentationModeOptions {
-    /// The modes to offer. The presets this device can run; when that is only
-    /// the running one (a role allows one mode, e.g. a driver-safety device),
-    /// its variants instead, so there is still a real choice to make.
-    static func make(catalog: PresetCatalog, activePreset: String?, customReplacesModes: Bool,
-                     isAvailable: (String) -> Bool) -> [PresentationModeOption] {
-        let active = Preset.split(activePreset)
-        let available = catalog.presets.filter { isAvailable($0.id) }
-        if available.count == 1, let only = available.first, !only.variants.isEmpty {
-            let current = active.base == only.id && !customReplacesModes
-                ? (active.variant ?? only.variants.first?.id) : nil
-            return only.variants.map { variant in
-                PresentationModeOption(id: "\(only.id):\(variant.id)", title: "\(only.title) · \(variant.title)",
-                                       short: variant.title, base: only.id, selected: current == variant.id)
-            }
-        }
-        return available.map { preset in
-            PresentationModeOption(id: preset.id, title: preset.title, short: preset.title, base: preset.id,
-                                   selected: active.base == preset.id && !customReplacesModes)
-        }
-    }
-}
+// PresentationModeOption(s), PresentationRule and PresentationSource: PresentationSource.swift.
 
 struct PresentationModeView: View {
-    @EnvironmentObject private var state: AppState
     @Environment(\.dismiss) private var dismiss
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
 
-    let device: Device
-    let instrument: InstrumentState
-    /// The presence word ("Online", "Stale" ...), as the device screen shows it.
-    let presence: String
-    let modeTitle: String
-    /// Jupiter's rules running on the device, as the device reports them.
-    let customRule: (title: String, summary: String, replacesModes: Bool)?
-    let options: [PresentationModeOption]
-    /// The device screen's switch in flight (its base), and the last failure.
-    let pendingBase: String?
-    let failure: String?
-    /// The newest alert in the last minute (the device screen's `alertActive` evidence).
-    let latestAlert: EventItem?
-    let lastDriverEvent: EventItem?
+    /// Everything shown, built by the screen underneath on every update.
+    let content: PresentationSource
     let session: LiveFeedSession
+    /// The screen's own mode switch (an option's id).
     let onSwitch: (String) -> Void
 
     /// Presentation shows the AI view; one tap returns to the clean picture.
@@ -131,7 +88,11 @@ struct PresentationModeView: View {
     @State private var switchTaps = 0
     @State private var videoAspect: CGFloat?
 
-    private var source: CameraSource { CameraSource(state: state, device: device) }
+    private var instrument: InstrumentState { content.instrument }
+    private var options: [PresentationModeOption] { content.options }
+    private var pendingBase: String? { content.pending }
+    private var failure: String? { content.failure }
+    private var latestAlert: EventItem? { content.latestAlert }
 
     var body: some View {
         GeometryReader { geo in
@@ -217,18 +178,18 @@ struct PresentationModeView: View {
 
             VStack(alignment: .leading, spacing: 2) {
                 HStack(spacing: 6) {
-                    Image(systemName: Preset.icon(for: Preset.split(device.activePreset).base))
+                    Image(systemName: Preset.icon(for: Preset.split(content.activePreset).base))
                         .font(.system(size: 13, weight: .semibold))
                         .foregroundStyle(SD.Colors.textSecondary)
                         .accessibilityHidden(true)
-                    Text(modeTitle)
+                    Text(content.modeTitle)
                         .font(SD.Typography.headline)
                         .foregroundStyle(SD.Colors.textPrimary)
                         .lineLimit(2)
                         .minimumScaleFactor(0.8)
                 }
                 .accessibilityElement(children: .ignore)
-                .accessibilityLabel("Mode: \(modeTitle)")
+                .accessibilityLabel("Mode: \(content.modeTitle)")
                 .accessibilityIdentifier("present.mode")
                 HStack(spacing: 5) {
                     Image(systemName: instrument.symbol)
@@ -236,7 +197,7 @@ struct PresentationModeView: View {
                         .accessibilityHidden(true)
                     Text(instrument.word)
                         .foregroundStyle(SD.Colors.textPrimary)
-                    Text("· \(presence)")
+                    Text("· \(content.presence)")
                         .foregroundStyle(SD.Colors.textSecondary)
                 }
                 .font(SD.Typography.callout.weight(.medium))
@@ -244,11 +205,11 @@ struct PresentationModeView: View {
                 .minimumScaleFactor(0.8)
                 .accessibilityElement(children: .ignore)
                 .accessibilityLabel(instrument.word)
-                .accessibilityValue(presence)
+                .accessibilityValue(content.presence)
                 .accessibilityIdentifier("present.state")
             }
             Spacer(minLength: SD.Space.xs)
-            if case .live = source.kind {
+            if content.hasLivePicture {
                 VStack(alignment: .trailing, spacing: 6) {
                     MJPEGLiveIndicator(reader: session.reader, monitoringStopped: instrument.kind == .stopped)
                     SimulatedBadgeIfNeeded(model: session.reader.overlayModel)
@@ -273,13 +234,14 @@ struct PresentationModeView: View {
     private var video: some View {
         let shape = RoundedRectangle(cornerRadius: SD.Radius.camera, style: .continuous)
         return ZStack {
-            switch source.kind {
+            switch content.picture {
             case .demo:
-                SimulatedFeedView(preset: device.activePreset ?? "driver_safety", alert: alerting)
+                SimulatedFeedView(preset: content.activePreset ?? "driver_safety", alert: alerting)
                     .aspectRatio(4 / 3, contentMode: .fit)
                     .dynamicTypeSize(...DynamicTypeSize.xxxLarge)
             case .live(let url):
-                MJPEGView(url: url, session: session, hardwareID: device.hardwareId, aiView: aiView)
+                MJPEGView(url: url, session: session, hardwareID: content.hardwareID,
+                          managedLocally: content.managedLocally, aiView: aiView)
                 CameraOffCover(reader: session.reader)
             case .none:
                 CameraPlaceholder(interrupted: instrument.isInterrupted)
@@ -294,14 +256,14 @@ struct PresentationModeView: View {
         .overlay(shape.strokeBorder(alerting ? SD.Colors.danger : Color.white.opacity(0.1),
                                     lineWidth: alerting ? 3 : 1))
         .overlay(alignment: .topLeading) {
-            if case .live = source.kind, aiView {
+            if content.hasLivePicture, aiView {
                 AIViewChrome(model: session.reader.overlayModel, compact: true)
                     .padding(SD.Space.sm)
                     .transition(.opacity)
             }
         }
         .overlay(alignment: .bottomLeading) {
-            if case .live = source.kind {
+            if content.hasLivePicture {
                 HStack(spacing: SD.Space.xs) {
                     AIViewToggle(isOn: $aiView)
                     if aiView { AIPerfReadout(model: session.reader.overlayModel) }
@@ -329,39 +291,51 @@ struct PresentationModeView: View {
         VStack(alignment: .leading, spacing: SD.Space.md) {
             PresentationAlertBanner(model: session.reader.overlayModel, latestAlert: latestAlert,
                                     fallback: alertDetail, fresh: alertIsFresh)
-            if let rule = customRule {
-                HStack(alignment: .top, spacing: SD.Space.sm) {
-                    OrynMark(height: 13, color: SD.Colors.signal)
-                        .frame(width: 22, height: 18)
-                        .accessibilityHidden(true)
-                    VStack(alignment: .leading, spacing: 2) {
-                        Text("\(rule.title) · set by Jupiter")
-                            .font(SD.Typography.label)
-                            .foregroundStyle(SD.Colors.textPrimary)
-                            .fixedSize(horizontal: false, vertical: true)
-                        Text(rule.summary)
-                            .font(SD.Typography.caption)
-                            .foregroundStyle(SD.Colors.textSecondary)
-                            .fixedSize(horizontal: false, vertical: true)
-                    }
-                }
-                .accessibilityElement(children: .combine)
-                .accessibilityIdentifier("present.rule")
+            switch content.rule {
+            case .none:
+                EmptyView()
+            case .running(let title, let summary, _):
+                ruleRow(title: "\(title) · set by Jupiter", detail: summary)
+            case .runningUnnamed:
+                // The device says Jupiter's rules run; their words are the
+                // account's, and this connection cannot read them.
+                ruleRow(title: PresentationRule.unnamedTitle, detail: PresentationRule.unnamedDetail)
             }
 
-            if Preset.split(device.activePreset).base == "driver_safety", customRule?.replacesModes != true {
+            if content.showsDriverPanel {
                 DriverMonitoringPanel(model: session.reader.overlayModel, monitoring: instrument,
-                                      hasLiveFeed: { if case .live = source.kind { return true }; return false }(),
-                                      lastEvent: lastDriverEvent, onDark: true)
+                                      hasLiveFeed: content.hasLivePicture,
+                                      lastEvent: content.lastDriverEvent, historyNotes: content.historyNotes,
+                                      onDark: true)
             }
         }
+    }
+
+    private func ruleRow(title: String, detail: String) -> some View {
+        HStack(alignment: .top, spacing: SD.Space.sm) {
+            OrynMark(height: 13, color: SD.Colors.signal)
+                .frame(width: 22, height: 18)
+                .accessibilityHidden(true)
+            VStack(alignment: .leading, spacing: 2) {
+                Text(title)
+                    .font(SD.Typography.label)
+                    .foregroundStyle(SD.Colors.textPrimary)
+                    .fixedSize(horizontal: false, vertical: true)
+                Text(detail)
+                    .font(SD.Typography.caption)
+                    .foregroundStyle(SD.Colors.textSecondary)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+        }
+        .accessibilityElement(children: .combine)
+        .accessibilityIdentifier("present.rule")
     }
 
     private var modeSwitch: some View {
         VStack(alignment: .leading, spacing: SD.Space.xs) {
             SDEyebrow("Switch mode")
             if options.isEmpty {
-                Text("No other mode is available on this device.")
+                Text(content.optionsNote ?? "No other mode is available on this device.")
                     .font(SD.Typography.caption)
                     .foregroundStyle(SD.Colors.textSecondary)
             } else {
@@ -378,7 +352,7 @@ struct PresentationModeView: View {
                     .fixedSize(horizontal: false, vertical: true)
                     .accessibilityIdentifier("present.switchFailed")
             } else if requested != nil || pendingBase != nil {
-                Text("Switching — waiting for \(device.name) to confirm")
+                Text("Switching — waiting for \(content.deviceName) to confirm")
                     .font(SD.Typography.caption)
                     .foregroundStyle(SD.Colors.textSecondary)
                     .fixedSize(horizontal: false, vertical: true)

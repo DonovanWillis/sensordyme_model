@@ -299,18 +299,7 @@ struct DeviceDetailView: View {
         // update (the 4 s poll, a mode confirmed), so it can never disagree
         // with the device screen underneath it.
         .fullScreenCover(isPresented: $showPresentation) {
-            PresentationModeView(
-                device: device, instrument: instrument, presence: ConnectionTruth.label(presence),
-                modeTitle: modeLine,
-                customRule: customMonitoringActive
-                    ? device.monitoring.map { ($0.title, $0.summary, customReplacesModes) } : nil,
-                options: presentationOptions,
-                pendingBase: pendingSwitch?.targetBase,
-                failure: failedSwitch.map { $0.reason ?? "Didn't switch — \(device.name) didn't confirm" },
-                latestAlert: alertActive ? events.first { $0.isCritical || $0.isConfigured } : nil,
-                lastDriverEvent: lastDriverEvent,
-                session: feedSession,
-                onSwitch: { setMode($0) })
+            PresentationModeView(content: presentationSource, session: feedSession, onSwitch: { setMode($0) })
         }
         .sheet(isPresented: $showZones) {
             ZoneEditorView(device: device)
@@ -479,14 +468,34 @@ struct DeviceDetailView: View {
     /// replaced it.
     private var showsDriverPanel: Bool { activeBase == "driver_safety" && !customReplacesModes }
 
-    /// The driver-monitoring event types (the driver_safety role's alerts).
-    private static let driverEventTypes: Set<String> = [
-        "distraction", "eyes_down", "eyes_up", "phone_use", "drowsiness", "attention_lost",
-    ]
-
     /// The newest driver event the history holds (not an experimental note).
-    private var lastDriverEvent: EventItem? {
-        events.first { Self.driverEventTypes.contains($0.type) && !$0.isExperimental }
+    private var lastDriverEvent: EventItem? { DriverEvents.newest(events) }
+
+    /// Presentation mode, from this screen's own state (PresentationSource.swift).
+    private var presentationSource: PresentationSource {
+        let source = CameraSource(state: state, device: device)
+        let picture: PresentationSource.Picture
+        switch source.kind {
+        case .demo: picture = .demo
+        case .live(let url): picture = .live(url)
+        case .none: picture = .none
+        }
+        var notes: [String: String] = [:]
+        for event in events { if let key = event.eventKey, !key.isEmpty { notes[key] = "In this device's activity" } }
+        return PresentationSource(
+            deviceName: device.name, hardwareID: device.hardwareId, managedLocally: false,
+            activePreset: device.activePreset, picture: picture, instrument: instrument,
+            presence: ConnectionTruth.label(presence), modeTitle: modeLine,
+            rule: customMonitoringActive
+                ? device.monitoring.map { .running(title: $0.title, summary: $0.summary,
+                                                   replacesModes: customReplacesModes) } ?? .none
+                : .none,
+            options: presentationOptions,
+            pending: pendingSwitch?.targetBase,
+            failure: failedSwitch.map { $0.reason ?? "Didn't switch — \(device.name) didn't confirm" },
+            latestAlert: alertActive ? events.first { $0.isCritical || $0.isConfigured } : nil,
+            lastDriverEvent: lastDriverEvent,
+            historyNotes: notes)
     }
 
     /// The modes presentation mode offers, selected from what the device reports.
