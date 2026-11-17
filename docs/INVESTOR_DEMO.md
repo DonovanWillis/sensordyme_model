@@ -1,4 +1,4 @@
-# Investor demonstration package (M11, updated M12 and M13)
+# Investor demonstration package (M11, updated M12, M13 and M14)
 
 **Status:** prepared and rehearsed **in software only.** The iOS Simulator ran
 against the virtual device, and the module harness ran the real driver module on
@@ -88,18 +88,28 @@ to the previous drawing).
 ## 2. The 90-second demo
 
 For a meeting slot, a booth or a video call. One presenter (a consenting
-adult), seated, **stationary**. The app is already open on the device screen,
+adult), seated, **stationary**. The iPhone is on the paired camera's screen,
 in presentation mode with the AI view on.
+
+**Before the slot (M14):**
+
+- Draw one area named `console` beside the presenter, outside their body.
+- Activate the Jupiter rule "Alert me when a cell phone stays in this area for
+  10 seconds" (§3.1).
+- Wait until the device reports it active. The rule is never activated live
+  inside the 90 seconds, because the device's acknowledgement takes a step.
 
 | Time | Say | Do | The audience sees |
 |---|---|---|---|
-| 0:00 | "This camera runs its own AI. Nothing here goes to a cloud." | Point at the Pi | The live picture, the "Protecting" state, fps |
-| 0:10 | "What you're seeing is what the device itself detected, on this exact frame." | Sit normally | The driver box, the face outline, the dashed seat region, "Head: Forward" |
-| 0:25 | "A short glance is normal driving." | Glance sideways ~1.5 s | "Head turned away" **developing** (amber), then it clears. No alert |
-| 0:40 | "A long one isn't." | Turn your head ~40° and hold 4 s | Developing → **confirmed** at ~3 s; **the buzzer sounds**; red banner: "turned 40 deg … + held 3.0 s" |
-| 1:00 | "The alert happens on the device, so it doesn't depend on the phone. It also tells you *why*, in measured terms." | Point at the banner and the panel | The device's own sentence; the event in history |
-| 1:15 | "Same for a phone in your hand, or eyes closing." | Optional: hold a phone in the lap and look at it, 3 s | `phone_use`, or `eyes_down` with its reason |
-| 1:30 | "All of it runs on the device in the car: the camera, the AI and the alert." | — | — |
+| 0:00 | "This is SensorDyme: a camera with its own AI chip. That's its live picture on the phone." | Point at the Pi, then the phone | The live picture, LIVE, "Protecting" |
+| 0:15 | "What you're seeing is what the device itself detected, on this exact frame." | Sit normally | The driver box, the face outline, the dashed seat region, "Head: Forward", measured fps |
+| 0:30 | "A long look away is what causes crashes." | Turn your head ~40° and hold 4 s | "Head turned away" **developing** (amber), then **confirmed** at ~3 s |
+| 0:50 | "The alert happens on the device, and it tells you *why*, in measured terms." | Turn back. Point at the buzzer, then the banner | **The buzzer sounds**; red banner in the device's own words ("turned 40 deg … + held 3.0 s"); the event in history |
+| 1:05 | "You can also add your own rule in plain English. This one is already on, beside Driver Safety: 'alert me when a phone stays in this area for 10 seconds'." | Eyes forward. Put the phone upright in the `console` area and let go | The phone box; then, at ~10 s, **one** alert: "Cell phone — A cell phone stays in this area for 10 seconds" |
+| 1:20 | "All of it runs on this device: camera, AI and alert. Our development computers are not involved." | — | — |
+
+The 0:30 head turn is the step to keep if time runs short. Never shorten the
+Jupiter rule's 10 s to fit the slot: it is the rule as written.
 
 If anything fails, do not improvise a claim. Say what the screen says (it is
 truthful by design), or switch to the fallback recording (§5) and **say it is a
@@ -122,7 +132,7 @@ simulated recording.**
 | 11 | "Phones: the device knows whose phone it is." | Hold a phone in the lap and look at it 3 s | `phone_use`, and the phone marked "driver" | — |
 | 12 | "Eyes closing." | Close the eyes ~3 s | `drowsiness` with "eyes closed 2.0 s + eye openness … under …" | Needs a calibrated driver: calibrate in the demo seat beforehand |
 | 13 | "One tap changes the policy, and the device confirms it." | Tap **Strict** in presentation mode | The chip selects only when the device reports it | A refusal names its reason: show it, as truthfulness is the point |
-| 14 | "Custom rules in plain English." | Ask Jupiter: "Alert me when a person remains in this area for 10 seconds." Draw the area → review → **Activate** | The rule appears beside Driver Safety; an alert ~10 s after someone stands in the area | Rehearsed only on a simulated general-role device. **Rehearse it on the unit beside Driver Safety before showing it.** Otherwise use the M11 rule "alert me if a phone is visible for 5 seconds" |
+| 14 | "Custom rules in plain English, beside Driver Safety, never instead of it." | Ask Jupiter: "Alert me when a cell phone stays in this area for 10 seconds." (one area, `console`, beside the presenter) → review → **Activate**. Wait for the device. Then put the phone upright in the area, eyes forward | The rule shows active once the device reports it; **one** alert ~10 s after the phone is placed; history, explain and the AI view's last event name the rule | §3.1. SIMULATED on a `driver_safety` twin only (M14). **Rehearse on the unit.** If the phone flickers: "Alert me when a cell phone is in this area." |
 | 15 | "None of this needs our development computers or the internet." | Close the MacBook lid, then repeat step 7 | **The buzzer still sounds.** The app shows "Direct connection"; the event reads "Not yet backed up" | Only once rehearsed on hardware (friend guide step 24b) |
 
 **Never in a demo:**
@@ -135,6 +145,143 @@ simulated recording.**
 - a simulated event or recording presented as real. A simulated event is
   labelled "Simulated" and never sounds.
 
+### 3.1 The Jupiter step on the real `role: driver_safety` unit (M14)
+
+**Status: SIMULATED only.** It ran end to end on the digital twin: the real
+backend, the real device runtime, scripted camera and models
+(`tests/test_m14_jupiter_driver_safety.py`). It has **not** run on the Pi 5 +
+Hailo-8L or on a physical iPhone. Rehearse it on the unit before showing it.
+
+#### Why not the M13 rule
+
+
+M13's showcase ("Alert me when a person remains in this area for 10 seconds")
+ran on a simulated `role: general` device. On `general`, and on every role
+except `driver_safety`, a Jupiter rule **replaces** the running mode (`ai_custom`).
+On `driver_safety` it runs **beside** Driver Safety (`standard_plus_custom`).
+In that case it may only name things the driver module's own detector reports:
+`person` and the `yolo_classes` in `config.yaml` (cell phone, cup, bottle, food
+and cutlery).
+
+The M13 rule does run beside Driver Safety (the test pins this). It is still the
+wrong demo here, for three reasons:
+
+- it needs a second person to stand in the area;
+- the demo rules say nobody but the consenting presenter may be in view;
+- a second person in view also touches driver association.
+
+The rule below needs only the presenter, who stays seated and keeps their eyes
+forward.
+
+#### The step
+
+**Before:**
+
+- Draw exactly **one** area in the app and name it `console`.
+- Put it on the desk or console beside the presenter, **outside** their body,
+  not over their lap. A phone inside the presenter's box is treated as the
+  driver's phone; looking at it for 2 s is then `phone_use` (Driver Safety
+  working as designed).
+- Prop the phone upright in that spot. How well the detector sees a phone lying
+  flat, in IR, at desk distance has **not been measured**.
+
+**The exact prompt (type it in Ask Jupiter):**
+
+> Alert me when a cell phone stays in this area for 10 seconds.
+
+Say "cell phone". "A phone stays in this area…" is not in the deterministic
+grammar, so it would go to a language model (none on the twin).
+
+With more than one area drawn, "this area" waits for an area named "marked
+area". In that case use the name instead: "Alert me when a cell phone stays in
+the console for 10 seconds."
+
+| Say | Do | The audience sees (twin) |
+|---|---|---|
+| "Driver Safety stays on. Jupiter adds a rule beside it, in plain English." | Type the prompt. Show the review. Tap **Activate** | Review: "Alert when a cell phone stays inside the area 'console' for 10 seconds or longer without leaving. Severity: warning; notification: push.", plus what it does and does not monitor |
+| "It's active only when the camera says it is." | Wait for the device | The rule shows active once the device reports it (on the twin, within one 4 s step: rule `lingering cell phone`, mode `standard_plus_custom`). Over a direct connection, presentation mode says "Rules set by Jupiter are running" |
+| "Watch the road. I'll put my phone down over here." | Eyes forward. Place the phone upright in the area and let go. **Don't look at it** | The phone box in the AI view; nothing else yet |
+| — | Wait ~10 s, still facing forward | **One alert at ~10 s** (on the twin, +10.25 s after the phone first appeared in the area). The buzzer plays the *warning* pattern ("double"). AI view "Last event": **Cell phone**, "A cell phone stays in this area for 10 seconds". The history row has the same words and the same `event_key`. Explain: "You were alerted because your rule alerts after 10 seconds", Area: console |
+| "And Driver Safety is untouched." | Take the phone away. Turn the head ~40° and hold 4 s (step 7) | `distraction`, exactly as without the rule |
+
+A phone in the area for less than 10 s gives no alert (6 s on the twin). The
+alert fires once per visit. A detector miss longer than 1 s restarts the
+10 s clock. The rule then waits 60 s before it can alert again.
+
+**Fallback if the phone flickers in rehearsal:** "Alert me when a cell phone
+is in this area." This is presence held for 2 s instead of a 10 s dwell. Only
+the parser has been tested on it; the device accepts the same label.
+
+**Never:**
+
+- change the unit's role for the pitch;
+- send the rule together with a mode switch (refused as `not_beside_mode`;
+  activate it on its own);
+- ask for something the driver module does not detect (see the table).
+
+#### What the test proves (SIMULATED)
+
+`tests/test_m14_jupiter_driver_safety.py` runs the same scripted timeline with
+the rule and without it. The timeline is:
+
+- the phone in the area for 6 s, then for 20 s;
+- the eyes closed for 5 s of the 20 s visit, so drowsiness and the rule fire
+  within the same second;
+- later, a 6 s head turn.
+
+It checks the following, all through the app's API calls:
+
+- The language model is never asked: the deterministic parser reads the
+  prompt into one typed policy.
+- The capability check passes against what **this** device reports, and the
+  driver module serves `cell phone`.
+- The device acknowledges the rule only after Activate. The mode is
+  `standard_plus_custom`, `driver_attention` runs throughout, and the role and
+  preset are unchanged.
+- **No second model or pipeline:** one module build in both runs, and the same
+  detector call count.
+- One rule alert at 10–11.5 s, and none for the 6 s visit.
+- **Driver Safety is not affected:** the same alerts, at the same device times,
+  each `alerted` with the buzzer `played` and nothing `skipped`, and the same
+  buzzer patterns. The driver thresholds equal `config.yaml`.
+- The alert is the same `event_key` in the backend history and in the
+  device's signed `/api/events`, and `/explain` answers for it.
+- sd-overlay/1 `last_event` is the rule's alert, with its `event_key`.
+
+#### Which existing policies run beside Driver Safety
+
+Pinned by `test_which_existing_policies_run_beside_driver_safety`:
+
+| Policy | On `driver_safety` | Why |
+|---|---|---|
+| Person dwell (M13; app suggestion "someone stays inside the marked area > 10 s") | runs | `person` is reported by the driver module. Needs a second person to demo; an area over the seat fires on the driver |
+| Person enters the area (`in_zone`) | runs | Same label. Same demo caveat |
+| Nobody in the area for N (`absent`) | runs | Same label. Overlaps Driver Safety's own critical `attention_lost` for an empty seat |
+| More than N people in the area (`count`) | runs | Same label. Needs several people |
+| **A cell phone stays in the area for 10 s (chosen)** | **runs** | `cell phone` is a driver-module detector class. One seated presenter can show it |
+| A bottle / cup / food enters the area | runs | Driver-module classes. Not scriptable in the twin's scenes (only phones and people) |
+| A dog enters the area (app suggestion) | **device refuses** | `dog` is not a driver-module label. The device refuses the whole set and keeps the running rule. The backend preview still says "ready" (it cannot see the device's labels) |
+| Pose compositions: resting/sleeping, waving, hand raised, lying down | **device refuses** | They are served by the pose module, which Driver Safety does not run. Running it would be a second model |
+| Identity / emotion / intent / sound / medical / "high risk" / "erratic hands" | refused up front | Refused on every role before any rule exists |
+| "Alert me if a phone is visible for 5 seconds" (M11 phrasing) | nothing proposed on the twin | Not in the deterministic grammar. It needs a configured language model; the rule it would produce (`cell phone`) is a driver-module label |
+
+#### What remains hardware-only
+
+- **Hardware, unmeasured:**
+  - whether the Hailo detector sees the propped phone steadily enough (in IR,
+    at desk distance) for a 10 s dwell;
+  - the real alert latency;
+  - that the buzzer's warning pattern is audible.
+- **App, not run:** what the iPhone app shows. This stream did not run the iOS
+  Simulator.
+  - The presentation banner's header reads "Driver alert" for **any** alert,
+    including a Jupiter rule's (`ios/Sources/PresentationMode.swift`). Say
+    "this is the rule's alert", or have the iOS stream change the header
+    copy.
+- **Buzzer queue: fixed in M14 (`2061794`).** A rule's pattern now ranks below
+  every mandatory pattern on the one buzzer, so it can never displace or jump
+  ahead of a waiting driver-safety pattern (`tests/test_m14_buzzer_precedence.py`).
+
 ## 4. Preflight and operator checklist
 
 **The day before:**
@@ -143,7 +290,7 @@ simulated recording.**
 - [ ] The iPhone app was reinstalled from Xcode **within the last 7 days**. A free personal team's signature expires after 7 days.
 - [ ] Driver calibration was done in the demo seat position, with only the presenter in view (README Phase 4).
 - [ ] The buzzer was heard at 1 m in the demo room (step 21).
-- [ ] The Jupiter step was rehearsed on this unit, or the M11 phrasing is used.
+- [ ] The Jupiter step (§3.1, cell phone in the `console` area) was rehearsed on this unit, beside Driver Safety.
 - [ ] The fallback recording (§5) is on the presenting laptop, and its sha256 matches the sidecar.
 
 **30 minutes before:**
