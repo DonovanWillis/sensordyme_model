@@ -495,7 +495,8 @@ sudo systemctl start sensordyme.service && systemctl is-active sensordyme.servic
 ```bash
 python3 $V/cabin_session.py plan --preset core --out ~/hwval/cabin/S01
 python3 $V/cabin_session.py run --plan ~/hwval/cabin/S01 --subject S01 --session S01-<date>-a --vehicle V01 \
-    --seat driver --lighting day --eyewear none --occupancy driver_only --mount dash_centre
+    --seat driver --lighting day --eyewear none --occupancy driver_only --mount dash_centre \
+    --consent-ref <consent record id>
 # observer, second ssh session, at the same time:
 python3 $V/cabin_session.py observe --session ~/hwval/cabin/S01 --annotator O1 --clock same_host \
     --consent-ref <consent record id> --independent
