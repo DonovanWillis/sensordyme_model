@@ -77,6 +77,20 @@ def without_ultralytics():
         for name in _SHIPPING_IMPORTS:
             sys.modules.pop(name, None)
         sys.modules.update(saved)
+        # Re-importing `core.accel` also rebinds the attribute on the `core`
+        # package; restoring sys.modules alone left `from core import accel`
+        # returning the fresh, unconfigured copy to every later test (found in
+        # M14: test_m83_inference_path fell back to ultralytics when run after
+        # this file). Put the package attributes back too.
+        for name in _SHIPPING_IMPORTS:
+            parent_name, _, child = name.rpartition(".")
+            parent = sys.modules.get(parent_name) if parent_name else None
+            if parent is None:
+                continue
+            if name in saved:
+                setattr(parent, child, saved[name])
+            elif hasattr(parent, child):
+                delattr(parent, child)
 
 
 def _requirement_names(path: Path) -> set[str]:
