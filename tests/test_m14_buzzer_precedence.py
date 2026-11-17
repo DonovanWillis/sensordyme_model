@@ -56,6 +56,20 @@ def test_string_categories_keep_their_old_ranking():
     assert outcome == ["n:skipped"]
 
 
+def test_a_category_object_without_the_flag_ranks_as_mandatory():
+    # Found by the M14 final gate: tests/test_m10_observe.py hands the sink a
+    # duck-typed category carrying only .name; the player must not crash and
+    # must treat it as mandatory (never below a rule).
+    outcome: list[str] = []
+    player = _busy_player(outcome)
+    player.play(PATTERNS["chirp"], _cat("warning", True), lambda r, e: outcome.append("rule:" + r))
+    player.play(PATTERNS["chirp"], _cat("warning", True), lambda r, e: outcome.append("rule2:" + r))
+    player.play(PATTERNS["chirp"], types.SimpleNamespace(name="warning"),  # type: ignore[arg-type]
+                lambda r, e: outcome.append("bare:" + r))
+    assert outcome == ["rule:skipped"]
+    assert max(player._pending, key=lambda p: p[0])[0] == (1, 1)
+
+
 class _RecordingSink:
     name = "recorder"
 

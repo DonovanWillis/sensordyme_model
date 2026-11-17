@@ -242,7 +242,9 @@ class _PatternPlayer:
         if isinstance(category, str):
             name, custom = category, False
         else:
-            name, custom = category.name, category.custom_rule
+            # A category object without the M14 flag (sinks are duck-typed) is
+            # treated as mandatory: it can never rank below a rule's pattern.
+            name, custom = category.name, bool(getattr(category, "custom_rule", False))
         rank = (0 if custom else 1, self._RANK.get(name, 1))
         dropped: Optional[Report] = None
         with self._lock:
