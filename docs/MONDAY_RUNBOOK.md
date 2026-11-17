@@ -224,16 +224,16 @@ What must survive a reinstall, and why:
 ```bash
 B=~/m6-backup-$(date +%Y%m%dT%H%M%S); mkdir -p $B && chmod 700 $B && cd $B
 cp -p $D/config.yaml config.yaml
-tar --exclude='.venv' -czf sensordyme_tree.tgz -C $(dirname $D) $(basename $D)
+tar --exclude='.venv' -czhf sensordyme_tree.tgz -C $(dirname $D) $(basename $D)   # -h: see the note below
 sudo tar -czf system_glue.tgz /etc/systemd/system/sensordyme*.service /etc/sudoers.d/sensordyme-reboot \
   /etc/polkit-1/rules.d/10-sensordyme-network.rules /etc/avahi/services/sensordyme.service \
-  /etc/NetworkManager/system-connections /var/lib/bluetooth 2>/dev/null
+  /etc/NetworkManager/system-connections /var/lib/bluetooth /etc/sensordyme 2>/dev/null
 sudo chown $USER system_glue.tgz && chmod 600 *
 sha256sum $D/models/*.hef > model_hashes.txt
 sha256sum * > SHA256SUMS; cat SHA256SUMS
 tar -tzf sensordyme_tree.tgz | grep -E 'config.yaml$|\.hef$|data/device_state.json$' 
 ```
-Expect: the archive lists `config.yaml`, the `.hef` and `data/`. Copy `$B` to the USB stick (or encrypted storage on the Mac) and verify `sha256sum -c SHA256SUMS` there. **Treat as secret.**
+Expect: the archive lists `config.yaml`, the `.hef` and `data/`. **M14: `-h` (dereference) is required on an adopted device** (`~/sensordyme.releases` exists): there `$D` is a symlink to the running release and `data/`, `models/`, `.secrets` are symlinks into `~/sensordyme.state/`; without `-h` the archive holds the one symlink and none of the device's state (no config, no `data/local_identity.pem`, no `.hef`). On a legacy tree `-h` changes nothing. Restoring such an archive (O2) on an adopted device: put `data/`, `models/`, `.secrets` back under `~/sensordyme.state/` and `config.yaml` into the running release, never over the `~/sensordyme` symlink. Copy `$B` to the USB stick (or encrypted storage on the Mac) and verify `sha256sum -c SHA256SUMS` there. **Treat as secret.**
 
 **E2. Record model hashes:** done in `model_hashes.txt`. Also copy it into `$EV`.
 
