@@ -64,3 +64,68 @@ def test_the_temp_wav_is_removed_even_when_aplay_fails(linux_aplay, tmp_path, mo
     assert sink._play_tone_safe(0.05) is not None
     assert list(tmp_path.glob("*.wav")) == []
     assert sink.readiness()[0] is False
+
+
+# ---------------------------------------------------------------------- camera: which board is this?
+class _BrokenPicamera2Finder:
+    """A `picamera2` whose import raises `exc` (as a broken apt/numpy install can)."""
+
+    def __init__(self, exc: BaseException) -> None:
+        self.exc = exc
+
+    def find_spec(self, name, path=None, target=None):
+        if name != "picamera2":
+            return None
+        import importlib.util
+
+        return importlib.util.spec_from_loader(name, self)
+
+    def create_module(self, spec):
+        return None
+
+    def exec_module(self, module):
+        raise self.exc
+
+
+@pytest.fixture
+def broken_picamera2(monkeypatch):
+    def install(exc: BaseException) -> None:
+        monkeypatch.delitem(sys.modules, "picamera2", raising=False)
+        monkeypatch.setattr(sys, "meta_path", [_BrokenPicamera2Finder(exc), *sys.meta_path])
+    return install
+
+
+def _board(monkeypatch, tmp_path, model: str | None) -> None:
+    from core import camera
+
+    path = tmp_path / "model"
+    if model is not None:
+        path.write_text(model + "\x00")
+    monkeypatch.setattr(camera, "DT_MODEL", path)
+
+
+@pytest.mark.parametrize("exc", [ImportError("No module named 'libcamera'"),
+                                 ValueError("numpy.dtype size changed, may indicate binary incompatibility")])
+def test_on_a_pi_a_broken_picamera2_is_the_cameras_reason_not_a_webcam_fallback(monkeypatch, tmp_path,
+                                                                                 broken_picamera2, exc):
+    from core import camera
+
+    _board(monkeypatch, tmp_path, "Raspberry Pi 5 Model B Rev 1.0")
+    broken_picamera2(exc)
+    assert camera.detect_pi() is True
+    monkeypatch.setattr(camera.cv2, "VideoCapture", lambda *_a: pytest.fail("a Pi never opens the webcam path"))
+    with pytest.raises(camera.CameraError) as raised:
+        camera.Camera({"width": 640, "height": 480, "fps": 30})
+    assert "could not start the Pi camera" in str(raised.value) and str(exc) in str(raised.value)
+    assert "macOS" not in str(raised.value)
+
+
+def test_off_a_pi_any_picamera2_import_failure_means_not_a_pi_and_never_crashes(monkeypatch, tmp_path,
+                                                                                 broken_picamera2):
+    from core import camera
+
+    _board(monkeypatch, tmp_path, None)  # no device tree (a Mac, a CI box)
+    broken_picamera2(RuntimeError("libcamera: no pipeline handler"))
+    assert camera.detect_pi() is False
+    _board(monkeypatch, tmp_path, "QEMU Virtual Machine")
+    assert camera.detect_pi() is False
