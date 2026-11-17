@@ -22,10 +22,11 @@ final class OrynJourneysUITests: XCTestCase {
     private static let startUnclaimed: Set<String> = ["test03_Discovery"]
     /// Journeys whose device also serves its local API (M12), with a token.
     private static let localDashboard: Set<String> = ["test29_OfflineLocalCamera", "test30_PresentationMode",
-                                                      "test31_LocalPresentation"]
+                                                      "test31_LocalPresentation", "test32_BackendDownCustomerJourney"]
     /// Journeys whose virtual device runs another scenario than "attentive".
     private static let scenarios: [String: String] = ["test30_PresentationMode": "showcase",
-                                                      "test31_LocalPresentation": "showcase"]
+                                                      "test31_LocalPresentation": "showcase",
+                                                      "test32_BackendDownCustomerJourney": "showcase"]
 
     override func setUpWithError() throws {
         continueAfterFailure = false
@@ -135,9 +136,23 @@ final class OrynJourneysUITests: XCTestCase {
         XCTAssertNotEqual(monitoring.label, "All clear", "a stopped device never reads as ready")
         let protection = reveal(app.buttons["detail.protection"])
         waitFor(protection, labelContains: "Resume", timeout: 30)
-        protection.tap()
+        fingerTap(protection)
         waitFor(monitoring, label: "All clear", timeout: 60)
         shot("06_resumed")
+    }
+
+    /// M14 regression check for journey 06's lost tap (see `fingerTap`): a
+    /// press held well past the system-gesture gate's decision (~105 ms after
+    /// touch-down), with the touch updates a held finger produces, still
+    /// resumes. Nothing about the Resume button may depend on a tap being quick.
+    func test06b_ResumeHeldPress() throws {
+        Stack.post("/protection?action=stop")
+        launch(["-orynOpenDevice"])
+        waitFor(monitoring, label: "Stopped", timeout: 60)
+        let protection = reveal(app.buttons["detail.protection"])
+        waitFor(protection, labelContains: "Resume", timeout: 30)
+        protection.press(forDuration: 0.4)
+        waitFor(monitoring, label: "All clear", timeout: 60)
     }
 
     func test07_PresetBrowse() throws {
@@ -884,13 +899,147 @@ final class OrynJourneysUITests: XCTestCase {
         XCTAssertTrue(element("local.banner").exists, "still a direct connection")
     }
 
+    /// M14 "Zero Day" §8: the whole customer journey with the MacBook backend
+    /// OFF, against the real device protocol on SIMULATED hardware (the virtual
+    /// SensorDyme: scripted camera and models, no Bluetooth, no Hailo).
+    ///
+    /// Cold launch -> the paired camera from the cache -> its identity verified
+    /// (a device-signed sd-local-v1 session: "Connected directly") -> its health
+    /// read fresh -> live video -> AI view -> Present -> Distracted Driving
+    /// (Driver Safety) Strict, confirmed by the DEVICE -> a simulated head-turn
+    /// event from the device's own journal reaches the foreground alert path
+    /// once, and its sound decision is made exactly once: SILENT, because the
+    /// event is simulated (AlertSound.decide, M11/M12: a simulated event never
+    /// sounds; the once-only rule for a real event is checked in
+    /// ios/Tests/LocalEventsTests.swift and AlertSoundTests.swift) -> the
+    /// camera's history shows it -> the camera goes away (process stopped): the
+    /// app says it is not answering, never "protecting" -> it comes back: live
+    /// video again -> no event announced or decided twice.
+    func test32_BackendDownCustomerJourney() throws {
+        Stack.post("/app/alert-decisions/clear")
+        openPairedCameraWithBackendDown(journey: "32", notifications: true)
+
+        // Identity and health: a verified session, and the camera's own fresh state.
+        XCTAssertTrue(element("local.banner").exists, "a direct connection, said as one")
+        waitFor(element("local.monitoring"), labelContains: "the camera reports it is protecting", timeout: 30)
+        shot("32c_identity_health_live")
+
+        // AI view on.
+        let toggle = element("ai.toggle")
+        XCTAssertTrue(toggle.waitForExistence(timeout: 15))
+        settle(toggle)
+        toggle.tap()
+        waitFor(toggle, value: "On, showing what the AI sees", timeout: 10)
+        XCTAssertTrue(element("ai.simulated").waitForExistence(timeout: 30), "simulated hardware is badged")
+
+        // Present.
+        let present = reveal(app.buttons["local.present"])
+        settle(present)
+        present.tap()
+        if !element("present.close").waitForExistence(timeout: 5), present.exists, present.isHittable {
+            Stack.saveText("the first tap on Present opened nothing; tapped once more", name: "32_second_tap", test: self)
+            present.tap()
+        }
+        XCTAssertTrue(element("present.close").waitForExistence(timeout: 15), "presentation mode opens")
+        waitFor(element("present.state"), value: "Direct connection", timeout: 30)
+        XCTAssertTrue(element("ai.simulated").waitForExistence(timeout: 30), "Simulated badge in presentation")
+
+        // Distracted Driving: the Driver Safety Strict variant, confirmed by the device.
+        waitFor(element("present.mode.driver_safety:standard"), value: "Active", timeout: 30)
+        let strict = element("present.mode.driver_safety:strict")
+        XCTAssertTrue(strict.waitForExistence(timeout: 10))
+        settle(strict)
+        strict.tap()
+        if !Stack.waitUntil(timeout: 5, { self.element("present.switching").exists || strict.isSelected }) {
+            Stack.saveText("the first tap on Strict started nothing; tapped once more", name: "32_second_tap_mode",
+                           test: self)
+            settle(strict)
+            strict.tap()
+        }
+        waitFor(strict, selected: true, timeout: 60)  // from what the camera reports
+        XCTAssertEqual(Stack.get("/device/local")["preset"] as? String, "driver_safety:strict", "the DEVICE runs Strict")
+        shot("32d_present_distracted_driving_strict")
+
+        // A simulated-policy event: the scenario's head-turn, as the device reports it...
+        waitFor(element("driver.panel.state"), labelContains: "Head turned away", timeout: 100)
+        // ...reaches the foreground alert path from the camera's own journal,
+        // and its sound decision is made once: silent, because it is simulated.
+        var first: [String: Any] = [:]
+        XCTAssertTrue(Stack.waitUntil(timeout: 90) {
+            first = self.alertDecisions().first { ($0["path"] as? String) == "local" } ?? [:]
+            return !first.isEmpty
+        }, "the app decided the alert sound for a local event: \(alertDecisions())")
+        XCTAssertEqual(first["simulated"] as? Bool, true, "the virtual device's event is flagged simulated: \(first)")
+        XCTAssertEqual(first["decision"] as? String, "silent:simulated",
+                       "a simulated event is shown, never sounded (AlertSound.decide): \(first)")
+        let banner = XCUIApplication(bundleIdentifier: "com.apple.springboard").descendants(matching: .any)
+            .matching(NSPredicate(format: "label CONTAINS %@", "Simulated · Driver alert")).firstMatch
+        let bannerSeen = banner.waitForExistence(timeout: 10)
+        shot("32e_simulated_event_foreground_alert")
+        XCTAssertTrue(bannerSeen, "the foreground alert is shown, labelled simulated")
+        // The banner sits over presentation's close key: let it go first.
+        _ = Stack.waitUntil(timeout: 15) { !banner.exists }
+        element("present.close").tap()
+        XCTAssertTrue(app.buttons["local.present"].waitForExistence(timeout: 15), "back on the paired camera")
+
+        // The camera's own history shows it.
+        let row = reveal(label(containing: "(simulated)"), timeout: 40)
+        XCTAssertTrue(row.exists, "the camera's history lists the simulated event")
+        shot("32f_local_history")
+
+        // The connection drops: the camera's process is stopped.
+        Stack.post("/device/stop")
+        let monitoring = element("local.monitoring")
+        waitFor(monitoring, labelContains: "isn't answering", timeout: 60)
+        XCTAssertFalse(monitoring.label.contains("protecting"), "never 'protecting' from memory: \(monitoring.label)")
+        let liveness = element("camera.liveness")
+        XCTAssertFalse(liveness.exists && liveness.label.contains("Live video"), "no live video claimed: \(liveness.label)")
+        shot("32g_after_camera_stopped")
+
+        // It comes back (a restart, like a Pi reboot): live video again, no re-pairing.
+        Stack.post("/device/start?scenario=showcase")
+        waitFor(monitoring, labelContains: "the camera reports it is protecting", timeout: 120)
+        waitFor(element("camera.liveness"), labelContains: "Live video", timeout: 90)
+        shot("32h_recovered_live")
+
+        // Let at least one more poll of the camera's journal happen after the
+        // restart, then: no event announced or decided twice.
+        _ = Stack.waitUntil(timeout: 12) { false }
+        let decisions = alertDecisions()
+        let identities = decisions.compactMap { $0["identity"] as? String }
+        XCTAssertEqual(identities.count, Set(identities).count, "no event decided twice: \(decisions)")
+        XCTAssertFalse(decisions.contains { ($0["decision"] as? String) == "play" },
+                       "nothing simulated ever sounded: \(decisions)")
+        Stack.saveText(decisions.map { "\($0)" }.joined(separator: "\n"), name: "32_alert_decisions", test: self)
+    }
+
+    /// The app's own record of its alert-sound decisions (DEBUG, journey 32).
+    private func alertDecisions() -> [[String: Any]] {
+        Stack.get("/app/alert-decisions")["decisions"] as? [[String: Any]] ?? []
+    }
+
+    /// The system's notification prompt, answered "Allow" (journey 32 only).
+    private func allowNotifications() {
+        let allow = XCUIApplication(bundleIdentifier: "com.apple.springboard").buttons["Allow"]
+        if allow.waitForExistence(timeout: 30) {
+            allow.tap()
+        } else {
+            Stack.saveText("no notification prompt was shown", name: "notification_prompt", test: self)
+        }
+    }
+
     /// Journeys 29 and 31: pair (the account relays this iPhone's key to the
     /// camera, and the live view plays over the phone's own local session),
     /// stop the MacBook backend, cold-launch with the saved session and nothing
     /// else, and open the paired camera from the cache until it plays live.
-    private func openPairedCameraWithBackendDown(journey: String) {
+    ///
+    /// `notifications`: the first launch asks for notification permission (no
+    /// -orynNoPrompt) and allows it in the system prompt, and the cold launch
+    /// shows banners, so the app's foreground alert path is the real one.
+    private func openPairedCameraWithBackendDown(journey: String, notifications: Bool = false) {
         XCTAssertEqual(Stack.state()["local_dashboard"] as? Bool, true, "this journey's device serves its local API")
-        launch(["-orynOpenDevice", "-orynDeviceFeed", "http://127.0.0.1:8899", "-"])
+        launch(["-orynOpenDevice", "-orynDeviceFeed", "http://127.0.0.1:8899", "-"], prompts: notifications)
+        if notifications { allowNotifications() }
         let liveness = element("camera.liveness")
         // The account relays the key on the device's next report (~2 s); the
         // stream then opens on the phone's own session.
@@ -905,7 +1054,7 @@ final class OrynJourneysUITests: XCTestCase {
         XCTAssertEqual(stopped["backend_running"] as? Bool, false, "the backend is stopped: \(stopped)")
 
         // A cold launch with the existing session and NO other launch arguments.
-        app.launchArguments = ["-orynNoPrompt"] + Stack.extraLaunchArguments
+        app.launchArguments = (notifications ? [] : ["-orynNoPrompt"]) + Stack.extraLaunchArguments
         app.launch()
         XCTAssertTrue(app.staticTexts["devices.title"].waitForExistence(timeout: 30), "still signed in")
         let card = app.buttons["local.card"]
@@ -949,8 +1098,8 @@ final class OrynJourneysUITests: XCTestCase {
         app.descendants(matching: .any).matching(NSPredicate(format: "label CONTAINS %@", text)).firstMatch
     }
 
-    private func launch(_ extra: [String] = [], signedIn: Bool = true) {
-        var args = ["-orynNoPrompt", "-orynSignOut"]
+    private func launch(_ extra: [String] = [], signedIn: Bool = true, prompts: Bool = false) {
+        var args = (prompts ? [] : ["-orynNoPrompt"]) + ["-orynSignOut"]
         if signedIn {
             let session = Stack.session()
             // An empty token signs the app in with nothing to send (see uitest_control.py).
@@ -1047,6 +1196,26 @@ final class OrynJourneysUITests: XCTestCase {
                 return
             }
         }
+    }
+
+    /// A tap as a finger makes it: a short press, which XCTest synthesizes with
+    /// the touch updates a finger on the glass streams while it is down.
+    ///
+    /// Why not `tap()` (M14, journey 06's lost tap, evidence in
+    /// ~/sensordyme-audit/2026-11-10/m14-evidence/streamC/test06-lost-tap-repro/):
+    /// `tap()` can arrive as a touch-down and a touch-up and nothing between.
+    /// On a loaded Mac the two were 150-164 ms apart, and iOS's
+    /// system-gesture-gate event (UIKit EventDispatch
+    /// "systemGestureStateChange: 1", ~105 ms after touch-down in every run) fell
+    /// BETWEEN them. In both such taps ever recorded (M13.1 0a59734; M14,
+    /// instrumented) the button never even showed pressed, and its action never
+    /// ran. Every tap whose touch-up came before that event fired (9 of 9). So did
+    /// every held press that spanned it with the touch updates a press streams
+    /// (0.2 s and 0.5 s, 4 of 4), and every 0.12 s press (2 of 2). The app did
+    /// nothing in between: no redraw of the button, no change of identity,
+    /// enabled throughout (os_log instrumentation, since removed).
+    private func fingerTap(_ element: XCUIElement) {
+        element.press(forDuration: 0.06)
     }
 
     private func waitFor(_ element: XCUIElement, label: String, timeout: TimeInterval,

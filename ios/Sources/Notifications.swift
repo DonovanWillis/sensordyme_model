@@ -259,6 +259,8 @@ final class AlertNotifier: NSObject, ObservableObject {
         content.threadIdentifier = "local-\(deviceName)"
         var log = sounded
         let decision = LocalAlerts.soundDecision(event, sounded: log, soundEnabled: Self.soundEnabled)
+        AlertDecisionJournal.record(path: "local", identity: AlertSound.identity(eventKey: event.eventKey, eventID: nil),
+                                    type: event.type, simulated: event.simulated == true, decision: decision)
         if decision == .play, let identity = AlertSound.identity(eventKey: event.eventKey, eventID: nil) {
             content.sound = .default
             log.insert(identity)
@@ -304,6 +306,8 @@ final class AlertNotifier: NSObject, ObservableObject {
             soundEnabled: Self.soundEnabled,
             simulated: event.isSimulated
         )
+        AlertDecisionJournal.record(path: "account", identity: identity, type: event.type,
+                                    simulated: event.isSimulated, decision: decision)
         if decision == .play, let identity {
             content.sound = .default
             log.insert(identity)
@@ -362,7 +366,11 @@ extension AlertNotifier: UNUserNotificationCenterDelegate {
         _ center: UNUserNotificationCenter,
         willPresent notification: UNNotification
     ) async -> UNNotificationPresentationOptions {
-        AlertNotifier.soundEnabled ? [.banner, .sound, .list] : [.banner, .list]
+        // Automated Simulator runs that never asked for permission (-orynNoPrompt,
+        // DEBUG only; always false in Release): a banner from a run that did ask
+        // (journey 32) must not cover the screen a later journey is checking.
+        if DebugLaunch.noPermissionPrompt { return [.list] }
+        return AlertNotifier.soundEnabled ? [.banner, .sound, .list] : [.banner, .list]
     }
 
     nonisolated func userNotificationCenter(
@@ -378,5 +386,40 @@ extension AlertNotifier: UNUserNotificationCenterDelegate {
             AlertNotifier.shared.pendingDeviceID = deviceID
             AlertNotifier.shared.pendingEventID = id
         }
+    }
+}
+
+/// Every alert-sound decision this phone made, one JSON line each, for the
+/// XCUITest journeys only (journey 32 reads it through the scenario controller,
+/// scripts/sim/uitest_control.py `GET /app/alert-decisions`): the sound itself
+/// cannot be observed from a UI test. DEBUG builds only; in Release `record`
+/// does nothing and nothing is written.
+enum AlertDecisionJournal {
+    #if DEBUG
+    static var url: URL {
+        FileManager.default.urls(for: .cachesDirectory, in: .userDomainMask)[0]
+            .appendingPathComponent("alert-decisions.jsonl")
+    }
+    #endif
+
+    static func record(path: String, identity: String?, type: String, simulated: Bool, decision: AlertSound.Decision) {
+        #if DEBUG
+        let word: String = switch decision {
+        case .play: "play"
+        case .silent(let reason): "silent:\(reason)"
+        }
+        let line: [String: Any] = ["path": path, "identity": identity ?? NSNull(), "type": type,
+                                   "simulated": simulated, "decision": word,
+                                   "at": Date().timeIntervalSince1970]
+        guard var data = try? JSONSerialization.data(withJSONObject: line, options: [.sortedKeys]) else { return }
+        data.append(0x0A)
+        if let handle = try? FileHandle(forWritingTo: url) {
+            defer { try? handle.close() }
+            _ = try? handle.seekToEnd()
+            try? handle.write(contentsOf: data)
+        } else {
+            try? data.write(to: url, options: .atomic)
+        }
+        #endif
     }
 }

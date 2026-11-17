@@ -45,8 +45,9 @@ private struct PresentationAlertBanner: View {
                     .foregroundStyle(SD.Colors.danger)
                     .accessibilityHidden(true)
                 VStack(alignment: .leading, spacing: 2) {
-                    Text(latestAlert?.isSimulated == true || model.summary.simulated
-                         ? "Driver alert · simulated" : "Driver alert")
+                    Text(PresentationAlertHeadline.text(
+                        liveDriverCondition: model.summary.alertActive, event: latestAlert,
+                        simulated: latestAlert?.isSimulated == true || model.summary.simulated))
                         .font(SD.Typography.headline)
                         .foregroundStyle(SD.Colors.textPrimary)
                     if let text {
@@ -143,7 +144,13 @@ struct PresentationModeView: View {
         .onDisappear { UIApplication.shared.isIdleTimerDisabled = false }
         .onChange(of: alerting) { _, now in
             // Said once when it arrives, for whoever can't see the screen.
-            if now { AccessibilityNotification.Announcement("Driver alert. \(alertDetail ?? "")").post() }
+            if now {
+                let summary = session.reader.overlayModel.summary
+                let headline = PresentationAlertHeadline.text(
+                    liveDriverCondition: summary.alertActive, event: latestAlert,
+                    simulated: latestAlert?.isSimulated == true || summary.simulated)
+                AccessibilityNotification.Announcement("\(headline). \(alertDetail ?? "")").post()
+            }
         }
         .onChange(of: options) { _, new in
             if let requested, new.first(where: { $0.id == requested })?.selected == true { self.requested = nil }

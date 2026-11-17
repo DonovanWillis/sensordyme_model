@@ -44,6 +44,11 @@ The UI tests drive scenarios through the control port (127.0.0.1 only):
                                         gateway  502 with a reverse proxy's HTML error page
                                         freeze   replay the last good GET /v1/devices reply (stale
                                                  telemetry: online=true, last_seen frozen); other paths pass
+    GET  /app/alert-decisions         M14: every alert-sound decision the app (DEBUG build) made, read from
+                                      its Simulator data container (AlertDecisionJournal in
+                                      ios/Sources/Notifications.swift): {"decisions": [...]}. The sound
+                                      cannot be observed from a UI test; this is the app's own record.
+    POST /app/alert-decisions/clear   M14: delete that record (a journey starts from none)
     POST /device/stop                 kill the virtual device process (it goes offline)
     POST /device/start?scenario=NAME  (re)start it with a scenario from sim/scenario.py
     POST /claim                       claim the device for the demo account (what "Add device" does)
@@ -467,7 +472,22 @@ def proxy_handler(stack: Stack):
     return Proxy
 
 
-def control_handler(stack: Stack, app_port: AppPort, stop: threading.Event):
+#: The app's bundle id and its DEBUG alert-decision journal, relative to its
+#: Simulator data container (AlertDecisionJournal.url).
+APP_BUNDLE_ID = "com.sensordyme.app"
+APP_ALERT_JOURNAL = "Library/Caches/alert-decisions.jsonl"
+
+
+def app_alert_journal(simulator: str) -> Path:
+    """The app's alert-decision journal in the Simulator (ValueError if the app is not installed)."""
+    found = subprocess.run(["xcrun", "simctl", "get_app_container", simulator, APP_BUNDLE_ID, "data"],
+                           capture_output=True, text=True, timeout=30, check=False)
+    if found.returncode != 0 or not found.stdout.strip():
+        raise ValueError(f"the app's data container was not found: {found.stderr.strip()[:200]}")
+    return Path(found.stdout.strip()) / APP_ALERT_JOURNAL
+
+
+def control_handler(stack: Stack, app_port: AppPort, stop: threading.Event, simulator: str = "booted"):
     scenario_lock = threading.Lock()
 
     class Control(BaseHTTPRequestHandler):
@@ -514,6 +534,14 @@ def control_handler(stack: Stack, app_port: AppPort, stop: threading.Event):
                                   "clients": len((clients or {}).get("clients", [])) if isinstance(clients, dict)
                                   else 0,
                                   "preset": presets.get("active") if isinstance(presets, dict) else None})
+            elif path == "/app/alert-decisions":
+                try:
+                    journal = app_alert_journal(simulator)
+                    lines = journal.read_text().splitlines() if journal.exists() else []
+                except (OSError, ValueError, subprocess.SubprocessError) as e:
+                    self._reply(503, {"error": str(e)})
+                    return
+                self._reply(200, {"decisions": [json.loads(line) for line in lines if line.strip()]})
             else:
                 self._reply(404, {"error": "unknown"})
 
@@ -536,6 +564,9 @@ def control_handler(stack: Stack, app_port: AppPort, stop: threading.Event):
                 app_port.up()
                 return stack.fresh(claimed=q.get("claimed", "1") != "0", tag=q.get("tag", ""),
                                    dashboard=q.get("dashboard") == "1", scenario=q.get("scenario", "attentive"))
+            if path == "/app/alert-decisions/clear":
+                app_alert_journal(simulator).unlink(missing_ok=True)
+                return {"cleared": True}
             if path == "/backend/stop":
                 # M12: the MacBook backend OFF. The process is stopped (the device
                 # loses it too) and the app's address stops listening. Only /fresh
@@ -616,6 +647,8 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--claimed", action="store_true", help="claim the device for the demo account at start")
     parser.add_argument("--device-dashboard-port", type=int, default=None,
                         help="serve the virtual device's own feed on this port (renders; default: none)")
+    parser.add_argument("--simulator", default="booted",
+                        help="the Simulator the app runs in (for GET /app/alert-decisions; default: booted)")
     parser.add_argument("--no-local-camera-while-stopped", action="store_true",
                         help="dashboard.local_camera_while_stopped: false on the virtual device (renders)")
     args = parser.parse_args(argv)
@@ -625,7 +658,7 @@ def main(argv: list[str] | None = None) -> int:
                   local_camera_while_stopped=not args.no_local_camera_while_stopped)
     stop = threading.Event()
     app_port = AppPort(args.app_port, stack)
-    control = ThreadingHTTPServer(("127.0.0.1", args.control_port), control_handler(stack, app_port, stop))
+    control = ThreadingHTTPServer(("127.0.0.1", args.control_port), control_handler(stack, app_port, stop, args.simulator))
     control.daemon_threads = True
     signal.signal(signal.SIGTERM, lambda *_: stop.set())
     serving = False
