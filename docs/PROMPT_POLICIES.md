@@ -165,6 +165,13 @@ cannot change module thresholds. A preset or settings switch keeps them
 there (see docs/PRESET_LIBRARY.md, `keep_rules`). On other roles, custom
 rules replace the preset, and the app is told so.
 
+Beside the driver preset, a rule may only name what the driver module's own
+detector reports: `person` and its `yolo_classes` (cell phone, cup, bottle,
+food, cutlery). The device refuses any other label, such as `dog` or a pose
+label like `resting`, for the whole set, and keeps the rules it was running.
+The backend preview cannot see the device's labels, so it still shows such a
+rule as `ready` (M14, `tests/test_m14_jupiter_driver_safety.py`).
+
 ## Known limits
 
 - The deterministic grammar is deliberately small. Anything outside it goes
