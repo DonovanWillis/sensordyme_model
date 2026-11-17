@@ -1161,13 +1161,17 @@ class DashboardServer:
             )
             self._counts[event.type] += 1
             self._flash_until = time.time() + FLASH_DURATION_S
-            # M13: the newest event, for the live overlay's "why" line.
-            key = getattr(event, "event_id", None)
-            self._last_event = {"type": event.type, "signals": str(event.contributing_signals or "")[:200],
-                                "severity": severity, "at": time.monotonic(),
-                                # The history row's event_key (core/local_events.py), so the app
-                                # can tie the live "why" line to its row and sync badge.
-                                "event_key": key if isinstance(key, str) and 0 < len(key) <= 64 else None}
+            # M13: the newest ALERT, for the live overlay's "why" line. Only
+            # loud/soft: the app shows nothing for a "log" record (LiveOverlay.swift
+            # OverlayWhyLine.make), so one landing after an alert -- an experimental
+            # observation, a re-detected phone -- blanked that alert's why line (M14).
+            if severity in ("loud", "soft"):
+                key = getattr(event, "event_id", None)
+                self._last_event = {"type": event.type, "signals": str(event.contributing_signals or "")[:200],
+                                    "severity": severity, "at": time.monotonic(),
+                                    # The history row's event_key (core/local_events.py), so the app
+                                    # can tie the live "why" line to its row and sync badge.
+                                    "event_key": key if isinstance(key, str) and 0 < len(key) <= 64 else None}
         journal = self.event_journal
         if journal is not None:
             # M12: the same event_id the uplink sends as event_key (core/local_events.py).
