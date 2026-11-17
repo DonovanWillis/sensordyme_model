@@ -227,8 +227,11 @@ cat ~/sensordyme/config.yaml >/dev/null 2>&1 && echo "config present (do NOT cop
 
 ### Clean install
 
-1. **Raspberry Pi Imager** (on the Mac) → *Raspberry Pi OS (64-bit)* (Bookworm)
-   → your SD card.
+1. **Raspberry Pi Imager** (on the Mac) → Raspberry Pi OS **(64-bit), Bookworm**
+   → your SD card. Newer Imagers default to Trixie (Debian 13, Python 3.13),
+   which this release does **not** support: pick the Bookworm 64-bit image
+   (listed under an older/legacy entry). `setup_pi.sh` refuses any other OS
+   before changing anything (hardware gate HG-OS, `docs/FIRST_PHYSICAL_BOOT.md`).
 2. In the Imager's settings gear before writing — this is the secure way to
    enable access, instead of enabling anything after boot:
    - hostname: something you'll recognise (e.g. `sensordyme-pi`);
@@ -298,11 +301,19 @@ scp -r ~/sensordyme-release/transfer-f63ddd9454f2 <user>@sensordyme-pi.local:tra
 ```bash
 cd ~/transfer
 sha256sum -c SHA256SUMS                                  # verify again, on the device
-mkdir -p ~/sensordyme && tar -xzf bundle/sensordyme-f63ddd9454f2.tar.gz -C ~/sensordyme
-mkdir -p ~/sensordyme/models && cp models/*.hef ~/sensordyme/models/
-cp -r wheels ~/sensordyme.wheels                         # enables the offline install
-cd ~/sensordyme && bash setup_pi.sh
+# one chained command: `mkdir` (no -p) stops it at once if ~/sensordyme already exists
+mkdir ~/sensordyme \
+  && tar -xzf bundle/sensordyme-f63ddd9454f2.tar.gz -C ~/sensordyme \
+  && cp -n config/config.yaml.example ~/sensordyme/config.yaml && chmod 600 ~/sensordyme/config.yaml \
+  && mkdir -p ~/sensordyme/models && cp models/*.hef ~/sensordyme/models/ \
+  && mkdir -p ~/sensordyme.wheels && cp wheels/*.whl ~/sensordyme.wheels/ \
+  && cd ~/sensordyme && bash setup_pi.sh
 ```
+
+The bundle never carries `config.yaml` (device state), so the template is copied
+in; `setup_pi.sh` refuses to start without one. It installs the hashed lock from
+`~/sensordyme.wheels` with `--no-index` when that directory holds the wheels. If it
+ends with "/dev/hailo0 is not present yet", reboot once: the Hailo driver loads at boot.
 
 What `setup_pi.sh` does (and what you should see):
 
