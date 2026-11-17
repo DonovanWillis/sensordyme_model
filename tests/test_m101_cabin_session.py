@@ -46,8 +46,10 @@ def _step(session: dict, block: str, event: str, k: int = 0) -> dict:
 @pytest.mark.parametrize("preset", sorted(cs.load_cues()["presets"]))
 def test_every_preset_makes_a_valid_annotation(preset):
     blocks = cs.load_cues()["presets"][preset]
-    occupancy = "driver_plus_front_passenger" if preset == "passenger" else "driver_only"
-    clips = cs.block_clips(_session(blocks, [], occupancy=occupancy), set())
+    need = cs.required_session_axes(blocks)  # M14: condition presets need their own lighting / eyewear
+    session = _session(blocks, [], occupancy=(need.get("occupancy") or ["driver_only"])[0])
+    session["meta"].update({axis: values[0] for axis, values in need.items()})
+    clips = cs.block_clips(session, set())
     assert clips
     for clip in clips:
         annotation, problems = av2.parse(clip["doc"], matrix=scenarios.load())
@@ -151,5 +153,5 @@ def test_run_without_a_device_is_blocked_not_a_traceback(tmp_path, capsys):
     cs.main(["plan", "--blocks", "calibrate", "--out", str(tmp_path)])
     code = cs.main(["run", "--plan", str(tmp_path), "--subject", "S0", "--session", "S0-x", "--vehicle", "V0",
                     "--lighting", "day", "--eyewear", "none", "--occupancy", "driver_only", "--mount",
-                    "dash_centre", "--url", "http://127.0.0.1:9"])
+                    "dash_centre", "--consent-ref", "C-0001", "--url", "http://127.0.0.1:9"])
     assert code == 2 and "BLOCKED" in capsys.readouterr().err
