@@ -227,6 +227,11 @@ def test_the_prompt_is_read_by_the_deterministic_parser_into_one_typed_policy():
     # Named instead of "this area" (when more than one area is drawn), the same rule.
     named = jp.parse("Alert me when a cell phone stays in the console for 10 seconds.", zones=["console", "dash"])
     assert named is not None and [p.rule["zone"] for p in named.policies] == ["console"]
+    # The rehearsal fallback (docs/_m14_jupiter_demo.md): presence held 2 s, same label, same area.
+    fallback = jp.parse("Alert me when a cell phone is in this area.", zones=["console"])
+    assert fallback is not None and [(p.rule["target"], p.rule["predicate"], p.rule["zone"], p.temporal)
+                                     for p in fallback.policies] == [("cell phone", "in_zone", "console",
+                                                                       {"sustain_s": 2.0})]
     # "a phone" alone is not a label the grammar reads: the demo must say "a cell phone".
     assert jp.parse("Alert me when a phone stays in this area for 10 seconds.", zones=["console"]) is None
 
