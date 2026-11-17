@@ -77,7 +77,7 @@ echo "== backend + virtual device + fault proxy"
 # Each test asks for its own fresh backend (POST /fresh); this one only has to
 # be there for the controller to answer.
 STACK="$(mktemp -d "${TMPDIR:-/tmp}/sd-uitest-stack.XXXXXX")"
-"$PY" scripts/sim/uitest_control.py --work "$STACK" --python "$PY" > "$OUT/control.out" 2>&1 &
+"$PY" scripts/sim/uitest_control.py --work "$STACK" --python "$PY" --simulator "$SIM" >"$OUT/control.out" 2>&1 &
 CTL=$!
 for _ in $(seq 120); do curl -sf http://127.0.0.1:8790/state >/dev/null && break; sleep 0.5; done
 curl -sf http://127.0.0.1:8790/state >/dev/null || { cat "$OUT/control.out"; exit 1; }
