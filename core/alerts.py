@@ -438,8 +438,20 @@ class SoundSink:
             wf.setsampwidth(2)
             wf.setframerate(fs)
             wf.writeframes(tone.tobytes())
-        subprocess.run(["aplay", "-q", path], check=False)  # noqa: S603, S607 - fixed argv, our own temp file
-        os.unlink(path)
+        # M14: the exit status is the result. It used to be ignored, so on a Pi 5
+        # (no analog audio out; `aplay` exists because setup_pi.sh installs
+        # alsa-utils) a failed playback reported "played" and kept this sink --
+        # and with it the device's audible-alert capability -- READY even when
+        # the GPIO buzzer was unavailable. A failure now raises, which
+        # _play_tone_safe records as _last_error and readiness() reports.
+        try:
+            done = subprocess.run(["aplay", "-q", path], check=False, capture_output=True,  # noqa: S603, S607 - fixed argv, our own temp file
+                                  text=True, timeout=duration_s + 5.0)
+        finally:
+            os.unlink(path)
+        if done.returncode != 0:
+            detail = (done.stderr or "").strip().splitlines()
+            raise RuntimeError(f"aplay exited {done.returncode}" + (f": {detail[-1][:160]}" if detail else ""))
 
 
 class GPIOBuzzerSink:
