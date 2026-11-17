@@ -12,8 +12,10 @@ This page is the order of operations and the decision points. The full procedure
   repository checkout on the Mac. Stage 19 is **stationary only**: never test an alert in a moving
   vehicle or on a public road.
 - Placeholders: `<user>@<host>` is whatever the owner set in Raspberry Pi Imager. Never guess it.
-  `<M14 release>` is **TO BE FILLED BY THE INTEGRATOR** with the release id (the first 12 characters of
-  the commit) and the full SHA.
+- **The M14 release** (`docs/RELEASE_M14.md`): release id `f3442f642a73`, tested commit
+  `f3442f642a73bcb6290e656b5d46ddc5f0589e87`, package `~/sensordyme-release/transfer-f3442f642a73/`, whose
+  `SHA256SUMS` has sha256 `01ecbbf20ed7667a3e4257ea9248e7c20cbad5542ceed4f21bda186fa31dc8b6`. The rollback
+  candidate is M13.1, `transfer-0a597349e83c/`.
 
 **Shell variables on the Pi:** use FHS §0.4 (`U`, `D`, `PY`, `V`, `EV`), and set `U` and `D` from step 6.
 The hardware tools default to `/home/pi/sensordyme`, so always pass `--install-dir $D`.
@@ -117,7 +119,7 @@ phone, run `xcrun devicectl device info ddiServices --device <UDID>`.
 - **Approval:** none for E1, which only adds a folder. The owner approves an SD image (RB-E5, power-off).
 
 ### 8. Verify the package
-- **Do (Mac):** in `~/sensordyme-release/transfer-<M14 release>/`, run `shasum -a 256 -c SHA256SUMS`.
+- **Do (Mac):** in `~/sensordyme-release/transfer-f3442f642a73/`, run `shasum -a 256 -c SHA256SUMS`.
   Copy the directory to the Pi as `~/transfer` (README §3.0).
 - **Do (Pi):** in `~/transfer`, run:
   - `sha256sum SHA256SUMS`, which must equal the value the owner sent separately;
@@ -143,7 +145,7 @@ phone, run `xcrun devicectl device info ddiServices --device <UDID>`.
   - `0x0`.
   - On a fresh card, `/dev/hailo0` does not exist yet. `hailo-all` installs it in stage 11.
 - **After an install (any time, read-only):** `$PY $V/sunday_preflight.py --install-dir $D --expect-commit
-  <M14 release> --out $EV/preflight`. The validation tools are unpacked as in FHS step 9.
+  f3442f642a73bcb6290e656b5d46ddc5f0589e87 --out $EV/preflight`. The validation tools are unpacked as in FHS step 9.
 - **If it fails:**
   - No Hailo on PCIe or no camera: power off and reseat (FHS steps 3–4, 14–15).
   - OS/Python wrong: HG-OS.
@@ -410,7 +412,7 @@ consents, and the buzzer is announced before every trigger.
   * reconnecting across a real IP change.
 
 ### 23. Capture evidence
-- **Do:** `$PY $V/collect_evidence.py --install-dir $D --expect-commit <M14 release> --minutes 5`.
+- **Do:** `$PY $V/collect_evidence.py --install-dir $D --expect-commit f3442f642a73bcb6290e656b5d46ddc5f0589e87 --minutes 5`.
   Read-only. It runs the preflight, samples the running service, redacts secrets and writes
   `~/hwval/evidence/evidence_<device-id>_<UTC>.tgz`.
 - **Expect:** a `.tgz` and its sha256 printed.
