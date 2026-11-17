@@ -131,6 +131,34 @@ def test_the_last_event_carries_its_history_event_key():
     assert summary["signals"].startswith("turned 40 deg left")
 
 
+def test_a_log_record_after_an_alert_does_not_replace_its_why_line():
+    """M14: `last_event` is the why line, and the app shows only alerts there
+    (ios/Sources/LiveOverlay.swift OverlayWhyLine.make drops "log"). A log
+    record that landed after an alert -- an experimental observation a few ms
+    after a drowsiness alert, a re-detected phone's `phone_detected` -- used to
+    become `last_event`, and the alert's why line vanished from the live view."""
+    from core.dashboard import DashboardServer
+    from core.events import Event
+
+    server = DashboardServer(host="127.0.0.1", port=0, module_name="driver_attention")
+    assert server.last_event_summary() is None
+    server.push_event(Event.now("monitoring_ready", 0.0, None, "driver_attention", "all monitoring policies"), "log")
+    assert server.last_event_summary() is None, "a log record is not a reason for anything on screen"
+    rule = Event.now("cell phone", 10.15, 0.88, "driver_attention", "A cell phone stays in this area for 10 seconds")
+    server.push_event(rule, "soft")
+    server.push_event(Event.now("elevated_risk", 0.0, None, "driver_attention", "EXPERIMENTAL observation"), "log")
+    server.push_event(Event.now("phone_detected", 0.0, 0.88, "driver_attention", ""), "log")
+    summary = server.last_event_summary()
+    assert summary is not None and (summary["type"], summary["severity"], summary["event_key"]) == \
+        ("cell phone", "soft", rule.event_id)
+    drowsy = Event.now("drowsiness", 2.0, 1.0, "driver_attention", "eyes closed 2.0 s")
+    server.push_event(drowsy, "loud")
+    newest = server.last_event_summary()
+    assert newest is not None and newest["event_key"] == drowsy.event_id, "the newest ALERT wins"
+    # Recent Activity still records every event, log records included.
+    assert [e["type"] for e in server._events][:4] == ["drowsiness", "phone_detected", "elevated_risk", "cell phone"]
+
+
 # ------------------------------------------------------------------ through the running runtime
 class OverlayModule(VisionModule):
     """Draws a white square when annotating: an overlay viewer must never see it."""

@@ -66,7 +66,7 @@ A real example, made by `core/overlay.py` from a fabricated observation:
 | `behaviours[]` | each behaviour in progress: `phase` = `developing` (condition true, not yet sustained) or `confirmed` (the module's alert condition); `for_s` = how long | "Head turned away · 2.1 s" developing, then confirmed |
 | `state` | the module's dominant state label | |
 | `alert_active` | an alert condition is active now | |
-| `last_event` | the newest event, at most 30 s old, with the text **the device wrote** (`signals`); `event_key` is the same key as that event's `/api/events` row | the "why" line, tied to its history row |
+| `last_event` | the newest **alert** (severity `loud` or `soft`), at most 30 s old, with the text **the device wrote** (`signals`); `event_key` is the same key as that event's `/api/events` row. A `log` record (an experimental observation, `phone_detected`, `monitoring_ready`) never replaces it (M14: one landing after an alert used to blank that alert's why line) | the "why" line, tied to its history row |
 | `unavailable` | components not working (stale, failed, unavailable) | hide or label those capabilities |
 | `perf.fps` | the processed-frame rate, measured on this device | "14 fps" |
 | `perf.<component>_ms` | each model's own run-time EMA, measured on this device | "Detector 11.8 ms" |
