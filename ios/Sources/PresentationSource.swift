@@ -244,3 +244,26 @@ enum LocalPresentation {
             historyNotes: historyNotes(events))
     }
 }
+
+/// The headline of presentation mode's alert banner (M14).
+///
+/// "Driver alert" only for what IS a driver alert: the driver analysis's own
+/// alert condition shown live, or an event of a driver-safety alert type
+/// (AlertSound.driverSafetyAlertTypes, the device's mandatory list). Any other
+/// alert, e.g. a Jupiter rule ("Cell phone" staying in an area) running beside
+/// Driver Safety, is not called a driver alert: a configured rule says "Rule
+/// alert", anything else "Alert". The event's own words follow on the line
+/// under it. A simulated one says so, as before.
+enum PresentationAlertHeadline {
+    static func text(liveDriverCondition: Bool, event: EventItem?, simulated: Bool) -> String {
+        let base: String
+        if liveDriverCondition || event.map({ AlertSound.isDriverSafetyAlert(type: $0.type) }) == true {
+            base = "Driver alert"
+        } else if event?.isConfigured == true {
+            base = "Rule alert"
+        } else {
+            base = "Alert"
+        }
+        return simulated ? "\(base) · simulated" : base
+    }
+}

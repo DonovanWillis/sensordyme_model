@@ -137,5 +137,25 @@ let account = PresentationModeOptions.make(catalog: catalog, activePreset: "driv
                                            customReplacesModes: false, isAvailable: { _ in true })
 check(account.filter(\.selected).map(\.id) == ["driver_safety:strict"], "settings after @ do not change the mode")
 
+print("== the alert banner's headline names what kind of alert it is (M14)")
+func alertEvent(_ type: String, source: String? = nil) -> EventItem {
+    EventItem(eventID: 1, timestamp: "2026-11-16T10:00:00", type: type, confidence: nil,
+              signals: "A cell phone stays in this area for 10 seconds", severity: "loud", source: source)
+}
+check(PresentationAlertHeadline.text(liveDriverCondition: false, event: alertEvent("distraction"), simulated: false)
+      == "Driver alert", "a driver-safety alert type: Driver alert, as before")
+check(PresentationAlertHeadline.text(liveDriverCondition: false, event: alertEvent("eyes_down:cab"), simulated: true)
+      == "Driver alert · simulated", "a zone-scoped driver type, simulated: said so")
+check(PresentationAlertHeadline.text(liveDriverCondition: true, event: nil, simulated: false) == "Driver alert",
+      "the driver analysis's own live condition: Driver alert")
+check(PresentationAlertHeadline.text(liveDriverCondition: false, event: alertEvent("cell_phone_dwell", source: "custom_rule"),
+                                     simulated: false) == "Rule alert",
+      "a Jupiter rule beside Driver Safety is never called a driver alert")
+check(PresentationAlertHeadline.text(liveDriverCondition: false, event: alertEvent("object_dwell:zone_1"),
+                                     simulated: true) == "Alert · simulated",
+      "any other alert: Alert (no source said)")
+check(PresentationAlertHeadline.text(liveDriverCondition: false, event: nil, simulated: false) == "Alert",
+      "nothing known about it: never claimed to be a driver alert")
+
 print(failures == 0 ? "\nall passed" : "\n\(failures) FAILED")
 exit(failures == 0 ? 0 : 1)
