@@ -16,6 +16,85 @@ demo mode and is labelled simulated.
 
 Line numbers refer to `ios/Sources/` at the commit that added this file.
 
+## Mission 13: the AI view and presentation mode (sd-overlay/1)
+
+Contract: `docs/LIVE_OVERLAY.md`. Tested in software only (Swift logic tests, the
+real app in the iOS Simulator against the virtual device). **Nothing here has run
+on a physical iPhone or a Pi.**
+
+| Piece | File | What it does |
+|---|---|---|
+| Request | `MJPEGStream.swift` | Every `/stream` request sends `X-Stream-Overlay: 1`: the device answers with CLEAN frames and an `X-SD-Overlay` per analysed part. The clean picture is the ordinary (default) view. An older device ignores the header (no `X-Stream-Overlay: sd-overlay/1` in its answer) and the app says "Live analysis not available". A part's overlay over 16 KB is refused unread (the part header block limit is now 20 KB). |
+| Model | `LiveOverlay.swift` | Typed sd-overlay/1, lenient (unknown fields ignored, junk entries dropped, numbers clamped to the frame); `det: null` ("could not look") is never `[]` ("nothing there"); another schema is refused. Every word drawn from it is a tested function: the behaviour strip ("Head turned away · 2.1 s", developing amber, confirmed in the alert colour), the why line (the device's `signals`, alerts only), the perf readout ("14 fps · Detector 11.8 ms · Frame 83 ms"), the head chip ("Head · Left", never gaze), the panel state (Not analysed / Detection unavailable / Face not visible / Insufficient evidence / Calibrating / Watching / behaviour / alert), the Simulated badge (sticky for the stream once any document says `sim`). |
+| Frame binding | `FeedViews.swift` (`MJPEGReader.frameOverlay`) | Decoded with its JPEG and published in the same update as the picture; a part without a document clears it (never the previous frame's analysis). The words around the picture come from `LiveOverlayModel`, republished on a change of meaning at once, a ticking duration at most 5×/s and perf once a second, so the chrome never redraws per frame. |
+| AI view | `AIViewOverlay.swift`, `CameraViews.swift` | A toggle on the live camera ("AI view", off by default, not remembered). Draws, in the picture's own rect: thin rounded boxes (driver bright, other people muted, a phone labelled "driver" or "other", tracker ids), the face oval and eye contours (a contour whose points are mostly parked on one spot, like the virtual device's scripted mesh, is not drawn), the dashed driver-seat region, hand boxes when the hand model ran. Boxes fade when `det_fresh` is false; nothing is drawn over a picture that isn't live. No confidence numbers. |
+| Driver panel | `DriverMonitoringPanel` | On the device screen (Driver Safety) and in presentation: the monitoring state word (InstrumentState), the live analysis state, behaviours with durations, eyes closed only when the device says `true`, head, unavailable components in words, and the last event in the device's own words (live ≤ 30 s, else the newest driver event in the history). With no live picture: "Live analysis appears when this iPhone can see the camera on the same network." |
+| Presentation | `PresentationMode.swift` | Device screen → **Present** key. Full screen, status bar hidden, landscape layout when wider than tall; live picture with the AI view on, mode name, the monitoring state and presence, the driver panel, the active Jupiter rule, an alert banner (the existing alert evidence, the device's words, danger outline, VoiceOver announcement; the notification and its sound stay with AlertWatcher / `AlertSound.decide`), and a one-tap mode switch (`setMode`: signed local path when the camera answers this iPhone, the account otherwise; selected only from the device's report). Exit: the × (`present.close`) or the VoiceOver escape gesture. |
+| History | `EventModel.swift` (`meaning`), `ActivityViews.swift` | A driver event's row says what its type means ("The driver's head stayed turned away from straight ahead") above the device's own words. |
+| Jupiter | `AIConfigureView.swift` | After Activate, the device is asked first after 0.75 s and then every second (it was every 2 s) for up to 20 s; "Running" is still only the device's report. |
+
+Tests: `ios/Tests/LiveOverlayTests.swift` (the doc's example, null vs empty, sim badge,
+unknown fields, oversized refused, strip/why/perf/panel wording, throttling),
+additions to `MJPEGStreamTests` (request header, per-part binding across a split,
+size bound) and `EventModelTests` (meanings). XCUITest `test30_PresentationMode`:
+the virtual device runs `showcase` (`sim/scenario.py`: a simulated head-turn every
+40 s, a phone every third time; `POST /fresh?scenario=`), the device screen opens on
+the clean picture with the Simulated badge, presentation opens with the AI view,
+the overlay's state and fps, shows the simulated distraction in the driver panel,
+and switches Driver Safety Standard → Strict as confirmed by the device.
+`tests/test_m13_showcase_scenario.py` pins the scenario and the controller option.
+
+Runs (`scripts/sim/ios_uitest.sh`, iPhone 17 Pro Simulator, iOS 26.1; evidence in
+`~/sensordyme-audit/2026-11-10/m13-evidence/ios/`): full run A (9d0b50d) 29/30, journey 29
+failed (the paired-camera card's tap opened nothing); 29+30 alone (bc49aa1) 0/2: 29 the
+same, 30's Strict tap landed while the alert banner moved the chips. The same journey 29
+passed on the M12 sources (1 run) and once on M13 (debug run), so it is a tap race on a
+card redrawn every second: 29 now settles and taps once more only if nothing opened; the
+presentation mode switch is pinned below the panel. Final full run (214a398): **30/30**,
+no second taps needed, both accessibility audits passed.
+
+## Mission 12: the camera works with the backend off (sd-local-v1)
+
+Contract: `docs/LOCAL_ACCESS.md`. Gaps closed: `docs/PORTABLE_OPERATION.md` C1–C6.
+Tested in software only (Swift logic tests, the app's Swift against the device's
+real Python dashboard, one XCUITest journey). **Nothing here has run on a physical
+iPhone, a Secure Enclave, real Bluetooth or a Pi** (LOCAL_ACCESS.md §10 gates).
+
+| Piece | File | What it does |
+|---|---|---|
+| Phone key | `LocalIdentity.swift` | One P-256 key **per paired camera**. Secure Enclave when available (the Keychain holds only the Enclave's encrypted handle); a software key in the Keychain otherwise (Simulator). `AfterFirstUnlockThisDeviceOnly`, never synchronizable, no Face ID prompt, no entitlement. Forgetting a camera destroys its key. |
+| Protocol | `LocalAccess.swift` | Canonical request/session strings, `X-SD-Local` header, device-signature check against the **cached** key, refusal-code table, BLE `enroll` seal/open. Pinned by `tests/local_access_vectors.json` (embedded in `ios/Tests/LocalAccessTests.swift`). |
+| Client | `LocalDeviceClient.swift` | hello → signed `POST /api/local/session` → `X-SD-Session` reads; every write signed over a fresh challenge. Renews a session a minute before it ends and on `session_invalid` (power cycle); an address change drops the session; `unknown_client` → forget, never a retry loop. Stop/resume and mode are confirmed only from `/api/state` / `/api/presets`. |
+| Cache | `TrustedDevices.swift`, `LocalAccessCenter.swift` | Keychain JSON of paired cameras (id, name, account id, last address, last seen, last mode name, device key + fingerprint, client id, how and whether enrolled, owning account). Survives a cold launch and a lost backend. Rediscovery: last address, then Bonjour `_sensordyme._tcp` matched by TXT `id`. |
+| Enrolment | `LocalAccessCenter.enrollViaAccount`, `BLEPoPFlow.sendEnrollment`, `migrateLegacyToken` | Account: `POST /v1/devices/{id}/local-clients` for a device listing `local_identity`, usable once a session succeeds. Bluetooth: `enroll` right after `proven` (first setup or re-pairing; "Keep its current Wi-Fi and finish"). Legacy token: enrol once with `X-Device-Token`, then the stored token is cleared. |
+| Video | `FeedViews.swift`, `MJPEGStream.swift` | The feed's credential is the camera's session (`X-SD-Session`); the pasted token is only the migration path. 401 renews the session, 403 says pair again. A renewed session never interrupts a healthy stream. |
+| Control | `DeviceDetailView.swift`, `LocalDeviceViews.swift` | When the camera answers this iPhone directly, stop/resume (same confirmation dialog) and mode go to it signed; a 409 role-floor refusal shows the camera's reason. Otherwise the account path as before. |
+| History | `LocalEvents.swift`, `EventHistoryView.swift` | `GET /api/events` merged with the account's history by `event_key`; camera-only rows say "Not yet backed up" / "On this camera only" / "Sent to your account"; with no `age_s` the row says its time is from the camera's clock. |
+| Alerts | `AlertWatcher.swift`, `Notifications.swift` | With the account server not connected, the foreground watcher polls `/api/events?after=` every 5 s; first poll is a baseline. Same `NotificationPolicy` + `AlertSound` + `SoundedEvents`; one banner and at most one sound per `event_key` across both transports; never simulated/experimental/log-only, never `age_s` ≥ 60 s. Foreground only. |
+| No account | `AuthView.swift`, `LocalOnlyHomeView` | "Set up a camera nearby" (Bluetooth Wi-Fi hand-off + pairing, no claim) and "Open cameras paired with this iPhone". |
+
+Ownership: an explicit Log out forgets the account's pairings (keys destroyed) and
+keeps ones made with no account; another account signing in never sees a
+previous account's cameras.
+
+Honest status copy: a cached camera is **Offline · last seen 5 min ago** or **Not
+reachable on this network**; **Looking…** while searching; only a local
+`/api/state` read in the last 30 s shows **Protecting / Stopped / Not
+protecting** with "Connected directly on this network". Banners: "Direct
+connection — Your account server can't be reached…", "Not connected to an
+account — no backup, no remote notifications…". Revoked: "This iPhone needs to
+be paired with the camera again."
+
+Tests: `ios/Tests/{LocalAccess,LocalDeviceClient,TrustedDevices,LocalEvents}Tests.swift`
+(IP change, power cycle, revocation, look-alike, lockout, role floor, sound rules),
+`BLEPoPFlowTests` (enrol), `MJPEGStreamTests` (session credential),
+`tests/test_m12_ios_local_access.py` (Swift client ↔ real `DashboardServer`), and
+XCUITest `test29_OfflineLocalCamera` (backend process stopped; cold launch; cached
+camera; live view and a stop over the local session, confirmed by the device as
+`local_app`). Direct-to-device on the test stack: `POST /fresh?dashboard=1` serves
+the virtual device's local API on 127.0.0.1:8899 **with a dashboard token**, so
+loopback grants nothing; `POST /backend/stop`; `GET /device/local`.
+
 ## Mission 8 (Checkpoint F): what changed, and how it is checked
 
 ### Presence comes from fresh device telemetry (ConnectionTruth.swift)
@@ -437,7 +516,7 @@ app side.
 
 Debug launch flags (DEBUG builds only, DebugLaunch.swift): `-orynDemo`,
 `-orynOpenDevice`, `-orynOpenJupiter -orynPrompt "<text>"`, `-orynOpenHistory`,
-`-orynScrollBottom`, `-orynTab shop|settings`.
+`-orynScrollBottom`, `-orynTab shop|settings`, `-orynPresent` (M13: presentation mode).
 
 ## Tests
 
@@ -445,7 +524,7 @@ Debug launch flags (DEBUG builds only, DebugLaunch.swift): `-orynDemo`,
 `<Name>Tests.swift` is concatenated with `Sources/<Name>.swift`). New in M11:
 `AlertSoundTests` (the iPhone alert sound: driver-safety types, never a
 log-only/experimental record, once per event, silent when delivered late or
-turned off, simulated labelled, the backlog never sounds) and additions to
+turned off, simulated labelled (and, since M12, never sounded), the backlog never sounds) and additions to
 `NotificationPolicyTests` (the first poll after (re)starting to watch is
 history). New in M8:
 `ConnectionTruthTests` (presence from telemetry age, reply age and refresh

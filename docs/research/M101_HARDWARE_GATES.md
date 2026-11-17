@@ -107,9 +107,15 @@ $PY $V/hwv_stage.py parse-hef --install-dir $D
 $PY $V/hwv_stage.py capture --install-dir $D --bundle ~/hwval/capture_kg
 $PY $V/hwv_stage.py parity --bundle ~/hwval/capture_kg --decoder both
 $PY $V/hwv_stage.py latency --install-dir $D
+$PY $V/hwv_stage.py latency --install-dir $D --latency-decoder both   # M13: B's decode cost on the A76, in process only
 sudo systemctl start sensordyme.service && systemctl is-active sensordyme.service
 SENSORDYME_TOKEN=$TOKEN $PY $V/hwv_stage.py thermal --minutes 30   # service running
 ```
+
+**M14: the same experiment as one command** (it composes the stages above, adds both decoders on the same
+captured tensors, calibration readiness, pipeline fps per decoder and thermal sampling, and writes one evidence
+directory with a KEEP LEGACY gate; `docs/HAILO_HARDWARE_VALIDATION.md`, "M14 addition"):
+`$PY $V/hwv_stage.py decoder-exp --install-dir $D --package ~/transfer-<id>` (service stopped).
 
 Read-only on the model: nothing writes under the install tree, and nothing
 changes a threshold or the decoder. The result is either "B's float gain
@@ -123,7 +129,8 @@ survives INT8 on this chip" or "it does not", per decoder, with the numbers.
 python3 $V/cabin_session.py plan --preset core --out ~/hwval/cabin/S01_day      # prints the operator sheet
 python3 $V/cabin_session.py run --plan ~/hwval/cabin/S01_day --subject S01 \
     --session S01-2026-11-16-a --vehicle V01 --seat driver \
-    --lighting day --eyewear none --occupancy driver_only --mount dash_centre
+    --lighting day --eyewear none --occupancy driver_only --mount dash_centre \
+    --consent-ref <consent record id>          # M14: required; --passenger-consent-ref with a passenger
 python3 $V/cabin_session.py score --session ~/hwval/cabin/S01_day --void <cues not performed>
 ```
 
@@ -152,8 +159,13 @@ python3 $V/cabin_session.py score --session ~/hwval/cabin/S01_day --void <cues n
   passenger (acted), passenger eyes shut.
 - `displacement`: run it, nudge the mount without recalibrating, run it again,
   and compare.
-- **Sunglasses and NoIR night:** the same presets with `--eyewear sunglasses_ir_pass|sunglasses_ir_block`
-  and `--lighting night_ir`.
+- **Sunglasses, low light and NoIR night (corrected in M14):** *not* the same presets. `core` contains the
+  day-only, no-sunglasses baseline (cell N1), so a `core` session at night could not be scored. Use the condition
+  presets: `low_light` (`--lighting dusk`), `night_ir` (`--lighting night_ir`), `eyewear_clear`,
+  `eyewear_sunglasses_ir_pass` and `eyewear_sunglasses_ir_block` (matching `--eyewear`). Also `occlusion` (a hand
+  over the face, a cap brim). `run` now refuses a plan whose cells need another condition **before** recording,
+  and the operator sheet names the condition.
+- **Camera angle:** `displacement` at each `--mount`, with the change written in `--notes`.
 - **Model uncertainty:** the abstention counts, plus the device's
   `driver_identity` in telemetry.
 

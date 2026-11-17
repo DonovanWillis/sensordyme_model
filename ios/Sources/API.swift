@@ -222,6 +222,15 @@ struct APIClient {
         return devices.map { var device = $0; device.receivedAt = received; return device }
     }
 
+    /// M12 (docs/LOCAL_ACCESS.md §4.2): ask the owner's device to trust this
+    /// phone's PUBLIC key on its network. The backend relays it to the device
+    /// as a signed command; it never holds anything that could act locally.
+    func registerLocalClient(deviceID: Int, publicKey: String, name: String) async throws -> LocalClientRegistration {
+        let data = try await request("POST", "v1/devices/\(deviceID)/local-clients",
+                                     body: ["public_key": publicKey, "name": name])
+        return (try? decode(LocalClientRegistration.self, from: data)) ?? LocalClientRegistration()
+    }
+
     func claim(code: String) async throws {
         _ = try await request("POST", "v1/devices/claim", body: ["claim_code": code])
     }
@@ -1101,6 +1110,8 @@ final class AppState: ObservableObject {
 
     func signIn(_ auth: AuthResponse) {
         claimLocalState(for: auth.email)
+        // M12: another account's direct pairings never carry over to this one.
+        LocalAccessCenter.shared.signedIn(owner: auth.email)
         storedToken = auth.token
         accountEmail = auth.email
         isSignedIn = true
@@ -1187,7 +1198,12 @@ final class AppState: ObservableObject {
         }
         let wasDemo = isDemo
         // Not when leaving the demo: the demo never had the real account's token.
-        if explicit && !wasDemo { deviceToken = "" }
+        if explicit && !wasDemo {
+            deviceToken = ""
+            // M12: the account's direct pairings go with it; one made with no
+            // account (Bluetooth setup before sign-in) stays on this iPhone.
+            LocalAccessCenter.shared.signedOutExplicitly()
+        }
         storedToken = ""
         accountEmail = ""
         storedDemo = false

@@ -161,6 +161,26 @@ SCENARIOS: dict[str, Scenario] = {s.name: s for s in (
 )}
 
 
+def _showcase_timeline(cycles: int = 60, period: float = 40.0) -> tuple[Segment, ...]:
+    """M13 presentation demo: every `period` s after calibration, 18 s attentive,
+    7 s head turned away (a distraction alert), attentive again; every third cycle
+    a phone held in the lap for 7 s instead. Repeats for `cycles` periods (40 min)."""
+    pairs: list[tuple] = []
+    for i in range(cycles):
+        start = CALIBRATION_S + i * period
+        scene = PHONE_IN_LAP if i % 3 == 2 else LOOKING_AWAY
+        pairs += [(start + 18.0, scene), (start + 25.0, ATTENTIVE)]
+    return _timeline(*pairs)
+
+
+#: M13: a repeating, labelled-simulated demo for presentation mode and its
+#: XCUITest journey (scripts/sim/uitest_control.py `/fresh?scenario=showcase`).
+SCENARIOS["showcase"] = Scenario(
+    "showcase", "A repeating demo for presentation mode: every 40 s the driver turns their head away "
+                "for 7 s (distraction); every third time holds a phone in the lap instead (phone_use).",
+    _showcase_timeline())
+
+
 def get(name: str) -> Scenario:
     try:
         return SCENARIOS[name]

@@ -49,11 +49,13 @@ from core import camera_privacy as cprivacy
 from core import diagnostics as dx
 from core import monitoring_state as ms
 from core import nodes as monitoring_nodes
+from core import overlay as overlay_mod
 from core import perception as pc
 from core.alerts import AlertLevel, AlertManager
 from core.behavior.experimental import is_experimental
 from core.camera import Camera, CameraError
 from core.dataset import CaptureStore
+from core.direct_mode import DirectModeManager
 from core.events import Event
 from core.frame_bus import FrameBus
 from core.health import HealthMonitor
@@ -68,6 +70,7 @@ from core.telemetry import TelemetryLogger
 from core.zones import load_zones
 from modules import get_module_class
 from services.capture import CaptureService
+from services.direct_mode import DirectModeService
 from services.provisioning import ProvisioningService
 from services.supervisor import Service, Supervisor
 
@@ -113,7 +116,8 @@ _NOT_PAUSED_WHEN_STOPPED = frozenset({"camera", "audible_alert", "alert_output"}
 #: camera or the inference loop that feeds them is impaired.
 _ANALYSIS_CAPABILITIES = frozenset({"face", "objects", "hands", "pose", "attention", "eye_timing"})
 #: The stop reason in words for the app ("by uplink" was internal jargon).
-_STOP_SOURCE_WORDS = {"uplink": "from the app", "dashboard": "from the device's dashboard"}
+_STOP_SOURCE_WORDS = {"uplink": "from the app", "dashboard": "from the device's dashboard",
+                      "local_app": "from the app on the device's network"}
 _MAX_SWAP_S = 120.0
 #: Quiet time after which a run of last-resort reboots counts as over.
 _REBOOT_CAMPAIGN_RESET_S = 24 * 3600.0
@@ -248,6 +252,7 @@ class DeviceRuntime:
     _perception_source = "camera"
     _perception_simulated = False
     _last_observation = None
+    _overlay = overlay_mod.OverlayBuilder()  # replaced per instance in __init__
     _detector_unavailable = None
     _node_zone_signature = None
     _preset_nodes_suspended = False
@@ -384,6 +389,8 @@ class DeviceRuntime:
         self._perception_source = "camera"
         self._perception_simulated = False
         self._last_observation: Optional[pc.Observation] = None
+        #: M13: sd-overlay/1 documents for viewers that draw the analysis (core/overlay.py).
+        self._overlay = overlay_mod.OverlayBuilder()
         self._detector_unavailable: Optional[str] = None
 
         # AI-configured rules. A rule naming "pool" resolves against the same
@@ -471,6 +478,8 @@ class DeviceRuntime:
         self.dashboard = None
         self.uplink = None
         self.provisioning: Optional[ProvisioningService] = None
+        #: Only when network.direct_mode.enabled (core/direct_mode.py); None otherwise.
+        self.direct_mode: Optional[DirectModeManager] = None
         self.health: Optional[HealthMonitor] = None
         self.supervisor: Optional[Supervisor] = None
         self.logger: Optional[EventLogger] = None
@@ -611,6 +620,22 @@ class DeviceRuntime:
         # M8.4 Decision C: the owner's camera-only setting, OFF unless saved ON
         # (core/camera_privacy.py). Loaded even without a dashboard: it is reported.
         self.camera_privacy = cprivacy.CameraPrivacy.load()
+        # M12 sd-local-v1 (core/local_auth.py, docs/LOCAL_ACCESS.md): per-phone
+        # local access, and the event journal enrolled phones read. Beside the
+        # event log; a key or store that cannot be used turns local access off,
+        # said in health -- the device protects exactly the same either way.
+        from core import local_auth, local_events
+
+        local_dir = Path(str(logging_config.get("csv_path", "data/events.csv"))).parent
+        self.local_authority, self._local_access_off = local_auth.build_authority(
+            self._local_device_id(), self.config.get("local_access"), local_dir)
+        if self._local_access_off:
+            print(f"SensorDyme: {self._local_access_off}")
+        journal_cfg = (self.config.get("local_access") or {}) if isinstance(self.config.get("local_access"),
+                                                                            dict) else {}
+        self.event_journal = local_events.LocalEventJournal(
+            journal_cfg.get("events_path") or local_dir / "local_events.jsonl",
+            max_events=int(journal_cfg.get("events_max", local_events.DEFAULT_MAX_EVENTS)))
         if bool(dash_cfg.get("enabled", False)):
             from core.dashboard import DashboardServer
 
@@ -642,7 +667,10 @@ class DeviceRuntime:
                 diagnostics_enabled=self._diagnostics_enabled,
                 camera_privacy=self.camera_privacy,
                 local_camera_while_stopped=dash_cfg.get("local_camera_while_stopped", True) is not False,
+                local_authority=self.local_authority,
+                event_journal=self.event_journal,
             )
+            self.dashboard.delivery_lookup = getattr(self.alert_manager, "delivery", None)
             # Refuse a role-violating preset at the request, with the reason, rather
             # than accept it and silently drop it in the inference loop.
             from main import resolve_preset
@@ -698,6 +726,12 @@ class DeviceRuntime:
             # M8.3: every event pushed carries what the alert policy did with it
             # and what the in-cabin outputs reported (docs/EVENT_PIPELINE.md).
             self.uplink.delivery_lookup = getattr(self.alert_manager, "delivery", None)
+            # M12: the owner's account can trust (signed) or revoke phones locally,
+            # and the local event list reports what is still waiting to go up.
+            self.uplink.local_authority = self.local_authority
+            self.event_journal.simulated = bool(getattr(self.uplink, "SIMULATED", False))
+            if self.dashboard is not None:
+                self.dashboard.pending_event_keys = self.uplink.pending_event_keys
             self.uplink.set_active_preset(self.active_preset)
             # Report the restored configuration at startup too, not only when a
             # new one arrives — otherwise a device that rebooted into a custom
@@ -729,10 +763,23 @@ class DeviceRuntime:
         wifi = WifiManager()
         self.wifi = wifi  # also read by the health report the app displays
         network_cfg = self.config.get("network", {})
+        # Direct mode (the device's own access point, docs/DIRECT_MODE.md): built
+        # only when enabled, so a disabled device runs exactly what it ran before.
+        # When it exists, provisioning treats the AP as offline (R1).
+        self.direct_mode = None
+        direct_cfg = network_cfg.get("direct_mode")
+        if isinstance(direct_cfg, dict) and direct_cfg.get("enabled") is True:
+            self.direct_mode = DirectModeManager(wifi, direct_cfg)
+            if self.dashboard is not None:
+                # M12: GET/POST /api/network/direct for the token holder or an enrolled phone.
+                self.dashboard.direct_mode = self.direct_mode
         self.provisioning = ProvisioningService(
             wifi, network_cfg.get("provisioning", {}), version=_VERSION,
             deployment=str(self.config.get("deployment", "development")),
+            direct_mode_active=self.direct_mode.is_active if self.direct_mode is not None else None,
         )
+        # M12: a phone that proves the setup code over Bluetooth may enrol for local access.
+        self.provisioning.local_authority = self.local_authority
 
         # Hardware HAL: null implementations today; health-visible either way.
         from hardware.hal import build_hardware
@@ -847,6 +894,10 @@ class DeviceRuntime:
             self._inference_service = _InferenceService(self)
             self.supervisor.add(self._inference_service)
         self.supervisor.add(self.provisioning)
+        if self.direct_mode is not None:
+            direct_service = DirectModeService(self.direct_mode)
+            self.supervisor.add(direct_service)
+            self.health.register("direct_mode", check=direct_service.status, check_interval_s=15.0)
         if self.uplink is not None:
             self.supervisor.add(_HealthReportService(self))
 
@@ -1177,6 +1228,12 @@ class DeviceRuntime:
         except Exception:  # diagnostics never cost a frame
             log.debug("diagnostics snapshot failed", exc_info=True)
 
+    def _local_device_id(self) -> str:
+        """The SD- id local signatures are bound to (the one health reports)."""
+        from core import device_health
+
+        return device_health._device_id()
+
     def _collect_health(self, caller: str = "loop") -> dict:
         """This device's real state, for the app's status indicators."""
         report = self._collect_component_health(caller)
@@ -1196,6 +1253,13 @@ class DeviceRuntime:
         if callable(backlog):
             report["uplink_backlog"] = backlog()
         report["storage"] = self._storage_report(report.get("uplink_backlog"))
+        # M12 sd-local-v1: the device's public key and which phones it trusts
+        # locally (ids only). The backend converges its set_local_clients on this.
+        authority = getattr(self, "local_authority", None)
+        if authority is not None:
+            report["local_access"] = authority.report()
+        elif getattr(self, "_local_access_off", None):
+            report["local_access"] = {"contract": "sd-local-v1", "unavailable": self._local_access_off}
         # Stamped HERE, where the sample is taken, not where it is sent (M8.1): a
         # snapshot re-sent unchanged keeps its generation, so the backend can tell
         # a frozen report from a new one whatever the device's wall clock says.
@@ -1877,6 +1941,18 @@ class DeviceRuntime:
         observation = engine.end_frame(self._module_signals(module))
         self._last_observation = observation
         return events, observation
+
+    @staticmethod
+    def _module_overlay_extras(module) -> dict:
+        hook = getattr(module, "overlay_extras", None)
+        if not callable(hook):
+            return {}
+        try:
+            extras = hook()
+        except Exception:  # a broken hook loses the module's half, never the frame
+            log.debug("overlay_extras() failed", exc_info=True)
+            return {}
+        return extras if isinstance(extras, dict) else {}
 
     @staticmethod
     def _module_signals(module) -> Optional[dict]:
@@ -2613,6 +2689,9 @@ class DeviceRuntime:
         handled -- applied or refused -- so the backend converges on THIS request.
         """
         action = str((request or {}).get("action", "")).lower()
+        if source == "dashboard" and (request or {}).get("by") == "local_app":
+            # M12: a signed request from an enrolled phone on the LAN (sd-local-v1).
+            source = "local_app"
         command_id = (request or {}).get("id")
         if command_id:
             self._last_protection_command = str(command_id)
@@ -3113,6 +3192,7 @@ class DeviceRuntime:
             if callable(setter):
                 setter(captured_at)  # decisions rest on when the frame was SEEN
             events, observation = self._perceive(module, frame, seq, captured_at)
+            self._overlay.note_frame(captured_at)  # M13: processed-fps, analysed frames only
             self._consecutive_process_failures = 0
             self._last_process_error = None
             # Processed-frame cadence, not capture cadence: a stall here is
@@ -3211,7 +3291,21 @@ class DeviceRuntime:
             and now - self._last_stream_push >= loop.stream_interval
         )
         view = None
-        if self.display or want_stream:
+        if want_stream and self.dashboard.wants_overlay():
+            # M13 sd-overlay/1: the clean frame + what the AI saw on it, for a
+            # viewer that draws the analysis itself (core/overlay.py). Presentation
+            # only: a failure here never touches detection.
+            try:
+                doc = self._overlay.build(
+                    self._last_observation, self._module_overlay_extras(module), module=self.module_name,
+                    mode=self.active_preset, last_event=self.dashboard.last_event_summary(),
+                    alert_active=module.is_alert_active() or self.rule_engine.is_alert_active(),
+                    captured_at=captured_at)
+                self.dashboard.push_overlay_frame(frame, overlay_mod.encode_header(doc), captured_at=captured_at)
+                self._last_stream_push = now
+            except Exception:
+                log.exception("the sd-overlay/1 frame could not be built; detection is unaffected")
+        if self.display or (want_stream and self.dashboard.wants_annotated()):
             # Guarded exactly like module.process() above, and for a sharper
             # reason: this call happens ONLY while someone is watching the
             # live feed (see `want_stream`). Unguarded, a module that drew

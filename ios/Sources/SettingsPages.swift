@@ -85,13 +85,16 @@ struct LiveFeedSettingsView: View {
                             .accessibilityIdentifier("settings.saveToken")
                     }
                 } header: {
-                    Text("Device token")
+                    Text("Device token (older setups)")
                 } footer: {
+                    // M12: a camera paired with this iPhone (Bluetooth setup or the
+                    // account) needs no token. The token stays only as the way an
+                    // older install moves over: the app pairs itself with it once.
                     Text(state.deviceToken.isEmpty
-                         ? "Set dashboard.token in the device's config.yaml, then paste the same value here. Without it the device refuses the live feed rather than showing its camera to everyone on the Wi-Fi."
+                         ? "Not needed: a camera set up over Bluetooth or added to your account is paired with this iPhone automatically. Only for an older setup that used dashboard.token: paste it once and the app pairs this iPhone with it, then stops needing it."
                          : (tokenDraft != state.deviceToken
                             ? "Not saved yet. The saved token is still in use."
-                            : "Saved to this phone's keychain. It must match dashboard.token in the device's config.yaml."))
+                            : "Saved to this phone's keychain. The app uses it once to pair this iPhone with the camera, then forgets it."))
                 }
 
                 // M8.4 (owner Decision C): from the account, as the device reports it.

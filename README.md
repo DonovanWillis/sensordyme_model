@@ -56,6 +56,10 @@ iPhone, pair, verify. After that, the loop above is the whole experience.
 
 > **Someone else is setting up the hardware?** Give them
 > [`docs/FRIEND_HARDWARE_SETUP.md`](docs/FRIEND_HARDWARE_SETUP.md): the same path as 28 steps.
+>
+> **M12:** the iPhone talks to the camera directly with its own key — no token to paste, works with
+> the MacBook off ([`docs/LOCAL_ACCESS.md`](docs/LOCAL_ACCESS.md)); optional device-hosted Wi-Fi
+> ([`docs/DIRECT_MODE.md`](docs/DIRECT_MODE.md), off by default, hardware-unverified).
 > Each step states the command, the expected result, pass/fail, recovery, whether it changes the
 > Pi, and whether the owner must approve. They share results with one sanitized evidence command
 > (`scripts/hw_validation/collect_evidence.py`). Demo: `docs/INVESTOR_DEMO.md`. Measured accuracy
@@ -104,8 +108,13 @@ failed while the Mac was overloaded passed on a quiet rerun).
 ### Development machines (not part of the product)
 
 These exist for building and validating SensorDyme. **None of them is required
-for ordinary operation** — the finished camera needs only power, Wi-Fi, a
-running backend, and your iPhone.
+for ordinary operation.** The camera needs only power to protect. Your iPhone
+reaches it directly on any network the two share (M12, `docs/LOCAL_ACCESS.md`);
+the backend adds account history, remote notifications, Ask Jupiter and
+pairing through the account.
+
+How to work across these machines (ASUS for Python/backend, oryn for CUDA via
+`sdrun`, the MacBook for Xcode): [`docs/DEVELOPER_SETUP.md`](docs/DEVELOPER_SETUP.md).
 
 | Machine | Role |
 |---|---|
@@ -218,8 +227,11 @@ cat ~/sensordyme/config.yaml >/dev/null 2>&1 && echo "config present (do NOT cop
 
 ### Clean install
 
-1. **Raspberry Pi Imager** (on the Mac) → *Raspberry Pi OS (64-bit)* (Bookworm)
-   → your SD card.
+1. **Raspberry Pi Imager** (on the Mac) → Raspberry Pi OS **(64-bit), Bookworm**
+   → your SD card. Newer Imagers default to Trixie (Debian 13, Python 3.13),
+   which this release does **not** support: pick the Bookworm 64-bit image
+   (listed under an older/legacy entry). `setup_pi.sh` refuses any other OS
+   before changing anything (hardware gate HG-OS, `docs/FIRST_PHYSICAL_BOOT.md`).
 2. In the Imager's settings gear before writing — this is the secure way to
    enable access, instead of enabling anything after boot:
    - hostname: something you'll recognise (e.g. `sensordyme-pi`);
@@ -289,11 +301,19 @@ scp -r ~/sensordyme-release/transfer-f63ddd9454f2 <user>@sensordyme-pi.local:tra
 ```bash
 cd ~/transfer
 sha256sum -c SHA256SUMS                                  # verify again, on the device
-mkdir -p ~/sensordyme && tar -xzf bundle/sensordyme-f63ddd9454f2.tar.gz -C ~/sensordyme
-mkdir -p ~/sensordyme/models && cp models/*.hef ~/sensordyme/models/
-cp -r wheels ~/sensordyme.wheels                         # enables the offline install
-cd ~/sensordyme && bash setup_pi.sh
+# one chained command: `mkdir` (no -p) stops it at once if ~/sensordyme already exists
+mkdir ~/sensordyme \
+  && tar -xzf bundle/sensordyme-f63ddd9454f2.tar.gz -C ~/sensordyme \
+  && cp -n config/config.yaml.example ~/sensordyme/config.yaml && chmod 600 ~/sensordyme/config.yaml \
+  && mkdir -p ~/sensordyme/models && cp models/*.hef ~/sensordyme/models/ \
+  && mkdir -p ~/sensordyme.wheels && cp wheels/*.whl ~/sensordyme.wheels/ \
+  && cd ~/sensordyme && bash setup_pi.sh
 ```
+
+The bundle never carries `config.yaml` (device state), so the template is copied
+in; `setup_pi.sh` refuses to start without one. It installs the hashed lock from
+`~/sensordyme.wheels` with `--no-index` when that directory holds the wheels. If it
+ends with "/dev/hailo0 is not present yet", reboot once: the Hailo driver loads at boot.
 
 What `setup_pi.sh` does (and what you should see):
 
@@ -529,8 +549,10 @@ dashboard:
 Put the `dk_…` key in `cloud.device_key` (or better, a 0600 file via
 `cloud.device_key_file` — `scripts/migrate_device_key.py`), then
 `chmod 600 ~/sensordyme/config.yaml && sudo systemctl restart sensordyme`.
-Keep the claim code and the dashboard token for the app steps below. For a
-hosted backend use its `https://…` URL as `base_url`.
+Keep the claim code for the app steps below. The dashboard token stays an
+**operator** credential (the `curl` checks in this guide); since M12 the app
+never needs it (`docs/LOCAL_ACCESS.md`). For a hosted backend use its
+`https://…` URL as `base_url`.
 
 ### The pairing journey in the app
 
@@ -558,9 +580,17 @@ hosted backend use its `https://…` URL as `base_url`.
    (typically well under a minute).
 9. **Choose what it watches for** (Driver Safety) and **Start watching** — or
    "Not now".
-10. **Live feed token**: on the device's screen, Settings → Live feed → enter
-    the dashboard token from the operator step. Status and alerts work without
-    it; the video needs it.
+10. **Nothing to paste for the live feed** (M12, `docs/LOCAL_ACCESS.md`): the
+    app pairs this iPhone with the camera by itself — over Bluetooth right
+    after step 5, or through your account once the device reports in. From then
+    on the iPhone reaches the camera **directly on any shared network, even with
+    the MacBook backend off**: live video, stop/resume, mode, local history and
+    in-app alerts. An app that already had a pasted token switches over once and
+    forgets it.
+
+**Without an account:** the sign-in screen offers **"Set up a camera nearby"**
+(Bluetooth Wi-Fi setup + pairing, no claim) and **"Open cameras paired with this
+iPhone"** — clearly labelled: no backup, no remote notifications.
 
 **Already-on-network device** (configured over SSH, no Bluetooth needed): the
 **＋ Add device** button keeps a claim-only path — tap through to the pair step
@@ -595,7 +625,7 @@ checklist):
 | Service starts on boot, restarts on failure | systemd `WantedBy=multi-user.target`, `Restart=always`, watchdog; bounded reboot budget as last resort |
 | Wi-Fi rejoins | NetworkManager autoconnect on the saved profile (BLE provisioning saves it `autoconnect yes` and prefers the newest network) |
 | Identity restored | `SD-XXXXXXXX` is derived from the SoC serial — stable across reboots, reflashes of the same board, and network changes |
-| Credentials restored | `cloud.device_key`/`base_url` + dashboard token live in the device's config (0600); a damaged config boots on the last-known-good copy and reports the fault |
+| Credentials restored | `cloud.device_key`/`base_url` + dashboard token live in the device's config (0600); a damaged config boots on the last-known-good copy and reports the fault. The device's local-access key and the iPhones it trusts (`data/local_identity.pem`, `data/local_clients.json`, both 0600) survive reboots, updates and rollbacks (`data/` is shared by every release) |
 | Monitoring configuration restored | preset, zones, companion nodes (`data/device_state.json`) and custom rules (`data/monitoring.json`) are re-applied at boot, re-validated against the role floor |
 | A deliberate Stop is **not** restored | by design: a reboot always comes back protecting (`stop` lives only in memory and the backend withdraws an undelivered stop after 30 s) |
 | Backend uplink reconnects | 2 s cadence, backoff capped at 30 s, instant recovery on first success; events queued on disk through outages and power cuts, delivered exactly once |
@@ -609,7 +639,7 @@ checklist):
 | Server found again | known addresses are health-checked first, then Bonjour; a discovered server must prove the pinned identity; 20 s heartbeat + revalidate-on-foreground afterwards |
 | Device list + real state | fetched on open and every 10 s; "All clear" is shown only from a fresh, device-reported ready |
 | Live feed reconnects | direct LAN stream re-uses the cached address, re-discovers when stale, and if the Pi finishes booting *after* you opened the app, the device list takes a throttled re-look at the LAN once the backend sees it online |
-| Paired camera remembered | the linked camera id + address and the device token survive relaunches, re-installs, and even session expiry |
+| Paired camera remembered | the camera's identity, public key, last address and this iPhone's own key (Secure Enclave on a real phone) live in the Keychain: a cold launch with the backend off still lists it as "Offline · last seen …" until a fresh local read says what it is doing (never "protecting" from the cache) |
 | Revoked/expired credentials handled truthfully | an expired or signed-out session lands on sign-in with an explanation; an operator-revoked device key is named as the first reason on the device card (never a bare, indefinite "status unknown") |
 
 **What iOS actually permits in the background (no overpromising):** reconnection
@@ -621,10 +651,17 @@ refreshes state.
 There is no claim of continuous background streaming or polling — Apple does
 not permit it for an app like this.
 
-**What the app needs where:** on your home Wi-Fi — everything. Elsewhere —
-status, alerts, history and commands via a hosted (HTTPS) backend; live video
-is LAN-only by design. With the Mac backend and the phone away from home, the
-app says truthfully that it can't reach the server.
+**What the app needs where (M12):**
+
+| | Needs |
+|---|---|
+| Live video, stop/resume, mode, local history, in-app alerts (app open) | a network the iPhone and the camera share: home Wi-Fi, an iPhone Personal Hotspot, a travel router — **no backend, no internet** |
+| Account history backup, remote notifications (ntfy/SMS), Ask Jupiter, sign-in, pairing through the account | the backend (the MacBook LaunchAgent today; no hosted backend is deployed) |
+| The camera's own protection and buzzer | nothing but power |
+| Optional: the camera as its own Wi-Fi network (direct mode, off by default) | `docs/DIRECT_MODE.md` — built and unit-tested, **not yet run on the Pi** |
+
+Live video is LAN-only by design: it never transits the backend. Away from
+the camera's network the app says truthfully that it cannot reach it.
 
 **Power-cycle test plan** (run after first setup, and after any update): unplug
 the device mid-monitoring → plug it back in → do not touch anything → within
@@ -688,7 +725,7 @@ one report that says which side is actually broken.
 | "Already claimed" | Phase 6 failure table (409). |
 | iPhone can't connect / app offline | `diagnose_backend_mac.py` (above): is the backend process actually running? Is its mDNS record current? Then: phone on the same Wi-Fi? Local Network permission granted? A guest/hotel network with client isolation blocks discovery entirely — phone hotspot is the reliable fallback (`docs/NETWORKING.md`). |
 | Device shows offline but works locally | Classic cause: `cloud.base_url` holds a bare IP or a dead hostname. The journal names the exact address it can't reach. Fix: `http://sensordyme-backend.local:8787` (the backend's own stable name), restart the service. |
-| No video feed | Same-LAN only. Then: dashboard token entered in the app (Settings → Live feed) and equal to `dashboard.token`? The device rejects a token with a stray trailing space (the app trims; a hand-typed curl might not). While *stopped*, no remote video is the privacy design, not a fault. |
+| No video feed | Same-LAN only. Then: is this iPhone paired with the camera (device screen: "This iPhone needs to be paired with the camera again" means it was revoked or idle 180 days — power-cycle the camera and re-pair over Bluetooth, or let the account re-pair it)? On the Pi, `.venv/bin/python scripts/local_clients.py list` shows which iPhones it trusts. While *stopped*, no remote video is the privacy design, not a fault. |
 | Degraded monitoring reported | Read the reason in the app or `/api/health` — it names the component. The device deliberately never hides this. Lens covered/dirty → `attention_lost` alerts; that's detection, not a fault. |
 | Buzzer silent | Event shows `output: sounded` but no sound → wiring (pin 11/GND), buzzer type (3.3 V-rated? active, not passive?), or a driver stage needed (Phase 1.4). This is a hard stop until fixed. |
 | Device restarts repeatedly | `systemctl status` + journal. A config error exits 78 and *stops* (no loop) with the reason; a damaged config auto-falls back to last-known-good and reports `config_fault`. Thermal: `vcgencmd measure_temp`, check the cooler. |

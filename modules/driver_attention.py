@@ -91,6 +91,7 @@ frames at a time. Three layers, all arithmetic, no new inference:
 from __future__ import annotations
 
 import contextlib
+import functools
 import json
 import math
 import statistics
@@ -357,6 +358,57 @@ def _camera_matrix(
         [[focal_length, 0, w / 2.0], [0, focal_length, h / 2.0], [0, 0, 1]],
         dtype=np.float64,
     )
+
+
+@functools.lru_cache(maxsize=1)
+def _tessellation_edges() -> np.ndarray:
+    return np.array(sorted(mp.solutions.face_mesh.FACEMESH_TESSELATION), dtype=np.int64)
+
+
+#: mediapipe's default face-mesh tessellation style (drawing_styles), BGR.
+_TESSELATION_COLOR = (128, 128, 128)
+
+
+def draw_face_tessellation(frame: np.ndarray, landmark_list) -> None:
+    """Draw the face-mesh tessellation, pixel-identical to mediapipe's
+    `draw_landmarks(..., FACEMESH_TESSELATION, landmark_drawing_spec=None,
+    connection_drawing_spec=<default tessellation style>)`, in one
+    `cv2.polylines` call instead of 2,556 Python `cv2.line` calls.
+
+    M13 measured the mediapipe path at ~3.4 ms per streamed frame (only while
+    a viewer watches the device-drawn stream); tests/test_m131_annotate.py
+    pins the pixels against mediapipe and the speed-up.
+
+    Same rules as mediapipe: a landmark is skipped when it carries a
+    visibility or presence below 0.5, or lies outside [0, 1]; an edge is drawn
+    only when both ends are kept; pixel = min(floor(v * size), size - 1).
+    """
+    marks = getattr(landmark_list, "landmark", None)
+    if not marks:
+        return
+    rows, cols = frame.shape[:2]
+    n = len(marks)
+    xy = np.empty((n, 2), dtype=np.float64)
+    keep = np.ones(n, dtype=bool)
+    for i, lm in enumerate(marks):
+        xy[i, 0] = lm.x
+        xy[i, 1] = lm.y
+        has = getattr(lm, "HasField", None)
+        if has is not None and ((has("visibility") and lm.visibility < 0.5)
+                                or (has("presence") and lm.presence < 0.5)):
+            keep[i] = False
+    keep &= (xy[:, 0] >= 0) & (xy[:, 0] <= 1) & (xy[:, 1] >= 0) & (xy[:, 1] <= 1)
+    edges = _tessellation_edges()
+    if int(edges.max()) >= n:
+        raise ValueError("Landmark index is out of range. Invalid connection")
+    edges = edges[keep[edges[:, 0]] & keep[edges[:, 1]]]
+    if not len(edges):
+        return
+    xy = np.where(keep[:, None], xy, 0.0)  # dropped points (NaN, off-frame) never reach the cast
+    px = np.empty((n, 2), dtype=np.int32)
+    px[:, 0] = np.minimum(np.floor(xy[:, 0] * cols), cols - 1)
+    px[:, 1] = np.minimum(np.floor(xy[:, 1] * rows), rows - 1)
+    cv2.polylines(frame, list(px[edges]), False, _TESSELATION_COLOR, 1)
 
 
 def estimate_head_rotation(
@@ -1250,6 +1302,12 @@ class RiskFusion:
         return self._high_tracker.is_active
 
 
+def _why(*parts: str) -> str:
+    """An event's own explanation (contributing_signals): measured facts joined with
+    " + ", which jupiter/explain.py turns into one fact each. Empty parts drop out."""
+    return " + ".join(p for p in parts if p)
+
+
 @register_module("driver_attention")
 class DriverAttentionModule(VisionModule):
     """Detects drowsiness, distraction, and phone/food use while tolerating normal behavior."""
@@ -1654,6 +1712,12 @@ class DriverAttentionModule(VisionModule):
         self._eyes_down_active = False
         self._eyes_up_active = False
         self._phone_use_active = False
+        # The conditions the drowsiness and phone_use trackers were last fed (M13):
+        # what the live view's "developing" phase reports, so it never shows a
+        # behaviour the module is not actually timing (a passenger's or mounted
+        # phone, a downward look's lowered lids).
+        self._last_drowsy_condition = False
+        self._last_phone_use_condition = False
         self._last_fired_event_types: list[str] = []
 
     def close(self) -> None:
@@ -1738,6 +1802,7 @@ class DriverAttentionModule(VisionModule):
             self._last_hand_boxes = []
             self._last_overlay_boxes = []
             self._last_overlay_confidences = []
+            self._last_driver_phone_boxes = []
             self._hand_overlaps_phone = False
             self._phone_hold.reset()
             self._phone_placement.reset()
@@ -1930,6 +1995,7 @@ class DriverAttentionModule(VisionModule):
         self._phone_association = association
         self._phone_driver_box = association.driver_box
         driver_phones = phones_for_associated_driver(phone_boxes, person_boxes, association)
+        self._last_driver_phone_boxes = list(driver_phones)
         self._hand_overlaps_phone = any(
             iou(hand_box, phone_box) > self._hand_phone_iou_threshold
             for hand_box in hand_boxes
@@ -2401,7 +2467,8 @@ class DriverAttentionModule(VisionModule):
             # Handling cues relative to where the face was last seen, and the
             # coasted downward gaze (M8.5).
             phone_candidate = self._phone_handling_now(self._phone_face_box, coasted_eyes_down)
-            fired = self._phone_use_tracker.update(phone_candidate and coasted_off_road, gaze_now)
+            self._last_phone_use_condition = phone_candidate and coasted_off_road
+            fired = self._phone_use_tracker.update(self._last_phone_use_condition, gaze_now)
             self._phone_use_active = self._phone_use_tracker.is_active
             if fired is not None:
                 off_road_confidence = _extrapolated(max(
@@ -2633,6 +2700,7 @@ class DriverAttentionModule(VisionModule):
         looking_down = self._closure_is_looking_down(
             ear, effective_threshold, closure_iris, iris_vetoes_closure, rotation, gaze_offset)
         drowsy_condition = ear < effective_threshold and not iris_vetoes_closure and not looking_down
+        self._last_drowsy_condition = drowsy_condition
         self._frame_signals["eye_state"] = shared_perception.EyeState(
             ear=float(ear), iris_openness=None if iris_ratio is None else float(iris_ratio),
             # Closed only against a calibrated threshold; before that there is
@@ -2653,7 +2721,9 @@ class DriverAttentionModule(VisionModule):
                             "driver not calibrated yet: closure judged against an uncalibrated EAR threshold")
             events.append(Event.now(
                 "drowsiness", fired,
-                margin_confidence(effective_threshold - ear, self._ear_noise.sigma), self.name, uncalibrated,
+                margin_confidence(effective_threshold - ear, self._ear_noise.sigma), self.name,
+                _why(f"eyes closed {fired:.1f} s", f"eye openness {ear:.2f} under {effective_threshold:.2f}",
+                     uncalibrated),
             ))
 
         # PERCLOS counts a DEEPER closure than drowsy_condition (see
@@ -2757,7 +2827,8 @@ class DriverAttentionModule(VisionModule):
             if fired is not None:
                 confidence = margin_confidence(abs(yaw) - self._yaw_threshold_deg, self._yaw_noise.sigma)
                 detail = "" if not self._distract_tracker.corroborated else "sustained wide-angle turn (mirror/blind-spot check taking too long)"
-                events.append(Event.now("distraction", fired, confidence, self.name, detail))
+                events.append(Event.now("distraction", fired, confidence, self.name,
+                                        _why(detail, self._turn_signal(yaw), f"held {fired:.1f} s")))
 
             if self._glance_counter.update(distract_condition, observed_now):
                 # A count crossing a limit: no graded evidence to report.
@@ -2770,6 +2841,8 @@ class DriverAttentionModule(VisionModule):
                 events.append(Event.now(
                     "eyes_down", fired,
                     margin_confidence(self._pitch_threshold_deg - pitch, self._pitch_noise.sigma), self.name,
+                    _why(f"looking {-pitch:.0f} deg below forward (limit {-self._pitch_threshold_deg:.0f} deg)",
+                         f"held {fired:.1f} s"),
                 ))
 
             eyes_up_condition = pitch > self._pitch_up_threshold_deg
@@ -2779,6 +2852,8 @@ class DriverAttentionModule(VisionModule):
                 events.append(Event.now(
                     "eyes_up", fired,
                     margin_confidence(pitch - self._pitch_up_threshold_deg, self._pitch_noise.sigma), self.name,
+                    _why(f"looking {pitch:.0f} deg above forward (limit {self._pitch_up_threshold_deg:.0f} deg)",
+                         f"held {fired:.1f} s"),
                 ))
 
             eyes_off_road = distract_condition or eyes_down_condition or eyes_up_condition
@@ -2804,6 +2879,8 @@ class DriverAttentionModule(VisionModule):
         # on a one-second pose failure (M10).
         fired = (self._phone_use_tracker.update(phone_use_condition, gaze_now)
                  if gaze_now is not None else None)
+        if gaze_now is not None:  # paused (gaze unreadable): the last fed condition stands
+            self._last_phone_use_condition = phone_use_condition
         # The tracker's own state, like every other condition here: clearing
         # the flag on any single False frame (one stride tick where YOLO missed
         # the phone) dropped the live alert for the rest of the episode, since
@@ -3053,9 +3130,9 @@ class DriverAttentionModule(VisionModule):
             "eyes_down_duration_s": round(self._eyes_down_tracker.elapsed(gaze_now), 1),
             "eyes_up_state": self._phase_label(self._last_pitch > self._pitch_up_threshold_deg, self._eyes_up_tracker),
             "eyes_up_duration_s": round(self._eyes_up_tracker.elapsed(gaze_now), 1),
-            "phone_use_state": self._phase_label(bool(self._last_phone_boxes), self._phone_use_tracker),
+            "phone_use_state": self._phase_label(self._last_phone_use_condition, self._phone_use_tracker),
             "phone_use_duration_s": round(self._phone_use_tracker.elapsed(gaze_now), 1),
-            "drowsy_state": self._phase_label(self._last_ear < self._last_ear_threshold, self._drowsy_tracker),
+            "drowsy_state": self._phase_label(self._last_drowsy_condition, self._drowsy_tracker),
             "risk_score": round(self._last_risk_score, 2),
             "state": self._state_label(),
             "alert_active": self.is_alert_active(),
@@ -3108,13 +3185,7 @@ class DriverAttentionModule(VisionModule):
     def annotate(self, frame: np.ndarray) -> np.ndarray:
         """Draw the face mesh, EAR/yaw readouts, and any detected phone/food/hand boxes on `frame`."""
         if self._last_face_proto is not None:
-            mp.solutions.drawing_utils.draw_landmarks(
-                image=frame,
-                landmark_list=self._last_face_proto,
-                connections=mp.solutions.face_mesh.FACEMESH_TESSELATION,
-                landmark_drawing_spec=None,
-                connection_drawing_spec=mp.solutions.drawing_styles.get_default_face_mesh_tesselation_style(),
-            )
+            draw_face_tessellation(frame, self._last_face_proto)
         cv2.putText(frame, f"EAR: {self._last_ear:.2f}", (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
         cv2.putText(frame, f"Yaw: {self._last_yaw:.1f} deg", (10, 60), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
         self._draw_risk_bar(frame)
@@ -3322,6 +3393,77 @@ class DriverAttentionModule(VisionModule):
             return Capability(IMPAIRED, f"frames arrive at {fps:.1f}/s; eye-closure timing (drowsiness, "
                                         f"fatigue) is verified from {self._eye_timing_min_fps:g}/s")
         return Capability()
+
+    def _turn_signal(self, yaw: float) -> str:
+        """The measured turn, frame-relative ("left"/"right" of the image, not of the car)."""
+        side = "left" if yaw > 0 else "right"  # the same sign convention as _gaze_label
+        return f"turned {abs(yaw):.0f} deg {side} of forward (limit {self._yaw_threshold_deg:.0f} deg)"
+
+    #: MediaPipe FaceMesh contours, in drawing order (the face oval and each eye).
+    _OVERLAY_CONTOURS: ClassVar[dict[str, tuple[int, ...]]] = {
+        "oval": (10, 338, 297, 332, 284, 251, 389, 356, 454, 323, 361, 288, 397, 365, 379, 378, 400, 377,
+                 152, 148, 176, 149, 150, 136, 172, 58, 132, 93, 234, 127, 162, 21, 54, 103, 67, 109),
+        "eye_l": (362, 382, 381, 380, 374, 373, 390, 249, 263, 466, 388, 387, 386, 385, 384, 398),
+        "eye_r": (33, 7, 163, 144, 145, 153, 154, 155, 133, 173, 157, 158, 159, 160, 161, 246),
+    }
+
+    def overlay_extras(self) -> dict:
+        """The live view's module half (core/overlay.py, sd-overlay/1).
+
+        Every value is what this module measured or decided on its last frame:
+        the face outline the landmark model returned, the person the driver
+        layer associated (and how), which phone box is the driver's, the head
+        orientation (head pose, NOT eye gaze), and each behaviour's phase.
+        Nothing here is estimated for display.
+        """
+        out: dict = {"state": self._state_label()}
+        proto = self._last_face_proto
+        if proto is not None and not self._face_lost_active:
+            marks = getattr(proto, "landmark", None) or ()
+            if len(marks) >= 468:
+                out["face_contours"] = {
+                    name: [(round(float(marks[i].x), 3), round(float(marks[i].y), 3)) for i in idx]
+                    for name, idx in self._OVERLAY_CONTOURS.items()}
+            # This frame's head pose as perception_signals reports it: relative to
+            # the driver's calibrated neutral when `calibrated` (what the overlay
+            # contract says), else the raw fit. It was the raw Euler angles under
+            # `calibrated: true` -- an upright head read pitch ~+-180 (M13).
+            head_pose = self._frame_signals.get("head_pose")
+            if head_pose is not None:
+                out["head"] = {"yaw_deg": round(float(head_pose.yaw_deg), 1),
+                               "pitch_deg": round(float(head_pose.pitch_deg), 1),
+                               "calibrated": bool(head_pose.calibrated),
+                               "direction": self._gaze_label()}
+        driver = self._driver
+        if driver is not None:
+            out["driver"] = {"box": driver.driver_box, "identity": driver.identity, "method": driver.method,
+                             "people": driver.people}
+        region = getattr(self._identity, "region", None)
+        if region is not None:
+            out["driver_region"] = {"box": tuple(region.box), "source": region.source}
+        out["driver_phone_boxes"] = list(getattr(self, "_last_driver_phone_boxes", []) or [])
+        gaze_now = self._gaze_clock.now
+        phases = []
+        for kind, condition, tracker in (
+            ("distraction", abs(self._last_yaw) > self._yaw_threshold_deg, self._distract_tracker),
+            ("eyes_down", self._last_pitch < self._pitch_threshold_deg, self._eyes_down_tracker),
+            ("eyes_up", self._last_pitch > self._pitch_up_threshold_deg, self._eyes_up_tracker),
+            # The conditions the trackers were fed, not proxies: any visible phone
+            # (a passenger's, a mounted one) read as phone_use "developing", and a
+            # downward look's lowered lids as drowsiness "developing" (M13).
+            ("phone_use", self._last_phone_use_condition, self._phone_use_tracker),
+            ("drowsiness", self._last_drowsy_condition, self._drowsy_tracker),
+        ):
+            if self._face_lost_active and kind != "phone_use":
+                continue  # nothing measured about the face: no face behaviour is in progress
+            phase = self._phase_label(condition, tracker)
+            if phase != "NONE":
+                phases.append({"type": kind, "phase": phase.lower(),
+                               "for_s": round(float(tracker.elapsed(gaze_now)), 1)})
+        if self._face_lost_active:
+            phases.append({"type": "face_not_visible", "phase": "confirmed", "for_s": None})
+        out["behaviours"] = phases
+        return out
 
     def perception_signals(self) -> dict:
         """Eye state, head pose and gaze measured on the last frame (core/perception.py

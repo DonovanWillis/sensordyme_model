@@ -214,6 +214,12 @@ class CloudUplink:
         #: envelope (set by _authenticated_command).
         self._command_verified = False
         self._stop = threading.Event()
+        #: M13: set when push_event() queues an alert, so the worker sends it now
+        #: rather than after the rest of the poll interval (on average half of
+        #: poll_interval_s of avoidable delay before the backend could notify
+        #: anyone). It never shortens the reconnection backoff: while syncs fail,
+        #: the worker waits exactly as before (see _wait_for_next_sync).
+        self._wake = threading.Event()
         self._connected = False
         self._explained_failure = False
         #: Consecutive failed syncs; drives the reconnection backoff.
@@ -420,6 +426,7 @@ class CloudUplink:
 
     def close(self) -> None:
         self._stop.set()
+        self._wake.set()  # a worker waiting for its next sync stops now
 
     # ------------------------------------------------------------------ main-loop side
     def push_event(
@@ -539,6 +546,7 @@ class CloudUplink:
                 self._alert_followups[event_key] = item
                 while len(self._alert_followups) > _ALERT_FOLLOWUP_MEMORY:
                     self._alert_followups.popitem(last=False)
+        self._wake.set()  # M13: send it on the next cycle, now, not after the poll interval
         if delivery is not None and not delivery.final:
             delivery.subscribe(lambda summary, key=event_key: self._alert_reported(key, summary))
             # A report that landed between summary() above and subscribe() is not lost.
@@ -706,8 +714,23 @@ class CloudUplink:
     # ------------------------------------------------------------------ worker
     def _run(self) -> None:
         while not self._stop.is_set():
+            # Cleared BEFORE the cycle: an alert queued while it runs (after its
+            # batch was taken) leaves the flag set, so the next cycle starts at once.
+            self._wake.clear()
             more_waiting = self.sync_once()
-            self._stop.wait(0 if more_waiting else self.next_delay())
+            if not more_waiting:
+                self._wait_for_next_sync(self.next_delay())
+
+    def _wait_for_next_sync(self, delay: float) -> None:
+        """Wait `delay` (the poll interval, or the backoff after a failure) before the
+        next sync. While connected, an alert queued meanwhile ends the wait early
+        (M13): the event goes up within one round trip instead of up to
+        poll_interval_s later. After a failed sync nothing ends it but close():
+        new alerts must not turn the reconnection backoff into a retry storm."""
+        if self._failures:
+            self._stop.wait(delay)
+        else:
+            self._wake.wait(delay)
 
     def sync_once(self) -> bool:
         """One sync cycle: push queued events + health, apply any command answered.
@@ -813,6 +836,8 @@ class CloudUplink:
                     print("cloud_uplink: ignored a malformed set_nodes command")
             if "set_camera_mode" in command:
                 self._accept_camera_mode(command.get("set_camera_mode"))
+            if "set_local_clients" in command:
+                self._accept_local_clients(command.get("set_local_clients"))
             if "set_zones" in command:
                 zones = command.get("set_zones")
                 with self._lock:
@@ -924,6 +949,16 @@ class CloudUplink:
                         f"newer ones kept"
                     )
         return more_waiting
+
+    def pending_event_keys(self) -> set[str]:
+        """event_keys not yet acknowledged by the backend (queued or in flight).
+
+        M12: the device's local event list (GET /api/events) says "pending" for
+        these and "sent" for the rest, so the phone shows sync state honestly.
+        """
+        with self._lock:
+            return {item["event_key"] for item in (*self._inflight, *self._queue)
+                    if isinstance(item, dict) and isinstance(item.get("event_key"), str)}
 
     # ------------------------------------------------------------------ backlog spool (M8)
     def backlog(self) -> dict:
@@ -1072,6 +1107,34 @@ class CloudUplink:
             return
         with self._lock:
             self._pending_camera_mode = request
+
+    #: M12 sd-local-v1: the device's LocalAuthority (core/local_auth.py), set by
+    #: the runtime. None: the device has no local access, and the command is ignored.
+    local_authority: Any = None
+
+    def _accept_local_clients(self, raw) -> None:
+        """The owner's phones to trust (or forget) locally, from their account (M12).
+
+        Adding a phone grants it the live camera and stop/resume on the LAN, so
+        it is applied ONLY under a verified signed envelope -- whatever
+        `cloud.command_auth` says, as for camera-only ON. A revocation is the
+        safe direction and is applied like any other command. Applied here, on
+        the uplink thread: the store is thread-safe and the next report carries
+        the new client list, which is what the backend converges on.
+        """
+        authority = self.local_authority
+        if authority is None or not isinstance(raw, dict):
+            return
+        change = {"revoke": raw.get("revoke") if isinstance(raw.get("revoke"), list) else []}
+        if raw.get("add"):
+            if not getattr(self, "_command_verified", False):
+                self._refuse_command("local_clients_require_signed_command")
+            else:
+                change["add"] = raw.get("add")
+        applied = authority.apply_remote(change)
+        if applied["added"] or applied["revoked"] or applied["refused"]:
+            print(f"cloud_uplink: local access: {len(applied['added'])} phone(s) trusted, "
+                  f"{len(applied['revoked'])} revoked, {len(applied['refused'])} refused")
 
     def pop_pending_camera_mode(self) -> Optional[dict]:
         """The owner's camera-only setting awaiting the main loop, if any.

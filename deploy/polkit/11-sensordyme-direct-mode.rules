@@ -1,0 +1,16 @@
+// Let SensorDyme start its own WPA access point (direct mode, docs/DIRECT_MODE.md).
+//
+// Installed ONLY when direct mode is enabled, by `sudo scripts/direct_mode.py
+// install`, to /etc/polkit-1/rules.d/ (0644, root). A device with direct mode
+// off never gets this grant.
+//
+// NetworkManager asks polkit for wifi.share.protected before it activates a
+// shared (ipv4.method shared) Wi-Fi connection with security, and
+// 10-sensordyme-network.rules does not grant it. wifi.share.open is
+// deliberately NOT granted: even a profile edited by hand to have no security
+// could not be raised as an open access point by the service.
+polkit.addRule(function (action, subject) {
+    if (action.id === "org.freedesktop.NetworkManager.wifi.share.protected" && subject.isInGroup("netdev")) {
+        return polkit.Result.YES;
+    }
+});

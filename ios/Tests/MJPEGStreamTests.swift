@@ -421,5 +421,81 @@ do {
     check(MJPEGReaderPolicy.livenessTick <= 0.5, "liveness is re-evaluated at least twice a second")
 }
 
+
+print("\nM12: a local session as the feed's credential:")
+do {
+    let session = MJPEGStreamRequest.sessionCredential("abc123")
+    let request = MJPEGStreamRequest.make(base: "http://192.168.1.20:8899", token: session)
+    check(request?.value(forHTTPHeaderField: "X-SD-Session") == "abc123", "a session goes out as X-SD-Session")
+    check(request?.value(forHTTPHeaderField: MJPEGStreamRequest.tokenHeader) == nil, "and never as the device token")
+    check(request?.url?.query == nil, "and never in the URL")
+    let legacy = MJPEGStreamRequest.make(base: "http://192.168.1.20:8899", token: "secret")
+    check(legacy?.value(forHTTPHeaderField: MJPEGStreamRequest.tokenHeader) == "secret"
+          && legacy?.value(forHTTPHeaderField: "X-SD-Session") == nil, "a legacy token still goes as X-Device-Token")
+    check(MJPEGReaderPolicy.completion(status: 401, error: nil, hasToken: true, usesSession: true) == .renewSession,
+          "401 on a session: renew it and reconnect, not 'rejected the token'")
+    check(MJPEGReaderPolicy.completion(status: 403, error: nil, hasToken: true, usesSession: true) == .needsPairing,
+          "403 on a session: this iPhone must be paired again")
+    check(!MJPEGStreamState.needsPairing.isRecoverableAutomatically
+          && MJPEGStreamState.needsPairing.message == "this iPhone needs to be paired with the camera again",
+          "needsPairing is not retried, and says what fixes it")
+    let renewed = MJPEGStreamRequest.sessionCredential("def456")
+    check(!MJPEGReaderPolicy.needsRestart(stopped: false, state: .streaming, currentBase: "http://a:1",
+                                          currentToken: session, base: "http://a:1", token: renewed),
+          "a renewed session does not interrupt a healthy stream")
+    check(MJPEGReaderPolicy.credentialUpdate(currentToken: session, token: renewed) == renewed,
+          "but is kept for the next connection")
+    check(MJPEGReaderPolicy.needsRestart(stopped: false, state: .reconnecting(attempt: 1, reason: nil),
+                                         currentBase: "http://a:1", currentToken: session, base: "http://a:1", token: renewed),
+          "a stream that is reconnecting picks the new session up at once")
+    check(MJPEGReaderPolicy.needsRestart(stopped: false, state: .streaming, currentBase: "http://a:1",
+                                         currentToken: "secret", base: "http://a:1", token: session),
+          "moving from the legacy token to a session reconnects")
+}
+
+print("\nM13: sd-overlay/1 rides with its own frame:")
+do {
+    let request = MJPEGStreamRequest.make(base: "http://192.168.1.20:8899", token: "secret")
+    check(request?.value(forHTTPHeaderField: "X-Stream-Overlay") == "1",
+          "every /stream request asks for clean frames + the analysis")
+    check(MJPEGResponse.overlayCapable(headers: ["X-Stream-Overlay": "sd-overlay/1"]),
+          "a device that answers sd-overlay/1 sends it")
+    check(!MJPEGResponse.overlayCapable(headers: ["Content-Type": "multipart/x-mixed-replace"]),
+          "older firmware (no answer) does not")
+    check(!MJPEGResponse.overlayCapable(headers: ["x-stream-overlay": "sd-overlay/2"]), "another schema is not read")
+
+    // Byte-stream framing: each part's overlay arrives with THAT part's JPEG.
+    func overlayPart(_ frame: Data, seq: Int, overlay: String?) -> Data {
+        var head = "--frame\r\nContent-Type: image/jpeg\r\nContent-Length: \(frame.count)\r\nX-Frame-Seq: \(seq)\r\n"
+        if let overlay { head += "X-SD-Overlay: \(overlay)\r\n" }
+        var out = Data((head + "\r\n").utf8)
+        out.append(frame)
+        out.append(Data("\r\n".utf8))
+        return out
+    }
+    let doc = String(repeating: "eyJzY2hlbWEiOiJzZC1vdmVybGF5LzEifQ", count: 60)  // ~2 KB, like the device's
+    var parser = MJPEGFrameParser()
+    var stream = overlayPart(jpeg([1]), seq: 1, overlay: doc)
+    stream.append(overlayPart(jpeg([2]), seq: 2, overlay: nil))  // a camera fallback part: no analysis
+    stream.append(overlayPart(jpeg([3]), seq: 3, overlay: "abc"))
+    // Split mid-header, the way TCP delivers it.
+    let cut = 1500
+    var parts = parser.appendParts(stream.prefix(cut))
+    parts += parser.appendParts(stream.suffix(from: cut))
+    let metas: [MJPEGPartMeta] = parts.compactMap { if case let .frame(_, m) = $0 { return m }; return nil }
+    check(metas.map(\.seq) == [1, 2, 3], "three frames, in order")
+    check(metas.map(\.overlay) == [doc, nil, "abc"], "each with its own overlay; the fallback part with none")
+
+    let huge = String(repeating: "A", count: MJPEGPartMeta.maxOverlayBytes + 1)
+    let refused = MJPEGPartMeta.from(fields: ["x-sd-overlay": huge])
+    check(refused.overlay == nil && refused.overlayRefused, "an oversized overlay is refused, never kept")
+    if case .frameHeader(let meta) = MJPEGResponse.classify(status: 200, mimeType: "image/jpeg",
+                                                            headers: ["X-SD-Overlay": "abc", "X-Frame-Seq": "9"]) {
+        check(meta.overlay == "abc" && meta.seq == 9, "URLSession's per-part response carries it too")
+    } else {
+        check(false, "a part response is a frame header")
+    }
+}
+
 print(failures == 0 ? "\nPASSED" : "\n\(failures) FAILURE(S)")
 exit(failures == 0 ? 0 : 1)

@@ -47,6 +47,34 @@ What this means, precisely:
 
 No certificate was created, nothing was disabled, and signing was not bypassed.
 
+### M14 re-check (2026-11-16, without signing)
+
+This checked that the **code** builds for a phone. It did not check signing.
+Run on this Mac (Xcode 26.1.1 / 17B100) from `8bbc758` plus the M14 stream C
+commits:
+
+```
+xcodebuild -project ios/SensorDyme.xcodeproj -scheme SensorDyme -configuration Release \
+  -destination 'generic/platform=iOS' -derivedDataPath <scratch> CODE_SIGNING_ALLOWED=NO build
+```
+
+* **Result:** `** BUILD SUCCEEDED **` (arm64, MinimumOSVersion 17.0, bundle id
+  `com.sensordyme.app`, no entitlements).
+* `ios/Tests/release_config_audit.sh` passed on that iphoneos product, and on
+  its own Simulator Release build.
+* **One warning:** "All interface orientations must be supported unless the
+  app requires full screen". The Info.plist has no
+  `UISupportedInterfaceOrientations`, and `UIDeviceFamily` includes iPad. This
+  matters for iPad multitasking validation at App Store upload. It does not
+  matter for a development install on an iPhone, which rotates as before
+  (journey 30 records "rotated"). Left unchanged.
+* **Signing state is unchanged since 2026-11-13:**
+  * one Apple Development identity on the Mac;
+  * no provisioning profile;
+  * the iPhone reports `unavailable` in `xcrun devicectl list devices`.
+
+  Section (b) is still required.
+
 ## (b) Minimal user actions (one-time, ~5 minutes)
 
 1. **Sign into Xcode**: Xcode → Settings… → Accounts → `+` → Apple Account →
@@ -133,6 +161,13 @@ config that reliably breaks the app when the network changes):
    `_sensordyme._tcp` on the LAN.
 5. **Notifications** prompt appears when alerts are first armed (local
    notifications only; no push entitlement, nothing to configure).
+6. **Direct camera access (M12, docs/LOCAL_ACCESS.md)** needs no extra
+   entitlement or capability: the phone's per-camera key is a CryptoKit Secure
+   Enclave key (its handle stored as an ordinary app Keychain item), and the
+   paired-camera list is an ordinary Keychain item. Free personal-team signing
+   is unaffected. No device token has to be pasted: setup over Bluetooth or the
+   account pairs the phone. On a physical phone the Enclave path is used; it
+   has NOT yet been checked on one (LOCAL_ACCESS.md §10 gate 6).
 
 ## Scope note
 

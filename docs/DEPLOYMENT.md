@@ -89,9 +89,16 @@ The adopt step refuses to run while the unit is active, while an M8 deploy is
 pending, or when the state directory already holds the same items.
 
 **A fresh device.** First install from an approved release with
-`setup_pi.sh`: extract the runbook A3 tarball to `~/sensordyme` and run
-`bash setup_pi.sh`. Since M8.5 it installs only the hashed lock. Then run
-`make deploy-adopt` once. Every update after that is `make deploy`.
+`setup_pi.sh`, using the transfer package's generated `INSTALL.md` section A: it
+extracts the bundle into a NEW `~/sensordyme`, copies `config/config.yaml.example`
+to `config.yaml` (the bundle never carries one), the verified `.hef` and the
+wheels (`~/sensordyme.wheels`), then runs `bash setup_pi.sh`. Since M8.5 it
+installs only the hashed lock; since M14 it first checks, read-only, for Raspberry
+Pi OS Bookworm, aarch64 with a 64-bit userland, CPython 3.11 and a `config.yaml`,
+and stops before any apt/venv/systemd change if one is missing (Trixie included),
+installs from `<install dir>.wheels` with `--no-index` when the wheels are there,
+and says when a reboot is needed for `/dev/hailo0`. Then run `make deploy-adopt`
+once. Every update after that is `make deploy`.
 
 To undo the adopt step (service stopped):
 

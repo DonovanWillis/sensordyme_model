@@ -32,6 +32,27 @@ class _Waits:
         self.limit = 0
 
 
+class _Wake:
+    """The worker's wake Event (M13: a connected worker sleeps on it so a new alert ends
+    the wait). Its waits are recorded with the stop Event's, in one list; an alert
+    setting it never stops the worker."""
+
+    def __init__(self, stop: _Waits):
+        self.stop = stop
+
+    def wait(self, timeout=None):
+        return self.stop.wait(timeout)
+
+    def set(self):
+        pass
+
+    def clear(self):
+        pass
+
+    def is_set(self):
+        return False
+
+
 class _Transport:
     """Answers each POST from a script: "fail" raises ConnectionError, else 200."""
 
@@ -55,6 +76,7 @@ def _uplink(script, poll=2.0, cap=None):
     uplink = CloudUplink(config)
     uplink._requests = _Transport(script)
     uplink._stop = _Waits(len(script))
+    uplink._wake = _Wake(uplink._stop)
     return uplink
 
 

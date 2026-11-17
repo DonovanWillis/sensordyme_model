@@ -154,6 +154,10 @@ def credential_problem(ssid, password) -> Optional[str]:
         return f"password is longer than {MAX_PASSWORD_BYTES} bytes"
     if _has_control_chars(password):
         return "password contains control characters"
+    if ssid == DIRECT_PROFILE:
+        # Client profiles are named after their SSID; this name is the device's
+        # own access point profile and must never be overwritten by a join.
+        return f"network name '{DIRECT_PROFILE}' is reserved for this device's own access point"
     return None
 
 
@@ -169,6 +173,90 @@ _SECRET_ARGS = frozenset({"password", "wifi-sec.psk", "802-11-wireless-security.
 def _redacted(args: list[str]) -> list[str]:
     """`args` with every passphrase replaced, for anything that may be logged."""
     return ["<redacted>" if i and args[i - 1] in _SECRET_ARGS else a for i, a in enumerate(args)]
+
+
+#: Public name for callers that print an nmcli plan (scripts/direct_mode.py --dry-run).
+redacted_args = _redacted
+
+
+#: The NetworkManager profile that carries direct mode (core/direct_mode.py, the
+#: device's own access point). A fixed NAME that is never an SSID: client
+#: profiles made here are named after their SSID, so provision() refuses this one.
+DIRECT_PROFILE = "sensordyme-direct"
+
+#: The settings that make the direct-mode profile what it is, read back after
+#: every write (ap_profile_problem). Order matters only for the query.
+AP_VERIFY_FIELDS = (
+    "connection.autoconnect",
+    "802-11-wireless.mode",
+    "802-11-wireless-security.key-mgmt",
+    "802-11-wireless-security.proto",
+    "ipv4.method",
+)
+
+#: Radio security per `network.direct_mode.security`. There is no open entry on
+#: purpose: an access point without a passphrase cannot be expressed here.
+#:   wpa2 -- WPA2-PSK, RSN only (no WPA1), CCMP only (no TKIP).
+#:   wpa3 -- WPA3-SAE, CCMP, management-frame protection required.
+AP_SECURITY: dict[str, list[str]] = {
+    "wpa2": ["wifi-sec.key-mgmt", "wpa-psk", "wifi-sec.proto", "rsn",
+             "wifi-sec.pairwise", "ccmp", "wifi-sec.group", "ccmp"],
+    "wpa3": ["wifi-sec.key-mgmt", "sae", "wifi-sec.proto", "rsn",
+             "wifi-sec.pairwise", "ccmp", "wifi-sec.group", "ccmp", "wifi-sec.pmf", "required"],
+}
+_AP_KEY_MGMT = {"wpa2": "wpa-psk", "wpa3": "sae"}
+
+
+def ap_profile_args(ssid: str, psk: str, *, interface: str = "wlan0", security: str = "wpa2",
+                    channel: int = 6, address: str = "10.42.0.1/24",
+                    name: str = DIRECT_PROFILE) -> list[str]:
+    """`nmcli connection add` arguments for the direct-mode access point.
+
+    * `connection.autoconnect no`: NetworkManager never raises it by itself, so
+      a power cycle always goes to the saved client networks first (R3).
+    * `ipv4.method shared`: NetworkManager runs DHCP and DNS (dnsmasq) for the
+      phone on `address`; IPv6 is off, so the firewall has one family to cover.
+    * A passphrase is required. ValueError for an unknown `security` or an
+      unusable `psk`, so no code path can build an open access point.
+    """
+    if security not in AP_SECURITY:
+        raise ValueError(f"direct mode security must be one of {sorted(AP_SECURITY)}, got {security!r}")
+    if not isinstance(psk, str) or not 8 <= len(psk) <= 63 or not psk.isascii() or _has_control_chars(psk):
+        raise ValueError("direct mode needs a WPA passphrase of 8-63 printable ASCII characters")
+    problem = credential_problem(ssid, psk)
+    if problem:
+        raise ValueError(problem)
+    return [
+        "connection", "add", "type", "wifi", "con-name", name, "ifname", interface, "ssid", ssid,
+        "connection.autoconnect", "no",
+        "802-11-wireless.mode", "ap", "802-11-wireless.band", "bg",
+        "802-11-wireless.channel", str(int(channel)),
+        "ipv4.method", "shared", "ipv4.addresses", address,
+        "ipv6.method", "disabled",
+        *AP_SECURITY[security],
+        "wifi-sec.psk", psk,
+    ]
+
+
+def ap_profile_problem(settings: dict[str, str], security: str = "wpa2") -> Optional[str]:
+    """Why the read-back profile is not a safe direct-mode AP, or None.
+
+    `settings` is AP_VERIFY_FIELDS as NetworkManager reports them. Anything
+    missing or different -- an open network above all -- is a refusal: the
+    profile is then never brought up.
+    """
+    expected = {
+        "connection.autoconnect": "no",
+        "802-11-wireless.mode": "ap",
+        "802-11-wireless-security.key-mgmt": _AP_KEY_MGMT.get(security, "?"),
+        "802-11-wireless-security.proto": "rsn",
+        "ipv4.method": "shared",
+    }
+    for field, want in expected.items():
+        have = settings.get(field, "")
+        if have != want:
+            return f"the direct-mode profile has {field}={have or '(unset)'!s}, expected {want}"
+    return None
 
 
 def _run(args: list[str], timeout: float = 10) -> subprocess.CompletedProcess:
@@ -614,6 +702,121 @@ class WifiManager:
             return result.returncode == 0
         except Exception:  # noqa: BLE001
             return False
+
+    # ------------------------------------------------------------ direct mode
+    # The access-point primitives core/direct_mode.py composes. Each is one
+    # nmcli call (or a read) and never raises: the caller owns the transaction.
+
+    def client_networks(self) -> list[str]:
+        """Saved Wi-Fi profiles that are client networks: everything but direct mode's AP."""
+        return [name for name in self.saved_networks() if name != DIRECT_PROFILE]
+
+    def profile_settings(self, name: str, fields: tuple[str, ...] = AP_VERIFY_FIELDS) -> dict[str, str]:
+        """{field: value} for the non-secret `fields` of profile `name`; {} when unreadable."""
+        if not nmcli_available():
+            return {}
+        try:
+            result = _run(["-t", "-f", ",".join(fields), "connection", "show", *_con(name)])
+        except Exception:  # noqa: BLE001
+            return {}
+        if result.returncode != 0:
+            return {}
+        settings: dict[str, str] = {}
+        for line in result.stdout.splitlines():
+            parts = _split_terse(line)
+            if len(parts) >= 2 and parts[0]:
+                settings[parts[0]] = ":".join(parts[1:])
+        return settings
+
+    def profile_ssid(self, name: str) -> Optional[str]:
+        """The SSID a saved profile joins (profiles NOT made here may be named otherwise)."""
+        value = self.profile_settings(name, ("802-11-wireless.ssid",)).get("802-11-wireless.ssid")
+        return value or None
+
+    def write_ap_profile(self, ssid: str, psk: str, *, security: str = "wpa2", interface: str = "wlan0",
+                         channel: int = 6, address: str = "10.42.0.1/24") -> tuple[bool, str]:
+        """(Re)create the direct-mode profile from scratch and verify what was saved.
+
+        Deleted and re-added rather than modified, so a profile someone edited
+        by hand (autoconnect on, security off) cannot survive into an AP. The
+        result is read back and refused unless it is exactly a WPA access point
+        with autoconnect off (ap_profile_problem). The passphrase is in argv for
+        the one `connection add` call only (as in provision()) and is never logged.
+        """
+        try:
+            args = ap_profile_args(ssid, psk, interface=interface, security=security,
+                                   channel=channel, address=address)
+        except ValueError as exc:
+            return False, str(exc)
+        if not nmcli_available():
+            return False, "no NetworkManager on this platform"
+        try:
+            if DIRECT_PROFILE in self.saved_networks():
+                _run(["connection", "delete", *_con(DIRECT_PROFILE)])
+            result = _run(args)
+        except Exception as exc:  # noqa: BLE001
+            return False, f"could not save the direct-mode profile: {exc}"
+        if result.returncode != 0:
+            reason = (result.stderr or "").strip() or "nmcli refused the access-point profile"
+            log.warning("could not create the direct-mode profile: %s", reason)
+            return False, reason
+        problem = ap_profile_problem(self.profile_settings(DIRECT_PROFILE), security)
+        if problem:
+            log.error("direct-mode profile refused after writing it: %s", problem)
+            self.forget_network(DIRECT_PROFILE)
+            return False, problem
+        return True, "direct-mode profile saved"
+
+    def set_autoconnect(self, name: str, enabled: bool) -> bool:
+        """`connection.autoconnect` for profile `name`; False when it could not be set."""
+        if not nmcli_available():
+            return False
+        try:
+            result = _run(["connection", "modify", *_con(name),
+                           "connection.autoconnect", "yes" if enabled else "no"])
+            return result.returncode == 0
+        except Exception:  # noqa: BLE001
+            return False
+
+    def activate_profile(self, name: str, timeout: float = _CONNECT_TIMEOUT_S) -> tuple[bool, str]:
+        """`nmcli connection up` for a saved profile. Returning True means activation began."""
+        if not nmcli_available():
+            return False, "no NetworkManager on this platform"
+        try:
+            result = _run(["connection", "up", *_con(name)], timeout=timeout)
+        except subprocess.TimeoutExpired:
+            return False, f"'{name}' did not come up within {timeout:.0f}s"
+        except Exception as exc:  # noqa: BLE001
+            return False, str(exc)
+        if result.returncode == 0:
+            return True, f"'{name}' activated"
+        return False, (result.stderr or "").split("Hint:", 1)[0].strip() or f"'{name}' did not come up"
+
+    def deactivate_profile(self, name: str) -> tuple[bool, str]:
+        """`nmcli connection down` for profile `name`."""
+        if not nmcli_available():
+            return False, "no NetworkManager on this platform"
+        try:
+            result = _run(["connection", "down", *_con(name)], timeout=20)
+        except Exception as exc:  # noqa: BLE001
+            return False, str(exc)
+        if result.returncode == 0:
+            return True, f"'{name}' deactivated"
+        return False, (result.stderr or "").strip() or f"'{name}' did not go down"
+
+    def interface_ipv4(self, interface: str) -> Optional[str]:
+        """The first IPv4 address (CIDR) on `interface`, or None."""
+        if not nmcli_available():
+            return None
+        try:
+            result = _run(["-t", "-f", "IP4.ADDRESS", "device", "show", interface])
+        except Exception:  # noqa: BLE001
+            return None
+        for line in result.stdout.splitlines():
+            _, _, value = line.partition(":")
+            if value.strip():
+                return value.strip()
+        return None
 
     def status(self) -> tuple[bool, str]:
         """(healthy, detail) for the health monitor's `wifi` component (non-critical:

@@ -685,12 +685,16 @@ CABIN_LEAD_IN_S = 12.0
 
 
 def run_cabin(scenario: CabinScenario, tmp_dir: str, *, fps: float = 10.0, hands_factory=None,
-              **config_overrides) -> dict:
+              on_frame=None, **config_overrides) -> dict:
     """Run one cabin scenario through the REAL module; returns its trace.
 
     Scenario time 0 is the end of the attentive lead-in; event times are on it.
     ``hands_factory`` (e.g. a real MediaPipe Hands graph) replaces the scripted
     hand model, for measuring its host cost (scripts/bench_hands_policy.py).
+    ``on_frame(t, module, events)`` (M13), when given, is called after every
+    scripted (t >= 0) frame with the module as that frame left it -- a read-only
+    observer (scripts/demo/flagship_rehearsal.py reads the overlay half and the
+    evidence state); it cannot change what the module decides.
     """
     import io
     import time as _time
@@ -759,6 +763,8 @@ def run_cabin(scenario: CabinScenario, tmp_dir: str, *, fps: float = 10.0, hands
                 risk_peak, risk_sum = max(risk_peak, risk), risk_sum + risk
                 for condition in module.active_alert_conditions():
                     active_s[condition] = active_s.get(condition, 0.0) + dt
+                if on_frame is not None:
+                    on_frame(round(t, 2), module, produced)
             t = round(t + dt, 6)
         engine = getattr(module, "_engine", None)
         report = engine.report() if engine is not None else None

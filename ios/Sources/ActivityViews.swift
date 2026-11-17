@@ -49,6 +49,8 @@ struct TimelineRow: View {
     /// `event.row` in Activity; the device screen's short list uses its own,
     /// so a query for the history's rows never finds the screen underneath.
     var identifier = "event.row"
+    /// M12: a line for a row read from the camera itself ("Not yet backed up").
+    var note: String? = nil
     var onToggle: () -> Void
     var onExplain: () -> Void
 
@@ -70,6 +72,13 @@ struct TimelineRow: View {
                     .accessibilityHint(expanded ? "Hides the details" : "Shows the details")
                     .accessibilityAddTraits(expanded ? .isSelected : [])
                     .accessibilityIdentifier(identifier)
+                if let note {
+                    Label(note, systemImage: "externaldrive")
+                        .font(SD.Typography.caption)
+                        .foregroundStyle(SD.Colors.textSecondary)
+                        .fixedSize(horizontal: false, vertical: true)
+                        .accessibilityIdentifier("event.sync")
+                }
                 if expanded { details }
             }
             .padding(.bottom, isLast ? 0 : SD.Space.md)
@@ -124,6 +133,14 @@ struct TimelineRow: View {
                 } else {
                     HStack(spacing: SD.Space.xs) { badges }
                 }
+            }
+            if let meaning = event.meaning {
+                // M13: what this kind of event is, before the device's words.
+                Text(meaning)
+                    .font(SD.Typography.caption)
+                    .foregroundStyle(SD.Colors.textPrimary.opacity(0.85))
+                    .multilineTextAlignment(.leading)
+                    .fixedSize(horizontal: false, vertical: true)
             }
             if let signals = event.signals, !signals.isEmpty {
                 // Wraps in full: two lines clipped the device's reason (audit).
@@ -274,6 +291,8 @@ struct TimelineRow: View {
 /// newest first, as one continuous spine per day.
 struct ActivityTimeline: View {
     let events: [EventItem]
+    /// M12: per `EventItem.id`, the line for rows that came from the camera only.
+    var notes: [String: String] = [:]
     var onExplain: (EventItem) -> Void
 
     @State private var expandedID: String?
@@ -305,6 +324,7 @@ struct ActivityTimeline: View {
                     ForEach(Array(day.events.enumerated()), id: \.element.id) { index, event in
                         TimelineRow(event: event, isLast: index == day.events.count - 1,
                                     expanded: expandedID == event.id,
+                                    note: notes[event.id],
                                     onToggle: { toggle(event) },
                                     onExplain: { onExplain(event) })
                     }

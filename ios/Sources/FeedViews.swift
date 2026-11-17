@@ -227,7 +227,28 @@ struct MJPEGView: View {
     /// The stream this view shows. Nil: the app's shared stream all the same
     /// (every session is a handle on the one connection).
     var session: LiveFeedSession? = nil
+    /// M12: which camera this is (its SD- id), so the feed uses that camera's
+    /// local session. Nil: the linked camera.
+    var hardwareID: String? = nil
+    /// The address comes from the paired-camera connection (LocalDeviceView),
+    /// not from the linked camera's DeviceLink.
+    var managedLocally = false
+    /// M13: draw what the AI saw over the picture. Off by default: the clean
+    /// picture is the ordinary view.
+    var aiView = false
     @EnvironmentObject private var state: AppState
+    @ObservedObject private var local = LocalAccessCenter.shared
+
+    private var cameraID: String { hardwareID ?? state.linkedDeviceID }
+
+    /// The local session when this iPhone is paired with the camera (no token
+    /// to paste; an empty session until one opens, which the reader answers by
+    /// asking for one); otherwise the legacy device token, for an older install.
+    private var credential: String {
+        if let session = local.streamCredential(cameraID) { return session }
+        if local.device(cameraID)?.isUsable == true { return MJPEGStreamRequest.sessionCredential("") }
+        return state.deviceToken
+    }
     private var feed: LiveFeedSession { session ?? LiveFeedSession.shared }
     private var reader: MJPEGReader { feed.reader }
     /// This view's hold on the shared connection, while it is on screen.
@@ -248,25 +269,40 @@ struct MJPEGView: View {
     @StateObject private var link = DeviceLink()
 
     var body: some View {
-        MJPEGFrame(reader: reader, liveness: reader.livenessModel)
+        MJPEGFrame(reader: reader, liveness: reader.livenessModel, aiView: aiView)
         .onAppear {
             // Wired before start(), so the very first run of failures can trigger
             // a re-resolve. Adopting the answer needs no code here: DeviceLink
             // writes the device's current address to the same stored key the feed
             // reads, so `onChange(of: url)` below picks it up and reconnects.
-            reader.onAddressLooksStale = { Task { await link.resolve(force: true) } }
+            let camera = cameraID
+            if managedLocally {
+                // A camera opened from the paired-camera list: the local
+                // connection finds it again (Bonjour by its id, or its last
+                // address) and the new address arrives through `url`.
+                reader.onAddressLooksStale = { Task { await LocalAccessCenter.shared.refresh(camera) } }
+            } else {
+                reader.onAddressLooksStale = { Task { await link.resolve(force: true) } }
+            }
+            // M12: a 401 on the local session opens a new one.
+            reader.onSessionRejected = { Task { await LocalAccessCenter.shared.renewSession(camera) } }
             // One lease per view: an appear without a disappear in between
             // (it happens) must not count this view twice and pin the stream.
             if lease == nil {
-                lease = feed.attach(base: url.absoluteString, token: state.deviceToken)
+                lease = feed.attach(base: url.absoluteString, token: credential)
             } else {
-                feed.retarget(base: url.absoluteString, token: state.deviceToken)
+                feed.retarget(base: url.absoluteString, token: credential)
+            }
+            // A paired camera with no session yet (a cold launch): open one.
+            // The session publishes and `onChange(of: credential)` retargets.
+            if local.device(camera)?.isUsable == true, local.streamCredential(camera) == nil {
+                Task { await LocalAccessCenter.shared.refresh(camera, hints: [url.absoluteString]) }
             }
             // An address is not an identity: confirm the camera answering there
             // is still the linked one (a DHCP swap, or two default-named Pis
             // trading `sensordyme.local`). If not, DeviceLink re-resolves and the
             // corrected address arrives through `onChange(of: url)`.
-            Task { await link.ensureConnection() }
+            if !managedLocally { Task { await link.ensureConnection() } }
         }
         .onDisappear {
             if let lease { feed.detach(lease) }
@@ -304,10 +340,11 @@ struct MJPEGView: View {
         // from — or endlessly retrying — whatever it was given when it first
         // appeared.
         .onChange(of: url) { _, newURL in
-            feed.retarget(base: newURL.absoluteString, token: state.deviceToken)
+            feed.retarget(base: newURL.absoluteString, token: credential)
         }
-        .onChange(of: state.deviceToken) { _, newToken in
-            feed.retarget(base: url.absoluteString, token: newToken)
+        // The token, or (M12) a new or renewed local session.
+        .onChange(of: credential) { _, newCredential in
+            feed.retarget(base: url.absoluteString, token: newCredential)
         }
     }
 }
@@ -321,11 +358,25 @@ final class FeedLivenessModel: ObservableObject {
     @Published fileprivate(set) var frameSource: String?
 }
 
+/// M13: what the AI saw, for the words around the picture (the Simulated
+/// badge, the behaviour strip, the driver panel, the perf readout). Published
+/// when its meaning changes, a running duration at most 5 times a second and
+/// the perf numbers once a second (LiveOverlaySummary.shouldPublish), so these
+/// views never redraw per frame. The boxes themselves are drawn per frame
+/// from `MJPEGReader.frameOverlay`, inside MJPEGFrame.
+@MainActor
+final class LiveOverlayModel: ObservableObject {
+    @Published fileprivate(set) var summary = LiveOverlaySummary.make(nil, overlayCapable: nil, live: false,
+                                                                       streamSeenSimulated: false)
+}
+
 /// The picture and the stream's own state, observed from the reader. The only
 /// view that redraws per frame.
 struct MJPEGFrame: View {
     @ObservedObject var reader: MJPEGReader
     @ObservedObject var liveness: FeedLivenessModel
+    /// M13: draw what the AI saw on this frame over it (the AI view).
+    var aiView = false
 
     var body: some View {
         ZStack {
@@ -338,6 +389,15 @@ struct MJPEGFrame: View {
                 Image(uiImage: image)
                     .resizable()
                     .aspectRatio(contentMode: .fit)
+                    // The analysis of THIS frame, in the picture's own rect (so
+                    // a normalised box lands where the device saw it). Only on a
+                    // live picture: a stalled frame's boxes describe the past.
+                    .overlay {
+                        if aiView, liveness.liveness.isLive, let overlay = reader.frameOverlay, overlay.analysed {
+                            AIOverlayCanvas(overlay: overlay)
+                                .accessibilityHidden(true)  // the chrome says it in words
+                        }
+                    }
                     .frame(maxWidth: .infinity)
                     .aspectRatio(image.size.height > 0 ? image.size.width / image.size.height : 4 / 3,
                                  contentMode: .fit)
@@ -443,12 +503,24 @@ struct MJPEGLiveIndicator: View {
 @MainActor
 final class MJPEGReader: NSObject, ObservableObject, URLSessionDataDelegate {
     @Published private(set) var image: UIImage?
+    /// M13: what the AI saw on the frame in `image` (sd-overlay/1), set in the
+    /// same update as the picture so the two can never come from different
+    /// frames. Nil when that frame carried no analysis.
+    @Published private(set) var frameOverlay: LiveOverlay?
     @Published private(set) var state: MJPEGStreamState = .idle {
         didSet { refreshLiveness() }
     }
     /// What the person is looking at, decided from evidence (M8.3). Separate
     /// object so its observers do not redraw per frame.
     let livenessModel = FeedLivenessModel()
+    /// M13: the analysis in words, throttled (LiveOverlayModel).
+    let overlayModel = LiveOverlayModel()
+    /// The stream answered `X-Stream-Overlay: sd-overlay/1` (nil: no answer yet).
+    private var overlayCapable: Bool?
+    /// Any document on this camera's stream said it is simulated: the badge
+    /// stays for every frame, including ones that carry no document.
+    private var streamSeenSimulated = false
+    private var overlayPublishedAt: TimeInterval = 0
     /// The liveness state machine and the rolling counters (StreamLiveness.swift).
     private var tracker = FeedLivenessTracker()
     private var watchdog: Task<Void, Never>?
@@ -480,6 +552,9 @@ final class MJPEGReader: NSObject, ObservableObject, URLSessionDataDelegate {
     /// A closure rather than a dependency so this class keeps knowing nothing
     /// about Bonjour, and so the behaviour is testable without a network.
     var onAddressLooksStale: (() -> Void)?
+    /// M12: the camera refused the stream's local session (401): open a new
+    /// one. The new credential arrives through `start` (a retarget).
+    var onSessionRejected: (() -> Void)?
 
     // MARK: Lifecycle
 
@@ -493,8 +568,19 @@ final class MJPEGReader: NSObject, ObservableObject, URLSessionDataDelegate {
             stopped: stopped, state: state,
             currentBase: self.base, currentToken: self.token,
             base: base, token: token
-        ) else { return }
+        ) else {
+            // A renewed local session for a healthy stream: kept for the next
+            // connection, without interrupting this one.
+            self.token = MJPEGReaderPolicy.credentialUpdate(currentToken: self.token, token: token)
+            return
+        }
         teardown()
+        if base != self.base {
+            // Another camera: nothing known about it yet.
+            streamSeenSimulated = false
+            overlayCapable = nil
+            frameOverlay = nil
+        }
         self.base = base
         self.token = token
         stopped = false
@@ -547,7 +633,22 @@ final class MJPEGReader: NSObject, ObservableObject, URLSessionDataDelegate {
         // stopped, the last picture is not kept in memory either -- the
         // viewport already hides it (hidesLastPicture); this drops it.
         if liveness.hidesLastPicture, image != nil { image = nil }
+        if liveness.hidesLastPicture, frameOverlay != nil { frameOverlay = nil }
         if livenessModel.frameSource != tracker.lastSource { livenessModel.frameSource = tracker.lastSource }
+        refreshOverlaySummary(now: now)
+    }
+
+    /// The analysis in words, from the newest frame's document and whether the
+    /// picture is live; published per LiveOverlaySummary.shouldPublish.
+    private func refreshOverlaySummary(now: TimeInterval) {
+        let summary = LiveOverlaySummary.make(frameOverlay, overlayCapable: overlayCapable,
+                                              live: livenessModel.liveness.isLive,
+                                              streamSeenSimulated: streamSeenSimulated)
+        if LiveOverlaySummary.shouldPublish(old: overlayModel.summary, new: summary,
+                                            sinceLast: now - overlayPublishedAt) {
+            overlayModel.summary = summary
+            overlayPublishedAt = now
+        }
     }
 
     /// Release the session and the pending retry, without deciding what happens next.
@@ -585,6 +686,7 @@ final class MJPEGReader: NSObject, ObservableObject, URLSessionDataDelegate {
         ) else {
             // Retrying cannot turn "192.168.1.20:8899" into a URL. Say so once.
             image = nil
+            frameOverlay = nil
             state = .unusableAddress
             return
         }
@@ -686,6 +788,7 @@ final class MJPEGReader: NSObject, ObservableObject, URLSessionDataDelegate {
             if let name = name as? String { headers[name] = "\(value)" }
         }
         let kind = MJPEGResponse.classify(status: status, mimeType: response.mimeType, headers: headers)
+        let overlayCapable = MJPEGResponse.overlayCapable(headers: headers)
         // Reading the body of a response we cannot use only wastes the radio; the
         // status is recovered from `task.response` in didCompleteWithError below,
         // which is where the decision about retrying is made.
@@ -701,6 +804,7 @@ final class MJPEGReader: NSObject, ObservableObject, URLSessionDataDelegate {
                 // a dead connection (FeedLivenessTracker.shouldForceReconnect).
                 self.tracker.connectionOpened(now: Self.now(), heartbeatCapable: heartbeatCapable,
                                               streamID: streamID)
+                self.overlayCapable = overlayCapable
                 // The device answered. Anything still wrong from here is the camera's
                 // end, not the network's, and the badge should stop blaming Wi-Fi.
                 if self.state != .streaming { self.state = .waitingForFrames }
@@ -731,6 +835,15 @@ final class MJPEGReader: NSObject, ObservableObject, URLSessionDataDelegate {
                         self.tracker.noteDecodeFailure()
                         continue
                     }
+                    // M13: this frame's own analysis, or none. Never the
+                    // previous frame's: a part without a document (a camera
+                    // fallback frame) clears it, and is shown "Not analysed".
+                    var overlay: LiveOverlay?
+                    if let header = meta.overlay, case .success(let doc) = LiveOverlay.decode(header: header) {
+                        overlay = doc
+                        if doc.isSimulated { self.streamSeenSimulated = true }
+                    }
+                    self.frameOverlay = overlay
                     self.image = decoded
                     self.state = .streaming
                     self.retryAttempt = 0  // healthy again: future drops start with a short retry
@@ -751,7 +864,21 @@ final class MJPEGReader: NSObject, ObservableObject, URLSessionDataDelegate {
             // the healthy session that had already replaced it.
             self.tracker.connectionClosed(error: MJPEGStreamDiagnosis.describe(error) != nil)
 
-            switch MJPEGReaderPolicy.completion(status: status, error: error, hasToken: !self.token.isEmpty) {
+            let usesSession = MJPEGStreamRequest.session(in: self.token) != nil
+            switch MJPEGReaderPolicy.completion(status: status, error: error, hasToken: !self.token.isEmpty,
+                                                usesSession: usesSession) {
+            case .renewSession:
+                // M12: the camera ended the session (it restarted, or the
+                // session expired): a new one is opened and the stream goes on.
+                self.consecutiveTransportFailures = 0
+                self.onSessionRejected?()
+                self.scheduleReconnect(reason: "renewing the connection to the camera", countsAsTransportFailure: false)
+            case .needsPairing:
+                self.consecutiveTransportFailures = 0
+                self.image = nil
+                self.frameOverlay = nil
+                self.state = .needsPairing
+                self.teardown()
             case .unauthorized(let hasToken):
                 // No amount of retrying supplies a token. Looping here is what
                 // turned a one-line settings mistake into a permanent spinner.
@@ -759,6 +886,7 @@ final class MJPEGReader: NSObject, ObservableObject, URLSessionDataDelegate {
                 // must not count toward re-resolving the address.
                 self.consecutiveTransportFailures = 0
                 self.image = nil
+                self.frameOverlay = nil
                 self.state = .unauthorized(hasToken: hasToken)
                 self.teardown()
             case .reconnect(let reason, let countsAsTransportFailure):

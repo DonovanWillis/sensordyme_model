@@ -27,6 +27,8 @@ _KNOWN_TOP_LEVEL = {
     # development (default) | production: production refuses insecure fallbacks,
     # e.g. unauthenticated Bluetooth setup (services/ble_pop.py, M6.5).
     "deployment",
+    # M12 sd-local-v1: per-phone local access (core/local_auth.py, docs/LOCAL_ACCESS.md).
+    "local_access",
 }
 
 
@@ -188,6 +190,65 @@ def _validate_categories(categories, where: str, errors: list[str]) -> None:
             errors.append(f"`{where}.categories.{name}:` {exc}")
 
 
+#: `network.direct_mode:` keys (core/direct_mode.DirectModeConfig).
+_DIRECT_MODE_KEYS = {
+    "enabled", "interface", "security", "channel", "ap_timeout_s", "passphrase_path", "state_path",
+    "fallback_enabled", "fallback_after_s", "return_check_s",
+}
+
+
+def _validate_direct_mode(direct, config: dict, errors: list[str], warnings: list[str]) -> None:
+    """`network.direct_mode:` (docs/DIRECT_MODE.md). Off unless `enabled: true`.
+
+    The radio security has no open value, and a passphrase in config.yaml is
+    refused outright: it lives only in the 0600 file behind the device label.
+    """
+    where = "network.direct_mode"
+    if not isinstance(direct, dict):
+        errors.append(f"`{where}:` must be a mapping, got {direct!r}")
+        return
+    for key in ("psk", "password", "passphrase"):
+        if key in direct:
+            errors.append(f"`{where}.{key}:` is refused: the direct-mode passphrase is never set in config.yaml; "
+                          "it is generated per device into `passphrase_path` (scripts/direct_mode_psk.py)")
+    for key in sorted(set(direct) - _DIRECT_MODE_KEYS - {"psk", "password", "passphrase"}):
+        warnings.append(f"`{where}.{key}:` unknown key (typo?) is ignored")
+    for key in ("enabled", "fallback_enabled"):
+        value = direct.get(key, False)
+        _check(errors, isinstance(value, bool), f"`{where}.{key}:` must be true or false, got {value!r}")
+    security = direct.get("security", "wpa2")
+    _check(errors, security in ("wpa2", "wpa3"),
+           f"`{where}.security:` must be wpa2 or wpa3 (there is no open access point), got {security!r}")
+    interface = direct.get("interface", "wlan0")
+    _check(errors, isinstance(interface, str) and 0 < len(interface) <= 15
+           and all(c.isalnum() or c in "_.-" for c in interface),
+           f"`{where}.interface:` must be a network interface name like wlan0, got {interface!r}")
+    channel = direct.get("channel", 6)
+    _check(errors, isinstance(channel, int) and not isinstance(channel, bool) and 1 <= channel <= 11,
+           f"`{where}.channel:` must be a 2.4 GHz channel 1-11, got {channel!r}")
+    for key, low, high, default in (("ap_timeout_s", 5, 120, 30), ("fallback_after_s", 60, 86400, 600),
+                                    ("return_check_s", 30, 86400, 300)):
+        value = direct.get(key, default)
+        _check(errors, _is_num(value) and low <= value <= high,
+               f"`{where}.{key}:` must be a number in [{low}, {high}], got {value!r}")
+    for key in ("passphrase_path", "state_path"):
+        if key in direct:
+            _check(errors, isinstance(direct[key], str) and direct[key] != "",
+                   f"`{where}.{key}:` must be a path string, got {direct[key]!r}")
+    if direct.get("enabled") is not True:
+        return
+    network = config.get("network") or {}
+    prov = network.get("provisioning") if isinstance(network, dict) else None
+    method = prov.get("method", "ble") if isinstance(prov, dict) else "ble"
+    if method != "ble":
+        warnings.append(f"{where} is enabled with network.provisioning.method: {method}: Bluetooth setup is "
+                        "the recovery path for a broken access point; without it only a power cycle recovers")
+    dashboard = config.get("dashboard")
+    if not (isinstance(dashboard, dict) and dashboard.get("token")):
+        warnings.append(f"{where} is enabled but dashboard.token is not set: a phone on the access point "
+                        "gets 401 on every request (the dashboard fails closed)")
+
+
 def validate(config: dict) -> tuple[list[str], list[str]]:
     """Validate the top-level runtime config. Returns (errors, warnings)."""
     errors: list[str] = []
@@ -218,6 +279,20 @@ def validate(config: dict) -> tuple[list[str], list[str]]:
         _check(errors, _is_num(fps) and 0 < fps <= 240, f"`camera.fps:` must be in (0, 240], got {fps!r}")
     else:
         errors.append("`camera:` must be a mapping")
+
+    local_access = config.get("local_access", {})
+    if isinstance(local_access, dict):
+        enabled = local_access.get("enabled", True)
+        _check(errors, isinstance(enabled, bool),
+               f"`local_access.enabled:` must be true or false, got {enabled!r}")
+        days = local_access.get("idle_expiry_days", 180)
+        _check(errors, _is_num(days) and 0 <= days <= 3650,
+               f"`local_access.idle_expiry_days:` must be 0-3650 (0 = never), got {days!r}")
+        events_max = local_access.get("events_max", 2000)
+        _check(errors, isinstance(events_max, int) and 10 <= events_max <= 100_000,
+               f"`local_access.events_max:` must be an integer 10-100000, got {events_max!r}")
+    elif local_access is not None:
+        errors.append("`local_access:` must be a mapping")
 
     dashboard = config.get("dashboard", {})
     if isinstance(dashboard, dict):
@@ -281,6 +356,8 @@ def validate(config: dict) -> tuple[list[str], list[str]]:
                               "with `deployment: production`; set `auth: pop` (services/ble_pop.py)")
         else:
             errors.append("`network.provisioning:` must be a mapping")
+        if "direct_mode" in network:
+            _validate_direct_mode(network["direct_mode"], config, errors, warnings)
     else:
         errors.append("`network:` must be a mapping")
 

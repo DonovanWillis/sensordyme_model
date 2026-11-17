@@ -42,6 +42,11 @@ NotifyAccess=main
 # default `pi`); the sudoers rule is templated with the same name.
 User=__SENSORDYME_USER__
 WorkingDirectory=__SENSORDYME_DIR__
+# M14: stdout is a pipe under systemd, so Python block-buffers it and the many
+# print() boot messages (config FAULT, sink unavailable, module could not be
+# built, cloud_uplink) reached the journal late -- or never, when the watchdog
+# killed the process. Unbuffered, the journal shows them as they happen.
+Environment=PYTHONUNBUFFERED=1
 # Preflight verifies config, camera, AI HAT, disk — results in
 # data/preflight.json and the journal. The leading "-" makes its exit status
 # advisory: Restart= applies to a failing ExecStartPre too, so a bad config (or a

@@ -148,6 +148,9 @@ class _StreamFrame:
     seq: int  # dashboard-wide, strictly increasing across annotated + camera frames
     captured_at: float  # time.monotonic() of the CAMERA capture this frame shows
     source: str  # "annotated" (the runtime's analysed view) | "camera" (fallback, unanalysed)
+    #: M13 sd-overlay/1 (core/overlay.py): the analysis of THIS frame, header-encoded.
+    #: Only on the clean slot; sent only to viewers that asked for it.
+    overlay: Optional[str] = None
 
 
 #: A loopback viewer while monitoring is stopped (local maintenance; never remote).
@@ -180,7 +183,8 @@ class _StreamClient:
     last_seq: int = 0
 
 
-def _part_header(frame: _StreamFrame, stream_id: str, now: float, source: Optional[str] = None) -> bytes:
+def _part_header(frame: _StreamFrame, stream_id: str, now: float, source: Optional[str] = None,
+                 overlay: bool = False) -> bytes:
     """One multipart part header for a JPEG.
 
     The first three lines are exactly what the stream always sent, so a client
@@ -201,6 +205,9 @@ def _part_header(frame: _StreamFrame, stream_id: str, now: float, source: Option
                        restarted and the seq started again
     """
     age_ms = max(0, int((now - frame.captured_at) * 1000))
+    # M13: X-SD-Overlay (sd-overlay/1) -- only for a viewer that asked, and only
+    # when this frame was analysed (a camera fallback frame carries none).
+    extra = f"X-SD-Overlay: {frame.overlay}\r\n" if overlay and frame.overlay else ""
     return (
         "--frame\r\n"
         "Content-Type: image/jpeg\r\n"
@@ -209,6 +216,7 @@ def _part_header(frame: _StreamFrame, stream_id: str, now: float, source: Option
         f"X-Frame-Age-Ms: {age_ms}\r\n"
         f"X-Frame-Source: {source or frame.source}\r\n"
         f"X-Stream-Id: {stream_id}\r\n"
+        f"{extra}"
         "\r\n"
     ).encode()
 
@@ -273,8 +281,18 @@ class DashboardServer:
         local_camera_while_stopped: bool = True,
         diagnostics_provider: Optional[Callable[[], dict]] = None,
         diagnostics_enabled: bool = False,
+        local_authority=None,
+        event_journal=None,
+        pending_event_keys: Optional[Callable[[], set]] = None,
     ) -> None:
         self._host = host
+        #: M12 sd-local-v1 (core/local_auth.py): per-phone keys enrolled through an
+        #: authorised path. None: only the legacy shared token opens /api and /stream.
+        self.local_authority = local_authority
+        #: M12: the bounded journal behind GET /api/events (core/local_events.py).
+        self.event_journal = event_journal
+        #: () -> event_keys still waiting for the uplink; None when there is no uplink.
+        self.pending_event_keys = pending_event_keys
         self._port = port
         #: Whether this bind is reachable from anything but this machine.
         #:
@@ -308,6 +326,10 @@ class DashboardServer:
         self._lock = threading.Lock()
         #: The ONE latest-frame slot (see _StreamFrame). Replaced, never queued.
         self._frame: Optional[_StreamFrame] = None
+        #: M13: the clean (unannotated) analysed frame + its sd-overlay/1 analysis,
+        #: for viewers that draw the overlay themselves. Encoded only while one watches.
+        self._clean_frame: Optional[_StreamFrame] = None
+        self._overlay_viewers = 0
         self._jpeg_seq = 0
         #: monotonic time of the runtime's last annotated push (fallback gate).
         self._annotated_at = 0.0
@@ -361,6 +383,52 @@ class DashboardServer:
 
             def log_message(self, *args) -> None:  # silence per-request logging
                 pass
+
+            # -- M12 sd-local-v1 ------------------------------------------------------
+            #: The enrolled phone this request is from (session or signature), or None.
+            local_client = None
+            _body_cache: Optional[bytes] = None
+
+            def _peer(self) -> Optional[str]:
+                return self.client_address[0] if self.client_address else None
+
+            def _session_client(self):
+                """A phone's read session (X-SD-Session), GET only. Never opens a write."""
+                authority = dashboard.local_authority
+                if authority is None or self.command != "GET":
+                    return None
+                sent = self.headers.get("X-SD-Session", "")
+                return authority.check_session(sent, self._peer()) if sent else None
+
+            def _signed_client(self, path: str):
+                """The phone that signed THIS write over a fresh challenge, else LocalAuthError."""
+                from core import local_auth as la
+
+                authority = dashboard.local_authority
+                if authority is None:
+                    raise la.LocalAuthError("local_access_off", 401)
+                return authority.verify_request(self.headers.get(la.HEADER), self.command, path,
+                                                self._raw_body(), self._peer())
+
+            def _local_refusal(self, exc) -> None:
+                body = {"error": "local access refused", "code": exc.reason}
+                if exc.retry_after_s is not None:
+                    body["retry_after_s"] = exc.retry_after_s
+                self._json(body, exc.status)
+
+            def _raw_body(self) -> bytes:
+                """The request body, read once and bounded (64 KiB); b"" for anything else."""
+                if self._body_cache is not None:
+                    return self._body_cache
+                try:
+                    length = int(self.headers.get("Content-Length", 0))
+                except ValueError:
+                    length = 0
+                self._body_cache = self.rfile.read(length) if 0 < length <= 64 * 1024 else b""
+                return self._body_cache
+
+            def _token_ok(self) -> bool:
+                return dashboard._token is not None and self._authorized()
 
             def _authorized(self) -> bool:
                 """When a device token is configured, require it on every /api and /stream path."""
@@ -444,21 +512,68 @@ class DashboardServer:
                 and an unbounded Content-Length is memory on the device's
                 terms. A malformed length used to raise into a traceback.
                 """
-                try:
-                    length = int(self.headers.get("Content-Length", 0))
-                except ValueError:
-                    return {}
-                if not 0 < length <= 64 * 1024:
+                raw = self._raw_body()
+                if not raw:
                     return {}
                 try:
-                    payload = json.loads(self.rfile.read(length))
+                    payload = json.loads(raw)
                 except (ValueError, UnicodeDecodeError):
                     return {}
                 return payload if isinstance(payload, dict) else {}
 
-            def do_POST(self) -> None:
+            def _local_post(self, path: str) -> bool:
+                """sd-local-v1 endpoints that are their own authentication. True if handled."""
+                from core import local_auth as la
+
+                authority = dashboard.local_authority
+                if path not in ("/api/local/session", "/api/local/enroll", "/api/local/revoke"):
+                    return False
+                if authority is None:
+                    self._json({"error": "local access is not available on this device",
+                                "code": "local_access_off"}, 404)
+                    return True
                 try:
-                    if not self._authorized():
+                    if path == "/api/local/session":
+                        reply = authority.open_session(self.headers.get(la.HEADER), path, self._raw_body(),
+                                                       self._peer())
+                        self._json(reply, 200)
+                    elif path == "/api/local/enroll":
+                        # Only the holder of the legacy device token (an install
+                        # that already had one) enrols over the LAN. A new phone
+                        # with no token enrols over Bluetooth (PoP) or through the
+                        # owner's account -- never by being on the network.
+                        if not self._token_ok():
+                            self._json({"error": "enrolling over the network needs the device token",
+                                        "code": "token_required"}, 401)
+                            return True
+                        payload = self._read_json()
+                        self._json(authority.enroll(payload.get("public_key"), payload.get("name"), "token"), 201)
+                    else:  # /api/local/revoke: any enrolled phone (the owner's) or the token holder
+                        if not self._token_ok():
+                            self._signed_client(path)
+                        payload = self._read_json()
+                        revoked = authority.revoke(payload.get("client_id"))
+                        self._json({"ok": revoked, "revoked": payload.get("client_id") if revoked else None},
+                                   200 if revoked else 404)
+                except la.LocalAuthError as exc:
+                    self._local_refusal(exc)
+                return True
+
+            def do_POST(self) -> None:
+                from core import local_auth as la
+
+                try:
+                    path = urlsplit(self.path).path
+                    if self._local_post(path):
+                        return
+                    if self.headers.get(la.HEADER) and dashboard.local_authority is not None:
+                        # A phone's signed write: verified over the exact body bytes.
+                        try:
+                            self.local_client = self._signed_client(path)
+                        except la.LocalAuthError as exc:
+                            self._local_refusal(exc)
+                            return
+                    elif not self._authorized():
                         self._json({"error": "invalid or missing device token"}, 401)
                         return
                     if self.path.startswith("/setup/wifi"):
@@ -482,6 +597,15 @@ class DashboardServer:
                             return
                         dashboard.request_preset(name)
                         self._json({"ok": True, "switching_to": name}, 202)
+                    elif path == "/api/network/direct":
+                        payload = self._read_json()
+                        if payload.get("confirm") is not True:
+                            self._json({"error": "switching networks requires \"confirm\": true",
+                                        "code": "confirmation_required"}, 400)
+                            return
+                        by = "from the app on the device's network" if self.local_client is not None \
+                            else "with the device token"
+                        self._json(*dashboard.request_direct_mode(str(payload.get("action", "")).lower(), by))
                     elif self.path.startswith("/api/protection"):
                         payload = self._read_json()
                         action = str(payload.get("action", "")).lower()
@@ -491,7 +615,11 @@ class DashboardServer:
                         if action == "stop" and payload.get("confirm") is not True:
                             self._json({"error": "stopping monitoring requires \"confirm\": true"}, 400)
                             return
-                        dashboard.request_protection({"action": action, "confirm": payload.get("confirm") is True})
+                        request = {"action": action, "confirm": payload.get("confirm") is True}
+                        if self.local_client is not None:
+                            # Recorded as the app on this network, with which phone.
+                            request.update(by="local_app", client=self.local_client.client_id)
+                        dashboard.request_protection(request)
                         self._json({"ok": True, "requested": action}, 202)
                     else:
                         self.send_response(404)
@@ -501,9 +629,31 @@ class DashboardServer:
 
             def do_GET(self) -> None:
                 try:
-                    if (self.path.startswith("/api") or self.path.startswith("/stream")) and not self._authorized():
-                        self._json({"error": "invalid or missing device token"}, 401)
+                    path = urlsplit(self.path).path
+                    if path == "/api/local/hello":
+                        # Unauthenticated by design: it hands out a single-use
+                        # challenge and the device's public-key fingerprint (both
+                        # useless without an enrolled key), nothing else.
+                        authority = dashboard.local_authority
+                        if authority is None:
+                            self._json({"error": "local access is not available on this device",
+                                        "code": "local_access_off"}, 404)
+                            return
+                        from core import local_auth as la
+
+                        self._json({"contract": la.CONTRACT, "device_id": authority.device_id,
+                                    "device_key_fp": authority.identity.fingerprint,
+                                    "challenge": authority.issue_challenge(),
+                                    "challenge_ttl_s": int(la.CHALLENGE_TTL_S),
+                                    "token_enrollment": dashboard._token is not None})
                         return
+                    if self.path.startswith("/api") or self.path.startswith("/stream"):
+                        self.local_client = self._session_client()
+                        if self.local_client is None and not self._authorized():
+                            # A phone whose session ended is told so, and opens a new one.
+                            code = "session_invalid" if self.headers.get("X-SD-Session") else "unauthorized"
+                            self._json({"error": "invalid or missing device token", "code": code}, 401)
+                            return
                     # Compare the PATH, not the raw request line. An operator
                     # opens the page as `/?token=...` when a token is configured,
                     # and an exact match on "/" 404s that -- so the one URL the
@@ -545,10 +695,25 @@ class DashboardServer:
                             with contextlib.suppress(ValueError):
                                 limit = min(2000, int(self.path.rsplit("limit=", 1)[1].split("&")[0]))
                         self._json({"events": dashboard.history(limit)})
+                    elif path == "/api/network/direct":
+                        self._json(*dashboard.direct_mode_status())
+                    elif path == "/api/events":
+                        self._json(*dashboard.events_response(parse_qs(urlsplit(self.path).query)))
+                    elif path == "/api/local/clients":
+                        authority = dashboard.local_authority
+                        if authority is None:
+                            self._json({"error": "local access is not available on this device",
+                                        "code": "local_access_off"}, 404)
+                        else:
+                            self._json({"clients": authority.clients_view(),
+                                        "this_client": self.local_client.client_id if self.local_client else None})
                     elif self.path.startswith("/api/stream/stats"):
                         self._json(dashboard.stream_stats())
                     elif self.path.startswith("/stream"):
                         heartbeat = self.headers.get("X-Stream-Heartbeat", "") == "1"
+                        # M13 sd-overlay/1: clean frames + the analysis as a header.
+                        overlay = (self.headers.get("X-Stream-Overlay", "") == "1"
+                                   or (parse_qs(urlsplit(self.path).query).get("overlay") or [""])[0] == "1")
                         local = cp.peer_is_local(self.client_address[0] if self.client_address else None)
                         self.send_response(200)
                         self.send_header(
@@ -560,6 +725,8 @@ class DashboardServer:
                         # M8.4: what this viewer may see right now (it can change
                         # mid-stream; heartbeats carry the change).
                         self.send_header("X-Stream-Camera", dashboard.stream_access(local))
+                        if overlay:
+                            self.send_header("X-Stream-Overlay", "sd-overlay/1")
                         if heartbeat:
                             self.send_header(
                                 "X-Stream-Heartbeat-Interval-Ms", str(int(dashboard.HEARTBEAT_INTERVAL_S * 1000))
@@ -569,7 +736,18 @@ class DashboardServer:
                         # its own thread, and only this long (_STREAM_SEND_TIMEOUT_S).
                         with contextlib.suppress(OSError):
                             self.connection.settimeout(dashboard._stream_send_timeout_s)
-                        dashboard.serve_stream(self.wfile.write, self._peer_gone, heartbeat=heartbeat, local=local)
+                        peer_gone = self._peer_gone
+                        if self.local_client is not None:
+                            # A phone's stream ends the moment that phone is revoked.
+                            # (Session expiry is checked at connect; the app renews
+                            # before it ends, and a stream is not cut mid-view.)
+                            client_id = self.local_client.client_id
+                            authority = dashboard.local_authority
+
+                            def peer_gone() -> bool:
+                                return self._peer_gone() or not authority.client_active(client_id)
+                        dashboard.serve_stream(self.wfile.write, peer_gone, heartbeat=heartbeat, local=local,
+                                               overlay=overlay)
                     else:
                         self.send_response(404)
                         self.end_headers()
@@ -665,13 +843,27 @@ class DashboardServer:
     def stream_interval(self) -> float:
         return self._stream_interval
 
-    def viewer_joined(self) -> None:
+    def viewer_joined(self, overlay: bool = False) -> None:
         with self._lock:
             self._viewers += 1
+            if overlay:
+                self._overlay_viewers += 1
 
-    def viewer_left(self) -> None:
+    def viewer_left(self, overlay: bool = False) -> None:
         with self._lock:
             self._viewers = max(0, self._viewers - 1)
+            if overlay:
+                self._overlay_viewers = max(0, self._overlay_viewers - 1)
+
+    def wants_overlay(self) -> bool:
+        """M13: a viewer is drawing sd-overlay/1 itself (clean frames + analysis)."""
+        with self._lock:
+            return self._overlay_viewers > 0
+
+    def wants_annotated(self) -> bool:
+        """A viewer wants the device-drawn view (the browser page, an older app)."""
+        with self._lock:
+            return self._viewers > self._overlay_viewers
 
     def has_viewers(self) -> bool:
         """True while at least one client is reading /stream."""
@@ -692,7 +884,7 @@ class DashboardServer:
         self._frame_source = source
 
     def serve_stream(self, write: Callable[[bytes], object], peer_gone: Callable[[], bool],
-                     heartbeat: bool = False, local: bool = False) -> None:
+                     heartbeat: bool = False, local: bool = False, overlay: bool = False) -> None:
         """Feed one viewer until it leaves. Runs on that viewer's handler thread.
 
         Latest-frame-only by construction: each pass reads the ONE shared slot
@@ -718,7 +910,7 @@ class DashboardServer:
             self._stream_counts["connections_total"] += 1
         # Registering as a viewer is what makes the main loop start annotating
         # and encoding at all -- see has_viewers().
-        self.viewer_joined()
+        self.viewer_joined(overlay)
         last_write = time.monotonic()
         try:
             # `not peer_gone()`, not `while True`: the loop used to learn that a
@@ -739,7 +931,7 @@ class DashboardServer:
                             self._stream_counts["privacy_heartbeats"] += 1
                     time.sleep(self.stream_interval)
                     continue
-                frame = self._current_frame()
+                frame = self._current_frame(overlay)
                 now = time.monotonic()
                 if frame is not None and frame.seq != client.last_seq:
                     if now - frame.captured_at > self.MAX_FRAME_AGE_S:
@@ -751,7 +943,7 @@ class DashboardServer:
                         # One write per part: header, JPEG and trailer together
                         # (the handler's wfile is unbuffered -- four writes were
                         # four syscalls per frame).
-                        header = _part_header(frame, self._stream_id, now, _source_for(frame, access))
+                        header = _part_header(frame, self._stream_id, now, _source_for(frame, access), overlay)
                         payload = b"".join((header, frame.jpeg, b"\r\n"))
                         write(payload)
                         skipped = max(0, frame.seq - client.last_seq - 1) if client.last_seq else 0
@@ -783,7 +975,7 @@ class DashboardServer:
         finally:
             with self._lock:
                 self._clients.pop(key, None)
-            self.viewer_left()
+            self.viewer_left(overlay)
 
     # ------------------------------------------------------------------ camera privacy (M8.4)
     def stream_access(self, local: bool = False) -> str:
@@ -816,8 +1008,20 @@ class DashboardServer:
         return self._camera_privacy.report(stopped=stopped, dashboard=True,
                                            local_while_stopped=self._local_camera_while_stopped)
 
-    def _current_frame(self) -> Optional[_StreamFrame]:
-        """The slot's frame, refreshed from the camera when the runtime is not drawing."""
+    def _current_frame(self, overlay: bool = False) -> Optional[_StreamFrame]:
+        """The slot's frame, refreshed from the camera when the runtime is not drawing.
+
+        `overlay`: the clean analysed frame while the runtime is drawing; otherwise
+        the same camera fallback every viewer gets (no analysis, so no overlay).
+        """
+        if overlay:
+            with self._lock:
+                clean, annotated_at = self._clean_frame, self._annotated_at
+            if annotated_at and time.monotonic() - annotated_at < self.ANNOTATION_GAP_S:
+                # The runtime is drawing: this viewer gets the clean analysed frame
+                # (None for the one tick before the first one is encoded), never the
+                # device-drawn picture with graphics burned in.
+                return clean
         with self._lock:
             frame, annotated_at = self._frame, self._annotated_at
         source = self._frame_source
@@ -922,6 +1126,19 @@ class DashboardServer:
                 )
                 self._annotated_at = now
 
+    def push_overlay_frame(self, clean_bgr: np.ndarray, overlay_header: str,
+                           captured_at: Optional[float] = None) -> None:
+        """M13: the clean analysed frame and its sd-overlay/1 header (core/overlay.py)."""
+        ok, buf = cv2.imencode(".jpg", clean_bgr, [int(cv2.IMWRITE_JPEG_QUALITY), self._jpeg_quality])
+        if ok:
+            now = time.monotonic()
+            with self._lock:
+                self._jpeg_seq += 1
+                self._clean_frame = _StreamFrame(
+                    buf.tobytes(), self._jpeg_seq, now if captured_at is None else float(captured_at), "annotated",
+                    overlay=overlay_header)
+                self._annotated_at = now
+
     def push_event(self, event, severity: str = "log") -> None:
         """Record one Event for the timeline. severity: 'loud' | 'soft' | 'log'.
 
@@ -944,6 +1161,105 @@ class DashboardServer:
             )
             self._counts[event.type] += 1
             self._flash_until = time.time() + FLASH_DURATION_S
+            # M13: the newest ALERT, for the live overlay's "why" line. Only
+            # loud/soft: the app shows nothing for a "log" record (LiveOverlay.swift
+            # OverlayWhyLine.make), so one landing after an alert -- an experimental
+            # observation, a re-detected phone -- blanked that alert's why line (M14).
+            if severity in ("loud", "soft"):
+                key = getattr(event, "event_id", None)
+                self._last_event = {"type": event.type, "signals": str(event.contributing_signals or "")[:200],
+                                    "severity": severity, "at": time.monotonic(),
+                                    # The history row's event_key (core/local_events.py), so the app
+                                    # can tie the live "why" line to its row and sync badge.
+                                    "event_key": key if isinstance(key, str) and 0 < len(key) <= 64 else None}
+        journal = self.event_journal
+        if journal is not None:
+            # M12: the same event_id the uplink sends as event_key (core/local_events.py).
+            delivery = None
+            lookup = self.delivery_lookup
+            if callable(lookup):
+                with contextlib.suppress(Exception):
+                    delivery = lookup(event)
+            journal.record(event, severity, delivery=delivery)
+
+    _last_event: Optional[dict] = None
+
+    def last_event_summary(self, max_age_s: float = 30.0) -> Optional[dict]:
+        """The newest event while it is recent: what the device itself wrote about it."""
+        with self._lock:
+            last = self._last_event
+        if last is None:
+            return None
+        age = time.monotonic() - last["at"]
+        if age > max_age_s:
+            return None
+        out = {"type": last["type"], "signals": last["signals"], "severity": last["severity"],
+               "age_s": round(age, 1)}
+        if last.get("event_key"):
+            out["event_key"] = last["event_key"]
+        return out
+
+    #: Set by the runtime (the alert policy's `delivery`): what each event actuated.
+    delivery_lookup: Optional[Callable] = None
+    #: M12: core/direct_mode.DirectModeManager when network.direct_mode.enabled, else None.
+    direct_mode = None
+
+    def direct_mode_status(self) -> tuple[dict, int]:
+        manager = self.direct_mode
+        if manager is None:
+            return {"mode": "unavailable", "reason": "direct mode is not enabled on this device "
+                    "(network.direct_mode.enabled: false)", "code": "direct_mode_off"}, 404
+        return manager.status(), 200
+
+    def request_direct_mode(self, action: str, by: str) -> tuple[dict, int]:
+        """Enter or leave the device's own access point, on a worker thread.
+
+        Answered BEFORE the switch: on home Wi-Fi the phone loses the device the
+        moment the radio changes, so the outcome is read afterwards (status on
+        whichever network the phone then shares with the device), never assumed.
+        """
+        manager = self.direct_mode
+        if manager is None:
+            return self.direct_mode_status()
+        if action not in ("enter", "leave"):
+            return {"error": "action must be 'enter' or 'leave'", "code": "bad_request"}, 400
+        run = manager.enter if action == "enter" else manager.leave
+
+        def worker() -> None:
+            try:
+                if action == "enter":
+                    run(f"requested {by}", by="explicit")
+                else:
+                    run(f"requested {by}")
+            except Exception:  # the manager reports its own errors in status()
+                log.exception("direct mode %s failed", action)
+
+        threading.Thread(target=worker, daemon=True, name=f"direct-mode-{action}").start()
+        return {"ok": True, "requested": action, "status": manager.status()}, 202
+
+    def events_response(self, query: dict) -> tuple[dict, int]:
+        """GET /api/events (sd-local-events/1): newest first, or `after=<seq>` oldest first."""
+        journal = self.event_journal
+        if journal is None:
+            return {"error": "this device keeps no local event journal", "code": "no_journal"}, 404
+        try:
+            limit = int((query.get("limit") or ["100"])[0])
+            raw_after = (query.get("after") or [None])[0]
+            after = None if raw_after in (None, "") else int(raw_after)
+        except (TypeError, ValueError):
+            return {"error": "limit and after must be integers", "code": "bad_request"}, 400
+        provider = self.pending_event_keys
+        pending: Optional[set] = None
+        if callable(provider):
+            try:
+                pending = set(provider())
+            except Exception:  # noqa: BLE001 - unknown backlog: say "pending", never "sent"
+                pending = None
+        page = journal.page(after=after, limit=limit, pending_keys=pending or set(), uplink=callable(provider))
+        if callable(provider) and pending is None:
+            for item in page["events"]:
+                item["sync"] = "unknown"
+        return page, 200
 
     def flash_active(self, now: Optional[float] = None) -> bool:
         """True for FLASH_DURATION_S after the most recent push_event() call.

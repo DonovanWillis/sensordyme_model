@@ -91,6 +91,16 @@ final class AlertNotifier: NSObject, ObservableObject {
         set { UserDefaults.standard.set(newValue.identities, forKey: Self.soundedKey) }
     }
 
+    /// M12: the device event keys already announced on this phone, from either
+    /// transport (the account or the camera directly). One banner per event_key:
+    /// an alert shown while only the local link was up is not shown again when
+    /// the account delivers it later, and the other way round.
+    private static let announcedKeysKey = "announcedEventKeys"
+    private var announcedKeys: SoundedEvents {
+        get { SoundedEvents(UserDefaults.standard.stringArray(forKey: Self.announcedKeysKey) ?? []) }
+        set { UserDefaults.standard.set(newValue.identities, forKey: Self.announcedKeysKey) }
+    }
+
     /// "Alert sound on this iPhone" (Settings → Alerts). On unless turned off.
     nonisolated static var soundEnabled: Bool {
         UserDefaults.standard.object(forKey: AlertSound.enabledKey) as? Bool ?? true
@@ -162,8 +172,11 @@ final class AlertNotifier: NSObject, ObservableObject {
         var toPost: [EventItem] = []
         var suppressed = 0
         // Oldest first, so a burst arrives in the order it happened.
+        var keys = announcedKeys
         for id in fresh {
             guard let event = byID[id] else { continue }
+            // Already announced from the camera directly (M12): not twice.
+            if let key = event.eventKey, !key.isEmpty, keys.contains(key) { continue }
 
             // The whole decision lives in NotificationPolicy, which is a pure
             // function with tests. Inlining it here is how it drifted before:
@@ -182,6 +195,7 @@ final class AlertNotifier: NSObject, ObservableObject {
             case .notify:
                 toPost.append(event)
                 lastNotifiedAt = Date()
+                if let key = event.eventKey, !key.isEmpty { keys.insert(key) }
             case .suppress(.withinCooldown):
                 // Recorded, not interrupted. Already in the event history.
                 suppressed += 1
@@ -189,12 +203,80 @@ final class AlertNotifier: NSObject, ObservableObject {
                 break
             }
         }
+        announcedKeys = keys
 
         if suppressed > 0 {
             suppressedDuringCooldown += suppressed
         }
         for event in toPost {
             await post(event, device: device, simulated: simulated)
+        }
+    }
+
+    /// M12 (C6): new events read from a paired camera directly while the
+    /// account server is not connected, through the same rules: NotificationPolicy
+    /// for whether to notify, LocalAlerts.soundDecision (AlertSound + the same
+    /// SoundedEvents) for the sound, one banner per event_key across both paths.
+    /// `events` are the fresh ones only (LocalAlerts.advance never returns the
+    /// backlog). The app must be open: nothing here runs in the background.
+    func announceLocal(_ events: [LocalEvent], deviceName: String, deviceID: Int?) async {
+        guard authorized else { return }
+        var keys = announcedKeys
+        var toPost: [LocalEvent] = []
+        let fetchedAt = Date()
+        for event in events {
+            guard !keys.contains(event.eventKey) else { continue }
+            let item = LocalHistory.eventItem(event, fetchedAt: fetchedAt)
+            let decision = NotificationPolicy.decide(isCritical: item.isCritical, isConfigured: item.isConfigured,
+                                                     alreadySeen: false, now: Date(), lastNotifiedAt: lastNotifiedAt,
+                                                     cooldown: Self.cooldown)
+            switch decision {
+            case .notify:
+                toPost.append(event)
+                lastNotifiedAt = Date()
+                keys.insert(event.eventKey)
+            case .suppress(.withinCooldown):
+                suppressedDuringCooldown += 1
+            case .suppress:
+                break
+            }
+        }
+        announcedKeys = keys
+        for event in toPost {
+            await postLocal(event, item: LocalHistory.eventItem(event, fetchedAt: fetchedAt),
+                            deviceName: deviceName, deviceID: deviceID)
+        }
+    }
+
+    private func postLocal(_ event: LocalEvent, item: EventItem, deviceName: String, deviceID: Int?) async {
+        let content = UNMutableNotificationContent()
+        content.title = AlertSound.title(type: event.type, critical: item.isCritical, simulated: item.isSimulated)
+        content.subtitle = item.isSimulated ? "\(item.title) (simulated)" : item.title
+        var parts = [deviceName, "from the camera directly"]
+        if let signals = event.signals, !signals.isEmpty { parts.append(signals.replacingOccurrences(of: "_", with: " ")) }
+        content.body = parts.joined(separator: " · ")
+        content.userInfo = ["eventID": -1, "deviceID": deviceID ?? -1]
+        content.threadIdentifier = "local-\(deviceName)"
+        var log = sounded
+        let decision = LocalAlerts.soundDecision(event, sounded: log, soundEnabled: Self.soundEnabled)
+        AlertDecisionJournal.record(path: "local", identity: AlertSound.identity(eventKey: event.eventKey, eventID: nil),
+                                    type: event.type, simulated: event.simulated == true, decision: decision)
+        if decision == .play, let identity = AlertSound.identity(eventKey: event.eventKey, eventID: nil) {
+            content.sound = .default
+            log.insert(identity)
+            sounded = log
+        } else {
+            content.sound = nil
+            if decision == .silent(.deliveredLate) {
+                content.body += event.ageS.map { " Happened \(Int($0 / 60)) min ago." } ?? " From before the camera last restarted."
+            }
+        }
+        content.interruptionLevel = .active
+        let request = UNNotificationRequest(identifier: "local-\(event.eventKey)", content: content, trigger: nil)
+        do {
+            try await UNUserNotificationCenter.current().add(request)
+        } catch {
+            lastError = error.localizedDescription
         }
     }
 
@@ -221,8 +303,11 @@ final class AlertNotifier: NSObject, ObservableObject {
             type: event.type, severity: event.severity, experimental: event.isExperimental,
             deliveredLate: event.deliveryDelay != nil,
             alreadySounded: identity.map { log.contains($0) } ?? true,
-            soundEnabled: Self.soundEnabled
+            soundEnabled: Self.soundEnabled,
+            simulated: event.isSimulated
         )
+        AlertDecisionJournal.record(path: "account", identity: identity, type: event.type,
+                                    simulated: event.isSimulated, decision: decision)
         if decision == .play, let identity {
             content.sound = .default
             log.insert(identity)
@@ -281,7 +366,11 @@ extension AlertNotifier: UNUserNotificationCenterDelegate {
         _ center: UNUserNotificationCenter,
         willPresent notification: UNNotification
     ) async -> UNNotificationPresentationOptions {
-        AlertNotifier.soundEnabled ? [.banner, .sound, .list] : [.banner, .list]
+        // Automated Simulator runs that never asked for permission (-orynNoPrompt,
+        // DEBUG only; always false in Release): a banner from a run that did ask
+        // (journey 32) must not cover the screen a later journey is checking.
+        if DebugLaunch.noPermissionPrompt { return [.list] }
+        return AlertNotifier.soundEnabled ? [.banner, .sound, .list] : [.banner, .list]
     }
 
     nonisolated func userNotificationCenter(
@@ -297,5 +386,40 @@ extension AlertNotifier: UNUserNotificationCenterDelegate {
             AlertNotifier.shared.pendingDeviceID = deviceID
             AlertNotifier.shared.pendingEventID = id
         }
+    }
+}
+
+/// Every alert-sound decision this phone made, one JSON line each, for the
+/// XCUITest journeys only (journey 32 reads it through the scenario controller,
+/// scripts/sim/uitest_control.py `GET /app/alert-decisions`): the sound itself
+/// cannot be observed from a UI test. DEBUG builds only; in Release `record`
+/// does nothing and nothing is written.
+enum AlertDecisionJournal {
+    #if DEBUG
+    static var url: URL {
+        FileManager.default.urls(for: .cachesDirectory, in: .userDomainMask)[0]
+            .appendingPathComponent("alert-decisions.jsonl")
+    }
+    #endif
+
+    static func record(path: String, identity: String?, type: String, simulated: Bool, decision: AlertSound.Decision) {
+        #if DEBUG
+        let word: String = switch decision {
+        case .play: "play"
+        case .silent(let reason): "silent:\(reason)"
+        }
+        let line: [String: Any] = ["path": path, "identity": identity ?? NSNull(), "type": type,
+                                   "simulated": simulated, "decision": word,
+                                   "at": Date().timeIntervalSince1970]
+        guard var data = try? JSONSerialization.data(withJSONObject: line, options: [.sortedKeys]) else { return }
+        data.append(0x0A)
+        if let handle = try? FileHandle(forWritingTo: url) {
+            defer { try? handle.close() }
+            _ = try? handle.seekToEnd()
+            try? handle.write(contentsOf: data)
+        } else {
+            try? data.write(to: url, options: .atomic)
+        }
+        #endif
     }
 }

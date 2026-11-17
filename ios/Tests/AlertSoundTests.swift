@@ -73,6 +73,14 @@ check(onTime.deliveryDelay == nil, "a 2-second arrival does not")
 print("\nthe person can turn it off:")
 check(sound(enabled: false) == .silent(.turnedOff), "off means silent, for every alert")
 
+print("\na simulated alert never sounds (M12), on either path:")
+check(AlertSound.decide(type: "distraction", severity: "loud", experimental: false, deliveredLate: false,
+                        alreadySounded: false, soundEnabled: true, simulated: true) == .silent(.simulated),
+      "a simulated driver alert is silent")
+check(AlertSound.decide(type: "distraction", severity: "loud", experimental: false, deliveredLate: false,
+                        alreadySounded: false, soundEnabled: true, simulated: false) == .play,
+      "the same real alert plays")
+
 print("\na simulated alert says so in the headline:")
 check(AlertSound.title(type: "distraction", critical: true, simulated: false) == "Driver alert", "a real driver alert")
 check(AlertSound.title(type: "phone_use", critical: true, simulated: true) == "Simulated · Driver alert",

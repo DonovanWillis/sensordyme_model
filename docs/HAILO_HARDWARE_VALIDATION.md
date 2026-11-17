@@ -14,6 +14,66 @@ buzzer on BCM 17 (`alerts.gpio_buzzer_pin`). Model:
 `e69136d3ebf3cc8ebaf3da5417a59962b139f3d3d67d715e9a9b1ae10963960e`
 (`accelerator.yolo_hef_sha256`).
 
+## M14 addition (2026-11-16): the decoder experiment as ONE command
+
+Prepared and dry-run on the Mac only (`--fake`, SIMULATED, exit 3). **Not run on hardware.**
+`hwv_stage.py decoder-exp` composes the existing stages; it is not a second validation system.
+
+```bash
+export U=<service user>  D=/home/$U/sensordyme  PY=$D/.venv/bin/python
+V=~/hwval/sensordyme_model/scripts/hw_validation
+sudo systemctl stop sensordyme.service                  # the tool never does this itself; it prints BLOCKED instead
+$PY $V/hwv_stage.py decoder-exp --install-dir $D --package ~/transfer-<id>      # one evidence dir; 20-30 min estimated, never timed on a Pi
+sudo systemctl start sensordyme.service && systemctl is-active sensordyme.service
+```
+
+Options: `--images DIR` (an extra, consented image set captured for calibration readiness),
+`--labels FILE` (human-verified boxes, `sensordyme.hwval.image_labels/1`, for precision/recall),
+`--video clip.mp4` (identical frames for every pipeline block instead of the live camera),
+`--block-seconds 60 --rounds 1` (a shorter pipeline phase), `--cabin-scores L.json,R.json` (criterion C11),
+`HAILO_TEMP_CMD` (a verified read-only Hailo temperature command, as for `thermal_soak.sh`).
+
+**Order** (each stage writes its usual report under `<evidence>/stages/`):
+1. Refusals before the chip is touched: `.hef` sha256 == config pin == `e69136d3…960e`, service stopped, nothing holds `/dev/hailo0`.
+2. `pins`, `model`, `parse-hef`, `capture` (known-good images → `<evidence>/capture/`), `parity --decoder both`.
+3. **Same tensors, both decoders** (`decoders.json`): every captured INT8 tensor through the product's own `core.accel` decoders (device-free) and `hwv_decode`'s `LEGACY` / `DEVICE_REFERENCE`. Records equality, the classes each emits (none ≥ 80: channel 80 is dropped), the channel-80 maximum, and decode time on the Pi CPU at the module's own query (its `yolo_classes` + person, at 0.20).
+4. **Calibration readiness** (`calibration.json`): per-class (person, phone) score histograms per decoder, counts at the production gates (0.50 / 0.20), and the count-matched reference threshold. With `--labels`, precision/recall at the gates and reference recall at legacy's precision. **No threshold is proposed or changed.**
+5. `latency --latency-decoder both`.
+6. **Pipeline fps** (`pipeline.json`): `driver_attention` end to end, legacy and reference in ABBA blocks. Each block uses the same frame source and one camera configuration, starts in the same thermal state, and records the decoder the loaded model actually ran.
+7. **Thermal** (`thermal.csv`): `vcgencmd measure_temp / get_throttled / measure_clock arm` every 5 s on a background thread and at every phase boundary, plus the Hailo die temperature when it can be read.
+8. **Gate** (`DECISION.md`, `evidence.json`, `SHA256SUMS`).
+
+**Gate.** It prints `KEEP LEGACY` unless every criterion passes. Even then it prints only "ELIGIBLE FOR OWNER REVIEW — production stays LEGACY", and it never edits config.
+
+| id | criterion |
+|---|---|
+| C0 | pins agree; installed decoder `legacy`; parse-hef HAILO8L, six raw outputs, no NMS |
+| C1 | `.hef` sha256 == config pin == `PRODUCTION_HEF_SHA256`, unchanged after the run |
+| C2 | capture complete; class heads in [0,1]; inputs bit-identical to the float run |
+| C3 | the device's production decoder == offline legacy on the device tensors |
+| C4 | `core.accel` reference == `hwv_decode.DEVICE_REFERENCE` (and legacy == `LEGACY`) on every captured tensor |
+| C5 | class map 0 = person, 67 = cell phone; no decoder emits a class ≥ 80 |
+| C6 | (provisional) reference passes its own INT8-vs-float parity checks and is no worse than legacy (errors ≤, \|Δscore\| p95 within +0.02) |
+| C7 | reference `predict()` p95 inside the stride budget, on the Hailo path |
+| C8 | (provisional) reference end-to-end fps ≥ 0.97 × legacy, < 1 % late, each block ran the decoder it claims |
+| C9 | no live throttle bit and no new "occurred" bit during the run |
+| C10 | a Raspberry Pi with a real Hailo device (never `--fake`) |
+| C11 | in-cabin comparison from verified labels: reference false alerts/h ≤ legacy and caught ≥ legacy (`--cabin-scores`; otherwise NOT EVALUATED) |
+| C12 | `config.yaml` sha256 unchanged by the run |
+
+The six known-good images contain no people and no phones. A handful of images does not prove real-world accuracy, and
+the gate says so in every output. The 30-minute soak under the running service (`thermal`) stays a separate stage.
+
+**Dry run** (Mac, `--fake`, 2026-11-16; SIMULATED). The stand-in chip plants a person, a phone that shares its anchor
+with a stronger "remote", and a lit channel 80. Results:
+- the product decoders equal the offline specs on all 6 samples, and no class ≥ 80 is emitted;
+- legacy keeps 0 phones at 0.20 and reference keeps 5. This is the multilabel difference, by construction;
+- the gate printed `KEEP LEGACY (criteria not passed: C8, C9, C10, C11)` and the run exited 3.
+
+Pinned by `tests/test_m14_decoder_experiment.py`. **Unverified until the Pi:** the in-process Hailo temperature read
+(`Device.control.get_chip_temperature()` through the held VDevice), every Pi number, and the pipeline phase on the live
+camera.
+
 ## M10 additions (2026-11-14): the runtime's own stage timings, and a single- vs dual-detector comparison
 
 Prepared, dry-run on the Mac only (`--fake`, SIMULATED, exit 3). **Not run on hardware.**

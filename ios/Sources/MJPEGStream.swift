@@ -47,6 +47,10 @@ enum MJPEGStreamState: Equatable {
     case unauthorized(hasToken: Bool)
     /// The configured address is not usable as a URL. Also unfixable by retrying.
     case unusableAddress
+    /// M12: the camera no longer trusts this iPhone's local key (403
+    /// `unknown_client`: revoked, or idle too long). Pairing again fixes it;
+    /// retrying never does.
+    case needsPairing
 
     /// Whether the app should keep retrying by itself.
     ///
@@ -55,7 +59,7 @@ enum MJPEGStreamState: Equatable {
     /// forever about something that is never going to connect.
     var isRecoverableAutomatically: Bool {
         switch self {
-        case .unauthorized, .unusableAddress: false
+        case .unauthorized, .unusableAddress, .needsPairing: false
         default: true
         }
     }
@@ -116,6 +120,8 @@ enum MJPEGStreamState: Equatable {
                 : "this device requires a token — add it in Settings → Device token"
         case .unusableAddress:
             return "device address isn't a valid URL — check Settings → Live feed"
+        case .needsPairing:
+            return "this iPhone needs to be paired with the camera again"
         }
     }
 }
@@ -141,6 +147,17 @@ struct MJPEGPartMeta: Equatable {
     var status: String?
     /// `X-Camera-Age-Ms` on a heartbeat: how old the camera's own newest frame is.
     var cameraAgeMs: Int?
+    /// M13 `X-SD-Overlay` (sd-overlay/1, docs/LIVE_OVERLAY.md): what the AI saw
+    /// on THIS part's frame, still encoded (LiveOverlay.decode). Nil when the
+    /// part carries none -- a camera fallback frame, a viewer that didn't ask,
+    /// older firmware -- or when it was refused for its size.
+    var overlay: String?
+    /// The part carried an `X-SD-Overlay` larger than `maxOverlayBytes`; it was
+    /// dropped unread, and the frame is shown as not analysed.
+    var overlayRefused = false
+
+    /// The largest `X-SD-Overlay` kept (the device bounds it below 4 KB).
+    static let maxOverlayBytes = 16 * 1024
 
     /// Header names, spelled once (they must match core/dashboard.py).
     enum Header {
@@ -151,6 +168,7 @@ struct MJPEGPartMeta: Equatable {
         static let heartbeat = "x-stream-heartbeat"
         static let status = "x-stream-status"
         static let cameraAge = "x-camera-age-ms"
+        static let overlay = "x-sd-overlay"
     }
 
     /// Parse one part's header block. Lines that are not `Name: value` (the
@@ -177,6 +195,9 @@ struct MJPEGPartMeta: Equatable {
         meta.isHeartbeat = fields[Header.heartbeat] == "1"
         meta.status = fields[Header.status]
         meta.cameraAgeMs = fields[Header.cameraAge].flatMap { Int($0) }
+        if let overlay = fields[Header.overlay], !overlay.isEmpty {
+            if overlay.utf8.count <= maxOverlayBytes { meta.overlay = overlay } else { meta.overlayRefused = true }
+        }
         return meta
     }
 }
@@ -212,6 +233,25 @@ enum MJPEGResponse: Equatable {
         let meta = MJPEGPartMeta.from(fields: fields)
         return meta.isHeartbeat ? .heartbeat(meta) : .frameHeader(meta)
     }
+
+    /// M13: whether the stream's response says it carries sd-overlay/1
+    /// (`X-Stream-Overlay: sd-overlay/1`). A device that predates it ignores the
+    /// request header and answers without this: its frames then carry the
+    /// device-drawn picture and no analysis, and the app says so.
+    static func overlayCapable(headers: [String: String]) -> Bool {
+        headers.first { $0.key.lowercased() == "x-stream-overlay" }?.value
+            .trimmingCharacters(in: .whitespaces) == LiveOverlayRequest.schema
+    }
+}
+
+/// M13: the sd-overlay/1 request (docs/LIVE_OVERLAY.md).
+enum LiveOverlayRequest {
+    /// Asks for CLEAN frames with an `X-SD-Overlay` analysis per part. Asked on
+    /// every connection: the clean picture is the consumer view, and the AI
+    /// view draws the analysis over the same frames. Grants nothing (auth is
+    /// the session or token).
+    static let header = "X-Stream-Overlay"
+    static let schema = "sd-overlay/1"
 }
 
 /// One complete thing the stream delivered.
@@ -240,7 +280,9 @@ struct MJPEGFrameParser {
     private static let headerEnd = Data("\r\n\r\n".utf8)
     /// A header block longer than this is not one; a non-image body longer
     /// than this is not a heartbeat. Both are discarded rather than held.
-    static let maxHeaderBytes = 4096
+    /// M13: room for an `X-SD-Overlay` line (kept up to
+    /// MJPEGPartMeta.maxOverlayBytes) beside the other part headers.
+    static let maxHeaderBytes = 20 * 1024
 
     /// Hard ceiling on retained bytes. A stream that never yields a complete
     /// frame -- a wrong endpoint, a truncated encoder, a corrupted link -- must
@@ -409,6 +451,20 @@ enum MJPEGStreamRequest {
     /// string is a 401 that looks exactly like a wrong token.
     static let tokenHeader = "X-Device-Token"
 
+    /// M12 (docs/LOCAL_ACCESS.md §3.3): the feed's credential is either the
+    /// legacy dashboard token or an sd-local-v1 session, carried through the
+    /// same `token` string everywhere (the shared coordinator, retargeting) and
+    /// told apart here by this prefix. A session goes out as `X-SD-Session`,
+    /// a token as `X-Device-Token`; never both, never in the URL.
+    static let sessionPrefix = "sd-session:"
+
+    static func sessionCredential(_ session: String) -> String { sessionPrefix + session }
+
+    /// The session inside a credential, or nil for a legacy token.
+    static func session(in credential: String) -> String? {
+        credential.hasPrefix(sessionPrefix) ? String(credential.dropFirst(sessionPrefix.count)) : nil
+    }
+
     /// Nil when `base` cannot be a stream URL -- see MJPEGStreamURL.
     static func make(base: String, token: String, idleTimeout: TimeInterval = 15) -> URLRequest? {
         guard let url = MJPEGStreamURL.streamURL(forBase: base) else { return nil }
@@ -422,13 +478,18 @@ enum MJPEGStreamRequest {
         // paste makes the CORRECT secret return 401 -- and a value written by an
         // older build never passed through the trimming setter.
         let cleaned = token.trimmingCharacters(in: .whitespacesAndNewlines)
-        if !cleaned.isEmpty {
+        if let session = session(in: cleaned) {
+            if !session.isEmpty { request.setValue(session, forHTTPHeaderField: "X-SD-Session") }
+        } else if !cleaned.isEmpty {
             request.setValue(cleaned, forHTTPHeaderField: tokenHeader)
         }
         // M8.3: ask for heartbeat parts. A device that predates them ignores an
         // unknown request header; one that knows them answers with
         // X-Stream-Heartbeat-Interval-Ms. It grants nothing: auth is the token.
         request.setValue("1", forHTTPHeaderField: heartbeatHeader)
+        // M13: clean frames + what the AI saw on each (sd-overlay/1). A device
+        // that predates it ignores the header and sends what it always sent.
+        request.setValue("1", forHTTPHeaderField: LiveOverlayRequest.header)
         return request
     }
 
@@ -539,7 +600,23 @@ enum MJPEGReaderPolicy {
         currentBase: String, currentToken: String,
         base: String, token: String
     ) -> Bool {
-        stopped || state == .idle || base != currentBase || token != currentToken
+        if stopped || state == .idle || base != currentBase { return true }
+        // M12: a RENEWED local session for a stream that is still healthy is
+        // not a reason to reconnect. The device checks a session when the
+        // stream connects and never cuts one mid-view, so the new session is
+        // simply used for the next connection (`credentialUpdate`).
+        if MJPEGStreamRequest.session(in: currentToken) != nil, MJPEGStreamRequest.session(in: token) != nil,
+           state == .streaming || state == .waitingForFrames {
+            return false
+        }
+        return token != currentToken
+    }
+
+    /// The credential to keep for the next connection when `needsRestart` said
+    /// no: a renewed session replaces the old one; anything else is unchanged.
+    static func credentialUpdate(currentToken: String, token: String) -> String {
+        MJPEGStreamRequest.session(in: currentToken) != nil && MJPEGStreamRequest.session(in: token) != nil
+            ? token : currentToken
     }
 
     /// What a finished connection means.
@@ -547,6 +624,11 @@ enum MJPEGReaderPolicy {
         /// The device refused the token. Not retried: no amount of waiting
         /// supplies a token.
         case unauthorized(hasToken: Bool)
+        /// M12: the local session ended (expired, the camera restarted, another
+        /// address): open a new one and reconnect. Not a transport failure.
+        case renewSession
+        /// M12: 403 for a local session: this iPhone is no longer trusted.
+        case needsPairing
         /// Try again. `countsAsTransportFailure` is false when the device DID
         /// answer: re-resolving its address cannot help with a camera that
         /// stopped producing frames.
@@ -558,7 +640,9 @@ enum MJPEGReaderPolicy {
     /// - Parameters:
     ///   - status: the HTTP status of the finished task's response, nil when
     ///     nothing answered.
-    static func completion(status: Int?, error: Error?, hasToken: Bool) -> Completion {
+    static func completion(status: Int?, error: Error?, hasToken: Bool, usesSession: Bool = false) -> Completion {
+        if usesSession, status == 401 { return .renewSession }
+        if usesSession, status == 403 { return .needsPairing }
         if status == 401 || status == 403 { return .unauthorized(hasToken: hasToken) }
         if status == 200 {
             // The device answered and then went quiet. Calling that "the device

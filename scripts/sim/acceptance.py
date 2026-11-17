@@ -273,7 +273,7 @@ JOURNEYS: tuple[Journey, ...] = (
             "test_sim_e2e.py::test_backend_outage_goes_stale_device_keeps_monitoring_and_reconnects; "
             "test_m8_lifecycle_e2e.py (local alerts continue, queue bounded, flushed once); twin_faults "
             "(backend restart with a pending stop converges once)",
-            ("test15_Offline",),
+            ("test15_Offline", "test29_OfflineLocalCamera", "test32_BackendDownCustomerJourney"),
             "modelled as an unreachable network or an instant backend restart; a backend held down for hours "
             "is not simulated"),
     Journey(22, "offline event queue", ("lifecycle", "events", "reliability_storage", "sim_stress"),
@@ -297,7 +297,7 @@ JOURNEYS: tuple[Journey, ...] = (
             "J (reboot: same identity, mode, rule); test_m8_lifecycle_e2e.py (app restart AND power cut, checked "
             "before any backend contact); truth_failure_matrix F3/F4 (offline while down, new boot protecting); "
             "test_sim_stress.py (12 cycles leak nothing)",
-            ("test17_Recovery",),
+            ("test17_Recovery", "test32_BackendDownCustomerJourney"),
             "a stop is deliberately not persisted: a restarted device comes back protecting"),
     Journey(26, "configuration restoration", ("m85_journeys", "lifecycle", "sim_e2e"),
             "test_m85_journeys_app.py::test_preset_zones_and_rules_all_return_after_a_reboot_onto_the_last_known_"

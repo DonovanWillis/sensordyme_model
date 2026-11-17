@@ -56,6 +56,10 @@ struct DeviceDetailView: View {
     /// camera alone and never this screen.
     @State private var feedSession = LiveFeedSession()
     @State private var showCamera = false
+    /// M13: what the AI saw, drawn over the picture. Off: the clean picture is
+    /// the ordinary view, and it is not remembered between visits.
+    @State private var aiView = false
+    @State private var showPresentation = false
     /// Device health opens itself when there is something to see (the device
     /// isn't reporting, or a component isn't working) and stays folded to one
     /// line while everything works. A tap overrides either way.
@@ -133,12 +137,21 @@ struct DeviceDetailView: View {
                 banners
 
                 // The camera is the centrepiece and always comes first.
-                CameraViewport(device: device, instrument: instrument, session: feedSession) { openCamera() }
+                CameraViewport(device: device, instrument: instrument, session: feedSession,
+                               aiView: $aiView) { openCamera() }
                     .sdZoomSource(.camera, in: zoomNS, cornerRadius: SD.Radius.camera, enabled: zoomEnabled)
                     .padding(.top, SD.Space.xs)
 
                 instrumentPanel
                     .padding(.top, SD.Space.lg)
+
+                // M13: what driver monitoring is doing, from the live analysis
+                // when this iPhone shows the camera, else from the history.
+                if showsDriverPanel {
+                    DriverMonitoringPanel(model: feedSession.reader.overlayModel, monitoring: instrument,
+                                          hasLiveFeed: hasLiveFeed, lastEvent: lastDriverEvent)
+                        .padding(.top, SD.Space.lg)
+                }
 
                 actionKeys
                     .padding(.top, SD.Space.lg)
@@ -279,8 +292,14 @@ struct DeviceDetailView: View {
         }
         .fullScreenCover(isPresented: $showCamera) {
             LiveCameraView(device: device, instrument: instrument,
-                           presence: ConnectionTruth.label(presence), session: feedSession)
+                           presence: ConnectionTruth.label(presence), session: feedSession, aiView: $aiView)
                 .sdZoomDestination(.camera, in: zoomNS, enabled: zoomEnabled)
+        }
+        // M13: presentation mode. Built from this screen's own state on every
+        // update (the 4 s poll, a mode confirmed), so it can never disagree
+        // with the device screen underneath it.
+        .fullScreenCover(isPresented: $showPresentation) {
+            PresentationModeView(content: presentationSource, session: feedSession, onSwitch: { setMode($0) })
         }
         .sheet(isPresented: $showZones) {
             ZoneEditorView(device: device)
@@ -365,6 +384,9 @@ struct DeviceDetailView: View {
             } else if let which = DebugLaunch.openEvent {
                 try? await Task.sleep(for: .seconds(1.5))
                 selectedEvent = which == "experimental" ? events.first(where: \.isExperimental) : events.first
+            } else if DebugLaunch.openPresentation {
+                try? await Task.sleep(for: .seconds(1.5))
+                openPresentation()
             } else if DebugLaunch.openCamera || DebugLaunch.openMode != nil {
                 // A beat on the device screen first, so a recording shows the
                 // zoom out of its source.
@@ -432,6 +454,62 @@ struct DeviceDetailView: View {
 
     /// iOS 18 zoom transitions, unless the reader asked for less motion.
     private var zoomEnabled: Bool { !reduceMotion }
+
+    // MARK: M13 live analysis and presentation
+
+    /// This iPhone shows the camera's live picture (and so its analysis).
+    private var hasLiveFeed: Bool {
+        if case .live = CameraSource(state: state, device: device).kind { return true }
+        return false
+    }
+
+    /// The driver panel belongs to Driver Safety (the Distracted Driving
+    /// product), whenever the device runs it and Jupiter's rules haven't
+    /// replaced it.
+    private var showsDriverPanel: Bool { activeBase == "driver_safety" && !customReplacesModes }
+
+    /// The newest driver event the history holds (not an experimental note).
+    private var lastDriverEvent: EventItem? { DriverEvents.newest(events) }
+
+    /// Presentation mode, from this screen's own state (PresentationSource.swift).
+    private var presentationSource: PresentationSource {
+        let source = CameraSource(state: state, device: device)
+        let picture: PresentationSource.Picture
+        switch source.kind {
+        case .demo: picture = .demo
+        case .live(let url): picture = .live(url)
+        case .none: picture = .none
+        }
+        var notes: [String: String] = [:]
+        for event in events { if let key = event.eventKey, !key.isEmpty { notes[key] = "In this device's activity" } }
+        return PresentationSource(
+            deviceName: device.name, hardwareID: device.hardwareId, managedLocally: false,
+            activePreset: device.activePreset, picture: picture, instrument: instrument,
+            presence: ConnectionTruth.label(presence), modeTitle: modeLine,
+            rule: customMonitoringActive
+                ? device.monitoring.map { .running(title: $0.title, summary: $0.summary,
+                                                   replacesModes: customReplacesModes) } ?? .none
+                : .none,
+            options: presentationOptions,
+            pending: pendingSwitch?.targetBase,
+            failure: failedSwitch.map { $0.reason ?? "Didn't switch — \(device.name) didn't confirm" },
+            latestAlert: alertActive ? events.first { $0.isCritical || $0.isConfigured } : nil,
+            lastDriverEvent: lastDriverEvent,
+            historyNotes: notes)
+    }
+
+    /// The modes presentation mode offers, selected from what the device reports.
+    private var presentationOptions: [PresentationModeOption] {
+        PresentationModeOptions.make(catalog: libraryCatalog, activePreset: device.activePreset,
+                                     customReplacesModes: customReplacesModes,
+                                     isAvailable: { unavailableReason($0) == nil })
+    }
+
+    private func openPresentation() {
+        var transaction = Transaction()
+        transaction.disablesAnimations = reduceMotion
+        withTransaction(transaction) { showPresentation = true }
+    }
 
     private func openCamera() {
         // Under Reduce Motion the camera appears at once rather than sliding
@@ -890,6 +968,15 @@ struct DeviceDetailView: View {
             .buttonStyle(SDPressStyle())
             .accessibilityLabel("Report")
             .accessibilityHint("Estimates from recent events")
+
+            // M13: the camera full screen with what the AI sees, for showing it.
+            Button { openPresentation() } label: {
+                InstrumentKey(icon: "play.rectangle", title: "Present")
+            }
+            .buttonStyle(SDPressStyle())
+            .accessibilityLabel("Presentation mode")
+            .accessibilityHint("Full screen: the camera, what the AI sees, and the mode switch")
+            .accessibilityIdentifier("detail.present")
 
             if state.isDemo {
                 Button { showDemoTrigger = true } label: {
@@ -1635,6 +1722,23 @@ struct DeviceDetailView: View {
         protectionSending = true
         protectionError = nil
         protectionNotice = nil
+        // M12 (LOCAL_ACCESS.md): the camera answers this iPhone directly on
+        // this network, so the request goes to it signed, not round the
+        // account server. Confirmed only from the camera's own /api/state; the
+        // account learns of it from the camera's next report.
+        if !state.isDemo, let hardwareID = device.hardwareId, LocalAccessCenter.shared.isReady(hardwareID) {
+            Task {
+                defer { protectionSending = false }
+                switch await LocalAccessCenter.shared.setProtection(hardwareID, stop: action == .stop) {
+                case .success(let outcome):
+                    protectionNotice = ("\(outcome.text) (direct, on this network)", Date(), outcome.isConfirmed)
+                case .failure(let error):
+                    protectionError = error.message
+                }
+                await reload()
+            }
+            return
+        }
         Task {
             defer { protectionSending = false }
             do {
@@ -1716,6 +1820,28 @@ struct DeviceDetailView: View {
         pendingSwitch = ModeSwitchState.PendingSwitch(targetBase: base, requestedAt: requestedAt)
 
         let token = setModeGuard.begin()
+        // M12: directly to the camera when it answers this iPhone on this
+        // network. Its role floor still refuses an unsafe mode (409), and that
+        // reason is shown; success is the camera's own report of the mode.
+        if !state.isDemo, let hardwareID = device.hardwareId, LocalAccessCenter.shared.isReady(hardwareID) {
+            Task {
+                let result = await LocalAccessCenter.shared.setPreset(hardwareID, name: name)
+                guard setModeGuard.isLatest(token) else { return }
+                if pendingSwitch?.targetBase == base { pendingSwitch = nil }
+                switch result {
+                case .success(let outcome) where outcome.isConfirmed:
+                    failedSwitch = nil
+                case .success(let outcome):
+                    failedSwitch = ModeSwitchState.PendingSwitch(targetBase: base, requestedAt: requestedAt,
+                                                                 reason: outcome.text)
+                case .failure(let error):
+                    failedSwitch = ModeSwitchState.PendingSwitch(targetBase: base, requestedAt: requestedAt,
+                                                                 reason: error.message)
+                }
+                await reload()
+            }
+            return
+        }
         Task {
             do {
                 try await state.backend.setPreset(deviceID: device.id, preset: name)

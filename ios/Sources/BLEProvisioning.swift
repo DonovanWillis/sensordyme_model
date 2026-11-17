@@ -140,6 +140,19 @@ final class BLEProvisioner: ObservableObject {
     /// accept a code again (its `retry_after_s`, counted from when it said so).
     @Published private(set) var lockouts: [String: Date] = [:]
 
+    /// M12: pairing this iPhone for direct (local) access inside the proven
+    /// session (docs/LOCAL_ACCESS.md §4.1). Independent of the Wi-Fi hand-off:
+    /// a refusal here leaves the proof, and the Wi-Fi setup, standing.
+    enum LocalEnrollment: Equatable {
+        case idle
+        case enrolling
+        case enrolled(LocalAccess.Enrollment)
+        case refused(String)
+    }
+
+    @Published private(set) var localEnrollment: LocalEnrollment = .idle
+    private var enrollTimeout: Task<Void, Never>?
+
     var timing = Timing()
     /// The clock lockouts and proof freshness are measured on (tests replace it).
     var now: () -> Date = Date.init
@@ -235,9 +248,34 @@ final class BLEProvisioner: ObservableObject {
         attempts = ProvisioningStatus.AttemptTracker()
         followUpReadWanted = false
         scanningNetworks = false
+        enrollTimeout?.cancel()
+        enrollTimeout = nil
+        // Per link: a pairing belongs to the device on THIS link.
+        localEnrollment = .idle
     }
 
     private func isCurrent(_ id: UUID) -> Bool { linkID == id }
+
+    /// M12: ask the proven device to trust this phone's local key. Only in
+    /// `.proven`, on the proof the device still holds; the result lands in
+    /// `localEnrollment`. Credentials can be sent afterwards as usual.
+    func enrollLocal(publicKey: Data, name: String) {
+        guard case .proven = state, let flow = popFlow, flow.step == .proven, linkID != nil else {
+            localEnrollment = .refused("Prove the setup code first, then this iPhone can be paired.")
+            return
+        }
+        if let provenAt, now().timeIntervalSince(provenAt) >= timing.provenFresh {
+            localEnrollment = .refused("The setup code proof has expired. Enter the code again to pair this iPhone.")
+            return
+        }
+        localEnrollment = .enrolling
+        enrollTimeout?.cancel()
+        enrollTimeout = after(timing.proof) { [weak self] in
+            guard let self, self.localEnrollment == .enrolling else { return }
+            self.localEnrollment = .refused("The camera didn't answer the pairing in time. Move closer and try again.")
+        }
+        perform(flow.sendEnrollment(publicKey: publicKey, name: name), flow: flow)
+    }
 
     /// Whether a credential write is outstanding. Before this is true the
     /// device's status is a description of itself, not an answer to anything.
@@ -383,6 +421,12 @@ final class BLEProvisioner: ObservableObject {
             proofRejection = nil
             if let deviceID { lockouts[deviceID] = nil }
             state = .proven(name: linkName)
+        case .enrolled(let enrollment):
+            enrollTimeout?.cancel()
+            localEnrollment = .enrolled(enrollment)
+        case .enrollRefused(let reason):
+            enrollTimeout?.cancel()
+            localEnrollment = .refused(reason)
         case .accepted:
             // The device records the attempt before it answers, so from here on
             // a status describes this write.
@@ -391,6 +435,10 @@ final class BLEProvisioner: ObservableObject {
             startStatusPolling()
         case .failed:
             let rejection = flow.rejection ?? .init(kind: .other, message: "The setup failed.", retryAfterSeconds: nil)
+            if localEnrollment == .enrolling {
+                enrollTimeout?.cancel()
+                localEnrollment = .refused(rejection.message)
+            }
             if case .sending = state, rejection.kind == .expired, !renewedForSend, let pending = pendingCredentials,
                let session = labelSession {
                 // The proof lapsed (or the device moved on after a failed join):

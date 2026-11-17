@@ -154,6 +154,21 @@ struct EventItem: Codable, Identifiable, Hashable {
     /// What the app may say about the device's own alert output for this event.
     var alertEvidence: AlertDeliveryEvidence { AlertDeliveryEvidence(alert, eventSimulated: isSimulated) }
 
+    /// M13: what a driver-monitoring event type means, in plain words, for the
+    /// history row (the device's own words stay on their own line). Head
+    /// orientation is said as the head's, never as gaze. Nil for any other type.
+    var meaning: String? {
+        switch type {
+        case "distraction": "The driver's head stayed turned away from straight ahead"
+        case "eyes_down": "The driver's head stayed tilted down"
+        case "eyes_up": "The driver's head stayed tilted up"
+        case "phone_use": "A phone was in the driver's hand"
+        case "drowsiness": "The driver's eyes stayed closed"
+        case "attention_lost": "The driver's face couldn't be seen"
+        default: nil
+        }
+    }
+
     /// "phone_use_while_distracted" -> "Phone use while distracted"
     var title: String {
         let words = type.replacingOccurrences(of: "_", with: " ")

@@ -30,7 +30,7 @@ from typing import Optional
 
 REPO = Path(__file__).resolve().parent.parent
 SOURCES = [
-    "BLETransport", "BLESimulatedTransport", "BLEProvisioning", "BLEPoPFlow", "BLEProofOfPossession",
+    "BLETransport", "BLESimulatedTransport", "BLEProvisioning", "BLEPoPFlow", "BLEProofOfPossession", "LocalAccess",
     "ProvisioningStatus", "SetupOnboarding", "SetupFlow",
 ]
 HARNESS = ["Support.swift", "main.swift"]

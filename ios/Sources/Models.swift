@@ -36,13 +36,50 @@ struct Device: Codable, Identifiable, Hashable {
     /// `APIClient.devices()`), so every screen can tell a current reading from
     /// an old one (ConnectionTruth). Not part of the JSON.
     var receivedAt: Date? = nil
+    /// M12: the device's PUBLIC local-access key (sd-local-v1), as it last
+    /// reported it to the account (`local_identity` in GET /v1/devices). Kept
+    /// by the backend even when health is stale: it names the camera, it does
+    /// not say it is healthy. Nil from a backend or firmware without it.
+    var localIdentity: LocalIdentityReport? = nil
 
     enum CodingKeys: String, CodingKey {
         case id, name, online, health, monitoring, status
+        case localIdentity = "local_identity"
         case hardwareId = "hardware_id"
         case activePreset = "active_preset"
         case desiredPreset = "desired_preset"
         case lastSeen = "last_seen"
+    }
+}
+
+/// `local_identity` on a device row (cloud/app.py `_public_local_identity`).
+struct LocalIdentityReport: Codable, Hashable {
+    var contract: String?
+    var devicePublicKey: String?
+    var deviceKeyFingerprint: String?
+    var reportedAt: Double?
+
+    enum CodingKeys: String, CodingKey {
+        case contract
+        case devicePublicKey = "device_public_key"
+        case deviceKeyFingerprint = "device_key_fp"
+        case reportedAt = "reported_at"
+    }
+}
+
+/// The answer to `POST /v1/devices/{id}/local-clients`.
+struct LocalClientRegistration: Codable, Hashable {
+    var clientID: String?
+    var state: String?
+    /// Whether the device already reports trusting this phone.
+    var onDevice: Bool?
+    var localIdentity: LocalIdentityReport?
+
+    enum CodingKeys: String, CodingKey {
+        case state
+        case clientID = "client_id"
+        case onDevice = "on_device"
+        case localIdentity = "local_identity"
     }
 }
 

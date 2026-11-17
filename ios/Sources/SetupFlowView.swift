@@ -30,6 +30,8 @@ struct SetupFlowView: View {
     @State private var codeProblem: String?
     @State private var claimCode = ""
     @State private var chosenMode: String?
+    /// M12: why this iPhone could not be paired with the camera, if it couldn't.
+    @State private var pairingProblem: String?
     /// The clock, for the device's lockout countdown only. It ticks while a
     /// lockout runs (`.task(id: lockedUntil)` below); a 1 Hz timer used to
     /// redraw this whole screen every second of setup for it.
@@ -79,6 +81,21 @@ struct SetupFlowView: View {
             }
             .onChange(of: flow.recommendedMode) { _, mode in
                 if chosenMode == nil { chosenMode = mode }
+            }
+            // M12 (LOCAL_ACCESS.md §4.1): once the device has proven the setup
+            // code, pair this iPhone with it inside the same encrypted session,
+            // before (or instead of) Wi-Fi. Works for a first setup and for
+            // re-pairing a camera that is already online.
+            .onChange(of: flow.state) { _, newState in
+                if case .choosingNetwork = newState, flow.ble.localEnrollment == .idle { pairThisPhone() }
+            }
+            .onChange(of: flow.ble.localEnrollment) { _, enrollment in
+                guard case .enrolled(let result) = enrollment else { return }
+                let owner = appState.isSignedIn && !appState.isDemo ? appState.accountEmail : ""
+                if !LocalAccessCenter.shared.adopt(result, name: "SensorDyme \(result.deviceID)", via: .bluetooth,
+                                                   owner: owner) {
+                    pairingProblem = "The camera's answer wasn't for this iPhone's key, so nothing was kept."
+                }
             }
         }
         .tint(SD.Colors.accent)
@@ -253,8 +270,12 @@ struct SetupFlowView: View {
                 busyCard("Checking the setup code. The device proves it back before anything is sent.")
             case .choosingNetwork(let problem):
                 VStack(alignment: .leading, spacing: SD.Space.sm) {
+                    localPairingCard
                     if let problem { warning(problem) }
                     networkList
+                        // One message at a time on the secure session: the
+                        // pairing answer comes first, then the Wi-Fi.
+                        .disabled(flow.ble.localEnrollment == .enrolling)
                 }
             case .sending, .joining, .associating, .claiming, .activatingMode:
                 progressCard
@@ -274,6 +295,53 @@ struct SetupFlowView: View {
             case .failed(let failure):
                 failureCard(failure)
             }
+        }
+    }
+
+    // MARK: Pairing this iPhone (M12)
+
+    private func pairThisPhone() {
+        pairingProblem = nil
+        guard let deviceID = flow.ble.deviceID,
+              let signer = LocalAccessCenter.shared.prepareKey(for: deviceID) else {
+            pairingProblem = "This iPhone couldn't create its key for the camera, so it can't be paired directly. Wi-Fi setup still works."
+            return
+        }
+        flow.ble.enrollLocal(publicKey: signer.publicKey, name: LocalAccessCenter.phoneName)
+    }
+
+    @ViewBuilder private var localPairingCard: some View {
+        VStack(alignment: .leading, spacing: SD.Space.xs) {
+            switch flow.ble.localEnrollment {
+            case .idle:
+                EmptyView()
+            case .enrolling:
+                Label("Pairing this iPhone with the camera…", systemImage: "lock.shield")
+                    .font(SD.Typography.callout)
+                    .foregroundStyle(SD.Colors.textSecondary)
+            case .enrolled:
+                Label("This iPhone is paired. It can open the camera directly on its network, with or without the server or your account.",
+                      systemImage: "checkmark.shield")
+                    .font(SD.Typography.callout)
+                    .foregroundStyle(SD.Colors.textPrimary)
+                    .fixedSize(horizontal: false, vertical: true)
+                    .accessibilityIdentifier("setup.paired")
+                Button {
+                    flow.stop()
+                    dismiss()
+                } label: {
+                    Text("Keep its current Wi-Fi and finish")
+                }
+                .buttonStyle(SDButtonStyle(kind: .secondary))
+                .accessibilityHint("For a camera that is already online: nothing about its network changes.")
+                .accessibilityIdentifier("setup.keepWifi")
+            case .refused(let reason):
+                warning(reason)
+                Button("Try pairing again") { pairThisPhone() }
+                    .buttonStyle(SDButtonStyle(kind: .tertiary))
+                    .accessibilityIdentifier("setup.pairAgain")
+            }
+            if let pairingProblem { warning(pairingProblem) }
         }
     }
 

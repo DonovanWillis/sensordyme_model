@@ -441,15 +441,28 @@ sudo systemctl start sensordyme.service && systemctl is-active sensordyme.servic
 ### Step 24. Live video
 | | |
 |---|---|
-| **Do** | In the app, on the device screen: Settings → Live feed → enter the dashboard token (the owner types it; it is never sent in chat). Phone on the **same Wi-Fi** as the Pi |
-| **Access** | iPhone on the LAN |
-| **Expect** | video within a few seconds; badge LIVE (a new frame ≤ 2 s old within the last 2 s); the same state as `/api/health` |
-| **Capture** | a screenshot of the hardware only, with nobody else in frame |
-| **Pass / fail** | FAIL: no video on the same LAN with the token entered |
-| **Common failure** | guest Wi-Fi with client isolation; token typo |
-| **Recovery** | a phone hotspot is the reliable fallback (README Phase 9) |
+| **Do** | Nothing to type (M12, `docs/LOCAL_ACCESS.md`): the app paired this iPhone with the camera over Bluetooth in step 23, or through the account once the device reported in. Open the device screen with the phone on the **same Wi-Fi** as the Pi. On the Pi, confirm the iPhone is trusted: `cd $D && .venv/bin/python scripts/local_clients.py list` (prints ids, a generic name and key fingerprints only) |
+| **Access** | iPhone on the LAN; SSH for the check |
+| **Expect** | video within a few seconds; badge LIVE (a new frame ≤ 2 s old within the last 2 s); the same state as `/api/health`. `local_clients.py list` shows one iPhone |
+| **Capture** | a screenshot of the hardware only, with nobody else in frame; the **count** of trusted iPhones (not the ids) |
+| **Pass / fail** | FAIL: no video on the same LAN, or no iPhone trusted after step 23 |
+| **Common failure** | guest Wi-Fi with client isolation; the app says "This iPhone needs to be paired with the camera again" (power-cycle the Pi and re-pair over Bluetooth within 5 minutes) |
+| **Recovery** | a phone hotspot is the reliable fallback (README Phase 9). Then **step 24b** |
 | **Modifies the Pi** | no |
 | **Owner approval** | no |
+
+### Step 24b. The camera without the MacBook (M12)
+| | |
+|---|---|
+| **Do** | With the app open on the device screen and video playing, the **owner** quits the backend on the MacBook (or closes the lid). Force-quit the app and open it again |
+| **Access** | iPhone on the LAN; the owner at the MacBook |
+| **Expect** | the camera is still listed ("Direct connection"); live video plays; stop (with confirmation) then resume work and the app says each was **confirmed by the camera**; a look-away still sounds the **buzzer**. Nothing claims it is protecting until the camera itself answers |
+| **Capture** | screenshots of the device screen (hardware only); `cd $D && curl -s -H "X-Device-Token: $SENSORDYME_TOKEN" localhost:8899/api/health \| .venv/bin/python -c 'import json,sys;d=json.load(sys.stdin);print(d["device"]["protection"]["state"], d["device"]["protection"].get("by"))'` after the stop (expect `stopped local_app`) |
+| **Pass / fail** | FAIL: the camera disappears from the app, video needs the backend, or a stop is shown as done before the camera confirmed it |
+| **Common failure** | the phone is not on the camera's network; the iPhone was never paired (step 24) |
+| **Recovery** | restart the backend on the MacBook; everything returns. Events raised meanwhile reach the account once, under the same id |
+| **Modifies the Pi** | stop/resume only (resume before moving on) |
+| **Owner approval** | **yes** (the owner stops the backend) |
 
 ### Step 25. Distracted Driving activation
 | | |
@@ -482,7 +495,8 @@ sudo systemctl start sensordyme.service && systemctl is-active sensordyme.servic
 ```bash
 python3 $V/cabin_session.py plan --preset core --out ~/hwval/cabin/S01
 python3 $V/cabin_session.py run --plan ~/hwval/cabin/S01 --subject S01 --session S01-<date>-a --vehicle V01 \
-    --seat driver --lighting day --eyewear none --occupancy driver_only --mount dash_centre
+    --seat driver --lighting day --eyewear none --occupancy driver_only --mount dash_centre \
+    --consent-ref <consent record id>
 # observer, second ssh session, at the same time:
 python3 $V/cabin_session.py observe --session ~/hwval/cabin/S01 --annotator O1 --clock same_host \
     --consent-ref <consent record id> --independent

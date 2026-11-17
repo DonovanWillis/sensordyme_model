@@ -44,6 +44,7 @@ Environment=MPLCONFIGDIR=/var/cache/sensordyme/matplotlib
 Environment=XDG_CACHE_HOME=/var/cache/sensordyme
 Environment=HAILORT_LOGGER_PATH=/var/log/sensordyme
 Environment=PYTHONDONTWRITEBYTECODE=1
+Environment=PYTHONUNBUFFERED=1
 ExecStartPre=-/opt/sensordyme/.venv/bin/python /opt/sensordyme/scripts/preflight.py
 ExecStart=/opt/sensordyme/.venv/bin/python /opt/sensordyme/main.py --no-display
 WatchdogSec=45

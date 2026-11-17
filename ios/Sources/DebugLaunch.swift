@@ -26,6 +26,8 @@ enum DebugLaunch {
     static var scrollToBottom: Bool { args.contains("-orynScrollBottom") }
     /// Open the full-screen camera from the device screen (to record its zoom).
     static var openCamera: Bool { args.contains("-orynOpenCamera") }
+    /// M13: open presentation mode from the device screen (screenshots, recordings).
+    static var openPresentation: Bool { args.contains("-orynPresent") }
     /// Open one mode's detail from the device screen (`-orynOpenMode driver_safety`).
     static var openMode: String? { value(after: "-orynOpenMode") }
     /// Select a tab: devices, shop or settings.
@@ -56,10 +58,13 @@ enum DebugLaunch {
     /// Point the live feed at a device (`-orynDeviceFeed <url> <token>`), e.g. the
     /// virtual device's own feed (scripts/sim/uitest_control.py
     /// --device-dashboard-port), for renders of the camera states. Applied after
-    /// sign-in (a new account clears the paired camera).
+    /// sign-in (a new account clears the paired camera). A token of `-` means
+    /// none: the M12 journey gives the camera's last-known address only, and
+    /// the app must get in with its own local key.
     static var deviceFeed: (url: String, token: String)? {
         guard let index = args.firstIndex(of: "-orynDeviceFeed"), args.indices.contains(index + 2) else { return nil }
-        return (args[index + 1], args[index + 2])
+        let token = args[index + 2]
+        return (args[index + 1], token == "-" ? "" : token)
     }
 
     private static func value(after flag: String) -> String? {
@@ -74,6 +79,7 @@ enum DebugLaunch {
     static let openEvent: String? = nil
     static let scrollToBottom = false
     static let openCamera = false
+    static let openPresentation = false
     static let openMode: String? = nil
     static let tab: String? = nil
     static let jupiterPrompt: String? = nil

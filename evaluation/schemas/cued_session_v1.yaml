@@ -122,6 +122,99 @@ blocks:
       - {say: "Lean fully OUT of the camera's view and HOLD", s: 6, event: driver_absent}
       - {say: "Back in the seat, road ahead", s: 10, event: null}
 
+  # ---- M14: condition blocks. Each counts toward ONE matrix cell whose session axis
+  # (lighting / eyewear) the run must match; `cabin_session.py run` refuses a plan
+  # whose blocks need another --lighting / --eyewear BEFORE anything is recorded.
+  low_light_dusk:
+    cell: L2_dusk
+    title: Dusk or covered windscreen, illuminator off (run with --lighting dusk)
+    steps:
+      - {say: "Look at the road ahead, blink naturally", s: 30, event: null}
+      - {say: "Check the LEFT mirror, about one second, then back", s: 1.5, event: glance_mirror_left}
+      - {say: "Road ahead", s: 6, event: null}
+      - {say: "Check the RIGHT mirror, about one second, then back", s: 1.5, event: glance_mirror_right}
+      - {say: "Road ahead", s: 6, event: null}
+      - {say: "Turn your head to the RIGHT target and HOLD until told", s: 5, event: eyes_off_road, attrs: {target: right_45}}
+      - {say: "Road ahead", s: 10, event: null}
+      - {say: "Head level, CLOSE your eyes and HOLD", s: 3, event: long_closure, attrs: {cued_duration_s: 3}}
+      - {say: "Open your eyes, road ahead", s: 10, event: null}
+
+  night_ir:
+    cell: L3_night_ir
+    title: Night, NoIR camera with the 850 nm illuminator, cabin lights off (run with --lighting night_ir)
+    steps:
+      - {say: "Look at the road ahead, blink naturally", s: 30, event: null}
+      - {say: "Check the REAR-VIEW mirror, about one second, then back", s: 1.5, event: glance_mirror_rear}
+      - {say: "Road ahead", s: 6, event: null}
+      - {say: "Glance at the speedometer, about one second", s: 1.2, event: glance_cluster}
+      - {say: "Road ahead", s: 6, event: null}
+      - {say: "Turn your head to the RIGHT target and HOLD until told", s: 5, event: eyes_off_road, attrs: {target: right_45}}
+      - {say: "Road ahead", s: 10, event: null}
+      - {say: "Head level, CLOSE your eyes and HOLD", s: 3, event: long_closure, attrs: {cued_duration_s: 3}}
+      - {say: "Open your eyes, road ahead", s: 10, event: null}
+      - {say: "Hold the PROP phone low and look at it", s: 5, event: phone_use, attrs: {position: hand}}
+      - {say: "Put it down out of view, road ahead", s: 10, event: null}
+
+  eyewear_clear:
+    cell: EW1_clear_glasses
+    title: Clear glasses (run with --eyewear clear; record day and night_ir sessions)
+    steps:
+      - {say: "Look at the road ahead, blink naturally", s: 30, event: null}
+      - {say: "Check the LEFT mirror, about one second, then back", s: 1.5, event: glance_mirror_left}
+      - {say: "Road ahead", s: 6, event: null}
+      - {say: "Glance at the speedometer, about one second", s: 1.2, event: glance_cluster}
+      - {say: "Road ahead", s: 6, event: null}
+      - {say: "Head level, CLOSE your eyes and HOLD", s: 3, event: long_closure, attrs: {cued_duration_s: 3}}
+      - {say: "Open your eyes, road ahead", s: 10, event: null}
+      - {say: "Look DOWN into your lap, eyes OPEN, and HOLD", s: 4, event: eyes_off_road, attrs: {target: lap, eyes: open}}
+      - {say: "Road ahead", s: 10, event: null}
+
+  eyewear_sunglasses_ir_pass:
+    cell: EW2_sunglasses_ir_pass
+    title: Sunglasses that pass 850 nm (run with --eyewear sunglasses_ir_pass; eyes visible in the NoIR preview first)
+    steps:
+      - {say: "Look at the road ahead, blink naturally", s: 30, event: null}
+      - {say: "Check the RIGHT mirror, about one second, then back", s: 1.5, event: glance_mirror_right}
+      - {say: "Road ahead", s: 6, event: null}
+      - {say: "Head level, CLOSE your eyes and HOLD", s: 3, event: long_closure, attrs: {cued_duration_s: 3}}
+      - {say: "Open your eyes, road ahead", s: 10, event: null}
+      - {say: "Turn your head to the RIGHT target and HOLD until told", s: 5, event: eyes_off_road, attrs: {target: right_45}}
+      - {say: "Road ahead", s: 10, event: null}
+
+  eyewear_sunglasses_ir_block:
+    cell: EW3_sunglasses_ir_block
+    title: Sunglasses that block 850 nm (run with --eyewear sunglasses_ir_block; the expected outcome is ABSTENTION)
+    steps:
+      - {say: "Eyes OPEN, look at the road ahead (a drowsiness alert here is a false alert)", s: 30, event: null}
+      - {say: "Head level, CLOSE your eyes and HOLD", s: 3, event: long_closure, attrs: {cued_duration_s: 3}}
+      - {say: "Open your eyes, road ahead", s: 10, event: null}
+      - {say: "Turn your head to the RIGHT target and HOLD until told", s: 5, event: eyes_off_road, attrs: {target: right_45}}
+      - {say: "Road ahead", s: 10, event: null}
+
+  occlusion_hand:
+    cell: O1_occlusion_hand
+    title: Hand partly over the face (boundary - outside the validated scope; alerts are tallied, not judged)
+    repeat: 3
+    steps:
+      - {say: "Hand over your MOUTH, eyes on the road, HOLD", s: 3, event: face_occluded, attrs: {part: mouth}}
+      - {say: "Hand down, road ahead", s: 6, event: null}
+      - {say: "Hand over your EYES, HOLD", s: 3, event: face_occluded, attrs: {part: eyes}}
+      - {say: "Hand down, road ahead", s: 6, event: null}
+      - {say: "Scratch your cheek, eyes on the road", s: 2, event: face_occluded, attrs: {part: cheek}}
+      - {say: "Hand down, road ahead", s: 6, event: null}
+
+  occlusion_cap:
+    cell: O2_occlusion_hat
+    title: Cap brim pulled low (the participant wears a cap for the whole block)
+    steps:
+      - {say: "Cap on, brim LOW; look at the road ahead", s: 30, event: null}
+      - {say: "Check the LEFT mirror, about one second, then back", s: 1.5, event: glance_mirror_left}
+      - {say: "Road ahead", s: 6, event: null}
+      - {say: "Head level, CLOSE your eyes and HOLD", s: 3, event: long_closure, attrs: {cued_duration_s: 3}}
+      - {say: "Open your eyes, road ahead", s: 10, event: null}
+      - {say: "Turn your head to the RIGHT target and HOLD until told", s: 5, event: eyes_off_road, attrs: {target: right_45}}
+      - {say: "Road ahead; cap off", s: 10, event: null}
+
 # Ready-made sessions (the --preset of cabin_session.py plan).
 presets:
   core: [calibrate, baseline, mirror_glances, cluster_glances, off_road_prolonged, look_down_vs_closure,
@@ -132,3 +225,13 @@ presets:
   # mount (record the change in --notes, e.g. "mount rotated ~5 deg yaw, no
   # recalibration") and run it again WITHOUT recalibrating; compare the two scores.
   displacement: [baseline, off_road_prolonged, look_down_vs_closure, closures, mirror_glances]
+  # M14 condition presets. The day-only `baseline` (cell N1) is NOT in them, so each
+  # runs under the condition its cell names (`run` refuses a mismatch up front).
+  # Camera angle variation = `displacement` at each --mount (dash_centre, mirror_base,
+  # a_pillar, column), the angle change written in --notes.
+  low_light: [calibrate, low_light_dusk, off_road_prolonged, phone_handheld]   # --lighting dusk
+  night_ir: [calibrate, night_ir, mirror_glances, off_road_prolonged]          # --lighting night_ir
+  eyewear_clear: [calibrate, eyewear_clear, mirror_glances]                    # --eyewear clear
+  eyewear_sunglasses_ir_pass: [calibrate, eyewear_sunglasses_ir_pass]          # --eyewear sunglasses_ir_pass
+  eyewear_sunglasses_ir_block: [calibrate, eyewear_sunglasses_ir_block]        # --eyewear sunglasses_ir_block
+  occlusion: [calibrate, occlusion_hand, occlusion_cap]

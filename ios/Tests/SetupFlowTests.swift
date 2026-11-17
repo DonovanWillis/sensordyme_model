@@ -1,7 +1,7 @@
 import Foundation
 
 // Run with ios/Tests/run.sh
-// run.sh deps: SetupOnboarding BLEProvisioning BLETransport BLEPoPFlow BLEProofOfPossession ProvisioningStatus
+// run.sh deps: SetupOnboarding BLEProvisioning BLETransport BLEPoPFlow BLEProofOfPossession ProvisioningStatus LocalAccess
 //
 // SetupFlow's seams -- Bluetooth to Wi-Fi to the account -- with a scripted
 // link (a legacy device, so no setup code; the proof itself is covered by

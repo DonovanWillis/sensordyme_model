@@ -17,6 +17,8 @@ struct AuthView: View {
     @State private var errorMessage: String?
     @State private var busy = false
     @FocusState private var focus: Field?
+    @State private var showLocalSetup = false
+    @ObservedObject private var local = LocalAccessCenter.shared
     @Environment(\.dynamicTypeSize) private var typeSize
 
     private enum Field { case email, password }
@@ -237,6 +239,36 @@ struct AuthView: View {
             Text("Simulated footage, clearly labelled throughout.")
                 .font(SD.Typography.caption)
                 .foregroundStyle(SD.Colors.textTertiary)
+
+            // M12 (C5): Bluetooth setup needs no account. It puts the camera on
+            // Wi-Fi and pairs this iPhone with it; adding it to an account (the
+            // claim) stays behind sign-in.
+            Button {
+                showLocalSetup = true
+            } label: {
+                Label("Set up a camera nearby", systemImage: "dot.radiowaves.left.and.right")
+            }
+            .buttonStyle(SDButtonStyle(kind: .secondary))
+            .accessibilityIdentifier("auth.setupNearby")
+
+            Text("Over Bluetooth, no account needed. Add it to an account later for backup and remote alerts.")
+                .font(SD.Typography.caption)
+                .foregroundStyle(SD.Colors.textTertiary)
+                .multilineTextAlignment(.center)
+                .fixedSize(horizontal: false, vertical: true)
+
+            if !local.devices.isEmpty {
+                NavigationLink {
+                    LocalOnlyHomeView()
+                } label: {
+                    Label("Open cameras paired with this iPhone", systemImage: "video")
+                }
+                .buttonStyle(SDButtonStyle(kind: .secondary))
+                .accessibilityIdentifier("auth.openLocal")
+            }
+        }
+        .sheet(isPresented: $showLocalSetup) {
+            SetupFlowView()
         }
     }
 

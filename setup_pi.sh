@@ -23,6 +23,55 @@ if ! id "$SERVICE_USER" >/dev/null 2>&1; then
 fi
 echo "==> Service user: $SERVICE_USER"
 
+# >>> platform preflight (tests/test_m14_setup_preflight.py runs this block)
+# M14: read-only checks BEFORE anything changes (no sudo, no apt, no venv). The
+# device lock is cp311/aarch64 wheels for Raspberry Pi OS Bookworm (Debian 12).
+# On any other OS -- notably Raspberry Pi OS Trixie (Debian 13, Python 3.13) --
+# this script used to run apt (where Bookworm-only packages such as
+# libatlas-base-dev do not exist) or get as far as the hashed install and fail
+# there, after apt and the venv had already changed the device. It now stops
+# here with the reason and changes nothing. Reflashing is NOT the automatic
+# answer: it erases the card (device identity, config, events) and needs the
+# owner's approval (docs/FIRST_PHYSICAL_BOOT.md, hardware gate HG-OS).
+# A package install (INSTALL.md section A) has no config.yaml until the
+# template is copied in; without one the service exits 78 at every start, so
+# that is checked here too.
+SETUP_PROBLEMS=()
+SETUP_OS_RELEASE="${SENSORDYME_OS_RELEASE:-/etc/os-release}"
+setup_os_field() { sed -n "s/^$1=//p" "$SETUP_OS_RELEASE" 2>/dev/null | head -n 1 | tr -d '"'; }
+SETUP_CODENAME="$(setup_os_field VERSION_CODENAME)"
+SETUP_OS_NAME="$(setup_os_field PRETTY_NAME)"
+SETUP_MACHINE="$(uname -m)"
+# The interpreter the venv is built from, and its pointer width: a 32-bit
+# userland on the Pi 5's 64-bit kernel still reports `uname -m` = aarch64.
+SETUP_PY="$(python3 -c 'import struct, sys; print("%d.%d %d" % (sys.version_info[0], sys.version_info[1], 8 * struct.calcsize("P")))' 2>/dev/null || true)"
+if grep -qa "Raspberry Pi" "${SENSORDYME_DT_MODEL:-/proc/device-tree/model}" 2>/dev/null \
+   || [ "${SENSORDYME_ALLOW_UNHASHED:-}" != "1" ]; then
+  if [ "$SETUP_CODENAME" != "bookworm" ]; then
+    SETUP_PROBLEMS+=("OS is '${SETUP_OS_NAME:-unknown}' (VERSION_CODENAME=${SETUP_CODENAME:-unknown}); this release supports Raspberry Pi OS Bookworm (Debian 12) only")
+  fi
+  if [ "$SETUP_MACHINE" != "aarch64" ]; then
+    SETUP_PROBLEMS+=("CPU architecture is '$SETUP_MACHINE'; this release needs aarch64 (Raspberry Pi OS 64-bit)")
+  fi
+  if [ "$SETUP_PY" != "3.11 64" ]; then
+    SETUP_PROBLEMS+=("python3 is '${SETUP_PY:-not found}' (version, bits); the device lock needs CPython 3.11, 64-bit")
+  fi
+else
+  echo "WARNING: not a Raspberry Pi and SENSORDYME_ALLOW_UNHASHED=1: OS/Python checks skipped (development box only)" >&2
+fi
+if [ ! -f "${SENSORDYME_CONFIG:-config.yaml}" ]; then
+  SETUP_PROBLEMS+=("no ${SENSORDYME_CONFIG:-config.yaml} in $(pwd): copy the package's config/config.yaml.example to it first (INSTALL.md section A); the service cannot start without one")
+fi
+if [ "${#SETUP_PROBLEMS[@]}" -gt 0 ]; then
+  echo "ERROR: this device does not meet the install requirements:" >&2
+  for problem in "${SETUP_PROBLEMS[@]}"; do echo "  - $problem" >&2; done
+  echo "Nothing was installed or changed (no apt, no venv, no service)." >&2
+  echo "Do NOT reflash on your own: it erases the card. See docs/FIRST_PHYSICAL_BOOT.md (hardware gate HG-OS)." >&2
+  exit 1
+fi
+echo "==> Platform: ${SETUP_OS_NAME:-unknown}, $SETUP_MACHINE, python3 ${SETUP_PY% *}"
+# <<< platform preflight
+
 echo "==> Installing apt packages (picamera2, libcamera, gpio, audio, BLE, mDNS)"
 sudo apt-get update
 sudo apt-get install -y \
@@ -49,6 +98,12 @@ sudo apt-get install -y \
 # installer their failed install was harmless.)
 echo "==> Installing Hailo support for the AI HAT+ (REQUIRED — there is no CPU fallback)"
 sudo apt-get install -y hailo-all || echo "WARNING: hailo-all not installed — this device will have NO object detector and will boot degraded (monitoring_active: false)"
+# M14: record which HailoRT this device got. The pinned .hef (Model Zoo v2.15.0)
+# was measured on HailoRT 4.20.0 (docs/PHASE5_DEMO_READINESS.md); any other
+# version loads it only if hwv_stage.py parse-hef / model PASS on this device.
+# Not a refusal: the runtime refuses a .hef it cannot load and reports why.
+HAILORT_VERSION="$(dpkg-query -W -f='${Version}' hailort 2>/dev/null || true)"
+echo "    HailoRT package: ${HAILORT_VERSION:-not installed} (the .hef was measured on 4.20.0)"
 
 echo "==> Creating virtualenv (with access to system site-packages for picamera2)"
 python3 -m venv --system-site-packages .venv
@@ -76,6 +131,16 @@ source .venv/bin/activate
 # setup: an unhashed install from the index is never an option on a device.
 is_raspberry_pi() { grep -qa "Raspberry Pi" "${SENSORDYME_DT_MODEL:-/proc/device-tree/model}" 2>/dev/null; }
 DEVICE_PIP=(.venv/bin/python -m pip install --require-hashes --only-binary=:all: --disable-pip-version-check --no-input -r requirements-device.lock)
+# M14: the transfer package's wheels/, copied beside the install as
+# <install dir>.wheels (INSTALL.md section A: `cp -r wheels ~/sensordyme.wheels`),
+# or SENSORDYME_FIND_LINKS=<dir>. Before this, those wheels were copied and then
+# never used by this script: PyPI was always needed. Still hash-checked against
+# the lock; with a wheelhouse the index is not contacted at all.
+WHEELHOUSE="${SENSORDYME_FIND_LINKS:-$(pwd).wheels}"
+if [ -d "$WHEELHOUSE" ] && compgen -G "$WHEELHOUSE/*.whl" >/dev/null; then
+  echo "==> Installing the device lock from the local wheels in $WHEELHOUSE (hash-checked; no index)"
+  DEVICE_PIP+=(--no-index --find-links "$WHEELHOUSE")
+fi
 if ! "${DEVICE_PIP[@]}"; then
   if is_raspberry_pi || [ "${SENSORDYME_ALLOW_UNHASHED:-}" != "1" ]; then
     echo "ERROR: the hash-checked install of requirements-device.lock failed; NOT falling back." >&2
@@ -199,17 +264,45 @@ else
   sudo systemctl disable sensordyme-provisioning.service 2>/dev/null || true
 fi
 
+# >>> direct mode firewall (tests/test_direct_mode_setup.py runs this block)
+# Direct mode (docs/DIRECT_MODE.md) is OFF by default and then nothing here
+# runs. When config.yaml enables it, install the access-point firewall (a root
+# NetworkManager dispatcher script plus its nftables ruleset): without it the
+# device refuses to start its access point. The label passphrase is a separate,
+# per-device factory step and is never generated here.
+DIRECT_MODE_ENABLED="$("${PYTHON:-python3}" - "${SENSORDYME_CONFIG:-config.yaml}" <<'PY' 2>/dev/null || true
+import sys, yaml
+with open(sys.argv[1]) as handle:
+    cfg = yaml.safe_load(handle) or {}
+direct = ((cfg.get("network") or {}).get("direct_mode") or {})
+print("yes" if isinstance(direct, dict) and direct.get("enabled") is True else "no")
+PY
+)"
+if [ "$DIRECT_MODE_ENABLED" = "yes" ]; then
+  echo "==> Installing the direct-mode access-point firewall (network.direct_mode.enabled: true)"
+  sudo "${PYTHON:-.venv/bin/python}" scripts/direct_mode.py install
+  echo "    Label Wi-Fi password, once per device as $SERVICE_USER (output to the label printer only):"
+  echo "    .venv/bin/python scripts/direct_mode_psk.py generate --out /etc/sensordyme/direct_mode_psk"
+fi
+# <<< direct mode firewall
+
 echo "==> Advertising the device over mDNS (app auto-discovery: _sensordyme._tcp)"
 # Generated, not copied: the record carries this board's stable device ID, which
 # is how the app knows a device found at a new IP is one it already has.
-sudo python3 scripts/publish_mdns.py /etc/avahi/services/sensordyme.service
+# -B: as root, python would otherwise leave a root-owned core/__pycache__ in this
+# service-user checkout, where the service could then never cache bytecode.
+sudo python3 -B scripts/publish_mdns.py /etc/avahi/services/sensordyme.service
 sudo systemctl restart avahi-daemon
 
 echo "==> Allowing the device to manage its own Wi-Fi (polkit)"
 # The polkit rule below grants to the netdev group; BlueZ's D-Bus policy lets the
 # bluetooth group register GATT applications. Make sure the service user is in
 # both (no-ops when already a member or when a group does not exist).
-for group in netdev bluetooth; do
+# M14: and in the hardware groups the stock unit relies on (it sets no
+# SupplementaryGroups): video (camera nodes, /dev/dma_heap, /dev/vcio), gpio (the
+# buzzer), audio. The Imager's first user already has them; an account created
+# later (SENSORDYME_USER=...) may not, and would then fail on the camera/buzzer.
+for group in netdev bluetooth video gpio audio; do
   if getent group "$group" >/dev/null 2>&1; then
     sudo usermod -aG "$group" "$SERVICE_USER"
   fi
@@ -258,5 +351,18 @@ sudo systemctl restart sensordyme.service
 
 echo ""
 echo "Setup complete. SensorDyme is running as a systemd service (Restart=always)."
+# M14: on a fresh card the Hailo kernel driver that hailo-all just built is
+# loaded at the next boot, so /dev/hailo0 is usually absent right now and the
+# service honestly reports no accelerator (monitoring_active: false). Say so
+# here, instead of letting that read as a hardware fault. Nothing is rebooted
+# automatically.
+if [ ! -e /dev/hailo0 ]; then
+  echo ""
+  echo "NOTE: /dev/hailo0 is not present yet, so the service is running WITHOUT the"
+  echo "  accelerator (it reports this; it never simulates detections). After a fresh"
+  echo "  hailo-all install the driver loads at boot: reboot once (sudo reboot), then"
+  echo "  check: ls -l /dev/hailo0 && hailortcli scan. Still absent after a reboot:"
+  echo "  power off and reseat the AI HAT+ PCIe ribbon (docs/FIRST_PHYSICAL_BOOT.md)."
+fi
 echo "Check status: sudo systemctl status sensordyme"
 echo "Tail logs:    journalctl -u sensordyme -f"

@@ -24,10 +24,53 @@ reported, never hidden. Each suite runs in its own process (the driver suites
 load real MediaPipe graphs).
 
 `make acceptance-full` must not run while anything else owns the iOS Simulator
-(ports 8787/8790/8797 must be free); `scripts/sim/ios_uitest.sh` builds the real
-app, runs all 28 journeys + 2 accessibility audits in one xcodebuild invocation
+(ports 8787/8790/8797/8899 must be free); `scripts/sim/ios_uitest.sh` builds the real
+app, runs every journey (M12 adds test29_OfflineLocalCamera: a cold launch with the
+backend process stopped opens the previously paired camera over its sd-local-v1
+session, live view and a confirmed local stop; it backs journey 21) + 2 accessibility audits in one xcodebuild invocation
 with no retries, and the acceptance report folds its per-test results in. Plain
 `make acceptance` states explicitly that the iOS half did not run.
+
+### M14: the backend-down customer journey, and journey 06's lost tap
+
+`test32_BackendDownCustomerJourney` runs the whole customer path with the
+backend process stopped, on the simulated device. It checks, in order:
+
+* a cold launch shows the paired camera from the cache;
+* a device-signed local session ("Connected directly") and the camera's fresh
+  state;
+* live video, then the AI view and Present;
+* Driver Safety Strict, confirmed by the DEVICE;
+* the showcase scenario's simulated head-turn reaches the foreground alert path
+  from the camera's own journal. The app decides its sound exactly once, and
+  the decision is `silent:simulated`: a simulated event never sounds
+  (`AlertSound.decide`). The banner is labelled "Simulated";
+* the camera's history lists the event;
+* the camera's process is stopped and the app says it isn't answering;
+* the camera restarts, live video returns, and no event is decided twice.
+
+The app's sound decisions are read from its DEBUG-only record
+(`AlertDecisionJournal`) through the controller's `GET /app/alert-decisions`.
+The journey answers the system's notification prompt with Allow. Runs that pass
+`-orynNoPrompt` show no banner (DEBUG only), so a later journey's screen is
+never covered by one. Nothing here is real Bluetooth, Hailo, a buzzer or a phone
+sound.
+
+**Journey 06's lost tap.** The cause is in how XCTest synthesizes a tap; the
+app plays no part. Evidence:
+`~/sensordyme-audit/2026-11-10/m14-evidence/streamC/test06-lost-tap-repro/NOTE.txt`.
+
+* `tap()` can be a touch-down and a touch-up with nothing between them.
+* On a loaded Mac these arrived 150–164 ms apart. iOS's system-gesture-gate
+  event (about 105 ms after touch-down) fell between them, and then the
+  SwiftUI button never registered the press.
+* App code was instrumented through the failure. Nothing happened between
+  touch-down and touch-up: no redraw, no change of the button's identity, and
+  it stayed enabled.
+
+The journey now taps with `fingerTap` (a 0.06 s `press`, which streams touch
+updates the way a finger does). `test06b_ResumeHeldPress` checks that a 0.4 s
+press across that event still resumes.
 
 ### Simulator readiness and the audit instrument (M11)
 
@@ -57,6 +100,44 @@ retried, no audit type or accepted issue changes, and a last attempt that
 also fails fails the test. Each retry is in the screen's `audit_<screen>.txt`
 (an `audit-retry` line), in xcodebuild.log ("ORYN audit retry"), and listed at
 the end of summary.md.
+
+### The Dynamic Type re-check (M13.1)
+
+**Observed.** `test21_AuditDefaultTextSize` failed intermittently on the Ask
+Jupiter sheet: in both M13.1 full runs (96afa1d, 20bf68a), and in 1 of 4 runs
+alone on the M13.1 code (`-test-iterations 4`). On the **unchanged M13 code
+(faae3de)** it failed the same way, also 1 run in 4. Each time XCTest flagged
+**every** text on the sheet at once ("Dynamic Type font sizes are partially
+unsupported" for the headings, the body text and the input field). The
+identical screen, with the same screenshot, passed in the other runs. Nothing
+on the sheet uses a fixed text size.
+
+**Also observed (contrast).** In the full run at bd9ff99, the device list's
+row name and mode ("Virtual SensorDyme 1 (SIMULATED)", "Driver Safety") failed
+contrast. Both are in the clear band, and measured from that run's own
+screenshot they are 17.4:1 (#F2F1ED) and 10.1:1 (#B6BABE) on #0A0B0C, against
+the 4.5:1 required. The same audit pass also produced 3 Dynamic Type findings
+that the re-check did not reproduce. It is the same pair of colours M11
+recorded "failing" mid-fade. The device list is unchanged in M13.1, and
+earlier runs had passed it.
+
+**Rule.** This is the one exception to "a finding is never retried":
+
+* It covers **Dynamic Type** findings, and **contrast** findings on a located
+  element in the clear band. Contrast under the bars or with no element keeps
+  its own M8.4 check.
+* A finding of either kind that is not an accepted issue is audited **once
+  more**, for that type only, on the unchanged screen once it is still.
+* Any finding the second audit reports fails the test as NEW. Both audits read
+  the same text and the same pixels, so a real non-scaling or low-contrast text
+  fails both and still fails the test.
+* A finding the second audit does not reproduce is written in
+  `audit_<screen>.txt` as a `not-reproduced` line with its labels.
+* Each re-check is logged as "ORYN audit retry 1/1 <screen> [<type>]" and
+  listed in summary.md.
+
+The owner may reverse this rule. Without it, the full suite fails about one run
+in four on unchanged code.
 
 ## The journey matrix
 

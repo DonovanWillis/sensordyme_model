@@ -82,6 +82,8 @@ struct CameraViewport: View {
     let device: Device
     let instrument: InstrumentState
     let session: LiveFeedSession
+    /// M13: draw what the AI saw over the picture. The clean picture is the default.
+    @Binding var aiView: Bool
     var onExpand: () -> Void
 
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
@@ -110,7 +112,7 @@ struct CameraViewport: View {
                     .dynamicTypeSize(...DynamicTypeSize.xxxLarge)
                     .accessibilityShowsLargeContentViewer()
             case .live(let url):
-                MJPEGView(url: url, session: session)
+                MJPEGView(url: url, session: session, hardwareID: device.hardwareId, aiView: aiView)
                 CameraOffCover(reader: session.reader)
             case .none:
                 CameraPlaceholder(interrupted: instrument.isInterrupted)
@@ -121,10 +123,31 @@ struct CameraViewport: View {
         .overlay(shape.strokeBorder(frameColor, lineWidth: instrument.kind == .alert ? 2 : 1))
         .overlay(alignment: .topLeading) {
             if case .live = source.kind {
-                MJPEGLiveIndicator(reader: session.reader, monitoringStopped: instrument.kind == .stopped)
+                VStack(alignment: .leading, spacing: 6) {
+                    MJPEGLiveIndicator(reader: session.reader, monitoringStopped: instrument.kind == .stopped)
+                        .dynamicTypeSize(...DynamicTypeSize.xxxLarge)
+                        .accessibilityShowsLargeContentViewer()
+                    if aiView {
+                        AIViewChrome(model: session.reader.overlayModel, compact: true)
+                            .transition(.opacity)
+                    }
+                }
+                .padding(SD.Space.sm)
+            }
+        }
+        .overlay(alignment: .topTrailing) {
+            if case .live = source.kind {
+                SimulatedBadgeIfNeeded(model: session.reader.overlayModel)
+                    .padding(SD.Space.sm)
+            }
+        }
+        .overlay(alignment: .bottomLeading) {
+            if case .live = source.kind {
+                AIViewToggle(isOn: $aiView)
                     .dynamicTypeSize(...DynamicTypeSize.xxxLarge)
                     .accessibilityShowsLargeContentViewer()
-                    .padding(SD.Space.sm)
+                    .padding(SD.Space.xxs)
+                    .padding(.leading, SD.Space.xxs)
             }
         }
         .overlay(alignment: .bottomTrailing) {
@@ -289,6 +312,8 @@ struct LiveCameraView: View {
     /// The presence word ("Online", "Stale" ...), as the device screen shows it.
     let presence: String
     let session: LiveFeedSession
+    /// M13: the same AI view switch as the inline camera.
+    @Binding var aiView: Bool
 
     @State private var drag: CGFloat = 0
     @Environment(\.dynamicTypeSize) private var typeSize
@@ -307,7 +332,7 @@ struct LiveCameraView: View {
                         .accessibilityShowsLargeContentViewer()
                 case .live(let url):
                     ZStack {
-                        MJPEGView(url: url, session: session)
+                        MJPEGView(url: url, session: session, hardwareID: device.hardwareId, aiView: aiView)
                         CameraOffCover(reader: session.reader)
                     }
                 case .none:
@@ -333,11 +358,20 @@ struct LiveCameraView: View {
     }
 
     private var topBar: some View {
-        HStack(alignment: .center, spacing: SD.Space.sm) {
+        HStack(alignment: .top, spacing: SD.Space.sm) {
             if case .live = CameraSource(state: state, device: device).kind {
-                MJPEGLiveIndicator(reader: session.reader, monitoringStopped: instrument.kind == .stopped)
-                    .dynamicTypeSize(...DynamicTypeSize.xxxLarge)
-                    .accessibilityShowsLargeContentViewer()
+                VStack(alignment: .leading, spacing: 6) {
+                    HStack(spacing: 6) {
+                        MJPEGLiveIndicator(reader: session.reader, monitoringStopped: instrument.kind == .stopped)
+                            .dynamicTypeSize(...DynamicTypeSize.xxxLarge)
+                            .accessibilityShowsLargeContentViewer()
+                        SimulatedBadgeIfNeeded(model: session.reader.overlayModel)
+                    }
+                    if aiView {
+                        AIViewChrome(model: session.reader.overlayModel)
+                            .transition(.opacity)
+                    }
+                }
             }
             Spacer()
             Button { dismiss() } label: {
@@ -388,12 +422,22 @@ struct LiveCameraView: View {
 
     private var bottomBar: some View {
         VStack(alignment: .leading, spacing: SD.Space.xxs) {
-            Text(device.name)
-                .font(SD.Typography.headline)
-                .foregroundStyle(SD.Colors.textPrimary)
-                .fixedSize(horizontal: false, vertical: true)
-            statusLine
-                .font(SD.Typography.callout)
+            if case .live = CameraSource(state: state, device: device).kind {
+                HStack(spacing: SD.Space.xs) {
+                    AIViewToggle(isOn: $aiView)
+                        .dynamicTypeSize(...DynamicTypeSize.xxxLarge)
+                    if aiView { AIPerfReadout(model: session.reader.overlayModel) }
+                }
+            }
+            VStack(alignment: .leading, spacing: SD.Space.xxs) {
+                Text(device.name)
+                    .font(SD.Typography.headline)
+                    .foregroundStyle(SD.Colors.textPrimary)
+                    .fixedSize(horizontal: false, vertical: true)
+                statusLine
+                    .font(SD.Typography.callout)
+            }
+            .accessibilityElement(children: .combine)
         }
         .frame(maxWidth: .infinity, alignment: .leading)
         .padding(.horizontal, SD.Space.lg)
@@ -403,6 +447,5 @@ struct LiveCameraView: View {
             LinearGradient(colors: [.clear, Color.black.opacity(0.85)], startPoint: .top, endPoint: .bottom)
                 .ignoresSafeArea()
         )
-        .accessibilityElement(children: .combine)
     }
 }

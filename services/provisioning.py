@@ -23,6 +23,14 @@ Method selection (`network.provisioning.method` in config.yaml):
                 installs without BLE); this service stays dormant
     off      -- no provisioning; Wi-Fi is whatever NetworkManager already knows
 
+Direct mode (core/direct_mode.py, `network.direct_mode`): while the device runs
+its own access point, NetworkManager still reports "connected (local only)",
+which is_online() counts as online. That connection reaches no network, so
+when the runtime hands in `direct_mode_active` the provisioning policy treats it
+as OFFLINE: the Bluetooth (PoP) window stays open for as long as direct mode is
+active. It is the way back for a device whose access point is broken (R1).
+Without `direct_mode_active` (direct mode disabled) nothing here changes.
+
 Who may write credentials (`network.provisioning.auth`):
     legacy   -- anyone in Bluetooth range while the window is open ("Just Works").
                 Development only: refused outright when the top-level
@@ -88,14 +96,22 @@ class ProvisioningService:
                  ble_server_factory: Optional[Callable[..., Any]] = None,
                  identity: Optional[tuple[str, str]] = None,
                  radio_available: Optional[Callable[[], bool]] = None,
-                 pop_limits: Optional[Limits] = None) -> None:
+                 pop_limits: Optional[Limits] = None,
+                 direct_mode_active: Optional[Callable[[], bool]] = None) -> None:
         """
         The keyword-only arguments are seams for the virtual Bluetooth peripheral
         (sim/ble_peripheral.py), which runs THIS state machine with an in-memory
         GATT table and a simulated radio. Production passes none of them: the
         BlueZ server, core.identity, nmcli and the protocol's own limits.
+
+        `direct_mode_active` is the exception: the runtime passes
+        DirectModeManager.is_active when `network.direct_mode.enabled` is true,
+        and nothing otherwise.
         """
         self._wifi = wifi
+        self._direct_mode_active = direct_mode_active
+        #: Whether the last connectivity check found the device in direct mode.
+        self._direct = False
         self._ble_server_factory = ble_server_factory
         self._identity = identity
         self._radio_available = radio_available
@@ -271,7 +287,7 @@ class ProvisioningService:
         while not stop.is_set():
             now = time.monotonic()
             self._reap_dead_ble(now)
-            online = self._wifi.is_online()
+            online = self._online()
             joining = self._join_in_flight()
             # A join that has an outcome keeps the channel open for a while, so
             # the outcome is delivered (and re-readable) before Bluetooth closes.
@@ -353,6 +369,19 @@ class ProvisioningService:
             changed.clear()
             changed.wait(timeout=interval)
 
+    def _online(self) -> bool:
+        """Connectivity for the provisioning policy: is_online(), except that the
+        device's own access point is not a network (R1, G8)."""
+        online = self._wifi.is_online()
+        if self._direct_mode_active is None:
+            return online
+        try:
+            self._direct = bool(self._direct_mode_active())
+        except Exception as exc:  # noqa: BLE001 - unknown keeps the recovery path open
+            log.warning("could not tell whether direct mode is active (%s); keeping Bluetooth setup open", exc)
+            self._direct = True
+        return online and not self._direct
+
     def _join_in_flight(self) -> bool:
         thread = self._connect_thread
         return thread is not None and thread.is_alive()
@@ -364,7 +393,7 @@ class ProvisioningService:
         spinner. Every field here is observed, never assumed.
         """
         if online is None:
-            online = self._wifi.is_online()
+            online = self._online()
         described = {
             "state": "online" if online else self.state,
             "ssid": self._wifi.current_ssid() if online else None,
@@ -417,6 +446,8 @@ class ProvisioningService:
                 and self.state in ("waiting", "provisioning", "reconfigurable")):
             # Observed, not assumed: the window is wanted and is NOT open.
             return False, f"Bluetooth setup could not start ({self._ble_failure}); retrying"
+        if self.state == "provisioning" and self._direct:
+            return True, "direct mode (the device's own access point) — Bluetooth setup kept open for recovery"
         if self.state == "provisioning":
             return True, "offline — Bluetooth setup open so the app can hand it a network"
         if self.state == "reconfigurable":
@@ -464,6 +495,9 @@ class ProvisioningService:
             code = load_setup_code(self._setup_code_path)  # SetupCodeError: caller fails closed
             self._pop = PopAuthenticator(device_id=self._device_id(), setup_code=code,
                                          limits=self._pop_limits or Limits())
+        # M12 sd-local-v1: a proven phone may enrol its key for local access.
+        authority = getattr(self, "local_authority", None)
+        self._pop.enroller = (lambda key, name: authority.enroll(key, name, "ble")) if authority else None
         return self._pop
 
     def _open_ble_window(self) -> None:

@@ -389,3 +389,102 @@ def test_bluetooth_setup_is_not_left_open_by_default(monkeypatch):
     _run_briefly(service, 0.2)
     assert service.state != "reconfigurable"
     assert all(not s.running for s in FakeBLEServer.instances)
+
+
+# ============================================================================ direct mode (R1, G8)
+class ApWifi(FakeWifi):
+    """The device as its own access point: NetworkManager says "connected (local only)",
+    which is_online() counts as online, but no network is reachable through it."""
+
+    def __init__(self):
+        super().__init__(online=True)
+
+    def current_ssid(self):
+        return None
+
+
+def _direct_service(monkeypatch, wifi, active):
+    """_make_service plus the hook the runtime passes when direct mode is enabled."""
+    service = _make_service(monkeypatch, wifi, reconfigure_window_s=0.0)
+    service._direct_mode_active = active
+    return service
+
+
+def test_bluetooth_setup_stays_open_for_as_long_as_direct_mode_is_active(monkeypatch):
+    """R1: a broken access point must never strand the device. Past the reconfigure
+    window, "connected (local only)" in direct mode is not online for provisioning."""
+    service = _direct_service(monkeypatch, ApWifi(), lambda: True)
+    _run_briefly(service, 0.3)
+    assert len(FakeBLEServer.instances) == 1
+    assert FakeBLEServer.instances[0].running, "the window closed while in direct mode"
+    assert service.state == "provisioning"
+    healthy, detail = service.status()
+    assert healthy and "direct mode" in detail
+    described = service._describe()
+    assert described["state"] == "provisioning" and described["ssid"] is None
+
+
+def test_the_same_connectivity_without_direct_mode_still_closes_the_window(monkeypatch):
+    """Today's behaviour is unchanged when direct mode is not wired in (disabled)."""
+    service = _make_service(monkeypatch, ApWifi(), reconfigure_window_s=0.0)
+    assert service._direct_mode_active is None
+    _run_briefly(service, 0.3)
+    assert FakeBLEServer.instances == []
+    assert service.state == "online"
+
+
+def test_leaving_direct_mode_for_a_working_network_closes_the_window(monkeypatch):
+    active = {"value": True}
+    service = _direct_service(monkeypatch, ApWifi(), lambda: active["value"])
+    stop = threading.Event()
+    thread = threading.Thread(target=service.run, args=(stop,))
+    thread.start()
+    try:
+        time.sleep(0.2)
+        assert FakeBLEServer.instances and FakeBLEServer.instances[0].running
+        active["value"] = False  # back on the home network
+        time.sleep(0.3)
+        assert not FakeBLEServer.instances[0].running
+        assert service.state == "online"
+    finally:
+        stop.set()
+        thread.join(timeout=2)
+
+
+def test_an_unknown_direct_mode_state_keeps_the_recovery_path_open(monkeypatch):
+    def broken():
+        raise RuntimeError("nmcli wedged")
+
+    service = _direct_service(monkeypatch, ApWifi(), broken)
+    _run_briefly(service, 0.3)
+    assert FakeBLEServer.instances and FakeBLEServer.instances[0].running
+
+
+def test_direct_mode_on_networkmanager_reads_offline_for_provisioning(monkeypatch, tmp_path):
+    """End to end over the fake nmcli: the AP profile is active, `nmcli general` says
+    "connected (local only)", WifiManager.is_online() says True, and the policy says offline."""
+    from direct_mode_fakes import FakeNM
+
+    import core.network as network
+    from core.direct_mode import DirectModeManager
+
+    nm = FakeNM()
+    nm.add_client(network.DIRECT_PROFILE, active=True)
+    monkeypatch.setattr(network, "nmcli_available", lambda: True)
+    monkeypatch.setattr(network, "_run", nm.run)
+
+    class Wifi(network.WifiManager):
+        def watch(self, on_change, stop):
+            return None
+
+    wifi = Wifi()
+    assert wifi.is_online() is True, "the raw signal still counts local-only as online"
+    manager = DirectModeManager(wifi, {"enabled": True, "state_path": str(tmp_path / "s.json")},
+                                device_id="SD-1A2B3C4D", has_nmcli=lambda: True)
+    service = _direct_service(monkeypatch, wifi, manager.is_active)
+    assert service._online() is False
+    _run_briefly(service, 0.3)
+    assert FakeBLEServer.instances and FakeBLEServer.instances[0].running
+
+    nm.add_client("Home", active=True)  # a BLE-provisioned join moved it off the AP
+    assert service._online() is True

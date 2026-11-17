@@ -39,22 +39,64 @@ final class AlertWatcher: ObservableObject {
     func start(state: AppState) {
         guard task == nil else { return }
         notifier.beginWatching()
+        // Each watch starts from where every camera's journal ends: the backlog
+        // is history, never news (LocalAlerts.advance).
+        localCursors.removeAll()
         task = Task { [weak self] in
             while !Task.isCancelled {
-                await self?.poll(state: state)
-                try? await Task.sleep(for: self?.interval ?? .seconds(5))
+                let local = await self?.poll(state: state) ?? false
+                try? await Task.sleep(for: local ? (self?.localInterval ?? .seconds(5)) : (self?.interval ?? .seconds(5)))
             }
         }
     }
+
+    /// M12 (C6): where each paired camera's journal was last read, by hardware id.
+    private var localCursors: [String: Int] = [:]
+    /// Polling the camera on this network is a small local request, so it runs
+    /// more often than the account poll.
+    private let localInterval: Duration = .seconds(5)
 
     func stop() {
         task?.cancel()
         task = nil
     }
 
-    private func poll(state: AppState) async {
+    /// One poll. True when it read the cameras directly (the local path).
+    private func poll(state: AppState) async -> Bool {
         await notifier.refreshAuthorization()
-        guard notifier.authorized, state.isSignedIn else { return }
+        guard notifier.authorized else { return false }
+        // M12 (C6): the account server is not connected (or there is no
+        // account), but a paired camera answers on this network: read its own
+        // journal for new events, through the same notification and sound
+        // rules. Foreground only, like everything here.
+        if !state.isDemo, !(state.isSignedIn && state.periodicRefreshMayRun) {
+            return await pollLocal()
+        }
+        await pollAccount(state: state)
+        return false
+    }
+
+    private func pollLocal() async -> Bool {
+        let center = LocalAccessCenter.shared
+        var polled = false
+        for device in center.devices where center.isReady(device.hardwareID) {
+            let key = device.hardwareID.uppercased()
+            let cursor = localCursors[key]
+            // First look: just where the journal ends (the newest row).
+            guard let page = try? await center.events(device.hardwareID, after: cursor, limit: cursor == nil ? 1 : 50)
+            else { continue }
+            polled = true
+            let (fresh, next) = LocalAlerts.advance(cursor: cursor, page: page)
+            localCursors[key] = next
+            if !fresh.isEmpty {
+                await notifier.announceLocal(fresh, deviceName: device.name, deviceID: device.backendDeviceID)
+            }
+        }
+        return polled
+    }
+
+    private func pollAccount(state: AppState) async {
+        guard state.isSignedIn else { return }
 
         // Don't poll into a backend that is known not to be there. Each attempt
         // otherwise costs a 15-second request timeout plus a Bonjour search, so a

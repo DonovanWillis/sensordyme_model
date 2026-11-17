@@ -240,5 +240,22 @@ check(EventEvidence.lasted(-1) == nil && EventEvidence.lasted(.nan) == nil, "an 
 check(SignalWords.plain("zone=pool_deep confirmed after 12.4s") == "zone=pool_deep confirmed after 12.4s",
       "key=value detail is kept verbatim")
 
+print("\nM13: a driver event says what it means; nothing else is given words it didn't have")
+do {
+    func event(_ type: String) -> EventItem {
+        EventItem(eventID: 1, timestamp: "2026-11-13T08:00:00+00:00", type: type, confidence: nil,
+                  signals: nil, severity: "loud", source: nil)
+    }
+    check(event("distraction").meaning == "The driver's head stayed turned away from straight ahead",
+          "distraction is about the head")
+    for type in ["distraction", "eyes_down", "eyes_up", "phone_use", "drowsiness", "attention_lost"] {
+        let meaning = event(type).meaning ?? ""
+        check(!meaning.isEmpty && !meaning.lowercased().contains("gaze") && !meaning.contains("looking at"),
+              "\(type): \(meaning)")
+    }
+    check(event("monitoring_ready").meaning == nil && event("custom_rule:zone").meaning == nil,
+          "other types keep the device's words only")
+}
+
 print("\n\(failures == 0 ? "PASSED" : "\(failures) FAILED")")
 exit(failures == 0 ? 0 : 1)

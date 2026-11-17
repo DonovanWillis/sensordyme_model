@@ -74,7 +74,7 @@ import time
 import uuid
 from collections import OrderedDict, deque
 from collections.abc import Callable, Iterable
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from enum import Enum
 from typing import Any, ClassVar, Optional, Protocol
 
@@ -144,6 +144,10 @@ class AlertCategory:
     repeat_s: float = 0.0          # 0 = no repetition
     escalate_after_s: float = 0.0  # seconds from episode start before repeats escalate
     max_repeats: int = 0           # bound on repeats per episode (initial actuation not counted)
+    #: M14: True for an episode a Jupiter (custom) rule started. On the one
+    #: buzzer/speaker, a custom rule's pattern always ranks below a mandatory
+    #: (module) pattern, so it can never displace a waiting driver-safety one.
+    custom_rule: bool = False
 
     def __post_init__(self) -> None:
         for pattern in (self.initial_pattern, self.escalated_pattern):
@@ -208,7 +212,10 @@ class _PatternPlayer:
     One physical buzzer, many overlapping requests: patterns are queued (at most
     `_DEPTH` waiting) instead of interleaving, so a soft chirp can never cut a
     critical pattern short. When the queue is full the least urgent waiting
-    pattern is dropped, never the most urgent.
+    pattern is dropped, never the most urgent. M14: urgency is (mandatory,
+    category rank), so a custom (Jupiter) rule's pattern ranks below every
+    mandatory module pattern: it never displaces a waiting driver-safety
+    pattern and never plays ahead of one.
 
     `render_step(on_s)` blocks for on_s and returns None, or the error that
     stopped it. Each pattern's `report` (if given) is called exactly once:
@@ -223,15 +230,22 @@ class _PatternPlayer:
         self._render_step = render_step  # callable(on_s) -> Optional[str] error; blocks for on_s
         self._lock = threading.Lock()
         #: (rank, pattern, report, monotonic time it was commanded)
-        self._pending: list[tuple[int, AlertPattern, Optional[Report], float]] = []
+        self._pending: list[tuple[tuple[int, int], AlertPattern, Optional[Report], float]] = []
         #: M10: while the FIRST step of a pattern renders, when that pattern was
         #: commanded; the output reads it once to time command -> pin driven.
         self.first_step_commanded_at: Optional[float] = None
         self._wake = threading.Event()
         self._thread: Optional[threading.Thread] = None
 
-    def play(self, pattern: AlertPattern, category_name: str, report: Optional[Report] = None) -> None:
-        rank = self._RANK.get(category_name, 1)
+    def play(self, pattern: AlertPattern, category: "AlertCategory | str",
+             report: Optional[Report] = None) -> None:
+        if isinstance(category, str):
+            name, custom = category, False
+        else:
+            # A category object without the M14 flag (sinks are duck-typed) is
+            # treated as mandatory: it can never rank below a rule's pattern.
+            name, custom = category.name, bool(getattr(category, "custom_rule", False))
+        rank = (0 if custom else 1, self._RANK.get(name, 1))
         dropped: Optional[Report] = None
         with self._lock:
             if len(self._pending) >= self._DEPTH:
@@ -363,7 +377,7 @@ class SoundSink:
         if sys.platform == "darwin":
             _safe_report(report, "skipped", "audio output is disabled on macOS (dev machine)")
             return
-        self._player.play(pattern, category.name, report)
+        self._player.play(pattern, category, report)
 
     def emit(self, event: Event, level: AlertLevel) -> None:
         """Play a tone whose length reflects the alert level.
@@ -438,8 +452,20 @@ class SoundSink:
             wf.setsampwidth(2)
             wf.setframerate(fs)
             wf.writeframes(tone.tobytes())
-        subprocess.run(["aplay", "-q", path], check=False)  # noqa: S603, S607 - fixed argv, our own temp file
-        os.unlink(path)
+        # M14: the exit status is the result. It used to be ignored, so on a Pi 5
+        # (no analog audio out; `aplay` exists because setup_pi.sh installs
+        # alsa-utils) a failed playback reported "played" and kept this sink --
+        # and with it the device's audible-alert capability -- READY even when
+        # the GPIO buzzer was unavailable. A failure now raises, which
+        # _play_tone_safe records as _last_error and readiness() reports.
+        try:
+            done = subprocess.run(["aplay", "-q", path], check=False, capture_output=True,  # noqa: S603, S607 - fixed argv, our own temp file
+                                  text=True, timeout=duration_s + 5.0)
+        finally:
+            os.unlink(path)
+        if done.returncode != 0:
+            detail = (done.stderr or "").strip().splitlines()
+            raise RuntimeError(f"aplay exited {done.returncode}" + (f": {detail[-1][:160]}" if detail else ""))
 
 
 class GPIOBuzzerSink:
@@ -492,7 +518,7 @@ class GPIOBuzzerSink:
         """
         if not hasattr(self, "_player"):
             self._player = _PatternPlayer(self._buzz)
-        self._player.play(pattern, category.name, report)
+        self._player.play(pattern, category, report)
 
     def _buzz(self, on_s: float, commanded_at: Optional[float] = None) -> Optional[str]:
         """Drive the pin on for on_s. Returns None, or the GPIO error.
@@ -953,6 +979,8 @@ class AlertManager:
                 if category is not None
                 else self.category_for(event.type, level=level if key is not None else chosen)
             )
+            if source == "rules" and not cat.custom_rule:
+                cat = replace(cat, custom_rule=True)
             # Rolling-window notices keep cooldown de-duplication: a second
             # "PERCLOS over threshold" inside the window is not a new danger.
             if (

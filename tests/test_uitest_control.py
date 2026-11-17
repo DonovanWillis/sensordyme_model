@@ -46,3 +46,22 @@ def test_a_failed_login_says_so_and_caches_nothing(tmp_path, reply):
     with pytest.raises(RuntimeError, match=f"demo login failed: HTTP {reply[0]}"):
         stack.token()
     assert stack._token is None
+
+
+def test_the_app_alert_journal_is_found_in_the_simulator_data_container(tmp_path, monkeypatch):
+    seen = []
+
+    def run(command, **kwargs):
+        seen.append(command)
+        return uc.subprocess.CompletedProcess(command, 0, stdout=f"{tmp_path}\n", stderr="")
+
+    monkeypatch.setattr(uc.subprocess, "run", run)
+    assert uc.app_alert_journal("SIM-1") == tmp_path / "Library/Caches/alert-decisions.jsonl"
+    assert seen == [["xcrun", "simctl", "get_app_container", "SIM-1", "com.sensordyme.app", "data"]]
+
+
+def test_no_app_container_is_an_error_not_an_empty_journal(monkeypatch):
+    monkeypatch.setattr(uc.subprocess, "run", lambda command, **kwargs: uc.subprocess.CompletedProcess(
+        command, 2, stdout="", stderr="No such app"))
+    with pytest.raises(ValueError, match="data container was not found: No such app"):
+        uc.app_alert_journal("booted")

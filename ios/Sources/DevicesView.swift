@@ -28,6 +28,44 @@ struct DevicesView: View {
     @State private var hasLoaded = false
     @StateObject private var link = DeviceLink()
     @StateObject private var notifier = AlertNotifier.shared
+    /// M12: cameras paired with this iPhone, reachable directly on this network.
+    @ObservedObject private var local = LocalAccessCenter.shared
+
+    /// Paired cameras the account list does not show: every one of them on a
+    /// cold launch with the server down (C1), and any paired over Bluetooth
+    /// that isn't on the account.
+    private var localOnly: [TrustedDevice] {
+        if state.isDemo { return [] }
+        // With the server answering, wait for its list: a camera that IS on
+        // the account must not flash up here first as "not on your account".
+        if serverConnected && !hasLoaded { return [] }
+        return TrustedDevices.unlisted(local.devices, accountHardwareIDs: devices.map(\.hardwareId))
+    }
+
+    private var serverConnected: Bool {
+        if case .connected = state.backendStatus { return true }
+        return false
+    }
+
+    private var localCaption: String? {
+        if errorMessage != nil || !serverConnected {
+            return "Your account server can't be reached. These cameras are paired with this iPhone and open directly on this network."
+        }
+        return "Not on your account: no backup or remote notifications for these."
+    }
+
+    /// Where each camera answered last (the linked camera's address), as a hint
+    /// for the direct connection.
+    private var localHints: [String: String] {
+        guard !state.deviceLocalURL.isEmpty else { return [:] }
+        if let index = FeedLink.linkedDeviceIndex(hardwareIDs: devices.map(\.hardwareId), linkedID: state.linkedDeviceID),
+           let id = devices[index].hardwareId {
+            return [id.uppercased(): state.deviceLocalURL]
+        }
+        if !state.linkedDeviceID.isEmpty { return [state.linkedDeviceID.uppercased(): state.deviceLocalURL] }
+        if local.devices.count == 1, let only = local.devices.first { return [only.hardwareID.uppercased(): state.deviceLocalURL] }
+        return [:]
+    }
     /// The device a tapped notification belongs to, so the alert can be opened
     /// from anywhere in the app rather than only from the device screen.
     @State private var notificationTarget: Device?
@@ -80,9 +118,21 @@ struct DevicesView: View {
                 // network changes, so a move never requires typing an IP.
                 link.start()
                 await link.ensureConnection()
+                // M12: an older install that pasted the device token pairs
+                // this iPhone with it once, and then no longer needs it.
+                if !state.isDemo, !state.deviceToken.isEmpty, !state.deviceLocalURL.isEmpty,
+                   await local.migrateLegacyToken(url: state.deviceLocalURL, token: state.deviceToken,
+                                                  owner: state.accountEmail) {
+                    state.deviceToken = ""
+                }
+                if !state.isDemo {
+                    let hints = localHints
+                    Task { await local.refreshAll(every: 0, hints: hints) }
+                }
             }
             .onReceive(refreshTimer) { tick in
                 now = tick
+                if !state.isDemo { Task { await local.refreshAll(hints: localHints) } }
                 // Same rule as DeviceDetailView: one timed reload at a time, and
                 // none into a backend AppState is already retrying on its own.
                 guard !timedReloadInFlight, state.periodicRefreshMayRun else { return }
@@ -113,6 +163,7 @@ struct DevicesView: View {
                 }
             }
             .navigationDestination(item: $launchTarget) { DeviceDetailView(device: $0) }
+            .navigationDestination(for: LocalDeviceRoute.self) { LocalDeviceView(hardwareID: $0.hardwareID) }
             // A tapped notification opens its device, which then consumes
             // pendingEventID and shows the alert. Without this the id was set
             // and nothing was listening unless that screen was already open —
@@ -192,7 +243,12 @@ struct DevicesView: View {
                         .padding(.bottom, SD.Space.xs)
                     }
 
-                    if devices.isEmpty {
+                    if !localOnly.isEmpty {
+                        LocalDevicesSection(devices: localOnly, caption: localCaption, now: now)
+                            .padding(.bottom, SD.Space.xs)
+                    }
+
+                    if devices.isEmpty && localOnly.isEmpty {
                         emptyOrLoading
                     }
                 }
@@ -335,6 +391,17 @@ struct DevicesView: View {
             // sees it online while the local link gave up at "can't find it".
             // One throttled re-look closes that without a relaunch.
             await link.retryWhileBackendSeesDevice(anyDeviceOnline: fetched.contains { $0.online })
+            // M12 (LOCAL_ACCESS.md §4.2): register this iPhone's key for each
+            // camera the account reports a local identity for, once; the
+            // camera then answers this phone directly on its network.
+            // In the background: the list never waits on a camera search.
+            if !state.isDemo {
+                let api = state.api, owner = state.accountEmail, hints = localHints
+                Task {
+                    await local.enrollViaAccount(devices: fetched, api: api, owner: owner)
+                    await local.refreshAll(hints: hints)
+                }
+            }
         } catch let error as APIError where error.isAuthFailure {
             guard reloadGuard.isLatest(token) else { return }
             refreshing.fail()

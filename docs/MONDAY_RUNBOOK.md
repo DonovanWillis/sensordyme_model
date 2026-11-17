@@ -224,16 +224,16 @@ What must survive a reinstall, and why:
 ```bash
 B=~/m6-backup-$(date +%Y%m%dT%H%M%S); mkdir -p $B && chmod 700 $B && cd $B
 cp -p $D/config.yaml config.yaml
-tar --exclude='.venv' -czf sensordyme_tree.tgz -C $(dirname $D) $(basename $D)
+tar --exclude='.venv' -czhf sensordyme_tree.tgz -C $(dirname $D) $(basename $D)   # -h: see the note below
 sudo tar -czf system_glue.tgz /etc/systemd/system/sensordyme*.service /etc/sudoers.d/sensordyme-reboot \
   /etc/polkit-1/rules.d/10-sensordyme-network.rules /etc/avahi/services/sensordyme.service \
-  /etc/NetworkManager/system-connections /var/lib/bluetooth 2>/dev/null
+  /etc/NetworkManager/system-connections /var/lib/bluetooth /etc/sensordyme 2>/dev/null
 sudo chown $USER system_glue.tgz && chmod 600 *
 sha256sum $D/models/*.hef > model_hashes.txt
 sha256sum * > SHA256SUMS; cat SHA256SUMS
 tar -tzf sensordyme_tree.tgz | grep -E 'config.yaml$|\.hef$|data/device_state.json$' 
 ```
-Expect: the archive lists `config.yaml`, the `.hef` and `data/`. Copy `$B` to the USB stick (or encrypted storage on the Mac) and verify `sha256sum -c SHA256SUMS` there. **Treat as secret.**
+Expect: the archive lists `config.yaml`, the `.hef` and `data/`. **M14: `-h` (dereference) is required on an adopted device** (`~/sensordyme.releases` exists): there `$D` is a symlink to the running release and `data/`, `models/`, `.secrets` are symlinks into `~/sensordyme.state/`; without `-h` the archive holds the one symlink and none of the device's state (no config, no `data/local_identity.pem`, no `.hef`). On a legacy tree `-h` changes nothing. Restoring such an archive (O2) on an adopted device: put `data/`, `models/`, `.secrets` back under `~/sensordyme.state/` and `config.yaml` into the running release, never over the `~/sensordyme` symlink. Copy `$B` to the USB stick (or encrypted storage on the Mac) and verify `sha256sum -c SHA256SUMS` there. **Treat as secret.**
 
 **E2. Record model hashes:** done in `model_hashes.txt`. Also copy it into `$EV`.
 
@@ -493,7 +493,7 @@ Simulate a startup crash, e.g. `sudo systemctl edit sensordyme` with `[Service]`
 **L1. Secure iPhone pairing** (CHANGE: config):
 1. Dashboard token: if unset or under 16 characters, generate one on the Pi with `openssl rand -hex 16`, set `dashboard.token` in `$D/config.yaml` (edit in place; never copy the repo's config over it), `chmod 600 $D/config.yaml`, and restart.
 2. Backend: `python cloud/manage.py create-device "Car unit"` on the backend host. Set `cloud.enabled: true`, `cloud.device_key: dk_…` and `cloud.base_url` in the device config. Prefer `https://` with a real certificate, or `ca_cert_path` for a self-signed one. An `http://` base URL works but is announced as cleartext in the journal and the preflight (development only).
-3. In the app: sign in, add the device with the claim code, then enter the dashboard token under Settings → Live feed.
+3. In the app: sign in and add the device with the claim code. Nothing to paste for the live feed (M12, `docs/LOCAL_ACCESS.md`): the app pairs this iPhone with the camera by itself (Bluetooth after the setup code, or through the account once the device reports). The token stays an operator credential for the `curl` checks below. `.venv/bin/python scripts/local_clients.py list` on the Pi shows which iPhones it trusts.
 4. Verify:
    ```bash
    curl -s -o /dev/null -w '%{http_code}\n' localhost:8899/api/health                             # 401

@@ -1,5 +1,27 @@
 # Portable device operation: what needs what (analysis, 2026-11-14)
 
+> **M12 status (2026-11-16).** The analysis below is the M11 baseline and is kept
+> as written. M12 built the gaps it lists, **in software only**. Nothing has run
+> on the Pi or a physical iPhone.
+>
+> | Gap | Status | Where |
+> |---|---|---|
+> | C1/G1 device list needs the backend | **built**: the trusted-camera cache is in the Keychain; a cold launch with no backend lists the camera, honest about staleness | `ios/Sources/TrustedDevices.swift`, `LocalAccessCenter.swift`; XCUITest `test29_OfflineLocalCamera` |
+> | C2/G2 no local commands | **built**: stop/resume and mode are signed per request (sd-local-v1) and confirmed from `/api/state` | `docs/LOCAL_ACCESS.md`, `core/local_auth.py`, `ios/Sources/LocalDeviceClient.swift` |
+> | C3/G3 the token is pasted by hand | **built**: per-phone P-256 keys enrolled over Bluetooth PoP, through the account (signed relay) or by the token holder. A device-signed session carries the video. The pasted token is a one-time migration | same; `services/ble_pop.py` `enroll` |
+> | C4/G4 history is backend-only | **built**: `GET /api/events` from a bounded journal keyed by the backend's `event_key`, merged without duplicates, with honest sync state | `core/local_events.py`, `ios/Sources/LocalEvents.swift` |
+> | C5/G10 Bluetooth setup is behind sign-in | **built**: "Set up a camera nearby" and a labelled local-only screen | `ios/Sources/AuthView.swift` |
+> | C6/G9 no alerts while direct | **built**: the foreground app polls `/api/events?after=`; one banner and one sound per `event_key` across both paths | `ios/Sources/AlertWatcher.swift` |
+> | G5–G8, G11 device access point | **built, off by default**: transactional enter with rollback, the label passphrase, an AP firewall, Bluetooth kept open in direct mode, the hotspot hardened. `GET/POST /api/network/direct`. **No app UI** to switch it yet | `docs/DIRECT_MODE.md` |
+>
+> Evidence: `tests/test_m12_*.py`, `tests/test_direct_mode*.py`. The end-to-end
+> run with the backend lost is `tests/test_m12_local_e2e.py`.
+>
+> The physical gates are `docs/LOCAL_ACCESS.md` §10 and `docs/DIRECT_MODE.md`
+> §6/§8: real Bluetooth enrolment, the Secure Enclave, Personal Hotspot
+> Bonjour, and the Pi radio as an access point. Until they pass, rehearse the
+> §4 demo cells on hardware before showing them.
+
 The target: *"Plug in SensorDyme. Turn it on. Open the iPhone app. It reconnects
 by itself. Start or resume monitoring. Use the camera and events."* The
 development machines (MacBook, `oryn`, `quantcompute`) build models; they must
@@ -509,6 +531,8 @@ the Pi.**
 
 Do **not** demo:
 
-* direct-AP mode (not built);
-* a cold launch of the app with the Mac off (empty device list, C1);
+* direct-AP mode (M12: built, but not run on the Pi, and no app UI to switch it);
+* a cold launch of the app with the Mac off **until it has been rehearsed on
+  the real Pi and iPhone** (M12 built it; it is verified only in the Simulator,
+  `test29_OfflineLocalCamera`);
 * video away from the device's network (by design: no relay).

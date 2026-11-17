@@ -38,6 +38,14 @@ camera:
 # PRIVACY: annotated frames stream in-memory over HTTP to connected browsers only --
 # never written to disk. host 127.0.0.1 = this machine only; set 0.0.0.0 on the Pi to
 # view from your phone on the same network (an explicit opt-in, like the VLM exception).
+# M12 sd-local-v1 (docs/LOCAL_ACCESS.md): each phone gets its own key, enrolled
+# over Bluetooth (setup code), through the owner's account (signed command), or
+# by a holder of dashboard.token. No shared secret to paste, nothing open on the
+# LAN: a phone that was never enrolled gets 401 on every /api and /stream path.
+local_access:
+  enabled: true
+  idle_expiry_days: 180   # a phone not seen for this long must pair again (0 = never)
+
 dashboard:
   enabled: true
   host: 0.0.0.0
@@ -185,6 +193,23 @@ network:
     #             and an app build that speaks proof of possession.
     auth: legacy
     setup_code_path: /etc/sensordyme/ble_setup_code
+  # Direct mode (docs/DIRECT_MODE.md): the device runs its own Wi-Fi access point,
+  # SensorDyme-XXXX, so a phone can reach the dashboard with no other network.
+  # OFF by default; with `enabled: false` nothing below is read. It needs the label
+  # passphrase (scripts/direct_mode_psk.py generate, 0600) and the access-point
+  # firewall (sudo scripts/direct_mode.py install). It is never an open network, and
+  # there is deliberately no passphrase setting here. Bluetooth setup stays open
+  # while it is active, and a power cycle always tries saved networks first.
+  direct_mode:
+    enabled: false
+    security: wpa2 # wpa2 (WPA2-PSK, CCMP) | wpa3 (WPA3-SAE only)
+    channel: 6 # 2.4 GHz channel, 1-11
+    ap_timeout_s: 30 # not up (address + firewall) by then: back to the previous network
+    passphrase_path: /etc/sensordyme/direct_mode_psk
+    # Start direct mode by itself after this long with no network, and leave it
+    # once a saved network is back in range. OFF by default.
+    fallback_enabled: false
+    fallback_after_s: 600
 
 # Health monitoring and automatic recovery: every component (camera, inference,
 # accelerator, dashboard, uplink, wifi, provisioning, hardware) is checked

@@ -134,3 +134,8 @@ float precision-0.80 hand threshold is in the M10 report and does not transfer t
 2. Measured Pi decode time, and processed fps no worse than with legacy.
 3. Event-level replay on in-cabin validation clips: phone-use and person-dependent alerts no worse on false alarms per hour.
 4. Owner approval, then set `accelerator.yolo_decoder: reference` on a **development** unit first.
+
+Items 1 and 2 (plus integrity, class map, thermal and provenance) are one run on the Pi:
+`hwv_stage.py decoder-exp --install-dir $D` (M14; see `docs/HAILO_HARDWARE_VALIDATION.md`, "M14 addition").
+Item 3 enters its gate as `--cabin-scores LEGACY.json,REFERENCE.json`. The tool prints `KEEP LEGACY` unless every
+criterion passes. It never edits config.

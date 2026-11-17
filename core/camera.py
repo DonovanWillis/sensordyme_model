@@ -11,6 +11,7 @@ import threading
 import time
 from collections.abc import Iterator
 from contextlib import suppress
+from pathlib import Path
 from typing import Optional
 
 import cv2
@@ -27,17 +28,41 @@ log = get_logger("camera")
 _ABANDONED_HANDLES: list = []
 
 
+#: The board's own name (set by the firmware). Module-level so tests can point it elsewhere.
+DT_MODEL = Path("/proc/device-tree/model")
+
+
+def is_raspberry_pi_board() -> bool:
+    """True when the device tree says this is a Raspberry Pi (no imports involved)."""
+    try:
+        return "Raspberry Pi" in DT_MODEL.read_text(errors="replace")
+    except OSError:
+        return False
+
+
 def detect_pi() -> bool:
-    """Return True if Picamera2 is importable, i.e. this is a Raspberry Pi.
+    """Return True on a Raspberry Pi: the board says so, or Picamera2 is importable.
 
     Public: main.py needs this too (to decide which AlertManager sink set is
     valid), not just Camera itself.
+
+    M14: this used to be "Picamera2 imports" alone. On a real Pi whose picamera2
+    import failed (a broken apt install, a venv without --system-site-packages)
+    the camera then silently took the Mac webcam path, opened /dev/video0 (a
+    raw rp1-cfe node on a Pi 5), and reported a macOS camera-permission hint;
+    the alert sinks were built as for a Mac. Worse, an import that raised
+    anything but ImportError crashed main.py before the runtime existed (a
+    restart loop). On a Pi board the answer is now True regardless, so the
+    Picamera2 path runs and reports the import failure itself as the camera's
+    reason (CameraError, an honest FAILED state).
     """
+    if is_raspberry_pi_board():
+        return True
     try:
         from picamera2 import Picamera2  # noqa: F401
 
         return True
-    except ImportError:
+    except Exception:  # noqa: BLE001 - any import failure off a Pi board means "not a Pi"
         return False
 
 
