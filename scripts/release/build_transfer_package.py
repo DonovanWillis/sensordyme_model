@@ -262,10 +262,14 @@ Release commit `{commit}`. Everything below is also in `docs/DEPLOYMENT.md`
 
 | Requirement | Why |
 |---|---|
-| Raspberry Pi OS **Bookworm**, **aarch64** | the wheels and the lock target this OS |
+| Raspberry Pi OS **Bookworm** (Debian 12), **aarch64**, 64-bit userland | the wheels and the lock target this OS. **Trixie (Debian 13, Python 3.13) is not supported** |
 | **Python 3.11** (`python3 --version`) | the lock pins cp311 wheels |
-| **HailoRT 4.x** via `hailo-all` (apt) | the .hef is compiled for Hailo-8L; no CPU fallback exists |
+| **HailoRT 4.x** via `hailo-all` (apt) | the .hef is compiled for Hailo-8L and was measured on HailoRT 4.20.0; on any other version `hwv_stage.py parse-hef` / `model` on the device decide. No CPU fallback exists |
 | non-interactive sudo for the installing user | the detached activation cannot ask for a password |
+
+`setup_pi.sh` checks the OS, architecture, Python and `config.yaml` first and, if any
+fails, stops with the reason **before changing anything**. Do not reflash to get past it
+without the owner's approval: reflashing erases the card (identity, config, events).
 
 ## Contents
 
@@ -282,19 +286,41 @@ Verify the package first: `shasum -a 256 -c SHA256SUMS` (Mac) or `sha256sum -c S
 
 ## A. Fresh device (no SensorDyme install yet)
 
+One command, run from this package directory. `mkdir` without `-p` makes it stop at
+once if `~/sensordyme` already exists (then this is not a fresh device: use B).
+
 ```bash
-mkdir -p ~/sensordyme && tar -xzf bundle/{tgz} -C ~/sensordyme
-mkdir -p ~/sensordyme/models && cp models/*.hef ~/sensordyme/models/   # setup_pi.sh verifies the pin again
-cp -r wheels ~/sensordyme.wheels                                        # optional: offline installs
-cd ~/sensordyme && bash setup_pi.sh                                     # the install entrypoint
+mkdir ~/sensordyme \\
+  && tar -xzf bundle/{tgz} -C ~/sensordyme \\
+  && cp -n config/config.yaml.example ~/sensordyme/config.yaml && chmod 600 ~/sensordyme/config.yaml \\
+  && mkdir -p ~/sensordyme/models && cp models/*.hef ~/sensordyme/models/ \\
+  && mkdir -p ~/sensordyme.wheels && cp wheels/*.whl ~/sensordyme.wheels/ \\
+  && cd ~/sensordyme && bash setup_pi.sh
 ```
 
-`setup_pi.sh` installs apt packages, the hashed lock (wheels only), verifies the model
-against `{pins.get('model_sha256')}`, and installs + starts the systemd service. Then adopt
-the staged layout once (`make deploy-adopt`, or on the Pi:
-`python3 install/release_guard.py adopt --root ~/sensordyme` with the service stopped).
+- `config.yaml`: the bundle never carries one (it is device state); the template is the
+  repo default. Without it the service exits 78 at every start, so setup_pi.sh refuses.
+- `models/`: setup_pi.sh verifies the pin `{pins.get('model_sha256')}` again.
+- `~/sensordyme.wheels`: setup_pi.sh installs the hashed lock from these wheels with
+  `--no-index` (no PyPI needed; apt still needs the internet).
+
+`setup_pi.sh` installs apt packages, the hashed lock (wheels only), verifies the model,
+and installs + starts the systemd service. If it ends with "/dev/hailo0 is not present
+yet", reboot once (`sudo reboot`): the Hailo driver it just installed loads at boot.
+Then adopt the staged layout once (`make deploy-adopt`, or on the Pi, from this package
+directory: `sudo systemctl stop sensordyme.service && python3 install/release_guard.py adopt
+--root ~/sensordyme && sudo systemctl start sensordyme.service`).
 
 ## B. Staged install onto an adopted device (the normal update)
+
+Back up first (`docs/MONDAY_RUNBOOK.md` RB-E1: tree, `config.yaml`, `data/`, model hashes).
+An existing install WITHOUT `~/sensordyme.releases` (a legacy tree) is adopted once, with
+the service stopped, before the commands below: `sudo systemctl stop sensordyme.service &&
+python3 install/release_guard.py adopt --root ~/sensordyme && sudo systemctl start
+sensordyme.service`. Adopt moves `data/`, `models/`, `logs/`, `.secrets` and `.env` to
+`~/sensordyme.state/` and links them back; `config.yaml` is carried into every new release.
+Nothing is rotated or regenerated: the device key, `data/local_identity.pem` and the
+device id stay what they are.
 
 From the Mac with this repo: `make deploy DEVICE=<user>@<host> DIR=sensordyme REF={commit}`.
 
