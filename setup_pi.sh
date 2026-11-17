@@ -298,7 +298,11 @@ echo "==> Allowing the device to manage its own Wi-Fi (polkit)"
 # The polkit rule below grants to the netdev group; BlueZ's D-Bus policy lets the
 # bluetooth group register GATT applications. Make sure the service user is in
 # both (no-ops when already a member or when a group does not exist).
-for group in netdev bluetooth; do
+# M14: and in the hardware groups the stock unit relies on (it sets no
+# SupplementaryGroups): video (camera nodes, /dev/dma_heap, /dev/vcio), gpio (the
+# buzzer), audio. The Imager's first user already has them; an account created
+# later (SENSORDYME_USER=...) may not, and would then fail on the camera/buzzer.
+for group in netdev bluetooth video gpio audio; do
   if getent group "$group" >/dev/null 2>&1; then
     sudo usermod -aG "$group" "$SERVICE_USER"
   fi
