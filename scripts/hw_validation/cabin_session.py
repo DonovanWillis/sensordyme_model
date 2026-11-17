@@ -54,6 +54,7 @@ import argparse
 import contextlib
 import json
 import os
+import re
 import subprocess
 import sys
 import time
@@ -84,6 +85,13 @@ OBSERVER_KEYS = {"c": "long_closure", "o": "eyes_off_road", "p": "phone_use", "a
                  "k": "glance_cluster", "f": "passenger_phone_use", "u": "UNCERTAIN"}
 EVIDENCE_CUE = "diagnostic_cue_schedule"
 EVIDENCE_VERIFIED = "verified_labels"
+#: subject / session / vehicle / consent ids are pseudonyms: no spaces, no e-mail, never a name (M14).
+PSEUDONYM = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,63}")
+#: what a session never records (written into every session file, M14).
+DATA_MINIMISATION = {"frames": False, "video": False, "audio": False,
+                     "token": "read from SENSORDYME_TOKEN, never written",
+                     "identity": "pseudonyms only; consent records are referenced by id, kept outside this tool",
+                     "recorded": "cue times, the device's per-alert availability and its event log"}
 
 
 # ------------------------------------------------------------------ plan
@@ -108,6 +116,34 @@ def build_plan(block_ids: list[str], cues: Optional[dict] = None) -> list[dict]:
     return steps
 
 
+SESSION_AXES = ("lighting", "eyewear", "occupancy", "mount")
+
+
+def required_session_axes(blocks: list[str], cues: Optional[dict] = None, matrix=None) -> dict[str, list[str]]:
+    """The session-axis values (lighting, eyewear, occupancy, mount) EVERY scored block of
+    this plan accepts, from each block's matrix cell (M14). A plan whose blocks disagree
+    has an empty list for that axis: it can never be scored, so it is refused up front."""
+    from evaluation import scenarios
+
+    cues, matrix = cues or load_cues(), matrix or scenarios.load()
+    need: dict[str, list[str]] = {}
+    for bid in blocks:
+        block = cues["blocks"][bid]
+        if block.get("ignore"):
+            continue
+        for axis, allowed in matrix.cells[block["cell"]].tags.items():
+            if axis in SESSION_AXES:
+                need[axis] = [v for v in need.get(axis, list(allowed)) if v in allowed]
+    return need
+
+
+def session_axis_problems(blocks: list[str], meta: dict, cues: Optional[dict] = None) -> list[str]:
+    """Why this session's conditions cannot be scored against these blocks (empty: they can)."""
+    return [f"this plan needs --{axis} in {allowed or '(no single value: split the plan)'}; the session is "
+            f"{meta.get(axis)}" for axis, allowed in required_session_axes(blocks, cues).items()
+            if meta.get(axis) not in allowed]
+
+
 def operator_sheet(steps: list[dict], blocks: list[str], cues: dict) -> str:
     total = sum(s["s"] for s in steps)
     lines = [f"# Cued session: {', '.join(blocks)}", "",
@@ -119,6 +155,12 @@ def operator_sheet(steps: list[dict], blocks: list[str], cues: dict) -> str:
         truth = s["event"] or ("(not scored: " + s["ignore"] + ")" if s["ignore"] else "attentive")
         lines.append(f"| {s['n']} | {t:6.1f} s | {s['s']:g} s | {s['say']} | {truth} |")
         t += s["s"]
+    need = required_session_axes(blocks, cues)
+    if need:
+        lines += ["", "Run this plan ONLY with: " + ", ".join(f"--{a} {'|'.join(v) or '(none: split the plan)'}"
+                                                        for a, v in sorted(need.items()))]
+    lines += ["", ("Before: signed consent for every adult in the vehicle (ids for --consent-ref / "
+                   "--passenger-consent-ref). No frames, video or audio are recorded.")]
     lines += ["", "After the session: list the numbers of any cue NOT performed as cued, for `score --void`."]
     for bid in blocks:
         block = cues["blocks"][bid]
@@ -218,6 +260,25 @@ def cmd_run(args) -> int:
     sustain = matrix.sustain_seconds(module_cfg)
     meta = {k: getattr(args, k) for k in ("subject", "session", "vehicle", "seat", "lighting", "eyewear",
                                           "occupancy", "mount", "notes")}
+    # M14: refuse BEFORE anything is recorded, not at scoring time after a wasted session.
+    problems = session_axis_problems(plan["blocks"], meta)
+    passenger = args.occupancy not in ("driver_only", "empty")
+    consent = {"subject_ref": args.consent_ref or ("SIMULATED" if args.fake else None),
+               "passenger_ref": args.passenger_consent_ref or ("SIMULATED" if args.fake and passenger else None),
+               "how": "consent record ids only; the signed forms stay with the owner (INCABIN_PILOT_PROTOCOL.md)"}
+    if not consent["subject_ref"]:
+        problems.append("--consent-ref (the driver's signed consent record id) is required")
+    if passenger and not consent["passenger_ref"]:
+        problems.append(f"--occupancy {args.occupancy}: --passenger-consent-ref is required for every other adult")
+    for key, value in (("subject", args.subject), ("session", args.session), ("vehicle", args.vehicle),
+                       ("consent-ref", consent["subject_ref"]), ("passenger-consent-ref", consent["passenger_ref"])):
+        if value is not None and not PSEUDONYM.fullmatch(str(value)):
+            problems.append(f"--{key} {value!r} is not a pseudonym (letters, digits, . _ -; never a name or e-mail)")
+    if problems:
+        print("REFUSED before recording anything:", file=sys.stderr)
+        for line in problems:
+            print(f"  - {line}", file=sys.stderr)
+        return 2
     device: Optional[Device] = None
     fake = FakeDevice(sustain) if args.fake else None
     health0: dict = {}
@@ -297,7 +358,8 @@ def cmd_run(args) -> int:
                    "versions": (health0.get("monitoring") or {}).get("versions"),
                    "model": (health0.get("monitoring") or {}).get("model")},
         "steps": record, "predictions": sorted(predictions),
-        "unavailable": dict(unavailable),
+        "unavailable": dict(unavailable), "consent": consent, "data_minimisation": DATA_MINIMISATION,
+        "evidence_scope": "one session: diagnostics only, never an accuracy claim (the cue schedule is not truth)",
         "note": "no frames, video or audio were recorded; ground truth = the cue schedule",
     }
     out = args.plan / ("session_SIMULATED.json" if args.fake else "session.json")
@@ -451,9 +513,6 @@ def _power_ok(summary: dict) -> bool:
 
 
 # ------------------------------------------------------------------ score
-SESSION_AXES = ("lighting", "eyewear", "occupancy", "mount")
-
-
 def block_clips(session: dict, void: set[int], matrix=None, labels: Optional[dict] = None) -> list[dict]:
     """The session as annotation v2 documents, ONE CLIP PER BLOCK RUN.
 
@@ -761,6 +820,10 @@ def main(argv: Optional[list[str]] = None) -> int:
     rn.add_argument("--occupancy", required=True)
     rn.add_argument("--mount", required=True, choices=["dash_centre", "mirror_base", "a_pillar", "column"])
     rn.add_argument("--notes", default="", help="conditions to record, e.g. 'mount nudged ~5 deg yaw, no recal'")
+    rn.add_argument("--consent-ref", default=None,
+                    help="the driver's signed consent record id (never a name); required except with --fake")
+    rn.add_argument("--passenger-consent-ref", default=None,
+                    help="required when --occupancy is not driver_only: the other adult's consent record id")
     rn.add_argument("--url", default=DEFAULT_URL)
     rn.add_argument("--fake", action="store_true", help="dry run against a simulated device; SIMULATED")
     sc = sub.add_parser("score", help="score a recorded session (diagnostics, behind the power check)")

@@ -113,7 +113,7 @@ def test_observe_and_record_refuse_cleanly_without_a_running_service(tmp_path):
 
 
 def test_all_never_runs_the_operator_only_stages(tmp_path):
-    assert set(hs._NOT_IN_ALL) == {"observe", "arch"}
+    assert set(hs._NOT_IN_ALL) == {"observe", "arch", "decoder-exp"}  # M14: decoder-exp is its own run
     assert {"observe", "arch"} <= set(hs.STAGES) and {"observe", "arch"} <= set(hs.RUNNERS)
 
 

@@ -13,6 +13,7 @@
     $PY $V/hwv_stage.py buzzer                # commanded pattern timing (+ a person listens) [Pi, service stopped]
     $PY $V/hwv_stage.py observe --minutes 10  # the runtime's own per-stage timings, recorded  [Pi, service RUNNING]
     $PY $V/hwv_stage.py arch --second-hef B.hef  # single vs dual detector, equal conditions   [Pi, service stopped]
+    $PY $V/hwv_stage.py decoder-exp           # M14: legacy vs reference decoder, ONE evidence dir + gate [Pi, stopped]
     python hwv_stage.py all --fake            # every stage against fakes, for a dry run
 
 Exit codes: 0 PASS, 1 FAIL, 2 BLOCKED (a prerequisite is missing: no Hailo device,
@@ -84,10 +85,13 @@ STAGES: dict[str, tuple[str, str, str]] = {
     "buzzer": ("yes (+ a person)", "stopped", "every pattern commanded with the designed timing; audibility by ear"),
     "observe": ("yes", "running", "M10: record /api/health per-stage timings, fps, RSS, temp, throttle for N min"),
     "arch": ("yes (+ a 2nd .hef)", "stopped", "M10: Arch A (production .hef) vs Arch B (+ --second-hef), ABBA blocks"),
+    "decoder-exp": ("yes", "stopped", ("M14: pins+model+parse-hef+capture+parity+latency+pipeline fps, both "
+                                       "decoders on the same INT8 tensors, thermal, one evidence dir, KEEP LEGACY "
+                                       "gate")),
 }
 #: Stages `all` never runs: they need an input only the operator has (a second .hef)
 #: or the service in the other state than the rest of `all`.
-_NOT_IN_ALL = ("observe", "arch")
+_NOT_IN_ALL = ("observe", "arch", "decoder-exp")
 
 
 # ------------------------------------------------------------------ reporting
@@ -1021,11 +1025,15 @@ RUNNERS: dict[str, Callable[[Report, Any], int]] = {
 }
 
 
-def run_stage(name: str, args) -> int:
+def run_stage(name: str, args, *, reports: Optional[list] = None, fake_wrap: bool = True) -> int:
+    """Run one stage and write its report. `reports` (M14) collects the Report; `fake_wrap=False`
+    when the caller already installed ONE stand-in chip for several stages (decoder-exp)."""
     print(f"== STAGE {name}{' [--fake: stand-ins, NOT evidence]' if args.fake else ''}", flush=True)
     rep = Report(name, args.fake)
+    if reports is not None:
+        reports.append(rep)
     try:
-        if args.fake and name in ("model", "capture", "latency", "buzzer", "arch"):
+        if fake_wrap and args.fake and name in ("model", "capture", "latency", "buzzer", "arch"):
             with fake_device() as install:
                 saved = args.install_dir
                 args.install_dir = install
@@ -1089,6 +1097,9 @@ def main(argv: Optional[list[str]] = None) -> int:
                    help="arch: start every block at or below this SoC temperature (default: the temperature at start)")
     p.add_argument("--temp-tolerance-c", type=float, default=2.0, help="arch: allowed start-temperature spread")
     p.add_argument("--cooldown-max-s", type=float, default=900.0, help="arch: longest wait for the start temperature")
+    import decoder_experiment
+
+    decoder_experiment.add_arguments(p)
     args = p.parse_args(argv)
     sys.dont_write_bytecode = True
     if args.out is None:
@@ -1102,6 +1113,8 @@ def main(argv: Optional[list[str]] = None) -> int:
         for name, (hw, svc, what) in STAGES.items():
             print(f"{name:<10} {hw:<28} {svc:<8} {what}")
         return PASS
+    if args.stage == "decoder-exp":
+        return decoder_experiment.run(args)
     if args.stage != "all":
         return run_stage(args.stage, args)
     results = {}

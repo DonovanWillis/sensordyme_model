@@ -58,7 +58,9 @@ closure was un-cued.
    - the observer and the operator are two different people.
 2. **On the Pi:** `collect_evidence.py` (baseline), then `cabin_session.py plan --preset core`.
 3. **Two SSH sessions on the Pi:**
-   - the operator runs `cabin_session.py run …`;
+   - the operator runs `cabin_session.py run … --consent-ref <id>` (plus `--passenger-consent-ref <id>` for
+     every other adult). `run` refuses without them, refuses any id that is not a pseudonym, and refuses a
+     plan whose matrix cells need another lighting, eyewear or occupancy, all **before** recording;
    - the observer runs `cabin_session.py observe --clock same_host --independent --annotator O1 --consent-ref <id>`.
 4. **Afterwards:**
    - `cabin_session.py score --labels labels_O1.json`;
@@ -69,6 +71,26 @@ closure was un-cued.
    - record video with the SensorDyme device;
    - put a participant's name anywhere;
    - tune a threshold during or after a session without the owner's explicit decision and a re-run on held-out sessions.
+
+## 4a. Session plans by condition (M14)
+
+| Condition | Preset (`cabin_session.py plan --preset`) | Run with |
+|---|---|---|
+| forward attention, mirror / cluster glances, prolonged off-road, look-down vs closure, closures, phone in hand, phone in mount, driver absent | `core` | `--lighting day --eyewear none\|clear --occupancy driver_only` |
+| passenger with a phone, passenger leaning in, driver closure with a passenger | `passenger` | `--occupancy driver_plus_front_passenger --passenger-consent-ref <id>` |
+| low light, illuminator off | `low_light` | `--lighting dusk` |
+| NoIR at night (850 nm illuminator) | `night_ir` | `--lighting night_ir` |
+| eyewear | `eyewear_clear`, `eyewear_sunglasses_ir_pass`, `eyewear_sunglasses_ir_block` | the matching `--eyewear` |
+| partial occlusion (hand over the face, cap brim) | `occlusion` | any lighting; the hand block is *boundary* (tallied, never judged) |
+| camera angle | `displacement`, once per `--mount`, the change in `--notes` | `--lighting day` |
+
+**Every session file records:**
+- the consent record ids (`consent`), never a name;
+- what it never captured (`data_minimisation`: no frames, video, audio or token);
+- `evidence_scope`: one session is diagnostics only.
+
+**Splits:** by subject, never by clip or frame, with sessions, vehicle-days and co-occupants linked
+(`python -m evaluation.leakage check|assign|lock`). The held-out test split is locked.
 
 ## 5. Reporting
 
